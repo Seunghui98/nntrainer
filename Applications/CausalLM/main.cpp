@@ -112,8 +112,8 @@ int main(int argc, char *argv[]) {
                                                   nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
-    "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
+    "Qwen2ForCausalLM", [](json cfg, json genration_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen2CausalLM>(cfg, genration_cfg,
                                                        nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
