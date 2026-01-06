@@ -74,10 +74,15 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
           .get<unsigned int>();
   }
 
-  EOS_TOKEN_ID =
-    generation_cfg["eos_token_id"].empty()
-      ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
-      : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+  if (generation_cfg["eos_token_id"].is_array()) {
+    EOS_TOKEN_ID =
+      generation_cfg["eos_token_id"].empty()
+        ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
+        : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+  } else {
+    EOS_TOKEN_ID.clear();
+    EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
+  }
   BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
                    ? cfg["bos_token_id"].get<unsigned int>()
                    : generation_cfg["bos_token_id"].get<unsigned int>();

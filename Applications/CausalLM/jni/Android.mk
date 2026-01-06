@@ -50,6 +50,7 @@ LOCAL_SRC_FILES := ../main.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/embedding.cpp \
+    ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen3/qwen3_causallm.cpp \
     ../models/qwen3_moe/qwen3_moe_causallm.cpp \
     ../models/qwen3_slim_moe/qwen3_slim_moe_causallm.cpp \
@@ -81,6 +82,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models \
     $(LOCAL_PATH)/../models/gpt_oss \
     $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
+    $(LOCAL_PATH)/../models/qwen2 \
     $(LOCAL_PATH)/../models/qwen3 \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
