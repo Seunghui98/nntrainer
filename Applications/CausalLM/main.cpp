@@ -34,6 +34,7 @@
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
 #include "qwen2_causallm.h"
+#include "qwen2_embedding.h"
 #include "qwen3_cached_slim_moe_causallm.h"
 #include "qwen3_causallm.h"
 #include "qwen3_moe_causallm.h"
@@ -110,6 +111,11 @@ int main(int argc, char *argv[]) {
     "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
                                                   nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen2Model", [](json cfg, json genration_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen2Embedding>(cfg, genration_cfg,
+                                                       nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Qwen2ForCausalLM", [](json cfg, json genration_cfg, json nntr_cfg) {

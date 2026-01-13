@@ -72,13 +72,15 @@ public:
    * @copydoc   Layer::getType()
    */
   const std::string getType() const override {
-    return "EmbeddingNormalizeLayer";
+    return EmbeddingNormalizeLayer::type;
   }
 
   /**
    * @copydoc   Layer::supportBackwarding()
    */
   bool supportBackwarding() const override { return false; }
+
+  static constexpr const char *type = "embedding_normalize";
 };
 
 } // namespace causallm

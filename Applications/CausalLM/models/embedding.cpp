@@ -9,11 +9,15 @@
  * @bug No known bugs except for NYI items
  * @brief This file defines Embedding's basic actions
  */
-
+#include <app_context.h>
 #include <embedding.h>
 
 #include <filesystem>
 #include <iostream>
+
+#include <embedding_normalize_layer.h>
+#include <embedding_pooling_layer.h>
+#include <engine.h>
 
 namespace causallm {
 
@@ -23,10 +27,7 @@ Embedding::Embedding(json &cfg, json &generation_cfg, json &nntr_cfg) :
 }
 
 std::map<std::string, std::string> Embedding::layer_map = {
-  ///@note NYI
-  // {"Pooling", "sentence_transformer_pooling"},
-  // {"Normalization", "sentence_transformer_normalization"},
-  // {"Normalize", "sentence_transformer_normalization"}
+  {"Pooling", "embedding_pooling"}, {"Normalize", "embedding_normalize"}
 };
 
 void Embedding::setupParameters(json &cfg, json &generation_cfg,
@@ -34,7 +35,7 @@ void Embedding::setupParameters(json &cfg, json &generation_cfg,
   Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
 
   std::string modules_config_path = "modules.json";
-  if (nntr_cfg.contains("module_config_path")) {
+  if (nntr_cfg.contains("modules_config_path")) {
     modules_config_path = nntr_cfg["modules_config_path"].get<std::string>();
   } else {
     std::cout << "modules_config_path is not set. Using default: "
@@ -197,19 +198,15 @@ std::vector<float *> Embedding::encode(const WSTR prompt,
   auto _input = tokenizer->Encode(converter.to_bytes(prompt_));
 #else
   std::string prompt_ = system_prompt + prompt + tail_prompt;
-  auto _input = tokenizer->Encode(prompt_);
+  auto _input = tokenizer->Encode(prompt_, true);
 #endif
 
   std::vector<int64_t> init_input;
-  unsigned int _len = _input.size();
-  unsigned int input_len = _len;
-
-  if (_len > MAX_SEQ_LEN) {
-    input_len = MAX_SEQ_LEN;
-  }
+  unsigned int input_len =
+    std::min((unsigned int)_input.size(), (unsigned int)MAX_SEQ_LEN);
 
   // feed only available length
-  for (unsigned int i = 0; i < input_len; ++i)
+  for (unsigned int i = 0; i < input_len; ++i)  
     init_input.push_back(_input[i]);
 
   float *input_sample =
@@ -231,8 +228,8 @@ std::vector<float *> Embedding::encode(const WSTR prompt,
   // start: 0, end: input_len (process all tokens at once)
   // This performs a single forward pass for the entire prompt sequence to get
   // embeddings.
-  auto output = model->incremental_inference(BATCH_SIZE, input, label,
-                                             input_len, 0, input_len, false);
+  std::vector<float *> output = model->incremental_inference(
+    BATCH_SIZE, input, label, input_len, 0, input_len, false);
 
   free(input_sample);
 
@@ -246,6 +243,24 @@ std::string Embedding::getLastComponent(const std::string &type) {
     last_component = type.substr(last_dot_pos + 1);
   }
   return last_component;
+}
+
+void Embedding::registerCustomLayers() {
+  Transformer::registerCustomLayers();
+
+  const auto &ct_engine = nntrainer::Engine::Global();
+  const auto app_context =
+    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+
+  try {
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register factory, reason: " << e.what()
+              << std::endl;
+  }
 }
 
 } // namespace causallm

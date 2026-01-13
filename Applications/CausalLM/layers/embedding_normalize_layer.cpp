@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <embedding_normalize_layer.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>

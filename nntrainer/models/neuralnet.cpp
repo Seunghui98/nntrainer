@@ -1173,9 +1173,19 @@ std::vector<float *> NeuralNetwork::incremental_inference(
       for (unsigned int batch = 0; batch < batch_size; ++batch) {
         if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+          /**
+           * If the output tensor's height (sequence dimension) is 1, it
+           * indicates a reduced/pooled output (e.g., Pooling,
+           * EmbeddingNormalize). In this case, the output for any 'step' is
+           * located at index 0. Otherwise, we access the specific step index
+           * corresponding to the last processed token.
+           */
+          unsigned int effective_step =
+            (out_t.getDim().height() == 1) ? 0 : step;
+
           const _FP16 *out_t_batch_ptr =
             out_t.getData<_FP16>() + batch * out_t.getDim().getFeatureLen() +
-            step * out_t.width();
+            effective_step * out_t.width();
           scopy(out_t.width(), out_t_batch_ptr, 1,
                 last_out_buf_data + batch * out_t.width(), 1);
 
@@ -1183,9 +1193,19 @@ std::vector<float *> NeuralNetwork::incremental_inference(
           throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
         } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+          /**
+           * If the output tensor's height (sequence dimension) is 1, it
+           * indicates a reduced/pooled output (e.g., Pooling,
+           * EmbeddingNormalize). In this case, the output for any 'step' is
+           * located at index 0. Otherwise, we access the specific step index
+           * corresponding to the last processed token.
+           */
+          unsigned int effective_step =
+            (out_t.getDim().height() == 1) ? 0 : step;
+          
           const float *out_t_batch_ptr =
             out_t.getData() + batch * out_t.getDim().getFeatureLen() +
-            step * out_t.width();
+            effective_step * out_t.width();
           // std::memcpy( last_out_buf_data + batch * out_t.width(),
           // out_t_batch_ptr, out_t.width()*sizeof(float));
           scopy(out_t.width(), out_t_batch_ptr, 1,

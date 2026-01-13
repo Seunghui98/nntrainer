@@ -11,6 +11,7 @@
  */
 
 #include <embedding_pooling_layer.h>
+#include <iostream>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -27,8 +28,8 @@ EmbeddingPoolingLayer::EmbeddingPoolingLayer() :
     props::WordEmbeddingDimension(), props::PoolingModeClsToken(false),
     props::PoolingModeMeanTokens(false), props::PoolingModeMaxTokens(false),
     props::PoolingModeMeanSqrtLenTokens(false),
-    props::PoolingModeWeightedMeanTokens(false),
-    props::PoolingModeLastToken(false), props::IncludePrompt(true)) {}
+    props::PoolingModeWeightedMeanTokens(false), props::PoolingModeLastToken(false), 
+    props::IncludePrompt(true)) {}
 
 void EmbeddingPoolingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
@@ -60,10 +61,10 @@ void EmbeddingPoolingLayer::finalize(nntrainer::InitLayerContext &context) {
   bool mode_weighted_mean =
     std::get<props::PoolingModeWeightedMeanTokens>(pooling_props);
 
-  if (mode_cls || mode_mean || mode_max || mode_mean_sqrt ||
+  if (mode_cls || mode_max || mode_mean_sqrt ||
       mode_weighted_mean) {
     throw nntrainer::exception::not_supported(
-      "Only pooling_mode_lasttoken is currently supported in "
+      "Only pooling_mode_lasttoken and pooling_mode_mean_tokens are currently supported in "
       "EmbeddingPoolingLayer");
   }
 }
@@ -84,6 +85,7 @@ void EmbeddingPoolingLayer::forwarding(nntrainer::RunLayerContext &context,
   unsigned int dim = input.width();
 
   bool mode_lasttoken = std::get<props::PoolingModeLastToken>(pooling_props);
+  bool mode_mean = std::get<props::PoolingModeMeanTokens>(pooling_props);
 
   if (mode_lasttoken) {
     for (unsigned int b = 0; b < batch; ++b) {
@@ -95,8 +97,22 @@ void EmbeddingPoolingLayer::forwarding(nntrainer::RunLayerContext &context,
         output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
       dest.copyData(source);
     }
-  } else {
-    output.setZero();
+  } else if (mode_mean) {
+    for (unsigned int b = 0; b < batch; ++b) {
+      nntrainer::Tensor out_slice =
+        output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
+      out_slice.setZero();
+      for (unsigned int pos = 0; pos < seq_len; ++pos) {
+        size_t token_offset = static_cast<size_t>(b) * seq_len * dim + pos * dim;
+        nntrainer::Tensor current_token =
+          input.getSharedDataTensor({1, 1, 1, dim}, token_offset);
+        out_slice.add_i(current_token);
+      }
+      // Use seq_len as denominator for now, but ensure it's handled per batch
+      if (seq_len > 0) {
+        out_slice.divide_i(static_cast<float>(seq_len));
+      }
+    }
   }
 }
 
@@ -111,6 +127,7 @@ void EmbeddingPoolingLayer::incremental_forwarding(
   size_t feature_len = input.getDim().getFeatureLen(); // height * width
 
   bool mode_lasttoken = std::get<props::PoolingModeLastToken>(pooling_props);
+  bool mode_mean = std::get<props::PoolingModeMeanTokens>(pooling_props);
 
   if (mode_lasttoken) {
     for (unsigned int b = 0; b < batch; ++b) {
@@ -124,6 +141,32 @@ void EmbeddingPoolingLayer::incremental_forwarding(
         output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
 
       dest.copyData(source);
+    }
+  } else if (mode_mean) {
+    for (unsigned int b = 0; b < batch; ++b) {
+      nntrainer::Tensor sum_slice =
+        output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
+
+      // If from is 0, we are starting a new pooling session for this batch item
+      if (from == 0) {
+        sum_slice.setZero();
+      } else {
+        // If from > 0, sum_slice contains the mean of [0, from)
+        // We need to restore the sum by multiplying it by 'from'
+        sum_slice.multiply_i(static_cast<float>(from));
+      }
+
+      for (unsigned int pos = from; pos < to; ++pos) {
+        size_t offset = static_cast<size_t>(b) * feature_len + pos * dim;
+        nntrainer::Tensor current_token =
+          input.getSharedDataTensor({1, 1, 1, dim}, offset);
+
+        sum_slice.add_i(current_token);
+      }
+
+      if (to > 0) {
+        sum_slice.divide_i(static_cast<float>(to));
+      }
     }
   } else {
     output.setZero();

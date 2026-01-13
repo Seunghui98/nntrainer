@@ -22,7 +22,9 @@ causallm_layer_dependencies += [
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_reshaped_rms_norm_dep,
-    causallm_qkv_layer_dep, 
+    causallm_qkv_layer_dep,
+    causallm_embedding_pooling_layer_dep,
+    causallm_embedding_normalize_layer_dep,
 ]
 
 subdir('models')
@@ -67,4 +69,15 @@ e = executable('nntr_causallm',
     executable_src,
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+test_pooling_exe = executable('test_pooling',
+    'test_pooling.cpp',
+    include_directories: causallm_inc,
+    dependencies: [
+        nntrainer_dep, 
+        nntrainer_ccapi_dep, 
+        causallm_layer_dependencies, 
+        causallm_dep
+    ],
 )

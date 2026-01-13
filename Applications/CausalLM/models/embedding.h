@@ -24,7 +24,7 @@ namespace causallm {
 /**
  * @brief Embedding Class
  */
-WIN_EXPORT class Embedding : public Transformer {
+WIN_EXPORT class Embedding : virtual public Transformer {
 
 public:
   /**
@@ -103,6 +103,11 @@ private:
    * @return Last component (e.g., "Pooling")
    */
   std::string getLastComponent(const std::string &type);
+
+  /**
+   * @brief register CustomLayers
+   */
+  void registerCustomLayers() override;
 };
 
 } // namespace causallm

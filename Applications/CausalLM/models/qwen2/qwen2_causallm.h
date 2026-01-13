@@ -47,7 +47,7 @@ public:
   static constexpr const char *architectures = "Qwen2CausalLM";
 
   Qwen2CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSAL_LM),
+    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
     CausalLM(cfg, generation_cfg, nntr_cfg),
     Qwen2Transformer(cfg, generation_cfg, nntr_cfg) {}
 
