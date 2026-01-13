@@ -414,6 +414,13 @@ private:
                         unsigned int from, BS::thread_pool<> &pool,
                         nntrainer::Tensor &sink_step);
 
+  void softmax_full(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
+                    unsigned int from, BS::thread_pool<> &pool);
+
+  void softmax_full(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
+                    unsigned int from, BS::thread_pool<> &pool,
+                    nntrainer::Tensor &sink_step);
+
   void compute_vcaches(nntrainer::Tensor &in, nntrainer::Tensor &vcache,
                        nntrainer::Tensor &out, unsigned int from,
                        size_t sequence_len, unsigned int num_heads,
