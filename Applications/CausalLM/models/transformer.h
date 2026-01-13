@@ -173,6 +173,8 @@ protected:
   unsigned int MAX_POSITION_EMBEDDINGS; /**< max_position embeddings */
   bool MEMORY_SWAP;                     /**< memory swap option */
   unsigned int FSU_LOOKAHEAD;
+
+  bool IS_CAUSAL = true;
 };
 /**
  * Loads JSON data from a file with detailed error handling

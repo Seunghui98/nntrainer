@@ -103,6 +103,7 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  IS_CAUSAL = cfg.contains("is_causal") ? cfg["is_causal"].get<bool>() : true;
 
   /** Initialize model parameters */
   NUM_VOCAB = cfg["vocab_size"];
@@ -352,6 +353,7 @@ Transformer::createAttention(const int layer_id, int seq_len, int n_heads,
                                 : UINT_MAX),
     withKey("rope_theta", ROPE_THETA),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("is_causal", IS_CAUSAL ? "true" : "false"),
     withKey("input_layers", {Q, K, V})};
   layers.push_back(createLayer("mha_core", a_params));
 
