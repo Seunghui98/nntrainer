@@ -60,6 +60,7 @@ std::vector<LayerHandle> Qwen2Transformer::createAttention(
     withKey("rope_theta", ROPE_THETA),
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("is_causal", IS_CAUSAL ? "true" : "false"),
     withKey("input_layers", {Q, K, V})};
   layers.push_back(createLayer("mha_core", a_params));
 
