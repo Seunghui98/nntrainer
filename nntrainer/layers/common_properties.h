@@ -1313,6 +1313,18 @@ public:
 };
 
 /**
+ * @brief Input shape property which saves a single tensor shape
+ * (practically, std::array<InputShape> is used)
+ *
+ */
+class InputShape : public GenericShape {
+
+public:
+  static constexpr const char *key = "input_shape"; /**< unique key to access */
+  using prop_tag = dimension_prop_tag;              /**< property type */
+};
+
+/**
  * @brief target shape property which saves a single tensor shape
  * (practically, std::array<TargetShape> is used)
  *

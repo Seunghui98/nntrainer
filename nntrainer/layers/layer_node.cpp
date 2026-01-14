@@ -102,18 +102,6 @@ public:
 };
 
 /**
- * @brief Input shape property which saves a single tensor shape
- * (practically, std::array<InputShape> is used)
- *
- */
-class InputShape : public GenericShape {
-
-public:
-  static constexpr const char *key = "input_shape"; /**< unique key to access */
-  using prop_tag = dimension_prop_tag;              /**< property type */
-};
-
-/**
  * @brief properties for shared from
  *
  */
@@ -810,11 +798,10 @@ void LayerNode::forwarding(bool training) {
   /** add loss only for loss layers */
   if (requireLabel())
     loss->set(*loss + run_context->getLoss());
+
 }
 
-/**
- * @brief     Incremental forward Propagation of a layer
- */
+// Debug Code
 void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
                                        bool training) {
   loss->set(run_context->getRegularizationLoss());
@@ -834,6 +821,7 @@ void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
   /** add loss only for loss layers */
   if (requireLabel())
     loss->set(*loss + run_context->getLoss());
+
 }
 
 /**

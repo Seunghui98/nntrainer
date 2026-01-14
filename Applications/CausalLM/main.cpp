@@ -26,9 +26,11 @@
 #include <vector>
 
 #include "json.hpp"
+#include <filesystem>
 #include <app_context.h>
 #include <factory.h>
 
+#include "deberta_v2.h"
 #include "causal_lm.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
@@ -124,6 +126,10 @@ std::string resolve_architecture(std::string model_type,
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
     }
+
+    if(architecture == "deberta-v2") {
+      return "DebertaV2";
+    }
   }
 
   return architecture;
@@ -197,6 +203,11 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "DebertaV2", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg,
+                                                        nntr_cfg);
+    });
 
   // Validate arguments
   if (argc < 2) {
@@ -216,7 +227,14 @@ int main(int argc, char *argv[]) {
 
   try {
     // Load configuration files
-    json cfg = causallm::LoadJsonFile(model_path + "/config.json");
+    std::filesystem::path config_path = std::filesystem::path(model_path) / "config.json";
+    std::filesystem::path encoder_config_path = std::filesystem::path(model_path) / "encoder_config" / "config.json";
+
+    if (std::filesystem::exists(encoder_config_path)) {
+      config_path = encoder_config_path;
+    }
+
+    json cfg = causallm::LoadJsonFile(config_path.string());
     json generation_cfg =
       causallm::LoadJsonFile(model_path + "/generation_config.json");
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
@@ -235,8 +253,14 @@ int main(int argc, char *argv[]) {
     std::cout << weight_file << std::endl;
 
     // Initialize and run model
-    std::string architecture =
-      cfg["architectures"].get<std::vector<std::string>>()[0];
+    std::string architecture;
+    
+    if(cfg.contains("architectures")) {
+      architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
+    } 
+    if(cfg.contains("model_type")) {
+      architecture = cfg["model_type"].get<std::string>();
+    } 
 
     if (nntr_cfg.contains("model_type")) {
       std::string model_type = nntr_cfg["model_type"].get<std::string>();

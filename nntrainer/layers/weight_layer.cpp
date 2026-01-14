@@ -26,7 +26,7 @@
 namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
-WeightLayer::WeightLayer() : LayerImpl(), weight_props({}, {}, {}) {}
+WeightLayer::WeightLayer() : LayerImpl(), weight_props({}, {}, {}, {}) {}
 
 void WeightLayer::finalize(InitLayerContext &context) {
   auto &weight_regularizer =
@@ -64,6 +64,13 @@ void WeightLayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, weight_props);
   LayerImpl::setProperty(remain_props);
 }
+
+// std::string WeightLayer::getProperty(const std::string &key) {
+//   std::string result = nntrainer::find_in_tuple(weight_props, key);
+//   if (!result.empty())
+//     return result;
+//   return LayerImpl::getProperty(key);
+// }
 
 void WeightLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &weight = context.getWeight(weight_idx);

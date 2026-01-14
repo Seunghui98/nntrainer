@@ -95,7 +95,8 @@ public:
   static constexpr const char *type = "weight";
 
 private:
-  std::tuple<props::TensorDimension, props::TensorDataType, props::WeightName>
+  std::tuple<props::TensorDimension, props::TensorDataType, props::WeightName,
+             nntrainer::props::InputShape>
     weight_props;
   unsigned int weight_idx;
 };

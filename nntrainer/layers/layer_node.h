@@ -47,7 +47,7 @@ class Name;
 class Distribute;
 class Flatten;
 class Loss;
-class InputShape;
+class SharedFrom;
 class Activation;
 class SharedFrom;
 class InputConnection;
@@ -55,6 +55,7 @@ class ClipGradByGlobalNorm;
 class Packed;
 class LossScaleForMixed;
 class ComputeEngine;
+
 } // namespace props
 
 /**

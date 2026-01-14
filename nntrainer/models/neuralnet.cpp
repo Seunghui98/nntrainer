@@ -30,6 +30,7 @@
 #include <future>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -688,12 +689,13 @@ void NeuralNetwork::load(const std::string &file_path,
 
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
+  std::unordered_set<std::string> seen_weights;
+
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
-      weight->getVariableRef().setFileOffset(start_from);
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for
       /// quantized tensors, requiring qparam to be saved
@@ -706,8 +708,21 @@ void NeuralNetwork::load(const std::string &file_path,
         // for tensor with qparam
         size += sizeof(uint16_t);
       }
-      file_offset.emplace_back(std::make_pair(start_from, size));
-      start_from += size;
+
+      if (seen_weights.find(weight->getName()) == seen_weights.end()) {
+        start_from += size;
+        seen_weights.insert(weight->getName());
+        weight->getVariableRef().setFileOffset(start_from - size);
+        file_offset.emplace_back(std::make_pair(start_from - size, size));
+      } else {
+        /// If the weight is already seen, we still need to set the offset for this
+        /// tensor instance to point to the correct location. Ideally, shared
+        /// tensors share the memory so this might be redundant for `read`, but
+        /// ensures consistency. However, since they share memory, `Tensor::read`
+        /// on the first instance populates the memory for all. The critical fix
+        /// is NOT incrementing `start_from` again.
+        // weight->getVariableRef().setFileOffset( ... ); // No-op: shared tensors rely on the underlying memory being filled by the first owner.
+      }
     }
   }
 
