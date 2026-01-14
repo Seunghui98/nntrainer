@@ -32,6 +32,7 @@
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "deberta_v2.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #if !defined(_WIN32)
@@ -168,6 +169,8 @@ std::string resolve_architecture(std::string model_type,
     } else if (architecture == "TimmViT" ||
                architecture == "vit_base_patch16_siglip_224") {
       return "TimmViT";
+    } else if (architecture == "deberta-v2") {
+      return "DebertaV2";
     } else {
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
@@ -269,6 +272,11 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::TimmViTTransformer>(cfg, generation_cfg,
                                                             nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "DebertaV2", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg,
+                                                   nntr_cfg);
+    });
 
   // Validate arguments
   if (argc < 2) {
@@ -317,9 +325,12 @@ int main(int argc, char *argv[]) {
     } else if (cfg.contains("architecture") &&
                cfg["architecture"].is_string()) {
       architecture = cfg["architecture"].get<std::string>();
+    } else if (cfg.contains("model_type") && cfg["model_type"].is_string()) {
+      architecture = cfg["model_type"].get<std::string>();
     } else {
       throw std::invalid_argument(
-        "config.json must contain 'architectures' or 'architecture'.");
+        "config.json must contain 'architectures', 'architecture', or "
+        "'model_type'.");
     }
 
     if (nntr_cfg.contains("model_type")) {
