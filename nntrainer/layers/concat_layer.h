@@ -110,6 +110,8 @@ private:
   TensorDim output_reshape_helper; /** helper dimension to reshape outputs */
   std::tuple<props::ConcatDimension> concat_props;
 
+  unsigned int concat_dimension_;
+
   /**
    * @brief set batch for the internal variables
    *

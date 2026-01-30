@@ -34,6 +34,7 @@
 #include "causal_lm.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
+#include "gliner2_multi_v1.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
 #include "qwen2_causallm.h"
@@ -130,6 +131,10 @@ std::string resolve_architecture(std::string model_type,
     if(architecture == "deberta-v2") {
       return "DebertaV2";
     }
+
+    if(architecture == "gliner2-multi-v1") {
+      return "GLiner2MultiV1";
+    }
   }
 
   return architecture;
@@ -208,6 +213,11 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "GLiner2MultiV1", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::GLiner2MultiV1>(cfg, generation_cfg,
+                                                        nntr_cfg);
+    });
 
   // Validate arguments
   if (argc < 2) {
@@ -257,9 +267,12 @@ int main(int argc, char *argv[]) {
     
     if(cfg.contains("architectures")) {
       architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
-    } 
+    }
     if(cfg.contains("model_type")) {
       architecture = cfg["model_type"].get<std::string>();
+    }
+    if(std::filesystem::exists(encoder_config_path) && std::filesystem::exists(config_path)){
+      architecture = nntr_cfg["architectures"].get<std::string>();
     } 
 
     if (nntr_cfg.contains("model_type")) {

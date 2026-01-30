@@ -29,6 +29,7 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep, 
     causallm_deberta_attention_layer_dep, 
     causallm_shared_fully_connected_layer_dep,
+    causallm_gather_layer_dep,
 ]
 
 subdir('models')

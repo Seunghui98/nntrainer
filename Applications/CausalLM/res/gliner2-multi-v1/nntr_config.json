@@ -1,0 +1,27 @@
+{
+    "model_type": "embedding",
+    "architectures" : "GLiner2MultiV1",
+    "model_tensor_type": "FP32-FP32",
+    "encoder_model_file_name": "nntr_mdeberta_v3_fp32.bin",
+    "model_file_name": "nntr_gliner2_multi_v1_fp32.bin",
+    "fc_layer_dtype": "FP32",
+    "embedding_dtype": "FP32",
+    "lora_rank": 0,
+    "lora_alpha": 0,
+    "lora_target": [],
+    "bad_word_ids": [],
+    "fsu": false,
+    "fsu_lookahead": 2,
+    "num_to_generate": 512,
+    "init_seq_len": 512,
+    "max_seq_len": 512,
+    "batch_size": 1,
+    "tokenizer_file": "/tmp/nntrainer/Applications/CausalLM/res/gliner2-multi-v1/tokenizer.json",
+    "sample_input": "iPhone 15 Pro Max with 256GB storage, A17 Pro chip, priced at $1199.",
+    "labels": [
+        "name::str::Full product name and model",
+        "storage::str::Storage capacity",
+        "processor::str::Chip or processor information", 
+        "price::str::Product price with currency"
+    ]
+}
