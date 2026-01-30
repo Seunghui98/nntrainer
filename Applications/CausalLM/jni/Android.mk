@@ -51,6 +51,7 @@ LOCAL_SRC_FILES := ../main.cpp \
     ../models/transformer.cpp \
     ../models/embedding.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
+    ../models/qwen2/qwen2_embedding.cpp \
     ../models/qwen3/qwen3_causallm.cpp \
     ../models/qwen3/qwen3_embedding.cpp \
     ../models/qwen3_moe/qwen3_moe_causallm.cpp \

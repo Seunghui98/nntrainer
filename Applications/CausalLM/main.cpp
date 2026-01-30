@@ -35,6 +35,7 @@
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
 #include "qwen2_causallm.h"
+#include "qwen2_embedding.h"
 #include "qwen3_cached_slim_moe_causallm.h"
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
@@ -116,6 +117,11 @@ std::string resolve_architecture(std::string model_type,
     } else if (architecture == "Gemma3ForCausalLM" ||
                architecture == "Gemma3TextModel") {
       return "EmbeddingGemma";
+    } else if (architecture == "Qwen2Model") {
+      return "Qwen2Embedding";
+    } else {
+      throw std::invalid_argument(
+        "Unsupported architecture for embedding model: " + architecture);
     }
   }
 
@@ -134,6 +140,11 @@ int main(int argc, char *argv[]) {
     "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
                                                        nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen2Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen2Embedding>(cfg, generation_cfg,
+                                                        nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
