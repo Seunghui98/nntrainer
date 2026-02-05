@@ -55,6 +55,8 @@
 #include <slice_realizer.h>
 #include <util_func.h>
 
+#include <iostream>
+
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
 #endif
@@ -1148,8 +1150,41 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   auto in_dim = getInputDimension();
 
   input_tensors.reserve(input.size());
+
+  std::cout << "[DEBUG] before inference input.size()=" << input.size() << std::endl;
+  for (size_t i = 0; i < input.size(); ++i) {
+    std::cout << "  input[" << i << "]=" << (void*)input[i] << std::endl;
+  }
+
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
+        auto d = in_dim[idx];
+
+    std::cout
+      << "[DEBUG INPUT MAP] idx=" << idx
+      << " batch=" << d.batch()
+      << " channel=" << d.channel()
+      << " height=" << d.height()
+      << " width=" << d.width()
+      << " datalen=" << d.getDataLen()
+      << " ptr=" << static_cast<void*>(input[idx])
+      << std::endl;
+
+    std::cout << "[DEBUG] input.size()=" << input.size() << std::endl;
+
+    auto in_dim = getInputDimension();
+    std::cout << "[DEBUG] in_dim.size()=" << in_dim.size() << std::endl;
+
+    for (size_t i = 0; i < input.size(); ++i) {
+      std::cout << "[DEBUG] input[" << i << "]=" << (void*)input[i] << std::endl;
+    }
+
+    for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
+    std::cout << "[DEBUG INPUT DIM] idx=" << idx
+            << " required=" << in_dim[idx]
+            << std::endl;
+    }
+
     input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
       input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
   }
