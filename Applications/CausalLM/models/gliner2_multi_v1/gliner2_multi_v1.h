@@ -14,7 +14,6 @@
 #ifndef __GLINER2_MULTI_V1_H__
 #define __GLINER2_MULTI_V1_H__
 
-#include "../embedding.h"
 #include <deberta_v2.h>
 #include <transformer.h>
 

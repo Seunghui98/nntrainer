@@ -574,20 +574,18 @@ std::vector<LayerHandle> GLiner2MultiV1::createMlp(const std::string &layer_name
                                                    int hidden_dim,
                                                    std::string input_name) {
   std::vector<LayerHandle> layers;
-
   layers.push_back(createLayer("fully_connected",
-                               {withKey("name", layer_name + "_ffn_fc1"),
-                                withKey("unit", hidden_dim),
-                                withKey("input_layers", input_name),
-                                withKey("disable_bias", "false"),
-                                withKey("packed", "false"),
-                                withKey("weight_initializer", "ones")}));
-
+                                {withKey("name", layer_name + "_ffn_fc1"),
+                                  withKey("unit", hidden_dim),
+                                  withKey("input_layers", input_name),
+                                  withKey("disable_bias", "false"),
+                                  withKey("packed", "false"),
+                                  withKey("weight_initializer", "ones")}));
   layers.push_back(createLayer("activation",
                                {withKey("name", layer_name + "_ffn_act"),
                                 withKey("activation", "relu"),
                                 withKey("input_layers", layer_name + "_ffn_fc1")}));
-
+  
   layers.push_back(createLayer("fully_connected",
                                {withKey("name", layer_name + "_ffn_fc2"),
                                 withKey("unit", dim),
@@ -785,6 +783,72 @@ std::vector<float *> GLiner2MultiV1::encode(const WSTR prompt,
             << prefill_duration.count() << " ms, "
             << ((double)input_len / prefill_duration.count() * 1000)
             << " TPS\n";
+
+  // const int NUM_RUNS = 10;
+  // std::vector<double> run_times_ms;
+  // std::vector<float *> outputs;
+
+  // std::cout << "[Benchmark] Starting " << NUM_RUNS << " runs for prefill..." << std::endl;
+
+  // for (int run = 0; run < NUM_RUNS; ++run) {
+  //   auto start_prefill = std::chrono::high_resolution_clock::now();
+    
+  //   // Run incremental inference for the prefill stage
+  //   // (주의: 이전 루프의 output 결과가 있다면 여기서 덮어씌워집니다. 
+  //   // 메모리 누수가 발생할 수 있으니 NNTrainer 구조에 따라 이전 output 메모리 해제가 필요할 수도 있습니다. 
+  //   // 보통 프레임워크 내부에서 관리해주면 놔둬도 됩니다.)
+  //   outputs = model->incremental_inference(BATCH_SIZE, inputs, label_dummy, input_len, 0, input_len, true, &custom_to_map);
+
+    
+  //   auto finish_prefill = std::chrono::high_resolution_clock::now();
+  //   double prefill_duration = std::chrono::duration<double, std::milli>(finish_prefill - start_prefill).count();
+    
+  //   run_times_ms.push_back(prefill_duration);
+    
+  //   // 각 런의 진행 상황 출력 (선택 사항)
+  //   // std::cout << "Run " << run + 1 << "/" << NUM_RUNS << " : " << prefill_duration << " ms\n";
+  // }
+
+  // // ==========================================
+  // // 통계 계산 (min, max, avg, std)
+  // // ==========================================
+  // double min_ms = *std::min_element(run_times_ms.begin(), run_times_ms.end());
+  // double max_ms = *std::max_element(run_times_ms.begin(), run_times_ms.end());
+  
+  // double sum_ms = std::accumulate(run_times_ms.begin(), run_times_ms.end(), 0.0);
+  // double avg_ms = sum_ms / NUM_RUNS;
+
+  // double variance = 0.0;
+  // for (double t : run_times_ms) {
+  //     variance += (t - avg_ms) * (t - avg_ms);
+  // }
+  // variance /= NUM_RUNS;
+  // double std_dev_ms = std::sqrt(variance);
+
+  // double avg_tps = (avg_ms > 0) ? ((double)input_len / avg_ms * 1000.0) : 0.0;
+  // double max_tps = (min_ms > 0) ? ((double)input_len / min_ms * 1000.0) : 0.0; // 최소 시간이면 최대 TPS!
+  // double min_tps = (max_ms > 0) ? ((double)input_len / max_ms * 1000.0) : 0.0; // 최대 시간이면 최소 TPS!
+
+  // // TPS의 표준편차는 시간의 역수이므로 직접 계산하는 것이 맞음
+  // std::vector<double> run_tps;
+  // for (double t : run_times_ms) {
+  //     run_tps.push_back((t > 0) ? ((double)input_len / t * 1000.0) : 0.0);
+  // }
+  // double sum_tps = std::accumulate(run_tps.begin(), run_tps.end(), 0.0);
+  // double true_avg_tps = sum_tps / NUM_RUNS;
+  // double variance_tps = 0.0;
+  // for (double tps : run_tps) {
+  //     variance_tps += (tps - true_avg_tps) * (tps - true_avg_tps);
+  // }
+  // double std_dev_tps = std::sqrt(variance_tps / NUM_RUNS);
+  // std::cout << "========================================\n";
+  // std::cout << "Prefill Benchmark Results (" << NUM_RUNS << " runs, " << input_len << " tokens)\n";
+  // std::cout << " - Avg: " << avg_ms << " ms (" << true_avg_tps << " TPS)\n";
+  // std::cout << " - Min: " << min_ms << " ms (" << max_tps << " TPS)\n";
+  // std::cout << " - Max: " << max_ms << " ms (" << min_tps << " TPS)\n";
+  // std::cout << " - Std: " << std_dev_ms << " ms (" << std_dev_tps << " TPS)\n";
+  // std::cout << "========================================\n";
+
   return outputs;
 }
 

@@ -948,11 +948,12 @@ void DebertaAttentionLayer::one_batch_incremental_forwarding(
                          query_step.getTensorType());
 
   const unsigned int gqa_size = num_heads_Q / num_heads_KV;
+  
   // auto start = std::chrono::high_resolution_clock::now();
   compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
                   gqa_size, head_dim, pool);
   // auto finish = std::chrono::high_resolution_clock::now();
-  // auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(
   //   finish - start);
   // std::cout << "compute_kcaches : " << time.count() << "ms\n";
 
@@ -990,32 +991,32 @@ void DebertaAttentionLayer::one_batch_incremental_forwarding(
   }
 #endif
   // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
   //   finish - start);
-  // std::cout << "add_relative_attn_score(pre) : " << time.count() << "ms\n";
+  // std::cout << "add_relative_attn_score(pre) : " << time.count() << "ns\n";
   
   // start = std::chrono::high_resolution_clock::now();  
   add_relative_attn_score(context, out_, query_step, b_cached_key, from, to); 
   // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
   //   finish - start);
-  // std::cout << "add_relative_attn_score : " << time.count() << "ms\n";
+  // std::cout << "add_relative_attn_score : " << time.count() << "ns\n";
   
   // start = std::chrono::high_resolution_clock::now();  
   softmax_triangle(out_, to - from, num_heads_Q, from, pool);
   // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
   //   finish - start);
-  // std::cout << "softmax_triangle : " << time.count() << "ms\n";
+  // std::cout << "softmax_triangle : " << time.count() << "ns\n";
 
   // start = std::chrono::high_resolution_clock::now();  
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 from, num_heads_KV, gqa_size, head_dim, to,
                                 pool);
   // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
   //   finish - start);
-  // std::cout << "compute_fp16vcache_transposed : " << time.count() << "ms\n";
+  // std::cout << "compute_fp16vcache_transposed : " << time.count() << "ns\n";
 }
 
 void DebertaAttentionLayer::setBatch(nntrainer::RunLayerContext &context,

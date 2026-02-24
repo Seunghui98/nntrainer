@@ -14,7 +14,7 @@
 #ifndef __DEBERTA_V2_H__
 #define __DEBERTA_V2_H__
 
-#include "../embedding.h"
+#include <sentence_transformer.h>
 #include <transformer.h>
 
 namespace causallm {
@@ -22,14 +22,14 @@ namespace causallm {
 /**
  * @brief DebertaV2 class
  */
-class DebertaV2 : public Embedding {
+class DebertaV2 : public SentenceTransformer {
 
 public:
   static constexpr const char *architectures = "DebertaV2";
 
   DebertaV2(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING),
-    Embedding(cfg, generation_cfg, nntr_cfg) {
+    SentenceTransformer(cfg, generation_cfg, nntr_cfg) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 

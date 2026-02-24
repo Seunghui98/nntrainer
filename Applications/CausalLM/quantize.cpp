@@ -441,7 +441,6 @@ int main(int argc, char *argv[]) {
     if (std::filesystem::exists(encoder_config_path)) {
       config_path = encoder_config_path;
     }
-  
     json cfg = causallm::LoadJsonFile(config_path.string());
     json generation_cfg =
       causallm::LoadJsonFile(model_path + "/generation_config.json");

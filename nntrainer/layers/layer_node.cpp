@@ -807,9 +807,19 @@ void LayerNode::forwarding(bool training) {
 void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
                                        bool training) {
   loss->set(run_context->getRegularizationLoss());
+
+  auto start_prefill = std::chrono::high_resolution_clock::now();
   PROFILE_TIME_START(forward_event_key);
   // std::cerr << getType() << "\n";
   layer->incremental_forwarding(*run_context, from, to, training);
+
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
+
+  std::cout << "layer_name: " << getName() << ", \t"
+            << "time: " << prefill_duration.count() << " ms \n";
+    
   PROFILE_TIME_END(forward_event_key);
   TRACE_MEMORY() << getName() + ": F";
   TRACE_TIME() << getName() + ": F";
@@ -824,6 +834,97 @@ void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
   if (requireLabel())
     loss->set(*loss + run_context->getLoss());
 }
+
+// void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
+//                                        bool training) {
+//   loss->set(run_context->getRegularizationLoss());
+
+//   static int step = 0;
+//   const int my_step = step++;
+
+//   std::cerr << "\n[INC ENTER " << my_step << "] "
+//             << getName() << " (" << getType() << ") "
+//             << "from=" << from << " to=" << to
+//             << " n_in=" << run_context->getNumInputs()
+//             << " n_out=" << run_context->getNumOutputs()
+//             << " n_w=" << run_context->getNumWeights()
+//             << std::endl;
+
+//   // 입력/출력 dim 및 실제 데이터 10개 출력
+//   for (unsigned i = 0; i < run_context->getNumInputs(); ++i) {
+//     const auto &input = run_context->getInput(i);
+//     std::cerr << "  IN[" << i << "] " << input.getDim() << " data: [";
+//     const float *data = input.getData();
+//     size_t n = std::min((size_t)20, input.size());
+//     for (size_t j = 0; j < n; ++j) {
+//       std::cerr << data[j];
+//       if (j < n - 1) std::cerr << ", ";
+//     }
+//     std::cerr << "]" << std::endl;
+//   }
+//   for (unsigned i = 0; i < run_context->getNumOutputs(); ++i) {
+//     const auto &output = run_context->getOutput(i);
+//     std::cerr << "  OUT[" << i << "] " << output.getDim() << " data: [";
+//     const float *data = output.getData();
+//     size_t n = std::min((size_t)20, output.size());
+//     for (size_t j = 0; j < n; ++j) {
+//       std::cerr << data[j];
+//       if (j < n - 1) std::cerr << ", ";
+//     }
+//     std::cerr << "]" << std::endl;
+//   }
+//   for (unsigned i = 0; i < run_context->getNumWeights(); ++i) {
+//     const auto &weight = run_context->getWeight(i);
+//     std::cerr << "  WEIGHT[" << i << "] " << weight.getDim() << " data: [";
+//     const float *data = weight.getData();
+//     size_t n = std::min((size_t)20, weight.size());
+//     for (size_t j = 0; j < n; ++j) {
+//       std::cerr << data[j];
+//       if (j < n - 1) std::cerr << ", ";
+//     }
+//     std::cerr << "]" << std::endl;
+//   }
+
+//   try {
+//     layer->incremental_forwarding(*run_context, from, to, training);
+//   } catch (const std::exception &e) {
+//     std::cerr << "\n[INC EXCEPTION " << my_step << "] "
+//               << getName() << " (" << getType() << ") "
+//               << e.what() << std::endl;
+//     throw;
+//   } catch (...) {
+//     std::cerr << "\n[INC EXCEPTION " << my_step << "] "
+//               << getName() << " (" << getType() << ") unknown" << std::endl;
+//     throw;
+//   }
+
+//   // 레이어 실행 후 output 데이터 출력
+//   std::cerr << "  [AFTER EXECUTION] OUTPUTS:" << std::endl;
+//   for (unsigned i = 0; i < run_context->getNumOutputs(); ++i) {
+//     const auto &output = run_context->getOutput(i);
+//     std::cerr << "    OUT[" << i << "] " << output.getDim() << " data: [";
+//     const float *data = output.getData();
+//     size_t n = std::min((size_t)800, output.size());
+//     for (size_t j = 0; j < n; ++j) {
+//       std::cerr << data[j];
+//       if (j < n - 1) std::cerr << ", ";
+//     }
+//     std::cerr << "]" << std::endl;
+//   }
+
+//   std::cerr << "[INC EXIT " << my_step << "] " << getName() << std::endl;
+
+// #ifdef DEBUG
+//   if (!run_context->validate(getNumInputConnections() == 0, !requireLabel()))
+//     throw std::runtime_error("Running forwarding() layer " + getName() +
+//                              " invalidated the context.");
+// #endif
+
+//   /** add loss only for loss layers */
+//   if (requireLabel())
+//     loss->set(*loss + run_context->getLoss());
+
+// }
 
 /**
  * @brief     calc the derivative to be passed to the previous layer

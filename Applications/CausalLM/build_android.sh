@@ -10,6 +10,8 @@ if [ -z "$ANDROID_NDK" ]; then
     exit 1
 fi
 
+export PATH=$ANDROID_NDK:$PATH
+
 # Set NNTRAINER_ROOT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -19,12 +21,12 @@ echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK: $ANDROID_NDK"
 
 # Step 1: Build nntrainer for Android if not already built
-echo "Building nntrainer for Android..."
-cd "$NNTRAINER_ROOT"
-if [ -d "$NNTRAINER_ROOT/builddir" ]; then
-    rm -rf builddir
-fi
-./tools/package_android.sh -Dmmap-read=false -Db_sanitize=address -Denable-fp16=true
+ echo "Building nntrainer for Android..."
+    cd "$NNTRAINER_ROOT"
+    if [ -d "$NNTRAINER_ROOT/builddir" ]; then
+        rm -rf builddir
+    fi
+./tools/package_android.sh -Dmmap-read=false -Db_sanitize=address
 # if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
 #     echo "Building nntrainer for Android..."
 #     cd "$NNTRAINER_ROOT"

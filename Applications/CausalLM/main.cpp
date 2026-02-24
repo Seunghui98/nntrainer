@@ -46,6 +46,7 @@
 #include "qwen3_slim_moe_causallm.h"
 #include <models/gemma3/function.h>
 #include <sys/resource.h>
+#include <profiler.h>
 
 #include <atomic>
 #include <chrono>
@@ -139,6 +140,11 @@ std::string resolve_architecture(std::string model_type,
 int main(int argc, char *argv[]) {
 
   auto start_time = std::chrono::high_resolution_clock::now();
+
+  #ifdef PROFILE
+    auto listener = std::make_shared<nntrainer::profile::GenericProfileListener>();
+    PROFILE_BEGIN(listener);
+#endif
 
   /** Register all runnable causallm models to factory */
   causallm::Factory::Instance().registerModel(
@@ -326,5 +332,9 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
+      
+#ifdef PROFILE
+    PROFILE_END(listener);
+#endif
   return EXIT_SUCCESS;
 }
