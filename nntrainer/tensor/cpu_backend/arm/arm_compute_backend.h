@@ -1351,8 +1351,8 @@ void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 /**
  * @brief repack q40 to q40x8
  *
- * @param W input q40
- * @param repacked_W output q40x8
+ * @param W output repacked q40x
+ * @param repacked_W input q40
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
@@ -1363,8 +1363,8 @@ void repack_q4_0(void *W, void *repacked_W, size_t data_size,
 /**
  * @brief repack q4K to q4Kx8
  *
- * @param W input q4K
- * @param repacked_W output q4Kx8
+ * @param W output repacked q4Kx8
+ * @param repacked_W input q4K
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns

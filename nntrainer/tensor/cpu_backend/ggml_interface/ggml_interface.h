@@ -310,8 +310,8 @@ void __ggml_dequantize_row_q8_K(const void *x, T *y, int64_t k);
 /**
  * @brief repack q40 to q40x8
  *
- * @param W input q40
- * @param repacked_W output q40x8
+ * @param W output repacked q40x
+ * @param repacked_W input q40
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
@@ -321,8 +321,8 @@ void __ggml_repack_q4_0_to_q4_0_4(void *W, void *repacked_W, size_t data_size,
 /**
  * @brief repack q40 to q40x8
  *
- * @param W input q40
- * @param repacked_W output q40x8
+ * @param W output repacked q40x
+ * @param repacked_W input q40
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
@@ -332,8 +332,8 @@ void __ggml_repack_q4_0_to_q4_0_8(void *W, void *repacked_W, size_t data_size,
 /**
  * @brief repack q4K to q4Kx8
  *
- * @param W input q4K
- * @param repacked_W output q4Kx8
+ * @param W output repacked q4Kx8
+ * @param repacked_W input q4K
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
