@@ -273,6 +273,55 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_quantization) {
   EXPECT_NEAR(max_differ, 0., eps * K * N);
 }
 
+/**
+ * @brief Test quantize -> repack -> unpack -> dequantize pipeline.
+ *
+ * Verifies that unpack_q4_0 correctly reverses the repack_q4_0 operation
+ * so that the subsequent dequantize_row_q4_0 produces the same result as
+ * direct quantize -> dequantize (without repack)
+ *
+ * NOTE: repack_q4_0 produces q4_0x4 on ARM and q4_0x8 on x86 backends.
+ *       unpack_q4_0 is the matching inverse for each backend.
+ */
+TEST(nntrainer_cpu_backend_standalone, q4_0_repack_unpack_dequantize) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 768;
+  const unsigned int N = 512;
+
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  // --- Path A: quantize -> dequantize (reference) ---
+  int64_t q4_0_block_size = QK4_0;
+  int64_t q4_0_type_size = sizeof(block_q4_0_testonly);
+  size_t data_size =
+    (static_cast<size_t>(K) * N / q4_0_block_size) * q4_0_type_size;
+
+  std::vector<char> q4_weight(data_size);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+
+  std::vector<float> ref_dequantized(N * K);
+  nntrainer::dequantize_row_q4_0(q4_weight.data(), ref_dequantized.data(),
+                                 static_cast<int64_t>(K) * N);
+
+  // --- Path B: quantize -> repack -> unpack -> dequantize ---
+  std::vector<char> repacked(data_size);
+  nntrainer::repack_q4_0(repacked.data(), q4_weight.data(), data_size, N, K);
+
+  std::vector<char> unpacked(data_size);
+  nntrainer::unpack_q4_0(repacked.data(), unpacked.data(), data_size, N, K);
+
+  std::vector<float> roundtrip_dequantized(N * K);
+  nntrainer::dequantize_row_q4_0(unpacked.data(), roundtrip_dequantized.data(),
+                                 static_cast<int64_t>(K) * N);
+
+  // --- Verify: Path A == Path B (bit-exact after XOR round-trip) ---
+  for (unsigned int i = 0; i < N * K; ++i) {
+    EXPECT_EQ(ref_dequantized[i], roundtrip_dequantized[i])
+      << "Mismatch at index " << i;
+  }
+}
+
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
