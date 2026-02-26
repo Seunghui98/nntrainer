@@ -1096,26 +1096,26 @@ void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 /**
  * @brief repack q40 to q40x8
  *
- * @param W output repacked q40x8
- * @param repacked_W input q40
+ * @param dst output repacked q40x8
+ * @param src input q40
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
  */
-void repack_q4_0(void *W, void *repacked_W, size_t data_size,
-                 const unsigned int M, const unsigned int N);
+void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
+                 const unsigned int N);
 
 /**
  * @brief repack q4K to q4Kx8
  *
- * @param W output repacked q4Kx8
- * @param repacked_W input q4K
+ * @param dst output repacked q4Kx8
+ * @param src input q4K
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
  */
-void repack_q4_K(void *W, void *repacked_W, size_t data_size,
-                 const unsigned int M, const unsigned int N);
+void repack_q4_K(void *dst, void *src, size_t data_size, const unsigned int M,
+                 const unsigned int N);
 
 /**
  * @brief unpack q40x8 to q40 - invers method: repack_q4_0

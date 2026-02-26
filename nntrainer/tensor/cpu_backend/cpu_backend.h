@@ -1244,25 +1244,25 @@ extern void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 /**
  * @brief repack q40 to q40x8
  *
- * @param W output repacked q40x8
- * @param repacked_W input q40
+ * @param dst output repacked data
+ * @param src input quantized data
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
  */
-extern void repack_q4_0(void *W, void *repacked_W, size_t data_size,
+extern void repack_q4_0(void *dst, void *src, size_t data_size,
                         const unsigned int M, const unsigned int N);
 
 /**
  * @brief repack q4K to q4Kx8
  *
- * @param W output repacked q4Kx8
- * @param repacked_W input q4K
+ * @param dst output repacked data
+ * @param src input quantized data
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
  */
-extern void repack_q4_K(void *W, void *repacked_W, size_t data_size,
+extern void repack_q4_K(void *dst, void *src, size_t data_size,
                         const unsigned int M, const unsigned int N);
 
 
