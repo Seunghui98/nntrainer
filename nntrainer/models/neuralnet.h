@@ -269,11 +269,15 @@ public:
 
   /**
    * @copydoc Model::save(const std::string &file_path, ml::train::ModelFormat
-   * format);
+   * format, TensorDim::DataType dtype, const std::map<std::string,
+   * TensorDim::DataType> &layer_dtype_map);
    */
-  void save(const std::string &file_path,
-            ml::train::ModelFormat format =
-              ml::train::ModelFormat::MODEL_FORMAT_BIN) override;
+  void
+  save(const std::string &file_path,
+       ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN,
+       TensorDim::DataType dtype = TensorDim::DataType::NONE,
+       const std::map<std::string, TensorDim::DataType> &layer_dtype_map = {})
+    override;
 
   /**
    * @copydoc Model::load(const std::string &file_path, ml::train::ModelFormat
