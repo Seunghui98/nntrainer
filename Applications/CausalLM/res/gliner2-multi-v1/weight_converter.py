@@ -65,19 +65,53 @@ def save_gliner2_multi_v1_for_nntrainer(params, n_layers, dtype, file):
         save_dense(f"{layer_prefix}output.dense")
         save_layernorm(f"{layer_prefix}output.LayerNorm")
     
+    for module in ["classifier"]:
+        for i in [0, 2]:
+            save_projection(f"{module}.{i}", "")
+            save_weight(params[f"{module}.{i}.bias"])
+    
     # Process classifier and count_pred
     for module in ["count_pred"]:
         for i in [0, 2]:
             save_projection(f"{module}.{i}", "")
             save_weight(params[f"{module}.{i}.bias"])
+    
+    save_weight(params["count_embed.pos_embedding.weight"])
 
     # Process span rep layers
     for module in ["project_end", "project_start", "out_project"]:
         for i in [0, 3]:
             save_projection(f"span_rep.span_rep_layer.{module}.{i}", "")
             save_weight(params[f"span_rep.span_rep_layer.{module}.{i}.bias"])
+    
+    # --- GRU Weight Processing ---
+    # PyTorch(R, Z, N) -> NNTrainer(Z, R, N)
+    
+    # 1. Weight IH (Input-Hidden)
+    w_ih = params["count_embed.gru.weight_ih_l0"]
+    r, z, n = w_ih.chunk(3, dim=0)         # (Reset, Update, New) for pytorch weight order
+    w_ih_new = torch.cat((z, r, n), dim=0) # -> (Z, R, N) for nntrianer gru
+    save_weight(w_ih_new.permute(1, 0))  
 
-    for module in ["classifier"]:
+    # 2. Weight HH (Hidden-Hidden)
+    w_hh = params["count_embed.gru.weight_hh_l0"]
+    r, z, n = w_hh.chunk(3, dim=0)         # (Reset, Update, New) for pytorch weight order
+    w_hh_new = torch.cat((z, r, n), dim=0) # -> (Z, R, N) for nntrianer gru
+    save_weight(w_hh_new.permute(1, 0)) 
+
+    # 3. Bias IH
+    b_ih = params["count_embed.gru.bias_ih_l0"]
+    r, z, n = b_ih.chunk(3, dim=0)         # (Reset, Update, New) for pytorch weight order
+    b_ih_new = torch.cat((z, r, n), dim=0) # -> (Z, R, N) for nntrianer gru
+    save_weight(b_ih_new)
+
+    # 4. Bias HH
+    b_hh = params["count_embed.gru.bias_hh_l0"]
+    r, z, n = b_hh.chunk(3, dim=0)         # (Reset, Update, New) for pytorch weight order
+    b_hh_new = torch.cat((z, r, n), dim=0) # -> (Z, R, N) for nntrianer gru
+    save_weight(b_hh_new) 
+    
+    for module in ["count_embed.projector"]:
         for i in [0, 2]:
             save_projection(f"{module}.{i}", "")
             save_weight(params[f"{module}.{i}.bias"])

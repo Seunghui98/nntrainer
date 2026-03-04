@@ -7,6 +7,8 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
+ * @note   Please refer to the following code :
+ *  https://github.com/fastino-ai/GLiNER2/blob/72241d6/gliner2/inference/engine.py
  */
 
 #ifndef __GLINER2_MULTI_V1_H__
@@ -15,7 +17,6 @@
 #include "../embedding.h"
 #include <deberta_v2.h>
 #include <transformer.h>
-#include <deberta_v2.h>
 
 namespace causallm {
 
@@ -55,7 +56,10 @@ protected:
   std::vector<LayerHandle> createMlp(const std::string &layer_name, int dim,
                                      int hidden_dim,
                                      std::string input_name);
-
+  
+  void run(const WSTR prompt, bool do_sample = false,
+           const WSTR system_prompt = "", const WSTR tail_prompt = "") override;
+  
   /**
    * @brief Encode the prompt and return the embedding
    * @param prompt User prompt
@@ -73,7 +77,7 @@ protected:
    * @return Pair of start and end indices vectors
    */
   std::pair<std::vector<float>, std::vector<float>>
-  generate_spans(int seq_len, int max_width = 12);
+  generate_spans(int seq_len, int max_width, int offset = 0);
 
   /**
    * @brief register CustomLayers
@@ -88,6 +92,7 @@ private:
   bool RELATIVE_ATTENTION;
   int POSITION_BUCKETS;
   int MAX_WIDTH = 12; // default value
+  std::vector<std::string> labels;
 };
 
 } // namespace causallm

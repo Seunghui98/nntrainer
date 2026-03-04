@@ -259,16 +259,25 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   TensorDim hidden_step_dim = hidden_dim;
 
   input_step_dim.batch(1);
-  if (input_dim.height() > 1)
-    input_step_dim.height(to - from);
+  // Clamp the slice size to the actual tensor height to prevent out-of-bounds memory access
+  // in cases where the dynamically overridden 'to' exceeds the physical tensor dimension.
+  if (input_dim.height() > 1) {
+    unsigned int step_h = to - from;
+    if (step_h > input_dim.height()) step_h = input_dim.height(); 
+    input_step_dim.height(step_h);
+  }
+
   hidden_step_dim.batch(1);
-  if (hidden_dim.height() > 1)
-    hidden_step_dim.height(to - from);
+  if (hidden_dim.height() > 1) {
+    unsigned int step_h = to - from;
+    if (step_h > hidden_dim.height()) step_h = hidden_dim.height();
+    hidden_step_dim.height(step_h);
+  }
 
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim, b * hidden_dim.getFeatureLen(), true);
+      input_step_dim, b * input_dim.getFeatureLen(), true);
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
