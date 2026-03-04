@@ -171,7 +171,7 @@ public:
   bool supportBackwarding() const override { return false; }
 
 private:
-  void softmax_last_dim(nntrainer::Tensor &tensor);
+  void softmax_last_dim(nntrainer::Tensor &tensor, unsigned int input_len);
 
   int make_log_bucket_position(int relative_pos, int bucket_size,
                                int max_position);
