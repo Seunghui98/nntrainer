@@ -123,17 +123,13 @@ std::string resolve_architecture(std::string model_type,
       return "EmbeddingGemma";
     } else if (architecture == "Qwen2Model") {
       return "Qwen2Embedding";
+    } else if (architecture == "DebertaV2") {
+      return "DebertaV2";
+    } else if (architecture == "GLiner2MultiV1") {
+      return "GLiner2MultiV1";
     } else {
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
-    }
-
-    if(architecture == "deberta-v2") {
-      return "DebertaV2";
-    }
-
-    if(architecture == "gliner2-multi-v1") {
-      return "GLiner2MultiV1";
     }
   }
 

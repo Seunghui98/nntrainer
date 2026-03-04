@@ -336,10 +336,7 @@ void DebertaAttentionLayer::incremental_forwarding(nntrainer::RunLayerContext &c
               if (idx < 0) idx = 0;
               if (idx >= (int)rel_len) idx = (int)rel_len - 1;
 
-              float raw = rp[k * stride_rp + idx];
-              float add = raw * scale_factor;
-
-              sc[q * stride_sc + k] += add;
+              sc[q * stride_sc + k] += rp[k * stride_rp + idx] * scale_factor;
             }
           }
         }

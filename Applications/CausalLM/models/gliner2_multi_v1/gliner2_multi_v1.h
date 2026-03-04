@@ -76,8 +76,7 @@ protected:
    * @param max_width Maximum span width
    * @return Pair of start and end indices vectors
    */
-  std::pair<std::vector<float>, std::vector<float>>
-  generate_spans(int seq_len, int max_width, int offset = 0);
+  std::pair<std::vector<float>, std::vector<float>> generate_spans(int seq_len, int max_width, int offset = 0);
 
   /**
    * @brief register CustomLayers

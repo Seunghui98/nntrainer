@@ -262,9 +262,6 @@ void CustomGRULayer::forwarding(RunLayerContext &context, bool training) {
       Tensor ztrt = zrg_t.getSharedDataTensor({unit * 2}, 0);
       Tensor gt = zrg_t.getSharedDataTensor({unit}, unit * 2);
 
-      // =====================================================================
-      // [Core bug fix] Multiply entire weight instead of slicing to create 1D vector!
-      // =====================================================================
       Tensor hh_proj = prev_hs.dot(weight_hh); // Shape: [1, 3 * unit]
       
       // Slicing 1D vector is 100% safe without memory corruption.
@@ -308,7 +305,6 @@ void CustomGRULayer::forwarding(RunLayerContext &context, bool training) {
         temp.multiply_i(rt);
         gt.add_i(temp);
       } else {
-        // Maintain existing code behavior (reset_after=true in PyTorch environment, so this is not used)
         rt.multiply(prev_hs, temp);
         
         // Note: Ideally, w_g should be sliced here too, but reset_after=false is not PyTorch style,
