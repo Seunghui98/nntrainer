@@ -336,18 +336,34 @@ void DebertaAttentionLayer::incremental_forwarding(nntrainer::RunLayerContext &c
               if (idx < 0) idx = 0;
               if (idx >= (int)rel_len) idx = (int)rel_len - 1;
 
-              sc[q * stride_sc + k] += rp[k * stride_rp + idx] * scale_factor;
+              float raw = rp[k * stride_rp + idx];
+              float add = raw * scale_factor;
+
+              sc[q * stride_sc + k] += add;
             }
           }
         }
       }
     } // relative_attention
 
-    // softmax per head
-    for (unsigned int h = 0; h < num_heads; ++h) {
-      softmax_last_dim(score_h[h], to);
+    // softmax per head (no masking)
+    // Apply softmax only on valid keys [0, valid_k) for each query row.
+    {
+      const unsigned int valid_k = std::min<unsigned int>(to, S_k);
+
+      for (unsigned int h = 0; h < num_heads; ++h) {
+        float *sc = score_h[h].getData(); // shape: [S_q, S_k]
+
+        for (unsigned int q = 0; q < S_q; ++q) {
+          const size_t row_start = static_cast<size_t>(q) * S_k;
+          const size_t row_end   = row_start + valid_k;
+
+          // softmax only within [row_start, row_end)
+          nntrainer::softmax_row_inplace(sc, row_start, row_end, /*num_head=*/1);
+        }
+      }
     }
-    
+
     // context per head
     for (unsigned int h = 0; h < num_heads; ++h) {
       ctx_h[h] = score_h[h].dot(vh[h], false, false);
@@ -363,25 +379,6 @@ void DebertaAttentionLayer::incremental_forwarding(nntrainer::RunLayerContext &c
     }
 
     out_step.copyData(merged);
-  }
-}
-
-void DebertaAttentionLayer::softmax_last_dim(nntrainer::Tensor &tensor, unsigned int input_len) {
-  float *data = tensor.getData();
-  unsigned int batch = tensor.batch();
-  unsigned int channel = tensor.channel();
-  unsigned int height = tensor.height();
-  unsigned int width = tensor.width();
-  unsigned int stride_b = channel * height;
-  unsigned int total_rows = batch * stride_b;
-
-  float minus_inf = -std::numeric_limits<float>::infinity();
-  for (unsigned int i = 0; i < total_rows; ++i) {
-    float *row_ptr = data + (i * width);
-    for (unsigned int j = input_len; j < width; ++j) {
-      row_ptr[j] = minus_inf;
-    }
-    nntrainer::softmax(width, row_ptr, row_ptr);
   }
 }
 
