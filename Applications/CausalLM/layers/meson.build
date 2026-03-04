@@ -14,6 +14,7 @@ causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_
 causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_attention_layer.cpp']
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
 causallm_gather_src_abs = [meson.current_source_dir() / 'gather_layer.cpp']
+causallm_custom_gru_src_abs = [meson.current_source_dir() / 'custom_gru_layer.cpp']
 
 openmp_dep = dependency('openmp')
 causallm_rms_norm = shared_library(
@@ -187,5 +188,19 @@ causallm_gather_layer = shared_library(
 
 causallm_gather_layer_dep = declare_dependency(
     link_with: causallm_gather_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_custom_gru_layer = shared_library(
+    'custom_gru_layer',
+    causallm_custom_gru_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_custom_gru_layer_dep = declare_dependency(
+    link_with: causallm_custom_gru_layer,
     include_directories: causallm_layer_inc
 )
