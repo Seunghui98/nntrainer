@@ -679,7 +679,9 @@ static nntrainer::Tensor buildInput(unsigned int width,
   nntrainer::Tensor input(dim);
   srand(seed);
   for (unsigned int w = 0; w < width; ++w)
-    input.setValue(0, 0, 0, w, static_cast<float>(rand()) / RAND_MAX - 0.5f);
+    input.setValue(0, 0, 0, w,
+                   static_cast<float>(rand()) / static_cast<float>(RAND_MAX) -
+                     0.5f);
   return input;
 }
 
