@@ -23,7 +23,6 @@
 #include <app_context.h>
 #include <weight_layer.h>
 #include <engine.h>
-#include <fc_layer.h>
 #include <layer_node.h>
 
 #include <sstream>
