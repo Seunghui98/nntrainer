@@ -310,21 +310,21 @@ LabelParseResult parse_labels_from_header(const std::vector<int> &input_tokens_l
  * nntrainer's Model::getLayer takes const char* and returns a Layer handle.
  * We cast it to LayerNode to access tensors.
  */
-float *get_layer_output_ptr(ml::train::Model *model, const std::string &layer_name) {
-  if (!model) return nullptr;
+// float *get_layer_output_ptr(ml::train::Model *model, const std::string &layer_name) {
+//   if (!model) return nullptr;
 
-  try {
-    std::shared_ptr<ml::train::Layer> layer_ptr;
-    model->getLayer(layer_name.c_str(), &layer_ptr);
-    auto node = std::dynamic_pointer_cast<nntrainer::LayerNode>(layer_ptr);
-    if (!node) return nullptr;
-    return node->getOutput(0).getData();
-  } catch (const std::exception &e) {
-    std::cerr << "error while getting layout output! details: "
-              << e.what() << std::endl;
-    return nullptr;
-  }
-}
+//   try {
+//     std::shared_ptr<ml::train::Layer> layer_ptr;
+//     model->getLayer(layer_name.c_str(), &layer_ptr);
+//     auto node = std::dynamic_pointer_cast<nntrainer::LayerNode>(layer_ptr);
+//     if (!node) return nullptr;
+//     return node->getOutput(0).getData();
+//   } catch (const std::exception &e) {
+//     std::cerr << "error while getting layout output! details: "
+//               << e.what() << std::endl;
+//     return nullptr;
+//   }
+// }
 
 /**
  * @brief Print results as a Python-like dictionary:
@@ -769,9 +769,20 @@ std::vector<float *> GLiner2MultiV1::encode(const WSTR prompt,
   };
 
   std::vector<float *> label_dummy;
+
+  auto start_prefill = std::chrono::high_resolution_clock::now();
+
   std::vector<float *> outputs =
     model->incremental_inference(BATCH_SIZE, inputs, label_dummy, input_len, 0, input_len, true, &custom_to_map);
 
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
+
+  std::cout << "prefill: " << input_len << " tokens, "
+            << prefill_duration.count() << " ms, "
+            << ((double)input_len / prefill_duration.count() * 1000)
+            << " TPS\n";
   return outputs;
 }
 
@@ -779,7 +790,7 @@ void GLiner2MultiV1::run(const WSTR prompt, bool do_sample, const WSTR system_pr
                          const WSTR tail_prompt) {
   try {
     // 1) Run inference via encode() (encode() MUST call incremental_inference()).
-    (void)encode(prompt, system_prompt, tail_prompt);
+    std::vector<float*> model_outputs = encode(prompt, system_prompt, tail_prompt);
 
     // 2) Recompute lightweight metadata needed for decoding (no header changes required).
     const std::string P_TOKEN = "[P]";
@@ -852,8 +863,8 @@ void GLiner2MultiV1::run(const WSTR prompt, bool do_sample, const WSTR system_pr
     const size_t num_labels = label_info.valid_labels.size();
 
     // 3) Fetch intermediate outputs produced by encode()->incremental_inference().
-    float *raw_span_vecs = get_layer_output_ptr(model.get(), "span_rep_project_out_ffn_fc2");
-    float *raw_label_vecs = get_layer_output_ptr(model.get(), "count_embed_mlp_ffn_fc2");
+    float *raw_span_vecs = model_outputs[0];
+    float *raw_label_vecs = model_outputs[1];
 
     if (num_spans == 0 || num_labels == 0 || !raw_span_vecs || !raw_label_vecs) {
       if (num_labels == 0) std::cout << "[WARN] No labels found in prompt (Check [E] token)." << std::endl;

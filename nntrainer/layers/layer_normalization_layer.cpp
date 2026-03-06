@@ -204,7 +204,7 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
   input.average(normalize_axes, temp_norm_size);
   input.subtract(temp_norm_size, deviation);
 
-#ifndef ENABLE_FP16
+#ifndef false
   deviation.pow(2.0f, temp_full_size);
   temp_full_size.average(normalize_axes, variance);
 
@@ -220,7 +220,7 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
     for (unsigned int j = 0; j < axis_dim; ++j) {
       sum += powf(static_cast<float>(data[j]), 2.0f);
     }
-    inv_std_dev.setValue(0, 0, i, 0, 1.0 / sqrt(sum / axis_dim - epsilon));
+    inv_std_dev.setValue(0, 0, i, 0, 1.0 / sqrt(sum / axis_dim + epsilon));
   }
 #endif
 

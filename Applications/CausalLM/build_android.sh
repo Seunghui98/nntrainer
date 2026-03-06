@@ -19,16 +19,22 @@ echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK: $ANDROID_NDK"
 
 # Step 1: Build nntrainer for Android if not already built
-if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
-    echo "Building nntrainer for Android..."
-    cd "$NNTRAINER_ROOT"
-    if [ -d "$NNTRAINER_ROOT/builddir" ]; then
-        rm -rf builddir
-    fi
-    ./tools/package_android.sh -Dmmap-read=false
-else
-    echo "nntrainer for Android already built."
+echo "Building nntrainer for Android..."
+cd "$NNTRAINER_ROOT"
+if [ -d "$NNTRAINER_ROOT/builddir" ]; then
+    rm -rf builddir
 fi
+./tools/package_android.sh -Dmmap-read=false -Db_sanitize=address -Denable-fp16=true
+# if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
+#     echo "Building nntrainer for Android..."
+#     cd "$NNTRAINER_ROOT"
+#     if [ -d "$NNTRAINER_ROOT/builddir" ]; then
+#         rm -rf builddir
+#     fi
+#     ./tools/package_android.sh -Dmmap-read=false
+# else
+#     echo "nntrainer for Android already built."
+# fi
 
 # Check if build was successful
 if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then

@@ -18,8 +18,8 @@
 #include <util_func.h>
 #include <layer_context.h>
 #include <iostream>
-#include <cmath> // std::round를 위해 필요
-#include <algorithm> // std::copy를 위해 필요
+#include <cmath>
+#include <algorithm>
 
 namespace causallm {
 

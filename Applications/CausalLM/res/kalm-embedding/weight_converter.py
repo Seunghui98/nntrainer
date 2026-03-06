@@ -74,6 +74,7 @@ if __name__ == "__main__":
     config = AutoConfig.from_pretrained(model_path)
     
     model = SentenceTransformer(model_path, trust_remote_code=True, model_kwargs={"torch_dtype": data_dtype})
+    
     model.eval()
 
     with open(output_name, "wb") as f_model :

@@ -263,8 +263,7 @@ int main(int argc, char *argv[]) {
     
     if(cfg.contains("architectures")) {
       architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
-    }
-    if(cfg.contains("model_type")) {
+    } else if(cfg.contains("model_type")) {
       architecture = cfg["model_type"].get<std::string>();
     }
     if(std::filesystem::exists(encoder_config_path) && std::filesystem::exists(config_path)){
