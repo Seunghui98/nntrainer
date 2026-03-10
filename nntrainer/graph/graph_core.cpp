@@ -87,8 +87,8 @@ void GraphCore::topologicalSort() {
   // should be the only one input for now.). Need to support multiple input and
   // support search.
 
-  for (unsigned int i = adj.size() - 1; i != -1; --i) {
-    if (visited[i] == false) {
+  for (int i = adj.size() - 1; i >= 0; --i) {
+    if (!visited[i]) {
       topologicalSortUtil(adj, i, visited, dfs_stack);
     }
   }
