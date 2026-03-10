@@ -1180,7 +1180,7 @@ void MHACoreLayer::compute_fp16vcache_transposed(
     } else {
       // Single token processing (common during generation)
       // Parallelize over KV heads for decoding since Q direction is always 1
-      int row_num = is_causal ? to - 1 : to - 1;
+      int row_num = to - 1;
 
       // Use OpenMP for lower overhead parallelization during decoding
       const float *in_data = in.getData<float>();
@@ -1216,7 +1216,7 @@ void MHACoreLayer::compute_fp16vcache_transposed(
             in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
           _FP16 *out = output.getData<_FP16>() +
                        i * (num_cache_head * gqa_size * head_dim);
-          int row_num = is_causal ? (to - seq + i) : to;
+          int row_num = is_causal ? (to - seq + i) : to - 1;
           nntrainer::compute_fp16vcache_transposed(
             row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
             gqa_size, head_dim, local_window_size);
@@ -1227,7 +1227,7 @@ void MHACoreLayer::compute_fp16vcache_transposed(
     } else {
       // Single token processing (common during generation)
       // Parallelize over KV heads for decoding since Q direction is always 1
-      int row_num = is_causal ? to - 1 : to;
+      int row_num = to - 1;
 
       // Use OpenMP for lower overhead parallelization during decoding
       const _FP16 *in_data = in.getData<_FP16>();
