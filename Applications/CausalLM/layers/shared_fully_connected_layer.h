@@ -16,6 +16,7 @@
 #include <common_properties.h>
 #include <causallm_common_properties.h>
 #include <layer_impl.h>
+#include <tensor_dim.h>
 
 namespace causallm {
 
@@ -87,7 +88,7 @@ public:
    */
   void save(std::ofstream &file, nntrainer::RunLayerContext &run_context,
             bool opt_var, ml::train::ExecutionMode mode, bool trainable,
-            nntrainer::TensorDim::DataType definedWeightDataType) const override;
+            nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE) const override;
 
   /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
