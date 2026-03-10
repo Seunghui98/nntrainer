@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file embedding.cpp
+ * @file sentence_transformer.cpp
  * @date 02 Jan 2026
  * @see https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
@@ -11,10 +11,10 @@
  */
 
 #include <app_context.h>
-#include <embedding.h>
 #include <embedding_normalize_layer.h>
 #include <embedding_pooling_layer.h>
 #include <engine.h>
+#include <sentence_transformer.h>
 
 #include <filesystem>
 #include <iostream>

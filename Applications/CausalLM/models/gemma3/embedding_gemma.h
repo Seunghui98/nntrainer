@@ -14,8 +14,8 @@
 #ifndef __EMBEDDING_GEMMA_H__
 #define __EMBEDDING_GEMMA_H__
 
-#include <embedding.h>
 #include <gemma3_causallm.h>
+#include <sentence_transformer.h>
 
 namespace causallm {
 

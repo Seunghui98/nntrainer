@@ -13,8 +13,8 @@
 #ifndef __QWEN2_EMBEDDING_H__
 #define __QWEN2_EMBEDDING_H__
 
-#include <embedding.h>
 #include <qwen2_causallm.h>
+#include <sentence_transformer.h>
 
 namespace causallm {
 

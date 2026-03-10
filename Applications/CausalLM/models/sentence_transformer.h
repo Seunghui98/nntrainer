@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file    embedding.h
+ * @file    sentence_transformer.h
  * @date    02 Jan 2026
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Eunju Yang <ej.yang@samsung.com>
@@ -11,8 +11,8 @@
  * which can be a parent of models with embedding (encoder) structure.
  */
 
-#ifndef __EMBEDDING_TRANSFORMER_H__
-#define __EMBEDDING_TRANSFORMER_H__
+#ifndef __SENTENCE_TRANSFORMER_H__
+#define __SENTENCE_TRANSFORMER_H__
 
 #pragma once
 

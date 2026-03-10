@@ -14,8 +14,8 @@
 #ifndef __QWEN3_EMBEDDING_H__
 #define __QWEN3_EMBEDDING_H__
 
-#include <embedding.h>
 #include <qwen3_causallm.h>
+#include <sentence_transformer.h>
 
 namespace causallm {
 
