@@ -78,6 +78,7 @@
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include "gliner2_multi_v1.h"
 
 using json = nlohmann::json;
 using DataType = ml::train::TensorDim::DataType;
@@ -190,6 +191,8 @@ std::string resolve_architecture(std::string model_type,
       return "EmbeddingGemma";
     else if (architecture == "Qwen2Model")
       return "Qwen2Embedding";
+    else if (architecture == "GLiner2MultiV1")
+      return "GLiner2MultiV1";
     else
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
@@ -263,6 +266,11 @@ void registerAllModels() {
   factory.registerModel("EmbeddingGemma",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::EmbeddingGemma>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+  factory.registerModel("GLiner2MultiV1",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::GLiner2MultiV1>(
                             cfg, generation_cfg, nntr_cfg);
                         });
 }
@@ -356,6 +364,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
       dtype_map[prefix + "_ffn_gate"] = fc_dtype;
       dtype_map[prefix + "_ffn_down"] = fc_dtype;
+
+      // for debert attention layers
+      dtype_map[prefix + "_intermediate"] = fc_dtype;
+      dtype_map[prefix + "_output_dense"] = fc_dtype;
     }
   }
 
@@ -423,7 +435,14 @@ int main(int argc, char *argv[]) {
     std::cout << "==========================================================\n";
     std::cout << "[1/5] Loading configurations from: " << model_path << "\n";
 
-    json cfg = causallm::LoadJsonFile(model_path + "/config.json");
+    std::filesystem::path config_path = std::filesystem::path(model_path) / "config.json";
+    std::filesystem::path encoder_config_path = std::filesystem::path(model_path) / "encoder_config" / "config.json";
+
+    if (std::filesystem::exists(encoder_config_path)) {
+      config_path = encoder_config_path;
+    }
+  
+    json cfg = causallm::LoadJsonFile(config_path.string());
     json generation_cfg =
       causallm::LoadJsonFile(model_path + "/generation_config.json");
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
@@ -477,10 +496,19 @@ int main(int argc, char *argv[]) {
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
     int num_layers = cfg["num_hidden_layers"].get<int>();
-    bool tie_word_embeddings = cfg["tie_word_embeddings"].get<bool>();
+    bool tie_word_embeddings = cfg.contains("tie_word_embeddings") 
+                      ? cfg["tie_word_embeddings"].get<bool>() 
+                      : false;
+
+    std::string architecture;
+    if(cfg.contains("architectures")) {
+      architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
+    } else if(nntr_cfg.contains("architectures")) {
+      architecture = nntr_cfg["architectures"].get<std::string>();
+    }
 
     std::cout << "  Architecture: "
-              << cfg["architectures"].get<std::vector<std::string>>()[0]
+              << architecture
               << "\n";
     std::cout << "  Num layers:   " << num_layers << "\n";
     std::cout << "  Source:       " << src_weight_path << "\n";
@@ -497,8 +525,6 @@ int main(int argc, char *argv[]) {
 
     registerAllModels();
 
-    std::string architecture =
-      cfg["architectures"].get<std::vector<std::string>>()[0];
     if (nntr_cfg.contains("model_type")) {
       std::string model_type = nntr_cfg["model_type"].get<std::string>();
       architecture = resolve_architecture(model_type, architecture);
