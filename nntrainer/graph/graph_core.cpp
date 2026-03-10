@@ -47,11 +47,13 @@ void GraphCore::makeAdjacencyList(
   }
 
   /** make the connections */
-  for (unsigned int i = node_list.size() - 1; i != -1; --i) {
-    auto &node = node_list[i];
-    for (auto const &in_conn : node->getInputConnections()) {
+  for (auto it = node_list.rbegin(); it != node_list.rend(); ++it) {
+    auto &node = *it;
+    for (const auto &in_conn : node->getInputConnections()) {
       unsigned int to_node_id = getNodeIdx(in_conn);
-      adj[to_node_id].push_back(node);
+      if (to_node_id < adj.size()) {
+        adj[to_node_id].push_back(node);
+      }
     }
   }
 }
