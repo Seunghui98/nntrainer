@@ -56,6 +56,7 @@ void DebertaV2::constructModel() {
     {withKey("name", "embeddings_norm"),
      withKey("input_layers", "embedding0"),
      withKey("axis", "3"),
+     withKey("packed", "false"),
      withKey("epsilon", "1e-7")}));
      
   int rel_embed_size = (POSITION_BUCKETS > 0) ? POSITION_BUCKETS * 2 : ((MAX_RELATIVE_POSITIONS < 1) ? MAX_POSITION_EMBEDDINGS * 2 : MAX_RELATIVE_POSITIONS * 2);
@@ -75,6 +76,7 @@ void DebertaV2::constructModel() {
     {withKey("name", "rel_embeddings_norm"),
      withKey("input_layers", "rel_embeddings"),
      withKey("axis", "3"),
+     withKey("packed", "false"),
      withKey("epsilon", "1e-7")}));
 
   // create Deberta layers
@@ -111,6 +113,7 @@ std::vector<LayerHandle> DebertaV2::createDebertaLayer(const int layer_id,
     {withKey("name", prefix + "_attention_norm"),
      withKey("epsilon", "1e-7"),
      withKey("axis", "3"),
+     withKey("packed", "false"),
      withKey("input_layers", prefix + "_attention_add")}));
 
   // 2. Intermediate Block
@@ -134,6 +137,7 @@ std::vector<LayerHandle> DebertaV2::createDebertaLayer(const int layer_id,
     {withKey("name", prefix + "_output"),
      withKey("epsilon", "1e-7"),
      withKey("axis", "3"),
+     withKey("packed", "false"),
      withKey("input_layers", prefix + "_output_add")}));
 
   return layers;

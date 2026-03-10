@@ -580,6 +580,7 @@ std::vector<LayerHandle> GLiner2MultiV1::createMlp(const std::string &layer_name
                                 withKey("unit", hidden_dim),
                                 withKey("input_layers", input_name),
                                 withKey("disable_bias", "false"),
+                                withKey("packed", "false"),
                                 withKey("weight_initializer", "ones")}));
 
   layers.push_back(createLayer("activation",
@@ -591,6 +592,7 @@ std::vector<LayerHandle> GLiner2MultiV1::createMlp(const std::string &layer_name
                                {withKey("name", layer_name + "_ffn_fc2"),
                                 withKey("unit", dim),
                                 withKey("disable_bias", "false"),
+                                withKey("packed", "false"),
                                 withKey("input_layers", layer_name + "_ffn_act"),
                                 withKey("weight_initializer", "ones")}));
 
