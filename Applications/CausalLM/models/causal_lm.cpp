@@ -459,6 +459,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (init_len < INIT_SEQ_LEN)
     registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
 
+  // output should be deallocated after use
+  for (auto &out : output) {
+    delete[] out;
+  }
+
   auto finish_prefill = std::chrono::high_resolution_clock::now();
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
@@ -501,6 +506,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                       log_output);
     }
     ++generation_cnt;
+
+    // output should be deallocated after use
+    for (auto out : output_interval) {
+      delete[] out;
+    }
 
     // check FINISH
     for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
