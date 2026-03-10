@@ -22,7 +22,7 @@ namespace causallm {
 /**
  * @brief EmbeddingGemma Class
  */
-class EmbeddingGemma : public Embedding, public Gemma3Transformer {
+class EmbeddingGemma : public SentenceTransformer, public Gemma3Transformer {
 
 public:
   static constexpr const char *architectures = "EmbeddingGemma";
@@ -38,7 +38,7 @@ public:
       Gemma3Transformer::sanitizeConfig(cfg),
       Gemma3Transformer::sanitizeGenerationConfig(generation_cfg, cfg),
       nntr_cfg, ModelType::EMBEDDING),
-    Embedding(cfg, generation_cfg, nntr_cfg),
+    SentenceTransformer(cfg, generation_cfg, nntr_cfg),
     Gemma3Transformer(cfg, generation_cfg, nntr_cfg) {}
 
   /**

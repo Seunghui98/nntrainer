@@ -22,7 +22,7 @@ namespace causallm {
 /**
  * @brief Qwen3Embedding Class
  */
-class Qwen3Embedding : public Embedding, public Qwen3Transformer {
+class Qwen3Embedding : public SentenceTransformer, public Qwen3Transformer {
 
 public:
   static constexpr const char *architectures = "Qwen3Embedding";
@@ -35,7 +35,7 @@ public:
    */
   Qwen3Embedding(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING),
-    Embedding(cfg, generation_cfg, nntr_cfg),
+    SentenceTransformer(cfg, generation_cfg, nntr_cfg),
     Qwen3Transformer(cfg, generation_cfg, nntr_cfg) {}
 
   /**

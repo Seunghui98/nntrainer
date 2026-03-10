@@ -21,12 +21,12 @@ namespace causallm {
 /**
  * @brief Qwen2Embedding class
  */
-class Qwen2Embedding : public Embedding, public Qwen2Transformer {
+class Qwen2Embedding : public SentenceTransformer, public Qwen2Transformer {
 
 public:
   Qwen2Embedding(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING),
-    Embedding(cfg, generation_cfg, nntr_cfg),
+    SentenceTransformer(cfg, generation_cfg, nntr_cfg),
     Qwen2Transformer(cfg, generation_cfg, nntr_cfg) {}
 
   virtual ~Qwen2Embedding() {}
