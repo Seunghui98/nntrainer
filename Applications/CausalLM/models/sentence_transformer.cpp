@@ -224,8 +224,8 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
 
   std::vector<int64_t> init_input;
   unsigned int input_len =
-    std::min((unsigned int)_input.size() - 1, (unsigned int)MAX_SEQ_LEN);
-
+    std::min((unsigned int)_input.size(), (unsigned int)MAX_SEQ_LEN);
+  std::cout << "input_len : !!! " << input_len << "\n";
   // feed only available length
   for (unsigned int i = 0; i < input_len; ++i)
     init_input.push_back(_input[i]);
@@ -252,7 +252,7 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   // This performs a single forward pass for the entire prompt sequence to get
   // embeddings.
   std::vector<float *> output = model->incremental_inference(
-    BATCH_SIZE, input, label, input_len, 0, input_len, true);
+    BATCH_SIZE, input, label, input_len, 0, input_len, false);
 
   free(input_sample);
   
