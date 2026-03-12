@@ -12,6 +12,7 @@
  */
 #ifndef __ARM_COMPUTE_BACKEND_H__
 #define __ARM_COMPUTE_BACKEND_H__
+
 #ifdef __cplusplus
 
 #include <cstdint>
@@ -673,6 +674,16 @@ void softmax_row_inplace(__fp16 *qk_out, size_t start_row, size_t end_row,
  */
 void softmax_row(__fp16 *qk_out, size_t start_row, size_t end_row,
                  size_t num_heads, float *sink);
+
+void causal_conv1d_fp16_w3(
+    __fp16 * x,       
+    const __fp16 * weight,  
+    const __fp16 * bias,    
+    __fp16 * out,         
+    const unsigned int B,
+    const unsigned int H,
+    const unsigned int W,
+    bool silu_activation); 
 #endif
 
 /**

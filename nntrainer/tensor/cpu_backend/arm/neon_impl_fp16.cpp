@@ -2628,4 +2628,162 @@ void calc_trigonometric_vals_dup(unsigned int N_half, _FP16 *angle, _FP16 *cos_,
     ++i_half;
   }
 }
+
+
+static inline float16x8_t silu_f16x8(float16x8_t x) {
+  float16x4_t x_lo_h = vget_low_f16(x);
+  float16x4_t x_hi_h = vget_high_f16(x);
+
+  float32x4_t x_lo = vcvt_f32_f16(x_lo_h);
+  float32x4_t x_hi = vcvt_f32_f16(x_hi_h);
+
+  float32x4_t ones = vdupq_n_f32(1.0f);
+
+  float32x4_t exp_x_lo = exp_ps(x_lo);
+  float32x4_t exp_x_hi = exp_ps(x_hi);
+
+  exp_x_lo = vaddq_f32(exp_x_lo, ones);
+  exp_x_hi = vaddq_f32(exp_x_hi, ones);
+
+  x_lo = vdivq_f32(x_lo, exp_x_lo);
+  x_hi = vdivq_f32(x_hi, exp_x_hi);
+
+  return vcombine_f16(vcvt_f16_f32(x_lo), vcvt_f16_f32(x_hi));
+}
+
+static inline __fp16 silu_scalar_f16(__fp16 x) {
+  const float v = static_cast<float>(x);
+  return static_cast<__fp16>(v / (1.0f + std::exp(-v)));
+}
+
+
+void causal_conv1d_channellast_fp16_w3(
+    __fp16 * x,       
+    const __fp16 * weight,  
+    const __fp16 * bias,    
+    __fp16 * out,         
+    const unsigned int B,
+    const unsigned int H,
+    const unsigned int W,
+    bool silu_activation) {
+
+  constexpr int kVec = 8;
+  const int batch_stride = H * W;
+
+  const __fp16 *w0_base = weight;
+  const __fp16 *w1_base = weight + W;
+  const __fp16 *w2_base = weight + 2 * W;
+
+  for (int b = 0; b < B; ++b) {
+    const __fp16 *x_b = x + b * batch_stride;
+    __fp16 *out_b = out + b * batch_stride;
+
+    // t = 0 : y[0] = bias + w2 * x[0]
+    if (H > 0) {
+      const __fp16 *x2 = x_b;
+      __fp16 *y = out_b;
+
+      int c = 0;
+
+      for (; c + kVec <= W; c += kVec) {
+        float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
+        float16x8_t w2 = vld1q_f16(w2_base + c);
+        float16x8_t xv2 = vld1q_f16(x2 + c);
+
+        acc = vfmaq_f16(acc, xv2, w2);
+        
+        if (silu_activation) {
+          acc = silu_f16x8(acc);
+        } 
+        vst1q_f16(y + c, acc);
+      }
+
+      for (; c < W; ++c) {
+        __fp16 acc = bias ? bias[c] : (__fp16)0;
+        acc = static_cast<__fp16>(acc + x2[c] * w2_base[c]);
+        if (silu_activation) {
+          acc = silu_scalar_f16(acc);
+        }
+        y[c] = acc;
+      }
+    }
+
+    if (H > 1) {
+      const __fp16 *x1 = x_b;
+      const __fp16 *x2 = x_b + W;
+      __fp16 *y = out_b + W;
+
+      int c = 0;
+      for (; c + kVec <= W; c += kVec) {
+        float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
+
+        float16x8_t w1 = vld1q_f16(w1_base + c);
+        float16x8_t w2 = vld1q_f16(w2_base + c);
+        float16x8_t xv1 = vld1q_f16(x1 + c);
+        float16x8_t xv2 = vld1q_f16(x2 + c);
+
+        acc = vfmaq_f16(acc, xv1, w1);
+        acc = vfmaq_f16(acc, xv2, w2);
+
+        if (silu_activation) {
+          acc = silu_f16x8(acc);
+        }
+        vst1q_f16(y + c, acc);
+      }
+
+      for (; c < W; ++c) {
+        __fp16 acc = bias ? bias[c] : (__fp16)0;
+        acc = static_cast<__fp16>(acc + x1[c] * w1_base[c]);
+        acc = static_cast<__fp16>(acc + x2[c] * w2_base[c]);
+        if (silu_activation) {
+          acc = silu_scalar_f16(acc);
+        }
+        y[c] = acc;
+      }
+    }
+
+    // t >= 2 : y[t] = bias + w0*x[t-2] + w1*x[t-1] + w2*x[t]
+    for (int t = 2; t < H; ++t) {
+      const __fp16 *x0 = x_b + (t - 2) * W;
+      const __fp16 *x1 = x_b + (t - 1) * W;
+      const __fp16 *x2 = x_b + t * W;
+      __fp16 *y = out_b + t * W;
+
+      int c = 0;
+      for (; c + kVec <= W; c += kVec) {
+        float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
+
+        float16x8_t w0 = vld1q_f16(w0_base + c);
+        float16x8_t w1 = vld1q_f16(w1_base + c);
+        float16x8_t w2 = vld1q_f16(w2_base + c);
+
+        float16x8_t xv0 = vld1q_f16(x0 + c);
+        float16x8_t xv1 = vld1q_f16(x1 + c);
+        float16x8_t xv2 = vld1q_f16(x2 + c);
+
+        acc = vfmaq_f16(acc, xv0, w0);
+        acc = vfmaq_f16(acc, xv1, w1);
+        acc = vfmaq_f16(acc, xv2, w2);
+
+        if (silu_activation) {
+          acc = silu_f16x8(acc);
+        }
+        vst1q_f16(y + c, acc);
+      }
+
+      for (; c < W; ++c) {
+        __fp16 acc = bias ? bias[c] : (__fp16)0;
+        acc = static_cast<__fp16>(acc + x0[c] * w0_base[c]);
+        acc = static_cast<__fp16>(acc + x1[c] * w1_base[c]);
+        acc = static_cast<__fp16>(acc + x2[c] * w2_base[c]);
+        if (silu_activation) {
+          acc = silu_scalar_f16(acc);
+        }
+        y[c] = acc;
+      }
+    }
+  }
+}
+
+
 } // namespace nntrainer::neon

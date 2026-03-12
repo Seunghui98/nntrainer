@@ -623,6 +623,16 @@ extern void nntr_gemm_qsi8d32p_qsi4c32p_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
+
+extern void causal_conv1d_fp16_w3(
+    __fp16 * x,       
+    const __fp16 * weight,  
+    const __fp16 * bias,    
+    __fp16 * out,         
+    const unsigned int B,
+    const unsigned int H,
+    const unsigned int W,
+    bool silu_activation); 
 #endif
 /**
  * @brief Initialization of ggml backend

@@ -431,6 +431,16 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, __fp16 *inout, __fp16 *output,
                               const __fp16 *cos_, const __fp16 *sin_);
 
+void causal_conv1d_channellast_fp16_w3(
+    __fp16 * x,       
+    const __fp16 * weight,  
+    const __fp16 * bias,    
+    __fp16 * out,         
+    const unsigned int B,
+    const unsigned int H,
+    const unsigned int W,
+    bool silu_activation);
+
 #endif
 
 /**
