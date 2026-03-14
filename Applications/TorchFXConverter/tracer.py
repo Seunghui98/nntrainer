@@ -53,12 +53,9 @@ LEAF_MODULES = (
     nn.Softmax,
     # Dropout (will be skipped in inference output)
     nn.Dropout,
-    # Conv layers
+    # Conv layers (for future models that use convolutions)
     nn.Conv1d,
     nn.Conv2d,
-    nn.ConvTranspose2d,
-    # Upsampling
-    nn.Upsample,
     # Pooling
     nn.AdaptiveAvgPool1d,
     nn.AdaptiveAvgPool2d,
@@ -69,29 +66,10 @@ LEAF_MODULES = (
     # Batch norm
     nn.BatchNorm1d,
     nn.BatchNorm2d,
-    # Group norm / Instance norm
-    nn.GroupNorm,
-    nn.InstanceNorm1d,
-    nn.InstanceNorm2d,
-    # Multi-head attention
-    nn.MultiheadAttention,
-    # Channel shuffle
-    nn.ChannelShuffle,
     # Recurrent layers -> gru / lstm / rnn
     nn.GRU,
     nn.LSTM,
     nn.RNN,
-    # Recurrent cell layers -> grucell / lstmcell / rnncell
-    nn.GRUCell,
-    nn.LSTMCell,
-    nn.RNNCell,
-    # Identity (passthrough)
-    nn.Identity,
-    # Loss layers
-    nn.CrossEntropyLoss,
-    nn.MSELoss,
-    nn.KLDivLoss,
-    nn.BCEWithLogitsLoss,
 )
 
 
@@ -155,10 +133,6 @@ def _build_leaf_check(leaf_modules, exclude_leaf_types=None):
             return True
         if _is_gelu_variant(module):
             return True
-        # Check plugin registry for custom module types
-        from plugin_registry import get_global_registry
-        if get_global_registry().lookup(module) is not None:
-            return True
         return False
     return is_leaf
 
@@ -193,7 +167,6 @@ class Tracer(TorchFunctionMode):
         self.module_stack = []
         self._tensor_to_node = {}
         self._data_ptr_to_node = {}  # Fallback: data_ptr -> node (for detach/clone)
-        self._tensor_refs = []  # Keep tensors alive to prevent id() reuse during tracing
         self.handles = []
         self.tracing_enabled = True
         self._obj_to_path = {}
@@ -217,12 +190,7 @@ class Tracer(TorchFunctionMode):
             # Fallback: detach()/clone() creates new tensor objects with new
             # id() values but the same underlying data storage. Use data_ptr()
             # to resolve these back to their producing node.
-            # Some tensors (meta tensors, nested tensors) have no storage,
-            # so data_ptr() raises RuntimeError — skip the fallback for those.
-            try:
-                dptr = obj.data_ptr()
-            except RuntimeError:
-                dptr = 0
+            dptr = obj.data_ptr()
             if dptr != 0 and dptr in self._data_ptr_to_node:
                 node = self._data_ptr_to_node[dptr]
                 self._tensor_to_node[id(obj)] = node
@@ -242,11 +210,9 @@ class Tracer(TorchFunctionMode):
             return node
         return obj
 
-    def _register_output(self, out, node, track_data_ptr=False):
+    def _register_output(self, out, node):
         for path, item in pytree.tree_flatten_with_path(out)[0]:
             if isinstance(item, Tensor):
-                # Pin tensor to prevent GC and id() reuse during tracing
-                self._tensor_refs.append(item)
                 cur_node = node
                 for key in path:
                     if isinstance(key, pytree.SequenceKey):
@@ -260,19 +226,11 @@ class Tracer(TorchFunctionMode):
                     cur_node = self.graph.call_function(
                         operator.getitem, args=(cur_node, key), kwargs={}
                     )
-                # Always register id -> node (including single tensor outputs
-                # where path is empty and the for-key loop doesn't execute)
-                self._tensor_to_node[id(item)] = cur_node
-                # Track data_ptr only for leaf module outputs (not intermediate
-                # views from __torch_function__), because view/reshape creates
-                # tensors sharing the same data_ptr, which would clobber entries.
-                if track_data_ptr:
-                    try:
-                        dptr = item.data_ptr()
-                    except RuntimeError:
-                        dptr = 0
-                    if dptr != 0:
-                        self._data_ptr_to_node[dptr] = cur_node
+                    self._tensor_to_node[id(item)] = cur_node
+                # Also track by data_ptr for detach/clone resolution
+                dptr = item.data_ptr()
+                if dptr != 0:
+                    self._data_ptr_to_node[dptr] = cur_node
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -317,10 +275,6 @@ class Tracer(TorchFunctionMode):
             node.meta["scope"] = self.module_stack[-1]
             node.meta["output_type"] = type(out)
 
-        # Store output shape for shape-dependent operations (reshape, etc.)
-        if isinstance(out, Tensor):
-            node.meta["output_shape"] = tuple(out.shape)
-
         self._register_output(out, node)
 
         return out
@@ -338,22 +292,16 @@ class Tracer(TorchFunctionMode):
                             name_hint = f"arg_{i}"
                             node = self.graph.placeholder(name_hint)
                             node.meta["type"] = type(item)
-                            if isinstance(item, Tensor):
-                                node.meta["output_shape"] = tuple(item.shape)
-                            self._register_output(item, node, track_data_ptr=True)
+                            self._register_output(item, node)
                     elif param and param.kind == inspect.Parameter.VAR_KEYWORD:
                         for key, item in arg_value.items():
                             node = self.graph.placeholder(key)
                             node.meta["type"] = type(item)
-                            if isinstance(item, Tensor):
-                                node.meta["output_shape"] = tuple(item.shape)
-                            self._register_output(item, node, track_data_ptr=True)
+                            self._register_output(item, node)
                     else:
                         node = self.graph.placeholder(arg_name)
                         node.meta["type"] = type(arg_value)
-                        if isinstance(arg_value, Tensor):
-                            node.meta["output_shape"] = tuple(arg_value.shape)
-                        self._register_output(arg_value, node, track_data_ptr=True)
+                        self._register_output(arg_value, node)
 
             if self._is_leaf(module):
                 self.tracing_enabled = False
@@ -379,8 +327,6 @@ class Tracer(TorchFunctionMode):
                 node = self.graph.call_module(name, args=node_args, kwargs=node_kwargs)
                 node.meta["scope"] = name
                 node.meta["output_type"] = type(output)
-                if isinstance(output, Tensor):
-                    node.meta["output_shape"] = tuple(output.shape)
                 node.meta["leaf_module"] = True
                 node.meta["module_type"] = type(module).__name__
                 node.meta["module_class"] = type(module)
@@ -422,7 +368,7 @@ class Tracer(TorchFunctionMode):
                     node.meta["dropout"] = module.dropout
                     node.meta["is_rnn_module"] = True
 
-                self._register_output(output, node, track_data_ptr=True)
+                self._register_output(output, node)
             elif self.module_stack:
                 self.module_stack.pop()
 
