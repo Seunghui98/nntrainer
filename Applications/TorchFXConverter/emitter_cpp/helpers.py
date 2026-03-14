@@ -13,7 +13,7 @@ def _q(s):
 
 
 def _cpp_layer(layer_type, props, indent=2):
-    """Generate a createLayer() call as a list of C++ lines (old addLayer pattern)."""
+    """Generate a createLayer() call as a list of C++ lines."""
     pad = "  " * indent
     lines = []
     lines.append(pad + 'layers.push_back(createLayer("' + layer_type + '", {')
@@ -22,61 +22,6 @@ def _cpp_layer(layer_type, props, indent=2):
         lines.append(pad + "  " + p + comma)
     lines.append(pad + "}));")
     return lines
-
-
-def _cpp_create_layer(layer_type, props, indent=1):
-    """Generate a createLayer() expression (no push_back, no variable assignment).
-
-    Returns a list of C++ lines forming: createLayer("type", {props...})
-    Caller is responsible for wrapping with LayerHandle var(...) or assignment.
-    """
-    pad = "  " * indent
-    lines = []
-    lines.append(pad + 'createLayer("' + layer_type + '", {')
-    for i, p in enumerate(props):
-        comma = "," if i < len(props) - 1 else ""
-        lines.append(pad + "  " + p + comma)
-    lines.append(pad + "})")
-    return lines
-
-
-def _cpp_tensor_layer(var_name, layer_type, props, input_expr, indent=1):
-    """Generate symbolic Tensor graph pattern:
-
-      LayerHandle var(createLayer("type", {props...}));
-      Tensor out = var(input);
-
-    Args:
-        var_name: C++ variable name for the LayerHandle
-        layer_type: NNTrainer layer type string
-        props: list of property expressions (without input_layers)
-        input_expr: C++ expression for input - either a single Tensor variable
-                    name (str) or a list/set expression like "{q, k, v}"
-
-    Returns:
-        tuple (lines, output_var) where output_var is the Tensor variable name.
-    """
-    pad = "  " * indent
-    out_var = var_name + "_out"
-    lines = []
-
-    # LayerHandle declaration
-    if len(props) <= 2:
-        prop_str = ", ".join(props)
-        lines.append(
-            f'{pad}LayerHandle {var_name}(createLayer("{layer_type}", '
-            f'{{{prop_str}}}));')
-    else:
-        lines.append(
-            f'{pad}LayerHandle {var_name}(createLayer("{layer_type}", {{')
-        for i, p in enumerate(props):
-            comma = "," if i < len(props) - 1 else ""
-            lines.append(f'{pad}  {p}{comma}')
-        lines.append(f'{pad}}}));')
-
-    # Tensor output
-    lines.append(f'{pad}Tensor {out_var} = {var_name}({input_expr});')
-    return lines, out_var
 
 
 def _with_key(key, val):
@@ -99,11 +44,8 @@ _CLASS_NAME_MAP = {
     "phi": "PhiCausalLM",
     "bert": "BertModel",
     "roberta": "RobertaModel",
-    "xlm-roberta": "XlmRobertaModel",
     "t5": "T5Model",
     "mt5": "MT5Model",
-    "lfm2": "Lfm2CausalLM",
-    "granitemoehybrid": "GraniteCausalLM",
 }
 
 _EMBED_NAME_MAP = {
@@ -114,14 +56,13 @@ _EMBED_NAME_MAP = {
     "qwen3": "Qwen3EmbeddingModel",
     "qwen2": "Qwen2EmbeddingModel",
     "bert": "BertEmbeddingModel",
-    "xlm-roberta": "XlmRobertaEmbeddingModel",
 }
 
 _KNOWN_CAUSAL_TYPES = frozenset({
     "qwen3", "qwen2", "llama", "mistral", "gemma",
     "gemma2", "gemma3_text", "phi", "gpt2",
     "gpt_neo", "gpt_neox", "starcoder2", "codegen",
-    "lfm2", "granitemoehybrid",
+    "lfm2",
 })
 
 
@@ -201,6 +142,5 @@ def get_file_base(structure, model_name=None):
 
 def get_norm_type(model_type):
     """Return the norm layer type for a given model type."""
-    layer_norm_types = ("bert", "roberta", "xlm-roberta")
-    return ("layer_normalization" if model_type in layer_norm_types
-            else "rms_norm")
+    return ("rms_norm" if model_type not in ("bert", "roberta")
+            else "layer_normalization")
