@@ -26,13 +26,10 @@ from typing import Optional
 
 from nntrainer_layers import (
     NNTrainerLayerDef,
-    LAYER_INPUT,
     LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_NEGATIVE,
-    LAYER_ADDITION, LAYER_SUBTRACT,
-    LAYER_DROPOUT, LAYER_EMBEDDING,
-    LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE,
+    LAYER_DROPOUT,
     LAZY_TENSOR_OPS, TENSOR_DIRECT_METHODS,
-    OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE,
+    OP_UNSUPPORTED, OP_NOOP,
 )
 from tracer import Tracer, LEAF_MODULES
 from node_mapper import NodeMapper
@@ -273,120 +270,6 @@ def resolve_unsupported_ops(layers):
 decompose_unsupported_ops = resolve_unsupported_ops
 
 
-def _remove_passthrough_layers(layers, layer_type, label):
-    """Remove layers of a given type and rewire downstream inputs.
-
-    For each removed layer, downstream layers that referenced it are
-    rewired to point at the removed layer's own input instead.
-    Handles chains (e.g. noop -> noop -> real layer).
-
-    Returns the filtered layer list.
-    """
-    target_names = {l.name for l in layers if l.layer_type == layer_type}
-    if not target_names:
-        return layers
-
-    # Build bypass map: removed_name -> its input (or None)
-    bypass = {}
-    for l in layers:
-        if l.layer_type == layer_type:
-            bypass[l.name] = l.input_layers[0] if l.input_layers else None
-
-    # Resolve chains
-    def _resolve(name):
-        visited = set()
-        while name in bypass and name not in visited:
-            visited.add(name)
-            name = bypass[name]
-        return name
-
-    # Rewire inputs of surviving layers
-    for l in layers:
-        if l.layer_type != layer_type and l.input_layers:
-            l.input_layers = [
-                _resolve(inp) if inp in target_names else inp
-                for inp in l.input_layers
-            ]
-            l.input_layers = [x for x in l.input_layers if x]
-
-    filtered = [l for l in layers if l.layer_type != layer_type]
-    print(f"  [CLEANUP] Removed {len(target_names)} {label} layers")
-    return filtered
-
-
-# =============================================================================
-# Position ID Chain Removal
-# =============================================================================
-
-# Layer types that are part of position ID computation chains.
-# These are arithmetic/reshape ops used to compute position indices
-# from attention masks before feeding into position embedding.
-_POSITION_CHAIN_OPS = frozenset({
-    LAYER_ADDITION, LAYER_SUBTRACT, LAYER_MULTIPLY, LAYER_DIVIDE,
-    OP_RESHAPE,
-})
-
-
-def _remove_position_id_chains(layers):
-    """Remove position ID computation chains (XLM-RoBERTa, etc.).
-
-    In models like XLM-RoBERTa, position IDs are computed from input masks:
-        input_ids → ne → int → cumsum → type_as → add → mul → add → Embedding
-
-    After noop removal (ne, int, cumsum, type_as are all noops), the remaining
-    arithmetic layers (add, mul, add) only serve to compute position indices.
-    NNTrainer handles position IDs internally, so these are redundant.
-
-    This function detects arithmetic layers that exclusively feed into
-    embedding layers (directly or through other arithmetic layers) and
-    removes them. It uses iterative fixed-point analysis to correctly
-    handle chains of arbitrary length.
-
-    Returns the filtered layer list.
-    """
-    by_name = {l.name: l for l in layers}
-
-    # Build consumer graph: layer_name -> set of consumer layer names
-    consumers = {}
-    for l in layers:
-        for inp in (l.input_layers or []):
-            consumers.setdefault(inp, set()).add(l.name)
-
-    embedding_names = {l.name for l in layers if l.layer_type == LAYER_EMBEDDING}
-
-    # Iterative fixed-point: mark arithmetic layers whose ALL consumers
-    # are either embedding layers or already-marked removable layers.
-    removable = set()
-    changed = True
-    while changed:
-        changed = False
-        for l in layers:
-            if l.name in removable or l.layer_type not in _POSITION_CHAIN_OPS:
-                continue
-            layer_consumers = consumers.get(l.name, set())
-            if not layer_consumers:
-                continue
-            if all(c in embedding_names or c in removable
-                   for c in layer_consumers):
-                removable.add(l.name)
-                changed = True
-
-    if not removable:
-        return layers
-
-    # Rewire embedding inputs past the removed chain
-    for l in layers:
-        if l.name not in removable and l.input_layers:
-            l.input_layers = [
-                inp for inp in l.input_layers if inp not in removable
-            ]
-
-    filtered = [l for l in layers if l.name not in removable]
-    print(f"  [CLEANUP] Removed {len(removable)} position ID "
-          f"computation layers")
-    return filtered
-
-
 # =============================================================================
 # Adaptive Converter Pipeline
 # =============================================================================
@@ -419,8 +302,7 @@ class AdaptiveConverter:
         result.summary()
     """
 
-    def __init__(self, model, model_config=None, training=False,
-                 plugin_registry=None):
+    def __init__(self, model, model_config=None, training=False):
         """
         Args:
             model: The HuggingFace model to convert.
@@ -428,18 +310,10 @@ class AdaptiveConverter:
             training: If False (default), dropout layers are removed from
                 the output since they are no-ops during inference. If True,
                 dropout layers are preserved for training use.
-            plugin_registry: Optional PluginRegistry for custom layer mappings.
-                If provided, registered custom module types are treated as
-                leaf modules (not decomposed) and mapped via the registry.
         """
         self.model = model
         self.config = model_config
         self.training = training
-        if plugin_registry is not None:
-            from plugin_registry import get_global_registry, _global_registry
-            # Merge into global registry so module_mapper can find them
-            for matcher, spec in plugin_registry._entries:
-                _global_registry.register(matcher, spec)
 
     def convert(self, input_kwargs, max_passes=3):
         """Run the adaptive conversion pipeline.
@@ -490,30 +364,13 @@ class AdaptiveConverter:
 
         # Pass 3.5: Remove dropout layers for inference mode
         if not self.training:
-            layers = _remove_passthrough_layers(
-                layers, LAYER_DROPOUT, "dropout")
-
-        # Pass 3.6: Remove noop layers (expand, size, _set_grad_enabled, etc.)
-        layers = _remove_passthrough_layers(layers, OP_NOOP, "noop")
-
-        # Pass 3.7: Remove position ID computation chains
-        # (arithmetic ops that exclusively feed position embeddings)
-        layers = _remove_position_id_chains(layers)
-
-        # Pass 3.8: Convert intermediate op types to final NNTrainer types
-        _OP_TO_LAYER = {
-            OP_RESHAPE: LAYER_RESHAPE,
-            OP_TRANSPOSE: LAYER_TRANSPOSE,
-            OP_PERMUTE: LAYER_PERMUTE,
-        }
-        for layer in layers:
-            if layer.layer_type in _OP_TO_LAYER:
-                layer.layer_type = _OP_TO_LAYER[layer.layer_type]
-
-        # Pass 3.9: Add input layers for external inputs and extract
-        # reshape/slice parameters from FX graph metadata
-        layers = _add_input_layers_and_shape_info(
-            layers, tracer.graph, input_kwargs)
+            dropout_count = sum(1 for l in layers
+                                if l.layer_type == LAYER_DROPOUT)
+            if dropout_count > 0:
+                layers = [l for l in layers
+                          if l.layer_type != LAYER_DROPOUT]
+                print(f"  [INFERENCE] Removed {dropout_count} dropout layers "
+                      f"(not needed for inference)")
 
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)
@@ -550,173 +407,6 @@ class AdaptiveConverter:
             model_structure=model_structure,
             training=self.training,
         )
-
-
-def _add_input_layers_and_shape_info(layers, graph, input_kwargs):
-    """Add input layers for external inputs and extract shape metadata.
-
-    1. Detects external inputs (referenced but not defined) and creates
-       NNTrainer input layers with proper input_shape.
-    2. Extracts target_shape for reshape/view operations from FX graph args.
-    3. Extracts slice parameters (start_index, end_index, axis) for
-       __getitem__ operations from FX graph args.
-
-    Args:
-        layers: List of NNTrainerLayerDef
-        graph: FX graph from tracer
-        input_kwargs: Dict of model inputs with tensor shapes
-
-    Returns:
-        Updated layers list with input layers prepended.
-    """
-    import torch
-
-    # Build name->node lookup from FX graph
-    fx_nodes = {node.name: node for node in graph.nodes}
-
-    # Detect external inputs
-    defined = set(l.name for l in layers)
-    external_inputs = []
-    seen = set()
-    for l in layers:
-        for inp in l.input_layers:
-            if inp not in defined and inp not in seen:
-                seen.add(inp)
-                external_inputs.append(inp)
-
-    # Create input layers for external inputs
-    input_layers = []
-    for inp_name in external_inputs:
-        tensor = input_kwargs.get(inp_name)
-        if tensor is not None and isinstance(tensor, torch.Tensor):
-            # Convert PyTorch shape to NNTrainer input_shape (C:H:W).
-            # Strip batch dimension (dim 0); pad to 3D if needed.
-            dims = list(tensor.shape[1:])  # skip batch
-            while len(dims) < 3:
-                dims.insert(0, 1)
-            input_shape = ":".join(str(d) for d in dims[-3:])
-        else:
-            input_shape = "1:1:1"  # fallback
-
-        input_layers.append(NNTrainerLayerDef(
-            layer_type=LAYER_INPUT,
-            name=inp_name,
-            properties={"input_shape": input_shape},
-        ))
-
-    if input_layers:
-        count = len(input_layers)
-        names = ", ".join(l.name for l in input_layers)
-        print(f"  [CLEANUP] Added {count} input layers: {names}")
-
-    # Extract shape info for reshape/view/unsqueeze/squeeze layers
-    for layer in layers:
-        if layer.layer_type not in (LAYER_RESHAPE, OP_RESHAPE):
-            continue
-        # Look up FX node by fx_node_name (preferred) or layer name
-        node = fx_nodes.get(layer.fx_node_name) or fx_nodes.get(layer.name)
-        if node is None:
-            continue
-
-        target = getattr(node, 'target', '')
-
-        if target in ('view', 'reshape'):
-            # node.args = (input_node, dim1, dim2, ...) or
-            # node.args = (input_node, (dim1, dim2, ...))
-            shape_args = node.args[1:]
-            if len(shape_args) == 1 and isinstance(shape_args[0], (list, tuple)):
-                shape_args = shape_args[0]
-            # Strip batch dim (first dim), convert to C:H:W
-            dims = [a for a in shape_args if isinstance(a, int)]
-            if dims:
-                dims = dims[1:]  # skip batch
-                while len(dims) < 3:
-                    dims.insert(0, 1)
-                layer.properties["target_shape"] = \
-                    ":".join(str(d) for d in dims[-3:])
-
-        else:
-            # For unsqueeze, squeeze, or any other reshape variant:
-            # use output_shape captured during tracing
-            out_shape = node.meta.get('output_shape')
-            if out_shape is not None:
-                dims = list(out_shape[1:])  # skip batch
-                while len(dims) < 3:
-                    dims.insert(0, 1)
-                layer.properties["target_shape"] = \
-                    ":".join(str(d) for d in dims[-3:])
-
-    # Extract slice parameters for __getitem__ layers
-    for layer in layers:
-        if layer.layer_type != "slice":
-            continue
-        node = fx_nodes.get(layer.fx_node_name) or fx_nodes.get(layer.name)
-        if node is None or len(node.args) < 2:
-            continue
-
-        # Determine input tensor rank for PyTorch→NCHW axis conversion
-        input_node = node.args[0] if hasattr(node.args[0], 'name') else None
-        input_rank = 4  # default
-        if input_node:
-            in_shape = input_node.meta.get('output_shape')
-            if in_shape:
-                input_rank = len(in_shape)
-
-        index_arg = node.args[1]
-        # Handle multi-dimensional indexing: tensor[..., idx]
-        # e.g. span_idx[:, :, 0] → args[1] = (slice(None), slice(None), 0)
-        if isinstance(index_arg, (list, tuple)):
-            # Find the axis being indexed (first non-slice(None) element)
-            for ax, idx in enumerate(index_arg):
-                if isinstance(idx, int):
-                    # Convert PyTorch dim to NCHW axis (1-3).
-                    # For a tensor of rank R mapped to 4D NCHW:
-                    #   nchw_dim = pytorch_dim + (4 - R) for dims > 0
-                    nn_axis = ax + (4 - input_rank)
-                    nn_axis = max(1, min(3, nn_axis))  # clamp to 1-3
-                    if idx < 0:
-                        # Need input shape to resolve negative index
-                        in_shape = input_node.meta.get('output_shape') \
-                            if input_node else None
-                        if in_shape and ax < len(in_shape):
-                            idx = in_shape[ax] + idx  # resolve negative
-                        else:
-                            break
-                    # NNTrainer slice: 1-based, end is exclusive
-                    layer.properties["axis"] = nn_axis
-                    layer.properties["start_index"] = idx + 1
-                    layer.properties["end_index"] = idx + 2
-                    break
-        elif isinstance(index_arg, int):
-            # Simple integer indexing on first non-batch dim
-            nn_axis = 1 + (4 - input_rank)
-            nn_axis = max(1, min(3, nn_axis))
-            layer.properties["axis"] = nn_axis
-            layer.properties["start_index"] = index_arg + 1
-            layer.properties["end_index"] = index_arg + 2
-
-    # Fix gather axis: convert PyTorch dim to NCHW axis (1-3)
-    for layer in layers:
-        if layer.layer_type != "gather":
-            continue
-        if "axis" not in layer.properties:
-            continue
-        node = fx_nodes.get(layer.fx_node_name) or fx_nodes.get(layer.name)
-        if node is None:
-            continue
-        # Gather's first input is the data tensor; get its rank
-        data_node = node.args[0] if hasattr(node.args[0], 'name') else None
-        if data_node:
-            data_shape = data_node.meta.get('output_shape')
-            if data_shape:
-                data_rank = len(data_shape)
-                pytorch_axis = layer.properties["axis"]
-                # Convert: nchw_dim = pytorch_dim + (4 - rank) for dim > 0
-                nn_axis = pytorch_axis + (4 - data_rank)
-                nn_axis = max(1, min(3, nn_axis))
-                layer.properties["axis"] = nn_axis
-
-    return input_layers + layers
 
 
 class ConversionResult:
