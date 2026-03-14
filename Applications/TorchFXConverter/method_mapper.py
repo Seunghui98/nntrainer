@@ -4,6 +4,8 @@ Handles Tensor.* method calls such as add, mul, view, reshape, permute,
 transpose, softmax, etc.
 """
 
+import math
+
 from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_ACTIVATION, LAYER_CLAMP,
@@ -14,16 +16,55 @@ from op_registry import (
     METHOD_RESHAPE_NAMES, METHOD_DECOMPOSE_OPS, METHOD_CLAMP_NAMES,
     METHOD_NOOP_NAMES, METHOD_SPLIT_NAMES,
 )
-from mapper_helpers import (
-    get_input_node_names, sanitize_name, make_scoped_name,
-    extract_clamp_params,
-)
 
-# Backward-compatible aliases
-_get_input_node_names = get_input_node_names
-_sanitize_name = sanitize_name
-_make_scoped_name = make_scoped_name
-_extract_clamp_params = extract_clamp_params
+
+def _get_input_node_names(node):
+    names = []
+    for arg in node.args:
+        if hasattr(arg, 'name'):
+            names.append(arg.name)
+    return names
+
+
+def _sanitize_name(name: str) -> str:
+    return name.replace(".", "_")
+
+
+def _make_scoped_name(scope, node, suffix=""):
+    if scope:
+        name = f"{_sanitize_name(scope)}_{node.name}"
+    else:
+        name = node.name
+    if suffix:
+        name = f"{name}_{suffix}"
+    return name
+
+
+def _extract_clamp_params(node, op_name, props):
+    """Extract min/max parameters from clamp/clip FX node."""
+    args = node.args
+    kwargs = node.kwargs or {}
+
+    if op_name == "clamp_min":
+        props["min"] = str(args[1] if len(args) > 1 else kwargs.get("min", 0))
+        props["max"] = str(math.inf)
+    elif op_name == "clamp_max":
+        props["min"] = str(-math.inf)
+        props["max"] = str(args[1] if len(args) > 1 else kwargs.get("max", 0))
+    else:
+        if len(args) > 1:
+            props["min"] = str(args[1])
+        elif "min" in kwargs and kwargs["min"] is not None:
+            props["min"] = str(kwargs["min"])
+        else:
+            props["min"] = str(-math.inf)
+
+        if len(args) > 2:
+            props["max"] = str(args[2])
+        elif "max" in kwargs and kwargs["max"] is not None:
+            props["max"] = str(kwargs["max"])
+        else:
+            props["max"] = str(math.inf)
 
 
 def map_method_node(node):
@@ -37,14 +78,14 @@ def map_method_node(node):
     """
     method_name = node.target  # string
     scope = node.meta.get("scope", "")
-    input_names = get_input_node_names(node)
+    input_names = _get_input_node_names(node)
 
     # === Simple ops (table lookup) ===
     layer_type = METHOD_SIMPLE_OPS.get(method_name)
     if layer_type is not None:
         return NNTrainerLayerDef(
             layer_type=layer_type,
-            name=make_scoped_name(scope, node),
+            name=_make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope if layer_type.endswith("_op") else "",
         )
@@ -54,7 +95,7 @@ def map_method_node(node):
     if act_type is not None:
         return NNTrainerLayerDef(
             layer_type=LAYER_ACTIVATION,
-            name=sanitize_name(scope) if scope else node.name,
+            name=_sanitize_name(scope) if scope else node.name,
             properties={"activation": act_type},
             input_layers=input_names,
             hf_module_name=scope,
@@ -75,7 +116,7 @@ def map_method_node(node):
     if method_name in METHOD_RESHAPE_NAMES:
         return NNTrainerLayerDef(
             layer_type=OP_RESHAPE,
-            name=make_scoped_name(scope, node),
+            name=_make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -85,7 +126,7 @@ def map_method_node(node):
     if decompose_props is not None:
         return NNTrainerLayerDef(
             layer_type=OP_UNSUPPORTED,
-            name=make_scoped_name(scope, node),
+            name=_make_scoped_name(scope, node),
             properties=dict(decompose_props),
             input_layers=input_names,
             hf_module_name=scope,
@@ -94,10 +135,10 @@ def map_method_node(node):
     # === Clamp ===
     if method_name in METHOD_CLAMP_NAMES:
         props = {"original_op": method_name}
-        extract_clamp_params(node, method_name, props)
+        _extract_clamp_params(node, method_name, props)
         return NNTrainerLayerDef(
             layer_type=LAYER_CLAMP,
-            name=make_scoped_name(scope, node),
+            name=_make_scoped_name(scope, node),
             properties=props,
             input_layers=input_names,
             hf_module_name=scope,
@@ -107,7 +148,7 @@ def map_method_node(node):
     if method_name in METHOD_SPLIT_NAMES:
         return NNTrainerLayerDef(
             layer_type="split",
-            name=make_scoped_name(scope, node),
+            name=_make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -116,7 +157,7 @@ def map_method_node(node):
     if method_name in METHOD_NOOP_NAMES:
         return NNTrainerLayerDef(
             layer_type=OP_NOOP,
-            name=make_scoped_name(scope, node),
+            name=_make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -125,7 +166,7 @@ def map_method_node(node):
     print(f"  [WARNING] Unmapped method: {method_name} in scope={scope}")
     return NNTrainerLayerDef(
         layer_type=f"unknown_method({method_name})",
-        name=make_scoped_name(scope, node),
+        name=_make_scoped_name(scope, node),
         input_layers=input_names,
         hf_module_name=scope,
     )
