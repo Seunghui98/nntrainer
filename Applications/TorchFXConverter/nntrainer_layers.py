@@ -143,17 +143,6 @@ LAYER_RNN = "rnn"
 LAYER_GRUCELL = "grucell"
 LAYER_LSTMCELL = "lstmcell"
 LAYER_RNNCELL = "rnncell"
-LAYER_ZONEOUT_LSTMCELL = "zoneout_lstmcell"
-
-# State Space Model (Mamba) layers
-LAYER_SSM = "ssm"  # Selective State Space Model (MambaMixer)
-
-# Loss layers
-LAYER_LOSS_MSE = "mse"
-LAYER_LOSS_CROSS_ENTROPY_SOFTMAX = "cross_softmax"
-LAYER_LOSS_CROSS_ENTROPY_SIGMOID = "cross_sigmoid"
-LAYER_LOSS_KLD = "kld"
-LAYER_LOSS_CONSTANT_DERIVATIVE = "constant_derivative"
 
 # Convolution & pooling
 LAYER_CONV1D = "conv1d"
@@ -171,14 +160,8 @@ LAYER_CHANNEL_SHUFFLE = "channel_shuffle"
 LAYER_L2NORM = "preprocess_l2norm"
 LAYER_MHA = "multi_head_attention"
 
-# Utility layers
-LAYER_CHANNEL_SHUFFLE = "channel_shuffle"
-LAYER_L2NORM = "preprocess_l2norm"
-LAYER_MHA = "multi_head_attention"
-
 # Activation type strings (for LAYER_ACTIVATION)
 ACT_RELU = "relu"
-ACT_LEAKY_RELU = "leaky_relu"
 ACT_GELU = "gelu"
 ACT_SWISH = "swish"  # SiLU = Swish
 ACT_SIGMOID = "sigmoid"
