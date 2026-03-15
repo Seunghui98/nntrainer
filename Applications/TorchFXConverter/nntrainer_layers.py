@@ -171,6 +171,11 @@ LAYER_CHANNEL_SHUFFLE = "channel_shuffle"
 LAYER_L2NORM = "preprocess_l2norm"
 LAYER_MHA = "multi_head_attention"
 
+# Utility layers
+LAYER_CHANNEL_SHUFFLE = "channel_shuffle"
+LAYER_L2NORM = "preprocess_l2norm"
+LAYER_MHA = "multi_head_attention"
+
 # Activation type strings (for LAYER_ACTIVATION)
 ACT_RELU = "relu"
 ACT_LEAKY_RELU = "leaky_relu"
