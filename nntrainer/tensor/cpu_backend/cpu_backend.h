@@ -640,7 +640,7 @@ extern void init_backend();
  * @param src q4_0 data
  * @param d_out scale data
  * @param qs_out quantized data
- * @param N number of block
+ * @param N number of ppppblock
  * @param K dim K
  */
 extern void unpack_q4_0x8_transpose16(const void *src, uint16_t *d_out,
@@ -704,6 +704,17 @@ extern void tanh_gelu(const unsigned int N, const float *X, float *Y);
  * @param Y float * for Vector Y (output)
  */
 extern void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
+
+
+/**
+ * @brief gelu function with neon but as
+ * 
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+extern void gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
  * @brief tanh_gelu function with neon but as
