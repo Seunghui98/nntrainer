@@ -1266,6 +1266,8 @@ void run_gemm_benchmark_comparison(const uint32_t M, const uint32_t K,
 }
 
 
+
+
 static void causal_conv1d_channellast_fp16_w3_ref(
   const __fp16 *x, const __fp16 *weight, const __fp16 *bias, __fp16 *out, int batch,
   int seqlen, int dim, bool silu_activation) {
@@ -1292,6 +1294,33 @@ static void causal_conv1d_channellast_fp16_w3_ref(
   }
 }
 
+static void causal_conv1d_channellast_fp16_w3_weight_reuse_ref(
+  const __fp16 *x, const __fp16 *weight, const __fp16 *bias, __fp16 *out, int batch,
+  int seqlen, int dim, bool silu_activation) {
+  const __fp16 *w0 = weight + 0 * dim;
+  const __fp16 *w1 = weight + 1 * dim;
+  const __fp16 *w2 = weight + 2 * dim;
+
+  for (int b = 0; b < batch; ++b) {
+    for (int c = 0; c < dim; ++c) {
+      for (int t = 0; t < seqlen; ++t) {
+        float acc = bias ? (float)bias[c] : 0.0f;
+        if (t >= 2)
+          acc += (float)x[(b * seqlen + (t - 2)) * dim + c] * (float)w0[c];
+        if (t >= 1)
+          acc += (float)x[(b * seqlen + (t - 1)) * dim + c] * (float)w1[c];
+        acc += (float)x[(b * seqlen + t) * dim + c] * (float)w2[c];
+
+        if (silu_activation) {
+          acc = acc / (1.0f + std::exp(-acc));
+        }
+        out[(b * seqlen + t) * dim + c] = (__fp16)acc;
+      }
+    }
+  }
+}
+
+
 static void repack_weight_c3_to_3c_fp16(const __fp16 *src_c3, __fp16 *dst_3c,
                                         int dim) {
   for (int c = 0; c < dim; ++c) {
@@ -1301,21 +1330,7 @@ static void repack_weight_c3_to_3c_fp16(const __fp16 *src_c3, __fp16 *dst_3c,
   }
 }
 
-
-
-
-TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_32x1024x4096) {
-  run_gemm_benchmark_comparison(32, 1024, 4096);
-}
-
-TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_1x3072x512) {
-  run_gemm_benchmark_comparison(1, 3072, 512);
-}
-
-TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic) {
-  const int B = 1;
-  const int L = 1024;
-  const int C = 2560;
+void run_causal_conv1d_accuracy_test(const int B, const int L, const int C){
 
   std::vector<__fp16> x = generate_random_vector<__fp16>(B * L * C);
   std::vector<__fp16> weight_c3 = generate_random_vector<__fp16>(C * 3);
@@ -1338,6 +1353,190 @@ TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic) {
 
   ASSERT_LE(mse, B*L*C*1e-5);
 }
+
+void run_causal_conv1d_accuracy_test(const int B, const int L, const int C, bool silu){
+
+  std::vector<__fp16> x = generate_random_vector<__fp16>(B * L * C);
+  std::vector<__fp16> weight_c3 = generate_random_vector<__fp16>(C * 3);
+  std::vector<__fp16> weight_3c(3 * C);
+  std::vector<__fp16> bias = generate_random_vector<__fp16>(C);
+  std::vector<__fp16> ref(B * L * C, (__fp16)0);
+  std::vector<__fp16> out(B * L * C, (__fp16)0);
+
+  repack_weight_c3_to_3c_fp16(weight_c3.data(), weight_3c.data(), C);
+
+  causal_conv1d_channellast_fp16_w3_ref(x.data(), weight_3c.data(), bias.data(),
+                                        ref.data(), B, L, C, silu);
+  nntrainer::causal_conv1d_fp16_w3(x.data(), weight_3c.data(), bias.data(),
+                                    out.data(), B, L, C, silu);
+
+  auto mse = compute_mse<__fp16>(B * L, C, ref, out, false);
+  auto cos_sim =
+    cosine_similarity<__fp16, __fp16>(ref.data(), out.data(), B * L * C);
+  auto max_diff = find_max_diff<__fp16>(ref.data(), out.data(), B * L, C);
+
+  ASSERT_LE(mse, B*L*C*1e-5);
+}
+
+void run_causal_conv1d_weight_reuse_accuracy_test(const int B, const int L, const int C, bool silu){
+
+  std::vector<__fp16> x = generate_random_vector<__fp16>(B * L * C);
+  std::vector<__fp16> weight_c3 = generate_random_vector<__fp16>(C * 3);
+  std::vector<__fp16> weight_3c(3 * C);
+  std::vector<__fp16> bias = generate_random_vector<__fp16>(C);
+  std::vector<__fp16> ref(B * L * C, (__fp16)0);
+  std::vector<__fp16> out(B * L * C, (__fp16)0);
+
+  repack_weight_c3_to_3c_fp16(weight_c3.data(), weight_3c.data(), C);
+
+  causal_conv1d_channellast_fp16_w3_weight_reuse_ref(x.data(), weight_3c.data(), bias.data(),
+                                        ref.data(), B, L, C, silu);
+  nntrainer::causal_conv1d_fp16_w3_weight_reuse(x.data(), weight_3c.data(), bias.data(),
+                                    out.data(), B, L, C, silu);
+
+  auto mse = compute_mse<__fp16>(B * L, C, ref, out, false);
+  auto cos_sim =
+    cosine_similarity<__fp16, __fp16>(ref.data(), out.data(), B * L * C);
+  auto max_diff = find_max_diff<__fp16>(ref.data(), out.data(), B * L, C);
+
+  ASSERT_LE(mse, B*L*C*1e-5);
+}
+
+void run_causal_conv1d_weight_time_test(const int B, const int L, const int C, bool silu){
+
+  const int test_iters = 100;
+
+  std::vector<__fp16> x = generate_random_vector<__fp16>(B * L * C);
+  std::vector<__fp16> weight_c3 = generate_random_vector<__fp16>(C * 3);
+  std::vector<__fp16> weight_3c(3 * C);
+  std::vector<__fp16> bias = generate_random_vector<__fp16>(C);
+  std::vector<__fp16> ref(B * L * C, (__fp16)0);
+  std::vector<__fp16> out(B * L * C, (__fp16)0);
+
+  repack_weight_c3_to_3c_fp16(weight_c3.data(), weight_3c.data(), C);
+  
+  nanoseconds total_time_q4_0 = nanoseconds(0);
+  for(int t = 0; t < test_iters; t++){
+    auto t1 = high_resolution_clock::now();
+    nntrainer::causal_conv1d_fp16_w3(x.data(), weight_3c.data(), bias.data(),
+                                    out.data(), B, L, C, silu);
+    auto t2 = high_resolution_clock::now();
+    total_time_q4_0 += duration_cast<nanoseconds>(t2 - t1);
+  }
+
+  nanoseconds total_time_q4_1 = nanoseconds(0);
+  for(int t = 0; t < test_iters; t++){
+    auto t1 = high_resolution_clock::now();
+    nntrainer::causal_conv1d_fp16_w3_weight_reuse(x.data(), weight_3c.data(), bias.data(),
+                                    out.data(), B, L, C, silu);
+    auto t2 = high_resolution_clock::now();
+    total_time_q4_1 += duration_cast<nanoseconds>(t2 - t1);
+  }
+
+  auto avg_4_0 = total_time_q4_0.count() / test_iters;
+  auto avg_4_1 = total_time_q4_1.count() / test_iters;
+
+
+  std::cout << "\n-----------------------------------------" << std::endl;
+    std::cout << "[RESULT] Average latency over " << test_iters
+              << " iterations:" << std::endl;
+    std::cout << "-----------------------------------------" << std::endl;
+    std::cout << "  causal_conv1d_original: "  << avg_4_0 <<  " ns " << std::endl;
+    std::cout << "  causal_conv1d_weight_reuse: "  << avg_4_1 <<  " ns " << std::endl;
+    std::cout << "-----------------------------------------\n" << std::endl;
+  
+}
+
+
+
+TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_32x1024x4096) {
+  run_gemm_benchmark_comparison(32, 1024, 4096);
+}
+
+TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_1x3072x512) {
+  run_gemm_benchmark_comparison(1, 3072, 512);
+}
+
+
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic_1x3072x3072) {
+  run_causal_conv1d_accuracy_test(1, 3072, 3072, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic_1x3072x3072_2) {
+  run_causal_conv1d_accuracy_test(1, 3072, 3072, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic_1x1024x4096) {
+  run_causal_conv1d_accuracy_test(1, 1024, 4096, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic_1x1024x4096_2) {
+  run_causal_conv1d_accuracy_test(1, 1024, 4096, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic_1x4096x1024) {
+  run_causal_conv1d_accuracy_test(1, 4096, 1024, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_basic_1x4096x1024_2) {
+  run_causal_conv1d_accuracy_test(1, 4096, 1024, true);
+}
+
+
+
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_wr_1x3072x3072) {
+  run_causal_conv1d_weight_reuse_accuracy_test(1, 3072, 3072, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_wr_1x3072x3072_2) {
+  run_causal_conv1d_weight_reuse_accuracy_test(1, 3072, 3072, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_wr_1x1024x4096) {
+  run_causal_conv1d_weight_reuse_accuracy_test(1, 1024, 4096, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_wr_1x1024x4096_2) {
+  run_causal_conv1d_weight_reuse_accuracy_test(1, 1024, 4096, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_wr_1x4096x1024) {
+  run_causal_conv1d_weight_reuse_accuracy_test(1, 4096, 1024, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_wr_1x4096x1024_2) {
+  run_causal_conv1d_weight_reuse_accuracy_test(1, 4096, 1024, true);
+}
+
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_time_1x3072x3072) {
+  run_causal_conv1d_weight_time_test(1, 3072, 3072, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_time_1x3072x3072_2) {
+  run_causal_conv1d_weight_time_test(1, 3072, 3072, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_time_1x1024x4096) {
+  run_causal_conv1d_weight_time_test(1, 1024, 4096, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_time_1x1024x4096_2) {
+  run_causal_conv1d_weight_time_test(1, 1024, 4096, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_time_1x4096x1024) {
+  run_causal_conv1d_weight_time_test(1, 4096, 1024, false);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_conv1d_w3_fp16_time_1x4096x1024_2) {
+  run_causal_conv1d_weight_time_test(1, 4096, 1024, true);
+}
+
+
+
 
 int main(int argc, char **argv) {
   int result = -1;

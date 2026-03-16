@@ -441,6 +441,17 @@ void causal_conv1d_channellast_fp16_w3(
     const unsigned int W,
     bool silu_activation);
 
+
+void causal_conv1d_channellast_fp16_w3_weight_reuse(
+    __fp16 * x,       
+    const __fp16 * weight,  
+    const __fp16 * bias,    
+    __fp16 * out,         
+    const unsigned int B,
+    const unsigned int H,
+    const unsigned int W,
+    bool silu_activation);
+
 #endif
 
 /**

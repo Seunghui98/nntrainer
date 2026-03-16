@@ -2639,8 +2639,8 @@ static inline float16x8_t silu_f16x8(float16x8_t x) {
 
   float32x4_t ones = vdupq_n_f32(1.0f);
 
-  float32x4_t exp_x_lo = exp_ps(x_lo);
-  float32x4_t exp_x_hi = exp_ps(x_hi);
+  float32x4_t exp_x_lo = exp_ps(vnegq_f32(x_lo));
+  float32x4_t exp_x_hi = exp_ps(vnegq_f32(x_hi));
 
   exp_x_lo = vaddq_f32(exp_x_lo, ones);
   exp_x_hi = vaddq_f32(exp_x_hi, ones);
@@ -2684,7 +2684,7 @@ void causal_conv1d_channellast_fp16_w3(
       __fp16 *y = out_b;
 
       int c = 0;
-
+      
       for (; c + kVec <= W; c += kVec) {
         float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
         float16x8_t w2 = vld1q_f16(w2_base + c);
@@ -2785,5 +2785,125 @@ void causal_conv1d_channellast_fp16_w3(
   }
 }
 
+
+void causal_conv1d_channellast_fp16_w3_weight_reuse(
+    const __fp16 *x,
+    const __fp16 *weight,
+    const __fp16 *bias,
+    __fp16 *out,
+    const unsigned int B,
+    const unsigned int H,
+    const unsigned int W,
+    bool silu_activation) {
+
+  constexpr unsigned int kVec = 8;
+
+  if (B == 0 || H == 0 || W == 0) {
+    return;
+  }
+
+  const unsigned int batch_stride = H * W;
+
+  const __fp16 *w0_base = weight;
+  const __fp16 *w1_base = weight + W;
+  const __fp16 *w2_base = weight + 2 * W;
+
+  for (unsigned int b = 0; b < B; ++b) {
+    const __fp16 *x_b = x + b * batch_stride;
+    __fp16 *out_b = out + b * batch_stride;
+
+    // vector path: weight/bias를 c-block 당 한 번만 load
+    unsigned int c = 0;
+    for (; c + kVec <= W; c += kVec) {
+      const float16x8_t w0 = vld1q_f16(w0_base + c);
+      const float16x8_t w1 = vld1q_f16(w1_base + c);
+      const float16x8_t w2 = vld1q_f16(w2_base + c);
+      const float16x8_t bvec =
+        bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
+
+      // t = 0
+      {
+        const __fp16 *x2 = x_b + c;
+        float16x8_t acc = vfmaq_f16(bvec, vld1q_f16(x2), w2);
+        if (silu_activation) {
+          acc = silu_f16x8(acc);
+        }
+        vst1q_f16(out_b + c, acc);
+      }
+
+      // t = 1
+      if (H > 1) {
+        const __fp16 *x1 = x_b + c;
+        const __fp16 *x2 = x_b + W + c;
+
+        float16x8_t acc = bvec;
+        acc = vfmaq_f16(acc, vld1q_f16(x1), w1);
+        acc = vfmaq_f16(acc, vld1q_f16(x2), w2);
+
+        if (silu_activation) {
+          acc = silu_f16x8(acc);
+        }
+        vst1q_f16(out_b + W + c, acc);
+      }
+
+      // t >= 2
+      for (unsigned int t = 2; t < H; ++t) {
+        const __fp16 *x0 = x_b + (t - 2) * W + c;
+        const __fp16 *x1 = x_b + (t - 1) * W + c;
+        const __fp16 *x2 = x_b + t * W + c;
+
+        float16x8_t acc = bvec;
+        acc = vfmaq_f16(acc, vld1q_f16(x0), w0);
+        acc = vfmaq_f16(acc, vld1q_f16(x1), w1);
+        acc = vfmaq_f16(acc, vld1q_f16(x2), w2);
+
+        if (silu_activation) {
+          acc = silu_f16x8(acc);
+        }
+        vst1q_f16(out_b + t * W + c, acc);
+      }
+    }
+
+    // tail scalar path
+    for (; c < W; ++c) {
+      const __fp16 w0 = w0_base[c];
+      const __fp16 w1 = w1_base[c];
+      const __fp16 w2 = w2_base[c];
+      const __fp16 bc = bias ? bias[c] : (__fp16)0;
+
+      // t = 0
+      {
+        __fp16 acc = static_cast<__fp16>(bc + x_b[c] * w2);
+        if (silu_activation) {
+          acc = silu_scalar_f16(acc);
+        }
+        out_b[c] = acc;
+      }
+
+      // t = 1
+      if (H > 1) {
+        __fp16 acc = bc;
+        acc = static_cast<__fp16>(acc + x_b[c] * w1);
+        acc = static_cast<__fp16>(acc + x_b[W + c] * w2);
+        if (silu_activation) {
+          acc = silu_scalar_f16(acc);
+        }
+        out_b[W + c] = acc;
+      }
+
+      // t >= 2
+      for (unsigned int t = 2; t < H; ++t) {
+        __fp16 acc = bc;
+        acc = static_cast<__fp16>(acc + x_b[(t - 2) * W + c] * w0);
+        acc = static_cast<__fp16>(acc + x_b[(t - 1) * W + c] * w1);
+        acc = static_cast<__fp16>(acc + x_b[t * W + c] * w2);
+        if (silu_activation) {
+          acc = silu_scalar_f16(acc);
+        }
+        out_b[t * W + c] = acc;
+      }
+    }
+  }
+}
 
 } // namespace nntrainer::neon
