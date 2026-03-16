@@ -2787,7 +2787,7 @@ void causal_conv1d_channellast_fp16_w3(
 
 
 void causal_conv1d_channellast_fp16_w3_weight_reuse(
-    const __fp16 *x,
+    __fp16 *x,
     const __fp16 *weight,
     const __fp16 *bias,
     __fp16 *out,
