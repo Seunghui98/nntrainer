@@ -397,7 +397,7 @@ void MHACoreLayer::compute_kcaches(
       const uint16_t *cache_data = cache.getData<uint16_t>();
       float *out_data = out.getData<float>();
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(4)
       for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
         nntrainer::compute_kcaches<uint16_t>(
           in_data, cache_data, out_data, row_to_compute, num_cache_head,
@@ -868,32 +868,65 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
 
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos)[from + h];
-            sin_ = &(*freqs_sin)[from + h];
+        unsigned int height = in.height();
+        if (height > 1) {
+          // Prefill path: parallelize over sequence positions
+#pragma omp parallel for schedule(static)
+          for (unsigned int h = 0; h < height; h++) {
+            std::vector<float> *lcos_ =
+              (from < max_timestep) ? &(*freqs_cos)[from + h] : nullptr;
+            std::vector<float> *lsin_ =
+              (from < max_timestep) ? &(*freqs_sin)[from + h] : nullptr;
+            float *in_ptr = in.getData<float>() +
+                            b * in.channel() * in.height() * in.width() +
+                            c * in.height() * in.width() + h * in.width();
+
+            if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+              nntrainer::compute_rotary_emb_value(
+                in.width(), dim, half_, in_ptr, nullptr, lcos_->data(),
+                lsin_->data(), convert_only);
+            } else if (out.getDataType() ==
+                         ml::train::TensorDim::DataType::UINT16 ||
+                       out.getDataType() ==
+                         ml::train::TensorDim::DataType::FP16) {
+              uint16_t *out_ptr =
+                out.getData<uint16_t>() +
+                b * out.channel() * out.height() * out.width() +
+                c * out.height() * out.width() + h * out.width();
+
+              nntrainer::compute_rotary_emb_value(
+                in.width(), dim, half_, in_ptr, out_ptr, lcos_->data(),
+                lsin_->data(), convert_only);
+            }
           }
-          float *in_ptr = in.getData<float>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
+        } else {
+          // Decode path (height == 1): no parallelism overhead needed
+          for (unsigned int h = 0; h < height; h++) {
+            if (from < max_timestep) {
+              cos_ = &(*freqs_cos)[from + h];
+              sin_ = &(*freqs_sin)[from + h];
+            }
+            float *in_ptr = in.getData<float>() +
+                            b * in.channel() * in.height() * in.width() +
+                            c * in.height() * in.width() + h * in.width();
 
-          if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+            if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+              nntrainer::compute_rotary_emb_value(in.width(), dim, half_,
+                                                  in_ptr, nullptr, cos_->data(),
+                                                  sin_->data(), convert_only);
+            } else if (out.getDataType() ==
+                         ml::train::TensorDim::DataType::UINT16 ||
+                       out.getDataType() ==
+                         ml::train::TensorDim::DataType::FP16) {
+              uint16_t *out_ptr =
+                out.getData<uint16_t>() +
+                b * out.channel() * out.height() * out.width() +
+                c * out.height() * out.width() + h * out.width();
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                nullptr, cos_->data(),
-                                                sin_->data(), convert_only);
-          } else if (out.getDataType() ==
-                       ml::train::TensorDim::DataType::UINT16 ||
-                     out.getDataType() ==
-                       ml::train::TensorDim::DataType::FP16) {
-            uint16_t *out_ptr = out.getData<uint16_t>() +
-                                b * out.channel() * out.height() * out.width() +
-                                c * out.height() * out.width() +
-                                h * out.width();
-
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), convert_only);
+              nntrainer::compute_rotary_emb_value(in.width(), dim, half_,
+                                                  in_ptr, out_ptr, cos_->data(),
+                                                  sin_->data(), convert_only);
+            }
           }
         }
       }
@@ -911,21 +944,44 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
 
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos_fp16)[from + h];
-            sin_ = &(*freqs_sin_fp16)[from + h];
-          }
-          _FP16 *in_ptr = in.getData<_FP16>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
-          _FP16 *out_ptr = out.getData<_FP16>() +
-                           b * out.channel() * out.height() * out.width() +
-                           c * out.height() * out.width() + h * out.width();
+        unsigned int height = in.height();
+        if (height > 1) {
+          // Prefill path: parallelize over sequence positions
+#pragma omp parallel for schedule(static)
+          for (unsigned int h = 0; h < height; h++) {
+            std::vector<_FP16> *lcos_ =
+              (from < max_timestep) ? &(*freqs_cos_fp16)[from + h] : nullptr;
+            std::vector<_FP16> *lsin_ =
+              (from < max_timestep) ? &(*freqs_sin_fp16)[from + h] : nullptr;
+            _FP16 *in_ptr = in.getData<_FP16>() +
+                            b * in.channel() * in.height() * in.width() +
+                            c * in.height() * in.width() + h * in.width();
+            _FP16 *out_ptr = out.getData<_FP16>() +
+                             b * out.channel() * out.height() * out.width() +
+                             c * out.height() * out.width() + h * out.width();
 
-          nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                              out_ptr, cos_->data(),
-                                              sin_->data());
+            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
+                                                out_ptr, lcos_->data(),
+                                                lsin_->data());
+          }
+        } else {
+          // Decode path (height == 1): no parallelism overhead needed
+          for (unsigned int h = 0; h < height; h++) {
+            if (from < max_timestep) {
+              cos_ = &(*freqs_cos_fp16)[from + h];
+              sin_ = &(*freqs_sin_fp16)[from + h];
+            }
+            _FP16 *in_ptr = in.getData<_FP16>() +
+                            b * in.channel() * in.height() * in.width() +
+                            c * in.height() * in.width() + h * in.width();
+            _FP16 *out_ptr = out.getData<_FP16>() +
+                             b * out.channel() * out.height() * out.width() +
+                             c * out.height() * out.width() + h * out.width();
+
+            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
+                                                out_ptr, cos_->data(),
+                                                sin_->data());
+          }
         }
       }
     }
