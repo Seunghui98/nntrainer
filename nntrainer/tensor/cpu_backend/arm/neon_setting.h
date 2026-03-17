@@ -14,6 +14,32 @@
 
 #include <omp.h>
 
+#include <cstdlib>
+#include <thread>
+
+/**
+ * @brief Get runtime thread count from OMP_NUM_THREADS environment variable.
+ * Falls back to hardware_concurrency()/2 if not set.
+ *
+ * @return int thread count to use
+ */
+inline int get_runtime_omp_num_threads() {
+  static int cached = -1;
+  if (cached > 0)
+    return cached;
+  const char *env = std::getenv("OMP_NUM_THREADS");
+  if (env != nullptr) {
+    int val = std::atoi(env);
+    if (val > 0) {
+      cached = val;
+      return cached;
+    }
+  }
+  int hw = static_cast<int>(std::thread::hardware_concurrency());
+  cached = (hw > 1) ? hw / 2 : 1;
+  return cached;
+}
+
 /// @note This variable should be optimized by user
 /// @todo Must find a general solution to optimize the functionality of
 /// multithreading : determining the combination of #threads and size of

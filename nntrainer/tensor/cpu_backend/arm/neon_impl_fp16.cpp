@@ -326,9 +326,7 @@ void hgemv(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M, uint32_t N,
 
 void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
                      uint32_t N, float alpha, float beta) {
-#ifdef OMP_NUM_THREADS
-  set_gemv_num_threads(OMP_NUM_THREADS);
-#endif
+  set_gemv_num_threads(get_runtime_omp_num_threads());
   size_t GEMV_NUM_THREADS = get_gemv_num_threads();
 
   float *Y32 = new float[N];
