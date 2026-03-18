@@ -9,6 +9,7 @@ causallm_mha_core_abs = [meson.current_source_dir()/ 'mha_core.cpp']
 causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp']
 causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms_norm.cpp']
 causallm_qkv_layer_src_abs = [meson.current_source_dir() / 'qkv_layer.cpp']
+causallm_gate_up_layer_src_abs = [meson.current_source_dir() / 'gate_up_layer.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
 causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_attention_layer.cpp']
@@ -158,6 +159,15 @@ causallm_deberta_attention_layer = shared_library(
     install_dir: application_install_dir
 )
 
+causallm_gate_up_layer = shared_library(
+    'gate_up_layer',
+    causallm_gate_up_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
 causallm_deberta_attention_layer_dep = declare_dependency(
     link_with: causallm_deberta_attention_layer,
     include_directories: causallm_layer_inc
@@ -202,5 +212,10 @@ causallm_custom_gru_layer = shared_library(
 
 causallm_custom_gru_layer_dep = declare_dependency(
     link_with: causallm_custom_gru_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_gate_up_layer_dep = declare_dependency(
+    link_with: causallm_gate_up_layer,
     include_directories: causallm_layer_inc
 )

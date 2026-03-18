@@ -197,7 +197,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
                                 QA.data(), M, M_step_end - M_step_start);
       }
     } else {
-      int n_threads = 1;
+      int n_threads = 4;
       // std::cout << "Parrallel gemv Ns.size(): " << Ns.size() << std::endl;
 #pragma omp parallel for num_threads(n_threads)
       for (int i = 0; i < n_threads; ++i) {

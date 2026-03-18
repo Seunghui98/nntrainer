@@ -26,6 +26,7 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <gate_up_layer.h>
 #include <reshaped_rms_norm.h>
 
 namespace causallm {
@@ -102,6 +103,39 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
   return layers;
 }
 
+std::vector<LayerHandle> Qwen3Transformer::createMlp(const int layer_id,
+                                                     int dim, int hidden_dim,
+                                                     std::string input_name) {
+  std::vector<LayerHandle> layers;
+
+  auto GATE_UP = "layer" + std::to_string(layer_id) + "_ffn_gate_up";
+
+  // Fused GateUp layer — single input quantization + multi-weight GEMV
+  std::vector<std::string> gate_up_params = {
+    withKey("name", GATE_UP),
+    withKey("up_unit", hidden_dim),
+    withKey("gate_unit", hidden_dim),
+    withKey("disable_bias", "true"),
+    withKey("input_layers", input_name),
+    withKey("weight_initializer", "ones")};
+  layers.push_back(createLayer("gate_up_layer", gate_up_params));
+
+  layers.push_back(createLayer(
+    "swiglu",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("input_layers", GATE_UP + "(1)," + GATE_UP + "(0)")}));
+
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
+     withKey("unit", dim), withKey("disable_bias", "true"),
+     withKey("input_layers",
+             "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("weight_initializer", "ones")}));
+
+  return layers;
+}
+
 void Qwen3Transformer::registerCustomLayers() {
   ///
   auto &ct_engine = nntrainer::Engine::Global();
@@ -111,6 +145,7 @@ void Qwen3Transformer::registerCustomLayers() {
   try {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    app_context->registerFactory(nntrainer::createLayer<causallm::GateUpLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
