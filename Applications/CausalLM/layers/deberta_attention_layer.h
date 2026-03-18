@@ -4,19 +4,28 @@
  *
  * @file   deberta_attention_layer.h
  * @date   14 January 2026
- * @see    https://github.com/nntrainer/nntrainer
+ * @see    https://github.com/huggingface/transformers/blob/5c1c72b/src/transformers/models/deberta/modeling_deberta.py
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  Please refer to the following code :
- * https://github.com/huggingface/transformers/blob/5c1c72b/src/transformers/models/deberta/modeling_deberta.py
+ * @brief  DeBERTa attention layer based on mha_core-style optimized path
  */
 
 #ifndef __DEBERTA_ATTENTION_LAYER_H__
 #define __DEBERTA_ATTENTION_LAYER_H__
 
+#include <array>
+#include <mutex>
+#include <tuple>
+#include <vector>
+
+#include <bs_thread_pool_manager.hpp>
+#include <common_properties.h>
+#include <cpu_backend.h>
 #include <layer_impl.h>
 #include <util_func.h>
-#include <common_properties.h>
+#include <util_simd.h>
+
+#include <limits.h>
 
 namespace causallm {
 
@@ -106,7 +115,7 @@ public:
 
 /**
  * @class DebertaAttentionLayer
- * @brief Deberta Attention Layer
+ * @brief DeBERTa Attention Layer
  */
 class DebertaAttentionLayer : public nntrainer::LayerImpl {
 public:
@@ -118,7 +127,7 @@ public:
   /**
    * @brief Destroy the Deberta Attention Layer object
    */
-  ~DebertaAttentionLayer();
+  ~DebertaAttentionLayer() override;
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
@@ -131,8 +140,8 @@ public:
   void forwarding(nntrainer::RunLayerContext &context, bool training) override;
 
   /**
-   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-   * int from, unsigned int to, bool training)
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context,
+   * unsigned int from, unsigned int to, bool training)
    */
   void incremental_forwarding(nntrainer::RunLayerContext &context,
                               unsigned int from, unsigned int to,
@@ -162,33 +171,155 @@ public:
   /**
    * @copydoc Layer::getType()
    */
-  const std::string getType() const override { return DebertaAttentionLayer::type; };
+  const std::string getType() const override {
+    return DebertaAttentionLayer::type;
+  }
 
   static constexpr const char *type = "deberta_attention";
-  
+
   /**
    * @copydoc Layer::supportBackwarding()
    */
   bool supportBackwarding() const override { return false; }
 
+  /**
+   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   */
+  void setBatch(nntrainer::RunLayerContext &context,
+                unsigned int batch) override;
+
+  /**
+   * @copydoc Layer::updateTensorsByInputDimensions(...)
+   */
+  void updateTensorsByInputDimensions(
+    nntrainer::RunLayerContext &context,
+    std::vector<nntrainer::TensorDim> input_dimensions) override;
+
+  /**
+   * @brief wrapper around nntrainer::compute_kcaches
+   */
+  void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
+                       nntrainer::Tensor &out, unsigned int from,
+                       size_t sequence_len, unsigned int num_heads,
+                       unsigned int group_size, unsigned int head_dim,
+                       BS::thread_pool<> &pool);
+
+  /**
+   * @brief softmax helper for score tensor
+   */
+  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
+                        size_t num_heads, unsigned int from,
+                        BS::thread_pool<> &pool);
+
+  /**
+   * @brief wrapper around nntrainer::compute_fp16vcache_transposed
+   */
+  void compute_fp16vcache_transposed(nntrainer::Tensor &in,
+                                     nntrainer::Tensor &vcache,
+                                     nntrainer::Tensor &output, int from,
+                                     int num_cache_head, int gqa_size,
+                                     int head_dim, int to,
+                                     BS::thread_pool<> &pool);
+
 private:
+  enum InputIndex {
+    INPUT_IDX_Q = 0,
+    INPUT_IDX_K = 1,
+    INPUT_IDX_V = 2,
+  };
+
+  enum OutputIndex {
+    OUTPUT_IDX = 0,
+  };
+
+  enum AttentionParams {
+    cache_key = 0,
+    cache_value = 1,
+    max_params
+  };
+
+  /**
+   * @brief one-batch incremental forwarding path
+   *
+   * This follows mha_core-style execution:
+   *   compute_kcaches()
+   *   -> add_relative_attn_score()
+   *   -> softmax_triangle()
+   *   -> compute_fp16vcache_transposed()
+   */
+  void one_batch_incremental_forwarding(
+    nntrainer::RunLayerContext &context,
+    const unsigned int batch, const unsigned int _from, const unsigned int from,
+    const unsigned int to, nntrainer::Tensor &query_step,
+    nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
+    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
+    nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+    ml::train::TensorDim &cache_key_step_dim,
+    ml::train::TensorDim &cache_value_dim,
+    ml::train::TensorDim &cache_value_step_dim);
+
+  /**
+   * @brief add DeBERTa relative attention score (c2p / p2c)
+   * into already computed qk score
+   */
+  void add_relative_attn_score(nntrainer::RunLayerContext &context,
+                               nntrainer::Tensor &score,
+                               nntrainer::Tensor &query_step,
+                               nntrainer::Tensor &key_cache,
+                               unsigned int from, unsigned int to);
+
+  /**
+   * @brief bucket helper
+   */
   int make_log_bucket_position(int relative_pos, int bucket_size,
                                int max_position);
 
-  void one_batch_incremental_forwarding(
-    const unsigned int batch, const unsigned int from, const unsigned int to,
-    nntrainer::Tensor &query_step, nntrainer::Tensor &key_step,
-    nntrainer::Tensor &value_step, nntrainer::Tensor &rel_embeddings,
-    nntrainer::Tensor &output_step, nntrainer::Tensor &mask_step, nntrainer::RunLayerContext &context);
+  /**
+   * @brief precompute bucket lookup table
+   */
+  void prepare_bucket_table(unsigned int max_seq_len);
+
+  /**
+   * @brief lookup precomputed bucket
+   */
+  int lookup_bucket(int relative_pos) const;
 
 private:
   std::tuple<nntrainer::props::NumHeads, props::MaxPositionEmbeddings,
              props::MaxRelativePositions, props::C2P, props::P2C,
              props::ShareAttKey, props::RelativeAttention,
-             props::PositionBuckets, props::InputLen, nntrainer::props::DisableBias>
+             props::PositionBuckets, props::InputLen,
+             nntrainer::props::DisableBias>
     deberta_props;
 
-  std::vector<unsigned int> weight_idx;
+  /**
+   * @brief internal tensor indices
+   */
+  std::array<unsigned int, max_params> tensor_idx;
+
+  /**
+   * @brief common runtime states, kept similar to mha_core
+   */
+  float epsilon;
+  size_t num_heads_Q;
+  size_t num_heads_KV;
+  size_t head_dim;
+
+  unsigned int max_position_embeddings;
+  unsigned int max_relative_positions;
+  int position_buckets;
+  unsigned int local_window_size;
+
+  float attn_logit_softcapping;
+  bool is_causal;
+
+  /**
+   * @brief relative bucket lookup table
+   */
+  std::vector<int> bucket_table;
+  unsigned int bucket_table_max_seq_len;
+  bool bucket_table_ready;
+  mutable std::mutex bucket_mtx;
 };
 
 } // namespace causallm

@@ -3,83 +3,287 @@
  * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
  *
  * @file   deberta_attention_layer.cpp
- * @date   14 January 2026
+ * @date   16 March 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  Please refer to the following code :
- * https://github.com/huggingface/transformers/blob/5c1c72b/src/transformers/models/deberta/modeling_deberta.py
+ * @brief  DeBERTa Attention Layer based on mha_core optimized path.
+ *
+ *         Main execution flow:
+ *           1) compute_kcaches()               -> content-to-content score
+ *           2) rescale content score           -> match DeBERTa scaling
+ *           3) add_relative_attn_score()       -> add c2p / p2c score
+ *           4) softmax_triangle()              -> softmax on score
+ *           5) compute_fp16vcache_transposed() -> score * value
  */
 
 #include <deberta_attention_layer.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <future>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include <omp.h>
+
 #include <common_properties.h>
+#include <cpu_backend.h>
+#include <engine.h>
+#include <fp16.h>
+#include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <util_func.h>
 
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <vector>
-
-#include <cpu_backend.h>
+#if !defined(__ANDROID__)
+#include <cblas.h>
+#endif
 
 namespace causallm {
 
-static constexpr size_t INPUT_IDX_Q = 0;
-static constexpr size_t INPUT_IDX_K = 1;
-static constexpr size_t INPUT_IDX_V = 2;
-static constexpr size_t OUTPUT_IDX = 0;
+#define tile_size 4
 
+namespace {
+
+/**
+ * @brief clamp helper
+ */
+template <typename T> static inline T clampv(T v, T lo, T hi) {
+  return std::min(std::max(v, lo), hi);
+}
+
+/**
+ * @brief exact bucket implementation used in the original working version
+ */
+static int compute_bucket_pos_impl(int relative_pos, int bucket_size,
+                                   int max_position) {
+  const int mid = bucket_size / 2;
+  const int sign = (relative_pos >= 0) ? 1 : -1;
+  const int abs_rp = std::abs(relative_pos);
+  const int abs_pos = (abs_rp < mid) ? (mid - 1) : abs_rp;
+
+  const double num = std::log((double)abs_pos / (double)mid);
+  const double den = std::log((double)(max_position - 1) / (double)mid);
+  int log_pos = (int)std::ceil(num / den * (mid - 1)) + mid;
+
+  return (abs_pos <= mid) ? relative_pos : (log_pos * sign);
+}
+
+/**
+ * @brief cache key for shared c2p/p2c relative index tables
+ *
+ * These indices depend only on relative geometry, not on layer weights.
+ * So all attention layers can reuse them.
+ */
+struct RelativeIndexKey {
+  unsigned int from;
+  unsigned int to;
+  unsigned int att_span;
+  unsigned int rel_len_q;
+  unsigned int rel_len_k;
+  bool c2p;
+  bool p2c;
+  bool use_bucket;
+
+  bool operator==(const RelativeIndexKey &rhs) const {
+    return from == rhs.from && to == rhs.to && att_span == rhs.att_span &&
+           rel_len_q == rhs.rel_len_q && rel_len_k == rhs.rel_len_k &&
+           c2p == rhs.c2p && p2c == rhs.p2c && use_bucket == rhs.use_bucket;
+  }
+};
+
+struct RelativeIndexValue {
+  std::vector<int> c2p_idx;
+  std::vector<int> p2c_idx;
+};
+
+/**
+ * Android/mobile path prefers avoiding global lock + deep copy on every call.
+ * Reuse per-thread relative index cache instead.
+ */
+static thread_local bool tl_rel_index_ready = false;
+static thread_local RelativeIndexKey tl_rel_index_key{};
+static thread_local RelativeIndexValue tl_rel_index_value{};
+
+/**
+ * Scratch buffer for unpacking key cache to FP32 in FP32 relative-attention path.
+ * Reused per-thread to avoid repeated allocation/resizing overhead.
+ */
+static thread_local std::vector<float> tl_key_cache_fp32_buf;
+
+} // namespace
+
+/**
+ * @brief constructor
+ */
 DebertaAttentionLayer::DebertaAttentionLayer() :
   LayerImpl(),
-  deberta_props(nntrainer::props::NumHeads(),
-                props::MaxPositionEmbeddings(),
-                props::MaxRelativePositions(),
-                props::C2P(), props::P2C(),
-                props::ShareAttKey(),
-                props::RelativeAttention(),
-                props::PositionBuckets(),
-                props::InputLen(),
-                nntrainer::props::DisableBias()) {}
+  deberta_props(nntrainer::props::NumHeads(), props::MaxPositionEmbeddings(),
+                props::MaxRelativePositions(), props::C2P(), props::P2C(),
+                props::ShareAttKey(), props::RelativeAttention(),
+                props::PositionBuckets(), props::InputLen(),
+                nntrainer::props::DisableBias()),
+  epsilon(1e-3f),
+  num_heads_Q(0),
+  num_heads_KV(0),
+  head_dim(0),
+  max_position_embeddings(0),
+  max_relative_positions(0),
+  position_buckets(0),
+  local_window_size(0),
+  attn_logit_softcapping(0.0f),
+  is_causal(false) {
+  tensor_idx.fill(std::numeric_limits<unsigned>::max());
+}
 
 DebertaAttentionLayer::~DebertaAttentionLayer() {}
 
+/**
+ * @brief finalize
+ */
 void DebertaAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
-  bool share_att_key = std::get<props::ShareAttKey>(deberta_props).get();
-  if (!share_att_key) {
-    throw nntrainer::exception::not_supported(
-      "DebertaAttentionLayer: share_att_key=false is not yet supported.");
-  }
+  const bool share_att_key = std::get<props::ShareAttKey>(deberta_props).get();
+  const bool relative_attention =
+    std::get<props::RelativeAttention>(deberta_props).get();
+  const bool c2p = std::get<props::C2P>(deberta_props).get();
+  const bool p2c = std::get<props::P2C>(deberta_props).get();
+
+  NNTR_THROW_IF(!share_att_key, nntrainer::exception::not_supported)
+    << "DebertaAttentionLayer: share_att_key=false is not supported yet.";
 
   unsigned int expected_inputs = 3;
-  if (std::get<props::C2P>(deberta_props).get()) expected_inputs++;
-  if (std::get<props::P2C>(deberta_props).get()) expected_inputs++;
-
-  NNTR_THROW_IF(context.getNumInputs() != expected_inputs, std::invalid_argument)
-    << "DebertaAttentionLayer expects " << expected_inputs << " inputs (Q, K, V"
-    << (std::get<props::C2P>(deberta_props).get() ? ", K_rel" : "")
-    << (std::get<props::P2C>(deberta_props).get() ? ", Q_rel" : "") << ")"
-    << " but received " << context.getNumInputs();
-
-  const nntrainer::TensorDim &q_dim = context.getInputDimensions()[INPUT_IDX_Q];
-
-  unsigned int num_heads = std::get<nntrainer::props::NumHeads>(deberta_props).get();
-  if (num_heads == 0) {
-    ml_logw("NumHeads property is not set or 0. Assuming it will be set later or inferred.");
+  if (relative_attention) {
+    if (p2c)
+      expected_inputs++;
+    if (c2p)
+      expected_inputs++;
   }
 
-  weight_idx.resize(4);
+  NNTR_THROW_IF(context.getNumInputs() != expected_inputs, std::invalid_argument)
+    << "DebertaAttentionLayer expects " << expected_inputs
+    << " inputs, but got " << context.getNumInputs();
 
-  // Output same as Q: (B, C, S, dim) in nntrainer terms
-  context.setOutputDimensions({q_dim});
+  const auto &input_dims = context.getInputDimensions();
+  const auto &query_dim = input_dims[INPUT_IDX_Q];
+  const auto &key_dim = input_dims[INPUT_IDX_K];
+  const auto &value_dim = input_dims[INPUT_IDX_V];
+
+  NNTR_THROW_IF(query_dim.width() != key_dim.width(), std::invalid_argument)
+    << "query/key hidden width mismatch";
+
+  NNTR_THROW_IF(key_dim.width() != value_dim.width(), std::invalid_argument)
+    << "key/value hidden width mismatch";
+
+  num_heads_Q = static_cast<size_t>(
+    std::get<nntrainer::props::NumHeads>(deberta_props).get());
+  num_heads_KV = num_heads_Q;
+
+  NNTR_THROW_IF(num_heads_Q == 0, std::invalid_argument)
+    << "num_heads must be > 0";
+
+  head_dim = static_cast<size_t>(query_dim.width()) / num_heads_Q;
+
+  NNTR_THROW_IF(head_dim * num_heads_Q != query_dim.width(),
+                std::invalid_argument)
+    << "query width must be divisible by num_heads";
+
+  max_position_embeddings =
+    std::get<props::MaxPositionEmbeddings>(deberta_props).get();
+  max_relative_positions =
+    std::get<props::MaxRelativePositions>(deberta_props).get();
+  position_buckets = std::get<props::PositionBuckets>(deberta_props).get();
+
+  if (max_relative_positions < 1)
+    max_relative_positions = max_position_embeddings;
+
+  is_causal = false;
+
+  local_window_size = std::max<unsigned int>(
+    query_dim.height(), max_position_embeddings > 0 ? max_position_embeddings
+                                                    : query_dim.height());
+
+  attn_logit_softcapping = 0.0f;
+
+#ifdef ENABLE_FP16
+  ml::train::TensorDim cache_key_dim(
+    {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+  ml::train::TensorDim cache_value_dim(
+    {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+#else
+  ml::train::TensorDim cache_key_dim(
+    {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
+    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+  ml::train::TensorDim cache_value_dim(
+    {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
+    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+#endif
+
+  tensor_idx[AttentionParams::cache_key] = context.requestTensor(
+    cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::MAX_LIFESPAN);
+
+  tensor_idx[AttentionParams::cache_value] = context.requestTensor(
+    cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::MAX_LIFESPAN);
+
+  std::vector<nntrainer::TensorDim> output_dims(1);
+  output_dims[0] = query_dim;
+  context.setOutputDimensions(output_dims);
+
+  prepare_bucket_table(std::max<unsigned int>(query_dim.height(),
+                                              max_position_embeddings));
+
+#if !defined(__ANDROID__)
+  // Keep BLAS single-threaded inside the layer to avoid oversubscription.
+  openblas_set_num_threads(4);
+#endif
 }
 
 void DebertaAttentionLayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, deberta_props);
   LayerImpl::setProperty(remain_props);
+}
+
+void DebertaAttentionLayer::prepare_bucket_table(unsigned int max_seq_len) {
+  const bool relative_attention =
+    std::get<props::RelativeAttention>(deberta_props).get();
+  if (!relative_attention || position_buckets == 0)
+    return;
+
+  std::lock_guard<std::mutex> lock(bucket_mtx);
+
+  if (bucket_table_ready && bucket_table_max_seq_len >= max_seq_len)
+    return;
+
+  bucket_table.resize(max_seq_len * 2 + 1);
+  const int offset = static_cast<int>(max_seq_len);
+
+  for (int diff = -static_cast<int>(max_seq_len);
+       diff <= static_cast<int>(max_seq_len); ++diff) {
+    bucket_table[diff + offset] = compute_bucket_pos_impl(
+      diff, static_cast<int>(position_buckets),
+      static_cast<int>(max_relative_positions));
+  }
+
+  bucket_table_max_seq_len = max_seq_len;
+  bucket_table_ready = true;
+}
+
+int DebertaAttentionLayer::lookup_bucket(int relative_pos) const {
+  if (!bucket_table_ready || position_buckets == 0)
+    return relative_pos;
+
+  const int offset = static_cast<int>(bucket_table_max_seq_len);
+  const int idx = clampv(relative_pos + offset, 0,
+                         static_cast<int>(bucket_table.size()) - 1);
+  return bucket_table[idx];
 }
 
 void DebertaAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -90,331 +294,796 @@ void DebertaAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
 }
 
 /**
- * Helper: copy per-head slice from packed width layout.
- * src: (1,1,S,dim) packed as [head0(D), head1(D), ...] for each token
- * dst: (1,1,S,head_dim) contiguous
+ * @brief incremental forwarding
  */
-static inline void slice_head_fp32(const nntrainer::Tensor &src_packed,
-                                   nntrainer::Tensor &dst_head,
-                                   unsigned int S,
-                                   unsigned int dim,
-                                   unsigned int head_dim,
-                                   unsigned int head_idx) {
-  const float *src = src_packed.getData();
-  float *dst = dst_head.getData();
-  const unsigned int base = head_idx * head_dim;
+void DebertaAttentionLayer::incremental_forwarding(
+  nntrainer::RunLayerContext &context, unsigned int _from, unsigned int _to,
+  bool training) {
 
-  for (unsigned int i = 0; i < S; ++i) {
-    std::memcpy(dst + i * head_dim,
-                src + i * dim + base,
-                sizeof(float) * head_dim);
-  }
-}
+  auto get_step_dim = [_from, _to](const ml::train::TensorDim &dim) {
+    auto step_dim = dim;
+    step_dim.batch(1);
+    step_dim.height(_to - _from);
+    return step_dim;
+  };
 
-/**
- * Helper: write per-head output back into packed width layout.
- * dst_packed: (1,1,S,dim)
- * src_head:   (1,1,S,head_dim)
- */
-static inline void write_head_fp32(nntrainer::Tensor &dst_packed,
-                                   const nntrainer::Tensor &src_head,
-                                   unsigned int S,
-                                   unsigned int dim,
-                                   unsigned int head_dim,
-                                   unsigned int head_idx) {
-  float *dst = dst_packed.getData();
-  const float *src = src_head.getData();
-  const unsigned int base = head_idx * head_dim;
-
-  for (unsigned int i = 0; i < S; ++i) {
-    std::memcpy(dst + i * dim + base,
-                src + i * head_dim,
-                sizeof(float) * head_dim);
-  }
-}
-
-void DebertaAttentionLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                                   unsigned int from,
-                                                   unsigned int to,
-                                                   bool training) {
   nntrainer::Tensor &query = context.getInput(INPUT_IDX_Q);
   nntrainer::Tensor &key = context.getInput(INPUT_IDX_K);
   nntrainer::Tensor &value = context.getInput(INPUT_IDX_V);
   nntrainer::Tensor &output = context.getOutput(OUTPUT_IDX);
 
-  unsigned int batch = query.batch();
-  unsigned int dim = query.width();
-  unsigned int q_len = query.height();
-
-  if ((to - from) != q_len && q_len > 1) {
-    ml_logw("Warning: DebertaAttention incremental forwarding received Q with height %d but requested step %d to %d. "
-            "Assuming Q is the step input.", q_len, from, to);
-  }
-
-  auto get_step_dim = [to, from](const ml::train::TensorDim &dim_) {
-    auto step_dim = dim_;
-    step_dim.batch(1);
-    step_dim.height(to - from);
-    return step_dim;
-  };
+  nntrainer::Tensor &cache_key =
+    context.getTensor(tensor_idx[AttentionParams::cache_key]);
+  nntrainer::Tensor &cache_value =
+    context.getTensor(tensor_idx[AttentionParams::cache_value]);
 
   ml::train::TensorDim query_dim = query.getDim();
   ml::train::TensorDim key_dim = key.getDim();
   ml::train::TensorDim value_dim = value.getDim();
   ml::train::TensorDim output_dim = output.getDim();
+  ml::train::TensorDim cache_key_dim = cache_key.getDim();
+  ml::train::TensorDim cache_value_dim = cache_value.getDim();
 
-  nntrainer::TensorDim query_step_dim = get_step_dim(query_dim);
-  nntrainer::TensorDim key_step_dim = get_step_dim(key_dim);
-  nntrainer::TensorDim value_step_dim = get_step_dim(value_dim);
-  nntrainer::TensorDim out_step_dim = get_step_dim(output_dim);
+  ml::train::TensorDim query_step_dim = get_step_dim(query_dim);
+  ml::train::TensorDim key_step_dim = get_step_dim(key_dim);
+  ml::train::TensorDim value_step_dim = get_step_dim(value_dim);
+  ml::train::TensorDim output_step_dim = get_step_dim(output_dim);
+  ml::train::TensorDim cache_key_step_dim = get_step_dim(cache_key_dim);
+  ml::train::TensorDim cache_value_step_dim = get_step_dim(cache_value_dim);
 
-  unsigned int num_heads = std::get<nntrainer::props::NumHeads>(deberta_props).get();
-  NNTR_THROW_IF(num_heads == 0, std::invalid_argument) << "NumHeads must be > 0";
+  const unsigned int batch_size = query_dim.batch();
 
-  bool relative_attention = std::get<props::RelativeAttention>(deberta_props).get();
-  bool c2p = std::get<props::C2P>(deberta_props).get();
-  bool p2c = std::get<props::P2C>(deberta_props).get();
+  for (unsigned int batch = 0; batch < batch_size; ++batch) {
+    nntrainer::Tensor query_step = query.getSharedDataTensor(
+      query_step_dim,
+      batch * query_dim.getFeatureLen() + _from * query_dim.width(), true);
+    nntrainer::Tensor key_step = key.getSharedDataTensor(
+      key_step_dim,
+      batch * key_dim.getFeatureLen() + _from * key_dim.width(), true);
+    nntrainer::Tensor value_step = value.getSharedDataTensor(
+      value_step_dim,
+      batch * value_dim.getFeatureLen() + _from * value_dim.width(), true);
+    nntrainer::Tensor output_step = output.getSharedDataTensor(
+      output_step_dim,
+      batch * output_dim.getFeatureLen() + _from * output_dim.width(), true);
 
-  unsigned int max_relative_positions = std::get<props::MaxRelativePositions>(deberta_props).get();
-  if (max_relative_positions < 1) {
-    max_relative_positions = std::get<props::MaxPositionEmbeddings>(deberta_props).get();
-  }
-
-  NNTR_THROW_IF(dim % num_heads != 0, std::invalid_argument)
-    << "dim must be divisible by num_heads. dim=" << dim << " heads=" << num_heads;
-
-  unsigned int head_dim = dim / num_heads;
-
-  int scale_factor_int = 1;
-  if (c2p) scale_factor_int += 1;
-  if (p2c) scale_factor_int += 1;
-
-  float scale = std::sqrt(static_cast<float>(head_dim * scale_factor_int));
-  float scale_factor = 1.0f / scale;
-
-  auto position_buckets = std::get<props::PositionBuckets>(deberta_props).get();
-
-  // NOTE: this code assumes FP32 in this layer for debug parity.
-  NNTR_THROW_IF(query.getDataType() != ml::train::TensorDim::DataType::FP32,
-                std::invalid_argument)
-    << "This debug/reference implementation expects FP32 tensors in DebertaAttentionLayer. "
-    << "Please add dtype branches if needed.";
-
-  for (unsigned int b = 0; b < batch; ++b) {
-    nntrainer::Tensor q_step =
-      query.getSharedDataTensor(query_step_dim, b * query_dim.getFeatureLen(), true);
-    nntrainer::Tensor k_step =
-      key.getSharedDataTensor(key_step_dim, b * key_dim.getFeatureLen(), true);
-    nntrainer::Tensor v_step =
-      value.getSharedDataTensor(value_step_dim, b * value_dim.getFeatureLen(), true);
-    nntrainer::Tensor out_step =
-      output.getSharedDataTensor(out_step_dim, b * output_dim.getFeatureLen(), true);
-
-    const unsigned int S_q = q_step.height();
-    const unsigned int S_k = k_step.height();
-
-    // Allocate per-head contiguous tensors
-    std::vector<nntrainer::Tensor> qh(num_heads), kh(num_heads), vh(num_heads);
-    std::vector<nntrainer::Tensor> score_h(num_heads), ctx_h(num_heads);
-
-    for (unsigned int h = 0; h < num_heads; ++h) {
-      nntrainer::TensorDim qh_dim({1, 1, S_q, head_dim}, q_step.getTensorType());
-      nntrainer::TensorDim kh_dim({1, 1, S_k, head_dim}, k_step.getTensorType());
-
-      qh[h] = nntrainer::Tensor(qh_dim, true);
-      kh[h] = nntrainer::Tensor(kh_dim, true);
-      vh[h] = nntrainer::Tensor(kh_dim, true);
-
-      slice_head_fp32(q_step, qh[h], S_q, dim, head_dim, h);
-      slice_head_fp32(k_step, kh[h], S_k, dim, head_dim, h);
-      slice_head_fp32(v_step, vh[h], S_k, dim, head_dim, h);
-    }
-
-    // 0) c2c score per head
-    for (unsigned int h = 0; h < num_heads; ++h) {
-      score_h[h] = qh[h].dot(kh[h], false, true);
-      score_h[h].multiply_i(scale_factor);
-    }
-
-    if (relative_attention) {
-      // =========================
-      // c2p
-      // =========================
-      if (c2p) {
-        int rel_input_offset = 4;
-        nntrainer::Tensor k_rel = context.getInput(rel_input_offset);
-
-        const unsigned int rel_len = k_rel.height();
-        NNTR_THROW_IF(k_rel.width() != dim, std::invalid_argument)
-          << "K_rel width must equal dim (packed). got " << k_rel.width() << " vs " << dim;
-
-        unsigned int att_span = (position_buckets > 0) ? position_buckets : max_relative_positions;
-
-        // Per-head slice of r_k
-        std::vector<nntrainer::Tensor> rkh(num_heads);
-        for (unsigned int h = 0; h < num_heads; ++h) {
-          nntrainer::TensorDim r_dim({1, 1, rel_len, head_dim}, k_rel.getTensorType());
-          rkh[h] = nntrainer::Tensor(r_dim, true);
-          slice_head_fp32(k_rel, rkh[h], rel_len, dim, head_dim, h);
-        }
-
-        // raw_c2p[h] = qh[h] x rkh[h]^T  => [S_q, rel_len]
-        std::vector<nntrainer::Tensor> raw_c2p(num_heads);
-        for (unsigned int h = 0; h < num_heads; ++h) {
-          raw_c2p[h] = qh[h].dot(rkh[h], false, true);
-        }
-
-        // gather bucket and add
-        for (unsigned int h = 0; h < num_heads; ++h) {
-          float *sc = score_h[h].getData();      // [S_q, S_k]
-          float *rc = raw_c2p[h].getData();      // [S_q, rel_len]
-          const unsigned int stride_sc_i = S_k;
-          const unsigned int stride_rc_i = rel_len;
-
-          const int att_span_i = (position_buckets > 0) ? (int)position_buckets : (int)max_relative_positions;
-
-
-          for (unsigned int i = 0; i < S_q; ++i) {
-            for (unsigned int j = 0; j < S_k; ++j) {
-              int diff = (int)i - (int)j;
-
-              // signed bucket_pos (HF make_log_bucket_position output)
-              int bucket_pos = make_log_bucket_position(diff, att_span_i, (int)max_relative_positions);
-
-              // HF: c2p_pos = clamp(bucket_pos + att_span, 0, 2*att_span-1)
-              int idx = bucket_pos + att_span_i;
-              idx = std::max(0, std::min(idx, (int)rel_len - 1));
-
-              sc[i * stride_sc_i + j] += rc[i * stride_rc_i + (unsigned int)idx] * scale_factor;
-            }
-          }
-        }
-      }
-
-      // =========================
-      // p2c 
-      // =========================
-      if (p2c) {
-        int rel_input_offset = 3;
-        nntrainer::Tensor q_rel = context.getInput(rel_input_offset);
-
-        const unsigned int rel_len = q_rel.height();
-        NNTR_THROW_IF(q_rel.width() != dim, std::invalid_argument)
-          << "Q_rel width must equal dim (packed). got " << q_rel.width() << " vs " << dim;
-
-        unsigned int att_span = (position_buckets > 0) ? position_buckets : max_relative_positions;
-
-        // rqh[h] = [rel_len, head_dim]
-        std::vector<nntrainer::Tensor> rqh(num_heads);
-        for (unsigned int h = 0; h < num_heads; ++h) {
-          nntrainer::TensorDim r_dim({1, 1, rel_len, head_dim}, q_rel.getTensorType());
-          rqh[h] = nntrainer::Tensor(r_dim, true);
-          slice_head_fp32(q_rel, rqh[h], rel_len, dim, head_dim, h);
-        }
-
-        // raw_p2c[h] = key @ rqh^T  => [S_k, rel_len] 
-        std::vector<nntrainer::Tensor> raw_p2c(num_heads);
-        for (unsigned int h = 0; h < num_heads; ++h) {
-          raw_p2c[h] = kh[h].dot(rqh[h], false, true); // [S_k, rel_len]
-        }
-
-        for (unsigned int h = 0; h < num_heads; ++h) {
-          float *sc = score_h[h].getData();       // [S_q, S_k]
-          float *rp = raw_p2c[h].getData();       // [S_k, rel_len]
-          const unsigned int stride_sc = S_k;
-          const unsigned int stride_rp = rel_len;
-
-          for (unsigned int q = 0; q < S_q; ++q) {
-            for (unsigned int k = 0; k < S_k; ++k) {
-              int diff_kq = (int)k - (int)q;  
-
-              int r_pos = make_log_bucket_position(diff_kq,
-                                                  (int)position_buckets,
-                                                  (int)max_relative_positions);
-
-              int idx = (-r_pos) + (int)att_span;
-              if (idx < 0) idx = 0;
-              if (idx >= (int)rel_len) idx = (int)rel_len - 1;
-
-              float raw = rp[k * stride_rp + idx];
-              float add = raw * scale_factor;
-
-              sc[q * stride_sc + k] += add;
-            }
-          }
-        }
-      }
-    } // relative_attention
-
-    // softmax per head (no masking)
-    // Apply softmax only on valid keys [0, valid_k) for each query row.
-    {
-      const unsigned int valid_k = std::min<unsigned int>(to, S_k);
-
-      for (unsigned int h = 0; h < num_heads; ++h) {
-        float *sc = score_h[h].getData(); // shape: [S_q, S_k]
-
-        for (unsigned int q = 0; q < S_q; ++q) {
-          const size_t row_start = static_cast<size_t>(q) * S_k;
-          const size_t row_end   = row_start + valid_k;
-
-          // softmax only within [row_start, row_end)
-          nntrainer::softmax_row_inplace(sc, row_start, row_end, /*num_head=*/1);
-        }
-      }
-    }
-
-    // context per head
-    for (unsigned int h = 0; h < num_heads; ++h) {
-      ctx_h[h] = score_h[h].dot(vh[h], false, false);
-    }
-    
-    // merge heads back to packed output
-    nntrainer::Tensor merged(out_step.getDim(), true);
-
-    std::fill(merged.getData(), merged.getData() + merged.size(), 0.0f);
-
-    for (unsigned int h = 0; h < num_heads; ++h) {
-      write_head_fp32(merged, ctx_h[h], S_q, dim, head_dim, h);
-    }
-
-    out_step.copyData(merged);
+    one_batch_incremental_forwarding(
+      context, batch, _from, _from, _to, query_step, key_step, value_step,
+      output_step, cache_key, cache_value, cache_key_dim, cache_key_step_dim,
+      cache_value_dim, cache_value_step_dim);
   }
 }
 
-void DebertaAttentionLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+/**
+ * @brief wrapper around nntrainer::compute_kcaches
+ */
+void DebertaAttentionLayer::compute_kcaches(
+  nntrainer::Tensor &in, nntrainer::Tensor &cache, nntrainer::Tensor &out,
+  unsigned int from, size_t sequence_len, unsigned int num_head,
+  unsigned int group_size, unsigned int head_dim, BS::thread_pool<> &pool) {
+
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    if (sequence_len == 1) {
+      const int row_to_compute = from + sequence_len;
+      const unsigned int num_cache_head = num_head / group_size;
+
+      const float *in_data = in.getData<float>();
+      const uint16_t *cache_data = cache.getData<uint16_t>();
+      float *out_data = out.getData<float>();
+
+#pragma omp parallel for schedule(static)
+      for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
+        nntrainer::compute_kcaches<uint16_t>(
+          in_data, cache_data, out_data, row_to_compute, num_cache_head,
+          head_dim, group_size, tile_size, local_window_size, head_kv,
+          head_kv + 1);
+      }
+
+    } else {
+      std::vector<std::future<void>> futures;
+      const unsigned int seq = static_cast<unsigned int>(sequence_len);
+
+      for (unsigned int i = 0; i < seq; ++i) {
+        float *input_addr = in.getData<float>() + num_head * head_dim * i;
+        uint16_t *cache_addr = cache.getData<uint16_t>();
+        const int row_to_compute = from + sequence_len;
+        const size_t out_start_row = i * (from + sequence_len);
+        float *output_addr = out.getData<float>() + out_start_row * num_head;
+
+        futures.emplace_back(pool.submit_task([=]() {
+          nntrainer::compute_kcaches<uint16_t>(
+            input_addr, cache_addr, output_addr, row_to_compute,
+            num_head / group_size, head_dim, group_size, tile_size,
+            local_window_size);
+        }));
+      }
+
+      for (auto &fut : futures)
+        fut.get();
+    }
+
+  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    if (sequence_len == 1) {
+      const int num_rows = from + sequence_len;
+      const unsigned int num_cache_head = num_head / group_size;
+
+      const _FP16 *in_data = in.getData<_FP16>();
+      const _FP16 *cache_data = cache.getData<_FP16>();
+      _FP16 *out_data = out.getData<_FP16>();
+
+#pragma omp parallel for schedule(static)
+      for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
+        nntrainer::compute_kcaches(
+          in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
+          group_size, tile_size, local_window_size, head_kv, head_kv + 1);
+      }
+    } else {
+      std::vector<std::future<void>> futures;
+      const unsigned int seq = static_cast<unsigned int>(sequence_len);
+
+      for (unsigned int i = 0; i < seq; ++i) {
+        _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
+        _FP16 *cache_addr = cache.getData<_FP16>();
+        const int row_to_compute = from + sequence_len;
+        const size_t out_start_row = i * (from + sequence_len);
+        _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
+
+        futures.emplace_back(pool.submit_task([=]() {
+          nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
+                                     row_to_compute, num_head / group_size,
+                                     head_dim, group_size, tile_size,
+                                     local_window_size);
+        }));
+      }
+
+      for (auto &fut : futures)
+        fut.get();
+    }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
+/**
+ * @brief softmax for linear layout [S_q, to, H]
+ */
+void DebertaAttentionLayer::softmax_triangle(nntrainer::Tensor &qk_out,
+                                             size_t row, size_t num_head,
+                                             unsigned int from,
+                                             BS::thread_pool<> &pool) {
+  if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *qk_out_ = qk_out.getData<float>();
+
+    if (attn_logit_softcapping > 0.0f) {
+      const size_t len =
+        qk_out.batch() * qk_out.height() * qk_out.width() * qk_out.channel();
+      const float inv_softcapping = 1.0f / attn_logit_softcapping;
+      for (size_t i = 0; i < len; ++i) {
+        qk_out_[i] =
+          std::tanh(qk_out_[i] * inv_softcapping) * attn_logit_softcapping;
+      }
+    }
+
+    if (row == 1) {
+      const size_t start_row = 0;
+      const size_t end_row = from + row;
+      nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
+    } else {
+      std::vector<std::future<void>> futures;
+      for (unsigned int i = 0; i < row; ++i) {
+        const unsigned int to = from + row;
+        const size_t start_row = i * to;
+        const size_t end_row = (i + 1) * to;
+        futures.push_back(pool.submit_task([=]() {
+          nntrainer::softmax_row(qk_out_, start_row, end_row, num_head);
+        }));
+      }
+      for (auto &fut : futures)
+        fut.get();
+    }
+
+  } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *qk_out_ = qk_out.getData<_FP16>();
+
+    if (attn_logit_softcapping > 0.0f) {
+      const size_t len =
+        qk_out.batch() * qk_out.height() * qk_out.width() * qk_out.channel();
+      const float inv_softcapping = 1.0f / attn_logit_softcapping;
+      for (size_t i = 0; i < len; ++i) {
+        qk_out_[i] = (_FP16)(std::tanh((float)qk_out_[i] * inv_softcapping) *
+                             attn_logit_softcapping);
+      }
+    }
+
+    if (row == 1) {
+      const size_t start_row = 0;
+      const size_t end_row = from + row;
+      nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
+    } else {
+      std::vector<std::future<void>> futures;
+      for (unsigned int i = 0; i < row; ++i) {
+        const unsigned int to = from + row;
+        const size_t start_row = i * to;
+        const size_t end_row = (i + 1) * to;
+        futures.push_back(pool.submit_task([=]() {
+          nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
+        }));
+      }
+      for (auto &fut : futures)
+        fut.get();
+    }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
+/**
+ * @brief score * value using mha_core optimized path
+ */
+void DebertaAttentionLayer::compute_fp16vcache_transposed(
+  nntrainer::Tensor &in, nntrainer::Tensor &vcache, nntrainer::Tensor &output,
+  int from, int num_cache_head, int gqa_size, int head_dim, int to,
+  BS::thread_pool<> &pool) {
+
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    if ((to - from) != 1) {
+      std::vector<std::future<void>> futures;
+      const int seq = to - from;
+      futures.reserve(seq);
+
+      for (int i = 0; i < seq; ++i) {
+        futures.push_back(pool.submit_task([=]() {
+          const size_t start_idx = i * to;
+          const float *input =
+            in.getData<float>() + start_idx * num_cache_head * gqa_size;
+          float *out = output.getData<float>() +
+                       i * (num_cache_head * gqa_size * head_dim);
+          const int row_num = to - 1;
+
+          nntrainer::compute_fp16vcache_fp32_transposed(
+            row_num, input, vcache.getData<uint16_t>(), out, num_cache_head,
+            gqa_size, head_dim, local_window_size);
+        }));
+      }
+
+      for (auto &fut : futures)
+        fut.get();
+
+    } else {
+      const int row_num = to - 1;
+
+      const float *in_data = in.getData<float>();
+      const uint16_t *vcache_data = vcache.getData<uint16_t>();
+      float *output_data = output.getData<float>();
+
+#pragma omp parallel for schedule(static)
+      for (int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
+        nntrainer::compute_fp16vcache_fp32_transposed(
+          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
+          head_dim, local_window_size, head_kv, head_kv + 1);
+      }
+    }
+
+  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    if ((to - from) != 1) {
+      std::vector<std::future<void>> futures;
+      const int seq = to - from;
+      futures.reserve(seq);
+
+      for (int i = 0; i < seq; ++i) {
+        futures.push_back(pool.submit_task([=]() {
+          const size_t start_idx = i * to;
+          const _FP16 *input =
+            in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
+          _FP16 *out = output.getData<_FP16>() +
+                       i * (num_cache_head * gqa_size * head_dim);
+          const int row_num = to - 1;
+
+          nntrainer::compute_fp16vcache_transposed(
+            row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
+            gqa_size, head_dim, local_window_size);
+        }));
+      }
+
+      for (auto &fut : futures)
+        fut.get();
+
+    } else {
+      const int row_num = to - 1;
+
+      const _FP16 *in_data = in.getData<_FP16>();
+      const _FP16 *vcache_data = vcache.getData<_FP16>();
+      _FP16 *output_data = output.getData<_FP16>();
+
+#pragma omp parallel for schedule(static)
+      for (int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
+        nntrainer::compute_fp16vcache_transposed(
+          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
+          head_dim, local_window_size, head_kv, head_kv + 1);
+      }
+    }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
+/**
+ * @brief add DeBERTa relative score (c2p / p2c)
+ */
+void DebertaAttentionLayer::add_relative_attn_score(
+  nntrainer::RunLayerContext &context, nntrainer::Tensor &score,
+  nntrainer::Tensor &query_step, nntrainer::Tensor &key_cache,
+  unsigned int from, unsigned int to) {
+
+  const bool relative_attention =
+    std::get<props::RelativeAttention>(deberta_props).get();
+  const bool c2p = std::get<props::C2P>(deberta_props).get();
+  const bool p2c = std::get<props::P2C>(deberta_props).get();
+
+  if (!relative_attention || (!c2p && !p2c))
+    return;
+
+  size_t next_input_idx = 3;
+  nntrainer::Tensor rel_query;
+  nntrainer::Tensor rel_key;
+  bool has_rel_query = false;
+  bool has_rel_key = false;
+
+  if (p2c) {
+    rel_query = context.getInput(next_input_idx++);
+    has_rel_query = true;
+  }
+  if (c2p) {
+    rel_key = context.getInput(next_input_idx++);
+    has_rel_key = true;
+  }
+
+  const unsigned int S_q = to - from;
+  const unsigned int S_k = to;
+  const unsigned int hidden = static_cast<unsigned int>(num_heads_Q * head_dim);
+
+  const unsigned int att_span =
+    position_buckets > 0 ? position_buckets : max_relative_positions;
+
+  const int scale_factor_int = 1 + (c2p ? 1 : 0) + (p2c ? 1 : 0);
+  const float scale =
+    1.0f / std::sqrt(static_cast<float>(head_dim * scale_factor_int));
+
+  /**
+   * Shared relative index cache across attention layers
+   *
+   * IMPORTANT:
+   * Never keep a pointer/reference to the global cache after unlocking.
+   * Another thread/layer may clear()/resize() the vectors, which can trigger
+   * use-after-realloc and segfaults especially on Android.
+   *
+   * So we build/update the global cache under lock, then copy it to a local
+   * value and use only the local copy outside the lock.
+   */
+  const bool use_bucket = position_buckets > 0;
+  const unsigned int rel_len_q =
+    (p2c && has_rel_query) ? rel_query.height() : 0u;
+  const unsigned int rel_len_k =
+    (c2p && has_rel_key) ? rel_key.height() : 0u;
+
+  const RelativeIndexKey cache_key{
+    from, to, att_span, rel_len_q, rel_len_k,
+    c2p && has_rel_key, p2c && has_rel_query, use_bucket};
+
+  RelativeIndexValue &rel_idx_local = tl_rel_index_value;
+
+  if (!tl_rel_index_ready || !(tl_rel_index_key == cache_key)) {
+    rel_idx_local.c2p_idx.clear();
+    rel_idx_local.p2c_idx.clear();
+
+    if (c2p && has_rel_key) {
+      rel_idx_local.c2p_idx.resize(static_cast<size_t>(S_q) * S_k);
+    }
+    if (p2c && has_rel_query) {
+      rel_idx_local.p2c_idx.resize(static_cast<size_t>(S_q) * S_k);
+    }
+
+    for (unsigned int q = 0; q < S_q; ++q) {
+      for (unsigned int k = 0; k < S_k; ++k) {
+        if (c2p && has_rel_key) {
+          const int rel = static_cast<int>(q + from) - static_cast<int>(k);
+          const int bucketed = use_bucket ? lookup_bucket(rel) : rel;
+          rel_idx_local.c2p_idx[static_cast<size_t>(q) * S_k + k] =
+            clampv(bucketed + static_cast<int>(att_span), 0,
+                  static_cast<int>(rel_len_k) - 1);
+        }
+
+        if (p2c && has_rel_query) {
+          const int rel_rev =
+            static_cast<int>(k) - static_cast<int>(q + from);
+          const int bucketed_rev = use_bucket ? lookup_bucket(rel_rev) : rel_rev;
+          rel_idx_local.p2c_idx[static_cast<size_t>(q) * S_k + k] =
+            clampv(-bucketed_rev + static_cast<int>(att_span), 0,
+                  static_cast<int>(rel_len_q) - 1);
+        }
+      }
+    }
+
+    tl_rel_index_key = cache_key;
+    tl_rel_index_ready = true;
+  }
+
+  if (score.getDataType() == ml::train::TensorDim::DataType::FP32) {
+  float *score_ptr = score.getData<float>();
+  const float *q_ptr = query_step.getData<float>();
+  const float *rel_query_ptr =
+    has_rel_query ? rel_query.getData<float>() : nullptr;
+  const float *rel_key_ptr =
+    has_rel_key ? rel_key.getData<float>() : nullptr;
+
+  const uint16_t *key_u16_ptr =
+    key_cache.getDataType() == ml::train::TensorDim::DataType::UINT16
+      ? key_cache.getData<uint16_t>()
+      : nullptr;
+
+  const float *key_f32_ptr =
+    key_cache.getDataType() == ml::train::TensorDim::DataType::FP32
+      ? key_cache.getData<float>()
+      : nullptr;
+
+  #ifdef ENABLE_FP16
+  const _FP16 *key_fp16_ptr =
+    key_cache.getDataType() == ml::train::TensorDim::DataType::FP16
+      ? key_cache.getData<_FP16>()
+      : nullptr;
+  #else
+  const void *key_fp16_ptr = nullptr;
+  #endif
+
+  std::vector<float> &key_cache_fp32_buf = tl_key_cache_fp32_buf;
+  const float *key_unpacked_ptr = nullptr;
+
+  /**
+   * p2c path needs key-cache values in FP32 for dot(q_rel, k_cache).
+   * If cache is packed/FP16, unpack once outside the hot loop.
+   */
+    if (p2c && (key_u16_ptr
+    #ifdef ENABLE_FP16
+                || key_fp16_ptr
+    #endif
+                )) {
+      const size_t unpack_len = static_cast<size_t>(S_k) * hidden;
+      if (key_cache_fp32_buf.size() < unpack_len) {
+        key_cache_fp32_buf.resize(unpack_len);
+      }
+
+      for (unsigned int k = 0; k < S_k; ++k) {
+        float *dst = key_cache_fp32_buf.data() + static_cast<size_t>(k) * hidden;
+
+      if (key_u16_ptr) {
+        const uint16_t *src = key_u16_ptr + static_cast<size_t>(k) * hidden;
+        for (unsigned int i = 0; i < hidden; ++i) {
+          dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+        }
+      }
+  #ifdef ENABLE_FP16
+      else if (key_fp16_ptr) {
+        const _FP16 *src = key_fp16_ptr + static_cast<size_t>(k) * hidden;
+        for (unsigned int i = 0; i < hidden; ++i) {
+          dst[i] = static_cast<float>(src[i]);
+        }
+      }
+  #endif
+    }
+
+    key_unpacked_ptr = key_cache_fp32_buf.data();
+  }
+
+#pragma omp parallel for schedule(static)
+    for (unsigned int q_idx = 0; q_idx < S_q; ++q_idx) {
+      const size_t qk_row_base = static_cast<size_t>(q_idx) * S_k;
+
+      for (unsigned int h = 0; h < num_heads_Q; ++h) {
+        const unsigned int h_base = h * head_dim;
+        const float *q_head = q_ptr + q_idx * hidden + h_base;
+
+        for (unsigned int k_idx = 0; k_idx < S_k; ++k_idx) {
+          float rel_score = 0.0f;
+
+          if (c2p && has_rel_key) {
+            const int rel_index = rel_idx_local.c2p_idx[qk_row_base + k_idx];
+            const float *rk_head =
+              rel_key_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
+
+            float c2p_dot = 0.0f;
+#pragma omp simd reduction(+ : c2p_dot)
+            for (unsigned int d = 0; d < head_dim; ++d) {
+              c2p_dot += q_head[d] * rk_head[d];
+            }
+            rel_score += c2p_dot * scale;
+          }
+
+          if (p2c && has_rel_query) {
+            const int rel_index = rel_idx_local.p2c_idx[qk_row_base + k_idx];
+            const float *rq_head =
+              rel_query_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
+
+            float p2c_dot = 0.0f;
+            if (key_unpacked_ptr) {
+              const float *k_head =
+                key_unpacked_ptr + static_cast<size_t>(k_idx) * hidden + h_base;
+#pragma omp simd reduction(+ : p2c_dot)
+              for (unsigned int d = 0; d < head_dim; ++d) {
+                p2c_dot += k_head[d] * rq_head[d];
+              }
+            } else {
+              NNTR_THROW_IF(key_f32_ptr == nullptr, std::invalid_argument)
+                << "FP32 relative attention path expected FP32 or UINT16 key cache";
+              const float *k_head =
+                key_f32_ptr + static_cast<size_t>(k_idx) * hidden + h_base;
+#pragma omp simd reduction(+ : p2c_dot)
+              for (unsigned int d = 0; d < head_dim; ++d) {
+                p2c_dot += k_head[d] * rq_head[d];
+              }
+            }
+
+            rel_score += p2c_dot * scale;
+          }
+
+          const size_t linear_idx =
+            (static_cast<size_t>(q_idx) * S_k + k_idx) * num_heads_Q + h;
+          score_ptr[linear_idx] += rel_score;
+        }
+      }
+    }
+
+  } else if (score.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    NNTR_THROW_IF(key_cache.getDataType() != ml::train::TensorDim::DataType::FP16,
+                  std::invalid_argument)
+      << "FP16 relative attention path requires FP16 key cache";
+
+    _FP16 *score_ptr = score.getData<_FP16>();
+    const _FP16 *q_ptr = query_step.getData<_FP16>();
+    const _FP16 *rel_query_ptr =
+      has_rel_query ? rel_query.getData<_FP16>() : nullptr;
+    const _FP16 *rel_key_ptr =
+      has_rel_key ? rel_key.getData<_FP16>() : nullptr;
+    const _FP16 *key_fp16_ptr = key_cache.getData<_FP16>();
+
+#pragma omp parallel for schedule(static)
+    for (unsigned int q_idx = 0; q_idx < S_q; ++q_idx) {
+      const size_t qk_row_base = static_cast<size_t>(q_idx) * S_k;
+
+      for (unsigned int h = 0; h < num_heads_Q; ++h) {
+        const unsigned int h_base = h * head_dim;
+        const _FP16 *q_head = q_ptr + q_idx * hidden + h_base;
+
+        for (unsigned int k_idx = 0; k_idx < S_k; ++k_idx) {
+          float rel_score = 0.0f;
+
+          if (c2p && has_rel_key) {
+            const int rel_index = rel_idx_local.c2p_idx[qk_row_base + k_idx];
+            const _FP16 *rk_head =
+              rel_key_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
+
+            float c2p_dot = 0.0f;
+#pragma omp simd reduction(+ : c2p_dot)
+            for (unsigned int d = 0; d < head_dim; ++d) {
+              c2p_dot += static_cast<float>(q_head[d]) *
+                         static_cast<float>(rk_head[d]);
+            }
+            rel_score += c2p_dot * scale;
+          }
+
+          if (p2c && has_rel_query) {
+            const int rel_index = rel_idx_local.p2c_idx[qk_row_base + k_idx];
+            const _FP16 *rq_head =
+              rel_query_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
+            const _FP16 *k_head =
+              key_fp16_ptr + static_cast<size_t>(k_idx) * hidden + h_base;
+
+            float p2c_dot = 0.0f;
+#pragma omp simd reduction(+ : p2c_dot)
+            for (unsigned int d = 0; d < head_dim; ++d) {
+              p2c_dot += static_cast<float>(k_head[d]) *
+                         static_cast<float>(rq_head[d]);
+            }
+            rel_score += p2c_dot * scale;
+          }
+
+          const size_t linear_idx =
+            (static_cast<size_t>(q_idx) * S_k + k_idx) * num_heads_Q + h;
+          score_ptr[linear_idx] =
+            (_FP16)(static_cast<float>(score_ptr[linear_idx]) + rel_score);
+        }
+      }
+    }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
+/**
+ * @brief one-batch path
+ */
+void DebertaAttentionLayer::one_batch_incremental_forwarding(
+  nntrainer::RunLayerContext &context, const unsigned int batch,
+  const unsigned int _from, const unsigned int from, const unsigned int to,
+  nntrainer::Tensor &query_step, nntrainer::Tensor &key_step,
+  nntrainer::Tensor &value_step, nntrainer::Tensor &attention_output_step,
+  nntrainer::Tensor &cache_key, nntrainer::Tensor &cache_value,
+  ml::train::TensorDim &cache_key_dim,
+  ml::train::TensorDim &cache_key_step_dim,
+  ml::train::TensorDim &cache_value_dim,
+  ml::train::TensorDim &cache_value_step_dim) {
+
+  auto &pool =
+    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
+
+  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
+    cache_key_step_dim,
+    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
+  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
+    cache_value_step_dim,
+    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
+    true);
+
+  b_cache_key_step.copyData(key_step);
+  b_cache_value_step.copyData(value_step);
+
+  ml::train::TensorDim cached_key_dim = cache_key_dim;
+  ml::train::TensorDim cached_value_dim = cache_value_dim;
+  cached_key_dim.height(to);
+  cached_value_dim.height(to);
+
+  nntrainer::Tensor b_cached_key = cache_key.getSharedDataTensor(
+    cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
+  nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
+    cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  nntrainer::Tensor out_(1, 1, (to - from) * to, num_heads_Q,
+                         query_step.getTensorType());
+
+  const unsigned int gqa_size = num_heads_Q / num_heads_KV;
+  // auto start = std::chrono::high_resolution_clock::now();
+  compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
+                  gqa_size, head_dim, pool);
+  // auto finish = std::chrono::high_resolution_clock::now();
+  // auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  //   finish - start);
+  // std::cout << "compute_kcaches : " << time.count() << "ms\n";
+
+  /**
+   * DeBERTa disentangled attention uses a shared scaling factor across
+   * content-to-content, content-to-position, and position-to-content terms.
+   *
+   * compute_kcaches() gives us content logits on the mha_core path, so we apply
+   * an extra 1/sqrt(scale_factor_int) here to match:
+   *   1 / sqrt(head_dim * scale_factor_int)
+   */
+  // start = std::chrono::high_resolution_clock::now();
+  const bool c2p = std::get<props::C2P>(deberta_props).get();
+  const bool p2c = std::get<props::P2C>(deberta_props).get();
+  const int scale_factor_int = 1 + (c2p ? 1 : 0) + (p2c ? 1 : 0);
+  const float content_rescale =
+    1.0f / std::sqrt(static_cast<float>(scale_factor_int));
+
+  if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *ptr = out_.getData<float>();
+    const size_t len =
+      out_.batch() * out_.channel() * out_.height() * out_.width();
+    for (size_t i = 0; i < len; ++i) {
+      ptr[i] *= content_rescale;
+    }
+  }
+#ifdef ENABLE_FP16
+  else if (out_.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    _FP16 *ptr = out_.getData<_FP16>();
+    const size_t len =
+      out_.batch() * out_.channel() * out_.height() * out_.width();
+    for (size_t i = 0; i < len; ++i) {
+      ptr[i] = (_FP16)((float)ptr[i] * content_rescale);
+    }
+  }
+#endif
+  // finish = std::chrono::high_resolution_clock::now();
+  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  //   finish - start);
+  // std::cout << "add_relative_attn_score(pre) : " << time.count() << "ms\n";
+  
+  // start = std::chrono::high_resolution_clock::now();  
+  add_relative_attn_score(context, out_, query_step, b_cached_key, from, to); 
+  // finish = std::chrono::high_resolution_clock::now();
+  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  //   finish - start);
+  // std::cout << "add_relative_attn_score : " << time.count() << "ms\n";
+  
+  // start = std::chrono::high_resolution_clock::now();  
+  softmax_triangle(out_, to - from, num_heads_Q, from, pool);
+  // finish = std::chrono::high_resolution_clock::now();
+  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  //   finish - start);
+  // std::cout << "softmax_triangle : " << time.count() << "ms\n";
+
+  // start = std::chrono::high_resolution_clock::now();  
+  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
+                                from, num_heads_KV, gqa_size, head_dim, to,
+                                pool);
+  // finish = std::chrono::high_resolution_clock::now();
+  // time = std::chrono::duration_cast<std::chrono::milliseconds>(
+  //   finish - start);
+  // std::cout << "compute_fp16vcache_transposed : " << time.count() << "ms\n";
+}
+
+void DebertaAttentionLayer::setBatch(nntrainer::RunLayerContext &context,
+                                     unsigned int batch) {
+  context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
+  context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+}
+
+void DebertaAttentionLayer::updateTensorsByInputDimensions(
+  nntrainer::RunLayerContext &context,
+  std::vector<nntrainer::TensorDim> input_dimensions) {
+
+  ml::train::TensorDim q_dim = input_dimensions[INPUT_IDX_Q];
+  ml::train::TensorDim k_dim = input_dimensions[INPUT_IDX_K];
+  ml::train::TensorDim v_dim = input_dimensions[INPUT_IDX_V];
+
+#ifdef ENABLE_FP16
+  k_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+  v_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+#else
+  k_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
+  v_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
+#endif
+
+  context.updateInput(INPUT_IDX_Q, input_dimensions[INPUT_IDX_Q]);
+  context.updateInput(INPUT_IDX_K, input_dimensions[INPUT_IDX_K]);
+  context.updateInput(INPUT_IDX_V, input_dimensions[INPUT_IDX_V]);
+  context.updateOutput(OUTPUT_IDX, input_dimensions[INPUT_IDX_Q]);
+
+  context.updateTensor(tensor_idx[AttentionParams::cache_key], k_dim);
+  context.updateTensor(tensor_idx[AttentionParams::cache_value], v_dim);
+
+  prepare_bucket_table(std::max<unsigned int>(
+    input_dimensions[INPUT_IDX_Q].height(), max_position_embeddings));
+}
+
+void DebertaAttentionLayer::calcDerivative(
+  nntrainer::RunLayerContext &context) {
   throw nntrainer::exception::not_supported(
-    "calcDerivative for DebertaAttention layer is not supported");
+    "DebertaAttentionLayer::calcDerivative not supported");
 }
 
 void DebertaAttentionLayer::calcGradient(nntrainer::RunLayerContext &context) {
   throw nntrainer::exception::not_supported(
-    "calcGradient for DebertaAttention layer is not supported");
+    "DebertaAttentionLayer::calcGradient not supported");
 }
 
-void DebertaAttentionLayer::exportTo(nntrainer::Exporter &exporter,
-                                     const ml::train::ExportMethods &method) const {
+void DebertaAttentionLayer::exportTo(
+  nntrainer::Exporter &exporter,
+  const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
+  exporter.saveResult(deberta_props, method, this);
 }
 
-int DebertaAttentionLayer::make_log_bucket_position(int relative_pos,
-                                                    int bucket_size,   // = position_buckets (ex. 256)
-                                                    int max_position) {
-  const int mid = bucket_size / 2;                 // 128 if bucket_size=256
-  const int sign = (relative_pos >= 0) ? 1 : -1;
+#ifdef PLUGGABLE
 
-  // HF: abs_pos = where(|rp|<mid, mid-1, |rp|)
-  const int abs_rp = std::abs(relative_pos);
-  const int abs_pos = (abs_rp < mid) ? (mid - 1) : abs_rp;
-
-  // HF: log_pos = ceil(log(abs_pos/mid)/log((max_position-1)/mid) * (mid-1)) + mid
-  const double num = std::log((double)abs_pos / (double)mid);
-  const double den = std::log((double)(max_position - 1) / (double)mid);
-  int log_pos = (int)std::ceil(num / den * (mid - 1)) + mid;
-
-  // bucket_pos = where(abs_pos <= mid, relative_pos, log_pos * sign)
-  const int bucket_pos = (abs_pos <= mid) ? relative_pos : (log_pos * sign);
-  return bucket_pos; 
+nntrainer::Layer *create_deberta_attention_layer() {
+  auto layer = new DebertaAttentionLayer();
+  return layer;
 }
+
+void destroy_deberta_attention_layer(nntrainer::Layer *layer) { delete layer; }
+
+extern "C" {
+nntrainer::LayerPluggable ml_train_layer_pluggable{
+  create_deberta_attention_layer, destroy_deberta_attention_layer};
+}
+
+#endif
 
 } // namespace causallm
