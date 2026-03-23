@@ -23,8 +23,10 @@ import argparse
 import json
 import tempfile
 import os
+import shutil
 from itertools import product
 from tabulate import tabulate
+from transformers import AutoTokenizer
 
 from device_utils import (
     get_thermal_temp, 
@@ -33,23 +35,34 @@ from device_utils import (
     get_model_size,
 ) 
 
-def generate_sample_input(target_tokens):
+def generate_sample_input(target_tokens, local_tokenizer_path=None):
     """
-    Generate sample input that matches target token count using heuristic.
-    Uses repeating pattern to approximate token count.
+    Generate sample input that matches target token count.
+    If transformers is available, use exact tokenizer. Otherwise, use heuristic.
     """
-    # Heuristic: assume ~4 chars per token on average
-    # This is approximate and tokenizer support will be added later
-    chars_per_token = 4
-    target_chars = target_tokens * chars_per_token
-    
-    # Use a repeating pattern
-    base_text = "The quick brown fox jumps over the lazy dog. "
-    repeats = max(1, target_chars // len(base_text) + 1)
-    generated_text = base_text * repeats
-    
-    # Trim to approximate length
-    return generated_text[:target_chars]
+    if local_tokenizer_path:
+        # Load tokenizer from local path
+        tokenizer = AutoTokenizer.from_pretrained(os.path.dirname(local_tokenizer_path))
+
+        # Generic base text (repeating pattern)
+        base_token = 5555
+        base_text = tokenizer.decode([base_token])
+
+        generated_text = base_text * target_tokens
+        
+        return generated_text
+    else:
+        # Heuristic fallback: assume ~4 chars per token on average
+        chars_per_token = 4
+        target_chars = target_tokens * chars_per_token
+        
+        # Use a repeating pattern
+        base_text = "The quick brown fox jumps over the lazy dog. "
+        repeats = max(1, target_chars // len(base_text) + 1)
+        generated_text = base_text * repeats
+        
+        # Trim to approximate length
+        return generated_text[:target_chars]
 
 
 def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1):
@@ -90,10 +103,54 @@ def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1):
             config["num_to_generate"] = self.n_gen
             config["batch_size"] = self.batch_size
             
-            # Generate sample_input matching target token count (heuristic)
-            generated_input = generate_sample_input(self.n_prompt)
+            # Generate sample_input matching target token count
+            local_tokenizer_path = None
+            
+            if "tokenizer_file" in config:
+                device_tokenizer_path = config["tokenizer_file"]
+                
+                # Create local temp directory for tokenizer
+                temp_dir = tempfile.mkdtemp(prefix="tokenizer_")
+                
+                try:
+                    # Extract tokenizer directory name from device path
+                    tokenizer_dir = os.path.dirname(device_tokenizer_path)
+                    tokenizer_filename = os.path.basename(device_tokenizer_path)
+                    
+                    # Pull tokenizer directory from device
+                    print(f"  Pulling tokenizer from device...")
+                    result = subprocess.run(
+                        ["adb", "pull", tokenizer_dir + '/' + tokenizer_filename, temp_dir],
+                        capture_output=True, text=True
+                    )
+                    result = subprocess.run(
+                        ["adb", "pull", tokenizer_dir + '/' + 'config.json', temp_dir],
+                        capture_output=True, text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        local_tokenizer_path = os.path.join(temp_dir, tokenizer_filename)
+                    else:
+                        print(f"  Warning: Could not pull tokenizer, using heuristic")
+                        shutil.rmtree(temp_dir)
+                        temp_dir = None
+                except Exception as e:
+                    print(f"  Warning: Could not pull tokenizer: {e}")
+                    if temp_dir:
+                        shutil.rmtree(temp_dir)
+                    temp_dir = None
+            
+            generated_input = generate_sample_input(self.n_prompt, local_tokenizer_path)
             config["sample_input"] = generated_input
-            print(f"Generated sample_input ({self.n_prompt} token length, heuristic)")
+            
+            if local_tokenizer_path:
+                print(f"Generated sample_input ({self.n_prompt} token length, using tokenizer)")
+            else:
+                print(f"Generated sample_input ({self.n_prompt} token length, heuristic)")
+            
+            # Clean up temporary tokenizer directory
+            if local_tokenizer_path and os.path.exists(os.path.dirname(local_tokenizer_path)):
+                shutil.rmtree(os.path.dirname(local_tokenizer_path))
             
             # Create temporary file with modified config
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
