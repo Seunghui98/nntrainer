@@ -1,9 +1,57 @@
 """
 Device utilities for nntrainer benchmark.
-Device interaction including device info.
+Device interaction including temperature monitoring, cooling, and device info.
 """
 
 import subprocess
+import time
+
+
+def get_thermal_temp():
+    """Get thermal zone temperature in Celsius."""
+    try:
+        cmd = ["adb", "shell", "cat", "/sys/class/thermal/thermal_zone0/temp"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return float(result.stdout.strip()) / 1000.0
+    except Exception as e:
+        print(f"Error reading temp: {e}")
+    return 0.0
+
+
+def wait_for_cooling(target_temp=40.0, max_wait=300, poll_interval=10):
+    """
+    Wait for device to cool down to target temperature.
+    
+    Args:
+        target_temp: Target temperature in Celsius (default: 40.0)
+        max_wait: Maximum wait time in seconds (default: 300 = 5 min)
+        poll_interval: Time between temperature checks (default: 10 seconds)
+    
+    Returns:
+        True if target temperature reached, False if timeout
+    """
+    current_temp = get_thermal_temp()
+    print(f"Current temp: {current_temp:.1f}°C, Target: {target_temp:.1f}°C")
+    
+    if current_temp <= target_temp:
+        print(f"Temperature already at target ({current_temp:.1f}°C ≤ {target_temp:.1f}°C)")
+        return True
+    
+    print(f"Cooling down device... (Max wait: {max_wait}s)")
+    start_time = time.time()
+    
+    while (time.time() - start_time) < max_wait:
+        time.sleep(poll_interval)
+        current_temp = get_thermal_temp()
+        print(f"  Current temp: {current_temp:.1f}°C")
+        
+        if current_temp <= target_temp:
+            print(f"Reached target temperature ({current_temp:.1f}°C)")
+            return True
+    
+    print(f"Warning: Timeout waiting for cooling. Current temp: {current_temp:.1f}°C")
+    return False
 
 
 def get_device_model():
