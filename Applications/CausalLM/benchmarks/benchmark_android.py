@@ -247,6 +247,46 @@ def calculate_statistics(values):
     return mean, std
 
 
+def validate_model_path(model_path):
+    """
+    Validate model path to prevent command injection and path traversal.
+    """
+    # Normalize path to remove any '..' sequences
+    try:
+        normalized = os.path.normpath(model_path)
+    except Exception as e:
+        raise ValueError(f"Invalid path format: {e}")
+    
+    # Define allowed prefix (must be within nntrainer causallm directory)
+    allowed_prefix = "/data/local/tmp/nntrainer/"
+    
+    # Ensure path starts with allowed prefix
+    if not normalized.startswith(allowed_prefix):
+        raise ValueError(
+            f"Model path must start with '{allowed_prefix}'. "
+            f"Got: {model_path}"
+        )
+    
+    # Validate characters: allow only safe filesystem characters
+    # Allow: alphanumeric, hyphen, underscore, dot, forward slash, plus sign
+    safe_chars_pattern = r'^[a-zA-Z0-9_\-./+]+$'
+    if not re.match(safe_chars_pattern, normalized):
+        raise ValueError(
+            f"Model path contains invalid characters. "
+            f"Only alphanumeric, '-', '_', '.', '/', and '+' are allowed. "
+            f"Got: {model_path}"
+        )
+    
+    # Prevent empty path segments (like double slashes)
+    if '//' in normalized:
+        raise ValueError(
+            f"Model path contains empty segments (double slashes). "
+            f"Got: {model_path}"
+        )
+    
+    return normalized
+
+
 def output_results_table(all_results, model_name, model_size, model_type, dtype, device):
     """Output all benchmark results in a pretty table format."""
     # Prepare table data
@@ -320,7 +360,7 @@ def main():
     configs = list(product(n_prompts, n_gens, n_threads_list))
     
     # Extract model name from path
-    model_path = os.path.normpath(args.model)
+    model_path = validate_model_path(args.model)
     model_name = os.path.basename(model_path)
     
     print(f"=== nntrainer benchmark sweep ===")
