@@ -37,30 +37,8 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
-#ifdef _WIN32
-#include <psapi.h>
-#include <windows.h>
-#else
-#include <sys/resource.h>
-#endif
 
 namespace causallm {
-
-size_t getPeakMemoryKb() {
-#if defined(_WIN32)
-  PROCESS_MEMORY_COUNTERS pmc;
-  if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-    return (size_t)(pmc.PeakWorkingSetSize / 1024);
-  }
-  return 0;
-#else
-  struct rusage rusage;
-  if (getrusage(RUSAGE_SELF, &rusage) == 0) {
-    return (size_t)(rusage.ru_maxrss);
-  }
-  return 0;
-#endif
-}
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {

@@ -41,6 +41,7 @@
 #include <limits.h>
 
 #include "json.hpp"
+#include "performance_metrics.h"
 #include <fstream>
 #include <tokenizers_c.h>
 #include <tokenizers_cpp.h>
@@ -100,6 +101,13 @@ public:
   virtual void run(const WSTR prompt, bool do_sample = false,
                    const WSTR system_prompt = "", const WSTR tail_prompt = "",
                    bool log_output = true);
+
+  /**
+   * @brief Get PerformanceMetrics
+   */
+  PerformanceMetrics getPerformanceMetrics() const {
+    return performance_metrics;
+  }
 
 protected:
   /**
@@ -176,6 +184,9 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+
+  // Performance metrics
+  PerformanceMetrics performance_metrics;
 };
 /**
  * Loads JSON data from a file with detailed error handling
