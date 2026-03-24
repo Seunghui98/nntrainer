@@ -34,7 +34,6 @@ typedef enum {
   CAUSAL_LM_ERROR_MODEL_LOAD_FAILED = 2,
   CAUSAL_LM_ERROR_INFERENCE_FAILED = 3,
   CAUSAL_LM_ERROR_NOT_INITIALIZED = 4,
-  CAUSAL_LM_ERROR_INFERENCE_NOT_RUN = 5,
   CAUSAL_LM_ERROR_UNKNOWN = 99
 } ErrorCode;
 
@@ -53,7 +52,6 @@ typedef enum {
  */
 typedef enum {
   CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
-  // CAUSAL_LM_MODEL_GEMMA_2B = 3,
 } ModelType;
 
 /**
