@@ -61,9 +61,9 @@ check_artifact() {
         return 0
     else
         echo -e "  ${RED}[ERROR]${NC} $filename not found!"
-        echo "  Checked paths:"
-        echo "    - $libs_path"
-        echo "    - $obj_path"
+        log_info "  Checked paths:"
+        log_info "    - $libs_path"
+        log_info "    - $obj_path"
         return 1
     fi
 }
@@ -71,7 +71,7 @@ check_artifact() {
 # Check if NDK path is set
 if [ -z "$ANDROID_NDK" ]; then
     log_error "ANDROID_NDK is not set. Please set it to your Android NDK path."
-    echo "Example: export ANDROID_NDK=/path/to/android-ndk-r21d"
+    log_info "Example: export ANDROID_NDK=/path/to/android-ndk-r21d"
     exit 1
 fi
 
@@ -81,9 +81,9 @@ NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export NNTRAINER_ROOT
 
 log_header "Build CausalLM Android Application"
-echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
-echo "ANDROID_NDK: $ANDROID_NDK"
-echo "Working directory: $(pwd)"
+log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
+log_info "ANDROID_NDK: $ANDROID_NDK"
+log_info "Working directory: $(pwd)"
 
 # Step 1: Build nntrainer for Android if not already built
 log_step "1/4" "Build nntrainer for Android"
@@ -117,8 +117,8 @@ if [ ! -f "lib/libtokenizers_android_c.a" ]; then
         ./build_tokenizer_android.sh
     else
         log_error "tokenizer library not found and build script is missing."
-        echo "Please build or download the tokenizer library for Android arm64-v8a"
-        echo "and place it in: $SCRIPT_DIR/lib/libtokenizers_android_c.a"
+        log_info "Please build or download the tokenizer library for Android arm64-v8a"
+        log_info "and place it in: $SCRIPT_DIR/lib/libtokenizers_android_c.a"
         exit 1
     fi
 else
@@ -150,7 +150,7 @@ log_step "4/4" "Build CausalLM Core (library + executable)"
 cd "$SCRIPT_DIR/jni"
 
 # Clean previous builds
-rm -rf obj libs
+rm -rf libs obj
 
 log_info "Building with ndk-build (builds causallm_core and nntrainer_causallm)..."
 # We explicitly set paths to ensure outputs are predictable
@@ -162,8 +162,7 @@ else
 fi
 
 # Verify outputs
-echo ""
-echo "Build artifacts:"
+log_info "Build artifacts:"
 
 check_artifact "libcausallm_core.so" || exit 1
 check_artifact "nntrainer_causallm" || exit 1
@@ -171,21 +170,15 @@ check_artifact "nntrainer_causallm" || exit 1
 # Summary
 log_header "Build Summary"
 log_success "Build completed successfully!"
-echo ""
-echo "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
-echo ""
-echo "Executables:"
-echo "  - nntrainer_causallm (main application)"
-echo ""
-echo "Libraries:"
-echo "  - libcausallm_core.so (CausalLM Core library)"
-echo "  - libnntrainer.so (nntrainer library)"
-echo "  - libccapi-nntrainer.so (nntrainer C/C API)"
-echo "  - libc++_shared.so (C++ runtime)"
-echo ""
-echo "To build API library, run:"
-echo "  ./build_api_lib.sh"
-echo ""
-echo "To install and run:"
-echo "  ./install_android.sh"
-echo ""
+log_info "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
+log_info "Executables:"
+log_info "  - nntrainer_causallm (main application)"
+log_info "Libraries:"
+log_info "  - libcausallm_core.so (CausalLM Core library)"
+log_info "  - libnntrainer.so (nntrainer library)"
+log_info "  - libccapi-nntrainer.so (nntrainer C/C API)"
+log_info "  - libc++_shared.so (C++ runtime)"
+log_info "To build API library, run:"
+log_info "  ./build_api_lib.sh"
+log_info "To install and run:"
+log_info "  ./install_android.sh"
