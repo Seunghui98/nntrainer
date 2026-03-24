@@ -21,6 +21,7 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <util_func.h>
+#include <cpu_backend.h>
 
 namespace nntrainer {
 
@@ -124,6 +125,8 @@ void DepthwiseConv1DLayer::finalize(InitLayerContext &context) {
   context.setOutputDimensions({out_dim});
 }
 
+
+
 void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
   unsigned int kernel_size = std::get<props::KernelSize>(conv_props).get();
   unsigned int stride = std::get<props::Stride>(conv_props).get();
@@ -142,14 +145,62 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
   unsigned int channels = in_dim.width();
   unsigned int out_height = out_dim.height();
   unsigned int pad_left = padding[0];
+  unsigned int pad_right = padding[1];
+
+#ifdef ENABLE_FP16
+  /**
+   * Fast path for custom causal fp16 kernel (kernel size = 3).
+   *
+   * Required conditions:
+   * - FP16 input/output/weight
+   * - kernel_size == 3
+   * - stride == 1
+   * - dilation == 1
+   * - causal padding => left pad = 2, right pad = 0
+   * - output height == input height
+   *
+   * Tensor layout of this layer is (B, 1, H, W), and because C == 1,
+   * its contiguous memory layout is equivalent to (B, H, W), which matches
+   * the custom kernel expectation.
+   *
+   * Weight layout is (1, 1, K, W), whose flat contiguous order is (K, W).
+   * Bias layout is (1, 1, 1, W), whose flat contiguous order is (W).
+   */
+  bool use_custom_fp16_kernel =
+    input_.getDataType() == nntrainer::Tdatatype::FP16 &&
+    hidden_.getDataType() == nntrainer::Tdatatype::FP16 &&
+    filter_kernel.getDataType() == nntrainer::Tdatatype::FP16 &&
+    kernel_size == 3 && stride == 1 && dilation == 1 &&
+    pad_left == 2 && pad_right == 0 &&
+    static_cast<unsigned int>(in_height) == out_height;
+
+  if (use_custom_fp16_kernel) {
+    _FP16 *input_data = input_.getData<_FP16>();
+    _FP16 *output_data = hidden_.getData<_FP16>();
+    const _FP16 *weight_data = filter_kernel.getData<_FP16>();
+
+    const _FP16 *bias_data = nullptr;
+    if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      Tensor &bias_kernel =
+        context.getWeight(wt_idx[DepthwiseConv1DParams::bias]);
+      bias_data = bias_kernel.getData<_FP16>();
+    }
+
+    causal_conv1d_fp16_w3(input_data, weight_data, bias_data, output_data, batch,
+                          static_cast<unsigned int>(in_height), channels,
+                          false);
+    return;
+  }
+#endif
 
   hidden_.setZero();
 
   auto compute_forward = [&]<typename T>(T) {
     for (unsigned int b = 0; b < batch; ++b) {
-      for (unsigned int ow = 0; ow < out_height; ++ow) {
+      for (unsigned int oh = 0; oh < out_height; ++oh) {
         int base_h =
-          static_cast<int>(ow * stride) - static_cast<int>(pad_left);
+          static_cast<int>(oh * stride) - static_cast<int>(pad_left);
 
         for (unsigned int c = 0; c < channels; ++c) {
           T sum = static_cast<T>(0);
@@ -162,7 +213,7 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
             }
           }
 
-          hidden_.setValue(b, 0, ow, c, sum);
+          hidden_.setValue(b, 0, oh, c, sum);
         }
       }
     }
