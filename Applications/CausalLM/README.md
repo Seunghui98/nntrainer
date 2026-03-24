@@ -59,7 +59,7 @@ $ ./build/Applications/CausalLM/nntr_causallm {your model config folder}
 
 e.g.,
 ```bash
-$ ./build/Applications/CausalLM/nntr_causallm /tmp/nntrainer/Applications/CausalLM/res/qwen3-4b/
+$ ./build/Applications/CausalLM/nntr_causallm /tmp/nntrainer/Applications/CausalLM/res/qwen3/qwen3-4b/
 ```
 
 ### 3. Android Build & Test
