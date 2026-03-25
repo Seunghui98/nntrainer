@@ -313,6 +313,14 @@ def main():
                     channels=3, kernel_size=3, disable_bias=True,
                     output_dir=output_dir)
 
+    # FP16
+    generate_golden("depthwise_conv1d_sb_fp16_causal_w3", batch=1, seq_len=8,
+                    channels=4, kernel_size=3, disable_bias=True,
+                    output_dir=output_dir)
+
+    generate_golden("depthwise_conv1d_mb_fp16_causal_w3", batch=3, seq_len=8,
+                    channels=4, kernel_size=3, disable_bias=True,
+                    output_dir=output_dir)
 
 if __name__ == "__main__":
     main()
