@@ -302,7 +302,6 @@ private:
   unsigned int local_window_size;
 
   float attn_logit_softcapping;
-  bool is_causal;
 
   /**
    * @brief relative bucket lookup table

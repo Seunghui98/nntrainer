@@ -128,8 +128,7 @@ DebertaAttentionLayer::DebertaAttentionLayer() :
   max_relative_positions(0),
   position_buckets(0),
   local_window_size(0),
-  attn_logit_softcapping(0.0f),
-  is_causal(false) {
+  attn_logit_softcapping(0.0f) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -193,8 +192,6 @@ void DebertaAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
 
   if (max_relative_positions < 1)
     max_relative_positions = max_position_embeddings;
-
-  is_causal = false;
 
   local_window_size = std::max<unsigned int>(
     query_dim.height(),
