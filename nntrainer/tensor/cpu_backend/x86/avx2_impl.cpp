@@ -998,6 +998,155 @@ void swiglu(const unsigned int N, float *X, const float *Y, const float *Z,
   _mm_setcsr(oldcsr);
 }
 
+
+
+#define gelu_start_tanh -4.38086284326899f
+#define gelu_end_tanh    4.38086284326899f
+
+#define tanh_c_gelu_p0   5.91303808e-6f
+#define tanh_c_gelu_p1   5.00000000e-1f
+#define tanh_c_gelu_p2   3.98865869e-1f
+#define tanh_c_gelu_p4  -6.66574676e-2f
+#define tanh_c_gelu_p6   1.00712610e-2f
+#define tanh_c_gelu_p8  -1.19336340e-3f
+#define tanh_c_gelu_p10  1.09543224e-4f
+#define tanh_c_gelu_p12 -7.55788500e-6f
+#define tanh_c_gelu_p14  3.73374142e-7f
+#define tanh_c_gelu_p16 -1.23162678e-8f
+#define tanh_c_gelu_p18  2.40940960e-10f
+#define tanh_c_gelu_p20 -2.10237709e-12f
+
+#define gelu_start_erf  -4.59373833108583f
+#define gelu_end_erf     4.59373833108583f
+
+#define erf_c_gelu_p0    8.70757509e-06f
+#define erf_c_gelu_p1    5.00000000e-1f
+#define erf_c_gelu_p2    3.98833088e-01f
+#define erf_c_gelu_p4   -6.62633808e-02f
+#define erf_c_gelu_p6    9.78776282e-03f
+#define erf_c_gelu_p8   -1.10798998e-03f
+#define erf_c_gelu_p10   9.51056006e-05f
+#define erf_c_gelu_p12  -6.04633051e-06f
+#define erf_c_gelu_p14   2.73076070e-07f
+#define erf_c_gelu_p16  -8.20707325e-09f
+#define erf_c_gelu_p18   1.46115955e-10f
+#define erf_c_gelu_p20  -1.16009840e-12f
+
+static inline __m256 poly_gelu_tanh_avx2(__m256 x) {
+  const __m256 x2 = _mm256_mul_ps(x, x);
+
+  __m256 y = _mm256_mul_ps(x2, _mm256_set1_ps(tanh_c_gelu_p20));
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p18));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p16));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p14));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p12));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p10));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p8));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p6));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p4));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p2));
+  y = _mm256_mul_ps(x2, y);
+
+  __m256 z = _mm256_mul_ps(x, _mm256_set1_ps(tanh_c_gelu_p1));
+  z = _mm256_add_ps(z, _mm256_set1_ps(tanh_c_gelu_p0));
+
+  y = _mm256_add_ps(y, z);
+
+  const __m256 gt_start = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_tanh), _CMP_GT_OQ);
+  const __m256 le_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_LE_OQ);
+  const __m256 gt_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_GT_OQ);
+
+  y = _mm256_and_ps(y, gt_start);
+  y = _mm256_and_ps(y, le_end);
+  __m256 x_hi = _mm256_and_ps(x, gt_end);
+
+  return _mm256_add_ps(y, x_hi);
+}
+
+static inline __m256 poly_gelu_erf_avx2(__m256 x) {
+  const __m256 x2 = _mm256_mul_ps(x, x);
+
+  __m256 y = _mm256_mul_ps(x2, _mm256_set1_ps(erf_c_gelu_p20));
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p18));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p16));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p14));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p12));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p10));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p8));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p6));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p4));
+  y = _mm256_mul_ps(x2, y);
+  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p2));
+  y = _mm256_mul_ps(x2, y);
+
+  __m256 z = _mm256_mul_ps(x, _mm256_set1_ps(erf_c_gelu_p1));
+  z = _mm256_add_ps(z, _mm256_set1_ps(erf_c_gelu_p0));
+
+  y = _mm256_add_ps(y, z);
+
+  const __m256 gt_start = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_erf), _CMP_GT_OQ);
+  const __m256 le_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_LE_OQ);
+  const __m256 gt_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_GT_OQ);
+
+  y = _mm256_and_ps(y, gt_start);
+  y = _mm256_and_ps(y, le_end);
+  __m256 x_hi = _mm256_and_ps(x, gt_end);
+
+  return _mm256_add_ps(y, x_hi);
+}
+
+void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
+  unsigned int i = 0;
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    __m256 y = poly_gelu_tanh_avx2(x);
+    _mm256_storeu_ps(&Y[i], y);
+  }
+
+  for (; i < N; ++i) {
+    const float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+}
+
+void gelu_v2(const unsigned int N, const float *X, float *Y) {
+  unsigned int i = 0;
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    __m256 y = poly_gelu_erf_avx2(x);
+    _mm256_storeu_ps(&Y[i], y);
+  }
+
+  for (; i < N; ++i) {
+    const float x = X[i];
+    Y[i] = 0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f)));
+  }
+}
+
+
+
+
+
+
+
 void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {

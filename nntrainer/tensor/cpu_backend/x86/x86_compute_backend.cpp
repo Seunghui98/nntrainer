@@ -301,7 +301,11 @@ void tanh_gelu(const unsigned int N, const float *X, float *Y) {
 }
 
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
+  nntrainer::avx2::tanh_gelu_v2(N, X, Y);
+}
+
+void gelu_v2(const unsigned int N, const float *X, float *Y) {
+  nntrainer::avx2::gelu_v2(N, X, Y);
 }
 
 void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {

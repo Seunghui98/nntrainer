@@ -556,6 +556,17 @@ void tanh_gelu(const unsigned int N, const float *X, float *Y);
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
+ * @brief tanh_gelu function
+ * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *     + 0.044715 * X^3))) with x4 loop unrolling
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void gelu_v2(const unsigned int N, const float *X, float *Y);
+
+/**
  * @brief tanh_gelu function with neon but as
  * X = Y / (1 + exp(-pi/4*(Y
  *     + 0.044715Y^3)) * Z
