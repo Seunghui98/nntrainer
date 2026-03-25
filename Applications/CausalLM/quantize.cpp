@@ -361,6 +361,7 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       dtype_map[prefix + "_attention_out"] = fc_dtype;
 
       // FFN FC layers
+      dtype_map[prefix + "_ffn_gate_up"] = fc_dtype;
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
       dtype_map[prefix + "_ffn_gate"] = fc_dtype;
       dtype_map[prefix + "_ffn_down"] = fc_dtype;

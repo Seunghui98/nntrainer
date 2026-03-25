@@ -160,6 +160,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gliner2_multi_v1/gliner2_multi_v1.cpp \
     ../layers/custom_gru_layer.cpp \
     ../layers/gather_layer.cpp \
+    ../layers/gate_up_layer.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c

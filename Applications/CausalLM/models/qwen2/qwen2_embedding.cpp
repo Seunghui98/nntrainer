@@ -11,4 +11,11 @@
  */
 #include "qwen2_embedding.h"
 
-namespace causallm {} // namespace causallm
+namespace causallm {
+
+void Qwen2Embedding::registerCustomLayers() {
+  SentenceTransformer::registerCustomLayers();
+  Qwen2Transformer::registerCustomLayers();
+}
+
+} // namespace causallm

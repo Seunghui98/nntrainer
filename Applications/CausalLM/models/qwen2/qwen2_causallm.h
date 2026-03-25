@@ -36,6 +36,12 @@ public:
                                            std::string query_name,
                                            std::string key_name,
                                            std::string value_name) override;
+  
+  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
+                                     int hidden_dim,
+                                     std::string input_name) override;
+
+  void registerCustomLayers() override;
 };
 
 /**
@@ -52,6 +58,8 @@ public:
     Qwen2Transformer(cfg, generation_cfg, nntr_cfg) {}
 
   virtual ~Qwen2CausalLM() = default;
+
+  void registerCustomLayers() override;
 };
 } // namespace causallm
 

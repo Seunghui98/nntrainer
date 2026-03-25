@@ -30,6 +30,11 @@ public:
     Qwen2Transformer(cfg, generation_cfg, nntr_cfg) {}
 
   virtual ~Qwen2Embedding() {}
+
+  /**
+   * @brief register CustomLayers
+   */
+  void registerCustomLayers() override;
 };
 
 } // namespace causallm

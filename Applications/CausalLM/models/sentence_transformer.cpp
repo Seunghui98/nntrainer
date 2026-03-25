@@ -247,32 +247,26 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
 
   std::vector<float *> label; // Empty label for inference
 
-  // auto start_prefill = std::chrono::high_resolution_clock::now();
+  auto start_prefill = std::chrono::high_resolution_clock::now();
 
   // Run incremental inference for the prefill stage
   // start: 0, end: input_len (process all tokens at once)
   // This performs a single forward pass for the entire prompt sequence to get
   // embeddings.
+
   std::vector<float *> output = model->incremental_inference(
     BATCH_SIZE, input, label, input_len, 0, input_len, false);
-  // auto start_prefill = std::chrono::high_resolution_clock::now();
-  // // Run incremental inference for the prefill stage
-  // // start: 0, end: input_len (process all tokens at once)
-  // // This performs a single forward pass for the entire prompt sequence to get
-  // // embeddings.
-  // std::vector<float *> output = model->incremental_inference(
-  //   BATCH_SIZE, input, label, input_len, 0, input_len, false);
   
-  // auto finish_prefill = std::chrono::high_resolution_clock::now();
-  // auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-  //   finish_prefill - start_prefill);
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
 
-  // std::cout << "prefill: " << input_len << " tokens, "
-  //           << prefill_duration.count() << " ms, "
-  //           << ((double)input_len / prefill_duration.count() * 1000)
-  //           << " TPS\n";
+  std::cout << "prefill: " << input_len << " tokens, "
+            << prefill_duration.count() << " ms, "
+            << ((double)input_len / prefill_duration.count() * 1000)
+            << " TPS\n";
 
-  // free(input_sample);
+  free(input_sample);
 
   
   // const int NUM_RUNS = 10;
