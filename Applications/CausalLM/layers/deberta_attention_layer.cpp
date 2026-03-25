@@ -88,12 +88,11 @@ struct RelativeIndexKey {
   unsigned int rel_len_k;
   bool c2p;
   bool p2c;
-  bool use_bucket;
 
   bool operator==(const RelativeIndexKey &rhs) const {
     return from == rhs.from && to == rhs.to && att_span == rhs.att_span &&
            rel_len_q == rhs.rel_len_q && rel_len_k == rhs.rel_len_k &&
-           c2p == rhs.c2p && p2c == rhs.p2c && use_bucket == rhs.use_bucket;
+           c2p == rhs.c2p && p2c == rhs.p2c;
   }
 };
 
@@ -355,7 +354,15 @@ void DebertaAttentionLayer::incremental_forwarding(
 }
 
 /**
- * @brief wrapper around nntrainer::compute_kcaches
+ * @brief Function to compute Attention Scores using Tensor inputs. Wrapper
+ * around nntrainer::compute_kcaches with multi-threading support
+ *
+ * Expected Input Shapes:
+ * @param in (Query): [Batch, 1, sequence_len, Num_Heads_Q * Head_Dim]
+ * @param cache (Key Cache): [Batch, 1, Max_Timestep, Num_Heads_KV * Head_Dim]
+ * @param out (Attention Score): [Batch, 1, 1, Num_Heads_Q * Context_Len]
+ *            where Context_Len is usually the current timestep 'to'.
+ *
  */
 void DebertaAttentionLayer::compute_kcaches(
   nntrainer::Tensor &in, nntrainer::Tensor &cache, nntrainer::Tensor &out,
@@ -632,16 +639,12 @@ void DebertaAttentionLayer::add_relative_attn_score(
   size_t next_input_idx = 3;
   nntrainer::Tensor rel_query;
   nntrainer::Tensor rel_key;
-  bool has_rel_query = false;
-  bool has_rel_key = false;
 
   if (p2c) {
     rel_query = context.getInput(next_input_idx++);
-    has_rel_query = true;
   }
   if (c2p) {
     rel_key = context.getInput(next_input_idx++);
-    has_rel_key = true;
   }
 
   const unsigned int S_q = to - from;
@@ -666,15 +669,13 @@ void DebertaAttentionLayer::add_relative_attn_score(
    * So we build/update the global cache under lock, then copy it to a local
    * value and use only the local copy outside the lock.
    */
-  const bool use_bucket = position_buckets > 0;
   const unsigned int rel_len_q =
-    (p2c && has_rel_query) ? rel_query.height() : 0u;
+    p2c ? rel_query.height() : 0u;
   const unsigned int rel_len_k =
-    (c2p && has_rel_key) ? rel_key.height() : 0u;
+    c2p ? rel_key.height() : 0u;
 
   const RelativeIndexKey cache_key{
-    from, to, att_span, rel_len_q, rel_len_k,
-    c2p && has_rel_key, p2c && has_rel_query, use_bucket};
+    from, to, att_span, rel_len_q, rel_len_k, c2p, p2c};
 
   RelativeIndexValue &rel_idx_local = tl_rel_index_value;
 
@@ -682,162 +683,151 @@ void DebertaAttentionLayer::add_relative_attn_score(
     rel_idx_local.c2p_idx.clear();
     rel_idx_local.p2c_idx.clear();
 
-    if (c2p && has_rel_key) {
+    if (c2p) {
       rel_idx_local.c2p_idx.resize(static_cast<size_t>(S_q) * S_k);
     }
-    if (p2c && has_rel_query) {
+    if (p2c) {
       rel_idx_local.p2c_idx.resize(static_cast<size_t>(S_q) * S_k);
     }
 
-    for (unsigned int q = 0; q < S_q; ++q) {
-      for (unsigned int k = 0; k < S_k; ++k) {
-        if (c2p && has_rel_key) {
-          const int rel = static_cast<int>(q + from) - static_cast<int>(k);
-          const int bucketed = use_bucket ? lookup_bucket(rel) : rel;
-          rel_idx_local.c2p_idx[static_cast<size_t>(q) * S_k + k] =
-            clampv(bucketed + static_cast<int>(att_span), 0,
-                  static_cast<int>(rel_len_k) - 1);
-        }
+    #pragma omp parallel for schedule(static)
+      for (unsigned int q = 0; q < S_q; ++q) {
+        for (unsigned int k = 0; k < S_k; ++k) {
+          if (c2p) {
+            const int rel = static_cast<int>(q + from) - static_cast<int>(k);
+            const int bucketed = lookup_bucket(rel);
+            rel_idx_local.c2p_idx[static_cast<size_t>(q) * S_k + k] =
+              clampv(bucketed + static_cast<int>(att_span), 0,
+                    static_cast<int>(rel_len_k) - 1);
+          }
 
-        if (p2c && has_rel_query) {
-          const int rel_rev =
-            static_cast<int>(k) - static_cast<int>(q + from);
-          const int bucketed_rev = use_bucket ? lookup_bucket(rel_rev) : rel_rev;
-          rel_idx_local.p2c_idx[static_cast<size_t>(q) * S_k + k] =
-            clampv(-bucketed_rev + static_cast<int>(att_span), 0,
-                  static_cast<int>(rel_len_q) - 1);
+          if (p2c) {
+            const int rel_rev =
+              static_cast<int>(k) - static_cast<int>(q + from);
+            const int bucketed_rev = lookup_bucket(rel_rev);
+            rel_idx_local.p2c_idx[static_cast<size_t>(q) * S_k + k] =
+              clampv(-bucketed_rev + static_cast<int>(att_span), 0,
+                    static_cast<int>(rel_len_q) - 1);
+          }
         }
       }
-    }
 
     tl_rel_index_key = cache_key;
     tl_rel_index_ready = true;
   }
 
   if (score.getDataType() == ml::train::TensorDim::DataType::FP32) {
-  float *score_ptr = score.getData<float>();
-  const float *q_ptr = query_step.getData<float>();
-  const float *rel_query_ptr =
-    has_rel_query ? rel_query.getData<float>() : nullptr;
-  const float *rel_key_ptr =
-    has_rel_key ? rel_key.getData<float>() : nullptr;
+    float *score_ptr = score.getData<float>();
+    const float *q_ptr = query_step.getData<float>();
+    const float *rel_query_ptr =
+      p2c ? rel_query.getData<float>() : nullptr;
+    const float *rel_key_ptr =
+      c2p ? rel_key.getData<float>() : nullptr;
 
-  const uint16_t *key_u16_ptr =
-    key_cache.getDataType() == ml::train::TensorDim::DataType::UINT16
-      ? key_cache.getData<uint16_t>()
-      : nullptr;
+    const uint16_t *key_u16_ptr =
+      key_cache.getDataType() == ml::train::TensorDim::DataType::UINT16
+        ? key_cache.getData<uint16_t>()
+        : nullptr;
 
-  const float *key_f32_ptr =
-    key_cache.getDataType() == ml::train::TensorDim::DataType::FP32
-      ? key_cache.getData<float>()
-      : nullptr;
-
-  #ifdef ENABLE_FP16
-  const _FP16 *key_fp16_ptr =
-    key_cache.getDataType() == ml::train::TensorDim::DataType::FP16
-      ? key_cache.getData<_FP16>()
-      : nullptr;
-  #else
-  const void *key_fp16_ptr = nullptr;
-  #endif
-
-  std::vector<float> &key_cache_fp32_buf = tl_key_cache_fp32_buf;
-  const float *key_unpacked_ptr = nullptr;
-
-  /**
-   * p2c path needs key-cache values in FP32 for dot(q_rel, k_cache).
-   * If cache is packed/FP16, unpack once outside the hot loop.
-   */
-    if (p2c && (key_u16_ptr
     #ifdef ENABLE_FP16
-                || key_fp16_ptr
+    const _FP16 *key_fp16_ptr =
+      key_cache.getDataType() == ml::train::TensorDim::DataType::FP16
+        ? key_cache.getData<_FP16>()
+        : nullptr;
+    #else
+    const void *key_fp16_ptr = nullptr;
     #endif
-                )) {
-      const size_t unpack_len = static_cast<size_t>(S_k) * hidden;
-      if (key_cache_fp32_buf.size() < unpack_len) {
-        key_cache_fp32_buf.resize(unpack_len);
-      }
 
-      for (unsigned int k = 0; k < S_k; ++k) {
-        float *dst = key_cache_fp32_buf.data() + static_cast<size_t>(k) * hidden;
+    std::vector<float> &key_cache_fp32_buf = tl_key_cache_fp32_buf;
+    const float *key_unpacked_ptr = nullptr;
 
-      if (key_u16_ptr) {
-        const uint16_t *src = key_u16_ptr + static_cast<size_t>(k) * hidden;
-        for (unsigned int i = 0; i < hidden; ++i) {
-          dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+    /**
+     * p2c path needs key-cache values in FP32 for dot(q_rel, k_cache).
+     * If cache is packed/FP16, unpack once outside the hot loop.
+     */
+    if (p2c && (key_u16_ptr
+      #ifdef ENABLE_FP16
+                  || key_fp16_ptr
+      #endif
+                  )) {
+        const size_t unpack_len = static_cast<size_t>(S_k) * hidden;
+        if (key_cache_fp32_buf.size() < unpack_len) {
+          key_cache_fp32_buf.resize(unpack_len);
         }
-      }
-  #ifdef ENABLE_FP16
-      else if (key_fp16_ptr) {
-        const _FP16 *src = key_fp16_ptr + static_cast<size_t>(k) * hidden;
-        for (unsigned int i = 0; i < hidden; ++i) {
-          dst[i] = static_cast<float>(src[i]);
+
+        for (unsigned int k = 0; k < S_k; ++k) {
+          float *dst =
+            key_cache_fp32_buf.data() + static_cast<size_t>(k) * hidden;
+
+          if (key_u16_ptr) {
+            const uint16_t *src =
+              key_u16_ptr + static_cast<size_t>(k) * hidden;
+            for (unsigned int i = 0; i < hidden; ++i) {
+              dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+            }
+          }
+      #ifdef ENABLE_FP16
+          else if (key_fp16_ptr) {
+            const _FP16 *src =
+              key_fp16_ptr + static_cast<size_t>(k) * hidden;
+            for (unsigned int i = 0; i < hidden; ++i) {
+              dst[i] = static_cast<float>(src[i]);
+            }
+          }
+      #endif
         }
-      }
-  #endif
+
+        key_unpacked_ptr = key_cache_fp32_buf.data();
     }
 
-    key_unpacked_ptr = key_cache_fp32_buf.data();
-  }
+  NNTR_THROW_IF(key_unpacked_ptr == nullptr, std::invalid_argument)
+                  << "FP32 relative attention path expected UINT16 or FP16 key cache";
 
-#pragma omp parallel for schedule(static)
-    for (unsigned int q_idx = 0; q_idx < S_q; ++q_idx) {
-      const size_t qk_row_base = static_cast<size_t>(q_idx) * S_k;
+  #pragma omp parallel for schedule(static)
+      for (unsigned int q_idx = 0; q_idx < S_q; ++q_idx) {
+        const size_t qk_row = static_cast<size_t>(q_idx) * S_k;
 
-      for (unsigned int h = 0; h < num_heads_Q; ++h) {
-        const unsigned int h_base = h * head_dim;
-        const float *q_head = q_ptr + q_idx * hidden + h_base;
+        for (unsigned int h = 0; h < num_heads_Q; ++h) {
+          const unsigned int h_base = h * head_dim;
+          const float *q_head = q_ptr + q_idx * hidden + h_base;
 
-        for (unsigned int k_idx = 0; k_idx < S_k; ++k_idx) {
-          float rel_score = 0.0f;
+          for (unsigned int k_idx = 0; k_idx < S_k; ++k_idx) {
+            float rel_score = 0.0f;
 
-          if (c2p && has_rel_key) {
-            const int rel_index = rel_idx_local.c2p_idx[qk_row_base + k_idx];
-            const float *rk_head =
-              rel_key_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
+            if (c2p) {
+              const int rel_index = rel_idx_local.c2p_idx[qk_row + k_idx];
+              const float *rk_head =
+                rel_key_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
 
-            float c2p_dot = 0.0f;
-#pragma omp simd reduction(+ : c2p_dot)
-            for (unsigned int d = 0; d < head_dim; ++d) {
-              c2p_dot += q_head[d] * rk_head[d];
+              float c2p_dot = 0.0f;
+  #pragma omp simd reduction(+ : c2p_dot)
+              for (unsigned int d = 0; d < head_dim; ++d) {
+                c2p_dot += q_head[d] * rk_head[d];
+              }
+              rel_score += c2p_dot * scale;
             }
-            rel_score += c2p_dot * scale;
-          }
 
-          if (p2c && has_rel_query) {
-            const int rel_index = rel_idx_local.p2c_idx[qk_row_base + k_idx];
-            const float *rq_head =
-              rel_query_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
+            if (p2c) {
+              const int rel_index = rel_idx_local.p2c_idx[qk_row + k_idx];
+              const float *rq_head =
+                rel_query_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
 
-            float p2c_dot = 0.0f;
-            if (key_unpacked_ptr) {
+              float p2c_dot = 0.0f;
               const float *k_head =
                 key_unpacked_ptr + static_cast<size_t>(k_idx) * hidden + h_base;
-#pragma omp simd reduction(+ : p2c_dot)
+  #pragma omp simd reduction(+ : p2c_dot)
               for (unsigned int d = 0; d < head_dim; ++d) {
                 p2c_dot += k_head[d] * rq_head[d];
               }
-            } else {
-              NNTR_THROW_IF(key_f32_ptr == nullptr, std::invalid_argument)
-                << "FP32 relative attention path expected FP32 or UINT16 key cache";
-              const float *k_head =
-                key_f32_ptr + static_cast<size_t>(k_idx) * hidden + h_base;
-#pragma omp simd reduction(+ : p2c_dot)
-              for (unsigned int d = 0; d < head_dim; ++d) {
-                p2c_dot += k_head[d] * rq_head[d];
-              }
+              rel_score += p2c_dot * scale;
             }
 
-            rel_score += p2c_dot * scale;
+            const size_t linear_idx =
+              (static_cast<size_t>(q_idx) * S_k + k_idx) * num_heads_Q + h;
+            score_ptr[linear_idx] += rel_score;
           }
-
-          const size_t linear_idx =
-            (static_cast<size_t>(q_idx) * S_k + k_idx) * num_heads_Q + h;
-          score_ptr[linear_idx] += rel_score;
         }
       }
-    }
-
   } else if (score.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     NNTR_THROW_IF(key_cache.getDataType() != ml::train::TensorDim::DataType::FP16,
@@ -847,9 +837,9 @@ void DebertaAttentionLayer::add_relative_attn_score(
     _FP16 *score_ptr = score.getData<_FP16>();
     const _FP16 *q_ptr = query_step.getData<_FP16>();
     const _FP16 *rel_query_ptr =
-      has_rel_query ? rel_query.getData<_FP16>() : nullptr;
+      p2c ? rel_query.getData<_FP16>() : nullptr;
     const _FP16 *rel_key_ptr =
-      has_rel_key ? rel_key.getData<_FP16>() : nullptr;
+      c2p ? rel_key.getData<_FP16>() : nullptr;
     const _FP16 *key_fp16_ptr = key_cache.getData<_FP16>();
 
 #pragma omp parallel for schedule(static)
@@ -863,7 +853,7 @@ void DebertaAttentionLayer::add_relative_attn_score(
         for (unsigned int k_idx = 0; k_idx < S_k; ++k_idx) {
           float rel_score = 0.0f;
 
-          if (c2p && has_rel_key) {
+          if (c2p) {
             const int rel_index = rel_idx_local.c2p_idx[qk_row_base + k_idx];
             const _FP16 *rk_head =
               rel_key_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
@@ -877,7 +867,7 @@ void DebertaAttentionLayer::add_relative_attn_score(
             rel_score += c2p_dot * scale;
           }
 
-          if (p2c && has_rel_query) {
+          if (p2c) {
             const int rel_index = rel_idx_local.p2c_idx[qk_row_base + k_idx];
             const _FP16 *rq_head =
               rel_query_ptr + static_cast<size_t>(rel_index) * hidden + h_base;
@@ -949,74 +939,42 @@ void DebertaAttentionLayer::one_batch_incremental_forwarding(
 
   const unsigned int gqa_size = num_heads_Q / num_heads_KV;
   
-  // auto start = std::chrono::high_resolution_clock::now();
   compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
                   gqa_size, head_dim, pool);
-  // auto finish = std::chrono::high_resolution_clock::now();
-  // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(
-  //   finish - start);
-  // std::cout << "compute_kcaches : " << time.count() << "ms\n";
 
-  /**
-   * DeBERTa disentangled attention uses a shared scaling factor across
-   * content-to-content, content-to-position, and position-to-content terms.
-   *
-   * compute_kcaches() gives us content logits on the mha_core path, so we apply
-   * an extra 1/sqrt(scale_factor_int) here to match:
-   *   1 / sqrt(head_dim * scale_factor_int)
-   */
-  // start = std::chrono::high_resolution_clock::now();
-  const bool c2p = std::get<props::C2P>(deberta_props).get();
-  const bool p2c = std::get<props::P2C>(deberta_props).get();
-  const int scale_factor_int = 1 + (c2p ? 1 : 0) + (p2c ? 1 : 0);
-  const float content_rescale =
-    1.0f / std::sqrt(static_cast<float>(scale_factor_int));
+  const bool relative_attention = std::get<props::RelativeAttention>(deberta_props).get();
+  if (relative_attention) {
+    const bool c2p = std::get<props::C2P>(deberta_props).get();
+    const bool p2c = std::get<props::P2C>(deberta_props).get();
+    const int scale_factor_int = 1 + (c2p ? 1 : 0) + (p2c ? 1 : 0);
+    const float content_rescale =
+      1.0f / std::sqrt(static_cast<float>(scale_factor_int));
 
-  if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *ptr = out_.getData<float>();
-    const size_t len =
-      out_.batch() * out_.channel() * out_.height() * out_.width();
-    for (size_t i = 0; i < len; ++i) {
-      ptr[i] *= content_rescale;
+    if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      float *ptr = out_.getData<float>();
+      const size_t len =
+        out_.batch() * out_.channel() * out_.height() * out_.width();
+      for (size_t i = 0; i < len; ++i) {
+        ptr[i] *= content_rescale;
+      }
     }
-  }
-#ifdef ENABLE_FP16
-  else if (out_.getDataType() == ml::train::TensorDim::DataType::FP16) {
-    _FP16 *ptr = out_.getData<_FP16>();
-    const size_t len =
-      out_.batch() * out_.channel() * out_.height() * out_.width();
-    for (size_t i = 0; i < len; ++i) {
-      ptr[i] = (_FP16)((float)ptr[i] * content_rescale);
+  #ifdef ENABLE_FP16
+    else if (out_.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      _FP16 *ptr = out_.getData<_FP16>();
+      const size_t len =
+        out_.batch() * out_.channel() * out_.height() * out_.width();
+      for (size_t i = 0; i < len; ++i) {
+        ptr[i] = (_FP16)((float)ptr[i] * content_rescale);
+      }
     }
+  #endif
+    add_relative_attn_score(context, out_, query_step, b_cached_key, from, to);  
   }
-#endif
-  // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
-  //   finish - start);
-  // std::cout << "add_relative_attn_score(pre) : " << time.count() << "ns\n";
-  
-  // start = std::chrono::high_resolution_clock::now();  
-  add_relative_attn_score(context, out_, query_step, b_cached_key, from, to); 
-  // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
-  //   finish - start);
-  // std::cout << "add_relative_attn_score : " << time.count() << "ns\n";
-  
-  // start = std::chrono::high_resolution_clock::now();  
   softmax_triangle(out_, to - from, num_heads_Q, from, pool);
-  // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
-  //   finish - start);
-  // std::cout << "softmax_triangle : " << time.count() << "ns\n";
 
-  // start = std::chrono::high_resolution_clock::now();  
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 from, num_heads_KV, gqa_size, head_dim, to,
                                 pool);
-  // finish = std::chrono::high_resolution_clock::now();
-  // time = std::chrono::duration_cast<std::chrono::nanoseconds>(
-  //   finish - start);
-  // std::cout << "compute_fp16vcache_transposed : " << time.count() << "ns\n";
 }
 
 void DebertaAttentionLayer::setBatch(nntrainer::RunLayerContext &context,
