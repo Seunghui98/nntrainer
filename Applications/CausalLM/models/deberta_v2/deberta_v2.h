@@ -45,9 +45,9 @@ protected:
                                               std::string input_name,
                                               std::string rel_embeddings_name);
 
-  std::vector<LayerHandle> createDebertaV2Attention(const int layer_id,
-                                                    std::string input_name,
-                                                    std::string rel_embeddings_name);
+  std::vector<LayerHandle>
+  createDebertaV2Attention(const int layer_id, std::string input_name,
+                           std::string rel_embeddings_name);
 
   /**
    * @brief Setup the parameters for the Deberta V2 model

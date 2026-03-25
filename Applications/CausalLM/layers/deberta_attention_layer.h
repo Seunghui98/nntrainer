@@ -4,7 +4,8 @@
  *
  * @file   deberta_attention_layer.h
  * @date   14 January 2026
- * @see    https://github.com/huggingface/transformers/blob/5c1c72b/src/transformers/models/deberta/modeling_deberta.py
+ * @see
+ * https://github.com/huggingface/transformers/blob/5c1c72b/src/transformers/models/deberta/modeling_deberta.py
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  DeBERTa attention layer based on mha_core-style optimized path
@@ -202,9 +203,8 @@ public:
   /**
    * @brief softmax helper for score tensor
    */
-  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
-                        size_t num_heads, unsigned int from,
-                        BS::thread_pool<> &pool);
+  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
+                        unsigned int from, BS::thread_pool<> &pool);
 
   /**
    * @brief wrapper around nntrainer::compute_fp16vcache_transposed
@@ -227,11 +227,7 @@ private:
     OUTPUT_IDX = 0,
   };
 
-  enum AttentionParams {
-    cache_key = 0,
-    cache_value = 1,
-    max_params
-  };
+  enum AttentionParams { cache_key = 0, cache_value = 1, max_params };
 
   /**
    * @brief one-batch incremental forwarding path
@@ -243,12 +239,12 @@ private:
    *   -> compute_fp16vcache_transposed()
    */
   void one_batch_incremental_forwarding(
-    nntrainer::RunLayerContext &context,
-    const unsigned int batch, const unsigned int _from, const unsigned int from,
-    const unsigned int to, nntrainer::Tensor &query_step,
-    nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
-    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
-    nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+    nntrainer::RunLayerContext &context, const unsigned int batch,
+    const unsigned int _from, const unsigned int from, const unsigned int to,
+    nntrainer::Tensor &query_step, nntrainer::Tensor &key_step,
+    nntrainer::Tensor &value_step, nntrainer::Tensor &attention_output_step,
+    nntrainer::Tensor &cache_key, nntrainer::Tensor &cache_value,
+    ml::train::TensorDim &cache_key_dim,
     ml::train::TensorDim &cache_key_step_dim,
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim);
@@ -260,8 +256,8 @@ private:
   void add_relative_attn_score(nntrainer::RunLayerContext &context,
                                nntrainer::Tensor &score,
                                nntrainer::Tensor &query_step,
-                               nntrainer::Tensor &key_cache,
-                               unsigned int from, unsigned int to);
+                               nntrainer::Tensor &key_cache, unsigned int from,
+                               unsigned int to);
 
   /**
    * @brief bucket helper
