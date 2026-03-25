@@ -14,7 +14,6 @@
  */
 
 #include <ggml_interface.h>
-#include <neon_setting.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 
@@ -137,7 +136,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                  K);
     }
-    int thread_num = get_runtime_omp_num_threads();
+    int thread_num = std::thread::hardware_concurrency() / 2;
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
 #pragma omp parallel for num_threads(thread_num)
@@ -197,7 +196,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
                                 QA.data(), M, M_step_end - M_step_start);
       }
     } else {
-      int n_threads = 4;
+      int n_threads = 1;
       // std::cout << "Parrallel gemv Ns.size(): " << Ns.size() << std::endl;
 #pragma omp parallel for num_threads(n_threads)
       for (int i = 0; i < n_threads; ++i) {
@@ -329,7 +328,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                               QA.data(), M, M_step_end - M_step_start);
     }
   } else { // GEMM
-    int n_threads = get_runtime_omp_num_threads();
+    int n_threads = std::thread::hardware_concurrency() / 2;
     unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
     const size_t qa_row_size = (sizeof(block_q8_0) * K) / QK8_0;
@@ -432,7 +431,7 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
                               QA.data(), M, M_step_end - M_step_start);
     }
   } else {
-    int n_threads = get_runtime_omp_num_threads();
+    int n_threads = std::thread::hardware_concurrency() / 2;
     unsigned int blocks_per_4_rows = (K + QK_K - 1) / QK_K;
     unsigned int qa_4_rows_size = sizeof(block_q8_Kx4) * blocks_per_4_rows;
     const size_t qa_row_size = (sizeof(block_q8_K) * K) / QK_K;
@@ -510,7 +509,7 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
                       const unsigned int lda, const void *B,
                       const unsigned int ldb, float *C,
                       const unsigned int ldc) {
-  int32_t thread_count = get_runtime_omp_num_threads();
+  int32_t thread_count = std::thread::hardware_concurrency() / 2;
 
   static constexpr const int32_t bs = 1;  // unused in ggml_vec_dot_q6_K_q8_K
   static constexpr const int32_t bx = 1;  // unused in ggml_vec_dot_q6_K_q8_K
