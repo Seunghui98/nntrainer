@@ -652,7 +652,6 @@ void DebertaAttentionLayer::add_relative_attn_score(
 
   /**
    * Shared relative index cache across attention layers
-
    */
   const unsigned int rel_len_q = p2c ? rel_query.height() : 0u;
   const unsigned int rel_len_k = c2p ? rel_key.height() : 0u;
