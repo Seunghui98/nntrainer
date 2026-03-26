@@ -437,7 +437,7 @@ public:
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
     nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+                       t_out.getData<float>());
     return t_out;
   }
 

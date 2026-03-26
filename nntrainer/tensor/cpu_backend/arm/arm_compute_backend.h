@@ -818,7 +818,6 @@ void tanh_gelu(const unsigned int N, const float *X, float *Y);
  */
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
-
 /**
  * @brief gelu function with neon but with polynoial approximation
  *

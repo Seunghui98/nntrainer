@@ -131,8 +131,6 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
  */
 void gelu_v2(const unsigned int N, const float *X, float *Y);
 
-
-
 /**
  * @brief swiglu function with alpha and AVX : X = (Y / (1 + exp(- alpha * Y)))
  * * Z

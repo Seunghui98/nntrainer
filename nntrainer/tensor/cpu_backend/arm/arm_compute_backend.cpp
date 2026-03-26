@@ -70,7 +70,7 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
 #ifdef __ARM_NEON
   nntrainer::neon::gelu_v2(N, X, Y);
 #endif
-//  __fallback_gelu_v2(N, X, Y); NYI TODO : fallback
+  __fallback_gelu_v2(N, X, Y);
 }
 
 void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {

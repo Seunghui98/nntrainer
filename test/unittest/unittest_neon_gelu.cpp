@@ -34,8 +34,8 @@ static inline float ref_tanh_gelu(float x) {
 
 static inline float ref_gelu(float x) {
   const float half = 0.5f;
-  const float c = 1/std::sqrt(2);
-  return half * x * (1.0f + std::erf(c*x));
+  const float c = 1 / std::sqrt(2);
+  return half * x * (1.0f + std::erf(c * x));
 }
 
 static inline float ref_tanh_gelu_mul(float x, float y) {
@@ -87,7 +87,6 @@ TEST(ActivationNeon, TanhGeluAccuracy) {
     expect_close(y[i], y_ref[i], abs_tol, rel_tol);
   }
 }
-
 
 TEST(ActivationNeon, Geluv2Accuracy) {
   constexpr size_t N = 4096;

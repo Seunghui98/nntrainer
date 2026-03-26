@@ -515,7 +515,7 @@ void __fallback_tanh_gelu_mul(const unsigned int N, _FP16 *X, _FP16 *Y,
                               _FP16 *Z);
 
 /**
- * @brief tanh_gelu v2 function 
+ * @brief tanh_gelu v2 function
  *
  * @param N number of elements in X
  * @param X _FP16 * for Vector X (output)
@@ -611,7 +611,6 @@ void __fallback_tanh_gelu(const unsigned int N, const float *X, float *Y);
  */
 void __fallback_tanh_gelu_mul(const unsigned int N, float *X, float *Y,
                               float *Z);
-
 
 /**
  * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X

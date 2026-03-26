@@ -705,10 +705,9 @@ extern void tanh_gelu(const unsigned int N, const float *X, float *Y);
  */
 extern void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
-
 /**
  * @brief gelu function with neon but as
- * 
+ *
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)

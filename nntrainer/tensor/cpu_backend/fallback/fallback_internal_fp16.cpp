@@ -234,10 +234,8 @@ void __fallback_tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
 void __fallback_gelu_v2(const unsigned int N, const _FP16 *X, _FP16 *Y) {
   for (unsigned int i = 0; i < N; ++i) {
     float x = static_cast<float>(X[i]);
-    
-    Y[i] = static_cast<_FP16>(
-      0.5f * x *
-      (1.0f + std::erf(x * 0.7071067811f)));
+
+    Y[i] = static_cast<_FP16>(0.5f * x * (1.0f + std::erf(x * 0.7071067811f)));
   }
 }
 

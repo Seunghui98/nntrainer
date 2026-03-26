@@ -998,39 +998,37 @@ void swiglu(const unsigned int N, float *X, const float *Y, const float *Z,
   _mm_setcsr(oldcsr);
 }
 
-
-
 #define gelu_start_tanh -4.38086284326899f
-#define gelu_end_tanh    4.38086284326899f
+#define gelu_end_tanh 4.38086284326899f
 
-#define tanh_c_gelu_p0   5.91303808e-6f
-#define tanh_c_gelu_p1   5.00000000e-1f
-#define tanh_c_gelu_p2   3.98865869e-1f
-#define tanh_c_gelu_p4  -6.66574676e-2f
-#define tanh_c_gelu_p6   1.00712610e-2f
-#define tanh_c_gelu_p8  -1.19336340e-3f
-#define tanh_c_gelu_p10  1.09543224e-4f
+#define tanh_c_gelu_p0 5.91303808e-6f
+#define tanh_c_gelu_p1 5.00000000e-1f
+#define tanh_c_gelu_p2 3.98865869e-1f
+#define tanh_c_gelu_p4 -6.66574676e-2f
+#define tanh_c_gelu_p6 1.00712610e-2f
+#define tanh_c_gelu_p8 -1.19336340e-3f
+#define tanh_c_gelu_p10 1.09543224e-4f
 #define tanh_c_gelu_p12 -7.55788500e-6f
-#define tanh_c_gelu_p14  3.73374142e-7f
+#define tanh_c_gelu_p14 3.73374142e-7f
 #define tanh_c_gelu_p16 -1.23162678e-8f
-#define tanh_c_gelu_p18  2.40940960e-10f
+#define tanh_c_gelu_p18 2.40940960e-10f
 #define tanh_c_gelu_p20 -2.10237709e-12f
 
-#define gelu_start_erf  -4.59373833108583f
-#define gelu_end_erf     4.59373833108583f
+#define gelu_start_erf -4.59373833108583f
+#define gelu_end_erf 4.59373833108583f
 
-#define erf_c_gelu_p0    8.70757509e-06f
-#define erf_c_gelu_p1    5.00000000e-1f
-#define erf_c_gelu_p2    3.98833088e-01f
-#define erf_c_gelu_p4   -6.62633808e-02f
-#define erf_c_gelu_p6    9.78776282e-03f
-#define erf_c_gelu_p8   -1.10798998e-03f
-#define erf_c_gelu_p10   9.51056006e-05f
-#define erf_c_gelu_p12  -6.04633051e-06f
-#define erf_c_gelu_p14   2.73076070e-07f
-#define erf_c_gelu_p16  -8.20707325e-09f
-#define erf_c_gelu_p18   1.46115955e-10f
-#define erf_c_gelu_p20  -1.16009840e-12f
+#define erf_c_gelu_p0 8.70757509e-06f
+#define erf_c_gelu_p1 5.00000000e-1f
+#define erf_c_gelu_p2 3.98833088e-01f
+#define erf_c_gelu_p4 -6.62633808e-02f
+#define erf_c_gelu_p6 9.78776282e-03f
+#define erf_c_gelu_p8 -1.10798998e-03f
+#define erf_c_gelu_p10 9.51056006e-05f
+#define erf_c_gelu_p12 -6.04633051e-06f
+#define erf_c_gelu_p14 2.73076070e-07f
+#define erf_c_gelu_p16 -8.20707325e-09f
+#define erf_c_gelu_p18 1.46115955e-10f
+#define erf_c_gelu_p20 -1.16009840e-12f
 
 static inline __m256 poly_gelu_tanh_avx2(__m256 x) {
   const __m256 x2 = _mm256_mul_ps(x, x);
@@ -1060,9 +1058,12 @@ static inline __m256 poly_gelu_tanh_avx2(__m256 x) {
 
   y = _mm256_add_ps(y, z);
 
-  const __m256 gt_start = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_tanh), _CMP_GT_OQ);
-  const __m256 le_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_LE_OQ);
-  const __m256 gt_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_GT_OQ);
+  const __m256 gt_start =
+    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_tanh), _CMP_GT_OQ);
+  const __m256 le_end =
+    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_LE_OQ);
+  const __m256 gt_end =
+    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_GT_OQ);
 
   y = _mm256_and_ps(y, gt_start);
   y = _mm256_and_ps(y, le_end);
@@ -1099,9 +1100,12 @@ static inline __m256 poly_gelu_erf_avx2(__m256 x) {
 
   y = _mm256_add_ps(y, z);
 
-  const __m256 gt_start = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_erf), _CMP_GT_OQ);
-  const __m256 le_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_LE_OQ);
-  const __m256 gt_end   = _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_GT_OQ);
+  const __m256 gt_start =
+    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_erf), _CMP_GT_OQ);
+  const __m256 le_end =
+    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_LE_OQ);
+  const __m256 gt_end =
+    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_GT_OQ);
 
   y = _mm256_and_ps(y, gt_start);
   y = _mm256_and_ps(y, le_end);
@@ -1140,12 +1144,6 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
     Y[i] = 0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f)));
   }
 }
-
-
-
-
-
-
 
 void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
