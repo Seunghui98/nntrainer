@@ -61,8 +61,8 @@ protected:
   void registerCustomLayers() override;
 
   int MAX_RELATIVE_POSITIONS;
-  bool c2p;
-  bool p2c;
+  bool C2P;
+  bool P2C;
   bool SHARE_ATT_KEY;
   bool RELATIVE_ATTENTION;
   int POSITION_BUCKETS;

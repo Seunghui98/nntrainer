@@ -278,13 +278,13 @@ void DebertaV2::setupParameters(json &cfg, json &generation_cfg,
         }
       }
 
-      c2p = std::find(pos_att_type_vec.begin(), pos_att_type_vec.end(),
+      C2P = std::find(pos_att_type_vec.begin(), pos_att_type_vec.end(),
                       "c2p") != pos_att_type_vec.end();
-      p2c = std::find(pos_att_type_vec.begin(), pos_att_type_vec.end(),
+      P2C = std::find(pos_att_type_vec.begin(), pos_att_type_vec.end(),
                       "p2c") != pos_att_type_vec.end();
     } else {
-      c2p = false;
-      p2c = false;
+      C2P = false;
+      P2C = false;
     }
 
     if (encoder_cfg.contains("share_att_key")) {
