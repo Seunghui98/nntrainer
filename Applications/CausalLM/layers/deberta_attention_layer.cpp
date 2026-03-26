@@ -33,10 +33,6 @@
 
 #include <node_exporter.h>
 
-#if !defined(__ANDROID__)
-#include <cblas.h>
-#endif
-
 namespace causallm {
 
 #define tile_size 4
@@ -229,11 +225,6 @@ void DebertaAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
 
   prepare_bucket_table(
     std::max<unsigned int>(query_dim.height(), max_position_embeddings));
-
-#if !defined(__ANDROID__)
-  // Keep BLAS single-threaded inside the layer to avoid oversubscription.
-  openblas_set_num_threads(4);
-#endif
 }
 
 void DebertaAttentionLayer::setProperty(
@@ -279,9 +270,8 @@ int DebertaAttentionLayer::lookup_bucket(int relative_pos) const {
 
 void DebertaAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
                                        bool training) {
-  nntrainer::Tensor &q = context.getInput(INPUT_IDX_Q);
-  nntrainer::Tensor &output = context.getOutput(OUTPUT_IDX);
-  output.copyData(q);
+  throw nntrainer::exception::not_supported(
+    "DebertaAttentionLayer::forwarding is not supported yet");
 }
 
 /**
@@ -757,8 +747,8 @@ void DebertaAttentionLayer::add_relative_attn_score(
       key_unpacked_ptr = key_cache_fp32_buf.data();
     }
 
-    NNTR_THROW_IF(key_unpacked_ptr == nullptr, std::invalid_argument)
-      << "FP32 relative attention path expected UINT16 or FP16 key cache";
+    NNTR_THROW_IF(p2c && key_unpacked_ptr == nullptr, std::invalid_argument)
+      << "FP32 p2c path expected UINT16 or FP16 key cache";
 
 #pragma omp parallel for schedule(static)
     for (unsigned int q_idx = 0; q_idx < S_q; ++q_idx) {
