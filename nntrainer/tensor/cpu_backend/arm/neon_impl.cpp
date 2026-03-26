@@ -924,96 +924,24 @@ void calc_trigonometric_vals_dup(unsigned int N_half, float *angle, float *cos_,
 }
 
 void swiglu(const unsigned int N, float *X, float *Y, float *Z) {
-unsigned int i = 0;
-  float32x4_t neg_alpha_vec = vdupq_n_f32(-1.0f);
-  float32x4_t one = vdupq_n_f32(1.0f);
-
-  for (; N - i >= 16; i += 16) {
-    float32x4_t y0 = vld1q_f32(&Y[i]);
-    float32x4_t y1 = vld1q_f32(&Y[i + 4]);
-    float32x4_t y2 = vld1q_f32(&Y[i + 8]);
-    float32x4_t y3 = vld1q_f32(&Y[i + 12]);
-
-    float32x4_t z0 = vld1q_f32(&Z[i]);
-    float32x4_t z1 = vld1q_f32(&Z[i + 4]);
-    float32x4_t z2 = vld1q_f32(&Z[i + 8]);
-    float32x4_t z3 = vld1q_f32(&Z[i + 12]);
-
-    float32x4_t alpha_y0 = vmulq_f32(y0, neg_alpha_vec);
-    float32x4_t alpha_y1 = vmulq_f32(y1, neg_alpha_vec);
-    float32x4_t alpha_y2 = vmulq_f32(y2, neg_alpha_vec);
-    float32x4_t alpha_y3 = vmulq_f32(y3, neg_alpha_vec);
-
-    float32x4_t exp0 = exp_ps(alpha_y0);
-    float32x4_t exp1 = exp_ps(alpha_y1);
-    float32x4_t exp2 = exp_ps(alpha_y2);
-    float32x4_t exp3 = exp_ps(alpha_y3);
-
-    exp0 = vaddq_f32(exp0, one);
-    exp1 = vaddq_f32(exp1, one);
-    exp2 = vaddq_f32(exp2, one);
-    exp3 = vaddq_f32(exp3, one);
-
-    exp0 = vdivq_f32(y0, exp0);
-    exp1 = vdivq_f32(y1, exp1);
-    exp2 = vdivq_f32(y2, exp2);
-    exp3 = vdivq_f32(y3, exp3);
-
-    exp0 = vmulq_f32(exp0, z0);
-    exp1 = vmulq_f32(exp1, z1);
-    exp2 = vmulq_f32(exp2, z2);
-    exp3 = vmulq_f32(exp3, z3);
-
-    vst1q_f32(&X[i], exp0);
-    vst1q_f32(&X[i + 4], exp1);
-    vst1q_f32(&X[i + 8], exp2);
-    vst1q_f32(&X[i + 12], exp3);
-  }
-
-  for (; N - i >= 8; i += 8) {
-    float32x4_t y0 = vld1q_f32(&Y[i]);
-    float32x4_t y1 = vld1q_f32(&Y[i + 4]);
-
-    float32x4_t z0 = vld1q_f32(&Z[i]);
-    float32x4_t z1 = vld1q_f32(&Z[i + 4]);
-
-    float32x4_t alpha_y0 = vmulq_f32(y0, neg_alpha_vec);
-    float32x4_t alpha_y1 = vmulq_f32(y1, neg_alpha_vec);
-
-    float32x4_t exp0 = exp_ps(alpha_y0);
-    float32x4_t exp1 = exp_ps(alpha_y1);
-
-    exp0 = vaddq_f32(exp0, one);
-    exp1 = vaddq_f32(exp1, one);
-
-    exp0 = vdivq_f32(y0, exp0);
-    exp1 = vdivq_f32(y1, exp1);
-
-    exp0 = vmulq_f32(exp0, z0);
-    exp1 = vmulq_f32(exp1, z1);
-
-    vst1q_f32(&X[i], exp0);
-    vst1q_f32(&X[i + 4], exp1);
-  }
-
+  unsigned int i = 0;
   for (; N - i >= 4; i += 4) {
     float32x4_t y0_3 = vld1q_f32(&Y[i]);
     float32x4_t z0_3 = vld1q_f32(&Z[i]);
-    float32x4_t alpha_y0_3 = vmulq_f32(y0_3, neg_alpha_vec);
-    float32x4_t exp0_3 = exp_ps(alpha_y0_3);
-    exp0_3 = vaddq_f32(exp0_3, one);
+    float32x4_t y0_3_minus = vmulq_n_f32(y0_3, -1);
+    float32x4_t exp0_3 = exp_ps(y0_3_minus);
+
+    exp0_3 = vaddq_f32(exp0_3, vmovq_n_f32(1.f));
     exp0_3 = vdivq_f32(y0_3, exp0_3);
     exp0_3 = vmulq_f32(exp0_3, z0_3);
 
     vst1q_f32(&X[i], exp0_3);
   }
   while (i < N) {
-    X[i] = (Y[i] / (1.f + std::exp(-Y[i]))) * Z[i];
+    X[i] = (Y[i] / (1.f + std::exp(static_cast<float>(-Y[i])))) * Z[i];
     ++i;
   }
 }
-
-
 
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   unsigned int i = 0;
