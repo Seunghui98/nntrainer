@@ -85,6 +85,9 @@ struct RelativeIndexKey {
   }
 };
 
+/**
+ * @brief shared c2p/p2c relative index value
+ */
 struct RelativeIndexValue {
   std::vector<int> c2p_idx;
   std::vector<int> p2c_idx;
