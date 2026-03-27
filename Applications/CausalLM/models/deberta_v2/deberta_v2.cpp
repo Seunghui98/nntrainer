@@ -7,7 +7,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note  Please refer to the following code :
+ * @brief  Please refer to the following code :
  * https://github.com/huggingface/transformers/blob/5c1c72b/src/transformers/models/deberta/modeling_deberta.py
  */
 
