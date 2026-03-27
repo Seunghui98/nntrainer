@@ -171,9 +171,9 @@ DebertaV2::createDebertaV2Attention(const int layer_id, std::string input_name,
 
   std::string attn_input_layers = Q + "," + K + "," + V;
 
-  // p2c uses Q_rel (projected relative embeddings using Query weights)
+  // P2C uses Q_rel (projected relative embeddings using Query weights)
   // DebertaAttentionLayer expects p2c input 5th (idx 4)
-  if (p2c) {
+  if (P2C) {
     auto Q_rel = "layer" + std::to_string(layer_id) + "_wq_rel";
     // Add Q as dependency to force Q to be finalized before Q_rel
     std::string q_rel_input_layers = rel_embeddings_name;
@@ -191,9 +191,9 @@ DebertaV2::createDebertaV2Attention(const int layer_id, std::string input_name,
     attn_input_layers += "," + Q_rel;
   }
 
-  // c2p uses K_rel (projected relative embeddings using Key weights)
-  // DebertaAttentionLayer expects c2p input 4th (idx 3)
-  if (c2p) {
+  // C2P uses K_rel (projected relative embeddings using Key weights)
+  // DebertaAttentionLayer expects C2P input 4th (idx 3)
+  if (C2P) {
     auto K_rel = "layer" + std::to_string(layer_id) + "_wk_rel";
     // Add K as dependency to force K to be finalized before K_rel
     std::string k_rel_input_layers = rel_embeddings_name;
@@ -215,8 +215,8 @@ DebertaV2::createDebertaV2Attention(const int layer_id, std::string input_name,
     withKey("num_heads", NUM_HEADS),
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_relative_positions", MAX_RELATIVE_POSITIONS),
-    withKey("c2p", c2p ? "true" : "false"),
-    withKey("p2c", p2c ? "true" : "false"),
+    withKey("c2p", C2P ? "true" : "false"),
+    withKey("p2c", P2C ? "true" : "false"),
     withKey("share_att_key", SHARE_ATT_KEY ? "true" : "false"),
     withKey("position_buckets", POSITION_BUCKETS),
     withKey("relative_attention", RELATIVE_ATTENTION ? "true" : "false"),
