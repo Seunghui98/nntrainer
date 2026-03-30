@@ -2,6 +2,8 @@
 #
 # Builds test executables from auto-generated model code (converter.py output).
 # Each test links against CausalLM's custom layer libraries and NNTrainer.
+#
+# nntr_runner: standalone runner — loads any NNTrainer INI without recompiling.
 
 converter_test_inc = [
   include_directories('.'),
@@ -39,6 +41,16 @@ converter_test_models = [
   # Custom models
   ['gliner2', 'converter_gliner2_test', 'ExtractorEmbeddingModel'],
 ]
+
+# nntr_runner: generic runner that loads any NNTrainer INI without per-model
+# compilation. All CausalLM custom layers are registered at startup.
+#
+#   Usage: nntr_runner <model.ini> [weights.bin]
+executable('nntr_runner',
+  [meson.current_source_dir() / 'nntr_runner.cpp'],
+  include_directories: converter_test_inc,
+  dependencies: [nntrainer_dep, nntrainer_ccapi_dep, converter_layer_deps],
+)
 
 foreach m : converter_test_models
   _src = meson.current_source_dir() / m[0] + '.cpp'

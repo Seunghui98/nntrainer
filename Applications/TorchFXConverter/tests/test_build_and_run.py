@@ -696,5 +696,150 @@ class TestConverterBuildAndRun(unittest.TestCase):
         self.assertIn("Model initialized successfully", stdout)
 
 
+# ---------------------------------------------------------------------------
+# nntr_runner tests
+# ---------------------------------------------------------------------------
+
+# Path to nntr_runner executable inside the build tree.
+_NNTR_RUNNER = os.path.join(
+    BUILD_DIR,
+    "Applications", "TorchFXConverter", "jni", "nntr_runner",
+)
+
+
+def _run_nntr_runner(ini_path, bin_path=""):
+    """Run nntr_runner with the given INI (and optional weight binary).
+
+    Returns (success, stdout, stderr).
+    """
+    env = os.environ.copy()
+    lib_paths = [
+        os.path.join(BUILD_DIR, "nntrainer"),
+        os.path.join(BUILD_DIR, "Applications", "CausalLM", "layers"),
+    ]
+    env["LD_LIBRARY_PATH"] = ":".join(lib_paths)
+    cmd = [_NNTR_RUNNER, ini_path]
+    if bin_path:
+        cmd.append(bin_path)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            timeout=60, env=env)
+    return result.returncode == 0, result.stdout, result.stderr
+
+
+def _run_converter_ini(model_dir, output_dir, model_name=None):
+    """Run converter.py with --format ini and return (success, stdout, stderr)."""
+    cmd = [
+        sys.executable, os.path.join(CONVERTER_DIR, "converter.py"),
+        "--model", model_dir,
+        "--output", output_dir,
+        "--format", "ini",
+    ]
+    if model_name:
+        cmd += ["--model-name", model_name]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return result.returncode == 0, result.stdout, result.stderr
+
+
+class TestNNTrainerRunner(unittest.TestCase):
+    """Verify that nntr_runner can load any converter-produced INI.
+
+    Unlike TestConverterBuildAndRun, these tests do NOT compile per-model
+    C++ code.  The workflow is simply:
+
+      convert → INI  →  nntr_runner <model.ini>  →  exit 0
+
+    This is faster and requires no meson reconfigure step.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Skip the whole class if build dir or nntr_runner is missing."""
+        if not os.path.isdir(BUILD_DIR):
+            raise unittest.SkipTest(
+                f"Build directory not found: {BUILD_DIR}. "
+                "Run: meson setup builddir && ninja -C builddir"
+            )
+        # Build nntr_runner if not already built
+        if not os.path.isfile(_NNTR_RUNNER):
+            target = "Applications/TorchFXConverter/jni/nntr_runner"
+            ok, _, stderr = _build_test(BUILD_DIR, target)
+            if not ok:
+                raise unittest.SkipTest(
+                    f"Could not build nntr_runner: {stderr[-300:]}"
+                )
+
+    # ---- Decoder-only CausalLM ----
+
+    def test_qwen3_tiny(self):
+        """Qwen3 tiny: convert to INI → nntr_runner."""
+        self._run_ini_test("qwen3")
+
+    def test_llama_tiny(self):
+        """LLaMA tiny: convert to INI → nntr_runner."""
+        self._run_ini_test("llama")
+
+    def test_qwen3_tied_embeddings(self):
+        """Qwen3 with tied word embeddings."""
+        self._run_ini_test("qwen3_tied")
+
+    # ---- Embedding models ----
+
+    def test_qwen3_embedding(self):
+        """Qwen3 embedding model: convert to INI → nntr_runner."""
+        self._run_ini_test("qwen3_embedding")
+
+    # ---- Encoder-only ----
+
+    def test_multilingual_e5(self):
+        """Multilingual-E5 (XLM-RoBERTa): convert to INI → nntr_runner."""
+        self._run_ini_test("multilingual_e5")
+
+    # ---- Common pipeline ----
+
+    def _run_ini_test(self, config_name):
+        """Pipeline: create tiny model → convert to INI → nntr_runner.
+
+        Steps:
+          1. Create a tiny HuggingFace model in a temp directory.
+          2. Run converter.py --format ini to produce <name>.ini.
+          3. Run nntr_runner <name>.ini and verify exit code 0.
+        """
+        config = MODEL_CONFIGS[config_name]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = os.path.join(tmpdir, "model")
+            output_dir = os.path.join(tmpdir, "output")
+
+            # Step 1: create local tiny model
+            if not _create_local_model(config, model_dir):
+                self.skipTest("transformers not available or model creation "
+                              "failed")
+
+            # Step 2: convert to INI
+            ok, stdout, stderr = _run_converter_ini(
+                model_dir, output_dir, model_name=config_name
+            )
+            self.assertTrue(ok, f"Converter failed:\n{stderr}")
+
+            # Locate the generated INI
+            ini_files = [
+                f for f in os.listdir(output_dir) if f.endswith(".ini")
+            ]
+            self.assertGreaterEqual(
+                len(ini_files), 1,
+                f"No INI file produced. Output dir: {os.listdir(output_dir)}"
+            )
+            ini_path = os.path.join(output_dir, ini_files[0])
+
+            # Step 3: run with nntr_runner
+            ok, stdout, stderr = _run_nntr_runner(ini_path)
+            self.assertTrue(
+                ok,
+                f"nntr_runner failed for {config_name}:\n"
+                f"stdout: {stdout}\nstderr: {stderr}",
+            )
+            self.assertIn("Model initialized successfully", stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

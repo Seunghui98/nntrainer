@@ -15,18 +15,76 @@ Supported architectures:
 
 ## Quick Start
 
+### Option A — INI mode with `nntr_runner` (recommended)
+
+The fastest way to verify a converted model. No per-model C++ compilation
+is required — `nntr_runner` registers all CausalLM custom layers and loads
+any NNTrainer INI directly.
+
 ```bash
-# Convert a HuggingFace model to C++
-python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --format cpp
+# Step 1: build NNTrainer and nntr_runner (once)
+cd /path/to/nntrainer
+meson setup builddir
+ninja -C builddir Applications/TorchFXConverter/jni/nntr_runner
 
-# Convert a local model directory
-python converter.py --model ./my_model/ --output ./out/ --format all
+# Step 2: convert a HuggingFace model to INI
+cd Applications/TorchFXConverter
+python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --format ini
 
-# With weights
-python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --weights --dtype float16
+# Step 3: load and verify with nntr_runner
+LD_LIBRARY_PATH=../../builddir/nntrainer:../../builddir/Applications/CausalLM/layers \
+  ../../builddir/Applications/TorchFXConverter/jni/nntr_runner ./out/qwen3.ini
 ```
 
-### CLI Arguments
+**With weight conversion:**
+
+```bash
+# Convert model to INI + weights binary
+python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --format ini --weights --dtype float16
+
+# Run with weights loaded
+LD_LIBRARY_PATH=../../builddir/nntrainer:../../builddir/Applications/CausalLM/layers \
+  ../../builddir/Applications/TorchFXConverter/jni/nntr_runner \
+  ./out/qwen3.ini ./out/qwen3.bin
+```
+
+**Via Python importer:**
+
+```python
+from importer import import_model
+
+result = import_model(
+    "Qwen/Qwen3-0.6B",
+    output_dir="./out/",
+    build_dir="../../builddir",
+    export_weights=True,
+)
+print(result.summary)     # NNTrainer model summary
+assert result.success
+```
+
+```bash
+# Or use the importer CLI directly
+python importer.py --model Qwen/Qwen3-0.6B --output ./out/
+python importer.py --model Qwen/Qwen3-0.6B --output ./out/ --weights
+python importer.py --ini ./out/qwen3.ini              # skip reconversion
+```
+
+### Option B — C++ class mode
+
+Generates a full C++ model class (compile once per model):
+
+```bash
+# Convert to C++
+python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --format cpp
+
+# Copy generated files to jni/ and rebuild
+cp out/qwen3.cpp out/qwen3.h jni/
+meson setup --reconfigure ../../builddir
+ninja -C ../../builddir Applications/TorchFXConverter/jni/converter_qwen3_gen_test
+```
+
+### converter.py CLI Arguments
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -39,6 +97,60 @@ python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --weights --dtype fl
 | `--seq-len` | Sequence length for tracing | `8` |
 | `--model-name` | Override output file basename | derived from `--model` |
 | `--quiet` | Suppress progress output | off |
+
+### nntr_runner usage
+
+```
+nntr_runner <model.ini> [weights.bin]
+
+  model.ini   : NNTrainer INI configuration produced by converter.py
+  weights.bin : Pre-converted weight binary (optional)
+```
+
+`nntr_runner` registers the following custom layer types automatically:
+`rms_norm`, `reshaped_rms_norm`, `mha_core`, `swiglu`, `embedding_layer`,
+`tie_word_embeddings`.
+
+### Weight converter
+
+The weight converter (`weight_converter.py`) converts HuggingFace state dicts
+to NNTrainer's binary format.  Two output formats are supported:
+
+| Format | Extension | Description |
+|--------|-----------|-------------|
+| Binary | `.bin` | Raw tensor bytes in layer-creation order (legacy) |
+| Safetensors | `.safetensors` | Self-describing format with JSON header; order-independent |
+
+```python
+from weight_converter import WeightConverter
+
+# After converting a model with converter.py:
+from decomposer import AdaptiveConverter
+from transformers import AutoConfig, AutoModelForCausalLM
+import torch
+
+config = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
+model  = AutoModelForCausalLM.from_config(config)
+conv   = AdaptiveConverter(model, seq_len=8)
+layers, structure = conv.convert()
+
+wc = WeightConverter(layers)
+wc.convert(model.state_dict(), "qwen3.bin", dtype="float32")
+wc.convert(model.state_dict(), "qwen3.safetensors",
+           output_format="safetensors", dtype="float16")
+wc.summary()   # print weight mapping table
+```
+
+Standalone weight conversion script:
+
+```python
+# Generate a self-contained conversion script
+script = wc.generate_script()
+with open("convert_weights.py", "w") as f:
+    f.write(script)
+# Run it later (no NNTrainer dependency needed):
+# python convert_weights.py Qwen/Qwen3-0.6B qwen3.bin float16
+```
 
 ## Tests
 
@@ -87,13 +199,28 @@ python -m pytest tests/test_emitters.py tests/test_emitter_cpp_modules.py tests/
 python -m pytest tests/test_e2e.py tests/test_multi_arch.py -v
 ```
 
-#### Build-and-run integration tests (requires NNTrainer build)
+#### nntr_runner integration tests (recommended, requires NNTrainer build)
+
+These tests convert each model to INI format and verify it with `nntr_runner` —
+no per-model C++ compilation step required:
+
+```bash
+# All nntr_runner tests
+python -m pytest tests/test_build_and_run.py::TestNNTrainerRunner -v
+
+# Individual model tests
+python -m pytest tests/test_build_and_run.py::TestNNTrainerRunner::test_qwen3_tiny -v
+python -m pytest tests/test_build_and_run.py::TestNNTrainerRunner::test_llama_tiny -v
+python -m pytest tests/test_build_and_run.py::TestNNTrainerRunner::test_multilingual_e5 -v
+```
+
+#### C++ build-and-run integration tests (requires NNTrainer build)
 
 These tests run the full pipeline: convert model → generate C++ → build with meson/ninja → run the executable with NNTrainer:
 
 ```bash
 # All build-and-run tests
-python -m pytest tests/test_build_and_run.py -v
+python -m pytest tests/test_build_and_run.py::TestConverterBuildAndRun -v
 
 # Individual model tests
 python -m pytest tests/test_build_and_run.py::TestConverterBuildAndRun::test_qwen3_tiny_build_and_run -v
@@ -138,6 +265,7 @@ Generated files are cleaned up after each test. The `jni/meson.build` conditiona
 ```
 TorchFXConverter/
 ├── converter.py              # CLI entry point
+├── importer.py               # Python importer: convert + run with nntr_runner
 ├── custom_models.py          # Custom model loaders (GLiNER2, etc.)
 ├── tracer.py                 # torch.fx callback tracer
 ├── decomposer.py             # Multi-pass conversion pipeline
@@ -149,7 +277,7 @@ TorchFXConverter/
 ├── mapper_helpers.py         # Name sanitization, scoping utilities
 ├── nntrainer_layers.py       # NNTrainer layer type constants
 ├── pattern_detector.py       # High-level pattern detection
-├── weight_converter.py       # Weight format conversion
+├── weight_converter.py       # Weight format conversion (.bin / .safetensors)
 ├── emitter_cpp/              # C++ code generation
 │   ├── __init__.py           # emit_cpp(), emit_cpp_header(), emit_cpp_source()
 │   ├── header.py             # Class header generation
@@ -162,12 +290,15 @@ TorchFXConverter/
 ├── emitter_ini/              # INI config generation
 ├── emitter_json.py           # JSON metadata generation
 ├── patterns/                 # Pattern detection modules
-├── jni/                      # NNTrainer test harness
-│   ├── main.cpp              # Generic test driver template
-│   ├── meson.build           # Build config for test executables
+├── jni/                      # NNTrainer runners and test harness
+│   ├── nntr_runner.cpp       # Standalone runner: loads any INI, no recompile
+│   ├── main.cpp              # Per-model test driver template (C++ class mode)
+│   ├── meson.build           # Build config (nntr_runner + per-model tests)
 │   └── test_model.*          # Pre-built Qwen3 reference model
 ├── tests/                    # Test suite
-│   ├── test_build_and_run.py # Integration tests (convert→build→run)
+│   ├── test_build_and_run.py # Integration tests:
+│   │                         #   TestNNTrainerRunner    (INI + nntr_runner)
+│   │                         #   TestConverterBuildAndRun (C++ compile + run)
 │   ├── test_tracer_*.py      # Tracer unit tests
 │   ├── test_node_mapper.py   # Mapper unit tests
 │   ├── test_decomposer.py    # Decomposer unit tests
