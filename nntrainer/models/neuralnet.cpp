@@ -754,6 +754,141 @@ void NeuralNetwork::save(const std::string &file_path,
     std::get<props::SavePath>(model_flex_props) = old_save_path;
     break;
   }
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    /**
+     * Safetensors format:
+     *   [8B]  header_size (little-endian uint64)
+     *   [header_size B] JSON header with tensor metadata
+     *   [data section]  raw tensor bytes
+     *
+     * JSON header format:
+     *   {
+     *     "__metadata__": { "format": "nntrainer" },
+     *     "weight_name": {
+     *       "dtype": "F32"|"F16"|...,
+     *       "shape": [d1, d2, ...],
+     *       "data_offsets": [start, end]
+     *     },
+     *     ...
+     *   }
+     */
+    auto model_file = checkedOpenStream<std::ofstream>(
+      file_path, std::ios::out | std::ios::binary | std::ios::trunc);
+
+    // -- 1. Collect weight metadata --
+    struct SafetensorEntry {
+      std::string name;
+      size_t data_size;
+      std::string dtype_str;
+      std::vector<size_t> shape;
+    };
+    std::vector<SafetensorEntry> entries;
+    size_t total_data_size = 0;
+
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (unsigned int i = 0; i < weights.size(); ++i) {
+        if (!(*iter)->getRunContext().isGradientFirstAccess(i))
+          continue;
+        auto &w = *weights[i];
+        size_t sz = w.getVariable().getMemoryBytes();
+        auto dtype = w.getDim().getDataType();
+
+        // Determine dtype string for safetensors header
+        std::string dtype_str;
+        switch (dtype) {
+        case TensorDim::DataType::FP32:
+          dtype_str = "F32";
+          break;
+        case TensorDim::DataType::FP16:
+          dtype_str = "F16";
+          break;
+        case TensorDim::DataType::QINT4:
+          dtype_str = "I4";
+          break;
+        case TensorDim::DataType::QINT8:
+          dtype_str = "I8";
+          break;
+        case TensorDim::DataType::QINT16:
+          dtype_str = "I16";
+          break;
+        case TensorDim::DataType::UINT4:
+          dtype_str = "U4";
+          break;
+        case TensorDim::DataType::UINT8:
+          dtype_str = "U8";
+          break;
+        case TensorDim::DataType::UINT16:
+          dtype_str = "U16";
+          break;
+        case TensorDim::DataType::UINT32:
+          dtype_str = "U32";
+          break;
+        default:
+          dtype_str = "F32";
+          break;
+        }
+
+        // Build shape from TensorDim (skip leading 1-dims for compact shape)
+        auto dim = w.getDim();
+        std::vector<size_t> shape;
+        const size_t *dims = dim.getDim();
+        bool found_nonone = false;
+        for (size_t d = 0; d < TensorDim::MAXDIM; ++d) {
+          if (dims[d] != 1)
+            found_nonone = true;
+          if (found_nonone)
+            shape.push_back(dims[d]);
+        }
+        if (shape.empty())
+          shape.push_back(1);
+
+        entries.push_back({w.getName(), sz, dtype_str, shape});
+        total_data_size += sz;
+      }
+    }
+
+    // -- 2. Build JSON header string --
+    std::ostringstream json_ss;
+    json_ss << "{\"__metadata__\":{\"format\":\"nntrainer\"}";
+
+    size_t data_offset = 0;
+    for (auto &e : entries) {
+      json_ss << ",\"" << e.name << "\":{\"dtype\":\"" << e.dtype_str
+              << "\",\"shape\":[";
+      for (size_t si = 0; si < e.shape.size(); ++si) {
+        if (si > 0)
+          json_ss << ",";
+        json_ss << e.shape[si];
+      }
+      json_ss << "],\"data_offsets\":[" << data_offset << ","
+              << (data_offset + e.data_size) << "]}";
+      data_offset += e.data_size;
+    }
+    json_ss << "}";
+    std::string header_json = json_ss.str();
+
+    // Pad header to 8-byte alignment
+    size_t header_len = header_json.size();
+    size_t header_padded = (header_len + 7) & ~static_cast<size_t>(7);
+    header_json.resize(header_padded, ' ');
+
+    // -- 3. Write header_size + header + data --
+    uint64_t hdr_size_val = static_cast<uint64_t>(header_padded);
+    model_file.write(reinterpret_cast<const char *>(&hdr_size_val),
+                     sizeof(hdr_size_val));
+    model_file.write(header_json.data(), header_padded);
+
+    // Write data section (weight bytes in graph order)
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      (*iter)->save(model_file, false, exec_mode);
+    }
+
+    model_file.close();
+    ml_logi("Saved model in safetensors format: %s (%zu weights, %zu bytes)",
+            file_path.c_str(), entries.size(), total_data_size);
+    break;
+  }
   case ml::train::ModelFormat::MODEL_FORMAT_ONNX: {
     throw nntrainer::exception::not_supported(
       "saving with ONNX format is not supported yet.");
@@ -780,6 +915,18 @@ void NeuralNetwork::convertBinV0ToV1(const std::string &v0_path,
           v1_path.c_str());
 }
 
+void NeuralNetwork::convertBinToSafetensors(const std::string &bin_path,
+                                            const std::string &st_path) {
+  NNTR_THROW_IF(!initialized, std::runtime_error)
+    << "Model must be initialized before converting weight format";
+
+  load(bin_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+  save(st_path, ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
+
+  ml_logi("Converted weight file from BIN to safetensors: %s -> %s",
+          bin_path.c_str(), st_path.c_str());
+}
+
 void NeuralNetwork::load(const std::string &file_path,
                          ml::train::ModelFormat format) {
   /// @todo this switch case should be delegating the function call only. It's
@@ -793,13 +940,15 @@ void NeuralNetwork::load(const std::string &file_path,
   auto f_path = (v.size() == 2) ? v[1] : v[0];
 
   /**
-   * Detect binary format version by checking for "NNTR" magic.
+   * Detect binary format version by checking for "NNTR" magic or safetensors.
    *   v0 (legacy): no magic, weights stored sequentially in topological order.
    *   v1: magic "NNTR" + header with name→offset mapping.
+   *   safetensors: [8B header_size][JSON header][data] with name→offset mapping.
    */
   uint32_t bin_version = 0;
   size_t data_section_start = 0;
   std::unordered_map<std::string, std::pair<size_t, size_t>> name_offset_map;
+  bool is_named_format = false; // true for v1 BIN or safetensors
 
   if (format == ml::train::ModelFormat::MODEL_FORMAT_BIN) {
     auto probe = checkedOpenStream<std::ifstream>(
@@ -834,16 +983,182 @@ void NeuralNetwork::load(const std::string &file_path,
           name_offset_map[wname] = {static_cast<size_t>(d_offset),
                                     static_cast<size_t>(d_size)};
         }
+        is_named_format = true;
         ml_logi("Loaded v%u weight file with %zu named entries", bin_version,
                 name_offset_map.size());
       }
     }
     probe.close();
+  } else if (format == ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS) {
+    /**
+     * Parse safetensors header:
+     *   [8B]  header_size (little-endian uint64)
+     *   [header_size B] JSON: {"name": {"dtype":..,"shape":..,"data_offsets":[start,end]}, ...}
+     *   [data section]
+     */
+    auto probe = checkedOpenStream<std::ifstream>(
+      f_path, std::ios::in | std::ios::binary);
+    uint64_t header_size = 0;
+    probe.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+    NNTR_THROW_IF(!probe.good(), std::runtime_error)
+      << "Failed to read safetensors header size from: " << f_path;
+
+    data_section_start = sizeof(uint64_t) + static_cast<size_t>(header_size);
+
+    std::string header_json(static_cast<size_t>(header_size), '\0');
+    probe.read(&header_json[0], header_size);
+    NNTR_THROW_IF(!probe.good(), std::runtime_error)
+      << "Failed to read safetensors JSON header from: " << f_path;
+    probe.close();
+
+    // Parse JSON header to extract tensor name -> (offset, size) mapping
+    // Format: {"__metadata__":{...}, "name":{"dtype":"F32","shape":[...],"data_offsets":[start,end]}, ...}
+    auto parse_safetensors_header =
+      [](const std::string &json,
+         std::unordered_map<std::string, std::pair<size_t, size_t>> &out_map) {
+        size_t pos = 0;
+        auto skip_ws = [&]() {
+          while (pos < json.size() &&
+                 (json[pos] == ' ' || json[pos] == '\n' || json[pos] == '\r' ||
+                  json[pos] == '\t'))
+            ++pos;
+        };
+        auto parse_string = [&]() -> std::string {
+          skip_ws();
+          if (pos >= json.size() || json[pos] != '"')
+            return "";
+          ++pos; // skip opening "
+          std::string result;
+          while (pos < json.size() && json[pos] != '"') {
+            if (json[pos] == '\\' && pos + 1 < json.size()) {
+              ++pos;
+            }
+            result += json[pos++];
+          }
+          if (pos < json.size())
+            ++pos; // skip closing "
+          return result;
+        };
+        auto parse_number = [&]() -> size_t {
+          skip_ws();
+          size_t val = 0;
+          while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+            val = val * 10 + (json[pos] - '0');
+            ++pos;
+          }
+          return val;
+        };
+        // Skip to find data_offsets within a value object
+        auto skip_value = [&]() {
+          skip_ws();
+          if (pos >= json.size())
+            return;
+          if (json[pos] == '"') {
+            parse_string();
+          } else if (json[pos] == '{') {
+            int depth = 1;
+            ++pos;
+            while (pos < json.size() && depth > 0) {
+              if (json[pos] == '{')
+                ++depth;
+              else if (json[pos] == '}')
+                --depth;
+              ++pos;
+            }
+          } else if (json[pos] == '[') {
+            int depth = 1;
+            ++pos;
+            while (pos < json.size() && depth > 0) {
+              if (json[pos] == '[')
+                ++depth;
+              else if (json[pos] == ']')
+                --depth;
+              ++pos;
+            }
+          } else {
+            // number, bool, null
+            while (pos < json.size() && json[pos] != ',' && json[pos] != '}' &&
+                   json[pos] != ']')
+              ++pos;
+          }
+        };
+
+        skip_ws();
+        if (pos >= json.size() || json[pos] != '{')
+          return;
+        ++pos; // skip {
+
+        while (pos < json.size()) {
+          skip_ws();
+          if (json[pos] == '}')
+            break;
+          if (json[pos] == ',')
+            ++pos;
+
+          std::string key = parse_string();
+          skip_ws();
+          if (pos < json.size() && json[pos] == ':')
+            ++pos; // skip :
+          skip_ws();
+
+          if (key == "__metadata__") {
+            skip_value();
+            continue;
+          }
+
+          // Parse tensor entry: {"dtype":"...","shape":[...],"data_offsets":[start,end]}
+          if (pos < json.size() && json[pos] == '{') {
+            ++pos; // skip {
+            size_t offset_start = 0, offset_end = 0;
+            bool found_offsets = false;
+            while (pos < json.size() && json[pos] != '}') {
+              skip_ws();
+              if (json[pos] == ',')
+                ++pos;
+              std::string field = parse_string();
+              skip_ws();
+              if (pos < json.size() && json[pos] == ':')
+                ++pos;
+
+              if (field == "data_offsets") {
+                skip_ws();
+                if (pos < json.size() && json[pos] == '[') {
+                  ++pos; // skip [
+                  offset_start = parse_number();
+                  skip_ws();
+                  if (pos < json.size() && json[pos] == ',')
+                    ++pos;
+                  offset_end = parse_number();
+                  skip_ws();
+                  if (pos < json.size() && json[pos] == ']')
+                    ++pos;
+                  found_offsets = true;
+                }
+              } else {
+                skip_value();
+              }
+            }
+            if (pos < json.size() && json[pos] == '}')
+              ++pos; // skip }
+
+            if (found_offsets) {
+              out_map[key] = {offset_start, offset_end - offset_start};
+            }
+          } else {
+            skip_value();
+          }
+        }
+      };
+
+    parse_safetensors_header(header_json, name_offset_map);
+    is_named_format = true;
+    ml_logi("Loaded safetensors file with %zu tensor entries",
+            name_offset_map.size());
   }
 
   /**
    * Assign file offsets to each weight tensor.
-   *   v1: look up by weight name in the header → order-independent.
+   *   Named format (v1/safetensors): look up by weight name → order-independent.
    *   v0: sequential accumulation in topological order (legacy behaviour).
    */
   size_t start_from = 0;
@@ -861,14 +1176,14 @@ void NeuralNetwork::load(const std::string &file_path,
         size += sizeof(uint16_t);
       }
 
-      if (bin_version >= 1) {
-        // v1: name-based offset lookup
+      if (is_named_format) {
+        // Named format (v1 BIN or safetensors): name-based offset lookup
         auto it = name_offset_map.find(weight->getName());
         if (it != name_offset_map.end()) {
           weight->getVariableRef().setFileOffset(data_section_start +
                                                  it->second.first);
         } else {
-          ml_logw("Weight '%s' not found in v1 header, using sequential offset",
+          ml_logw("Weight '%s' not found in header, using sequential offset",
                   weight->getName().c_str());
           weight->getVariableRef().setFileOffset(start_from);
         }
@@ -1050,6 +1365,79 @@ void NeuralNetwork::load(const std::string &file_path,
   case ml::train::ModelFormat::MODEL_FORMAT_ONNX: {
     int ret = loadFromConfig((v.size() == 2) ? v[1] : v[0]);
     throw_status(ret);
+    break;
+  }
+
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    NNTR_THROW_IF(!initialized, std::runtime_error)
+      << "Cannot load if not initialized yet, path: " << file_path
+      << " format: safetensors";
+
+    // Safetensors loading uses the same parallel mmap strategy as BIN v1.
+    // File offsets have already been assigned via name-based lookup above.
+    if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
+      std::vector<std::thread> threads;
+      threads.reserve(model_graph.size());
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        auto node = *iter;
+        threads.emplace_back([&, node]() {
+#if defined(_WIN32)
+          HANDLE hFile =
+            CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+          NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+            << "CreateFileA failed";
+          HANDLE hMap =
+            CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+          NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+            << "CreateFileMapping failed";
+          char *view =
+            static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+          NNTR_THROW_IF((view == nullptr), std::runtime_error)
+            << "MapViewOfFile failed";
+          node->read(view, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true);
+          UnmapViewOfFile(view);
+          CloseHandle(hMap);
+          CloseHandle(hFile);
+#else
+          int fd = ::open(f_path.c_str(), O_RDONLY);
+          NNTR_THROW_IF((fd == -1), std::invalid_argument)
+            << "Cannot open file : " << f_path;
+          struct stat st {};
+          NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+            << "Cannot get file info (fstat): " << f_path;
+          size_t f_size = static_cast<size_t>(st.st_size);
+          void *mmap_ptr =
+            ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+          ::close(fd);
+          NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+            << "mmap failed";
+          (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+          char *view = static_cast<char *>(mmap_ptr);
+          node->read(view, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true);
+          (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+          ::munmap(mmap_ptr, f_size);
+#endif
+        });
+      }
+      for (auto &t : threads) {
+        if (t.joinable())
+          t.join();
+      }
+    } else {
+      // Training mode: sequential loading (no optimizer state in safetensors)
+      auto model_file = checkedOpenStream<std::ifstream>(
+        f_path, std::ios::in | std::ios::binary);
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        (*iter)->read(model_file, false, exec_mode, fsu_mode);
+      }
+    }
+
+    ml_logi("read safetensors modelfile: %s", f_path.c_str());
     break;
   }
 
