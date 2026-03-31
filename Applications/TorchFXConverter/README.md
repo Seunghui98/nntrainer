@@ -15,8 +15,10 @@ Supported architectures:
 
 ## Quick Start — Qwen3-0.5B end-to-end example
 
-This section walks through the full pipeline using `Qwen/Qwen3-0.5B` as a
-concrete reference.
+`nntr_runner` works like `nntr_causallm`: point it at a directory produced by
+`converter.py` and it auto-discovers INI, JSON, C++ header, and weight binary,
+then loads the model generically (via `loadFromConfig`) and runs an inference
+pass — no per-model C++ compilation required.
 
 ### 1. Build NNTrainer and nntr_runner (once)
 
@@ -26,65 +28,48 @@ meson setup builddir
 ninja -C builddir Applications/TorchFXConverter/jni/nntr_runner
 ```
 
-### 2. Convert the model
+### 2. Convert Qwen3-0.5B to a single output directory
 
 ```bash
 cd Applications/TorchFXConverter
 
-# Generate INI + JSON + C++ header + source + weights in float16
 python converter.py \
-  --model Qwen/Qwen3-0.5B \
+  --model  Qwen/Qwen3-0.5B \
   --output ./out/qwen3_05b/ \
   --format all \
   --weights \
-  --dtype float16
+  --dtype  float16
 ```
 
 Converter output:
 
 ```
 out/qwen3_05b/
-├── qwen3_0.5b.ini          # NNTrainer INI config  (for nntr_runner)
-├── qwen3_0.5b.json         # layer metadata + weight map
-├── qwen3_0.5b.h            # auto-generated C++ class header
-├── qwen3_0.5b.cpp          # auto-generated C++ class source
-└── qwen3_0.5b.bin          # converted weight binary (float16)
+├── qwen3_0.5b.ini       # NNTrainer INI config  ← used by nntr_runner
+├── qwen3_0.5b.json      # layer metadata + weight map
+├── qwen3_0.5b.h         # auto-generated C++ class header
+├── qwen3_0.5b.cpp       # auto-generated C++ class source
+└── qwen3_0.5b.bin       # converted weight binary (float16)
 ```
 
-### 3. Run with `nntr_runner`
+### 3. Run with `nntr_runner` — just like `nntr_causallm`
 
 ```bash
-export NNTR_LIBS="../../builddir/nntrainer:../../builddir/Applications/CausalLM/layers"
-RUNNER="../../builddir/Applications/TorchFXConverter/jni/nntr_runner"
+export LD_LIBRARY_PATH=\
+../../builddir/nntrainer:\
+../../builddir/Applications/CausalLM/layers
 
-# INI only — verify graph compiles and initializes
-LD_LIBRARY_PATH=$NNTR_LIBS $RUNNER ./out/qwen3_05b/qwen3_0.5b.ini
+RUNNER=../../builddir/Applications/TorchFXConverter/jni/nntr_runner
 
-# INI + JSON — also print model metadata from the converter JSON
-LD_LIBRARY_PATH=$NNTR_LIBS $RUNNER \
-  --ini     ./out/qwen3_05b/qwen3_0.5b.ini \
-  --json    ./out/qwen3_05b/qwen3_0.5b.json
-
-# All files — metadata + C++ class info + weight load
-LD_LIBRARY_PATH=$NNTR_LIBS $RUNNER \
-  --ini     ./out/qwen3_05b/qwen3_0.5b.ini \
-  --json    ./out/qwen3_05b/qwen3_0.5b.json \
-  --header  ./out/qwen3_05b/qwen3_0.5b.h \
-  --weights ./out/qwen3_05b/qwen3_0.5b.bin
-
-# Auto-detect form — pass all files, extensions determine roles
-LD_LIBRARY_PATH=$NNTR_LIBS $RUNNER \
-  out/qwen3_05b/qwen3_0.5b.ini \
-  out/qwen3_05b/qwen3_0.5b.json \
-  out/qwen3_05b/qwen3_0.5b.h \
-  out/qwen3_05b/qwen3_0.5b.bin
+# Primary form: pass the directory — nntr_runner auto-discovers all files
+$RUNNER ./out/qwen3_05b/
 ```
 
-Expected output (truncated):
+Expected output:
 
 ```
 [nntr_runner] C++ class: Qwen3CausalLM
-[nntr_runner] Model metadata from JSON:
+[nntr_runner] Model metadata:
   model_type: qwen3
   arch_type: decoder_only
   hidden_size: 1024
@@ -98,102 +83,107 @@ Expected output (truncated):
   total_layers: 314
 [nntr_runner] Loading config: ./out/qwen3_05b/qwen3_0.5b.ini
 [nntr_runner] Loading weights: ./out/qwen3_05b/qwen3_0.5b.bin
-+-----------------------+----------+-----------+...
++-----------------------------------------------+
+| Model                                         |
++-----------------------------------------------+
+...
+[nntr_runner] Running dummy inference (zero input)...
+[nntr_runner] Inference OK — 1 output tensor(s).
 [nntr_runner] Model initialized successfully.
+```
+
+You can also pass files explicitly with named flags or by extension:
+
+```bash
+# Named flags — any subset works
+$RUNNER --ini ./out/qwen3_05b/qwen3_0.5b.ini \
+        --json ./out/qwen3_05b/qwen3_0.5b.json \
+        --header ./out/qwen3_05b/qwen3_0.5b.h \
+        --weights ./out/qwen3_05b/qwen3_0.5b.bin
+
+# Auto-detect by extension (same as directory form but explicit paths)
+$RUNNER out/qwen3_05b/qwen3_0.5b.ini \
+        out/qwen3_05b/qwen3_0.5b.json \
+        out/qwen3_05b/qwen3_0.5b.h \
+        out/qwen3_05b/qwen3_0.5b.bin
 ```
 
 ### 4. One-liner via Python importer
 
 ```python
-from importer import import_model
+from importer import NNTrainerImporter
 
-result = import_model(
+imp = NNTrainerImporter(build_dir="../../builddir", dtype="float16")
+
+# Convert + run in one call
+result = imp.convert_and_run(
     "Qwen/Qwen3-0.5B",
     output_dir="./out/qwen3_05b/",
-    build_dir="../../builddir",
     export_weights=True,
-    dtype="float16",
 )
 assert result.success, result.error
 print(result.summary)
+
+# Or run a pre-converted directory directly (like nntr_causallm)
+result = imp.run_dir("./out/qwen3_05b/")
+assert result.success
 ```
 
 ```bash
-# CLI equivalent
-python importer.py \
-  --model  Qwen/Qwen3-0.5B \
-  --output ./out/qwen3_05b/ \
-  --weights
+# CLI: convert + run
+python importer.py --model Qwen/Qwen3-0.5B --output ./out/qwen3_05b/ --weights
+
+# CLI: run an existing directory (skip conversion)
+python importer.py --dir ./out/qwen3_05b/
 ```
 
 ---
 
 ## Quick Start
 
-### Option A — INI mode with `nntr_runner` (recommended)
+### Option A — `nntr_runner` (recommended)
 
-The fastest way to verify a converted model. No per-model C++ compilation
-is required — `nntr_runner` registers all CausalLM custom layers and loads
-any NNTrainer INI directly.
+Works like `nntr_causallm`: convert to an output directory, then pass that
+directory to `nntr_runner`. It auto-discovers INI, JSON, header, and weights,
+loads the model via `loadFromConfig`, and runs a dummy inference pass to
+verify the full pipeline — no per-model C++ compilation required.
 
 ```bash
-# Step 1: build NNTrainer and nntr_runner (once)
+# Step 1: build nntr_runner once
 cd /path/to/nntrainer
 meson setup builddir
 ninja -C builddir Applications/TorchFXConverter/jni/nntr_runner
 
-# Step 2: convert a HuggingFace model to INI
+# Step 2: convert to a directory (all formats)
 cd Applications/TorchFXConverter
-python converter.py --model Qwen/Qwen3-0.5B --output ./out/ --format ini
+python converter.py --model Qwen/Qwen3-0.5B --output ./out/qwen3_05b/ \
+  --format all --weights --dtype float16
 
-# Step 3: load and verify with nntr_runner
+# Step 3: run — just like nntr_causallm
 LD_LIBRARY_PATH=../../builddir/nntrainer:../../builddir/Applications/CausalLM/layers \
-  ../../builddir/Applications/TorchFXConverter/jni/nntr_runner ./out/qwen3_0.5b.ini
+  ../../builddir/Applications/TorchFXConverter/jni/nntr_runner ./out/qwen3_05b/
 ```
-
-**With all converter outputs + weight loading:**
-
-```bash
-# Generate all outputs including weights
-python converter.py --model Qwen/Qwen3-0.5B --output ./out/ --format all --weights --dtype float16
-
-# Run with all files (auto-detect by extension)
-LD_LIBRARY_PATH=../../builddir/nntrainer:../../builddir/Applications/CausalLM/layers \
-  ../../builddir/Applications/TorchFXConverter/jni/nntr_runner \
-  ./out/qwen3_0.5b.ini ./out/qwen3_0.5b.json ./out/qwen3_0.5b.h ./out/qwen3_0.5b.bin
-```
-
-**Via Python importer:**
 
 ```python
-from importer import import_model
-
-result = import_model(
-    "Qwen/Qwen3-0.5B",
-    output_dir="./out/",
-    build_dir="../../builddir",
-    export_weights=True,
-)
-print(result.summary)     # NNTrainer model summary
+# Python importer
+from importer import NNTrainerImporter
+imp = NNTrainerImporter(build_dir="../../builddir", dtype="float16")
+result = imp.convert_and_run("Qwen/Qwen3-0.5B", "./out/qwen3_05b/", export_weights=True)
 assert result.success
 ```
 
 ```bash
-# Or use the importer CLI directly
-python importer.py --model Qwen/Qwen3-0.5B --output ./out/
-python importer.py --model Qwen/Qwen3-0.5B --output ./out/ --weights
-python importer.py --ini ./out/qwen3_0.5b.ini              # skip reconversion
+# importer CLI
+python importer.py --model Qwen/Qwen3-0.5B --output ./out/qwen3_05b/ --weights
+python importer.py --dir ./out/qwen3_05b/   # run pre-converted directory
 ```
 
 ### Option B — C++ class mode
 
-Generates a full C++ model class (compile once per model):
+Generates a full C++ model class (requires per-model meson build):
 
 ```bash
-# Convert to C++
 python converter.py --model Qwen/Qwen3-0.5B --output ./out/ --format cpp
-
-# Copy generated files to jni/ and rebuild
 cp out/qwen3_0.5b.cpp out/qwen3_0.5b.h jni/
 meson setup --reconfigure ../../builddir
 ninja -C ../../builddir Applications/TorchFXConverter/jni/converter_qwen3_gen_test
@@ -216,6 +206,9 @@ ninja -C ../../builddir Applications/TorchFXConverter/jni/converter_qwen3_gen_te
 ### nntr_runner usage
 
 ```
+# Primary form — pass the converter output directory (like nntr_causallm)
+nntr_runner <output_dir/>
+
 # Named flags (any subset)
 nntr_runner --ini model.ini [--json model.json] [--header model.h] [--weights model.bin]
 

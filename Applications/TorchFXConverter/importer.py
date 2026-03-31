@@ -138,15 +138,16 @@ class NNTrainerImporter:
 
         Steps
         -----
-        1. Run ``converter.py`` to produce an INI file (and optionally
-           a weight binary).
-        2. Run ``nntr_runner <model.ini> [weights.bin]`` to compile and
-           initialize the model inside NNTrainer.
+        1. Run ``converter.py --format all`` to produce INI + JSON + C++
+           header/source in *output_dir*, plus optionally a weight binary.
+        2. Pass *output_dir* directly to ``nntr_runner`` which auto-discovers
+           the files and runs a full inference pass — just like
+           ``nntr_causallm <model_dir/>``.
 
         Parameters
         ----------
         model_name_or_path:
-            HuggingFace model ID (e.g. ``"Qwen/Qwen3-0.6B"``) or a local
+            HuggingFace model ID (e.g. ``"Qwen/Qwen3-0.5B"``) or a local
             directory containing ``config.json``.
         output_dir:
             Directory where converted files are written.
@@ -165,7 +166,7 @@ class NNTrainerImporter:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Step 1: convert
+        # Step 1: convert (all formats so nntr_runner gets INI + JSON + header)
         if verbose:
             print(f"[importer] Converting: {model_name_or_path}")
         ok, converted_files, err = self._run_converter(
@@ -181,30 +182,48 @@ class NNTrainerImporter:
                 converted_files=converted_files,
             )
 
-        # Locate the INI file
-        ini_path = self._find_file(converted_files, ".ini")
-        if not ini_path:
-            ini_path = self._find_file(
-                [os.path.join(output_dir, f)
-                 for f in os.listdir(output_dir)], ".ini"
-            )
-        if not ini_path or not os.path.isfile(ini_path):
+        if not any(f.endswith(".ini") for f in converted_files):
             return ImportResult(
                 success=False,
                 error="Converter did not produce an INI file.",
                 converted_files=converted_files,
             )
 
-        # Locate the weight binary (if exported)
-        bin_path = self._find_file(converted_files, ".bin") if export_weights else ""
-
         if verbose:
-            print(f"[importer] Running nntr_runner: {ini_path}")
+            print(f"[importer] Running nntr_runner on: {output_dir}")
 
-        # Step 2: run with nntr_runner
-        result = self._run_nntr_runner(ini_path, bin_path, verbose=verbose)
+        # Step 2: pass the output directory directly to nntr_runner
+        result = self._run_nntr_runner_dir(output_dir, verbose=verbose)
         result.converted_files = converted_files
+        result.ini_path = self._find_file(converted_files, ".ini")
+        result.bin_path = self._find_file(converted_files, ".bin")
         return result
+
+    def run_dir(
+        self,
+        output_dir: str,
+        verbose: bool = True,
+    ) -> ImportResult:
+        """Run nntr_runner on a directory of converter output files.
+
+        Pass the directory produced by ``converter.py --format all``
+        directly — nntr_runner auto-discovers the INI, JSON, header,
+        and weight binary inside.
+
+        Parameters
+        ----------
+        output_dir:
+            Directory containing converter output (*.ini, *.json, *.h, *.bin).
+        verbose:
+            Print progress to stdout.
+
+        Returns
+        -------
+        ImportResult
+        """
+        if verbose:
+            print(f"[importer] Running nntr_runner on: {output_dir}")
+        return self._run_nntr_runner_dir(output_dir, verbose=verbose)
 
     def run_ini(
         self,
@@ -229,7 +248,11 @@ class NNTrainerImporter:
         """
         if verbose:
             print(f"[importer] Running nntr_runner: {ini_path}")
-        return self._run_nntr_runner(ini_path, bin_path, verbose=verbose)
+        cmd = [ini_path]
+        if bin_path:
+            cmd.append(bin_path)
+        return self._run_nntr_runner(cmd, ini_path=ini_path,
+                                     bin_path=bin_path, verbose=verbose)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -247,13 +270,17 @@ class NNTrainerImporter:
         model_name: Optional[str],
         verbose: bool,
     ):
-        """Invoke converter.py as a subprocess and return (ok, files, stderr)."""
+        """Invoke converter.py and return (ok, files, stderr).
+
+        Uses ``--format all`` so nntr_runner gets the full set of files
+        (INI, JSON, C++ header+source) in one shot.
+        """
         converter_script = os.path.join(_HERE, "converter.py")
         cmd = [
             sys.executable, converter_script,
             "--model", model_name_or_path,
             "--output", output_dir,
-            "--format", "ini",
+            "--format", "all",
             "--seq-len", str(self.seq_len),
             "--batch-size", str(self.batch_size),
         ]
@@ -270,7 +297,6 @@ class NNTrainerImporter:
         if verbose and result.stdout:
             print(result.stdout, end="")
 
-        # Collect generated files from output directory
         files = []
         if os.path.isdir(output_dir):
             files = [
@@ -280,32 +306,8 @@ class NNTrainerImporter:
 
         return result.returncode == 0, files, result.stderr
 
-    def _run_nntr_runner(
-        self,
-        ini_path: str,
-        bin_path: str,
-        verbose: bool,
-    ) -> ImportResult:
-        """Run nntr_runner and return an ImportResult."""
-        runner = self._nntr_runner_path()
-        if not os.path.isfile(runner):
-            return ImportResult(
-                success=False,
-                ini_path=ini_path,
-                bin_path=bin_path,
-                error=(
-                    f"nntr_runner not found: {runner}\n"
-                    "Build NNTrainer first:\n"
-                    "  meson setup builddir\n"
-                    "  ninja -C builddir "
-                    "Applications/TorchFXConverter/jni/nntr_runner"
-                ),
-            )
-
-        cmd = [runner, ini_path]
-        if bin_path:
-            cmd.append(bin_path)
-
+    def _make_env(self) -> dict:
+        """Build LD_LIBRARY_PATH environment for running nntr_runner."""
         env = os.environ.copy()
         lib_paths = [
             os.path.join(self.build_dir, "nntrainer"),
@@ -315,9 +317,72 @@ class NNTrainerImporter:
             [p for p in lib_paths if os.path.isdir(p)]
             + [env.get("LD_LIBRARY_PATH", "")]
         ).rstrip(":")
+        return env
 
+    def _check_runner(self) -> Optional[str]:
+        """Return error string if nntr_runner is missing, else None."""
+        runner = self._nntr_runner_path()
+        if not os.path.isfile(runner):
+            return (
+                f"nntr_runner not found: {runner}\n"
+                "Build NNTrainer first:\n"
+                "  meson setup builddir\n"
+                "  ninja -C builddir "
+                "Applications/TorchFXConverter/jni/nntr_runner"
+            )
+        return None
+
+    def _run_nntr_runner_dir(
+        self,
+        output_dir: str,
+        verbose: bool,
+    ) -> ImportResult:
+        """Run nntr_runner with a directory argument (primary usage).
+
+        nntr_runner auto-discovers *.ini, *.json, *.h, *.bin inside the
+        directory — mirrors how ``nntr_causallm <model_dir/>`` is used.
+        """
+        err = self._check_runner()
+        if err:
+            return ImportResult(success=False, error=err)
+
+        runner = self._nntr_runner_path()
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, env=env
+            [runner, output_dir],
+            capture_output=True, text=True,
+            timeout=120, env=self._make_env(),
+        )
+
+        if verbose:
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.returncode != 0 and result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
+
+        return ImportResult(
+            success=result.returncode == 0,
+            summary=result.stdout,
+            error=result.stderr if result.returncode != 0 else "",
+        )
+
+    def _run_nntr_runner(
+        self,
+        extra_args: List[str],
+        ini_path: str = "",
+        bin_path: str = "",
+        verbose: bool = True,
+    ) -> ImportResult:
+        """Run nntr_runner with explicit file arguments."""
+        err = self._check_runner()
+        if err:
+            return ImportResult(success=False, ini_path=ini_path,
+                                bin_path=bin_path, error=err)
+
+        runner = self._nntr_runner_path()
+        result = subprocess.run(
+            [runner] + extra_args,
+            capture_output=True, text=True,
+            timeout=120, env=self._make_env(),
         )
 
         if verbose:
@@ -408,6 +473,12 @@ def _parse_args() -> argparse.Namespace:
         help="HuggingFace model ID or local path to convert.",
     )
     group.add_argument(
+        "--dir",
+        metavar="DIR",
+        help="Run nntr_runner on an existing converter output directory "
+             "(skips conversion).",
+    )
+    group.add_argument(
         "--ini",
         metavar="INI",
         help="Path to an existing NNTrainer INI file (skip conversion).",
@@ -416,7 +487,7 @@ def _parse_args() -> argparse.Namespace:
         "--output",
         metavar="DIR",
         default="./nntr_output",
-        help="Output directory for converted files.",
+        help="Output directory for converted files (used with --model).",
     )
     parser.add_argument(
         "--build-dir",
@@ -465,7 +536,9 @@ def main() -> int:
         dtype=args.dtype,
     )
 
-    if args.ini:
+    if args.dir:
+        result = importer.run_dir(args.dir, verbose=verbose)
+    elif args.ini:
         result = importer.run_ini(args.ini, bin_path=args.bin, verbose=verbose)
     else:
         result = importer.convert_and_run(
@@ -479,9 +552,9 @@ def main() -> int:
         print(f"\n[importer] FAILED:\n{result.error}", file=sys.stderr)
         return 1
 
-    print(f"\n[importer] SUCCESS — model initialized successfully.")
+    print(f"\n[importer] SUCCESS — model initialized and inference passed.")
     if result.ini_path:
-        print(f"  INI  : {result.ini_path}")
+        print(f"  INI    : {result.ini_path}")
     if result.bin_path:
         print(f"  Weights: {result.bin_path}")
     return 0
