@@ -39,6 +39,12 @@ public:
   static BertModel createTestModel();
 
   ModelHandle &getModel() { return model; }
+
+  void run(const WSTR prompt, bool do_sample = false,
+           const WSTR system_prompt = "", const WSTR tail_prmopt = "",
+           bool log_output = true) override;
+  std::vector<float *> encodeIds(const std::vector<unsigned int> &input_ids);
+
 };
 
 } // namespace causallm

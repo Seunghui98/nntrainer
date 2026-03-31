@@ -78,7 +78,7 @@ struct KVCacheBuffers {
 /**
  * @brief Model Type Enum
  */
-enum class ModelType { MODEL, CAUSALLM, EMBEDDING, BERT, UNKNOWN };
+enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
 
 /**
  * @brief Transformer Class
