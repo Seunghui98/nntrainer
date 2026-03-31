@@ -71,3 +71,15 @@ e = executable('nntr_causallm',
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
+
+# Generic model runner: loads any converter.py-produced INI and runs inference.
+# Supports encoder-only (BERT, RoBERTa) and decoder-only (LLaMA, Qwen) models.
+runner_inc = [
+    include_directories('.'),
+    include_directories('layers'),
+]
+executable('nntr_runner',
+    [meson.current_source_dir() / 'nntr_runner.cpp'],
+    include_directories: runner_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies],
+)

@@ -3,13 +3,24 @@
 from .helpers import norm_type_for_model, format_property
 
 
-def emit_structured(layers, structure, batch_size):
+def _norm_extra_props(nt):
+    """Return extra property lines required by each norm type."""
+    if nt == "layer_normalization":
+        # axis=3 normalizes over the width (hidden_size) dimension
+        return ["axis = 3"]
+    if nt == "rms_norm":
+        return ["packed = false"]
+    return []
+
+
+def emit_structured(layers, structure, batch_size, seq_len=8):
     """Emit structured INI config using detected model patterns.
 
     Args:
         layers: List of NNTrainerLayerDef.
         structure: ModelStructure from pattern detection.
         batch_size: Batch size for [Model] section.
+        seq_len: Sequence length used during tracing (sets Input_Shape width).
 
     Returns:
         str: Complete INI file content in structured mode.
@@ -28,10 +39,10 @@ def emit_structured(layers, structure, batch_size):
     sections.append(f"batch_size = {batch_size}")
     sections.append("")
 
-    # Input layer
+    # Input layer — width = seq_len (token IDs fed as float values)
     sections.append("[input0]")
     sections.append("Type = input")
-    sections.append(f"Input_Shape = 1:1:1")
+    sections.append(f"Input_Shape = 1:1:{seq_len}")
     sections.append("")
 
     # Embedding
@@ -83,8 +94,8 @@ def _emit_encoder_decoder(sections, s, first_input, nt):
     sections.append(f"Type = {nt}")
     sections.append(f"input_layers = {enc_last}")
     sections.append(f"epsilon = {s.norm_eps}")
-    if nt == "rms_norm":
-        sections.append("packed = false")
+    for _p in _norm_extra_props(nt):
+        sections.append(_p)
     sections.append("")
 
     # Decoder blocks (with cross-attention)
@@ -109,8 +120,8 @@ def _emit_encoder_decoder(sections, s, first_input, nt):
         sections.append(f"Type = {nt}")
         sections.append(f"input_layers = {dec_last}")
         sections.append(f"epsilon = {s.norm_eps}")
-        if nt == "rms_norm":
-            sections.append("packed = false")
+        for _p in _norm_extra_props(nt):
+            sections.append(_p)
         sections.append("")
 
     # LM head
@@ -131,11 +142,21 @@ def _emit_encoder_decoder(sections, s, first_input, nt):
 # Single-stack layout (decoder_only / encoder_only)
 # =========================================================================
 
+def _block_out_suffix(block):
+    """Return the output layer name suffix for a block based on its role."""
+    if block and block.block_role in ("encoder", "decoder"):
+        return "block_output"
+    return "decoder_output"
+
+
 def _emit_single_stack(sections, s, first_input, nt):
     """Emit blocks for single-stack (decoder-only/encoder-only) models."""
     for i in range(s.num_layers):
-        input_name = (first_input if i == 0
-                      else f"layer{i-1}_decoder_output")
+        if i == 0:
+            input_name = first_input
+        else:
+            prev_block = s.blocks[i - 1] if (i - 1) < len(s.blocks) else None
+            input_name = f"layer{i-1}_{_block_out_suffix(prev_block)}"
         block_i = s.blocks[i] if i < len(s.blocks) else None
         sections.extend(
             emit_block_ini(i, input_name, s, block=block_i,
@@ -144,13 +165,14 @@ def _emit_single_stack(sections, s, first_input, nt):
 
     # Final norm
     if s.final_norm:
-        last_block = f"layer{s.num_layers - 1}_decoder_output"
+        last_block_obj = s.blocks[-1] if s.blocks else None
+        last_block = f"layer{s.num_layers - 1}_{_block_out_suffix(last_block_obj)}"
         sections.append("[output_norm]")
         sections.append(f"Type = {nt}")
         sections.append(f"input_layers = {last_block}")
         sections.append(f"epsilon = {s.norm_eps}")
-        if nt == "rms_norm":
-            sections.append("packed = false")
+        for _p in _norm_extra_props(nt):
+            sections.append(_p)
         sections.append("")
 
     # LM head
@@ -209,8 +231,8 @@ def emit_block_ini(layer_id, input_name, s, block=None, prefix=None,
         lines.append(f"Type = {norm_type}")
         lines.append(f"input_layers = {input_name}")
         lines.append(f"epsilon = {s.norm_eps}")
-        if norm_type == "rms_norm":
-            lines.append("packed = false")
+        for _p in _norm_extra_props(norm_type):
+            lines.append(_p)
         lines.append("")
         op_input = norm_name
     else:
@@ -256,8 +278,8 @@ def emit_block_ini(layer_id, input_name, s, block=None, prefix=None,
         lines.append(f"Type = {norm_type}")
         lines.append(f"input_layers = {ffn_norm_input}")
         lines.append(f"epsilon = {s.norm_eps}")
-        if norm_type == "rms_norm":
-            lines.append("packed = false")
+        for _p in _norm_extra_props(norm_type):
+            lines.append(_p)
         lines.append("")
         ffn_input = f"{prefix}_ffn_norm"
     else:
@@ -334,12 +356,13 @@ def _emit_attention_layers(lines, b0, s, prefix, op_input, norm_type):
         q_input = f"{prefix}_q_norm"
         k_input = f"{prefix}_k_norm"
 
-    # MHA core
+    # MHA core — max_timestep is required by MHACoreLayer::finalize()
     lines.append(f"[{prefix}_attention]")
     lines.append("Type = mha_core")
     lines.append(f"input_layers = {q_input},{k_input},{prefix}_wv")
     lines.append(f"num_heads = {s.num_heads}")
     lines.append(f"num_heads_kv = {s.num_kv_heads}")
+    lines.append(f"max_timestep = {s.max_position_embeddings}")
     if attn.has_rope and s.rope_theta:
         lines.append(f"rope_theta = {int(s.rope_theta)}")
     lines.append("")
@@ -367,8 +390,8 @@ def _emit_cross_attention(lines, b0, s, prefix, last_residual,
         lines.append(f"Type = {norm_type}")
         lines.append(f"input_layers = {last_residual}")
         lines.append(f"epsilon = {s.norm_eps}")
-        if norm_type == "rms_norm":
-            lines.append("packed = false")
+        for _p in _norm_extra_props(norm_type):
+            lines.append(_p)
         lines.append("")
         cross_q = f"{prefix}_cross_attn_norm"
     else:
@@ -404,6 +427,7 @@ def _emit_cross_attention(lines, b0, s, prefix, last_residual,
                  f"{prefix}_cross_wk,{prefix}_cross_wv")
     lines.append(f"num_heads = {s.num_heads}")
     lines.append(f"num_heads_kv = {s.num_kv_heads}")
+    lines.append(f"max_timestep = {s.max_position_embeddings}")
     lines.append("")
 
     lines.append(f"[{prefix}_cross_attention_out]")

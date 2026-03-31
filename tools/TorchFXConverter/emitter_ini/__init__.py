@@ -23,9 +23,11 @@ class IniEmitter(BaseEmitter):
          with block structure and proper naming.
     """
 
-    def __init__(self, layers, structure, batch_size=1, model_name=None):
+    def __init__(self, layers, structure, batch_size=1, seq_len=8,
+                 model_name=None):
         super().__init__(layers, structure, model_name=model_name)
         self.batch_size = batch_size
+        self.seq_len = seq_len
 
     def emit(self, mode="structured"):
         """Generate INI configuration string.
@@ -44,24 +46,26 @@ class IniEmitter(BaseEmitter):
         # Fall back to flat mode for non-transformer models
         if not self.structure.blocks:
             return emit_flat(self.layers, self.batch_size)
-        return emit_structured(self.layers, self.structure, self.batch_size)
+        return emit_structured(self.layers, self.structure, self.batch_size,
+                               self.seq_len)
 
 
 # =============================================================================
 # Convenience function
 # =============================================================================
 
-def emit_ini(layers, structure, batch_size=1, mode="structured"):
+def emit_ini(layers, structure, batch_size=1, seq_len=8, mode="structured"):
     """Generate NNTrainer INI configuration.
 
     Args:
         layers: List of NNTrainerLayerDef from converter pipeline.
         structure: ModelStructure from pattern detection.
         batch_size: Batch size for the model.
+        seq_len: Sequence length used during tracing.
         mode: "structured" or "flat".
 
     Returns:
         str: Complete INI file content.
     """
-    emitter = IniEmitter(layers, structure, batch_size)
+    emitter = IniEmitter(layers, structure, batch_size, seq_len=seq_len)
     return emitter.emit(mode=mode)

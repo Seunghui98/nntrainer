@@ -190,7 +190,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
 
     if "ini" in formats:
         ini_text = emit_ini(layers, structure, batch_size=batch_size,
-                            mode="structured")
+                            seq_len=seq_len, mode="structured")
         ini_path = os.path.join(output_dir, filenames["ini"])
         with open(ini_path, "w") as f:
             f.write(ini_text)
