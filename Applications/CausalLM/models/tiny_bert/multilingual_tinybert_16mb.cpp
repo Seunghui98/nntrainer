@@ -7,6 +7,8 @@
 #include <tensor_api.h>
 #include <app_context.h>
 #include <engine.h>
+#include <iomanip>
+#include <sstream>
 
 #include <embedding_layer.h>
 #include <mha_core.h>
@@ -21,6 +23,15 @@ static std::string withKey(const std::string &key, T val) {
   return key + "=" + std::to_string(val);
 }
 
+// Float specialization: use scientific notation to avoid precision loss
+// (e.g. std::to_string(1e-12f) gives "0.000000" which fails epsilon > 0 check)
+template <>
+std::string withKey(const std::string &key, float val) {
+  std::ostringstream oss;
+  oss << key << "=" << std::scientific << std::setprecision(10) << val;
+  return oss.str();
+}
+
 template <>
 std::string withKey(const std::string &key, std::string val) {
   return key + "=" + val;
@@ -32,6 +43,35 @@ std::string withKey(const std::string &key, const char *val) {
 }
 
 namespace causallm {
+
+void BertModel::initialize() {
+  // Re-apply BERT-specific parameters. The Transformer base constructor calls
+  // Transformer::setupParameters() (not BertModel::setupParameters()) due to
+  // C++ constructor vtable rules, so BERT-specific settings are applied here.
+  BertModel::setupParameters(saved_cfg, saved_gen_cfg, saved_nntr_cfg);
+
+  // Register custom layers
+  registerCustomLayers();
+
+  // Create model and set properties
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  std::vector<std::string> model_props = {
+    withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
+    withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
+  model->setProperty(model_props);
+
+  // constructModel() uses the symbolic tensor API which calls
+  // compile() + initialize() + allocate() internally in one shot.
+  // So we must NOT call model->initialize() again after constructModel().
+  try {
+    constructModel();
+  } catch (const std::exception &e) {
+    throw std::invalid_argument(
+      std::string("BertModel construction failed: ") + e.what());
+  }
+
+  is_initialized = true;
+}
 
 void BertModel::setupParameters(json &cfg, json &generation_cfg,
                               json &nntr_cfg) {
@@ -124,7 +164,7 @@ void BertModel::constructModel() {
   // Post-embedding normalization
   LayerHandle emb_norm(createLayer("layer_normalization", {
     withKey("name", "embedding_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS))
+    withKey("epsilon", NORM_EPS)
     , withKey("axis", 3)
   }));
   x = emb_norm(x);
@@ -134,9 +174,15 @@ void BertModel::constructModel() {
     x = createTransformerDecoderBlock(i, x);
   }
 
-  // Compile model from symbolic tensor graph
+  // Compile model from symbolic tensor graph.
+  // Note: this symbolic overload also calls initialize() + allocate() internally.
   std::vector<Tensor> outputs = {x};
-  model->compile(all_inputs, outputs, ml::train::ExecutionMode::INFERENCE);
+  int compile_status = model->compile(all_inputs, outputs, ml::train::ExecutionMode::INFERENCE);
+  if (compile_status != 0) {
+    throw std::invalid_argument(
+      "BertModel::constructModel compile failed (status=" +
+      std::to_string(compile_status) + ")");
+  }
 }
 
 Tensor
@@ -154,7 +200,7 @@ BertModel::createTransformerDecoderBlock(const int layer_id,
   Tensor residual = input.add(att_out);
   LayerHandle att_norm(createLayer("layer_normalization", {
     withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS))
+    withKey("epsilon", NORM_EPS)
     , withKey("axis", 3)
   }));
   Tensor normed = att_norm(residual);
@@ -166,7 +212,7 @@ BertModel::createTransformerDecoderBlock(const int layer_id,
   Tensor ffn_residual = normed.add(ffn_out);
   LayerHandle ffn_norm(createLayer("layer_normalization", {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS))
+    withKey("epsilon", NORM_EPS)
     , withKey("axis", 3)
   }));
   Tensor block_out = ffn_norm(ffn_residual);
@@ -267,7 +313,7 @@ BertModel BertModel::createTestModel() {
   cfg["head_dim"] = 8;
   cfg["intermediate_size"] = 128;
   cfg["layer_norm_eps"] = 1e-12;
-  cfg["tie_word_embeddings"] = true;
+  cfg["tie_word_embeddings"] = false;
   cfg["max_position_embeddings"] = 512;
   cfg["is_causal"] = false;
 
@@ -275,10 +321,16 @@ BertModel BertModel::createTestModel() {
   gen_cfg["max_new_tokens"] = 0;
 
   json nntr_cfg;
+  nntr_cfg["model_type"] = "embedding";
   nntr_cfg["init_seq_len"] = 8;
+  nntr_cfg["max_seq_len"] = 8;
+  nntr_cfg["num_to_generate"] = 0;
   nntr_cfg["batch_size"] = 1;
   nntr_cfg["model_tensor_type"] = "FP32-FP32";
-  nntr_cfg["memory_swap"] = false;
+  nntr_cfg["embedding_dtype"] = "FP32";
+  nntr_cfg["fc_layer_dtype"] = "FP32";
+  nntr_cfg["fsu"] = false;
+  nntr_cfg["fsu_lookahead"] = 1;
   nntr_cfg["tokenizer_file"] = "";
 
   return BertModel(cfg, gen_cfg, nntr_cfg);

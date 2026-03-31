@@ -17,8 +17,10 @@ class BertModel : public Transformer {
 
 public:
   BertModel(json &cfg, json &generation_cfg, json &nntr_cfg)
-    : Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING) {}
+    : Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING),
+      saved_cfg(cfg), saved_gen_cfg(generation_cfg), saved_nntr_cfg(nntr_cfg) {}
 
+  void initialize() override;
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
   void constructModel() override;
@@ -39,6 +41,11 @@ public:
   static BertModel createTestModel();
 
   ModelHandle &getModel() { return model; }
+
+private:
+  json saved_cfg;
+  json saved_gen_cfg;
+  json saved_nntr_cfg;
 };
 
 } // namespace causallm
