@@ -25,7 +25,7 @@ pass — no per-model C++ compilation required.
 ```bash
 cd /path/to/nntrainer
 meson setup builddir
-ninja -C builddir Applications/TorchFXConverter/jni/nntr_runner
+ninja -C builddir Applications/TorchFXRunner/jni/nntr_runner
 ```
 
 ### 2. Convert Qwen3-0.5B to a single output directory
@@ -59,7 +59,7 @@ export LD_LIBRARY_PATH=\
 ../../builddir/nntrainer:\
 ../../builddir/Applications/CausalLM/layers
 
-RUNNER=../../builddir/Applications/TorchFXConverter/jni/nntr_runner
+RUNNER=../../builddir/Applications/TorchFXRunner/jni/nntr_runner
 
 # Primary form: pass the directory — nntr_runner auto-discovers all files
 $RUNNER ./out/qwen3_05b/
@@ -152,7 +152,7 @@ verify the full pipeline — no per-model C++ compilation required.
 # Step 1: build nntr_runner once
 cd /path/to/nntrainer
 meson setup builddir
-ninja -C builddir Applications/TorchFXConverter/jni/nntr_runner
+ninja -C builddir Applications/TorchFXRunner/jni/nntr_runner
 
 # Step 2: convert to a directory (all formats)
 cd Applications/TorchFXConverter
@@ -161,7 +161,7 @@ python converter.py --model Qwen/Qwen3-0.5B --output ./out/qwen3_05b/ \
 
 # Step 3: run — just like nntr_causallm
 LD_LIBRARY_PATH=../../builddir/nntrainer:../../builddir/Applications/CausalLM/layers \
-  ../../builddir/Applications/TorchFXConverter/jni/nntr_runner ./out/qwen3_05b/
+  ../../builddir/Applications/TorchFXRunner/jni/nntr_runner ./out/qwen3_05b/
 ```
 
 ```python

@@ -60,7 +60,7 @@ if _HERE not in sys.path:
 _NNTRAINER_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DEFAULT_BUILD_DIR = os.path.join(_NNTRAINER_ROOT, "builddir")
 _NNTR_RUNNER_REL = os.path.join(
-    "Applications", "TorchFXConverter", "jni", "nntr_runner"
+    "Applications", "TorchFXRunner", "jni", "nntr_runner"
 )
 
 

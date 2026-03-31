@@ -701,9 +701,10 @@ class TestConverterBuildAndRun(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 # Path to nntr_runner executable inside the build tree.
+# nntr_runner lives in TorchFXRunner (its own application directory).
 _NNTR_RUNNER = os.path.join(
     BUILD_DIR,
-    "Applications", "TorchFXConverter", "jni", "nntr_runner",
+    "Applications", "TorchFXRunner", "jni", "nntr_runner",
 )
 
 
@@ -761,7 +762,7 @@ class TestNNTrainerRunner(unittest.TestCase):
             )
         # Build nntr_runner if not already built
         if not os.path.isfile(_NNTR_RUNNER):
-            target = "Applications/TorchFXConverter/jni/nntr_runner"
+            target = "Applications/TorchFXRunner/jni/nntr_runner"
             ok, _, stderr = _build_test(BUILD_DIR, target)
             if not ok:
                 raise unittest.SkipTest(

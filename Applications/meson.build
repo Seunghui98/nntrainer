@@ -58,6 +58,7 @@ if get_option('enable-transformer')
   if (get_option('platform') != 'tizen') and (get_option('platform') != 'windows')
     subdir('CausalLM')
     subdir('TorchFXConverter/jni')
+    subdir('TorchFXRunner/jni')
   endif
 endif
 
