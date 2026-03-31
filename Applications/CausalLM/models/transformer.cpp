@@ -163,6 +163,8 @@ void Transformer::initialize() {
   model->setProperty(model_props);
 
   // construct and compile model via symbolic tensor graph
+  // Note: model->compile(Tensor, Tensor) internally calls compile(),
+  // initialize(), and allocate() — no separate initialize() needed.
   constructModel();
 
   // if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
