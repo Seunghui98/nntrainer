@@ -15,16 +15,51 @@ Supported architectures:
 
 ## Quick Start
 
+### Step 1 — Convert a model
+
 ```bash
-# Convert a HuggingFace model to C++
-python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --format cpp
+# Decoder-only (Qwen3, LLaMA, ...)
+python converter.py --model Qwen/Qwen3-0.6B --output ./out/qwen3/ \
+    --format all --weights --dtype float16 --seq-len 512
 
-# Convert a local model directory
+# Encoder-only (BERT, XLM-RoBERTa, ...)
+python converter.py --model zl369/multilingual-tinyBERT-16MB --output ./out/bert/ \
+    --format all --weights --dtype float32 --seq-len 128
+
+# Local model directory
 python converter.py --model ./my_model/ --output ./out/ --format all
-
-# With weights
-python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --weights --dtype float16
 ```
+
+### Step 2 — Run with nntr_runner
+
+`nntr_runner` is a generic NNTrainer model runner built in `Applications/CausalLM/`.
+It reads the converter output directory, registers all required custom layers,
+and runs one inference pass to verify the model end-to-end.
+
+```bash
+# Build NNTrainer first (one-time)
+meson setup builddir -Denable-transformer=true
+ninja -C builddir Applications/CausalLM/nntr_runner
+
+RUNNER=./builddir/Applications/CausalLM/nntr_runner
+
+# Run on a converter output directory (auto-discovers INI / JSON / weights)
+$RUNNER ./out/bert/
+
+# Pass token IDs on the command line
+$RUNNER ./out/bert/ --input "101 7592 1010 2023 2003 1037 4937 102"
+
+# Pass token IDs from a file (one per line or space-separated)
+$RUNNER ./out/bert/ --input-file tokens.txt
+
+# Explicit file paths (useful when multiple models share a directory)
+$RUNNER --ini ./out/bert/tinybert.ini \
+        --json ./out/bert/tinybert.json \
+        --weights ./out/bert/tinybert.bin \
+        --input "101 2023 102"
+```
+
+See [nntr_runner documentation](#nntr_runner) below for the full reference.
 
 ### CLI Arguments
 
@@ -39,6 +74,170 @@ python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --weights --dtype fl
 | `--seq-len` | Sequence length for tracing | `8` |
 | `--model-name` | Override output file basename | derived from `--model` |
 | `--quiet` | Suppress progress output | off |
+
+---
+
+## nntr_runner
+
+`nntr_runner` (`Applications/CausalLM/nntr_runner.cpp`) is a generic inference
+runner for any model converted by `converter.py`.  It mirrors the workflow of
+`nntr_causallm` but works with any architecture — encoder-only, decoder-only,
+or embedding models — without requiring per-model C++ classes.
+
+### How it works
+
+1. **Auto-discover files** from the converter output directory:
+
+   | Extension | Role |
+   |-----------|------|
+   | `*.ini`   | NNTrainer config (required) |
+   | `*.json`  | Converter metadata — printed and used to detect arch type |
+   | `*.bin` / `*.safetensors` | Weight binary (optional) |
+
+2. **Register custom layers** — all CausalLM custom layers (`embedding_layer`,
+   `mha_core`, `rms_norm`, `reshaped_rms_norm`, `swiglu`, `tie_word_embeddings`)
+   are registered before `loadFromConfig()` so every layer type in the INI
+   resolves correctly.
+
+3. **Load and compile** the model via NNTrainer's `loadFromConfig()` →
+   `compile(INFERENCE)` → `initialize(INFERENCE)`.
+
+4. **Load weights** (if a binary is present).
+
+5. **Run inference**:
+   - Encoder-only models (BERT, RoBERTa, …): `model->inference()`
+   - Decoder-only models (LLaMA, Qwen3, …): `model->incremental_inference()`
+
+   The arch type is read from the JSON metadata `arch_type` field; if no JSON
+   is present it defaults to encoder-only (`inference()`).
+
+### Full convert → run walkthrough
+
+#### BERT / encoder-only model
+
+```bash
+cd tools/TorchFXConverter
+
+# 1. Convert
+python converter.py \
+    --model zl369/multilingual-tinyBERT-16MB \
+    --output ./out/bert/ \
+    --format all \
+    --weights \
+    --seq-len 128
+
+# Output:
+#   out/bert/multilingual_tinybert_16mb.ini
+#   out/bert/multilingual_tinybert_16mb.json
+#   out/bert/multilingual_tinybert_16mb.h
+#   out/bert/multilingual_tinybert_16mb.cpp
+#   out/bert/multilingual_tinybert_16mb.bin
+
+# 2. Build runner (from repo root, one-time)
+meson setup builddir -Denable-transformer=true
+ninja -C builddir Applications/CausalLM/nntr_runner
+
+# 3. Run — directory form (recommended)
+./builddir/Applications/CausalLM/nntr_runner ./out/bert/
+
+# 4. Run with real token IDs
+#    (e.g. "Hello, this is a test" tokenized with bert-base-multilingual-cased)
+./builddir/Applications/CausalLM/nntr_runner ./out/bert/ \
+    --input "101 31178 117 48029 10271 10124 102"
+```
+
+Expected output:
+
+```
+[nntr_runner] Model metadata:
+  model_type: bert
+  arch_type: encoder_only
+  hidden_size: 256
+  num_layers: 4
+  ...
+[nntr_runner] Loading config: ./out/bert/multilingual_tinybert_16mb.ini
+[nntr_runner] Loading weights: ./out/bert/multilingual_tinybert_16mb.bin
+================================================================================
+  Layer name     Layer type   Output dimension   Input layer
+================================================================================
+  input0         input        1:1:1:128
+  embedding0     embedding_layer  1:1:128:256    input0
+  ...
+================================================================================
+[nntr_runner] Running forward inference (user input)...
+[nntr_runner] Inference OK — 1 output tensor(s).
+[nntr_runner] Done.
+```
+
+#### Decoder-only model (Qwen3)
+
+```bash
+# 1. Convert
+python converter.py \
+    --model Qwen/Qwen3-0.5B \
+    --output ./out/qwen3/ \
+    --format all \
+    --weights \
+    --dtype float16 \
+    --seq-len 512
+
+# 2. Run — directory form
+./builddir/Applications/CausalLM/nntr_runner ./out/qwen3/
+
+# 3. Run with prompt token IDs
+./builddir/Applications/CausalLM/nntr_runner ./out/qwen3/ \
+    --input "1 9906 29892 3186 29991"
+```
+
+### CLI reference
+
+```
+nntr_runner <output_dir/> [options]
+nntr_runner --ini FILE [--json FILE] [--weights FILE] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `<output_dir/>` | Directory from `converter.py --format all` (auto-discovers files) |
+| `--ini FILE` | NNTrainer INI config (overrides auto-discovery) |
+| `--json FILE` | Converter JSON metadata (overrides auto-discovery) |
+| `--weights FILE` | Weight binary `.bin` or `.safetensors` (overrides auto-discovery) |
+| `--input "1 2 3"` | Space-separated token IDs to use as inference input |
+| `--input-file FILE` | File containing token IDs (one per line or space-separated) |
+
+**Exit codes:** `0` = success, `1` = error (details on stderr).
+
+### Supplying token input
+
+Without `--input` or `--input-file`, the runner fills the input buffer with
+sequential dummy token IDs `[1, 2, 3, …]`.  To run with real tokens:
+
+```bash
+# Inline
+nntr_runner ./out/bert/ --input "101 7592 1010 2023 2003 1037 4937 102"
+
+# From a file (tokens.txt — one line with space-separated IDs)
+echo "101 7592 1010 2023 102" > tokens.txt
+nntr_runner ./out/bert/ --input-file tokens.txt
+```
+
+If fewer token IDs are provided than the model's sequence length, the
+remaining positions are zero-padded.
+
+### Building nntr_runner
+
+The runner is part of the `Applications/CausalLM` meson target:
+
+```bash
+# From repo root
+meson setup builddir -Denable-transformer=true
+ninja -C builddir Applications/CausalLM/nntr_runner
+
+# Binary location
+./builddir/Applications/CausalLM/nntr_runner
+```
+
+---
 
 ## Tests
 
