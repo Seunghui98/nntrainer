@@ -12,6 +12,10 @@
 #include <mha_core.h>
 #include <tie_word_embedding.h>
 
+#include <sstream>
+#include <codecvt>
+#include <locale>
+
 using ml::train::createLayer;
 using ml::train::Tensor;
 using LayerHandle = ml::train::LayerHandle;
@@ -32,6 +36,56 @@ std::string withKey(const std::string &key, const char *val) {
 }
 
 namespace causallm {
+
+std::vector<float *>
+BertModel::encodeIds(const std::vector<unsigned int> &input_ids) {
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "BertModel is not initialized. Please call initialize() before run().");
+  }
+
+  unsigned int input_len =
+    std::min(static_cast<unsigned int>(input_ids.size()), INIT_SEQ_LEN);
+
+  float *input_sample =
+    (float *)malloc(sizeof(float) * BATCH_SIZE * INIT_SEQ_LEN);
+  float *position_ids =
+    (float *)malloc(sizeof(float) * BATCH_SIZE * INIT_SEQ_LEN);
+  float *token_type_ids =
+    (float *)malloc(sizeof(float) * BATCH_SIZE * INIT_SEQ_LEN);
+
+  if (!input_sample || !position_ids || !token_type_ids) {
+    free(input_sample);
+    free(position_ids);
+    free(token_type_ids);
+    throw std::runtime_error("Failed to allocate input buffers");
+  }
+
+  std::fill(input_sample, input_sample + BATCH_SIZE * INIT_SEQ_LEN, 0.0f);
+  std::fill(position_ids, position_ids + BATCH_SIZE * INIT_SEQ_LEN, 0.0f);
+  std::fill(token_type_ids, token_type_ids + BATCH_SIZE * INIT_SEQ_LEN, 0.0f);
+
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    for (unsigned int i = 0; i < input_len; ++i) {
+      input_sample[static_cast<size_t>(b) * INIT_SEQ_LEN + i] =
+        static_cast<float>(input_ids[i]);
+      position_ids[static_cast<size_t>(b) * INIT_SEQ_LEN + i] =
+        static_cast<float>(i);
+      token_type_ids[static_cast<size_t>(b) * INIT_SEQ_LEN + i] = 0.0f;
+    }
+  }
+
+  std::vector<float *> input = {input_sample, position_ids, token_type_ids};
+  std::vector<float *> label;
+
+  auto output = model->inference(BATCH_SIZE, input, label);
+
+  free(input_sample);
+  free(position_ids);
+  free(token_type_ids);
+
+  return output;
+}
 
 void BertModel::setupParameters(json &cfg, json &generation_cfg,
                               json &nntr_cfg) {
@@ -282,6 +336,64 @@ BertModel BertModel::createTestModel() {
   nntr_cfg["tokenizer_file"] = "";
 
   return BertModel(cfg, gen_cfg, nntr_cfg);
+}
+
+void BertModel::run(const WSTR prompt, bool do_sample,
+                    const WSTR system_prompt, const WSTR tail_prompt,
+                    bool log_output) {
+  (void)do_sample;
+
+  try {
+#if defined(_WIN32)
+    std::wstring prompt_ = system_prompt + prompt + tail_prompt;
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    auto tokenized = tokenizer->Encode(converter.to_bytes(prompt_), true);
+#else
+    std::string prompt_ = system_prompt + prompt + tail_prompt;
+    auto tokenized = tokenizer->Encode(prompt_, true);
+#endif
+
+    std::vector<unsigned int> input_ids;
+    unsigned int input_len =
+      std::min(static_cast<unsigned int>(tokenized.size()), INIT_SEQ_LEN);
+
+    for (unsigned int i = 0; i < input_len; ++i) {
+      input_ids.push_back(static_cast<unsigned int>(tokenized[i]));
+    }
+
+    std::vector<float *> results = encodeIds(input_ids);
+
+    if (log_output) {
+      unsigned int seq_len =
+        std::min(static_cast<unsigned int>(input_ids.size()), INIT_SEQ_LEN);
+
+      std::cout << "BERT Output (" << BATCH_SIZE << " batch(es)):\n";
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        for (unsigned int t = 0; t < seq_len; ++t) {
+          std::cout << "Batch " << b << ", token " << t << ": [";
+
+          int print_dim = (DIM > 10) ? 10 : DIM;
+          size_t base = static_cast<size_t>(b) * INIT_SEQ_LEN * DIM + t * DIM;
+
+          for (int i = 0; i < print_dim; ++i) {
+            std::cout << results[0][base + i];
+            if (i + 1 != print_dim)
+              std::cout << ", ";
+          }
+
+          if (DIM > 10)
+            std::cout << ", ...";
+          std::cout << "]\n";
+        }
+      }
+    }
+
+    for (auto out : results) {
+      delete[] out;
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "Error during BertModel run: " << e.what() << std::endl;
+  }
 }
 
 } // namespace causallm

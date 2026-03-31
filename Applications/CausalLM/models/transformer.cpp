@@ -84,8 +84,8 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
   setupParameters(cfg, generation_cfg, nntr_cfg);
 
   // prep tokenizer
-  // tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-  //   LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  tokenizer = tokenizers::Tokenizer::FromBlobJSON(
+    LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
 };
 
 void Transformer::setupParameters(json &cfg, json &generation_cfg,
@@ -165,9 +165,9 @@ void Transformer::initialize() {
   // construct and compile model via symbolic tensor graph
   constructModel();
 
-  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
-    throw std::invalid_argument("Model initialization failed.");
-  }
+  // if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
+  //   throw std::invalid_argument("Model initialization failed.");
+  // }
 
   is_initialized = true;
 
