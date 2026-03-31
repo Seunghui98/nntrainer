@@ -216,18 +216,24 @@ static void registerCustomLayers() {
   auto *app_context = static_cast<nntrainer::AppContext *>(
     ct_engine.getRegisteredContext("cpu"));
 
-  app_context->registerFactory(
-    nntrainer::createLayer<causallm::EmbeddingLayer>);
-  app_context->registerFactory(
-    nntrainer::createLayer<causallm::MHACoreLayer>);
-  app_context->registerFactory(
-    nntrainer::createLayer<causallm::RMSNormLayer>);
-  app_context->registerFactory(
-    nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-  app_context->registerFactory(
-    nntrainer::createLayer<causallm::SwiGLULayer>);
-  app_context->registerFactory(
-    nntrainer::createLayer<causallm::TiedEmbeddingLayer>);
+  try {
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::EmbeddingLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::MHACoreLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::RMSNormLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::SwiGLULayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::TieWordEmbedding>);
+  } catch (const std::invalid_argument &e) {
+    // Layer already registered — safe to ignore on repeated calls.
+    std::cerr << "[nntr_runner] registerFactory warning: " << e.what()
+              << std::endl;
+  }
 }
 
 // ---------------------------------------------------------------------------
