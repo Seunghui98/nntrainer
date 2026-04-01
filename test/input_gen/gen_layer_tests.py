@@ -28,6 +28,7 @@ from recorder import (
     record_single_fp16,
     record_single_embedding_mixed,
     record_single_embedding_fp32,
+    record_single_fp32in_fp16w_fp16out_inference,
 )
 
 with warnings.catch_warnings():
@@ -61,6 +62,62 @@ def inspect_file(file_name, _dtype="float32"):
             print(np.fromfile(f, dtype=_dtype, count=sz))
 
 
+
+class CausalDepthwiseConv1D_FP32IN_FP16W_FP16OUT(tf.keras.layers.Layer):
+    def __init__(self, width, **kwargs):
+        super().__init__(dtype=tf.float32, **kwargs)
+        self.width = width
+
+    def build(self, input_shape):
+        self.w = self.add_weight(
+            name="causal_conv1d_weight",
+            shape=(1, 1, 3, self.width),
+            initializer="glorot_uniform",
+            dtype=tf.float16,
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        x = tf.cast(inputs, tf.float32)
+        w = self.w
+
+        w0 = tf.cast(w[:, :, 0, :], tf.float32)
+        w1 = tf.cast(w[:, :, 1, :], tf.float32)
+        w2 = tf.cast(w[:, :, 2, :], tf.float32)
+
+        cur = x
+        prev1 = tf.pad(x[:, :, :-1, :], [[0, 0], [0, 0], [1, 0], [0, 0]])
+        prev2 = tf.pad(x[:, :, :-2, :], [[0, 0], [0, 0], [2, 0], [0, 0]])
+
+        y = cur * w0 + prev1 * w1 + prev2 * w2
+        return tf.cast(y, tf.float16)
+
+def gen_causal_conv1d_tests():
+    layer = CausalDepthwiseConv1D_FP32IN_FP16W_FP16OUT(8)
+    record_single_fp32in_fp16w_fp16out_inference(
+        layer, (1, 1, 1, 8), "causal_conv1d_sb_h1_w8"
+    )
+
+    layer = CausalDepthwiseConv1D_FP32IN_FP16W_FP16OUT(8)
+    record_single_fp32in_fp16w_fp16out_inference(
+        layer, (1, 1, 2, 8), "causal_conv1d_sb_h2_w8"
+    )
+
+    layer = CausalDepthwiseConv1D_FP32IN_FP16W_FP16OUT(8)
+    record_single_fp32in_fp16w_fp16out_inference(
+        layer, (1, 1, 4, 8), "causal_conv1d_sb_h4_w8"
+    )
+
+    layer = CausalDepthwiseConv1D_FP32IN_FP16W_FP16OUT(8)
+    record_single_fp32in_fp16w_fp16out_inference(
+        layer, (3, 1, 4, 8), "causal_conv1d_mb_h4_w8"
+    )
+
+    layer = CausalDepthwiseConv1D_FP32IN_FP16W_FP16OUT(32)
+    record_single_fp32in_fp16w_fp16out_inference(
+        layer, (1, 1, 16, 32), "causal_conv1d_sb_h16_w32"
+    )
 class PositionalEncoding(tf.keras.layers.Layer):
     """_summary_
 
@@ -114,6 +171,7 @@ class PositionalEncoding(tf.keras.layers.Layer):
 
 
 if __name__ == "__main__":
+    gen_causal_conv1d_tests()
     fc = K.layers.Dense(5)
     record_single(fc, (3, 1, 1, 10), "fc_plain")
     fc = K.layers.Dense(4)

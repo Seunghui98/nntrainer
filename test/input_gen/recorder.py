@@ -118,6 +118,69 @@ def _debug_print(
         except KeyError:
             pass
 
+def record_single_fp32in_fp16w_fp16out_inference(layer,
+                                                 input_shape,
+                                                 test_name,
+                                                 call_args={},
+                                                 input_type='float'):
+    """
+    Golden writer for inference-only layers:
+      - input   : fp32
+      - weight  : fp16
+      - output  : fp16
+    """
+
+    layer = attach_trans_layer(layer)
+    layer.build(input_shape)
+
+    if isinstance(input_shape, list):
+        inputs = [_rand_like(in_shape, 1, input_type) for in_shape in input_shape]
+        inputs = [tf.cast(inp, tf.float32) for inp in inputs]
+    else:
+        inputs = _rand_like(input_shape, 1, input_type)
+        inputs = tf.cast(inputs, tf.float32)
+
+    initial_weights = [tf.Variable(i) for i in layer.weights]
+
+    for _ in range(4):
+        layer.call(inputs, **call_args)
+
+    outputs = layer.call(inputs, **call_args)
+    weights = layer.weights.copy()
+
+    with open(test_name + ".nnlayergolden", "wb") as f:
+        writer = _get_writer(f)
+
+        def write_tensor_fp32(tensors):
+          if tensors is None:
+            return
+          if not isinstance(tensors, list):
+            tensors = [tensors]
+          for tensor in tensors:
+            if tensor is None:
+              continue
+            writer(tf.size(tensor), tf.cast(tensor, tf.float32))
+
+        def write_tensor_fp16(tensors):
+          if tensors is None:
+            return
+          if not isinstance(tensors, list):
+            tensors = [tensors]
+          for tensor in tensors:
+            if tensor is None:
+              continue
+            tensor = tf.cast(tensor, tf.float16)
+            writer(tf.size(tensor, out_type=tf.int16), tensor)
+
+        def write_empty():
+          writer(np.array([0], dtype=np.int32))
+
+        write_tensor_fp16(initial_weights)
+        write_tensor_fp32(inputs)
+        write_tensor_fp16(outputs)
+        write_empty()
+        write_tensor_fp16(weights)
+        write_empty()
 
 ##
 # @brief generate data using uniform data from a function and save to the file.

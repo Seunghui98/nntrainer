@@ -1,4 +1,4 @@
-layer_common_test_inc = [ include_directories('./', '../../include') ]
+layer_common_test_inc = [ include_directories('./', '../../include', '../../../Applications/CausalLM/layers') ]
 layer_common_test_standalone_files = files('layers_standalone_common_tests.cpp')
 layer_common_test_dependent_files = files('layers_dependent_common_tests.cpp')
 
@@ -112,7 +112,8 @@ test_target = [
   'unittest_layers_mol_attention.cpp',
   'unittest_layers_multi_head_attention.cpp',
   'unittest_layers_positional_encoding.cpp',
-  'unittest_layers_upsample2d.cpp'
+  'unittest_layers_upsample2d.cpp',
+  'unittest_layers_causal_conv1d.cpp'
 ]
 
 if get_option('enable-opencl')
