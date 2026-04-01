@@ -237,9 +237,12 @@ int main(int argc, char *argv[]) {
     }
 
     // Construct weight file path
-    const std::string weight_file =
-      model_path + "/" + nntr_cfg["model_file_name"].get<std::string>();
-
+    std::string weight_file;
+    if(nntr_cfg.contains("safe_tensor_file_name")){
+      weight_file = model_path + "/" + nntr_cfg["safe_tensor_file_name"].get<std::string>();
+    } else {
+      weight_file = model_path + "/" + nntr_cfg["model_file_name"].get<std::string>();
+    }
     std::cout << weight_file << std::endl;
 
     // Initialize and run model
