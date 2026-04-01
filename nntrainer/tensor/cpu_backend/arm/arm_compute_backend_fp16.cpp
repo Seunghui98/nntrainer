@@ -529,30 +529,5 @@ void nntr_gemm_qsi8d32p_qsi4c32p_packed(size_t m, size_t n, size_t k,
     idx_variant, transB, lower_bound, upper_bound);
 }
 
-void causal_conv1d_fp16_w3(
-    _FP16 * x,       
-    const _FP16 * weight,  
-    const _FP16 * bias,    
-    _FP16 * out,         
-    const unsigned int B,
-    const unsigned int H,
-    const unsigned int W,
-    bool silu_activation) {
-    neon::causal_conv1d_channellast_fp16_w3(
-    x, weight, bias, out, B, H, W, silu_activation);
-}
-
-void causal_conv1d_fp16_w3_weight_reuse(
-    _FP16 * x,       
-    const _FP16 * weight,  
-    const _FP16 * bias,    
-    _FP16 * out,         
-    const unsigned int B,
-    const unsigned int H,
-    const unsigned int W,
-    bool silu_activation) {
-    neon::causal_conv1d_channellast_fp16_w3_weight_reuse(
-    x, weight, bias, out, B, H, W, silu_activation);
-}
 
 } /* namespace nntrainer */
