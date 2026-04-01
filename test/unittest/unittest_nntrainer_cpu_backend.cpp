@@ -1338,6 +1338,155 @@ DECLARE_transform_int4_test_K_N(1024, 648, 64);
 DECLARE_transform_int4_test_K_N(1024, 648, 128);
 DECLARE_transform_int4_test_K_N(3072, 8192, 32);
 
+
+
+static void causal_depthwise_conv1d_k3_naive_torch_semantics(
+  const float *input,
+  const float *packed_weight,
+  const float *bias,
+  float *output,
+  unsigned int B,
+  unsigned int H,
+  unsigned int W) {
+
+  const float *w0 = packed_weight;
+  const float *w1 = packed_weight + W;
+  const float *w2 = packed_weight + 2 * W;
+
+  for (unsigned int b = 0; b < B; ++b) {
+    const float *x_base = input + static_cast<size_t>(b) * H * W;
+    float *y_base = output + static_cast<size_t>(b) * H * W;
+
+    for (unsigned int t = 0; t < H; ++t) {
+      const float *x_cur = x_base + static_cast<size_t>(t) * W;
+      const float *x_prev1 =
+        (t >= 1) ? (x_base + static_cast<size_t>(t - 1) * W) : nullptr;
+      const float *x_prev2 =
+        (t >= 2) ? (x_base + static_cast<size_t>(t - 2) * W) : nullptr;
+      float *y = y_base + static_cast<size_t>(t) * W;
+
+      for (unsigned int c = 0; c < W; ++c) {
+        float acc = x_cur[c] * w0[c];
+        if (x_prev1)
+          acc += x_prev1[c] * w1[c];
+        if (x_prev2)
+          acc += x_prev2[c] * w2[c];
+        if (bias)
+          acc += bias[c];
+        y[c] = acc;
+      }
+    }
+  }
+}
+
+static void run_causal_depthwise_conv1d_k3_unittest(unsigned int B,
+                                                    unsigned int H,
+                                                    unsigned int W,
+                                                    bool use_bias,
+                                                    bool print = false) {
+  nntrainer::init_backend();
+
+  const int TEST_CNT = 50;
+
+  std::vector<float> input =
+    generate_random_vector<float, false>(static_cast<size_t>(B) * H * W, -1.0f,
+                                         1.0f);
+  std::vector<float> packed_weight =
+    generate_random_vector<float, false>(3u * W, -1.0f, 1.0f);
+  std::vector<float> bias =
+    use_bias ? generate_random_vector<float, false>(W, -1.0f, 1.0f)
+             : std::vector<float>();
+
+  std::vector<float> ref_out(static_cast<size_t>(B) * H * W, 0.0f);
+  std::vector<float> neon_out(static_cast<size_t>(B) * H * W, 0.0f);
+
+  // correctness check
+  causal_depthwise_conv1d_k3_naive_torch_semantics(
+    input.data(), packed_weight.data(), use_bias ? bias.data() : nullptr,
+    ref_out.data(), B, H, W);
+
+  causal_depthwise_conv1d_k3(
+    input.data(), packed_weight.data(), use_bias ? bias.data() : nullptr,
+    neon_out.data(), B, H, W);
+
+  const float max_diff = static_cast<float>(
+    find_max_diff(ref_out.data(), neon_out.data(), B * H, W));
+  const float mse_val = mse<float, float>(ref_out.data(), neon_out.data(),
+                                          static_cast<size_t>(B) * H * W);
+  const float cos_sim =
+    cosine_similarity<float, float>(ref_out.data(), neon_out.data(),
+                                    static_cast<size_t>(B) * H * W);
+
+  EXPECT_LE(max_diff, 1e-5f);
+  EXPECT_LE(mse_val, 1e-7f);
+  EXPECT_NEAR(cos_sim, 1.0f, 1e-6f);
+
+  // speed check
+  nanoseconds ref_time = nanoseconds::zero();
+  nanoseconds neon_time = nanoseconds::zero();
+
+  for (int i = -1; i < TEST_CNT; ++i) {
+    std::fill(ref_out.begin(), ref_out.end(), 0.0f);
+    std::fill(neon_out.begin(), neon_out.end(), 0.0f);
+
+    {
+      auto t1 = high_resolution_clock::now();
+      causal_depthwise_conv1d_k3_naive_torch_semantics(
+        input.data(), packed_weight.data(), use_bias ? bias.data() : nullptr,
+        ref_out.data(), B, H, W);
+      auto t2 = high_resolution_clock::now();
+      if (i >= 0) {
+        ref_time += duration_cast<nanoseconds>(t2 - t1);
+      }
+    }
+
+    {
+      auto t1 = high_resolution_clock::now();
+      causal_depthwise_conv1d_k3(
+        input.data(), packed_weight.data(), use_bias ? bias.data() : nullptr,
+        neon_out.data(), B, H, W);
+      auto t2 = high_resolution_clock::now();
+      if (i >= 0) {
+        neon_time += duration_cast<nanoseconds>(t2 - t1);
+      }
+    }
+  }
+
+  if (print) {
+    std::cout << "[INFO] causal_depthwise_conv1d_k3"
+              << " B: " << B << ", H: " << H << ", W: " << W
+              << ", bias: " << use_bias
+              << ", avg_ref: " << ref_time.count() / TEST_CNT << " ns"
+              << ", avg_neon: " << neon_time.count() / TEST_CNT << " ns"
+              << ", speedup: "
+              << static_cast<double>(ref_time.count()) /
+                   std::max<int64_t>(1, neon_time.count())
+              << "x"
+              << ", max_diff: " << max_diff << ", mse: " << mse_val
+              << ", cos_sim: " << cos_sim << std::endl;
+  }
+}
+
+
+
+TEST(nntrainer_cpu_backend_standalone, causal_depthwise_conv1d_k3_no_bias) {
+  run_causal_depthwise_conv1d_k3_unittest(1, 16, 64, false, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_depthwise_conv1d_k3_with_bias) {
+  run_causal_depthwise_conv1d_k3_unittest(1, 16, 64, true, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     causal_depthwise_conv1d_k3_non_multiple_of_4) {
+  run_causal_depthwise_conv1d_k3_unittest(2, 33, 70, true, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_depthwise_conv1d_k3_large_shape) {
+  run_causal_depthwise_conv1d_k3_unittest(1, 512, 1024, true, true);
+}
+
+
 int main(int argc, char **argv) {
   int result = -1;
 
