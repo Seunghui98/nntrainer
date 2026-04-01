@@ -16,6 +16,15 @@
 #include <codecvt>
 #include <locale>
 
+#include <iomanip>
+#include <sstream>
+
+static std::string toStringPrecise(float v) {
+  std::ostringstream oss;
+  oss << std::setprecision(20) << v;
+  return oss.str();
+}
+
 using ml::train::createLayer;
 using ml::train::Tensor;
 using LayerHandle = ml::train::LayerHandle;
@@ -38,14 +47,30 @@ std::string withKey(const std::string &key, const char *val) {
 namespace causallm {
 
 std::vector<float *>
-BertModel::encodeIds(const std::vector<unsigned int> &input_ids) {
+BertModel::encode(const WSTR prompt,
+                  const WSTR system_prompt,
+                  const WSTR tail_prompt) {
   if (!is_initialized) {
     throw std::runtime_error(
       "BertModel is not initialized. Please call initialize() before run().");
   }
 
+  #if defined(_WIN32)
+    std::wstring prompt_ = system_prompt + prompt + tail_prompt;
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    auto tokenized = tokenizer->Encode(converter.to_bytes(prompt_), true);
+#else
+    std::string prompt_ = system_prompt + prompt + tail_prompt;
+    auto tokenized = tokenizer->Encode(prompt_, true);
+#endif
+
+  std::vector<unsigned int> input_ids;
   unsigned int input_len =
-    std::min(static_cast<unsigned int>(input_ids.size()), INIT_SEQ_LEN);
+    std::min(static_cast<unsigned int>(tokenized.size()), INIT_SEQ_LEN);
+
+  for (unsigned int i = 0; i < input_len; ++i) {
+    input_ids.push_back(static_cast<unsigned int>(tokenized[i]));
+  }
 
   float *input_sample =
     (float *)malloc(sizeof(float) * BATCH_SIZE * INIT_SEQ_LEN);
@@ -77,8 +102,10 @@ BertModel::encodeIds(const std::vector<unsigned int> &input_ids) {
 
   std::vector<float *> input = {input_sample, position_ids, token_type_ids};
   std::vector<float *> label;
-
-  auto output = model->inference(BATCH_SIZE, input, label);
+  unsigned int init_len = input.size();
+  auto output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
+                                        SYS_PROMP_LEN,
+                                        SYS_PROMP_LEN + input_len, false);
 
   free(input_sample);
   free(position_ids);
@@ -87,37 +114,19 @@ BertModel::encodeIds(const std::vector<unsigned int> &input_ids) {
   return output;
 }
 
+BertModel::BertModel(json &cfg, json &generation_cfg,
+                                         json &nntr_cfg) :
+  Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING) {
+  setupParameters(cfg, generation_cfg, nntr_cfg);
+}
+
 void BertModel::setupParameters(json &cfg, json &generation_cfg,
                               json &nntr_cfg) {
+  Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
 
-  // nntrainer parameters
-  BATCH_SIZE = nntr_cfg["batch_size"].get<unsigned int>();
-  MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"].get<std::string>();
-  INIT_SEQ_LEN = nntr_cfg["init_seq_len"];
-  MAX_SEQ_LEN = nntr_cfg.value("max_seq_len", INIT_SEQ_LEN);
-  NUM_TO_GENERATE = nntr_cfg.value("num_to_generate", 0);
-  MEMORY_SWAP = nntr_cfg.value("fsu", false);
-  FSU_LOOKAHEAD = nntr_cfg.value("fsu_lookahead", 1u);
-  EMBEDDING_DTYPE = nntr_cfg.value("embedding_dtype", MODEL_TENSOR_TYPE);
-  FC_LAYER_DTYPE = nntr_cfg.value("fc_layer_dtype", MODEL_TENSOR_TYPE);
-
-  // Encoder-only model: bidirectional attention
   IS_CAUSAL = false;
-
-  // Model architecture parameters
-  NUM_VOCAB = cfg["vocab_size"];
-  DIM = cfg["hidden_size"];
-  INTERMEDIATE_SIZE = cfg["intermediate_size"];
-  NUM_LAYERS = cfg["num_hidden_layers"];
-  NUM_HEADS = cfg["num_attention_heads"];
-  HEAD_DIM = cfg.value("head_dim", DIM / NUM_HEADS);
-  NUM_KEY_VALUE_HEADS = cfg.value("num_key_value_heads", NUM_HEADS);
-  MAX_POSITION_EMBEDDINGS = cfg.value("max_position_embeddings", 512u);
-  TIE_WORD_EMBEDDINGS = cfg.value("tie_word_embeddings", false);
   NORM_EPS = cfg.value("layer_norm_eps", 1e-12f);
   ROPE_THETA = 0;  // No RoPE for this model
-  GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
-  SLIDING_WINDOW = cfg.value("sliding_window", UINT_MAX);
 }
 
 void BertModel::constructModel() {
@@ -178,8 +187,8 @@ void BertModel::constructModel() {
   // Post-embedding normalization
   LayerHandle emb_norm(createLayer("layer_normalization", {
     withKey("name", "embedding_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS))
-    , withKey("axis", 3)
+    withKey("epsilon", toStringPrecise(NORM_EPS)),
+    withKey("axis", 3)
   }));
   x = emb_norm(x);
 
@@ -208,8 +217,8 @@ BertModel::createTransformerDecoderBlock(const int layer_id,
   Tensor residual = input.add(att_out);
   LayerHandle att_norm(createLayer("layer_normalization", {
     withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS))
-    , withKey("axis", 3)
+    withKey("epsilon", toStringPrecise(NORM_EPS)),
+    withKey("axis", 3)
   }));
   Tensor normed = att_norm(residual);
 
@@ -220,8 +229,8 @@ BertModel::createTransformerDecoderBlock(const int layer_id,
   Tensor ffn_residual = normed.add(ffn_out);
   LayerHandle ffn_norm(createLayer("layer_normalization", {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS))
-    , withKey("axis", 3)
+    withKey("epsilon", toStringPrecise(NORM_EPS)),
+    withKey("axis", 3)
   }));
   Tensor block_out = ffn_norm(ffn_residual);
 
@@ -272,7 +281,8 @@ BertModel::createAttention(const int layer_id, int seq_len,
     withKey("num_heads", n_heads),
     withKey("num_heads_kv", n_heads / GQA_SIZE),
     withKey("max_timestep", std::to_string(INIT_SEQ_LEN)),
-    withKey("is_causal", IS_CAUSAL ? "true" : "false")
+    withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+    withKey("rope_theta", ROPE_THETA),
   };
   LayerHandle attn(createLayer("mha_core", attn_props));
   Tensor a = attn({q, k, v});
@@ -344,50 +354,27 @@ void BertModel::run(const WSTR prompt, bool do_sample,
   (void)do_sample;
 
   try {
-#if defined(_WIN32)
-    std::wstring prompt_ = system_prompt + prompt + tail_prompt;
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    auto tokenized = tokenizer->Encode(converter.to_bytes(prompt_), true);
-#else
-    std::string prompt_ = system_prompt + prompt + tail_prompt;
-    auto tokenized = tokenizer->Encode(prompt_, true);
-#endif
-
-    std::vector<unsigned int> input_ids;
-    unsigned int input_len =
-      std::min(static_cast<unsigned int>(tokenized.size()), INIT_SEQ_LEN);
-
-    for (unsigned int i = 0; i < input_len; ++i) {
-      input_ids.push_back(static_cast<unsigned int>(tokenized[i]));
-    }
-
-    std::vector<float *> results = encodeIds(input_ids);
+    std::vector<float *> results = encode(prompt, system_prompt, tail_prompt);
 
     if (log_output) {
-      unsigned int seq_len =
-        std::min(static_cast<unsigned int>(input_ids.size()), INIT_SEQ_LEN);
 
-      std::cout << "BERT Output (" << BATCH_SIZE << " batch(es)):\n";
+      std::cout << "Embedding Result (" << BATCH_SIZE
+                << " batch(es)):" << std::endl;
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-        for (unsigned int t = 0; t < seq_len; ++t) {
-          std::cout << "Batch " << b << ", token " << t << ": [";
-
-          int print_dim = (DIM > 10) ? 10 : DIM;
-          size_t base = static_cast<size_t>(b) * INIT_SEQ_LEN * DIM + t * DIM;
-
-          for (int i = 0; i < print_dim; ++i) {
-            std::cout << results[0][base + i];
-            if (i + 1 != print_dim)
-              std::cout << ", ";
-          }
-
-          if (DIM > 10)
-            std::cout << ", ...";
-          std::cout << "]\n";
+        std::cout << "Batch " << b << ": [";
+        // Print first few elements as sample
+        int print_dim = (DIM > 10) ? 10 : DIM;
+        for (int i = 0; i < print_dim; ++i) {
+          std::cout << results[0][b * DIM + i]
+                    << (i == print_dim - 1 ? "" : ", ");
         }
+        if (DIM > 10)
+          std::cout << ", ...";
+        std::cout << "] (Total DIM: " << DIM << ")" << std::endl;
       }
     }
 
+    // output should be deallocated after use.
     for (auto out : results) {
       delete[] out;
     }

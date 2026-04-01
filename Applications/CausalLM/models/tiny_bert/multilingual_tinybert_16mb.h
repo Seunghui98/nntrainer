@@ -16,8 +16,9 @@ namespace causallm {
 class BertModel : public Transformer {
 
 public:
-  BertModel(json &cfg, json &generation_cfg, json &nntr_cfg)
-    : Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING) {}
+  BertModel(json &cfg, json &generation_cfg, json &nntr_cfg);
+
+  virtual ~BertModel() {}
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
@@ -43,7 +44,8 @@ public:
   void run(const WSTR prompt, bool do_sample = false,
            const WSTR system_prompt = "", const WSTR tail_prmopt = "",
            bool log_output = true) override;
-  std::vector<float *> encodeIds(const std::vector<unsigned int> &input_ids);
+  std::vector<float *> encode(const WSTR prompt, const WSTR system_prompt = "",
+                              const WSTR tail_prompt = "");
 
 };
 
