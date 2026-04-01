@@ -30,9 +30,11 @@ from nntrainer_layers import (
     LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_NEGATIVE,
     LAYER_ADDITION, LAYER_SUBTRACT,
     LAYER_DROPOUT, LAYER_EMBEDDING,
-    LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE,
+    LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE, LAYER_CONCAT,
+    LAYER_RMS_NORM, LAYER_RESHAPED_RMS_NORM, LAYER_LAYER_NORM,
+    LAYER_FC,
     LAZY_TENSOR_OPS, TENSOR_DIRECT_METHODS,
-    OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE,
+    OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA,
 )
 from tracer import Tracer, LEAF_MODULES
 from node_mapper import NodeMapper
@@ -399,6 +401,19 @@ _ROPE_CHAIN_OPS = frozenset({
     "concat", "slice", "cos", "sin", "matmul",
 })
 
+# Subset for forward propagation only.  Excludes "concat" and "slice"
+# because these are ambiguous: they appear in rotate_half (RoPE) but
+# also in KV-cache concatenation.  rotate_half concat/slice are caught
+# by the backward pass (all their consumers are removable), whereas
+# KV-cache concats feed into SDPA and must survive.
+_ROPE_FORWARD_OPS = _ROPE_CHAIN_OPS - {"concat", "slice"}
+
+# Subset for backward propagation.  Excludes transpose because
+# transpose layers are the pre-rotation Q/K tensors — the boundary
+# between the main data path and the RoPE chain.  SDPA needs to be
+# rewired to these after RoPE removal.
+_ROPE_BACKWARD_OPS = _ROPE_CHAIN_OPS - {LAYER_TRANSPOSE, OP_TRANSPOSE}
+
 
 def _remove_rope_chains(layers):
     """Remove rotary position embedding computation chains.
@@ -439,12 +454,14 @@ def _remove_rope_chains(layers):
         return layers
 
     # Step 2: Forward pass — mark tensor ops that have ANY input from
-    # the removable set (these consume rope cos/sin outputs)
+    # the removable set (these consume rope cos/sin outputs).
+    # Uses _ROPE_FORWARD_OPS (excludes concat/slice) to avoid catching
+    # KV-cache concats that merely consume the RoPE output.
     changed = True
     while changed:
         changed = False
         for l in layers:
-            if l.name in removable or l.layer_type not in _ROPE_CHAIN_OPS:
+            if l.name in removable or l.layer_type not in _ROPE_FORWARD_OPS:
                 continue
             if l.input_layers and any(inp in removable
                                       for inp in l.input_layers):
@@ -453,12 +470,14 @@ def _remove_rope_chains(layers):
 
     # Step 3: Backward pass — mark tensor ops whose ALL consumers are
     # already removable (captures rotate_half: split→neg→cat chains
-    # that only feed into the rope multiply layers)
+    # that only feed into the rope multiply layers).
+    # Uses _ROPE_BACKWARD_OPS (excludes transpose) so that pre-rotation
+    # Q/K transpose layers are preserved as rewire targets for SDPA.
     changed = True
     while changed:
         changed = False
         for l in layers:
-            if l.name in removable or l.layer_type not in _ROPE_CHAIN_OPS:
+            if l.name in removable or l.layer_type not in _ROPE_BACKWARD_OPS:
                 continue
             layer_consumers = consumers.get(l.name, set())
             if layer_consumers and all(c in removable
@@ -505,6 +524,163 @@ def _remove_rope_chains(layers):
     filtered = [l for l in layers if l.name not in removable]
     print(f"  [CLEANUP] Removed {len(removable)} rotary embedding layers")
     return filtered
+
+
+# =============================================================================
+# MHA Op Absorption
+# =============================================================================
+
+# Layer types that mha_core handles internally.
+_MHA_ABSORBABLE = frozenset({
+    LAYER_RESHAPE, OP_RESHAPE, LAYER_TRANSPOSE, OP_TRANSPOSE,
+    LAYER_PERMUTE, OP_PERMUTE, LAYER_CONCAT, "concat",
+})
+
+# Layer types that are attention Q/K norms (boundary: keep these).
+_ATTN_NORM_TYPES = frozenset({
+    LAYER_RMS_NORM, LAYER_RESHAPED_RMS_NORM, LAYER_LAYER_NORM,
+})
+
+
+def _absorb_mha_ops(layers):
+    """Absorb reshape/transpose/concat around SDPA into mha_core.
+
+    NNTrainer's mha_core handles input reshape, transpose, KV-cache
+    concat, and output transpose/reshape internally.  The FX graph
+    produces explicit layers for these, which must be removed so the
+    converted graph matches the C++ symbolic tensor API:
+
+        q_proj -> [q_norm] -> mha_core -> o_proj
+        k_proj -> [k_norm] -> mha_core
+        v_proj            -> mha_core
+
+    For each SDPA layer:
+      - Trace each input backward through absorbable ops to find the
+        source (FC projection or attention norm).
+      - Trace the output forward through absorbable ops to find the
+        sink (o_proj FC).
+      - Remove intermediate absorbable layers and rewire connections.
+
+    Returns the filtered layer list.
+    """
+    by_name = {l.name: l for l in layers}
+
+    # Build consumer map
+    consumers = {}
+    for l in layers:
+        for inp in (l.input_layers or []):
+            consumers.setdefault(inp, set()).add(l.name)
+
+    sdpa_layers = [l for l in layers if l.layer_type == OP_SDPA]
+    if not sdpa_layers:
+        return layers
+
+    absorbed = set()
+
+    for sdpa in sdpa_layers:
+        # --- Input side: trace each SDPA input backward ---
+        new_inputs = []
+        for inp_name in (sdpa.input_layers or []):
+            source = _trace_back_through(inp_name, by_name, absorbed,
+                                         consumers)
+            new_inputs.append(source)
+
+            # If the source is an attention norm, also absorb any reshape
+            # between the FC projection and the norm (reshaped_rms_norm
+            # handles reshape internally via feature_size).
+            source_layer = by_name.get(source)
+            if source_layer and source_layer.layer_type in _ATTN_NORM_TYPES:
+                norm_source = _trace_back_through(
+                    source_layer.input_layers[0] if source_layer.input_layers
+                    else source, by_name, absorbed, consumers)
+                source_layer.input_layers = [norm_source]
+
+        sdpa.input_layers = new_inputs
+
+        # --- Output side: trace forward from SDPA through absorbable ops ---
+        _trace_forward_through(sdpa.name, by_name, absorbed, consumers)
+
+    if absorbed:
+        layers = [l for l in layers if l.name not in absorbed]
+        print(f"  [CLEANUP] Absorbed {len(absorbed)} reshape/transpose/concat "
+              f"layers into mha_core")
+
+    return layers
+
+
+def _trace_back_through(name, by_name, absorbed, consumers):
+    """Trace backward from `name` through absorbable ops to find source.
+
+    Returns the name of the source layer (FC, norm, or non-absorbable).
+    Marks intermediate absorbable layers in `absorbed` set.
+    """
+    visited = set()
+    current = name
+    chain = []  # layers to potentially absorb
+
+    while current in by_name and current not in visited:
+        visited.add(current)
+        layer = by_name[current]
+
+        # Stop at non-absorbable layers (FC, norm, etc.)
+        if layer.layer_type not in _MHA_ABSORBABLE:
+            break
+
+        # Only absorb if this layer has a single consumer path into SDPA
+        layer_consumers = consumers.get(current, set())
+        non_absorbed = layer_consumers - absorbed
+        if len(non_absorbed) > 1:
+            # Multiple consumers — don't absorb, use as-is
+            break
+
+        chain.append(current)
+
+        # Follow single input backward
+        if layer.input_layers and len(layer.input_layers) >= 1:
+            current = layer.input_layers[0]
+        else:
+            break
+
+    # Mark chain as absorbed
+    absorbed.update(chain)
+    return current
+
+
+def _trace_forward_through(sdpa_name, by_name, absorbed, consumers):
+    """Trace forward from SDPA through absorbable ops on the output side.
+
+    Absorbs transpose/reshape between SDPA and o_proj, rewiring o_proj
+    to take input directly from SDPA.
+    """
+    visited = set()
+    current = sdpa_name
+    chain = []
+
+    while current not in visited:
+        visited.add(current)
+        layer_consumers = consumers.get(current, set()) - absorbed
+        if len(layer_consumers) != 1:
+            break
+
+        next_name = next(iter(layer_consumers))
+        next_layer = by_name.get(next_name)
+        if next_layer is None:
+            break
+
+        if next_layer.layer_type not in _MHA_ABSORBABLE:
+            # Reached o_proj or other non-absorbable layer — rewire it
+            if chain:
+                last_absorbed = chain[-1]
+                next_layer.input_layers = [
+                    sdpa_name if inp == last_absorbed else inp
+                    for inp in (next_layer.input_layers or [])
+                ]
+            break
+
+        chain.append(next_name)
+        current = next_name
+
+    absorbed.update(chain)
 
 
 # =============================================================================
@@ -576,6 +752,24 @@ def _repair_orphaned_layers(layers, graph):
 
     if repaired:
         print(f"  [CLEANUP] Orphan repair: {repaired} reconnected")
+
+    # Remove dead nodes: orphaned layers (no inputs) that have no consumers
+    consumer_inputs = set()
+    for l in layers:
+        for inp in (l.input_layers or []):
+            consumer_inputs.add(inp)
+
+    dead_names = set()
+    for l in layers:
+        if l.layer_type == LAYER_INPUT:
+            continue
+        if not l.input_layers and l.name not in consumer_inputs:
+            dead_names.add(l.name)
+
+    if dead_names:
+        layers = [l for l in layers if l.name not in dead_names]
+        print(f"  [CLEANUP] Dead node removal: {len(dead_names)} removed "
+              f"({', '.join(sorted(dead_names)[:5])}{'...' if len(dead_names) > 5 else ''})")
 
     return layers
 
@@ -696,6 +890,10 @@ class AdaptiveConverter:
         # Pass 3.7.5: Remove rotary embedding chains
         # (NNTrainer mha_core handles RoPE via rope_theta, like llama.cpp)
         layers = _remove_rope_chains(layers)
+
+        # Pass 3.7.7: Absorb reshape/transpose/concat around SDPA into
+        # mha_core (NNTrainer handles these internally)
+        layers = _absorb_mha_ops(layers)
 
         # Pass 3.7.9: Repair orphaned layers (non-input layers that lost
         # all input_layers during cleanup passes)
