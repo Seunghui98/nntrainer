@@ -1065,6 +1065,9 @@ TEST(nntrainer_cpu_backend_standalone, trigonometric_values_test) {
   run_trigonometric_values_test(N);
 }
 
+
+
+
 /**
  * @brief Benchmark comparison of three GEMM implementations
  *
@@ -1265,6 +1268,155 @@ void run_gemm_benchmark_comparison(const uint32_t M, const uint32_t K,
   }
 }
 
+
+/**
+* @brief Reference scalar implementation for causal depthwise conv1d k=3
+*
+* Input / output layout:
+*   input  : [B, H, W]
+*   output : [B, H, W]
+*
+* packed_weight layout:
+*   [w0(0:W), w1(W:2W), w2(2W:3W)]
+*
+* Formula:
+*   y[t, c] = x[t, c] * w0[c]
+*           + x[t-1, c] * w1[c]
+*           + x[t-2, c] * w2[c]
+*/
+static void reference_causal_depthwise_conv1d_k3_fp16(
+  const _FP16 *input,
+  const _FP16 *packed_weight,
+  _FP16 *output,
+  const unsigned int B,
+  const unsigned int H,
+  const unsigned int W) {
+
+  const _FP16 *w0 = packed_weight;
+  const _FP16 *w1 = packed_weight + W;
+  const _FP16 *w2 = packed_weight + 2 * W;
+
+  for (unsigned int b = 0; b < B; ++b) {
+    const _FP16 *x_base = input + static_cast<size_t>(b) * H * W;
+    _FP16 *y_base = output + static_cast<size_t>(b) * H * W;
+
+    for (unsigned int c = 0; c < W; ++c) {
+      float prev1 = 0.0f;
+      float prev2 = 0.0f;
+
+      const float sw0 = static_cast<float>(w0[c]);
+      const float sw1 = static_cast<float>(w1[c]);
+      const float sw2 = static_cast<float>(w2[c]);
+
+      for (unsigned int t = 0; t < H; ++t) {
+        const size_t idx = static_cast<size_t>(t) * W + c;
+        const float cur = static_cast<float>(x_base[idx]);
+        const float acc = cur * sw0 + prev1 * sw1 + prev2 * sw2;
+        y_base[idx] = static_cast<_FP16>(acc);
+
+        prev2 = prev1;
+        prev1 = cur;
+      }
+    }
+  }
+}
+
+/**
+* @brief Benchmark + accuracy test helper for causal_depthwise_conv1d_k3_fp16
+*/
+static void run_causal_depthwise_conv1d_k3_fp16_test(
+  const unsigned int B,
+  const unsigned int H,
+  const unsigned int W,
+  const unsigned int warmup_iters = 3,
+  const unsigned int test_iters = 20,
+  bool print = false) {
+
+  nntrainer::init_backend();
+
+  const size_t input_size = static_cast<size_t>(B) * H * W;
+  const size_t weight_size = static_cast<size_t>(3) * W;
+
+  std::vector<_FP16> input =
+    generate_random_vector<_FP16>(input_size, static_cast<_FP16>(-1.0f),
+                                  static_cast<_FP16>(1.0f));
+  std::vector<_FP16> packed_weight =
+    generate_random_vector<_FP16>(weight_size, static_cast<_FP16>(-1.0f),
+                                  static_cast<_FP16>(1.0f));
+
+  std::vector<_FP16> ref_output(input_size, (_FP16)0);
+  std::vector<_FP16> test_output(input_size, (_FP16)0);
+
+  // Reference
+  auto t_ref_0 = high_resolution_clock::now();
+  for (unsigned int i = 0; i < test_iters; ++i) {
+    reference_causal_depthwise_conv1d_k3_fp16(
+      input.data(), packed_weight.data(), ref_output.data(), B, H, W);
+  }
+  auto t_ref_1 = high_resolution_clock::now();
+  auto ref_time = duration_cast<nanoseconds>(t_ref_1 - t_ref_0);
+
+  // Warmup
+  for (unsigned int i = 0; i < warmup_iters; ++i) {
+    nntrainer::causal_depthwise_conv1d_k3_fp16(
+      input.data(), packed_weight.data(), test_output.data(), B, H, W);
+  }
+
+  // Kernel benchmark
+  auto t_0 = high_resolution_clock::now();
+  for (unsigned int i = 0; i < test_iters; ++i) {
+    nntrainer::causal_depthwise_conv1d_k3_fp16(
+      input.data(), packed_weight.data(), test_output.data(), B, H, W);
+  }
+  auto t_1 = high_resolution_clock::now();
+  auto kernel_time = duration_cast<nanoseconds>(t_1 - t_0);
+
+  const float mse_val = compute_mse<_FP16>(
+    B * H, W, ref_output, test_output, print);
+  const float cos_sim = cosine_similarity<_FP16, _FP16>(
+    ref_output.data(), test_output.data(), input_size);
+  const float max_diff = find_max_diff<_FP16>(
+    ref_output.data(), test_output.data(), B * H, W);
+
+  if (print) {
+    std::cout << " =========================================" << std::endl;
+    std::cout << "[BENCHMARK] causal_depthwise_conv1d_k3_fp16"
+              << " (B:" << B << ", H:" << H << ", W:" << W << ")"
+              << std::endl;
+    std::cout << "=========================================" << std::endl;
+    std::cout << "[INFO] reference avg: "
+              << ref_time.count() / test_iters << " ns ("
+              << ref_time.count() / test_iters / 1'000 << " us, "
+              << ref_time.count() / test_iters / 1'000'000 << " ms)"
+              << std::endl;
+    std::cout << "[INFO] kernel avg:    "
+              << kernel_time.count() / test_iters << " ns ("
+              << kernel_time.count() / test_iters / 1'000 << " us, "
+              << kernel_time.count() / test_iters / 1'000'000 << " ms)"
+              << std::endl;
+    std::cout << "[INFO] speedup:       "
+              << static_cast<double>(ref_time.count()) /
+                   static_cast<double>(kernel_time.count())
+              << "x" << std::endl;
+    std::cout << "[INFO] MSE:           " << mse_val << std::endl;
+    std::cout << "[INFO] Cosine Sim:    " << cos_sim << std::endl;
+    std::cout << "[INFO] Max Diff:      " << max_diff << std::endl;
+    std::cout << "========================================= " << std::endl;
+  }
+
+  // fp16 accumulate/fma rounding 때문에 너무 빡빡하게 잡지는 말고
+  EXPECT_LE(mse_val, 1e-4f);
+  EXPECT_GE(cos_sim, 0.999f);
+  EXPECT_LE(max_diff, 2e-2f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_depthwise_conv1d_k3_fp16_1x64x4096) {
+  run_causal_depthwise_conv1d_k3_fp16_test(1, 1024, 4096, 3, 20, true);
+}
+
+TEST(nntrainer_cpu_backend_standalone, causal_depthwise_conv1d_k3_fp16_1x2048x256) {
+  run_causal_depthwise_conv1d_k3_fp16_test(1, 3, 4096, 3, 20, true);
+}
 
 
 
