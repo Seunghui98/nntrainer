@@ -519,12 +519,12 @@ void LayerNode::read(ReadSource src, bool opt_var,
 
 void LayerNode::save(std::ofstream &file, bool opt_var,
                      ml::train::ExecutionMode mode,
-                     TensorDim::DataType target_dtype) const {
+                     ml::train::TensorDim::DataType target_type) const {
   NNTR_THROW_IF(!run_context, std::runtime_error)
     << __func__ << " layer needs to be finalized first!";
   getLayer()->save(file, *run_context, opt_var, mode,
                    (getTrainable() && mode == ml::train::ExecutionMode::TRAIN),
-                   target_dtype);
+                   target_type);
 }
 
 void LayerNode::clearOptVar() {
