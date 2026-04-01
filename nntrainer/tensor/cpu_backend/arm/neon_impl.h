@@ -827,6 +827,7 @@ void softmax_row(T *qk_out, size_t start_row, size_t end_row, size_t num_heads,
 void causal_depthwise_conv1d_k3(const float * input, const float * packed_weight, const float * bias,
                                 float * output, unsigned int B, unsigned int H, unsigned int W);
 
+
 #ifdef ENABLE_FP16
 /**
  * @brief Multihead softmax with mixed precision, inplace version (overload)
@@ -978,6 +979,10 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
                                      void *output, const float *cos_,
                                      const float *sin_,
                                      bool only_convert_to_fp16);
+
+void causal_depthwise_conv1d_k3_fp16(const __fp16 *input, const __fp16 *packed_weight,
+                                     __fp16 *output, unsigned int B,
+                                     unsigned int H, unsigned int W);
 #endif
 } // namespace nntrainer::neon
 

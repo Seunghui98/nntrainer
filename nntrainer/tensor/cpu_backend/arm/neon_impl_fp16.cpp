@@ -2293,6 +2293,9 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
   }
 }
 
+
+
+
 // Function to apply Rotary Positional Embeddings (RoPE)
 // Rotates pairs of elements in the embedding vector by a given angle.
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
@@ -2363,6 +2366,133 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
       } else {
         inout[i0] = out0;
         inout[i1] = out1;
+      }
+    }
+  }
+}
+
+
+void causal_depthwise_conv1d_k3_fp16(
+  const __fp16 *input,
+  const __fp16 *packed_weight,
+  __fp16 *output,
+  unsigned int B,
+  unsigned int H,
+  unsigned int W) {
+  const __fp16 *w0 = packed_weight;
+  const __fp16 *w1 = packed_weight + W;
+  const __fp16 *w2 = packed_weight + 2 * W;
+
+  constexpr unsigned int VEC = 8;
+  constexpr unsigned int TILE = 32;
+  
+  for (unsigned int b = 0; b < B; ++b) {
+    const __fp16 *x_base = input + (size_t)b * H * W;
+    __fp16 *y_base = output + (size_t)b * H * W;
+
+    unsigned int c = 0;
+
+    for (; c + TILE <= W; c += TILE) {
+      const float16x8_t vw0_0 = vld1q_f16(w0 + c + 0);
+      const float16x8_t vw0_1 = vld1q_f16(w0 + c + 8);
+      const float16x8_t vw0_2 = vld1q_f16(w0 + c + 16);
+      const float16x8_t vw0_3 = vld1q_f16(w0 + c + 24);
+
+      const float16x8_t vw1_0 = vld1q_f16(w1 + c + 0);
+      const float16x8_t vw1_1 = vld1q_f16(w1 + c + 8);
+      const float16x8_t vw1_2 = vld1q_f16(w1 + c + 16);
+      const float16x8_t vw1_3 = vld1q_f16(w1 + c + 24);
+
+      const float16x8_t vw2_0 = vld1q_f16(w2 + c + 0);
+      const float16x8_t vw2_1 = vld1q_f16(w2 + c + 8);
+      const float16x8_t vw2_2 = vld1q_f16(w2 + c + 16);
+      const float16x8_t vw2_3 = vld1q_f16(w2 + c + 24);
+
+      float16x8_t prev1_0 = vdupq_n_f16(0);
+      float16x8_t prev1_1 = vdupq_n_f16(0);
+      float16x8_t prev1_2 = vdupq_n_f16(0);
+      float16x8_t prev1_3 = vdupq_n_f16(0);
+
+      float16x8_t prev2_0 = vdupq_n_f16(0);
+      float16x8_t prev2_1 = vdupq_n_f16(0);
+      float16x8_t prev2_2 = vdupq_n_f16(0);
+      float16x8_t prev2_3 = vdupq_n_f16(0);
+
+      for (unsigned int t = 0; t < H; ++t) {
+        const __fp16 *x_ptr = x_base + (size_t)t * W + c;
+        __fp16 *y_ptr = y_base + (size_t)t * W + c;
+
+        const float16x8_t cur0 = vld1q_f16(x_ptr + 0);
+        const float16x8_t cur1 = vld1q_f16(x_ptr + 8);
+        const float16x8_t cur2 = vld1q_f16(x_ptr + 16);
+        const float16x8_t cur3 = vld1q_f16(x_ptr + 24);
+
+        float16x8_t acc0 = vmulq_f16(cur0, vw0_0);
+        float16x8_t acc1 = vmulq_f16(cur1, vw0_1);
+        float16x8_t acc2 = vmulq_f16(cur2, vw0_2);
+        float16x8_t acc3 = vmulq_f16(cur3, vw0_3);
+
+        acc0 = vfmaq_f16(acc0, prev1_0, vw1_0);
+        acc1 = vfmaq_f16(acc1, prev1_1, vw1_1);
+        acc2 = vfmaq_f16(acc2, prev1_2, vw1_2);
+        acc3 = vfmaq_f16(acc3, prev1_3, vw1_3);
+
+        acc0 = vfmaq_f16(acc0, prev2_0, vw2_0);
+        acc1 = vfmaq_f16(acc1, prev2_1, vw2_1);
+        acc2 = vfmaq_f16(acc2, prev2_2, vw2_2);
+        acc3 = vfmaq_f16(acc3, prev2_3, vw2_3);
+
+        vst1q_f16(y_ptr + 0, acc0);
+        vst1q_f16(y_ptr + 8, acc1);
+        vst1q_f16(y_ptr + 16, acc2);
+        vst1q_f16(y_ptr + 24, acc3);
+
+        prev2_0 = prev1_0; prev1_0 = cur0;
+        prev2_1 = prev1_1; prev1_1 = cur1;
+        prev2_2 = prev1_2; prev1_2 = cur2;
+        prev2_3 = prev1_3; prev1_3 = cur3;
+      }
+    }
+
+    for (; c + VEC <= W; c += VEC) {
+      const float16x8_t vw0 = vld1q_f16(w0 + c);
+      const float16x8_t vw1 = vld1q_f16(w1 + c);
+      const float16x8_t vw2 = vld1q_f16(w2 + c);
+
+      float16x8_t prev1 = vdupq_n_f16(0);
+      float16x8_t prev2 = vdupq_n_f16(0);
+
+      for (unsigned int t = 0; t < H; ++t) {
+        const __fp16 *x_ptr = x_base + (size_t)t * W + c;
+        __fp16 *y_ptr = y_base + (size_t)t * W + c;
+
+        const float16x8_t cur = vld1q_f16(x_ptr);
+
+        float16x8_t acc = vmulq_f16(cur, vw0);
+        acc = vfmaq_f16(acc, prev1, vw1);
+        acc = vfmaq_f16(acc, prev2, vw2);
+
+        vst1q_f16(y_ptr, acc);
+
+        prev2 = prev1;
+        prev1 = cur;
+      }
+    }
+
+    for (; c < W; ++c) {
+      const __fp16 sw0 = w0[c];
+      const __fp16 sw1 = w1[c];
+      const __fp16 sw2 = w2[c];
+
+      __fp16 prev1 = 0;
+      __fp16 prev2 = 0;
+
+      for (unsigned int t = 0; t < H; ++t) {
+        size_t idx = (size_t)t * W + c;
+        __fp16 cur = x_base[idx];
+        y_base[idx] = cur * sw0 + prev1 * sw1 + prev2 * sw2;
+        prev2 = prev1;
+        prev1 = cur;
       }
     }
   }
@@ -2630,280 +2760,7 @@ void calc_trigonometric_vals_dup(unsigned int N_half, _FP16 *angle, _FP16 *cos_,
 }
 
 
-static inline float16x8_t silu_f16x8(float16x8_t x) {
-  float16x4_t x_lo_h = vget_low_f16(x);
-  float16x4_t x_hi_h = vget_high_f16(x);
-
-  float32x4_t x_lo = vcvt_f32_f16(x_lo_h);
-  float32x4_t x_hi = vcvt_f32_f16(x_hi_h);
-
-  float32x4_t ones = vdupq_n_f32(1.0f);
-
-  float32x4_t exp_x_lo = exp_ps(vnegq_f32(x_lo));
-  float32x4_t exp_x_hi = exp_ps(vnegq_f32(x_hi));
-
-  exp_x_lo = vaddq_f32(exp_x_lo, ones);
-  exp_x_hi = vaddq_f32(exp_x_hi, ones);
-
-  x_lo = vdivq_f32(x_lo, exp_x_lo);
-  x_hi = vdivq_f32(x_hi, exp_x_hi);
-
-  return vcombine_f16(vcvt_f16_f32(x_lo), vcvt_f16_f32(x_hi));
-}
-
-static inline __fp16 silu_scalar_f16(__fp16 x) {
-  const float v = static_cast<float>(x);
-  return static_cast<__fp16>(v / (1.0f + std::exp(-v)));
-}
 
 
-void causal_conv1d_channellast_fp16_w3(
-    __fp16 * x,       
-    const __fp16 * weight,  
-    const __fp16 * bias,    
-    __fp16 * out,         
-    const unsigned int B,
-    const unsigned int H,
-    const unsigned int W,
-    bool silu_activation) {
-
-  constexpr int kVec = 8;
-  const int batch_stride = H * W;
-
-  const __fp16 *w0_base = weight;
-  const __fp16 *w1_base = weight + W;
-  const __fp16 *w2_base = weight + 2 * W;
-
-  for (int b = 0; b < B; ++b) {
-    const __fp16 *x_b = x + b * batch_stride;
-    __fp16 *out_b = out + b * batch_stride;
-
-    // t = 0 : y[0] = bias + w2 * x[0]
-    if (H > 0) {
-      const __fp16 *x2 = x_b;
-      __fp16 *y = out_b;
-
-      int c = 0;
-      
-      for (; c + kVec <= W; c += kVec) {
-        float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
-        float16x8_t w2 = vld1q_f16(w2_base + c);
-        float16x8_t xv2 = vld1q_f16(x2 + c);
-
-        acc = vfmaq_f16(acc, xv2, w2);
-        
-        if (silu_activation) {
-          acc = silu_f16x8(acc);
-        } 
-        vst1q_f16(y + c, acc);
-      }
-
-      for (; c < W; ++c) {
-        __fp16 acc = bias ? bias[c] : (__fp16)0;
-        acc = static_cast<__fp16>(acc + x2[c] * w2_base[c]);
-        if (silu_activation) {
-          acc = silu_scalar_f16(acc);
-        }
-        y[c] = acc;
-      }
-    }
-
-    if (H > 1) {
-      const __fp16 *x1 = x_b;
-      const __fp16 *x2 = x_b + W;
-      __fp16 *y = out_b + W;
-
-      int c = 0;
-      for (; c + kVec <= W; c += kVec) {
-        float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
-
-        float16x8_t w1 = vld1q_f16(w1_base + c);
-        float16x8_t w2 = vld1q_f16(w2_base + c);
-        float16x8_t xv1 = vld1q_f16(x1 + c);
-        float16x8_t xv2 = vld1q_f16(x2 + c);
-
-        acc = vfmaq_f16(acc, xv1, w1);
-        acc = vfmaq_f16(acc, xv2, w2);
-
-        if (silu_activation) {
-          acc = silu_f16x8(acc);
-        }
-        vst1q_f16(y + c, acc);
-      }
-
-      for (; c < W; ++c) {
-        __fp16 acc = bias ? bias[c] : (__fp16)0;
-        acc = static_cast<__fp16>(acc + x1[c] * w1_base[c]);
-        acc = static_cast<__fp16>(acc + x2[c] * w2_base[c]);
-        if (silu_activation) {
-          acc = silu_scalar_f16(acc);
-        }
-        y[c] = acc;
-      }
-    }
-
-    // t >= 2 : y[t] = bias + w0*x[t-2] + w1*x[t-1] + w2*x[t]
-    for (int t = 2; t < H; ++t) {
-      const __fp16 *x0 = x_b + (t - 2) * W;
-      const __fp16 *x1 = x_b + (t - 1) * W;
-      const __fp16 *x2 = x_b + t * W;
-      __fp16 *y = out_b + t * W;
-
-      int c = 0;
-      for (; c + kVec <= W; c += kVec) {
-        float16x8_t acc = bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
-
-        float16x8_t w0 = vld1q_f16(w0_base + c);
-        float16x8_t w1 = vld1q_f16(w1_base + c);
-        float16x8_t w2 = vld1q_f16(w2_base + c);
-
-        float16x8_t xv0 = vld1q_f16(x0 + c);
-        float16x8_t xv1 = vld1q_f16(x1 + c);
-        float16x8_t xv2 = vld1q_f16(x2 + c);
-
-        acc = vfmaq_f16(acc, xv0, w0);
-        acc = vfmaq_f16(acc, xv1, w1);
-        acc = vfmaq_f16(acc, xv2, w2);
-
-        if (silu_activation) {
-          acc = silu_f16x8(acc);
-        }
-        vst1q_f16(y + c, acc);
-      }
-
-      for (; c < W; ++c) {
-        __fp16 acc = bias ? bias[c] : (__fp16)0;
-        acc = static_cast<__fp16>(acc + x0[c] * w0_base[c]);
-        acc = static_cast<__fp16>(acc + x1[c] * w1_base[c]);
-        acc = static_cast<__fp16>(acc + x2[c] * w2_base[c]);
-        if (silu_activation) {
-          acc = silu_scalar_f16(acc);
-        }
-        y[c] = acc;
-      }
-    }
-  }
-}
-
-
-void causal_conv1d_channellast_fp16_w3_weight_reuse(
-    __fp16 *x,
-    const __fp16 *weight,
-    const __fp16 *bias,
-    __fp16 *out,
-    const unsigned int B,
-    const unsigned int H,
-    const unsigned int W,
-    bool silu_activation) {
-
-  constexpr unsigned int kVec = 8;
-
-  if (B == 0 || H == 0 || W == 0) {
-    return;
-  }
-
-  const unsigned int batch_stride = H * W;
-
-  const __fp16 *w0_base = weight;
-  const __fp16 *w1_base = weight + W;
-  const __fp16 *w2_base = weight + 2 * W;
-
-  for (unsigned int b = 0; b < B; ++b) {
-    const __fp16 *x_b = x + b * batch_stride;
-    __fp16 *out_b = out + b * batch_stride;
-
-    // vector path: weight/bias를 c-block 당 한 번만 load
-    unsigned int c = 0;
-    for (; c + kVec <= W; c += kVec) {
-      const float16x8_t w0 = vld1q_f16(w0_base + c);
-      const float16x8_t w1 = vld1q_f16(w1_base + c);
-      const float16x8_t w2 = vld1q_f16(w2_base + c);
-      const float16x8_t bvec =
-        bias ? vld1q_f16(bias + c) : vdupq_n_f16((__fp16)0);
-
-      // t = 0
-      {
-        const __fp16 *x2 = x_b + c;
-        float16x8_t acc = vfmaq_f16(bvec, vld1q_f16(x2), w2);
-        if (silu_activation) {
-          acc = silu_f16x8(acc);
-        }
-        vst1q_f16(out_b + c, acc);
-      }
-
-      // t = 1
-      if (H > 1) {
-        const __fp16 *x1 = x_b + c;
-        const __fp16 *x2 = x_b + W + c;
-
-        float16x8_t acc = bvec;
-        acc = vfmaq_f16(acc, vld1q_f16(x1), w1);
-        acc = vfmaq_f16(acc, vld1q_f16(x2), w2);
-
-        if (silu_activation) {
-          acc = silu_f16x8(acc);
-        }
-        vst1q_f16(out_b + W + c, acc);
-      }
-
-      // t >= 2
-      for (unsigned int t = 2; t < H; ++t) {
-        const __fp16 *x0 = x_b + (t - 2) * W + c;
-        const __fp16 *x1 = x_b + (t - 1) * W + c;
-        const __fp16 *x2 = x_b + t * W + c;
-
-        float16x8_t acc = bvec;
-        acc = vfmaq_f16(acc, vld1q_f16(x0), w0);
-        acc = vfmaq_f16(acc, vld1q_f16(x1), w1);
-        acc = vfmaq_f16(acc, vld1q_f16(x2), w2);
-
-        if (silu_activation) {
-          acc = silu_f16x8(acc);
-        }
-        vst1q_f16(out_b + t * W + c, acc);
-      }
-    }
-
-    // tail scalar path
-    for (; c < W; ++c) {
-      const __fp16 w0 = w0_base[c];
-      const __fp16 w1 = w1_base[c];
-      const __fp16 w2 = w2_base[c];
-      const __fp16 bc = bias ? bias[c] : (__fp16)0;
-
-      // t = 0
-      {
-        __fp16 acc = static_cast<__fp16>(bc + x_b[c] * w2);
-        if (silu_activation) {
-          acc = silu_scalar_f16(acc);
-        }
-        out_b[c] = acc;
-      }
-
-      // t = 1
-      if (H > 1) {
-        __fp16 acc = bc;
-        acc = static_cast<__fp16>(acc + x_b[c] * w1);
-        acc = static_cast<__fp16>(acc + x_b[W + c] * w2);
-        if (silu_activation) {
-          acc = silu_scalar_f16(acc);
-        }
-        out_b[W + c] = acc;
-      }
-
-      // t >= 2
-      for (unsigned int t = 2; t < H; ++t) {
-        __fp16 acc = bc;
-        acc = static_cast<__fp16>(acc + x_b[(t - 2) * W + c] * w0);
-        acc = static_cast<__fp16>(acc + x_b[(t - 1) * W + c] * w1);
-        acc = static_cast<__fp16>(acc + x_b[t * W + c] * w2);
-        if (silu_activation) {
-          acc = silu_scalar_f16(acc);
-        }
-        out_b[t * W + c] = acc;
-      }
-    }
-  }
-}
 
 } // namespace nntrainer::neon

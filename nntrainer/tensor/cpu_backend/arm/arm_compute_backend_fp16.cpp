@@ -329,6 +329,12 @@ template <> void dequantize_row_q8_0(const void *x_raw, _FP16 *y, int64_t k) {
   __ggml_dequantize_row_q8_0(x_raw, y, k);
 }
 
+void causal_depthwise_conv1d_k3_fp16(const __fp16 *input, const __fp16 *packed_weight,
+                                     __fp16 *output, unsigned int B,
+                                     unsigned int H, unsigned int W){
+  nntrainer::neon::causal_depthwise_conv1d_k3_fp16(input, packed_weight, output, B, H, W); 
+}
+
 template <>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const _FP16 *A, const unsigned int lda, const void *B,
