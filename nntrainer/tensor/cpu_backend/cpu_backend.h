@@ -1350,6 +1350,10 @@ template <typename T = float>
 extern void softmax_row(T *qk_out, size_t start_row, size_t end_row,
                         size_t num_heads, T *sink = nullptr);
 
+extern void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
+                                       const float *bias, float *output,
+                                       unsigned int B, unsigned int H, unsigned int W); 
+
 #ifdef ENABLE_FP16
 /**
  * @brief Multihead softmax with mixed precision, inplace version (overload)
