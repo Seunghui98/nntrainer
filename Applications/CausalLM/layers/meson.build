@@ -13,6 +13,9 @@ causallm_qkv_layer_src_abs = [meson.current_source_dir() / 'qkv_layer.cpp']
 causallm_gptoss_moe_layer_tm_src_abs = [meson.current_source_dir() / 'gpt_oss_moe_layer_tm.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
+causallm_transpose_layer_src_abs = [meson.current_source_dir() / 'transpose_layer.cpp']
+causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_multiply.cpp']
+causallm_custom_slice_layer_src_abs = [meson.current_source_dir() / 'custom_slice.cpp']
 
 openmp_dep = dependency('openmp')
 causallm_rms_norm = shared_library(
@@ -173,3 +176,46 @@ causallm_gptoss_moe_layer_tm_dep = declare_dependency(
     link_with: causallm_gptoss_moe_layer_tm,
     include_directories: causallm_layer_inc
 )
+
+causallm_transpose_layer = shared_library(
+    'transpose_layer',
+    causallm_transpose_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_transpose_layer_dep = declare_dependency(
+    link_with: causallm_transpose_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_custom_multiply_layer = shared_library(
+    'custom_multiply',
+    causallm_custom_multiply_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_custom_multiply_dep = declare_dependency(
+    link_with: causallm_custom_multiply_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_custom_slice_layer = shared_library(
+    'custom_slice',
+    causallm_custom_slice_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_custom_slice_dep = declare_dependency(
+    link_with: causallm_custom_slice_layer,
+    include_directories: causallm_layer_inc
+)
+
