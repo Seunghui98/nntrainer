@@ -33,10 +33,7 @@ public:
 class Lfm2CausalLM : public CausalLM, public Lfm2Transformer {
 
 public:
-  Lfm2CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg)
-    : Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
-      CausalLM(cfg, generation_cfg, nntr_cfg),
-      Lfm2Transformer(cfg, generation_cfg, nntr_cfg) {}
+  Lfm2CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
 
   void constructModel() override;
   void setupParameters(json &cfg, json &generation_cfg,
@@ -47,15 +44,13 @@ public:
 
   /**
    * @brief Test constructor with minimal config
-   * @note Creates model with                                                        small dimensions for testing
+   * @note Creates model with small dimensions for testing
    */
   static Lfm2CausalLM createTestModel();
 
   ModelHandle &getModel() { return model; }
 
 public:
-  unsigned int NUM_VOCAB;
-  int DIM;
   int CONV_DIM;
   int CONV_DIM_OUT;
   int CONV_L_CACHE;
