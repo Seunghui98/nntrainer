@@ -21,11 +21,11 @@
 namespace {
 
 auto create_causal_conv1d_layer =
-  [](const std::vector<nntrainer::props::Property> &properties)
+  [](const std::vector<std::string> &properties)
   -> std::unique_ptr<nntrainer::Layer> {
   (void)properties;
-  auto layer = std::make_unique<causallm::CausalConv1DLayer>();
-  return layer;
+  return
+  std::make_unique<causallm::CausalConv1DLayer>();
 };
 
 auto semantic_causal_conv1d = LayerSemanticsParamType(

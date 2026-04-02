@@ -145,6 +145,7 @@ exe = executable(
   'unittest_layers', test_target,
   dependencies: [
     nntrainer_test_main_deps,
+    causallm_causal_conv1d_dep,   
   ],
   cpp_args : cpp_args_str,
   install: get_option('enable-test'),
