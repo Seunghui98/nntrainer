@@ -1,26 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
-/**
-* Copyright (C) 2026 Hyeong-Gwon Hong
-*
-* @file   causal_conv1d_layer.h
-* @date   01 April 2026
-* @brief  Causal depthwise Conv1D layer for CausalLM
-* @see    https://github.com/nntrainer/nntrainer
-* @author Hyeong-Gwon Hong
-* @bug    No known bugs except for NYI items
-*
-*/
-
+// causal_conv1d_layer.h
 #ifndef __CAUSAL_LM_CAUSAL_CONV1D_LAYER_H__
 #define __CAUSAL_LM_CAUSAL_CONV1D_LAYER_H__
 
 #include <array>
 #include <limits>
 #include <string>
+#include <vector>
 
-#include <layer_context.h>
+#include <layer_devel.h>
 #include <layer_impl.h>
-#include <node_exporter.h>
 #include <tensor_dim.h>
 
 namespace causallm {
@@ -35,10 +23,11 @@ public:
   void incremental_forwarding(nntrainer::RunLayerContext &context,
                               unsigned int from, unsigned int to,
                               bool training) override;
-
   void calcDerivative(nntrainer::RunLayerContext &context) override;
   void calcGradient(nntrainer::RunLayerContext &context) override;
-
+  void updateTensorsByInputDimensions(
+    nntrainer::RunLayerContext &context,
+    std::vector<nntrainer::TensorDim> input_dimensions) override;
   const std::string getType() const override;
   void exportTo(nntrainer::Exporter &exporter,
                 const ml::train::ExportMethods &method) const override;
@@ -48,10 +37,7 @@ public:
   inline static const std::string type = "causal_conv1d";
 
 private:
-  enum CausalConv1DParams {
-    weight = 0,
-  };
-
+  enum CausalConv1DParams { weight = 0 };
   static constexpr size_t SINGLE_INOUT_IDX = 0;
   static constexpr unsigned int KERNEL_SIZE = 3;
 

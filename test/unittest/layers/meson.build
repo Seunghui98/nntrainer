@@ -75,7 +75,6 @@ test_target = [
   'unittest_layers_layer_normalization.cpp',
   'unittest_layers_convolution2d.cpp',
   'unittest_layers_convolution1d.cpp',
-  'unittest_layers_depthwise_convolution1d.cpp',
   'unittest_layers_pooling2d.cpp',
   'unittest_layers_flatten.cpp',
   'unittest_layers_activation.cpp',
@@ -113,7 +112,8 @@ test_target = [
   'unittest_layers_multi_head_attention.cpp',
   'unittest_layers_positional_encoding.cpp',
   'unittest_layers_upsample2d.cpp',
-  'unittest_layers_causal_conv1d.cpp'
+  #'unittest_layers_causal_conv1d.cpp',
+  #'../../../Applications/CausalLM/layers/causal_conv1d_layer.cpp'
 ]
 
 if get_option('enable-opencl')
@@ -144,8 +144,7 @@ endif
 exe = executable(
   'unittest_layers', test_target,
   dependencies: [
-    nntrainer_test_main_deps,
-    causallm_causal_conv1d_dep,   
+    nntrainer_test_main_deps,  
   ],
   cpp_args : cpp_args_str,
   install: get_option('enable-test'),

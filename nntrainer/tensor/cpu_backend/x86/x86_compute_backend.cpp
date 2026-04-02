@@ -455,6 +455,16 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
     local_window_size, head_start, head_end);
 }
 
+void causal_depthwise_conv1d_k3_fp16(const uint16_t *input,
+                                     const uint16_t *packed_weight,
+                                     float *output,
+                                     unsigned int B,
+                                     unsigned int H,
+                                     unsigned int W){
+  nntrainer::avx2::causal_depthwise_conv1d_k3_fp16(
+    input, packed_weight, output, B, H, W);
+}
+
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, float *inout, void *output,
                               const float *cos_, const float *sin_,

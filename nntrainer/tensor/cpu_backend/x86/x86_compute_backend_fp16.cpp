@@ -121,6 +121,8 @@ _FP16 snrm2(const unsigned int N, const _FP16 *X, const unsigned int incX) {
   return sum;
 }
 
+
+
 void scopy(const unsigned int N, const _FP16 *X, const unsigned int incX,
            _FP16 *Y, const unsigned int incY) {
   if (incX == 1 && incY == 1) {

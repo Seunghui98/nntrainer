@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <cpu_backend.h>
+#include <fp16.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
@@ -29,10 +30,6 @@ CausalConv1DLayer::CausalConv1DLayer() : LayerImpl() {
 
 void CausalConv1DLayer::validateInputShape(
   const nntrainer::TensorDim &input_dim) const {
-  /**
-   * Expected input format:
-   *   [B, C, H, W] = [batch, 1, seq_len, hidden]
-   */
   NNTR_THROW_IF(input_dim.rank() != 4, std::invalid_argument)
     << "[CausalConv1DLayer] input rank must be 4, but got "
     << input_dim.rank();
@@ -60,30 +57,22 @@ void CausalConv1DLayer::finalize(nntrainer::InitLayerContext &context) {
 
   const unsigned int W = input_dim.width();
 
-  /**
-   * Weight layout:
-   *   [1, 1, 3, W]
-   * Memory layout expected by kernel:
-   *   [w0(0:W), w1(W:2W), w2(2W:3W)]
-   *
-   * Weight dtype is FP16.
-   */
+#ifdef ENABLE_FP16
   nntrainer::TensorDim weight_dim(
     1, 1, KERNEL_SIZE, W, ml::train::TensorDim::DataType::FP16);
+#else
+  nntrainer::TensorDim weight_dim(
+    1, 1, KERNEL_SIZE, W, ml::train::TensorDim::DataType::UINT16);
+#endif
 
-  /**
-   * Output shape is same as input shape, but FP16.
-   */
   nntrainer::TensorDim output_dim = input_dim;
-  output_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+  output_dim.setDataType(ml::train::TensorDim::DataType::FP32);
 
   context.setOutputDimensions({output_dim});
 
-  /**
-   * requestWeight() overload may differ slightly depending on local branch.
-   */
-  context.requestWeight(weight_idx[weight], "causal_conv1d_weight", weight_dim,
-                        nntrainer::Initializer::GLOROT_UNIFORM, true);
+  context.requestWeight(weight_dim,
+                        nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE,
+                        0.0f, 0.0f, "causal_conv1d_weight");
 }
 
 void CausalConv1DLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -96,10 +85,6 @@ void CausalConv1DLayer::forwarding(nntrainer::RunLayerContext &context,
 void CausalConv1DLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-#ifndef ENABLE_FP16
-  throw std::runtime_error(
-    "[CausalConv1DLayer] ENABLE_FP16 is required for this layer.");
-#else
   NNTR_THROW_IF(training, std::invalid_argument)
     << "[CausalConv1DLayer] training/backward is not supported yet.";
 
@@ -120,13 +105,22 @@ void CausalConv1DLayer::incremental_forwarding(
   NNTR_THROW_IF(input.getDataType() != ml::train::TensorDim::DataType::FP32,
                 std::invalid_argument)
     << "[CausalConv1DLayer] input must be FP32.";
-  NNTR_THROW_IF(output.getDataType() != ml::train::TensorDim::DataType::FP16,
+
+  NNTR_THROW_IF(output.getDataType() != ml::train::TensorDim::DataType::FP32,
                 std::invalid_argument)
-    << "[CausalConv1DLayer] output must be FP16.";
+    << "[CausalConv1DLayer] output must be FP32.";
+
+#ifdef ENABLE_FP16
   NNTR_THROW_IF(conv_weight.getDataType() !=
                   ml::train::TensorDim::DataType::FP16,
                 std::invalid_argument)
     << "[CausalConv1DLayer] weight must be FP16.";
+#else
+  NNTR_THROW_IF(conv_weight.getDataType() !=
+                  ml::train::TensorDim::DataType::UINT16,
+                std::invalid_argument)
+    << "[CausalConv1DLayer] weight must be UINT16 when ENABLE_FP16 is off.";
+#endif
 
   NNTR_THROW_IF(!input.isContiguous(), std::invalid_argument)
     << "[CausalConv1DLayer] input tensor must be contiguous.";
@@ -138,26 +132,23 @@ void CausalConv1DLayer::incremental_forwarding(
     << "[CausalConv1DLayer] invalid incremental end: to=" << to
     << ", H=" << H;
 
-  /**
-   * Cast only prefix [0, to) from FP32 -> FP16,
-   * then run the existing FP16 kernel on that prefix.
-   */
   const size_t prefix_elems = static_cast<size_t>(B) * to * W;
-  std::vector<__fp16> input_fp16(prefix_elems);
+  std::vector<uint16_t> input_fp16(prefix_elems);
 
   const float *input_ptr = input.getData<float>();
   for (size_t i = 0; i < prefix_elems; ++i) {
-    input_fp16[i] = static_cast<__fp16>(input_ptr[i]);
+    input_fp16[i] = fp16_ieee_from_fp32_value(input_ptr[i]);
   }
 
-  /**
-   * Run user's kernel directly.
-   * H argument is prefix length = to.
-   */
-  nntrainer::causal_depthwise_conv1d_k3_fp16(
-    input_fp16.data(), conv_weight.getData<__fp16>(), output.getData<__fp16>(),
-    B, to, W);
+#ifdef ENABLE_FP16
+  const uint16_t *weight_ptr =
+    reinterpret_cast<const uint16_t *>(conv_weight.getData<__fp16>());
+#else
+  const uint16_t *weight_ptr = conv_weight.getData<uint16_t>();
 #endif
+
+  nntrainer::causal_depthwise_conv1d_k3_fp16(
+    input_fp16.data(), weight_ptr, output.getData<float>(), B, to, W);
 }
 
 void CausalConv1DLayer::calcDerivative(nntrainer::RunLayerContext &context) {

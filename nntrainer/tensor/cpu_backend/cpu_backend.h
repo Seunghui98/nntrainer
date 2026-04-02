@@ -1265,6 +1265,7 @@ extern void repack_q4_0(void *W, void *repacked_W, size_t data_size,
 extern void repack_q4_K(void *W, void *repacked_W, size_t data_size,
                         const unsigned int M, const unsigned int N);
 
+
 /**
  * @brief unpack q40x8 or q40x4 (for ARM backend) to q40 - invers method:
  * repack_q4_0
