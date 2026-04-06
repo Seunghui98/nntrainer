@@ -204,10 +204,9 @@ void CausalConv1DLayer::exportTo(
 }
 
 void CausalConv1DLayer::setProperty(const std::vector<std::string> &values) {
-  if (!values.empty()) {
-    throw std::invalid_argument(
-      "[CausalConv1DLayer] Unknown layer properties: " + values[0]);
-  }
+  // Delegate to LayerImpl which handles standard properties (name, trainable,
+  // etc.) and throws for any unrecognised keys.
+  LayerImpl::setProperty(values);
 }
 
 } // namespace causallm

@@ -29,13 +29,10 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
-<<<<<<< HEAD
     causallm_causal_conv1d_dep,
-=======
     causallm_transpose_layer_dep,
     causallm_custom_multiply_dep,
     causallm_custom_slice_dep,
->>>>>>> 0a4ae651 ([CausalLM] Add new layers build)
 ]
 
 subdir('models')
