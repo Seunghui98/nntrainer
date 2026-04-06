@@ -120,7 +120,7 @@ void CausalConv1DLayer::incremental_forwarding(
       float       *s     = state_data + b * (KERNEL_SIZE - 1) * W;
 
       // y = w0*x + w1*s1 + w2*s0; state updated in-place by kernel
-      causal_depthwise_conv1d_k3_decode(x_cur, w_ptr, s, y_cur, W);
+      nntrainer::causal_depthwise_conv1d_k3_decode(x_cur, w_ptr, s, y_cur, W);
     }
 
   } else {
@@ -131,7 +131,7 @@ void CausalConv1DLayer::incremental_forwarding(
       const float *x = input.getData<float>()  + b * H * W;
       float       *y = output.getData<float>()  + b * H * W;
 
-      causal_depthwise_conv1d_k3(x, w_ptr, nullptr, y, 1, to, W);
+      nntrainer::causal_depthwise_conv1d_k3(x, w_ptr, nullptr, y, 1, to, W);
 
       // Save last KERNEL_SIZE-1 tokens to state for decode steps
       float *s = state_data + b * (KERNEL_SIZE - 1) * W;
