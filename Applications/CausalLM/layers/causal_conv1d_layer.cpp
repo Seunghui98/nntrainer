@@ -102,9 +102,6 @@ void CausalConv1DLayer::incremental_forwarding(
   const unsigned int H = input.height(); // full sequence length (INIT_SEQ_LEN)
   const unsigned int W = input.width();  // feature dimension
 
-  NNTR_THROW_IF(to > H, std::invalid_argument)
-    << "[CausalConv1DLayer] to=" << to << " exceeds H=" << H;
-
   const float *w_ptr = w_tensor.getData<float>(); // [KERNEL_SIZE, W]
   const float *w0 = w_ptr;           // kernel for current  token  (k=0)
   const float *w1 = w_ptr + W;       // kernel for token at t-1    (k=1)
@@ -115,33 +112,32 @@ void CausalConv1DLayer::incremental_forwarding(
   if (to - from == 1) {
     // ----------------------------------------------------------------
     // Single-token decode path: O(W) per step.
-    // Use the persistent state for positions t-1 and t-2.
+    // During incremental_forwarding, NNTrainer places the current token's
+    // data at offset 0 within each batch slice (not at offset `from`).
+    // Reads/writes must all use position 0, not position `from`.
     // ----------------------------------------------------------------
-    const unsigned int t = from; // absolute position to compute
 
     for (unsigned int b = 0; b < B; ++b) {
-      const float *x = input.getData<float>() + b * H * W;
-      float *y = output.getData<float>() + b * H * W;
-      // state row layout: [s0=x_{t-2}, s1=x_{t-1}] each of width W
-      const float *s0 = state_data + b * (KERNEL_SIZE - 1) * W;       // x_{t-2}
-      const float *s1 = state_data + b * (KERNEL_SIZE - 1) * W + W;   // x_{t-1}
+      // Current token is at position 0 within the batch slice.
+      const float *x_cur = input.getData<float>() + b * H * W;  // offset 0
+      float *y_cur = output.getData<float>() + b * H * W;        // offset 0
+
+      const float *s0 = state_data + b * (KERNEL_SIZE - 1) * W;      // x_{t-2}
+      const float *s1 = state_data + b * (KERNEL_SIZE - 1) * W + W;  // x_{t-1}
 
       for (unsigned int f = 0; f < W; ++f) {
-        y[t * W + f] =
-          w0[f] * x[t * W + f] + w1[f] * s1[f] + w2[f] * s0[f];
+        y_cur[f] = w0[f] * x_cur[f] + w1[f] * s1[f] + w2[f] * s0[f];
       }
     }
 
-    // Update state: shift left and insert x_t
-    //   new state[0] = old state[1]  (x_{t-1} becomes x_{t-2})
-    //   new state[1] = x_t            (current becomes the new x_{t-1})
+    // Update state: shift left and insert x_t (at position 0)
     for (unsigned int b = 0; b < B; ++b) {
       float *s = state_data + b * (KERNEL_SIZE - 1) * W;
-      const float *x = input.getData<float>() + b * H * W + from * W;
+      const float *x_cur = input.getData<float>() + b * H * W;  // position 0
       // Shift: s[0] <- s[1]
       std::memcpy(s, s + W, W * sizeof(float));
-      // Insert current: s[1] <- x[t]
-      std::memcpy(s + W, x, W * sizeof(float));
+      // Insert current: s[1] <- x_cur
+      std::memcpy(s + W, x_cur, W * sizeof(float));
     }
 
   } else {
