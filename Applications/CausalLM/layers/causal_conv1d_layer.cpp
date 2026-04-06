@@ -55,7 +55,8 @@ void CausalConv1DLayer::finalize(nntrainer::InitLayerContext &context) {
   //     k=1 → w1: applied to x_{t-1}
   //     k=2 → w2: applied to x_{t-2}
   nntrainer::TensorDim weight_dim(
-    1, 1, KERNEL_SIZE, W, ml::train::TensorDim::DataType::FP32);
+    {1, 1, KERNEL_SIZE, W},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP32});
   weight_idx[weight] =
     context.requestWeight(weight_dim, nntrainer::Initializer::NONE,
                           nntrainer::WeightRegularizer::NONE, 0.0f, 0.0f,
@@ -65,7 +66,8 @@ void CausalConv1DLayer::finalize(nntrainer::InitLayerContext &context) {
   //   state[b, 0, 0, f] = x_{t-2}
   //   state[b, 0, 1, f] = x_{t-1}
   nntrainer::TensorDim state_dim(
-    B, 1, KERNEL_SIZE - 1, W, ml::train::TensorDim::DataType::FP32);
+    {B, 1, KERNEL_SIZE - 1, W},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP32});
   tensor_idx[conv_state] =
     context.requestTensor(state_dim, "conv_state",
                           nntrainer::Initializer::ZEROS, false,
