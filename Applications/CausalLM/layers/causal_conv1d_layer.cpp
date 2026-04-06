@@ -18,166 +18,11 @@
 #include <string>
 #include <vector>
 
+#include <cpu_backend.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
-// Platform-specific SIMD headers
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#elif defined(__AVX2__)
-#include <immintrin.h>
-#endif
-
 namespace causallm {
-
-// ---------------------------------------------------------------------------
-// SIMD kernel: y[f] = w0[f]*x[f] + w1[f]*s1[f] + w2[f]*s0[f]  for W floats.
-// Called once per decode step – this is the hot path.
-// ---------------------------------------------------------------------------
-static void conv_fma_decode(const float * __restrict__ w0,
-                            const float * __restrict__ w1,
-                            const float * __restrict__ w2,
-                            const float * __restrict__ x,
-                            const float * __restrict__ s1,
-                            const float * __restrict__ s0,
-                            float       * __restrict__ y,
-                            unsigned int W) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-  unsigned int f = 0;
-  for (; f + 4 <= W; f += 4) {
-    float32x4_t vw0 = vld1q_f32(w0 + f);
-    float32x4_t vw1 = vld1q_f32(w1 + f);
-    float32x4_t vw2 = vld1q_f32(w2 + f);
-    float32x4_t vx  = vld1q_f32(x  + f);
-    float32x4_t vs1 = vld1q_f32(s1 + f);
-    float32x4_t vs0 = vld1q_f32(s0 + f);
-
-    float32x4_t vy = vmulq_f32(vw0, vx);
-    vy = vfmaq_f32(vy, vw1, vs1);
-    vy = vfmaq_f32(vy, vw2, vs0);
-    vst1q_f32(y + f, vy);
-  }
-  for (; f < W; ++f)
-    y[f] = w0[f] * x[f] + w1[f] * s1[f] + w2[f] * s0[f];
-
-#elif defined(__AVX2__)
-  unsigned int f = 0;
-  for (; f + 8 <= W; f += 8) {
-    __m256 vw0 = _mm256_loadu_ps(w0 + f);
-    __m256 vw1 = _mm256_loadu_ps(w1 + f);
-    __m256 vw2 = _mm256_loadu_ps(w2 + f);
-    __m256 vx  = _mm256_loadu_ps(x  + f);
-    __m256 vs1 = _mm256_loadu_ps(s1 + f);
-    __m256 vs0 = _mm256_loadu_ps(s0 + f);
-
-    __m256 vy  = _mm256_mul_ps(vw0, vx);
-    vy = _mm256_fmadd_ps(vw1, vs1, vy);
-    vy = _mm256_fmadd_ps(vw2, vs0, vy);
-    _mm256_storeu_ps(y + f, vy);
-  }
-  for (; f < W; ++f)
-    y[f] = w0[f] * x[f] + w1[f] * s1[f] + w2[f] * s0[f];
-
-#else
-  for (unsigned int f = 0; f < W; ++f)
-    y[f] = w0[f] * x[f] + w1[f] * s1[f] + w2[f] * s0[f];
-#endif
-}
-
-// ---------------------------------------------------------------------------
-// SIMD kernel: prefill causal depthwise conv1d (kernel size 3, no bias).
-// Processes to tokens of width W per batch b.
-// Uses the same packed-weight layout [w0|w1|w2] (each W floats).
-// ---------------------------------------------------------------------------
-static void conv_fma_prefill(const float * __restrict__ w0,
-                             const float * __restrict__ w1,
-                             const float * __restrict__ w2,
-                             const float * __restrict__ x,
-                             float       * __restrict__ y,
-                             unsigned int to,
-                             unsigned int W) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-  unsigned int c = 0;
-  for (; c + 4 <= W; c += 4) {
-    float32x4_t vw0 = vld1q_f32(w0 + c);
-    float32x4_t vw1 = vld1q_f32(w1 + c);
-    float32x4_t vw2 = vld1q_f32(w2 + c);
-
-    float32x4_t prev2 = vdupq_n_f32(0.0f);
-    float32x4_t prev1 = vdupq_n_f32(0.0f);
-
-    for (unsigned int t = 0; t < to; ++t) {
-      float32x4_t cur = vld1q_f32(x + t * W + c);
-
-      float32x4_t vy = vmulq_f32(vw0, cur);
-      vy = vfmaq_f32(vy, vw1, prev1);
-      vy = vfmaq_f32(vy, vw2, prev2);
-      vst1q_f32(y + t * W + c, vy);
-
-      prev2 = prev1;
-      prev1 = cur;
-    }
-  }
-  // scalar tail for remaining features
-  for (; c < W; ++c) {
-    float prev2 = 0.0f, prev1 = 0.0f;
-    for (unsigned int t = 0; t < to; ++t) {
-      float cur = x[t * W + c];
-      y[t * W + c] = w0[c] * cur + w1[c] * prev1 + w2[c] * prev2;
-      prev2 = prev1;
-      prev1 = cur;
-    }
-  }
-
-#elif defined(__AVX2__)
-  unsigned int c = 0;
-  for (; c + 8 <= W; c += 8) {
-    __m256 vw0 = _mm256_loadu_ps(w0 + c);
-    __m256 vw1 = _mm256_loadu_ps(w1 + c);
-    __m256 vw2 = _mm256_loadu_ps(w2 + c);
-
-    __m256 prev2 = _mm256_setzero_ps();
-    __m256 prev1 = _mm256_setzero_ps();
-
-    for (unsigned int t = 0; t < to; ++t) {
-      __m256 cur = _mm256_loadu_ps(x + t * W + c);
-
-      __m256 vy  = _mm256_mul_ps(vw0, cur);
-      vy = _mm256_fmadd_ps(vw1, prev1, vy);
-      vy = _mm256_fmadd_ps(vw2, prev2, vy);
-      _mm256_storeu_ps(y + t * W + c, vy);
-
-      prev2 = prev1;
-      prev1 = cur;
-    }
-  }
-  // scalar tail
-  for (; c < W; ++c) {
-    float prev2 = 0.0f, prev1 = 0.0f;
-    for (unsigned int t = 0; t < to; ++t) {
-      float cur = x[t * W + c];
-      y[t * W + c] = w0[c] * cur + w1[c] * prev1 + w2[c] * prev2;
-      prev2 = prev1;
-      prev1 = cur;
-    }
-  }
-
-#else
-  // Scalar fallback
-  for (unsigned int t = 0; t < to; ++t) {
-    const float *cur = x + t * W;
-    const float *p1  = (t >= 1) ? x + (t - 1) * W : nullptr;
-    const float *p2  = (t >= 2) ? x + (t - 2) * W : nullptr;
-    float *yt = y + t * W;
-    for (unsigned int f = 0; f < W; ++f) {
-      float val = w0[f] * cur[f];
-      if (p1) val += w1[f] * p1[f];
-      if (p2) val += w2[f] * p2[f];
-      yt[f] = val;
-    }
-  }
-#endif
-}
 
 // ===========================================================================
 
@@ -260,13 +105,8 @@ void CausalConv1DLayer::incremental_forwarding(
   const unsigned int H = input.height(); // full sequence length (INIT_SEQ_LEN)
   const unsigned int W = input.width();  // feature dimension
 
-  // Packed weight layout: [w0 | w1 | w2]  (each W floats)
-  const float *w_ptr = w_tensor.getData<float>();
-  const float *w0    = w_ptr;
-  const float *w1    = w_ptr + W;
-  const float *w2    = w_ptr + 2 * W;
-
-  float *state_data = state.getData<float>(); // [B, 1, KERNEL_SIZE-1, W]
+  const float *w_ptr   = w_tensor.getData<float>();
+  float       *state_data = state.getData<float>(); // [B, 1, KERNEL_SIZE-1, W]
 
   if (to - from == 1) {
     // ----------------------------------------------------------------
@@ -277,18 +117,10 @@ void CausalConv1DLayer::incremental_forwarding(
     for (unsigned int b = 0; b < B; ++b) {
       const float *x_cur = input.getData<float>()  + b * H * W;
       float       *y_cur = output.getData<float>()  + b * H * W;
-      const float *s0    = state_data + b * (KERNEL_SIZE - 1) * W;
-      const float *s1    = s0 + W;
+      float       *s     = state_data + b * (KERNEL_SIZE - 1) * W;
 
-      // SIMD FMA: y = w0*x + w1*s1 + w2*s0
-      conv_fma_decode(w0, w1, w2, x_cur, s1, s0, y_cur, W);
-
-      // Update state: shift and insert current token
-      //   s[0] <- s[1]  (x_{t-2} <- x_{t-1})
-      //   s[1] <- x_cur (x_{t-1} <- x_t     )
-      float *s = state_data + b * (KERNEL_SIZE - 1) * W;
-      std::memcpy(s,     s + W,  W * sizeof(float)); // shift
-      std::memcpy(s + W, x_cur,  W * sizeof(float)); // insert
+      // y = w0*x + w1*s1 + w2*s0; state updated in-place by kernel
+      causal_depthwise_conv1d_k3_decode(x_cur, w_ptr, s, y_cur, W);
     }
 
   } else {
@@ -299,8 +131,7 @@ void CausalConv1DLayer::incremental_forwarding(
       const float *x = input.getData<float>()  + b * H * W;
       float       *y = output.getData<float>()  + b * H * W;
 
-      // SIMD prefill kernel (column-major SIMD, row-major fallback)
-      conv_fma_prefill(w0, w1, w2, x, y, to, W);
+      causal_depthwise_conv1d_k3(x, w_ptr, nullptr, y, 1, to, W);
 
       // Save last KERNEL_SIZE-1 tokens to state for decode steps
       float *s = state_data + b * (KERNEL_SIZE - 1) * W;

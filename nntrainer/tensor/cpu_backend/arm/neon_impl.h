@@ -837,6 +837,9 @@ void softmax_row(T *qk_out, size_t start_row, size_t end_row, size_t num_heads,
 void causal_depthwise_conv1d_k3(const float * input, const float * packed_weight, const float * bias,
                                 float * output, unsigned int B, unsigned int H, unsigned int W);
 
+void causal_depthwise_conv1d_k3_decode(const float *x_cur,
+                                       const float *packed_weight, float *state,
+                                       float *y_cur, unsigned int W);
 
 #ifdef ENABLE_FP16
 /**
