@@ -69,22 +69,55 @@ void applyBadWordsPenalty(float *logits, unsigned int *bad_words_ids,
 
 /**
  * @brief Apply temperature & top-k & top-p to logits
- * @return Max logit for softmax
+ * @details Applies temperature scaling, then top-k filtering, then top-p
+ *          (nucleus) filtering. Non-selected logits are set to -INFINITY so
+ *          the subsequent softmax+sampling is restricted to the chosen tokens.
+ * @return Max logit of the surviving tokens (for numerically stable softmax)
  */
 float applyTKP(float *logits, int len, float temperature, unsigned int top_k,
                float top_p) {
 
-  // Apply temperature & Sort logits
-  std::vector<std::pair<int, float>> top_indices_and_logits;
-  for (int i = 0; i < len; ++i) {
-    if (temperature > 1e-5)
-      logits[i] = logits[i] / temperature;
-    top_indices_and_logits.push_back({i, logits[i]});
+  // 1. Apply temperature scaling
+  if (temperature > 1e-5) {
+    for (int i = 0; i < len; ++i)
+      logits[i] /= temperature;
   }
-  std::partial_sort(top_indices_and_logits.begin(),
-                    top_indices_and_logits.begin() + 1,
-                    top_indices_and_logits.end(),
-                    [](auto &a, auto &b) { return a.second > b.second; });
 
-  return top_indices_and_logits[0].second;
+  // 2. Clamp top_k to valid range
+  if (top_k == 0 || top_k > static_cast<unsigned int>(len))
+    top_k = static_cast<unsigned int>(len);
+
+  // 3. Build index-logit pairs and partial-sort to find top-k
+  std::vector<std::pair<int, float>> pairs;
+  pairs.reserve(len);
+  for (int i = 0; i < len; ++i)
+    pairs.push_back({i, logits[i]});
+
+  std::partial_sort(pairs.begin(), pairs.begin() + top_k, pairs.end(),
+                    [](const auto &a, const auto &b) {
+                      return a.second > b.second;
+                    });
+
+  // 4. Apply top-p (nucleus) filtering within the top-k candidates.
+  //    Convert to probabilities (softmax over top-k) then accumulate.
+  float max_logit = pairs[0].second;
+  float sum_exp = 0.0f;
+  for (unsigned int i = 0; i < top_k; ++i)
+    sum_exp += std::exp(pairs[i].second - max_logit);
+
+  float cum_prob = 0.0f;
+  unsigned int nucleus_size = 0;
+  for (unsigned int i = 0; i < top_k; ++i) {
+    cum_prob += std::exp(pairs[i].second - max_logit) / sum_exp;
+    ++nucleus_size;
+    if (cum_prob >= top_p)
+      break;
+  }
+
+  // 5. Mask all logits outside the nucleus to -INFINITY
+  std::fill(logits, logits + len, -std::numeric_limits<float>::infinity());
+  for (unsigned int i = 0; i < nucleus_size; ++i)
+    logits[pairs[i].first] = pairs[i].second;
+
+  return max_logit;
 }

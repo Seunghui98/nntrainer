@@ -17,6 +17,7 @@
 #include <tie_word_embedding.h>
 #include <custom_multiply.h>
 #include <custom_slice.h>
+#include <causal_conv1d_layer.h>
 
 using ml::train::createLayer;
 using ml::train::Tensor;
@@ -136,6 +137,7 @@ void Lfm2Transformer::registerCustomLayers() {
     app_context->registerFactory(nntrainer::createLayer<causallm::TransposeLayer>);
     app_context->registerFactory(nntrainer::createLayer<causallm::CustomMultiplyLayer>);
     app_context->registerFactory(nntrainer::createLayer<causallm::CustomSliceLayer>);
+    app_context->registerFactory(nntrainer::createLayer<causallm::CausalConv1DLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what() << std::endl;
   }
@@ -227,6 +229,7 @@ Lfm2CausalLM::createConvBlock(const int layer_id,
   auto prefix = "layer" + std::to_string(layer_id);
 
   // Pre-conv normalization
+  // Input/output: [B, 1, T, DIM]
   LayerHandle conv_norm(createLayer("rms_norm", {
     withKey("name", prefix + "_conv_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)),
@@ -234,76 +237,57 @@ Lfm2CausalLM::createConvBlock(const int layer_id,
   }));
   Tensor normed = conv_norm(input);
 
-  // Conv operator (tensor-level operations)
-  LayerHandle conv_op_0(createLayer("fully_connected", {
+  // Expand features: [B, 1, T, DIM] → [B, 1, T, 3*CONV_DIM]
+  LayerHandle conv_in_proj(createLayer("fully_connected", {
     withKey("name", prefix + "_conv_in_proj"),
-    withKey("unit", 4608),
+    withKey("unit", 3 * CONV_DIM),
     withKey("disable_bias", "true")
   }));
-  Tensor conv_op_0_out = conv_op_0(normed);
+  Tensor proj_out = conv_in_proj(normed);
 
-  LayerHandle conv_op_1(createLayer("custom_transpose", {
-    withKey("name", prefix + "_conv_transpose"),
-    withKey("perm", "2:0:1")
-  }));
-  Tensor conv_op_1_out = conv_op_1(conv_op_0_out);
-
-  LayerHandle conv_op_2(createLayer("split", {
-    withKey("name", prefix + "_conv_model_layers_0_conv_chunk"),
-    withKey("axis", 1),
+  // Split along width (axis=3): [B,1,T,3*CONV_DIM] → 3 × [B,1,T,CONV_DIM]
+  // No transpose needed - CausalConv1DLayer operates on [B,1,T,W] directly.
+  LayerHandle chunk_layer(createLayer("split", {
+    withKey("name", prefix + "_conv_chunk"),
+    withKey("axis", 3),
     withKey("split_number", 3)
   }));
-  Tensor conv_op_2_out = conv_op_2(conv_op_1_out);
+  Tensor chunks = chunk_layer(proj_out);
 
-  // Indexed outputs from split/chunk
-  Tensor chunk_0 = conv_op_2_out.output(0);
-  Tensor chunk_1 = conv_op_2_out.output(1);
-  Tensor chunk_2 = conv_op_2_out.output(2);
+  Tensor chunk_0 = chunks.output(0); // gate_a  [B,1,T,CONV_DIM]
+  Tensor chunk_1 = chunks.output(1); // gate_b  [B,1,T,CONV_DIM]
+  Tensor chunk_2 = chunks.output(2); // gate_c  [B,1,T,CONV_DIM]
 
-  LayerHandle conv_op_3(createLayer("custom_multiply", {
-    withKey("name", prefix + "_conv_model_layers_0_conv_mul")
+  // Gating before conv: gate_a ⊙ gate_c
+  LayerHandle gate_mul(createLayer("custom_multiply", {
+    withKey("name", prefix + "_conv_mul_pre")
   }));
-  Tensor conv_op_3_out = conv_op_3({chunk_0, chunk_2});
+  Tensor gated = gate_mul({chunk_0, chunk_2});
 
-  LayerHandle conv_op_4(createLayer("depthwiseconv1d", {
-    withKey("name", prefix + "_conv_conv"),
-    withKey("filters", 1536),
-    withKey("kernel_size", 3),
-    withKey("stride", 1),
-    withKey("padding", 2),
-    withKey("dilation", 1),
-    withKey("disable_bias", "true")
+  // Causal depthwise conv1d with state cache.
+  // Input/output: [B, 1, T, CONV_DIM]
+  // Weight: [1, 1, 3, CONV_DIM] FP32  (kernel-first layout)
+  LayerHandle causal_conv(createLayer("causal_conv1d", {
+    withKey("name", prefix + "_conv_conv")
   }));
-  Tensor conv_op_4_out = conv_op_4(conv_op_3_out);
+  Tensor conv_out = causal_conv(gated);
 
-  LayerHandle conv_op_5(createLayer("custom_slice", {
-    withKey("name", prefix + "_conv_model_layers_0_conv___getitem___1"),
-    withKey("axis", 3),
-    withKey("start_index", 1),
-    withKey("end_index", INIT_SEQ_LEN + 1)
+  // Gating after conv: gate_b ⊙ conv_out
+  LayerHandle out_mul(createLayer("custom_multiply", {
+    withKey("name", prefix + "_conv_mul_post")
   }));
-  Tensor conv_op_5_out = conv_op_5(conv_op_4_out);
+  Tensor gated_out = out_mul({chunk_1, conv_out});
 
-  LayerHandle conv_op_6(createLayer("custom_multiply", {
-    withKey("name", prefix + "_conv_model_layers_0_conv_mul_1")
-  }));
-  Tensor conv_op_6_out = conv_op_6({chunk_1, conv_op_5_out});
-
-  LayerHandle conv_op_7(createLayer("custom_transpose", {
-    withKey("name", prefix + "_conv_transpose_1"),
-    withKey("perm", "1:2:0")
-  }));
-  Tensor conv_op_7_out = conv_op_7(conv_op_6_out);
-
-  LayerHandle conv_op_8(createLayer("fully_connected", {
+  // Project back: [B,1,T,CONV_DIM] → [B,1,T,DIM]
+  LayerHandle conv_out_proj(createLayer("fully_connected", {
     withKey("name", prefix + "_conv_out_proj"),
-    withKey("unit", 1536),
+    withKey("unit", DIM),
     withKey("disable_bias", "true")
   }));
-  Tensor conv_op_8_out = conv_op_8(conv_op_7_out);
+  Tensor proj_back = conv_out_proj(gated_out);
 
   // Conv residual connection
-  Tensor residual = input.add(conv_op_8_out);
+  Tensor residual = input.add(proj_back);
 
   // Pre-FFN normalization
   LayerHandle ffn_norm(createLayer("rms_norm", {

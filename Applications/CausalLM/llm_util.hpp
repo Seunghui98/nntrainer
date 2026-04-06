@@ -14,8 +14,10 @@
 #ifndef __LLM_UTIL_HPP__
 #define __LLM_UTIL_HPP__ __LLM_UTIL_HPP__
 
-#include <algorithm> // sort
-#include <math.h>    // INFINITY
+#include <algorithm> // sort, partial_sort, fill
+#include <cmath>     // exp, INFINITY
+#include <limits>    // numeric_limits
+#include <math.h>    // INFINITY (legacy)
 #include <optional>
 
 #include <base_properties.h>
