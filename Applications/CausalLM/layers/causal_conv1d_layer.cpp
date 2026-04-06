@@ -21,7 +21,165 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
+// Platform-specific SIMD headers
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace causallm {
+
+// ---------------------------------------------------------------------------
+// SIMD kernel: y[f] = w0[f]*x[f] + w1[f]*s1[f] + w2[f]*s0[f]  for W floats.
+// Called once per decode step – this is the hot path.
+// ---------------------------------------------------------------------------
+static void conv_fma_decode(const float * __restrict__ w0,
+                            const float * __restrict__ w1,
+                            const float * __restrict__ w2,
+                            const float * __restrict__ x,
+                            const float * __restrict__ s1,
+                            const float * __restrict__ s0,
+                            float       * __restrict__ y,
+                            unsigned int W) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  unsigned int f = 0;
+  for (; f + 4 <= W; f += 4) {
+    float32x4_t vw0 = vld1q_f32(w0 + f);
+    float32x4_t vw1 = vld1q_f32(w1 + f);
+    float32x4_t vw2 = vld1q_f32(w2 + f);
+    float32x4_t vx  = vld1q_f32(x  + f);
+    float32x4_t vs1 = vld1q_f32(s1 + f);
+    float32x4_t vs0 = vld1q_f32(s0 + f);
+
+    float32x4_t vy = vmulq_f32(vw0, vx);
+    vy = vfmaq_f32(vy, vw1, vs1);
+    vy = vfmaq_f32(vy, vw2, vs0);
+    vst1q_f32(y + f, vy);
+  }
+  for (; f < W; ++f)
+    y[f] = w0[f] * x[f] + w1[f] * s1[f] + w2[f] * s0[f];
+
+#elif defined(__AVX2__)
+  unsigned int f = 0;
+  for (; f + 8 <= W; f += 8) {
+    __m256 vw0 = _mm256_loadu_ps(w0 + f);
+    __m256 vw1 = _mm256_loadu_ps(w1 + f);
+    __m256 vw2 = _mm256_loadu_ps(w2 + f);
+    __m256 vx  = _mm256_loadu_ps(x  + f);
+    __m256 vs1 = _mm256_loadu_ps(s1 + f);
+    __m256 vs0 = _mm256_loadu_ps(s0 + f);
+
+    __m256 vy  = _mm256_mul_ps(vw0, vx);
+    vy = _mm256_fmadd_ps(vw1, vs1, vy);
+    vy = _mm256_fmadd_ps(vw2, vs0, vy);
+    _mm256_storeu_ps(y + f, vy);
+  }
+  for (; f < W; ++f)
+    y[f] = w0[f] * x[f] + w1[f] * s1[f] + w2[f] * s0[f];
+
+#else
+  for (unsigned int f = 0; f < W; ++f)
+    y[f] = w0[f] * x[f] + w1[f] * s1[f] + w2[f] * s0[f];
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// SIMD kernel: prefill causal depthwise conv1d (kernel size 3, no bias).
+// Processes to tokens of width W per batch b.
+// Uses the same packed-weight layout [w0|w1|w2] (each W floats).
+// ---------------------------------------------------------------------------
+static void conv_fma_prefill(const float * __restrict__ w0,
+                             const float * __restrict__ w1,
+                             const float * __restrict__ w2,
+                             const float * __restrict__ x,
+                             float       * __restrict__ y,
+                             unsigned int to,
+                             unsigned int W) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  unsigned int c = 0;
+  for (; c + 4 <= W; c += 4) {
+    float32x4_t vw0 = vld1q_f32(w0 + c);
+    float32x4_t vw1 = vld1q_f32(w1 + c);
+    float32x4_t vw2 = vld1q_f32(w2 + c);
+
+    float32x4_t prev2 = vdupq_n_f32(0.0f);
+    float32x4_t prev1 = vdupq_n_f32(0.0f);
+
+    for (unsigned int t = 0; t < to; ++t) {
+      float32x4_t cur = vld1q_f32(x + t * W + c);
+
+      float32x4_t vy = vmulq_f32(vw0, cur);
+      vy = vfmaq_f32(vy, vw1, prev1);
+      vy = vfmaq_f32(vy, vw2, prev2);
+      vst1q_f32(y + t * W + c, vy);
+
+      prev2 = prev1;
+      prev1 = cur;
+    }
+  }
+  // scalar tail for remaining features
+  for (; c < W; ++c) {
+    float prev2 = 0.0f, prev1 = 0.0f;
+    for (unsigned int t = 0; t < to; ++t) {
+      float cur = x[t * W + c];
+      y[t * W + c] = w0[c] * cur + w1[c] * prev1 + w2[c] * prev2;
+      prev2 = prev1;
+      prev1 = cur;
+    }
+  }
+
+#elif defined(__AVX2__)
+  unsigned int c = 0;
+  for (; c + 8 <= W; c += 8) {
+    __m256 vw0 = _mm256_loadu_ps(w0 + c);
+    __m256 vw1 = _mm256_loadu_ps(w1 + c);
+    __m256 vw2 = _mm256_loadu_ps(w2 + c);
+
+    __m256 prev2 = _mm256_setzero_ps();
+    __m256 prev1 = _mm256_setzero_ps();
+
+    for (unsigned int t = 0; t < to; ++t) {
+      __m256 cur = _mm256_loadu_ps(x + t * W + c);
+
+      __m256 vy  = _mm256_mul_ps(vw0, cur);
+      vy = _mm256_fmadd_ps(vw1, prev1, vy);
+      vy = _mm256_fmadd_ps(vw2, prev2, vy);
+      _mm256_storeu_ps(y + t * W + c, vy);
+
+      prev2 = prev1;
+      prev1 = cur;
+    }
+  }
+  // scalar tail
+  for (; c < W; ++c) {
+    float prev2 = 0.0f, prev1 = 0.0f;
+    for (unsigned int t = 0; t < to; ++t) {
+      float cur = x[t * W + c];
+      y[t * W + c] = w0[c] * cur + w1[c] * prev1 + w2[c] * prev2;
+      prev2 = prev1;
+      prev1 = cur;
+    }
+  }
+
+#else
+  // Scalar fallback
+  for (unsigned int t = 0; t < to; ++t) {
+    const float *cur = x + t * W;
+    const float *p1  = (t >= 1) ? x + (t - 1) * W : nullptr;
+    const float *p2  = (t >= 2) ? x + (t - 2) * W : nullptr;
+    float *yt = y + t * W;
+    for (unsigned int f = 0; f < W; ++f) {
+      float val = w0[f] * cur[f];
+      if (p1) val += w1[f] * p1[f];
+      if (p2) val += w2[f] * p2[f];
+      yt[f] = val;
+    }
+  }
+#endif
+}
+
+// ===========================================================================
 
 CausalConv1DLayer::CausalConv1DLayer() : LayerImpl() {
   weight_idx.fill(std::numeric_limits<unsigned int>::max());
@@ -93,88 +251,66 @@ void CausalConv1DLayer::incremental_forwarding(
   NNTR_THROW_IF(to == 0 || to <= from, std::invalid_argument)
     << "[CausalConv1DLayer] invalid range: from=" << from << ", to=" << to;
 
-  nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input   = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &output  = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &w_tensor = context.getWeight(weight_idx[weight]);
-  nntrainer::Tensor &state = context.getTensor(tensor_idx[conv_state]);
+  nntrainer::Tensor &state    = context.getTensor(tensor_idx[conv_state]);
 
   const unsigned int B = input.batch();
   const unsigned int H = input.height(); // full sequence length (INIT_SEQ_LEN)
   const unsigned int W = input.width();  // feature dimension
 
-  const float *w_ptr = w_tensor.getData<float>(); // [KERNEL_SIZE, W]
-  const float *w0 = w_ptr;           // kernel for current  token  (k=0)
-  const float *w1 = w_ptr + W;       // kernel for token at t-1    (k=1)
-  const float *w2 = w_ptr + 2 * W;   // kernel for token at t-2    (k=2)
+  // Packed weight layout: [w0 | w1 | w2]  (each W floats)
+  const float *w_ptr = w_tensor.getData<float>();
+  const float *w0    = w_ptr;
+  const float *w1    = w_ptr + W;
+  const float *w2    = w_ptr + 2 * W;
 
   float *state_data = state.getData<float>(); // [B, 1, KERNEL_SIZE-1, W]
 
   if (to - from == 1) {
     // ----------------------------------------------------------------
-    // Single-token decode path: O(W) per step.
-    // During incremental_forwarding, NNTrainer places the current token's
-    // data at offset 0 within each batch slice (not at offset `from`).
-    // Reads/writes must all use position 0, not position `from`.
+    // Decode path (hot): single-token inference.
+    // NNTrainer places the current token at offset 0 within each batch
+    // slice (not at offset `from`).
     // ----------------------------------------------------------------
-
     for (unsigned int b = 0; b < B; ++b) {
-      // Current token is at position 0 within the batch slice.
-      const float *x_cur = input.getData<float>() + b * H * W;  // offset 0
-      float *y_cur = output.getData<float>() + b * H * W;        // offset 0
+      const float *x_cur = input.getData<float>()  + b * H * W;
+      float       *y_cur = output.getData<float>()  + b * H * W;
+      const float *s0    = state_data + b * (KERNEL_SIZE - 1) * W;
+      const float *s1    = s0 + W;
 
-      const float *s0 = state_data + b * (KERNEL_SIZE - 1) * W;      // x_{t-2}
-      const float *s1 = state_data + b * (KERNEL_SIZE - 1) * W + W;  // x_{t-1}
+      // SIMD FMA: y = w0*x + w1*s1 + w2*s0
+      conv_fma_decode(w0, w1, w2, x_cur, s1, s0, y_cur, W);
 
-      for (unsigned int f = 0; f < W; ++f) {
-        y_cur[f] = w0[f] * x_cur[f] + w1[f] * s1[f] + w2[f] * s0[f];
-      }
-    }
-
-    // Update state: shift left and insert x_t (at position 0)
-    for (unsigned int b = 0; b < B; ++b) {
+      // Update state: shift and insert current token
+      //   s[0] <- s[1]  (x_{t-2} <- x_{t-1})
+      //   s[1] <- x_cur (x_{t-1} <- x_t     )
       float *s = state_data + b * (KERNEL_SIZE - 1) * W;
-      const float *x_cur = input.getData<float>() + b * H * W;  // position 0
-      // Shift: s[0] <- s[1]
-      std::memcpy(s, s + W, W * sizeof(float));
-      // Insert current: s[1] <- x_cur
-      std::memcpy(s + W, x_cur, W * sizeof(float));
+      std::memcpy(s,     s + W,  W * sizeof(float)); // shift
+      std::memcpy(s + W, x_cur,  W * sizeof(float)); // insert
     }
 
   } else {
     // ----------------------------------------------------------------
-    // Prefill path: compute all positions [0, to).
+    // Prefill path: process all positions [0, to).
     // ----------------------------------------------------------------
     for (unsigned int b = 0; b < B; ++b) {
-      const float *x = input.getData<float>() + b * H * W;
-      float *y = output.getData<float>() + b * H * W;
+      const float *x = input.getData<float>()  + b * H * W;
+      float       *y = output.getData<float>()  + b * H * W;
 
-      for (unsigned int t = 0; t < to; ++t) {
-        const float *cur = x + t * W;
-        const float *p1 = (t >= 1) ? x + (t - 1) * W : nullptr;
-        const float *p2 = (t >= 2) ? x + (t - 2) * W : nullptr;
+      // SIMD prefill kernel (column-major SIMD, row-major fallback)
+      conv_fma_prefill(w0, w1, w2, x, y, to, W);
 
-        for (unsigned int f = 0; f < W; ++f) {
-          float val = w0[f] * cur[f];
-          if (p1) val += w1[f] * p1[f];
-          if (p2) val += w2[f] * p2[f];
-          y[t * W + f] = val;
-        }
-      }
-    }
-
-    // Save last KERNEL_SIZE-1 positions to state for subsequent decode steps
-    for (unsigned int b = 0; b < B; ++b) {
+      // Save last KERNEL_SIZE-1 tokens to state for decode steps
       float *s = state_data + b * (KERNEL_SIZE - 1) * W;
-      const float *x = input.getData<float>() + b * H * W;
 
-      // state[0] = x_{to-2}  (or zeros if to < 2)
       if (to >= 2)
-        std::memcpy(s, x + (to - 2) * W, W * sizeof(float));
+        std::memcpy(s, x + (to - 2) * W, W * sizeof(float)); // x_{to-2}
       else
         std::memset(s, 0, W * sizeof(float));
 
-      // state[1] = x_{to-1}
-      std::memcpy(s + W, x + (to - 1) * W, W * sizeof(float));
+      std::memcpy(s + W, x + (to - 1) * W, W * sizeof(float));  // x_{to-1}
     }
   }
 }
@@ -202,8 +338,6 @@ void CausalConv1DLayer::exportTo(
 }
 
 void CausalConv1DLayer::setProperty(const std::vector<std::string> &values) {
-  // Delegate to LayerImpl which handles standard properties (name, trainable,
-  // etc.) and throws for any unrecognised keys.
   LayerImpl::setProperty(values);
 }
 
