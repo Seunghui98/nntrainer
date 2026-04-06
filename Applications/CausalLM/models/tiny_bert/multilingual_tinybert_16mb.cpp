@@ -188,6 +188,7 @@ void BertModel::constructModel() {
   LayerHandle emb_norm(createLayer("layer_normalization", {
     withKey("name", "embedding_norm"),
     withKey("epsilon", toStringPrecise(NORM_EPS)),
+    withKey("packed", "false"),
     withKey("axis", 3)
   }));
   x = emb_norm(x);
@@ -218,6 +219,7 @@ BertModel::createTransformerDecoderBlock(const int layer_id,
   LayerHandle att_norm(createLayer("layer_normalization", {
     withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
     withKey("epsilon", toStringPrecise(NORM_EPS)),
+    withKey("packed", "false"),
     withKey("axis", 3)
   }));
   Tensor normed = att_norm(residual);
@@ -230,6 +232,7 @@ BertModel::createTransformerDecoderBlock(const int layer_id,
   LayerHandle ffn_norm(createLayer("layer_normalization", {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
     withKey("epsilon", toStringPrecise(NORM_EPS)),
+    withKey("packed", "false"),
     withKey("axis", 3)
   }));
   Tensor block_out = ffn_norm(ffn_residual);
