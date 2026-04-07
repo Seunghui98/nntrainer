@@ -51,7 +51,7 @@ enum GDNTensors {
 
 void GatedDeltaNetLayer::setProperty(
   const std::vector<std::string> &values) {
-  auto remain_props = loadProperties(values, gdn_props);
+  auto remain_props = nntrainer::loadProperties(values, gdn_props);
   NNTR_THROW_IF(!remain_props.empty(), std::invalid_argument)
     << "[gated_delta_net] Unknown Layer Properties count " +
          std::to_string(values.size());
@@ -59,7 +59,7 @@ void GatedDeltaNetLayer::setProperty(
 
 void GatedDeltaNetLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  auto &num_heads_prop = std::get<props::NumHeads>(gdn_props);
+  auto &num_heads_prop = std::get<nntrainer::props::NumHeads>(gdn_props);
   auto &epsilon_prop = std::get<nntrainer::props::Epsilon>(gdn_props);
   auto &key_head_dim_prop = std::get<props::KeyHeadDim>(gdn_props);
   auto &value_head_dim_prop = std::get<props::ValueHeadDim>(gdn_props);

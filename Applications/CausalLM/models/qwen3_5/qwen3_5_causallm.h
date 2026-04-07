@@ -103,6 +103,9 @@ public:
 
   void registerCustomLayers() override;
 
+  void setupParameters(json &cfg, json &generation_cfg,
+                     json &nntr_cfg) override;
+
 private:
 };
 

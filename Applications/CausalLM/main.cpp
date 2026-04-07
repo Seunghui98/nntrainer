@@ -130,6 +130,43 @@ std::string resolve_architecture(std::string model_type,
   return architecture;
 }
 
+json normalize_model_config_for_text_config(const json &raw_cfg,
+                                        const std::string &architecture) {
+  if (architecture == "Qwen3_5ForConditionalGeneration") {
+    if (!raw_cfg.contains("text_config")) {
+      throw std::invalid_argument(
+        "Qwen3_5ForConditionalGeneration requires 'text_config' in config.json");
+    }
+
+    json normalized_cfg = raw_cfg["text_config"];
+
+    if (raw_cfg.contains("architectures")) {
+      normalized_cfg["architectures"] = raw_cfg["architectures"];
+    }
+    if (raw_cfg.contains("tie_word_embeddings") &&
+        !normalized_cfg.contains("tie_word_embeddings")) {
+      normalized_cfg["tie_word_embeddings"] = raw_cfg["tie_word_embeddings"];
+    }
+
+    if (raw_cfg.contains("image_token_id")) {
+      normalized_cfg["image_token_id"] = raw_cfg["image_token_id"];
+    }
+    if (raw_cfg.contains("video_token_id")) {
+      normalized_cfg["video_token_id"] = raw_cfg["video_token_id"];
+    }
+    if (raw_cfg.contains("vision_start_token_id")) {
+      normalized_cfg["vision_start_token_id"] = raw_cfg["vision_start_token_id"];
+    }
+    if (raw_cfg.contains("vision_end_token_id")) {
+      normalized_cfg["vision_end_token_id"] = raw_cfg["vision_end_token_id"];
+    }
+
+    return normalized_cfg;
+  }
+
+  return raw_cfg;
+}
+
 int main(int argc, char *argv[]) {
 
   auto start_time = std::chrono::high_resolution_clock::now();
@@ -156,7 +193,7 @@ int main(int argc, char *argv[]) {
                                                        nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
-    "Qwen3_5ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+    "Qwen3_5ForConditionalGeneration", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen3_5CausalLM>(cfg, generation_cfg,
                                                           nntr_cfg);
     });
@@ -243,6 +280,10 @@ int main(int argc, char *argv[]) {
     // Initialize and run model
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
+    
+    if (architecture == "Qwen3_5ForConditionalGeneration") {
+      cfg = normalize_model_config_for_text_config(cfg, architecture);
+    }
 
     if (nntr_cfg.contains("model_type")) {
       std::string model_type = nntr_cfg["model_type"].get<std::string>();

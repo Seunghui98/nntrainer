@@ -43,6 +43,7 @@
 #include <node_exporter.h>
 
 #include <causallm_common_properties.h>
+#include <common_properties.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
 
@@ -159,7 +160,7 @@ private:
   unsigned int conv_kernel_size;
   float norm_eps;
 
-  std::tuple<props::NumHeads, nntrainer::props::Epsilon, props::KeyHeadDim,
+  std::tuple<nntrainer::props::NumHeads, nntrainer::props::Epsilon, props::KeyHeadDim,
              props::ValueHeadDim, props::NumKeyHeads, props::ConvKernelSize>
     gdn_props;
 };

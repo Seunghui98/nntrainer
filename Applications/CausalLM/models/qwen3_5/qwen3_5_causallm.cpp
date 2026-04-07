@@ -261,4 +261,9 @@ void Qwen3_5CausalLM::registerCustomLayers() {
   Qwen3_5Transformer::registerCustomLayers();
 }
 
+void Qwen3_5CausalLM::setupParameters(json &cfg, json &generation_cfg,
+                                      json &nntr_cfg) {
+  Qwen3_5Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
+}
+
 } // namespace causallm
