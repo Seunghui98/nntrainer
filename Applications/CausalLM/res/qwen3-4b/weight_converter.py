@@ -8,9 +8,12 @@ import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 total_size = 0
-def save_qwen3_for_nntrainer(params, n_layers, dtype, file):  
-    """Convert and save weights as nntrainer format for multi-head attention model"""  
-      
+def save_qwen3_for_nntrainer(params, config, dtype, file):
+    """Convert and save weights as nntrainer format for multi-head attention model"""
+
+    n_layers = config.num_hidden_layers
+    tie_word_embeddings = getattr(config, 'tie_word_embeddings', False)
+
     def save_weight(weight):
         np.array(weight, dtype=dtype).tofile(file)  
 
@@ -28,10 +31,10 @@ def save_qwen3_for_nntrainer(params, n_layers, dtype, file):
         """Save attention layer weights"""  
         save_weight(params[f"{layer_name}input_layernorm.weight"])  
           
-        # Save Q/K/V/O projections using helper  
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:  
-            save_projection(layer_name, f"self_attn.{proj}")  
-            # Qwen3
+        # Save V/K/Q/O projections to match NNTrainer layer creation order
+        for proj in ["v_proj", "k_proj", "q_proj", "o_proj"]:
+            save_projection(layer_name, f"self_attn.{proj}")
+            # Qwen3: save norm weight after corresponding projection
             proj_norm_name = f"{layer_name}self_attn.{proj[0]}_norm.weight"
             if proj_norm_name in params:
                 print(proj_norm_name)
@@ -54,9 +57,12 @@ def save_qwen3_for_nntrainer(params, n_layers, dtype, file):
         save_attention(layer_prefix)  
         save_feed_forward(layer_prefix)  
 
-    # Save final layers  
-    save_weight(params["model.norm.weight"])  
-    save_weight(params["lm_head.weight"].permute(1, 0))  
+    # Save final layers
+    save_weight(params["model.norm.weight"])
+    if not tie_word_embeddings:
+        save_weight(params["lm_head.weight"].permute(1, 0))
+    else:
+        print("tie_word_embeddings=true: skipping lm_head (shared with embedding)")  
 
 
 if __name__ == "__main__":
@@ -77,4 +83,4 @@ if __name__ == "__main__":
     model.eval()
 
     with open(output_name, "wb") as f_model :
-        save_qwen3_for_nntrainer(model.state_dict(), config.num_hidden_layers, data_dtype, f_model)
+        save_qwen3_for_nntrainer(model.state_dict(), config, data_dtype, f_model)

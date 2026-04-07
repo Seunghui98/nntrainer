@@ -68,10 +68,10 @@ def save_gpt_oss_for_nntrainer(params, config, dtype, file):
     def save_attention(layer_name):  
         """Save attention layer weights"""  
           
-        # Save Q/K/V projections using helper  
-        for proj in ["q_proj", "k_proj", "v_proj"]:  
+        # Save V/K/Q projections to match NNTrainer layer creation order
+        for proj in ["v_proj", "k_proj", "q_proj"]:
             # save projection weight
-            save_projection(layer_name, f"self_attn.{proj}")  
+            save_projection(layer_name, f"self_attn.{proj}")
             # save projection bias
             save_weight(f"{layer_name}self_attn.{proj}.bias")
         

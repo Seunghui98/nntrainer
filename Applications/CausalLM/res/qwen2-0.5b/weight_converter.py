@@ -30,8 +30,8 @@ def save_qwen2_for_nntrainer(params, n_layers, dtype, file):
         """Save attention layer weights"""  
         save_weight(params[f"{layer_name}input_layernorm.weight"])  
           
-        # Save Q/K/V/O projections using helper  
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+        # Save V/K/Q/O projections to match NNTrainer layer creation order
+        for proj in ["v_proj", "k_proj", "q_proj", "o_proj"]:
             save_projection(layer_name, f"self_attn.{proj}")
             if proj != "o_proj":
                 save_weight(params[f"{layer_name}self_attn.{proj}.bias"])
