@@ -99,7 +99,14 @@ if __name__ == "__main__":
     print(f"hidden_size: {text_cfg.hidden_size}")
     print(f"vocab_size: {text_cfg.vocab_size}")
 
+    # Print state dict keys for debugging
+    sd = model.state_dict()
+    print(f"\n=== State dict keys (layer 0) ===")
+    for k in sorted(sd.keys()):
+        if 'layers.0.' in k or 'embed' in k or 'norm' in k or 'lm_head' in k:
+            print(f"  {k}: {sd[k].shape}")
+
     with open(output_name, "wb") as f_model:
-        save_qwen3_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
+        save_qwen3_for_nntrainer(sd, config, data_dtype, f_model)
 
     print(f"Saved to {output_name}")
