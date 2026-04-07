@@ -103,10 +103,19 @@ BertModel::encode(const WSTR prompt,
   std::vector<float *> input = {input_sample, position_ids, token_type_ids};
   std::vector<float *> label;
   unsigned int init_len = input.size();
+  auto start_prefill = std::chrono::high_resolution_clock::now();
   auto output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
                                         SYS_PROMP_LEN,
                                         SYS_PROMP_LEN + input_len, false);
+  
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
 
+  std::cout << "prefill: " << input_len << " tokens, "
+            << prefill_duration.count() << " ms, "
+            << ((double)input_len / prefill_duration.count() * 1000)
+            << " TPS\n";
   free(input_sample);
   free(position_ids);
   free(token_type_ids);
@@ -161,6 +170,7 @@ void BertModel::constructModel() {
   const std::string embedding_type = TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
   LayerHandle word_emb(createLayer(embedding_type, {
     withKey("name", "embedding0"),
+    withKey("weight_dtype", EMBEDDING_DTYPE),
     withKey("in_dim", NUM_VOCAB),
     withKey("out_dim", DIM)
   }));
@@ -169,6 +179,7 @@ void BertModel::constructModel() {
   // Position embedding
   LayerHandle pos_emb(createLayer("embedding_layer", {
     withKey("name", "position_embedding"),
+    withKey("weight_dtype", EMBEDDING_DTYPE),
     withKey("in_dim", MAX_POSITION_EMBEDDINGS),
     withKey("out_dim", DIM)
   }));
@@ -178,6 +189,7 @@ void BertModel::constructModel() {
   // Token type embedding
   LayerHandle tt_emb(createLayer("embedding_layer", {
     withKey("name", "token_type_embedding"),
+    withKey("weight_dtype", EMBEDDING_DTYPE),
     withKey("in_dim", 2),
     withKey("out_dim", DIM)
   }));
