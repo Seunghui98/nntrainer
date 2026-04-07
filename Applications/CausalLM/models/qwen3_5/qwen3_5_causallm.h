@@ -101,6 +101,12 @@ public:
 
   virtual ~Qwen3_5CausalLM() = default;
 
+  void setupParameters(json &cfg, json &generation_cfg,
+                       json &nntr_cfg) override {
+    CausalLM::setupParameters(cfg, generation_cfg, nntr_cfg);
+    Qwen3_5Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
+  }
+
   void registerCustomLayers() override;
 
 private:
