@@ -1,83 +1,165 @@
 ## @file weight_converter.py
-## @brief weight conversion script for qwen3.5 model
-## @note  Qwen3.5 uses the same architecture as Qwen3 (Qwen3ForCausalLM)
-##        but typically uses tie_word_embeddings=true for smaller models.
+## @brief weight conversion script for Qwen3.5 hybrid model (Gated DeltaNet + Transformer)
+## @author Seunghui Lee <shsh1004.lee@samsung.com>
 
 import argparse
 import torch
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
+
 def get_text_config(config):
-    """Extract text model config from potentially nested VLM config (e.g. Qwen3.5)"""
+    """Extract text model config from potentially nested VLM config"""
     if hasattr(config, 'text_config'):
         return config.text_config
     return config
 
-def save_qwen3_for_nntrainer(params, config, dtype, file):
-    """Convert and save weights as nntrainer format for multi-head attention model"""
 
-    # Qwen3.5 is a VLM with nested config: use text_config for the LM part
+def save_qwen3_5_for_nntrainer(params, config, dtype, file):
+    """Convert and save Qwen3.5 hybrid model weights for NNTrainer"""
+
     text_cfg = get_text_config(config)
     n_layers = text_cfg.num_hidden_layers
     tie_word_embeddings = getattr(config, 'tie_word_embeddings', False)
 
+    # Determine layer types
+    layer_types = []
+    if hasattr(text_cfg, 'layer_types') and text_cfg.layer_types:
+        layer_types = text_cfg.layer_types
+    else:
+        # Infer from state dict
+        for i in range(n_layers):
+            has_self_attn = f'model.layers.{i}.self_attn.q_proj.weight' in params
+            layer_types.append('full_attention' if has_self_attn else 'linear_attention')
+
+    print(f"Layer types: {layer_types}")
+
     def save_weight(weight):
         np.array(weight.float(), dtype=dtype).tofile(file)
 
-    def save_projection(layer_name, proj_name):
-        """Helper function to handle base/lora weight saving"""
-        lora_key = f"{layer_name}{proj_name}.lora_A.default.weight"
-        if lora_key in params:
-            save_weight(params[f"{layer_name}{proj_name}.base_layer.weight"].permute(1, 0))
-            save_weight(params[f"{layer_name}{proj_name}.lora_A.default.weight"].permute(1, 0))
-            save_weight(params[f"{layer_name}{proj_name}.lora_B.default.weight"].permute(1, 0))
-        else:
-            save_weight(params[f"{layer_name}{proj_name}.weight"].permute(1, 0))
+    def save_projection(key, transpose=True):
+        """Save a weight tensor, optionally transposed"""
+        w = params[key]
+        if transpose:
+            w = w.permute(1, 0)
+        save_weight(w)
+        print(f"  {key}: {params[key].shape}")
 
-    def save_attention(layer_name):
-        """Save attention layer weights"""
-        save_weight(params[f"{layer_name}input_layernorm.weight"])
+    def save_linear_attn(layer_prefix):
+        """Save Gated DeltaNet (linear attention) layer weights.
 
-        # Save V/K/Q/O projections to match NNTrainer layer creation order
+        Weight order must match GatedDeltaNetLayer::finalize() weight request order:
+          0: in_proj_qkv  (conv_dim, hidden_size) -> transposed to (hidden_size, conv_dim)
+          1: conv1d        (conv_dim, 1, conv_kernel) -> reshaped to (conv_dim, conv_kernel)
+          2: A_log          (num_v_heads)
+          3: dt_bias        (num_v_heads)
+          4: in_proj_a     (num_v_heads, hidden_size) -> transposed
+          5: in_proj_b     (num_v_heads, hidden_size) -> transposed
+          6: in_proj_z     (value_dim, hidden_size) -> transposed
+          7: norm           (head_v_dim)
+          8: out_proj      (hidden_size, value_dim) -> transposed
+        """
+        prefix = f"{layer_prefix}linear_attn."
+
+        # in_proj_qkv: (conv_dim, hidden_size) -> (hidden_size, conv_dim)
+        save_projection(f"{prefix}in_proj_qkv.weight", transpose=True)
+
+        # conv1d: (conv_dim, 1, conv_kernel) -> flatten to (conv_dim, conv_kernel)
+        conv_w = params[f"{prefix}conv1d.weight"]
+        conv_w = conv_w.squeeze(1)  # (conv_dim, conv_kernel)
+        save_weight(conv_w)
+        print(f"  {prefix}conv1d.weight: {params[f'{prefix}conv1d.weight'].shape} -> {conv_w.shape}")
+
+        # A_log: (num_v_heads)
+        save_weight(params[f"{prefix}A_log"])
+        print(f"  {prefix}A_log: {params[f'{prefix}A_log'].shape}")
+
+        # dt_bias: (num_v_heads)
+        save_weight(params[f"{prefix}dt_bias"])
+        print(f"  {prefix}dt_bias: {params[f'{prefix}dt_bias'].shape}")
+
+        # in_proj_a: (num_v_heads, hidden_size) -> (hidden_size, num_v_heads)
+        save_projection(f"{prefix}in_proj_a.weight", transpose=True)
+
+        # in_proj_b: (num_v_heads, hidden_size) -> (hidden_size, num_v_heads)
+        save_projection(f"{prefix}in_proj_b.weight", transpose=True)
+
+        # in_proj_z: (value_dim, hidden_size) -> (hidden_size, value_dim)
+        save_projection(f"{prefix}in_proj_z.weight", transpose=True)
+
+        # norm: (head_v_dim)
+        save_weight(params[f"{prefix}norm.weight"])
+        print(f"  {prefix}norm.weight: {params[f'{prefix}norm.weight'].shape}")
+
+        # out_proj: (hidden_size, value_dim) -> (value_dim, hidden_size)
+        save_projection(f"{prefix}out_proj.weight", transpose=True)
+
+    def save_self_attn(layer_prefix):
+        """Save self-attention layer weights.
+
+        Weight order matches Qwen3_5Transformer::createAttention():
+          V, K, K_norm, Q, Q_norm, O
+        """
+        prefix = f"{layer_prefix}self_attn."
+
+        # V/K/Q/O projections + norms to match NNTrainer layer creation order
         for proj in ["v_proj", "k_proj", "q_proj", "o_proj"]:
-            save_projection(layer_name, f"self_attn.{proj}")
-            # Qwen3: save norm weight after corresponding projection
-            proj_norm_name = f"{layer_name}self_attn.{proj[0]}_norm.weight"
-            if proj_norm_name in params:
-                print(proj_norm_name)
-                save_weight(params[proj_norm_name])
+            save_projection(f"{prefix}{proj}.weight", transpose=True)
+            # Save norm weight after corresponding projection (if exists)
+            norm_key = f"{prefix}{proj[0]}_norm.weight"
+            if norm_key in params:
+                save_weight(params[norm_key])
+                print(f"  {norm_key}: {params[norm_key].shape}")
 
-    def save_feed_forward(layer_name):
-        """Save feed forward layer weights"""
-        save_weight(params[f"{layer_name}post_attention_layernorm.weight"])
-
-        # Save MLP projections using helper
+    def save_feed_forward(layer_prefix):
+        """Save MLP weights: up_proj, gate_proj, down_proj"""
         for proj in ["up_proj", "gate_proj", "down_proj"]:
-            save_projection(layer_name, f"mlp.{proj}")
+            save_projection(f"{layer_prefix}mlp.{proj}.weight", transpose=True)
 
-    # Save embedding layer
+    # === Save weights in NNTrainer layer creation order ===
+
+    # 1. Embedding
     save_weight(params["model.embed_tokens.weight"])
+    print(f"model.embed_tokens.weight: {params['model.embed_tokens.weight'].shape}")
 
-    # Process all layers
+    # 2. Decoder layers
     for layer_idx in range(n_layers):
         layer_prefix = f"model.layers.{layer_idx}."
-        save_attention(layer_prefix)
+        is_self_attn = (layer_types[layer_idx] == 'full_attention')
+
+        print(f"\n--- Layer {layer_idx} ({'self_attn' if is_self_attn else 'linear_attn'}) ---")
+
+        # Input layernorm
+        save_weight(params[f"{layer_prefix}input_layernorm.weight"])
+        print(f"  {layer_prefix}input_layernorm.weight")
+
+        # Attention (linear or self)
+        if is_self_attn:
+            save_self_attn(layer_prefix)
+        else:
+            save_linear_attn(layer_prefix)
+
+        # Post-attention layernorm
+        save_weight(params[f"{layer_prefix}post_attention_layernorm.weight"])
+        print(f"  {layer_prefix}post_attention_layernorm.weight")
+
+        # MLP
         save_feed_forward(layer_prefix)
 
-    # Save final layers
+    # 3. Final norm
     save_weight(params["model.norm.weight"])
+    print(f"\nmodel.norm.weight: {params['model.norm.weight'].shape}")
 
-    # Only save lm_head weights if not using tie_word_embeddings
+    # 4. LM head (only if not tied)
     if not tie_word_embeddings:
-        save_weight(params["lm_head.weight"].permute(1, 0))
+        save_projection("lm_head.weight", transpose=True)
     else:
         print("tie_word_embeddings=true: skipping lm_head (shared with embedding)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-2B")
+    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_name", type=str, default="./nntr_qwen3_5_2b_fp32.bin")
     parser.add_argument("--data_type", type=str, default="float32")
     args = parser.parse_args()
@@ -88,7 +170,8 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="float", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, dtype=torch.float32, trust_remote_code=True)
     model.eval()
 
     text_cfg = get_text_config(config)
@@ -99,28 +182,7 @@ if __name__ == "__main__":
     print(f"hidden_size: {text_cfg.hidden_size}")
     print(f"vocab_size: {text_cfg.vocab_size}")
 
-    # Print state dict keys for debugging
-    sd = model.state_dict()
-    print(f"\n=== Layer 0 (linear_attn) ===")
-    for k in sorted(sd.keys()):
-        if 'layers.0.' in k:
-            print(f"  {k}: {sd[k].shape}")
-    print(f"\n=== Layer 3 (self_attn) ===")
-    for k in sorted(sd.keys()):
-        if 'layers.3.' in k:
-            print(f"  {k}: {sd[k].shape}")
-    print(f"\n=== Global ===")
-    for k in sorted(sd.keys()):
-        if 'embed' in k or k == 'model.norm.weight' or 'lm_head' in k:
-            print(f"  {k}: {sd[k].shape}")
-    print(f"\n=== Attention type per layer ===")
-    for i in range(text_cfg.num_hidden_layers):
-        has_self_attn = any(f'layers.{i}.self_attn.' in k for k in sd.keys())
-        has_linear = any(f'layers.{i}.linear_attn.' in k for k in sd.keys())
-        atype = "self_attn" if has_self_attn else ("linear_attn" if has_linear else "unknown")
-        print(f"  layer {i}: {atype}")
-
     with open(output_name, "wb") as f_model:
-        save_qwen3_for_nntrainer(sd, config, data_dtype, f_model)
+        save_qwen3_5_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
 
-    print(f"Saved to {output_name}")
+    print(f"\nSaved to {output_name}")

@@ -19,5 +19,11 @@
     "batch_size": 1,
 
     "tokenizer_file": "/home/leeseunghui/workspace/nntrainer/Applications/CausalLM/res/qwen3_5-2b/tokenizer.json",
-    "sample_input": "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n"
+    "sample_input": "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n",
+
+    "self_attn_layers": [3, 7, 11, 15, 19, 23],
+    "linear_num_v_heads": 16,
+    "linear_head_k_dim": 128,
+    "linear_head_v_dim": 128,
+    "linear_conv_kernel": 4
 }
