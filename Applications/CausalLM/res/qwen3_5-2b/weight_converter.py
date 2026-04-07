@@ -8,13 +8,18 @@ import torch
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
+def get_text_config(config):
+    """Extract text model config from potentially nested VLM config (e.g. Qwen3.5)"""
+    if hasattr(config, 'text_config'):
+        return config.text_config
+    return config
+
 def save_qwen3_for_nntrainer(params, config, dtype, file):
     """Convert and save weights as nntrainer format for multi-head attention model"""
 
-    # Qwen3.5 config may use 'num_layers' instead of 'num_hidden_layers'
-    n_layers = getattr(config, 'num_hidden_layers', None) or getattr(config, 'num_layers', None)
-    if n_layers is None:
-        raise ValueError(f"Cannot find num_hidden_layers in config. Available: {list(config.to_dict().keys())}")
+    # Qwen3.5 is a VLM with nested config: use text_config for the LM part
+    text_cfg = get_text_config(config)
+    n_layers = text_cfg.num_hidden_layers
     tie_word_embeddings = getattr(config, 'tie_word_embeddings', False)
 
     def save_weight(weight):
@@ -86,11 +91,13 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="float", trust_remote_code=True)
     model.eval()
 
+    text_cfg = get_text_config(config)
     print(f"Model: {model_path}")
-    print(f"Config keys: {list(config.to_dict().keys())}")
+    print(f"model_type: {getattr(config, 'model_type', 'N/A')}")
     print(f"tie_word_embeddings: {getattr(config, 'tie_word_embeddings', 'N/A')}")
-    n_layers = getattr(config, 'num_hidden_layers', None) or getattr(config, 'num_layers', None)
-    print(f"num_layers: {n_layers}")
+    print(f"num_hidden_layers: {text_cfg.num_hidden_layers}")
+    print(f"hidden_size: {text_cfg.hidden_size}")
+    print(f"vocab_size: {text_cfg.vocab_size}")
 
     with open(output_name, "wb") as f_model:
         save_qwen3_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
