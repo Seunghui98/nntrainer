@@ -23,7 +23,7 @@ def save_qwen3_for_nntrainer(params, config, dtype, file):
     tie_word_embeddings = getattr(config, 'tie_word_embeddings', False)
 
     def save_weight(weight):
-        np.array(weight, dtype=dtype).tofile(file)
+        np.array(weight.float(), dtype=dtype).tofile(file)
 
     def save_projection(layer_name, proj_name):
         """Helper function to handle base/lora weight saving"""
