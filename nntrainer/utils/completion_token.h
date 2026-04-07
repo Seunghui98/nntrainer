@@ -47,8 +47,8 @@ public:
     if (!state_)
       return;
     std::unique_lock<std::mutex> lock(state_->mutex);
-    state_->cv.wait(lock,
-                    [this] { return state_->done.load(std::memory_order_acquire); });
+    state_->cv.wait(
+      lock, [this] { return state_->done.load(std::memory_order_acquire); });
     if (state_->exception)
       std::rethrow_exception(state_->exception);
   }
@@ -73,9 +73,9 @@ public:
     if (!state_)
       return true;
     std::unique_lock<std::mutex> lock(state_->mutex);
-    return state_->cv.wait_for(
-      lock, timeout,
-      [this] { return state_->done.load(std::memory_order_acquire); });
+    return state_->cv.wait_for(lock, timeout, [this] {
+      return state_->done.load(std::memory_order_acquire);
+    });
   }
 
   /**
@@ -87,6 +87,9 @@ public:
 private:
   friend class ThreadManager;
 
+  /**
+   * @brief Stores a shared state
+   */
   struct SharedState {
     std::mutex mutex;
     std::condition_variable cv;

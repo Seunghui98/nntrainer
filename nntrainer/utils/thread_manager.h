@@ -15,10 +15,11 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -30,7 +31,8 @@ namespace nntrainer {
 struct ThreadManagerConfig {
   /**
    * @brief Number of compute worker threads.
-   * Default uses NNTR_NUM_THREADS if set > 0, otherwise OMP_NUM_THREADS - 1.
+   * Default uses NNTR_NUM_THREADS if set > 0, otherwise
+   * std::thread::hardware_concurrency() / 2
    */
   unsigned int compute_threads = defaultComputeThreads();
   unsigned int io_threads = 1;
@@ -41,17 +43,26 @@ struct ThreadManagerConfig {
    * barrier for minimal latency. When false (default), uses condvar-based
    * barrier which is safe without dedicated cores.
    */
-  bool enable_affinity = false;
+  bool enable_affinity = true;
 
 private:
   static unsigned int defaultComputeThreads() {
+    // priority
+    // 1. environment variable
+    // 2. compile flag
+    // 3. std::thread::hardware_concurrency()
+
+    auto nntr_num_threads = std::getenv("NNTR_NUM_THREADS");
+    if (nntr_num_threads) {
+      return static_cast<unsigned int>(std::stoul(nntr_num_threads));
+    }
+
 #if defined(NNTR_NUM_THREADS) && NNTR_NUM_THREADS > 0
     return NNTR_NUM_THREADS;
-#elif defined(OMP_NUM_THREADS) && OMP_NUM_THREADS > 1
-    return OMP_NUM_THREADS - 1;
 #else
+    /// @todo use performance core only for x86
     unsigned int hw = std::thread::hardware_concurrency();
-    return hw > 2 ? std::min(hw - 2, 6u) : 1;
+    return hw > 0 ? hw / 2 : 1;
 #endif
   }
 };
@@ -111,7 +122,8 @@ public:
   CompletionToken submit(std::function<void()> task);
 
   unsigned int getComputeThreadCount() const {
-    return static_cast<unsigned int>(compute_workers_.size());
+    // main thread is not in compute_workers
+    return static_cast<unsigned int>(compute_workers_.size()) + 1;
   }
 
   unsigned int getIOThreadCount() const {

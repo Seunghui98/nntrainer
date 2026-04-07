@@ -26,9 +26,9 @@
 #include <algorithm>
 #include <cmath>
 #include <node_exporter.h>
-#include <thread_manager.h>
 #include <qwen_moe_layer.h>
 #include <stdexcept>
+#include <thread_manager.h>
 
 namespace causallm {
 
@@ -188,10 +188,12 @@ void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
   const uint32_t *indices_data = topk_indices.getData<uint32_t>();
   {
     auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, static_cast<size_t>(total_tokens), [&](size_t i) {
-      for (int k = 0; k < static_cast<int>(topk); ++k) {
-        expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-      }
+    size_t total_iters =
+      static_cast<size_t>(total_tokens) * static_cast<size_t>(topk);
+    tm.parallel_for(0, static_cast<size_t>(total_iters), [&](size_t idx) {
+      int k = idx % topk;
+      int i = idx / topk;
+      expert_mask.setValue(indices_data[idx], 0, k, i, 1.0f);
     });
   }
 
@@ -223,18 +225,19 @@ void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
   if (use_parallel) {
     // Parallel processing for larger workloads
     auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        return;
+    tm.parallel_for(
+      0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
+        const auto &assignments = expert_assignments[expert_idx];
+        if (assignments.empty())
+          return;
 
-      // Use optimized expert forward computation without memory copies
-      compute_expert_forward(
-        input, output, assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    });
+        // Use optimized expert forward computation without memory copies
+        compute_expert_forward(
+          input, output, assignments,
+          context.getWeight(expert_gate_proj_indices[expert_idx]),
+          context.getWeight(expert_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+      });
   } else {
     // Sequential processing for smaller workloads
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
@@ -475,17 +478,19 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     {
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
-        const auto &assignments = expert_assignments[expert_idx];
-        if (assignments.empty())
-          return;
+      tm.parallel_for(
+        0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
+          const auto &assignments = expert_assignments[expert_idx];
+          if (assignments.empty())
+            return;
 
-        compute_expert_forward_no_critical(
-          input, expert_outputs[expert_idx], assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-      });
+          compute_expert_forward_no_critical(
+            input, expert_outputs[expert_idx], assignments,
+            context.getWeight(expert_gate_proj_indices[expert_idx]),
+            context.getWeight(expert_up_proj_indices[expert_idx]),
+            context.getWeight(expert_down_proj_indices[expert_idx]),
+            hidden_size);
+        });
     }
 
     // Combine expert outputs

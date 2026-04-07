@@ -445,61 +445,62 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
   {
     const int cols_chunks = (cols_scales + CT - 1) / CT;
     auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, static_cast<size_t>(cols_chunks * groups_pairs), [&](size_t idx) {
-      int c0 = (static_cast<int>(idx) / groups_pairs) * CT;
-      int bp = static_cast<int>(idx) % groups_pairs;
-      const int b0 = 2 * bp;
-      const int b1 = b0 + 1;
-      const int r0 = b0 * 8; // 16 rows: r0..r0+15
-      const int c1 = std::min(c0 + CT, cols_scales);
+    tm.parallel_for(
+      0, static_cast<size_t>(cols_chunks * groups_pairs), [&](size_t idx) {
+        int c0 = (static_cast<int>(idx) / groups_pairs) * CT;
+        int bp = static_cast<int>(idx) % groups_pairs;
+        const int b0 = 2 * bp;
+        const int b1 = b0 + 1;
+        const int r0 = b0 * 8; // 16 rows: r0..r0+15
+        const int c1 = std::min(c0 + CT, cols_scales);
 
-      for (int c = c0; c < c1; ++c) {
-        const block_q4_0x8 &A = x[b0 * cols_scales + c];
-        const block_q4_0x8 &B = x[b1 * cols_scales + c];
+        for (int c = c0; c < c1; ++c) {
+          const block_q4_0x8 &A = x[b0 * cols_scales + c];
+          const block_q4_0x8 &B = x[b1 * cols_scales + c];
 
-        unsigned short *__restrict dT_c = dT + c * N;
-        unsigned short *__restrict qsT_c0 = qsT + (c * 8) * N;
+          unsigned short *__restrict dT_c = dT + c * N;
+          unsigned short *__restrict qsT_c0 = qsT + (c * 8) * N;
 
-        // scales: pack two 8×u16 vectors → one 256b store to dT[c, r0..r0+15]
-        __m128i sd0 = _mm_loadu_si128((const __m128i *)A.d);
-        __m128i sd1 = _mm_loadu_si128((const __m128i *)B.d);
-        __m256i sdp = _mm256_set_m128i(sd1, sd0);
-        store256_u16(dT_c + r0, sdp);
+          // scales: pack two 8×u16 vectors → one 256b store to dT[c, r0..r0+15]
+          __m128i sd0 = _mm_loadu_si128((const __m128i *)A.d);
+          __m128i sd1 = _mm_loadu_si128((const __m128i *)B.d);
+          __m256i sdp = _mm256_set_m128i(sd1, sd0);
+          store256_u16(dT_c + r0, sdp);
 
-        // pre-split stripes
-        const unsigned char *__restrict A0 = A.qs;      // + 8*off
-        const unsigned char *__restrict A1 = A.qs + 64; // + 8*off
-        const unsigned char *__restrict B0 = B.qs;
-        const unsigned char *__restrict B1 = B.qs + 64;
+          // pre-split stripes
+          const unsigned char *__restrict A0 = A.qs;      // + 8*off
+          const unsigned char *__restrict A1 = A.qs + 64; // + 8*off
+          const unsigned char *__restrict B0 = B.qs;
+          const unsigned char *__restrict B1 = B.qs + 64;
 
-        // build 8 rows for A and 8 rows for B
-        __m128i Ra[8], Rb[8];
-        for (int off = 0; off < 8; ++off) {
-          Ra[off] = pack_row8(A0, A1, off);
-          Rb[off] = pack_row8(B0, B1, off);
+          // build 8 rows for A and 8 rows for B
+          __m128i Ra[8], Rb[8];
+          for (int off = 0; off < 8; ++off) {
+            Ra[off] = pack_row8(A0, A1, off);
+            Rb[off] = pack_row8(B0, B1, off);
+          }
+
+          // 8×8 transpose → columns (each 8×u16) for A and B
+          __m128i Ca0, Ca1, Ca2, Ca3, Ca4, Ca5, Ca6, Ca7;
+          __m128i Cb0, Cb1, Cb2, Cb3, Cb4, Cb5, Cb6, Cb7;
+          transpose8x8_epi16(Ra[0], Ra[1], Ra[2], Ra[3], Ra[4], Ra[5], Ra[6],
+                             Ra[7], Ca0, Ca1, Ca2, Ca3, Ca4, Ca5, Ca6, Ca7);
+          transpose8x8_epi16(Rb[0], Rb[1], Rb[2], Rb[3], Rb[4], Rb[5], Rb[6],
+                             Rb[7], Cb0, Cb1, Cb2, Cb3, Cb4, Cb5, Cb6, Cb7);
+
+          // pair and store 32B per column t: rows r0..r0+15 are contiguous
+          unsigned short *__restrict base = qsT_c0 + r0;
+          const int S = N;
+          store256_u16(base + 0 * S, _mm256_set_m128i(Cb0, Ca0));
+          store256_u16(base + 1 * S, _mm256_set_m128i(Cb1, Ca1));
+          store256_u16(base + 2 * S, _mm256_set_m128i(Cb2, Ca2));
+          store256_u16(base + 3 * S, _mm256_set_m128i(Cb3, Ca3));
+          store256_u16(base + 4 * S, _mm256_set_m128i(Cb4, Ca4));
+          store256_u16(base + 5 * S, _mm256_set_m128i(Cb5, Ca5));
+          store256_u16(base + 6 * S, _mm256_set_m128i(Cb6, Ca6));
+          store256_u16(base + 7 * S, _mm256_set_m128i(Cb7, Ca7));
         }
-
-        // 8×8 transpose → columns (each 8×u16) for A and B
-        __m128i Ca0, Ca1, Ca2, Ca3, Ca4, Ca5, Ca6, Ca7;
-        __m128i Cb0, Cb1, Cb2, Cb3, Cb4, Cb5, Cb6, Cb7;
-        transpose8x8_epi16(Ra[0], Ra[1], Ra[2], Ra[3], Ra[4], Ra[5], Ra[6],
-                           Ra[7], Ca0, Ca1, Ca2, Ca3, Ca4, Ca5, Ca6, Ca7);
-        transpose8x8_epi16(Rb[0], Rb[1], Rb[2], Rb[3], Rb[4], Rb[5], Rb[6],
-                           Rb[7], Cb0, Cb1, Cb2, Cb3, Cb4, Cb5, Cb6, Cb7);
-
-        // pair and store 32B per column t: rows r0..r0+15 are contiguous
-        unsigned short *__restrict base = qsT_c0 + r0;
-        const int S = N;
-        store256_u16(base + 0 * S, _mm256_set_m128i(Cb0, Ca0));
-        store256_u16(base + 1 * S, _mm256_set_m128i(Cb1, Ca1));
-        store256_u16(base + 2 * S, _mm256_set_m128i(Cb2, Ca2));
-        store256_u16(base + 3 * S, _mm256_set_m128i(Cb3, Ca3));
-        store256_u16(base + 4 * S, _mm256_set_m128i(Cb4, Ca4));
-        store256_u16(base + 5 * S, _mm256_set_m128i(Cb5, Ca5));
-        store256_u16(base + 6 * S, _mm256_set_m128i(Cb6, Ca6));
-        store256_u16(base + 7 * S, _mm256_set_m128i(Cb7, Ca7));
-      }
-    });
+      });
   }
 
   // -------- tail: if odd number of 8-row groups, process the last one (8 rows)
@@ -2236,7 +2237,8 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
       for (int r = 0; r < max_r; r += NUM_Q4_0_BLOCKS) {
         create_q4_0_weights_x8(&mx16x16_local[16 * r], dst_tmp_local);
 
-        nntr_make_block_q4_0x8(dst_tmp_local, (block_q4_0x8 *)(dst_ + dst_offset),
+        nntr_make_block_q4_0x8(dst_tmp_local,
+                               (block_q4_0x8 *)(dst_ + dst_offset),
                                &osv32_scales[scale_offset + row_id + r]);
         row_out_block_id++;
         dst_offset +=

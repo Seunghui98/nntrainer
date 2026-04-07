@@ -1374,7 +1374,7 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
   unsigned char *dst_data =
     static_cast<unsigned char *>(output.getData<void>());
 
-// Parallel copy using ThreadManager
+  // Parallel copy using ThreadManager
   auto &tm = ThreadManager::Global();
   tm.parallel_for(0, static_cast<size_t>(indices.size()), [&](size_t i) {
     const unsigned batch_idx = indices[i];

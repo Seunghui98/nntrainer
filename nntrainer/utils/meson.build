@@ -23,8 +23,7 @@ util_headers = [
   'nonmovable.h',
   'noncopyable.h',
   'thread_manager.h',
-  'completion_token.h',
-  'barrier.h',
+  'completion_token.h'
 ]
 
 if get_option('enable-trace')

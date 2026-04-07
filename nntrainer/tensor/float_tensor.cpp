@@ -19,6 +19,7 @@
 #include <float_tensor.h>
 #include <int4_tensor.h>
 #include <q4_0_utils.h>
+#include <thread_manager.h>
 
 #include <tensor.h>
 #include <util_func.h>
@@ -661,7 +662,7 @@ void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
     size_t total_elements = size();
     int num_vectors = static_cast<int>(total_elements / dim_size);
 
-auto &tm = ThreadManager::Global();
+    auto &tm = ThreadManager::Global();
     tm.parallel_for(0, static_cast<size_t>(num_vectors), [&](size_t i) {
       float *vec_ptr = data + i * dim_size;
       float norm = snrm2(dim_size, vec_ptr, 1);
@@ -1175,7 +1176,7 @@ void FloatTensor::topK(unsigned int k, void *output_data,
   output_dim.width(k);
   const auto output_strides = output_dim.computeStrides();
 
-auto &tm = ThreadManager::Global();
+  auto &tm = ThreadManager::Global();
   tm.parallel_for(
     0, static_cast<size_t>(batch * channel * height), [&](size_t idx) {
       int b = static_cast<int>(idx / (channel * height));

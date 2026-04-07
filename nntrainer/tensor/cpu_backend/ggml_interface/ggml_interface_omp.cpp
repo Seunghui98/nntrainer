@@ -32,7 +32,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldc) {
   int NB_COLS = 4;
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   if (M == 1) { // GEMV
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
@@ -75,7 +75,6 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
         (float *)A + i * K,
         (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
     }
-
     // Compute 4-divisible-M row portion with multithreaded GEMM
     tm.parallel_for_chunked(thread_num, [=](size_t i) {
       unsigned int src0_start = (i * N) / thread_num;
@@ -158,7 +157,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
   int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
 
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   if (M == 1) {
     int qa_size = sizeof(block_q8_0) * blocks_per_4_rows;
@@ -289,7 +288,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldb, float *C,
                                const unsigned int ldc) {
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   if (M == 1) { // GEMV
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
@@ -385,7 +384,7 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldb, float *C,
                                const unsigned int ldc) {
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   if (M == 1) { // GEMV
     unsigned int blocks_per_row = (K + QK_K - 1) / QK_K;

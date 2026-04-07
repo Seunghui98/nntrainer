@@ -17,12 +17,12 @@
 
 #include <algorithm>
 #include <assert.h>
-#include <thread_manager.h>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <math.h>
 #include <stdint.h>
+#include <thread_manager.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -411,40 +411,40 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
   }
 
   ///@todo Dynamic thread-number selection for GEMM problem size
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int M_step_start = (i * N) / thread_num;
-      unsigned int M_step_end = ((i + 1) * N) / thread_num;
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-      M_step_start = (M_step_start % NB_COLS)
-                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                       : M_step_start;
-      M_step_end = (M_step_end % NB_COLS)
-                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                     : M_step_end;
+    M_step_start = (M_step_start % NB_COLS)
+                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                     : M_step_start;
+    M_step_end = (M_step_end % NB_COLS)
+                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                   : M_step_end;
 
-      nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
-                              ((char *)B + ((M_step_start)*B_step)), QA.data(),
-                              M4 * 4, (M_step_end) - (M_step_start));
-    });
+    nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
+                            ((char *)B + ((M_step_start)*B_step)), QA.data(),
+                            M4 * 4, (M_step_end) - (M_step_start));
+  });
 
   for (unsigned int pb = M4 * 4; pb < M; pb++) {
     tm.parallel_for_chunked(thread_num, [=](size_t i) {
-        unsigned int M_step_start = (i * N) / thread_num;
-        unsigned int M_step_end = ((i + 1) * N) / thread_num;
+      unsigned int M_step_start = (i * N) / thread_num;
+      unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-        M_step_start = (M_step_start % 8)
-                         ? M_step_start + 8 - (M_step_start % 8)
-                         : M_step_start;
-        M_step_end =
-          (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+      // why 8 instead of NB_COLS?
+      M_step_start = (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8)
+                                        : M_step_start;
+      M_step_end =
+        (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-        nntr_gemv_q4_0_4x8_q8_0(
-          K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
-          N, (void *)((char *)B + M_step_start * B_step),
-          QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
-          M_step_end - M_step_start);
-      });
+      nntr_gemv_q4_0_4x8_q8_0(
+        K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
+        N, (void *)((char *)B + M_step_start * B_step),
+        QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+        M_step_end - M_step_start);
+    });
   }
 
   __copy_f16_from_f32(C, C16, M * N);

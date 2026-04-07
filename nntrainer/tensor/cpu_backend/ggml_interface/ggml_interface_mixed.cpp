@@ -13,13 +13,13 @@
  */
 
 #include <algorithm>
-#include <thread_manager.h>
 #include <cmath>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 #include <string>
 #include <thread>
+#include <thread_manager.h>
 #include <vector>
 
 namespace nntrainer {
@@ -39,22 +39,22 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMV(
   int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int M_step_start = (i * N) / thread_num;
-      unsigned int M_step_end = ((i + 1) * N) / thread_num;
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-      M_step_start = (M_step_start % NB_COLS)
-                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                       : M_step_start;
-      M_step_end = (M_step_end % NB_COLS)
-                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                     : M_step_end;
+    M_step_start = (M_step_start % NB_COLS)
+                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                     : M_step_start;
+    M_step_end = (M_step_end % NB_COLS)
+                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                   : M_step_end;
 
-      nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
-                              (void *)((char *)B + M_step_start * B_step),
-                              QA.data(), M, M_step_end - M_step_start);
-    });
+    nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
+                            (void *)((char *)B + M_step_start * B_step),
+                            QA.data(), M, M_step_end - M_step_start);
+  });
 }
 
 static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMM(
@@ -85,8 +85,25 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMM(
   }
 
   ///@todo Dynamic thread-number selection for GEMM problem size
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
+
+    M_step_start = (M_step_start % NB_COLS)
+                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                     : M_step_start;
+    M_step_end = (M_step_end % NB_COLS)
+                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                   : M_step_end;
+
+    nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
+                            ((char *)B + ((M_step_start)*B_step)), QA.data(),
+                            M4 * 4, (M_step_end) - (M_step_start));
+  });
+
+  for (unsigned int pb = M4 * 4; pb < M; pb++) {
+    tm.parallel_for_chunked(thread_num, [=](size_t i) {
       unsigned int M_step_start = (i * N) / thread_num;
       unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
@@ -97,29 +114,12 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMM(
                      ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
                      : M_step_end;
 
-      nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
-                              ((char *)B + ((M_step_start)*B_step)), QA.data(),
-                              M4 * 4, (M_step_end) - (M_step_start));
+      nntr_gemv_q4_0_4x8_q8_0(
+        K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
+        N, (void *)((char *)B + M_step_start * B_step),
+        QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+        M_step_end - M_step_start);
     });
-
-  for (unsigned int pb = M4 * 4; pb < M; pb++) {
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-        unsigned int M_step_start = (i * N) / thread_num;
-        unsigned int M_step_end = ((i + 1) * N) / thread_num;
-
-        M_step_start = (M_step_start % NB_COLS)
-                         ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                         : M_step_start;
-        M_step_end = (M_step_end % NB_COLS)
-                       ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                       : M_step_end;
-
-        nntr_gemv_q4_0_4x8_q8_0(
-          K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
-          N, (void *)((char *)B + M_step_start * B_step),
-          QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
-          M_step_end - M_step_start);
-      });
   }
 }
 
@@ -145,7 +145,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
                                std::vector<float *> Cs,
                                std::vector<unsigned int> ldcs) {
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   int NB_COLS = 4;
   int B_step = sizeof(block_q4_0) * (K / QK4_0);
@@ -178,28 +178,28 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
       }
     } else {
       tm.parallel_for_chunked(thread_num, [=](size_t i) {
-          for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
-            unsigned int N = Ns[num_w];
-            float *C = Cs[num_w];
-            void *B = Bs[num_w];
-            unsigned int M_step_start = (i * N) / thread_num;
-            unsigned int M_step_end = ((i + 1) * N) / thread_num;
+        for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
+          unsigned int N = Ns[num_w];
+          float *C = Cs[num_w];
+          void *B = Bs[num_w];
+          unsigned int M_step_start = (i * N) / thread_num;
+          unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-            M_step_start = (M_step_start % NB_COLS)
-                             ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                             : M_step_start;
-            M_step_end = (M_step_end % NB_COLS)
-                           ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                           : M_step_end;
+          M_step_start = (M_step_start % NB_COLS)
+                           ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                           : M_step_start;
+          M_step_end = (M_step_end % NB_COLS)
+                         ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                         : M_step_end;
 
-            nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
-                                    (void *)((char *)B + M_step_start * B_step),
-                                    QA.data(), M, M_step_end - M_step_start);
-          }
-        });
+          nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
+                                  (void *)((char *)B + M_step_start * B_step),
+                                  QA.data(), M, M_step_end - M_step_start);
+        }
+      });
     }
   } else {
-    unsigned int n_threads = tm.getComputeThreadCount() + 1;
+    unsigned int n_threads = tm.getComputeThreadCount();
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
     const size_t qa_row_size = (sizeof(block_q8_0) * K) / QK8_0;
 
@@ -288,20 +288,20 @@ static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMV(
   int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int M_step_start = (i * N) / thread_num;
-      unsigned int M_step_end = ((i + 1) * N) / thread_num;
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-      M_step_start = (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8)
-                                        : M_step_start;
-      M_step_end =
-        (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+    M_step_start =
+      (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8) : M_step_start;
+    M_step_end =
+      (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-      nntr_gemv_q4_0_8x8_q8_0(K, (float *)(C + M_step_start), N,
-                              (void *)((char *)B + M_step_start * B_step),
-                              QA.data(), M, M_step_end - M_step_start);
-    });
+    nntr_gemv_q4_0_8x8_q8_0(K, (float *)(C + M_step_start), N,
+                            (void *)((char *)B + M_step_start * B_step),
+                            QA.data(), M, M_step_end - M_step_start);
+  });
 }
 
 static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMM(
@@ -331,8 +331,23 @@ static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMM(
   }
 
   ///@todo Dynamic thread-number selection for GEMM problem size
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
+
+    M_step_start =
+      (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8) : M_step_start;
+    M_step_end =
+      (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+
+    nntr_gemm_q4_0_8x8_q8_0(K, (C + (M_step_start)), ldc,
+                            ((char *)B + ((M_step_start)*B_step)), QA.data(),
+                            M4 * 4, (M_step_end) - (M_step_start));
+  });
+
+  for (unsigned int pb = M4 * 4; pb < M; pb++) {
+    tm.parallel_for_chunked(thread_num, [=](size_t i) {
       unsigned int M_step_start = (i * N) / thread_num;
       unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
@@ -341,28 +356,12 @@ static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMM(
       M_step_end =
         (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-      nntr_gemm_q4_0_8x8_q8_0(K, (C + (M_step_start)), ldc,
-                              ((char *)B + ((M_step_start)*B_step)), QA.data(),
-                              M4 * 4, (M_step_end) - (M_step_start));
+      nntr_gemv_q4_0_8x8_q8_0(
+        K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
+        N, (void *)((char *)B + M_step_start * B_step),
+        QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+        M_step_end - M_step_start);
     });
-
-  for (unsigned int pb = M4 * 4; pb < M; pb++) {
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-        unsigned int M_step_start = (i * N) / thread_num;
-        unsigned int M_step_end = ((i + 1) * N) / thread_num;
-
-        M_step_start = (M_step_start % 8)
-                         ? M_step_start + 8 - (M_step_start % 8)
-                         : M_step_start;
-        M_step_end =
-          (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
-
-        nntr_gemv_q4_0_8x8_q8_0(
-          K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
-          N, (void *)((char *)B + M_step_start * B_step),
-          QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
-          M_step_end - M_step_start);
-      });
   }
 }
 
@@ -387,7 +386,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M,
                                std::vector<float *> Cs,
                                std::vector<unsigned int> ldcs) {
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   int B_step = sizeof(block_q4_0) * (K / QK4_0);
   int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
@@ -419,26 +418,26 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M,
     }
 
     tm.parallel_for_chunked(thread_num, [=](size_t i) {
-        for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
-          unsigned int N = Ns[num_w];
-          float *C = Cs[num_w];
-          void *B = Bs[num_w];
-          unsigned int M_step_start = (i * N) / thread_num;
-          unsigned int M_step_end = ((i + 1) * N) / thread_num;
+      for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
+        unsigned int N = Ns[num_w];
+        float *C = Cs[num_w];
+        void *B = Bs[num_w];
+        unsigned int M_step_start = (i * N) / thread_num;
+        unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-          M_step_start = (M_step_start % 8)
-                           ? M_step_start + 8 - (M_step_start % 8)
-                           : M_step_start;
-          M_step_end =
-            (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+        M_step_start = (M_step_start % 8)
+                         ? M_step_start + 8 - (M_step_start % 8)
+                         : M_step_start;
+        M_step_end =
+          (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-          nntr_gemv_q4_0_8x8_q8_0(K, (float *)(C + M_step_start), N,
-                                  (void *)((char *)B + M_step_start * B_step),
-                                  QA.data(), M, M_step_end - M_step_start);
-        }
-      });
+        nntr_gemv_q4_0_8x8_q8_0(K, (float *)(C + M_step_start), N,
+                                (void *)((char *)B + M_step_start * B_step),
+                                QA.data(), M, M_step_end - M_step_start);
+      }
+    });
   } else {
-    unsigned int n_threads = tm.getComputeThreadCount() + 1;
+    unsigned int n_threads = tm.getComputeThreadCount();
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
     const size_t qa_row_size = (sizeof(block_q8_0) * K) / QK8_0;
 
@@ -521,20 +520,20 @@ static inline void __ggml_q4_K_8x8_q8_K_GEMM_GEMV(
   nntr_quantize_row_q8_K(A, qa_data, K);
 
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int M_step_start = (i * N) / thread_num;
-      unsigned int M_step_end = ((i + 1) * N) / thread_num;
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-      M_step_start = (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8)
-                                        : M_step_start;
-      M_step_end =
-        (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+    M_step_start =
+      (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8) : M_step_start;
+    M_step_end =
+      (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-      nntr_gemv_q4_K_8x8_q8_K(K, (float *)(C + M_step_start), N,
-                              (void *)((char *)B + M_step_start * B_step),
-                              QA.data(), M, M_step_end - M_step_start);
-    });
+    nntr_gemv_q4_K_8x8_q8_K(K, (float *)(C + M_step_start), N,
+                            (void *)((char *)B + M_step_start * B_step),
+                            QA.data(), M, M_step_end - M_step_start);
+  });
 }
 
 static inline void __ggml_q4_K_8x8_q8_K_GEMM_GEMM(
@@ -564,8 +563,23 @@ static inline void __ggml_q4_K_8x8_q8_K_GEMM_GEMM(
   }
 
   ///@todo Dynamic thread-number selection for GEMM problem size
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
+    unsigned int M_step_start = (i * N) / thread_num;
+    unsigned int M_step_end = ((i + 1) * N) / thread_num;
+
+    M_step_start =
+      (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8) : M_step_start;
+    M_step_end =
+      (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+
+    nntr_gemm_q4_K_8x8_q8_K(K, (C + (M_step_start)), ldc,
+                            ((char *)B + ((M_step_start)*B_step)), QA.data(),
+                            M4 * 4, (M_step_end) - (M_step_start));
+  });
+
+  for (unsigned int pb = M4 * 4; pb < M; pb++) {
+    tm.parallel_for_chunked(thread_num, [=](size_t i) {
       unsigned int M_step_start = (i * N) / thread_num;
       unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
@@ -574,28 +588,12 @@ static inline void __ggml_q4_K_8x8_q8_K_GEMM_GEMM(
       M_step_end =
         (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-      nntr_gemm_q4_K_8x8_q8_K(K, (C + (M_step_start)), ldc,
-                              ((char *)B + ((M_step_start)*B_step)), QA.data(),
-                              M4 * 4, (M_step_end) - (M_step_start));
+      nntr_gemv_q4_K_8x8_q8_K(
+        K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
+        N, (void *)((char *)B + M_step_start * B_step),
+        QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+        M_step_end - M_step_start);
     });
-
-  for (unsigned int pb = M4 * 4; pb < M; pb++) {
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-        unsigned int M_step_start = (i * N) / thread_num;
-        unsigned int M_step_end = ((i + 1) * N) / thread_num;
-
-        M_step_start = (M_step_start % 8)
-                         ? M_step_start + 8 - (M_step_start % 8)
-                         : M_step_start;
-        M_step_end =
-          (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
-
-        nntr_gemv_q4_K_8x8_q8_K(
-          K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
-          N, (void *)((char *)B + M_step_start * B_step),
-          QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
-          M_step_end - M_step_start);
-      });
   }
 }
 
@@ -620,7 +618,7 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M,
                                std::vector<unsigned int> ldcs) {
 
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+  unsigned int thread_num = tm.getComputeThreadCount();
 
   int B_step = sizeof(block_q4_K) * (K / QK_K);
   int blocks_per_4_rows = (K + QK_K - 1) / QK_K;
@@ -651,28 +649,28 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M,
       }
     } else {
       tm.parallel_for_chunked(thread_num, [=](size_t i) {
-          for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
-            unsigned int N = Ns[num_w];
-            float *C = Cs[num_w];
-            void *B = Bs[num_w];
-            unsigned int M_step_start = (i * N) / thread_num;
-            unsigned int M_step_end = ((i + 1) * N) / thread_num;
+        for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
+          unsigned int N = Ns[num_w];
+          float *C = Cs[num_w];
+          void *B = Bs[num_w];
+          unsigned int M_step_start = (i * N) / thread_num;
+          unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-            M_step_start = (M_step_start % 8)
-                             ? M_step_start + 8 - (M_step_start % 8)
-                             : M_step_start;
-            M_step_end =
-              (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+          M_step_start = (M_step_start % 8)
+                           ? M_step_start + 8 - (M_step_start % 8)
+                           : M_step_start;
+          M_step_end =
+            (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
 
-            nntr_gemv_q4_K_8x8_q8_K(K, (float *)(C + M_step_start), N,
-                                    (void *)((char *)B + M_step_start * B_step),
-                                    QA.data(), M, M_step_end - M_step_start);
-          }
-        });
+          nntr_gemv_q4_K_8x8_q8_K(K, (float *)(C + M_step_start), N,
+                                  (void *)((char *)B + M_step_start * B_step),
+                                  QA.data(), M, M_step_end - M_step_start);
+        }
+      });
     }
   } else {
 
-    unsigned int n_threads = tm.getComputeThreadCount() + 1;
+    unsigned int n_threads = tm.getComputeThreadCount();
     unsigned int qa_4_rows_size = sizeof(block_q8_Kx4) * blocks_per_4_rows;
     const size_t qa_row_size = (sizeof(block_q8_K) * K) / QK_K;
 

@@ -23,12 +23,12 @@
 
 #include <qkv_layer.h>
 
-#include <thread_manager.h>
 #include <engine.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 namespace causallm {

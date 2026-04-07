@@ -20,7 +20,6 @@
 
 #include <gtest/gtest.h>
 
-#include <barrier.h>
 #include <completion_token.h>
 #include <thread_manager.h>
 
@@ -33,7 +32,8 @@ TEST(CompletionToken, DefaultIsAlreadyDone) {
   token.wait(); // should not block
 }
 
-// Test CompletionToken through ThreadManager::submit (create/complete are private)
+// Test CompletionToken through ThreadManager::submit (create/complete are
+// private)
 TEST(CompletionToken, WaitBlocksUntilComplete) {
   auto &tm = nntrainer::ThreadManager::Global();
   std::atomic<bool> started{false};
@@ -70,56 +70,10 @@ TEST(CompletionToken, WaitForTimeout) {
 TEST(CompletionToken, FailRethrows) {
   auto &tm = nntrainer::ThreadManager::Global();
 
-  auto token = tm.submit([] {
-    throw std::runtime_error("test error");
-  });
+  auto token = tm.submit([] { throw std::runtime_error("test error"); });
 
   EXPECT_THROW(token.wait(), std::runtime_error);
   EXPECT_TRUE(token.isDone());
-}
-
-// ─── Barrier Tests ──────────────────────────────────────────
-
-TEST(Barrier, AllThreadsArrive) {
-  const int N = 4;
-  nntrainer::Barrier barrier(N);
-  std::atomic<int> count{0};
-
-  std::vector<std::thread> threads;
-  for (int i = 0; i < N; ++i) {
-    threads.emplace_back([&] {
-      count.fetch_add(1, std::memory_order_relaxed);
-      barrier.wait();
-    });
-  }
-
-  for (auto &t : threads)
-    t.join();
-
-  EXPECT_EQ(count.load(), N);
-}
-
-TEST(Barrier, ReusableAcrossRounds) {
-  const int N = 4;
-  const int ROUNDS = 10;
-  nntrainer::Barrier barrier(N);
-  std::atomic<int> round_count{0};
-
-  std::vector<std::thread> threads;
-  for (int i = 0; i < N; ++i) {
-    threads.emplace_back([&] {
-      for (int r = 0; r < ROUNDS; ++r) {
-        barrier.wait();
-        round_count.fetch_add(1, std::memory_order_relaxed);
-        barrier.wait(); // sync before next round
-      }
-    });
-  }
-
-  for (auto &t : threads)
-    t.join();
-
-  EXPECT_EQ(round_count.load(), N * ROUNDS);
 }
 
 // ─── ThreadManager parallel_for Tests ───────────────────────
@@ -240,8 +194,7 @@ TEST(ThreadManager, SubmitMultipleTasks) {
 TEST(ThreadManager, SubmitWithException) {
   auto &tm = nntrainer::ThreadManager::Global();
 
-  auto token =
-    tm.submit([] { throw std::runtime_error("async error"); });
+  auto token = tm.submit([] { throw std::runtime_error("async error"); });
 
   EXPECT_THROW(token.wait(), std::runtime_error);
 }
@@ -327,8 +280,8 @@ TEST(ThreadManager, ParallelForWithOneWorker) {
   std::atomic<size_t> sum{0};
 
   // 1 worker + caller = 2 threads
-  tm.parallel_for(0, N, 1u,
-                  [&](size_t i) { sum.fetch_add(i, std::memory_order_relaxed); });
+  tm.parallel_for(
+    0, N, 1u, [&](size_t i) { sum.fetch_add(i, std::memory_order_relaxed); });
 
   EXPECT_EQ(sum.load(), (N * (N - 1)) / 2);
 }
@@ -342,8 +295,8 @@ TEST(ThreadManager, ParallelForNWorkersRepeated) {
     std::atomic<int> count{0};
     unsigned int workers = (round % 3) + 1; // 1, 2, 3, 1, 2, 3, ...
     tm.parallel_for(0, N, workers, [&](size_t) { count.fetch_add(1); });
-    EXPECT_EQ(count.load(), (int)N) << "Failed at round " << round
-                                     << " with " << workers << " workers";
+    EXPECT_EQ(count.load(), (int)N)
+      << "Failed at round " << round << " with " << workers << " workers";
   }
 }
 

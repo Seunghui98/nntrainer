@@ -25,6 +25,7 @@ static std::mutex rope_init_mtx;
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
+#include <thread_manager.h>
 
 #include <cstdint>
 
@@ -342,7 +343,7 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         cache_value_dim, cache_value_step_dim);
     }
   }
-  
+
   // increase cache size
   cache_index += step_size;
 }
@@ -358,10 +359,12 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
  *            where Context_Len is usually the current timestep 'to'.
  *
  */
-void MHACoreLayer::compute_kcaches(
-  nntrainer::Tensor &in, nntrainer::Tensor &cache, nntrainer::Tensor &out,
-  unsigned int from, size_t sequence_len, unsigned int num_head,
-  unsigned int group_size, unsigned int head_dim) {
+void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
+                                   nntrainer::Tensor &cache,
+                                   nntrainer::Tensor &out, unsigned int from,
+                                   size_t sequence_len, unsigned int num_head,
+                                   unsigned int group_size,
+                                   unsigned int head_dim) {
 
   // Dispatch based on data type (FP32 or FP16)
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
@@ -377,19 +380,19 @@ void MHACoreLayer::compute_kcaches(
       float *out_data = out.getData<float>();
 
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-        nntrainer::compute_kcaches<uint16_t>(
-          in_data, cache_data, out_data, row_to_compute, num_cache_head,
-          head_dim, group_size, tile_size, local_window_size, head_kv,
-          head_kv + 1);
-      });
+      tm.parallel_for(0, static_cast<size_t>(num_cache_head),
+                      [=](size_t head_kv) {
+                        nntrainer::compute_kcaches<uint16_t>(
+                          in_data, cache_data, out_data, row_to_compute,
+                          num_cache_head, head_dim, group_size, tile_size,
+                          local_window_size, head_kv, head_kv + 1);
+                      });
 
     } else {
       // Sequence processing (prefill or chunked)
       // Parallelize over the sequence length
       int seq =
         sequence_len < local_window_size ? sequence_len : local_window_size;
-
       auto &tm = nntrainer::ThreadManager::Global();
       tm.parallel_for(0, static_cast<size_t>(seq), [=](size_t i) {
         float *input_addr = in.getData<float>() + num_head * head_dim * i;
@@ -421,31 +424,34 @@ void MHACoreLayer::compute_kcaches(
       _FP16 *out_data = out.getData<_FP16>();
 
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-        nntrainer::compute_kcaches(
-          in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
-          group_size, tile_size, local_window_size, head_kv, head_kv + 1);
-      });
+      tm.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_kcaches(
+            in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
+            group_size, tile_size, local_window_size, head_kv, head_kv + 1);
+        });
     } else {
       unsigned int seq_start =
         sequence_len < local_window_size ? 0 : sequence_len - local_window_size;
 
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(static_cast<size_t>(seq_start), static_cast<size_t>(sequence_len), [=](size_t i) {
-        _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
-        _FP16 *cache_addr = cache.getData<_FP16>();
-        int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
-        size_t out_start_row =
-          is_causal ? calc_attn_index(from + i) - calc_attn_index(from)
-                    : i * (from + sequence_len);
+      tm.parallel_for(
+        static_cast<size_t>(seq_start), static_cast<size_t>(sequence_len),
+        [=](size_t i) {
+          _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
+          _FP16 *cache_addr = cache.getData<_FP16>();
+          int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
+          size_t out_start_row =
+            is_causal ? calc_attn_index(from + i) - calc_attn_index(from)
+                      : i * (from + sequence_len);
 
-        _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
+          _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
 
-        nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
-                                   row_to_compute, num_head / group_size,
-                                   head_dim, group_size, tile_size,
-                                   local_window_size);
-      });
+          nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
+                                     row_to_compute, num_head / group_size,
+                                     head_dim, group_size, tile_size,
+                                     local_window_size);
+        });
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -473,9 +479,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    *  |<-------------b_cached_key--------------->|
    */
 
-  /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
-   * **/
-
+  // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
     batch * cache_key_dim.getFeatureLen() + cache_index * cache_key_dim.width(),
@@ -572,7 +576,6 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
    * **/
-
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
     batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
@@ -1116,15 +1119,14 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       tm.parallel_for(0, static_cast<size_t>(seq), [=](size_t i) {
         size_t start_idx;
         if (is_causal) {
-          start_idx =
-            calc_attn_index(to - seq + i) - calc_attn_index(to - seq);
+          start_idx = calc_attn_index(to - seq + i) - calc_attn_index(to - seq);
         } else {
           start_idx = i * to; // linear index
         }
         const float *input =
           in.getData<float>() + start_idx * num_cache_head * gqa_size;
-        float *out = output.getData<float>() +
-                     i * (num_cache_head * gqa_size * head_dim);
+        float *out =
+          output.getData<float>() + i * (num_cache_head * gqa_size * head_dim);
 
         int row_num = is_causal ? (to - seq + i) : to - 1;
         nntrainer::compute_fp16vcache_fp32_transposed(
@@ -1142,11 +1144,12 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       float *output_data = output.getData<float>();
 
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-        nntrainer::compute_fp16vcache_fp32_transposed(
-          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
-          head_dim, local_window_size, head_kv, head_kv + 1);
-      });
+      tm.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_fp16vcache_fp32_transposed(
+            row_num, in_data, vcache_data, output_data, num_cache_head,
+            gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
+        });
     }
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -1159,15 +1162,14 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       tm.parallel_for(0, static_cast<size_t>(seq), [=](size_t i) {
         size_t start_idx;
         if (is_causal) {
-          start_idx =
-            calc_attn_index(to - seq + i) - calc_attn_index(to - seq);
+          start_idx = calc_attn_index(to - seq + i) - calc_attn_index(to - seq);
         } else {
           start_idx = i * to;
         }
         const _FP16 *input =
           in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
-        _FP16 *out = output.getData<_FP16>() +
-                     i * (num_cache_head * gqa_size * head_dim);
+        _FP16 *out =
+          output.getData<_FP16>() + i * (num_cache_head * gqa_size * head_dim);
         int row_num = is_causal ? (to - seq + i) : to - 1;
         nntrainer::compute_fp16vcache_transposed(
           row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
@@ -1184,11 +1186,12 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       _FP16 *output_data = output.getData<_FP16>();
 
       auto &tm_fp16 = nntrainer::ThreadManager::Global();
-      tm_fp16.parallel_for(0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-        nntrainer::compute_fp16vcache_transposed(
-          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
-          head_dim, local_window_size, head_kv, head_kv + 1);
-      });
+      tm_fp16.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_fp16vcache_transposed(
+            row_num, in_data, vcache_data, output_data, num_cache_head,
+            gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
+        });
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
