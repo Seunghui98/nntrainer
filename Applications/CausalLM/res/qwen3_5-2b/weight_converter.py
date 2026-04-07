@@ -11,7 +11,10 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 def save_qwen3_for_nntrainer(params, config, dtype, file):
     """Convert and save weights as nntrainer format for multi-head attention model"""
 
-    n_layers = config.num_hidden_layers
+    # Qwen3.5 config may use 'num_layers' instead of 'num_hidden_layers'
+    n_layers = getattr(config, 'num_hidden_layers', None) or getattr(config, 'num_layers', None)
+    if n_layers is None:
+        raise ValueError(f"Cannot find num_hidden_layers in config. Available: {list(config.to_dict().keys())}")
     tie_word_embeddings = getattr(config, 'tie_word_embeddings', False)
 
     def save_weight(weight):
@@ -84,8 +87,10 @@ if __name__ == "__main__":
     model.eval()
 
     print(f"Model: {model_path}")
-    print(f"tie_word_embeddings: {config.tie_word_embeddings}")
-    print(f"num_hidden_layers: {config.num_hidden_layers}")
+    print(f"Config keys: {list(config.to_dict().keys())}")
+    print(f"tie_word_embeddings: {getattr(config, 'tie_word_embeddings', 'N/A')}")
+    n_layers = getattr(config, 'num_hidden_layers', None) or getattr(config, 'num_layers', None)
+    print(f"num_layers: {n_layers}")
 
     with open(output_name, "wb") as f_model:
         save_qwen3_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
