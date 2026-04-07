@@ -101,10 +101,24 @@ if __name__ == "__main__":
 
     # Print state dict keys for debugging
     sd = model.state_dict()
-    print(f"\n=== State dict keys (layer 0) ===")
+    print(f"\n=== Layer 0 (linear_attn) ===")
     for k in sorted(sd.keys()):
-        if 'layers.0.' in k or 'embed' in k or 'norm' in k or 'lm_head' in k:
+        if 'layers.0.' in k:
             print(f"  {k}: {sd[k].shape}")
+    print(f"\n=== Layer 3 (self_attn) ===")
+    for k in sorted(sd.keys()):
+        if 'layers.3.' in k:
+            print(f"  {k}: {sd[k].shape}")
+    print(f"\n=== Global ===")
+    for k in sorted(sd.keys()):
+        if 'embed' in k or k == 'model.norm.weight' or 'lm_head' in k:
+            print(f"  {k}: {sd[k].shape}")
+    print(f"\n=== Attention type per layer ===")
+    for i in range(text_cfg.num_hidden_layers):
+        has_self_attn = any(f'layers.{i}.self_attn.' in k for k in sd.keys())
+        has_linear = any(f'layers.{i}.linear_attn.' in k for k in sd.keys())
+        atype = "self_attn" if has_self_attn else ("linear_attn" if has_linear else "unknown")
+        print(f"  layer {i}: {atype}")
 
     with open(output_name, "wb") as f_model:
         save_qwen3_for_nntrainer(sd, config, data_dtype, f_model)
