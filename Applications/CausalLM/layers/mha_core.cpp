@@ -852,6 +852,9 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
+  // Partial rotary: rope_dim < head_dim, need per-head processing
+  bool partial_rotary = (dim < head_dim) && !convert_only;
+
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (freqs_cos == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
@@ -875,9 +878,22 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
 
           if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                nullptr, cos_->data(),
-                                                sin_->data(), convert_only);
+            if (partial_rotary) {
+              // Process each head individually: apply RoPE only to the first
+              // rope_dim dimensions, leave the rest unchanged (in-place)
+              unsigned int num_heads_in = in.width() / head_dim;
+              for (unsigned int hd = 0; hd < num_heads_in; ++hd) {
+                float *head_ptr = in_ptr + hd * head_dim;
+                nntrainer::compute_rotary_emb_value(
+                  dim, dim, half_, head_ptr, nullptr, cos_->data(),
+                  sin_->data(), false);
+              }
+            } else {
+              nntrainer::compute_rotary_emb_value(in.width(), dim, half_,
+                                                  in_ptr, nullptr,
+                                                  cos_->data(), sin_->data(),
+                                                  convert_only);
+            }
           } else if (out.getDataType() ==
                        ml::train::TensorDim::DataType::UINT16 ||
                      out.getDataType() ==
@@ -887,9 +903,28 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                 c * out.height() * out.width() +
                                 h * out.width();
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), convert_only);
+            if (partial_rotary) {
+              // Process each head: RoPE on first rope_dim dims, convert the
+              // remaining (head_dim - rope_dim) pass-through dims to FP16
+              unsigned int num_heads_in = in.width() / head_dim;
+              for (unsigned int hd = 0; hd < num_heads_in; ++hd) {
+                float *head_in = in_ptr + hd * head_dim;
+                uint16_t *head_out = out_ptr + hd * head_dim;
+                nntrainer::compute_rotary_emb_value(
+                  dim, dim, half_, head_in, head_out, cos_->data(),
+                  sin_->data(), false);
+                // Convert pass-through dims to FP16/UINT16
+                for (unsigned int d = dim; d < head_dim; ++d) {
+                  head_out[d] =
+                    nntrainer::compute_fp32_to_fp16(head_in[d]);
+                }
+              }
+            } else {
+              nntrainer::compute_rotary_emb_value(in.width(), dim, half_,
+                                                  in_ptr, out_ptr,
+                                                  cos_->data(), sin_->data(),
+                                                  convert_only);
+            }
           }
         }
       }
@@ -919,9 +954,24 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                            b * out.channel() * out.height() * out.width() +
                            c * out.height() * out.width() + h * out.width();
 
-          nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                              out_ptr, cos_->data(),
-                                              sin_->data());
+          if (partial_rotary) {
+            unsigned int num_heads_in = in.width() / head_dim;
+            for (unsigned int hd = 0; hd < num_heads_in; ++hd) {
+              _FP16 *head_in = in_ptr + hd * head_dim;
+              _FP16 *head_out = out_ptr + hd * head_dim;
+              nntrainer::compute_rotary_emb_value(
+                dim, dim, half_, head_in, head_out, cos_->data(),
+                sin_->data());
+              // Copy pass-through dims
+              for (unsigned int d = dim; d < head_dim; ++d) {
+                head_out[d] = head_in[d];
+              }
+            }
+          } else {
+            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
+                                                out_ptr, cos_->data(),
+                                                sin_->data());
+          }
         }
       }
     }
