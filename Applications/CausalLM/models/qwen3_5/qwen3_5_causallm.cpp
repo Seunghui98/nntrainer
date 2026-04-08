@@ -271,6 +271,25 @@ void Qwen3_5Transformer::registerCustomLayers() {
   }
 }
 
+void Qwen3_5CausalLM::constructModel() {
+  // Build hybrid model (embedding + hybrid decoder layers + final norm)
+  Qwen3_5Transformer::constructModel();
+
+  // Add lm_head (CausalLM specific)
+  const std::string lmhead_type =
+    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
+  std::vector<std::string> lmhead_prop = {
+    withKey("name", "output_of_causallm"),
+    withKey("unit", NUM_VOCAB),
+    withKey("disable_bias", "true"),
+    withKey("input_layers", "output_norm"),
+    withKey("weight_dtype", LMHEAD_DTYPE),
+  };
+  if (TIE_WORD_EMBEDDINGS)
+    lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
+  model->addLayer(createLayer(lmhead_type, lmhead_prop));
+}
+
 void Qwen3_5CausalLM::registerCustomLayers() {
   CausalLM::registerCustomLayers();
   Qwen3_5Transformer::registerCustomLayers();
