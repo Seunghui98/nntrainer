@@ -3,9 +3,10 @@
 ## @author Seunghui Lee <shsh1004.lee@samsung.com>
 
 import argparse
+import os
 import torch
 import numpy as np
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModel
 
 
 def get_text_config(config):
@@ -34,8 +35,12 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
 
     print(f"Layer types: {layer_types}")
 
+    total_floats = [0]  # mutable counter
+
     def save_weight(weight):
-        np.array(weight.float(), dtype=dtype).tofile(file)
+        arr = weight.detach().float().cpu().numpy().astype(dtype)
+        arr.tofile(file)
+        total_floats[0] += arr.size
 
     def save_projection(key, transpose=True):
         """Save a weight tensor, optionally transposed"""
@@ -180,6 +185,9 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
     else:
         print("tie_word_embeddings=true: skipping lm_head (shared with embedding)")
 
+    print(f"\nTotal floats saved: {total_floats[0]:,}")
+    print(f"Total bytes: {total_floats[0] * 4:,}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -194,8 +202,11 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype=torch.float32, trust_remote_code=True)
+
+    # Use AutoModel (not AutoModelForCausalLM) since Qwen3.5 is a VLM
+    # (Qwen3_5ForConditionalGeneration, not ForCausalLM)
+    model = AutoModel.from_pretrained(
+        model_path, torch_dtype=torch.float32, trust_remote_code=True)
     model.eval()
 
     text_cfg = get_text_config(config)
@@ -206,7 +217,39 @@ if __name__ == "__main__":
     print(f"hidden_size: {text_cfg.hidden_size}")
     print(f"vocab_size: {text_cfg.vocab_size}")
 
-    with open(output_name, "wb") as f_model:
-        save_qwen3_5_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
+    # Print all available state dict keys for verification
+    sd = model.state_dict()
+    text_keys = [k for k in sd.keys() if 'layers.0.' in k or 'embed' in k or k == 'model.norm.weight']
+    print(f"\nSample state dict keys:")
+    for k in sorted(text_keys)[:15]:
+        print(f"  {k}: {sd[k].shape}")
 
+    # Check if keys use a prefix (e.g., "model.text_model." vs "model.")
+    sample_key = "model.embed_tokens.weight"
+    if sample_key not in sd:
+        # Try common VLM prefixes
+        for prefix in ["model.text_model.", "text_model.", "language_model.model."]:
+            alt_key = f"{prefix}embed_tokens.weight"
+            if alt_key in sd:
+                print(f"\nWARNING: state dict uses prefix '{prefix}'. Adjusting keys...")
+                # Rename all keys
+                new_sd = {}
+                for k, v in sd.items():
+                    if k.startswith(prefix):
+                        new_sd["model." + k[len(prefix):]] = v
+                    else:
+                        new_sd[k] = v
+                sd = new_sd
+                break
+        else:
+            print(f"\nERROR: Cannot find '{sample_key}' in state dict!")
+            print(f"Available keys with 'embed': {[k for k in sd.keys() if 'embed' in k]}")
+            exit(1)
+
+    with open(output_name, "wb") as f_model:
+        save_qwen3_5_for_nntrainer(sd, config, data_dtype, f_model)
+
+    file_size = os.path.getsize(output_name)
     print(f"\nSaved to {output_name}")
+    print(f"File size: {file_size:,} bytes ({file_size / 1024**3:.2f} GB)")
+    print(f"Expected floats: {file_size // 4:,}")
