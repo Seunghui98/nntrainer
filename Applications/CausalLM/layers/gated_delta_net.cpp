@@ -272,11 +272,32 @@ void GatedDeltaNetLayer::incremental_forwarding(
         conv_out[i] = silu(conv_out[i]);
       }
 
+      // DEBUG: compare intermediate values with HF reference
+      static int dbg_step = 0;
+      if (dbg_step == 0) {
+        std::cerr << "[GDN step1] qkv_proj[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << mixed_qkv[i] << " ";
+        std::cerr << std::endl;
+        std::cerr << "[GDN step3] after_conv_silu[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << conv_out[i] << " ";
+        std::cerr << std::endl;
+      }
+
       // --- Step 4: Split into Q, K, V ---
       // Q: [0, key_dim), K: [key_dim, 2*key_dim), V: [2*key_dim, conv_dim)
       float *q_data = conv_out.data();
       float *k_data = conv_out.data() + key_dim;
       float *v_data = conv_out.data() + 2 * key_dim;
+
+      if (dbg_step == 0) {
+        std::cerr << "[GDN step4] Q[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << q_data[i] << " ";
+        std::cerr << "\n[GDN step4] K[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << k_data[i] << " ";
+        std::cerr << "\n[GDN step4] V[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << v_data[i] << " ";
+        std::cerr << std::endl;
+      }
 
       // --- Step 5: L2 normalize Q and K per head ---
       for (unsigned int h = 0; h < num_v_heads; ++h) {
@@ -288,6 +309,12 @@ void GatedDeltaNetLayer::incremental_forwarding(
       float q_scale = 1.0f / std::sqrt((float)head_k_dim);
       for (unsigned int i = 0; i < key_dim; ++i) {
         q_data[i] *= q_scale;
+      }
+
+      if (dbg_step == 0) {
+        std::cerr << "[GDN step6] Q_scaled[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << q_data[i] << " ";
+        std::cerr << std::endl;
       }
 
       // --- Step 7: Compute projections a, b, z ---
@@ -383,6 +410,15 @@ void GatedDeltaNetLayer::incremental_forwarding(
             o_h[vi] += S[ki * head_v_dim + vi] * q_val;
           }
         }
+      }
+
+      if (dbg_step == 0) {
+        std::cerr << "[GDN step9] attn_out[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << attn_out[i] << " ";
+        std::cerr << "\n[GDN step9] z_val[0:5]: ";
+        for (int i = 0; i < 5; i++) std::cerr << z_val[i] << " ";
+        std::cerr << std::endl;
+        dbg_step++;
       }
 
       // --- Step 10: Gated RMS Norm ---
