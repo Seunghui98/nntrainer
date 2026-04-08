@@ -33,7 +33,11 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
             has_self_attn = f'model.layers.{i}.self_attn.q_proj.weight' in params
             layer_types.append('full_attention' if has_self_attn else 'linear_attention')
 
+    # Self-attention head_dim (for de-interleaving q_proj query/gate)
+    head_dim_sa = getattr(text_cfg, 'head_dim', 256)
+
     print(f"Layer types: {layer_types}")
+    print(f"Self-attention head_dim: {head_dim_sa}")
 
     total_floats = [0]  # mutable counter
 
@@ -104,66 +108,39 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         # out_proj: (hidden_size, value_dim) -> (value_dim, hidden_size)
         save_projection(f"{prefix}out_proj.weight", transpose=True)
 
-    # def save_self_attn(layer_prefix):
-    #     """Save self-attention layer weights.
-
-    #     Weight order matches Qwen3_5Transformer::createAttention():
-    #       V, K, K_norm, Q_query, Q_gate, Q_norm, mha_core(no wt), attn_gate(no wt), O
-
-    #     Note: q_proj is (num_heads*head_dim*2, hidden_size) because of attn_output_gate.
-    #           First half = query, second half = gate. We split and save separately.
-    #     """
-    #     prefix = f"{layer_prefix}self_attn."
-
-    #     # V projection
-    #     save_projection(f"{prefix}v_proj.weight", transpose=True)
-
-    #     # K projection
-    #     save_projection(f"{prefix}k_proj.weight", transpose=True)
-
-    #     # K norm (RMS norm: add 1.0 for offset format)
-    #     norm_key = f"{prefix}k_norm.weight"
-    #     if norm_key in params:
-    #         save_weight(params[norm_key])
-    #         print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
-
-    #     # Q projection - split into query and gate halves
-    #     q_weight = params[f"{prefix}q_proj.weight"]  # (num_heads*head_dim*2, hidden_size)
-    #     q_half = q_weight.shape[0] // 2
-    #     q_query = q_weight[:q_half, :]   # first half: query
-    #     q_gate = q_weight[q_half:, :]    # second half: gate
-    #     print(f"  {prefix}q_proj.weight: {q_weight.shape} -> split into query{q_query.shape} + gate{q_gate.shape}")
-    #     save_weight(q_query.permute(1, 0))  # Q_query FC weight
-    #     save_weight(q_gate.permute(1, 0))   # Q_gate FC weight
-
-    #     # Q norm
-    #     # Q norm (RMS norm: add 1.0 for offset format)
-    #     norm_key = f"{prefix}q_norm.weight"
-    #     if norm_key in params:
-    #         save_weight(params[norm_key])
-    #         print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
-
-    #     # O projection
-    #     save_projection(f"{prefix}o_proj.weight", transpose=True)
-
     def save_self_attn(layer_prefix):
+        """Save self-attention weights in NNTrainer execution order.
+
+        HF q_proj layout: (num_heads * head_dim * 2, hidden_size)
+        When viewed as (num_heads, head_dim*2, hidden_size), each head has
+        [query(head_dim), gate(head_dim)] interleaved. We must de-interleave
+        into separate query and gate weight matrices.
+        """
         prefix = f"{layer_prefix}self_attn."
 
-        q_weight = params[f"{prefix}q_proj.weight"]
-        q_half = q_weight.shape[0] // 2
-        q_query = q_weight[:q_half, :]
-        q_gate  = q_weight[q_half:, :]
+        q_weight = params[f"{prefix}q_proj.weight"]  # (4096, 2048) for 2B
+        total_out = q_weight.shape[0]
+        num_heads_sa = total_out // (head_dim_sa * 2)  # 4096 / (256*2) = 8
+        # De-interleave: extract query and gate rows per head
+        q_query_rows = []
+        q_gate_rows = []
+        for h in range(num_heads_sa):
+            start = h * head_dim_sa * 2
+            q_query_rows.append(q_weight[start : start + head_dim_sa, :])
+            q_gate_rows.append(q_weight[start + head_dim_sa : start + head_dim_sa * 2, :])
+        q_query = torch.cat(q_query_rows, dim=0)  # (2048, 2048)
+        q_gate = torch.cat(q_gate_rows, dim=0)    # (2048, 2048)
 
-        # nntrainer full-attn block actual consumption order
-        # layer3_wq_gate -> layer3_wq -> layer3_q_norm -> layer3_wk -> layer3_k_norm -> layer3_wv -> layer3_attention_out
+        # NNTrainer execution order for self-attn block:
+        # layer_wq_gate -> layer_wq -> layer_q_norm -> layer_wk -> layer_k_norm -> layer_wv -> layer_attention_out
 
         # 1) q_gate
         save_weight(q_gate.permute(1, 0))
-        print(f"  {prefix}q_proj.weight(gate): {q_gate.shape}")
+        print(f"  {prefix}q_proj.weight(gate, de-interleaved): {q_gate.shape}")
 
         # 2) q_query
         save_weight(q_query.permute(1, 0))
-        print(f"  {prefix}q_proj.weight(query): {q_query.shape}")
+        print(f"  {prefix}q_proj.weight(query, de-interleaved): {q_query.shape}")
 
         # 3) q_norm (NO +1)
         norm_key = f"{prefix}q_norm.weight"
