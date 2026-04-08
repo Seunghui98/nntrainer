@@ -95,9 +95,11 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         # in_proj_z: (value_dim, hidden_size) -> (hidden_size, value_dim)
         save_projection(f"{prefix}in_proj_z.weight", transpose=True)
 
-        # norm: (head_v_dim) - RMSNormGated, add 1.0 for offset format
-        save_weight(params[f"{prefix}norm.weight"], is_rms=True)
-        print(f"  {prefix}norm.weight (+1.0): {params[f'{prefix}norm.weight'].shape}")
+        # norm: (head_v_dim) - Qwen3_5RMSNormGated uses weight directly (NO +1.0)
+        # Unlike Qwen3_5RMSNorm which uses (1+weight), the gated norm is
+        # initialized to torch.ones and uses self.weight directly.
+        save_weight(params[f"{prefix}norm.weight"])
+        print(f"  {prefix}norm.weight (no +1.0): {params[f'{prefix}norm.weight'].shape}")
 
         # out_proj: (hidden_size, value_dim) -> (value_dim, hidden_size)
         save_projection(f"{prefix}out_proj.weight", transpose=True)
