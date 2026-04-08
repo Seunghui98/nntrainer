@@ -35,9 +35,9 @@ with torch.no_grad():
     x = ln_output[0]  # (1, 18, 2048)
     q_full = sa.q_proj(x)  # (1, 18, 4096)
 
-    num_heads = sa.num_heads
-    head_dim = sa.head_dim
-    q_dim = num_heads * head_dim  # 2048
+    num_heads = getattr(sa, 'num_heads', 8)
+    head_dim = getattr(sa, 'head_dim', 256)
+    q_dim = q_full.shape[-1] // 2  # half is query, half is gate
 
     query = q_full[:, :, :q_dim]   # (1, 18, 2048)
     gate = q_full[:, :, q_dim:]    # (1, 18, 2048)
