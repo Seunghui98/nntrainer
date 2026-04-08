@@ -184,7 +184,7 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("feature_size", std::to_string(SELF_ATTN_HEAD_DIM))}));
 
-  // Attention core
+  // Attention core (with partial_rotary_factor=0.25 for Qwen3.5)
   layers.push_back(createLayer(
     "mha_core",
     {withKey("name", A), withKey("num_heads", n_heads),
@@ -194,6 +194,7 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("partial_rotary_factor", 0.25f),
      withKey("input_layers", {Q_norm, K_norm, V})}));
 
   // Attention gate: output = attn_output * sigmoid(gate)
