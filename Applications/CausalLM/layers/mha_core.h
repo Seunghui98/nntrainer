@@ -161,8 +161,6 @@ public:
     "partial_rotary_factor";                  /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
 
 }; // namespace props
 
