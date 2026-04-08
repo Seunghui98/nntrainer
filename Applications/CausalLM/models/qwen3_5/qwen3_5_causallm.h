@@ -83,10 +83,16 @@ class Qwen3_5CausalLM : public CausalLM, public Qwen3_5Transformer {
 public:
   static constexpr const char *architectures = "Qwen3_5ForCausalLM";
 
+  /** Helper to unwrap VLM nested config */
+  static json &getTextConfig(json &cfg) {
+    return cfg.contains("text_config") ? cfg["text_config"] : cfg;
+  }
+
   Qwen3_5CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
-    CausalLM(cfg, generation_cfg, nntr_cfg),
-    Qwen3_5Transformer(cfg, generation_cfg, nntr_cfg) {}
+    Transformer(getTextConfig(cfg), generation_cfg, nntr_cfg,
+                ModelType::CAUSALLM),
+    CausalLM(getTextConfig(cfg), generation_cfg, nntr_cfg),
+    Qwen3_5Transformer(getTextConfig(cfg), generation_cfg, nntr_cfg) {}
 
   virtual ~Qwen3_5CausalLM() = default;
 
