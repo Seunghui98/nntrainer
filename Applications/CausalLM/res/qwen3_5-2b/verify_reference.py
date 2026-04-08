@@ -1,9 +1,7 @@
 """
 Verify NNTrainer's GatedDeltaNet by comparing with HuggingFace reference.
-Run this script, then compare the printed values with NNTrainer's debug output.
 """
 import torch
-import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 model_path = "Qwen/Qwen3.5-2B"
@@ -26,64 +24,61 @@ inputs = tokenizer(prompt, return_tensors="pt")
 input_ids = inputs["input_ids"]
 print(f"Input tokens: {input_ids.shape}, ids: {input_ids[0].tolist()}")
 
-# Hook to capture layer 0 outputs
-layer0_output = {}
+# Hooks to capture intermediate values
+captured = {}
 
-def hook_fn(module, input, output):
-    if isinstance(output, tuple):
-        layer0_output['hidden'] = output[0].detach()
-    else:
-        layer0_output['hidden'] = output.detach()
-
-def hook_input_fn(module, input, output):
-    layer0_output['input'] = input[0].detach()
-
-# Register hook on layer 0
 layer0 = text_model.layers[0]
-hook1 = layer0.register_forward_hook(hook_fn)
-hook2 = layer0.register_forward_hook(hook_input_fn)
+la = layer0.linear_attn
 
-# Also hook the linear_attn module directly
-if hasattr(layer0, 'linear_attn'):
-    linear_attn = layer0.linear_attn
-    la_output = {}
-    def la_hook(module, input, output):
-        if isinstance(output, tuple):
-            la_output['output'] = output[0].detach()
-        else:
-            la_output['output'] = output.detach()
-        la_output['input'] = input[0].detach()
-    hook3 = linear_attn.register_forward_hook(la_hook)
+# Hook on the full linear_attn output
+def la_hook(module, args, kwargs, output):
+    if isinstance(output, tuple):
+        captured['la_out'] = output[0].detach()
+    else:
+        captured['la_out'] = output.detach()
+
+# Hook on decoder layer output (after residual)
+def decoder_hook(module, args, kwargs, output):
+    if isinstance(output, tuple):
+        captured['decoder_out'] = output[0].detach()
+    else:
+        captured['decoder_out'] = output.detach()
+
+h1 = la.register_forward_hook(la_hook, with_kwargs=True)
+h2 = layer0.register_forward_hook(decoder_hook, with_kwargs=True)
 
 with torch.no_grad():
     outputs = model(input_ids)
 
-hook1.remove()
-hook2.remove()
+h1.remove()
+h2.remove()
 
-# Print results
-if 'input' in la_output:
-    la_in = la_output['input']
-    la_out = la_output['output']
-    print(f"\n=== Layer 0 Linear Attention ===")
-    print(f"Input norm (first token): {la_in[0, 0].norm().item():.6f}")
-    print(f"Input norm (last token):  {la_in[0, -1].norm().item():.6f}")
-    print(f"Output norm (first token): {la_out[0, 0].norm().item():.6f}")
-    print(f"Output norm (last token):  {la_out[0, -1].norm().item():.6f}")
-    print(f"Output first 5 values (token 0): {la_out[0, 0, :5].tolist()}")
-    print(f"Output first 5 values (last token): {la_out[0, -1, :5].tolist()}")
+# Print linear_attn output
+if 'la_out' in captured:
+    la_out = captured['la_out']
+    print(f"\n=== Layer 0 linear_attn OUTPUT ===")
+    print(f"Shape: {la_out.shape}")
+    print(f"Token 0 first 10: {la_out[0, 0, :10].tolist()}")
+    print(f"Token 0 norm: {la_out[0, 0].norm().item():.6f}")
+    print(f"Token -1 first 10: {la_out[0, -1, :10].tolist()}")
+    print(f"Token -1 norm: {la_out[0, -1].norm().item():.6f}")
 
-# Print logits
-logits = outputs.logits[0, -1]  # last position
+if 'decoder_out' in captured:
+    dec = captured['decoder_out']
+    print(f"\n=== Layer 0 decoder OUTPUT (after residual) ===")
+    print(f"Token 0 first 10: {dec[0, 0, :10].tolist()}")
+
+# Final logits
+logits = outputs.logits[0, -1]
 top5_vals, top5_idx = logits.topk(5)
 print(f"\n=== Final logits (last position) ===")
-print(f"Max logit: {logits.max().item():.4f}, Min: {logits.min().item():.4f}")
+print(f"Max: {logits.max().item():.4f}, Min: {logits.min().item():.4f}")
 print(f"Top 5 tokens: {top5_idx.tolist()}")
-print(f"Top 5 logits: {top5_vals.tolist()}")
+print(f"Top 5 logits: {[f'{v:.4f}' for v in top5_vals.tolist()]}")
 print(f"Top 5 decoded: {[tokenizer.decode([t]) for t in top5_idx.tolist()]}")
 print(f"Logit[198]: {logits[198].item():.4f}")
 
-# Check what the model would generate
+# Generate
 gen = model.generate(input_ids, max_new_tokens=20, do_sample=False)
-print(f"\n=== Generated text (greedy, 20 tokens) ===")
+print(f"\n=== Generated (greedy, 20 tokens) ===")
 print(tokenizer.decode(gen[0][input_ids.shape[1]:]))
