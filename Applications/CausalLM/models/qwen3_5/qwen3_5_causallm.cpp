@@ -46,7 +46,7 @@ void Qwen3_5Transformer::setupQwen35Parameters(json &cfg, json &nntr_cfg) {
       is_self_attn_layer[i] = true;
     }
   }
-
+  ROPE_THETA = cfg["rope_parameters"]["rope_theta"].get<unsigned int>();
   // Linear attention parameters from config or nntr_config
   // For Qwen3.5-2B: num_v_heads=16, head_k_dim=128, head_v_dim=128
   LINEAR_NUM_V_HEADS = nntr_cfg.contains("linear_num_v_heads")
