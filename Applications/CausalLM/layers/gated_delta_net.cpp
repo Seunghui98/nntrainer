@@ -412,6 +412,26 @@ void GatedDeltaNetLayer::incremental_forwarding(
         }
         y[i] = sum;
       }
+
+      // DEBUG: print output stats for first layer, first few tokens
+      static int debug_count = 0;
+      if (debug_count < 3) {
+        float out_norm = 0.0f, in_norm = 0.0f, attn_norm_v = 0.0f;
+        for (unsigned int i = 0; i < hidden_size; ++i) {
+          out_norm += y[i] * y[i];
+          in_norm += x[i] * x[i];
+        }
+        for (unsigned int i = 0; i < value_dim; ++i)
+          attn_norm_v += attn_out[i] * attn_out[i];
+        std::cerr << "[DEBUG GDN] "
+                  << "in_norm=" << std::sqrt(in_norm)
+                  << " attn_out_norm=" << std::sqrt(attn_norm_v)
+                  << " final_out_norm=" << std::sqrt(out_norm)
+                  << " decay[0]=" << g_exp[0]
+                  << " beta[0]=" << beta[0]
+                  << std::endl;
+        debug_count++;
+      }
     }
   }
 }
