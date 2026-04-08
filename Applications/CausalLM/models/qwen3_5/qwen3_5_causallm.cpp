@@ -173,7 +173,7 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
 
   // Qwen3.5 self-attention with QK-norm + output gate
   // q_proj outputs 2x size: [query, gate]. We split into 2 FC layers.
-  // Weight converter saves: V, K, K_norm, Q_query, Q_gate, Q_norm, O
+  // Layer creation order (= weight load order): V, K, K_norm, Q, Q_gate, Q_norm, O
   std::vector<LayerHandle> layers;
   auto prefix = "layer" + std::to_string(layer_id);
   auto V = prefix + "_wv";
