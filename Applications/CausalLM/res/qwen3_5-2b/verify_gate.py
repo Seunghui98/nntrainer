@@ -1,7 +1,4 @@
-"""
-Verify Q_gate values for layer 3 self-attention.
-Compare NNTrainer's Q_gate output with HuggingFace reference.
-"""
+"""Verify Q_gate values for layer 3 self-attention."""
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -12,70 +9,55 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32, trust_remote_code=True)
 model.eval()
 
-if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-    text_model = model.model
-else:
-    text_model = model.model
-
+text_model = model.model if hasattr(model.model, 'layers') else model.model
 inputs = tokenizer(prompt, return_tensors="pt")
-input_ids = inputs["input_ids"]
 
-# Hook layer 3 self_attn to capture gate values
-layer3 = text_model.layers[3]
-sa = layer3.self_attn
-captured = {}
+# Get layer 3 self_attn module
+sa = text_model.layers[3].self_attn
+ln = text_model.layers[3].input_layernorm
 
-def sa_hook(module, args, kwargs, output):
-    # Capture internal values from the self_attn forward
-    captured['sa_output'] = output[0].detach() if isinstance(output, tuple) else output.detach()
-
-h1 = sa.register_forward_hook(sa_hook, with_kwargs=True)
-
-# Also manually compute q_proj to get gate values
+# Run model to get embeddings through layers 0-2
 with torch.no_grad():
-    outputs = model(input_ids)
+    # Get hidden states after embedding + layers 0-2
+    hidden = text_model.embed_tokens(inputs["input_ids"])
+    # We need to pass through layers 0-2 to get the correct input for layer 3
+    # Instead, just run the full model and hook layer 3
 
-h1.remove()
+    ln_output = [None]
+    def ln_hook(m, inp, out):
+        ln_output[0] = out.detach()
 
-# Manually get gate values for layer 3
-with torch.no_grad():
-    # Get the input to layer 3 self_attn (= input_layernorm output)
-    layer3_input = None
-    def capture_ln(module, args, kwargs, output):
-        nonlocal layer3_input
-        layer3_input = output.detach()
-    h = layer3.input_layernorm.register_forward_hook(capture_ln, with_kwargs=True)
-    outputs2 = model(input_ids)
+    h = ln.register_forward_hook(ln_hook)
+    outputs = model(inputs["input_ids"])
     h.remove()
 
-    # Compute q_proj manually
-    q_proj_out = sa.q_proj(layer3_input)  # (1, 18, 4096)
+    # Now compute q_proj manually on the captured layernorm output
+    x = ln_output[0]  # (1, 18, 2048)
+    q_full = sa.q_proj(x)  # (1, 18, 4096)
+
     num_heads = sa.num_heads
     head_dim = sa.head_dim
-    q_dim = num_heads * head_dim
+    q_dim = num_heads * head_dim  # 2048
 
-    query = q_proj_out[:, :, :q_dim]      # (1, 18, 2048) - query part
-    gate = q_proj_out[:, :, q_dim:]        # (1, 18, 2048) - gate part
+    query = q_full[:, :, :q_dim]   # (1, 18, 2048)
+    gate = q_full[:, :, q_dim:]    # (1, 18, 2048)
 
-    print(f"=== Layer 3 Q_proj analysis ===")
-    print(f"q_proj output shape: {q_proj_out.shape}")
-    print(f"num_heads={num_heads}, head_dim={head_dim}, q_dim={q_dim}")
-    print(f"query shape: {query.shape}, gate shape: {gate.shape}")
-    print(f"\nQuery (pos 0, first 10): {query[0, 0, :10].tolist()}")
-    print(f"Gate  (pos 0, first 10): {gate[0, 0, :10].tolist()}")
-    print(f"sigmoid(Gate) (pos 0, first 10): {torch.sigmoid(gate[0, 0, :10]).tolist()}")
+print(f"=== Layer 3 Q_proj ===")
+print(f"num_heads={num_heads}, head_dim={head_dim}, q_dim={q_dim}")
+print(f"Query (pos 0)[0:10]: {query[0, 0, :10].tolist()}")
+print(f"Gate  (pos 0)[0:10]: {gate[0, 0, :10].tolist()}")
+print(f"sigmoid(Gate)[0:10]: {torch.sigmoid(gate[0, 0, :10]).tolist()}")
 
-    # Also print q_proj weight structure
-    print(f"\nq_proj weight shape: {sa.q_proj.weight.shape}")
-    print(f"q_proj weight[0, :5]: {sa.q_proj.weight[0, :5].tolist()}")
-    print(f"q_proj weight[{q_dim}, :5]: {sa.q_proj.weight[q_dim, :5].tolist()}")
+# Compare with V to compute expected o_proj input
+v = sa.v_proj(x)  # (1, 18, 512)
+print(f"\nV (pos 0)[0:10]: {v[0, 0, :10].tolist()}")
 
-    # Print o_proj input (= gated attention output)
-    v_proj_out = sa.v_proj(layer3_input)
-    print(f"\nV_proj output (pos 0, first 10): {v_proj_out[0, 0, :10].tolist()}")
+# For pos 0, attn output = V[0] (causal, self-attend only)
+# Gated output = V * sigmoid(gate) (reshaped per head)
+# Element 0 = V[head0, dim0] * sigmoid(gate[head0, dim0])
+print(f"\nExpected gated[0] = V[0]*sigmoid(gate[0]) = {v[0,0,0].item():.6f} * {torch.sigmoid(gate[0,0,0]).item():.6f} = {(v[0,0,0] * torch.sigmoid(gate[0,0,0])).item():.6f}")
 
-# Print final logits
-logits = outputs.logits[0, -1]
-top5_vals, top5_idx = logits.topk(5)
-print(f"\n=== Final logits ===")
-print(f"Top 5: {[(tokenizer.decode([t]), f'{v:.2f}') for t, v in zip(top5_idx.tolist(), top5_vals.tolist())]}")
+# q_proj weight info
+print(f"\nq_proj weight shape: {sa.q_proj.weight.shape}")
+print(f"q_proj.weight[0, 0:5]:    {sa.q_proj.weight[0, :5].tolist()}")
+print(f"q_proj.weight[2048, 0:5]: {sa.q_proj.weight[q_dim, :5].tolist()}")
