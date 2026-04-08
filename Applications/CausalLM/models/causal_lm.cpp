@@ -474,25 +474,28 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
-    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
-
-    // DEBUG: print first 5 generated tokens
+    // DEBUG: print raw logits BEFORE generate() modifies them
     if (generation_cnt < 5) {
       float *logits = output_interval[0];
       float max_v = logits[0], min_v = logits[0];
+      unsigned int max_idx = 0;
       bool has_nan = false;
       for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
         if (std::isnan(logits[i])) has_nan = true;
-        if (logits[i] > max_v) max_v = logits[i];
+        if (logits[i] > max_v) { max_v = logits[i]; max_idx = i; }
         if (logits[i] < min_v) min_v = logits[i];
       }
-      std::cerr << "[DEBUG gen " << generation_cnt << "] token=" << ids_list[0]
+      std::cerr << "[DEBUG gen " << generation_cnt << "] BEFORE generate: "
+                << "argmax_token=" << max_idx
                 << " max_logit=" << max_v << " min_logit=" << min_v
                 << " nan=" << has_nan
+                << " logit[198]=" << logits[198]
                 << " do_sample=" << do_sample
-                << " decode='" << tokenizer->Decode({(int)ids_list[0]}) << "'"
+                << " decode='" << tokenizer->Decode({(int)max_idx}) << "'"
                 << std::endl;
     }
+
+    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     if (token_generation_idx < input_len) {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
