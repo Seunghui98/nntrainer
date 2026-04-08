@@ -37,7 +37,10 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
 
     total_floats = [0]  # mutable counter
 
-    def save_weight(weight):
+    def save_weight(weight, is_rms=False):
+        """Save weight tensor. For RMS norm weights, add 1.0 (offset format)."""
+        if is_rms:
+            weight = weight + 1.0
         arr = weight.detach().float().cpu().numpy().astype(dtype)
         arr.tofile(file)
         total_floats[0] += arr.size
@@ -92,9 +95,9 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         # in_proj_z: (value_dim, hidden_size) -> (hidden_size, value_dim)
         save_projection(f"{prefix}in_proj_z.weight", transpose=True)
 
-        # norm: (head_v_dim)
-        save_weight(params[f"{prefix}norm.weight"])
-        print(f"  {prefix}norm.weight: {params[f'{prefix}norm.weight'].shape}")
+        # norm: (head_v_dim) - RMSNormGated, add 1.0 for offset format
+        save_weight(params[f"{prefix}norm.weight"], is_rms=True)
+        print(f"  {prefix}norm.weight (+1.0): {params[f'{prefix}norm.weight'].shape}")
 
         # out_proj: (hidden_size, value_dim) -> (value_dim, hidden_size)
         save_projection(f"{prefix}out_proj.weight", transpose=True)
@@ -116,11 +119,11 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         # K projection
         save_projection(f"{prefix}k_proj.weight", transpose=True)
 
-        # K norm
+        # K norm (RMS norm: add 1.0 for offset format)
         norm_key = f"{prefix}k_norm.weight"
         if norm_key in params:
-            save_weight(params[norm_key])
-            print(f"  {norm_key}: {params[norm_key].shape}")
+            save_weight(params[norm_key], is_rms=True)
+            print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
 
         # Q projection - split into query and gate halves
         q_weight = params[f"{prefix}q_proj.weight"]  # (num_heads*head_dim*2, hidden_size)
@@ -132,10 +135,11 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         save_weight(q_gate.permute(1, 0))   # Q_gate FC weight
 
         # Q norm
+        # Q norm (RMS norm: add 1.0 for offset format)
         norm_key = f"{prefix}q_norm.weight"
         if norm_key in params:
-            save_weight(params[norm_key])
-            print(f"  {norm_key}: {params[norm_key].shape}")
+            save_weight(params[norm_key], is_rms=True)
+            print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
 
         # O projection
         save_projection(f"{prefix}o_proj.weight", transpose=True)
@@ -158,9 +162,9 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
 
         print(f"\n--- Layer {layer_idx} ({'self_attn' if is_self_attn else 'linear_attn'}) ---")
 
-        # Input layernorm
-        save_weight(params[f"{layer_prefix}input_layernorm.weight"])
-        print(f"  {layer_prefix}input_layernorm.weight")
+        # Input layernorm (RMS norm: add 1.0 for offset format)
+        save_weight(params[f"{layer_prefix}input_layernorm.weight"], is_rms=True)
+        print(f"  {layer_prefix}input_layernorm.weight (+1.0)")
 
         # Attention (linear or self)
         if is_self_attn:
@@ -168,16 +172,16 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         else:
             save_linear_attn(layer_prefix)
 
-        # Post-attention layernorm
-        save_weight(params[f"{layer_prefix}post_attention_layernorm.weight"])
-        print(f"  {layer_prefix}post_attention_layernorm.weight")
+        # Post-attention layernorm (RMS norm: add 1.0)
+        save_weight(params[f"{layer_prefix}post_attention_layernorm.weight"], is_rms=True)
+        print(f"  {layer_prefix}post_attention_layernorm.weight (+1.0)")
 
         # MLP
         save_feed_forward(layer_prefix)
 
-    # 3. Final norm
-    save_weight(params["model.norm.weight"])
-    print(f"\nmodel.norm.weight: {params['model.norm.weight'].shape}")
+    # 3. Final norm (RMS norm: add 1.0)
+    save_weight(params["model.norm.weight"], is_rms=True)
+    print(f"\nmodel.norm.weight (+1.0): {params['model.norm.weight'].shape}")
 
     # 4. LM head (only if not tied)
     if not tie_word_embeddings:
