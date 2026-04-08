@@ -16,6 +16,7 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <attn_gate.h>
 #include <gated_delta_net.h>
 #include <reshaped_rms_norm.h>
 
@@ -123,29 +124,35 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
   const int layer_id, int seq_len, int n_heads, int head_dim,
   std::string query_name, std::string key_name, std::string value_name) {
 
-  // Qwen3-style attention with QK-norm (for self_attn layers)
+  // Qwen3.5 self-attention with QK-norm + output gate
+  // q_proj outputs 2x size: [query, gate]. We split into 2 FC layers.
+  // Weight converter saves: V, K, K_norm, Q_query, Q_gate, Q_norm, O
   std::vector<LayerHandle> layers;
-  auto Q = "layer" + std::to_string(layer_id) + "_wq";
-  auto Q_norm = "layer" + std::to_string(layer_id) + "_q_norm";
-  auto K = "layer" + std::to_string(layer_id) + "_wk";
-  auto K_norm = "layer" + std::to_string(layer_id) + "_k_norm";
-  auto V = "layer" + std::to_string(layer_id) + "_wv";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
+  auto prefix = "layer" + std::to_string(layer_id);
+  auto V = prefix + "_wv";
+  auto K = prefix + "_wk";
+  auto K_norm = prefix + "_k_norm";
+  auto Q = prefix + "_wq";
+  auto Q_gate = prefix + "_wq_gate";
+  auto Q_norm = prefix + "_q_norm";
+  auto A = prefix + "_attention";
+  auto AG = prefix + "_attn_gate";
+  auto O = prefix + "_attention_out";
+
+  unsigned int kv_dim = SELF_ATTN_HEAD_DIM * n_heads / GQA_SIZE;
+  unsigned int q_dim = SELF_ATTN_HEAD_DIM * n_heads;
 
   // V layer
   layers.push_back(createLayer(
     "fully_connected",
-    {withKey("name", V),
-     withKey("unit", SELF_ATTN_HEAD_DIM * n_heads / GQA_SIZE),
+    {withKey("name", V), withKey("unit", kv_dim),
      withKey("disable_bias", "true"), withKey("input_layers", value_name),
      withKey("weight_initializer", "ones")}));
 
   // K layer
   layers.push_back(createLayer(
     "fully_connected",
-    {withKey("name", K),
-     withKey("unit", SELF_ATTN_HEAD_DIM * n_heads / GQA_SIZE),
+    {withKey("name", K), withKey("unit", kv_dim),
      withKey("disable_bias", "true"), withKey("input_layers", key_name),
      withKey("weight_initializer", "ones")}));
 
@@ -156,14 +163,21 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("feature_size", std::to_string(SELF_ATTN_HEAD_DIM))}));
 
-  // Q layer
+  // Q layer (query part only - first half of q_proj)
   layers.push_back(createLayer(
     "fully_connected",
-    {withKey("name", Q), withKey("unit", SELF_ATTN_HEAD_DIM * n_heads),
+    {withKey("name", Q), withKey("unit", q_dim),
      withKey("disable_bias", "true"), withKey("input_layers", query_name),
      withKey("weight_initializer", "ones")}));
 
-  // Q-reshaped-norm
+  // Q_gate layer (gate part - second half of q_proj)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", Q_gate), withKey("unit", q_dim),
+     withKey("disable_bias", "true"), withKey("input_layers", query_name),
+     withKey("weight_initializer", "ones")}));
+
+  // Q-reshaped-norm (only applied to query, not gate)
   layers.push_back(createLayer(
     "reshaped_rms_norm",
     {withKey("name", Q_norm), withKey("input_layers", Q),
@@ -182,11 +196,16 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("input_layers", {Q_norm, K_norm, V})}));
 
-  // O layer
+  // Attention gate: output = attn_output * sigmoid(gate)
+  layers.push_back(createLayer("attn_gate",
+                               {withKey("name", AG),
+                                withKey("input_layers", A + "," + Q_gate)}));
+
+  // O layer (projects gated attention output)
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", O), withKey("unit", DIM),
-     withKey("disable_bias", "true"), withKey("input_layers", A),
+     withKey("disable_bias", "true"), withKey("input_layers", AG),
      withKey("weight_initializer", "ones")}));
 
   return layers;
@@ -265,6 +284,14 @@ void Qwen3_5Transformer::registerCustomLayers() {
   try {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::GatedDeltaNetLayer>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register factory, reason: " << e.what()
+              << std::endl;
+  }
+
+  try {
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::AttnGateLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

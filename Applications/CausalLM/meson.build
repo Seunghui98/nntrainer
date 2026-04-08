@@ -24,6 +24,7 @@ causallm_layer_dependencies += [
     causallm_reshaped_rms_norm_dep,
     causallm_qkv_layer_dep,
     causallm_gated_delta_net_dep,
+    causallm_attn_gate_dep,
 ]
 
 subdir('models')
