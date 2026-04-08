@@ -6,7 +6,7 @@ import argparse
 import os
 import torch
 import numpy as np
-from transformers import AutoConfig, AutoTokenizer, AutoModel
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 
 def get_text_config(config):
@@ -203,10 +203,22 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
 
-    # Use AutoModel (not AutoModelForCausalLM) since Qwen3.5 is a VLM
-    # (Qwen3_5ForConditionalGeneration, not ForCausalLM)
-    model = AutoModel.from_pretrained(
+    # Load full VLM, then extract language model only
+    full_model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.float32, trust_remote_code=True)
+    full_model.eval()
+
+    # Extract the text/language model part (skip vision encoder)
+    if hasattr(full_model, 'model') and hasattr(full_model.model, 'layers'):
+        # Direct access: model.layers exists -> use full_model directly
+        model = full_model
+    elif hasattr(full_model, 'language_model'):
+        model = full_model.language_model
+    elif hasattr(full_model, 'text_model'):
+        model = full_model.text_model
+    else:
+        model = full_model
+    print(f"Using model class: {type(model).__name__}")
     model.eval()
 
     text_cfg = get_text_config(config)
