@@ -104,53 +104,93 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         # out_proj: (hidden_size, value_dim) -> (value_dim, hidden_size)
         save_projection(f"{prefix}out_proj.weight", transpose=True)
 
+    # def save_self_attn(layer_prefix):
+    #     """Save self-attention layer weights.
+
+    #     Weight order matches Qwen3_5Transformer::createAttention():
+    #       V, K, K_norm, Q_query, Q_gate, Q_norm, mha_core(no wt), attn_gate(no wt), O
+
+    #     Note: q_proj is (num_heads*head_dim*2, hidden_size) because of attn_output_gate.
+    #           First half = query, second half = gate. We split and save separately.
+    #     """
+    #     prefix = f"{layer_prefix}self_attn."
+
+    #     # V projection
+    #     save_projection(f"{prefix}v_proj.weight", transpose=True)
+
+    #     # K projection
+    #     save_projection(f"{prefix}k_proj.weight", transpose=True)
+
+    #     # K norm (RMS norm: add 1.0 for offset format)
+    #     norm_key = f"{prefix}k_norm.weight"
+    #     if norm_key in params:
+    #         save_weight(params[norm_key])
+    #         print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
+
+    #     # Q projection - split into query and gate halves
+    #     q_weight = params[f"{prefix}q_proj.weight"]  # (num_heads*head_dim*2, hidden_size)
+    #     q_half = q_weight.shape[0] // 2
+    #     q_query = q_weight[:q_half, :]   # first half: query
+    #     q_gate = q_weight[q_half:, :]    # second half: gate
+    #     print(f"  {prefix}q_proj.weight: {q_weight.shape} -> split into query{q_query.shape} + gate{q_gate.shape}")
+    #     save_weight(q_query.permute(1, 0))  # Q_query FC weight
+    #     save_weight(q_gate.permute(1, 0))   # Q_gate FC weight
+
+    #     # Q norm
+    #     # Q norm (RMS norm: add 1.0 for offset format)
+    #     norm_key = f"{prefix}q_norm.weight"
+    #     if norm_key in params:
+    #         save_weight(params[norm_key])
+    #         print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
+
+    #     # O projection
+    #     save_projection(f"{prefix}o_proj.weight", transpose=True)
+
     def save_self_attn(layer_prefix):
-        """Save self-attention layer weights.
-
-        Weight order matches Qwen3_5Transformer::createAttention():
-          V, K, K_norm, Q_query, Q_gate, Q_norm, mha_core(no wt), attn_gate(no wt), O
-
-        Note: q_proj is (num_heads*head_dim*2, hidden_size) because of attn_output_gate.
-              First half = query, second half = gate. We split and save separately.
-        """
         prefix = f"{layer_prefix}self_attn."
 
-        # V projection
-        save_projection(f"{prefix}v_proj.weight", transpose=True)
-
-        # K projection
-        save_projection(f"{prefix}k_proj.weight", transpose=True)
-
-        # K norm (RMS norm: add 1.0 for offset format)
-        norm_key = f"{prefix}k_norm.weight"
-        if norm_key in params:
-            save_weight(params[norm_key], is_rms=True)
-            print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
-
-        # Q projection - split into query and gate halves
-        q_weight = params[f"{prefix}q_proj.weight"]  # (num_heads*head_dim*2, hidden_size)
+        q_weight = params[f"{prefix}q_proj.weight"]
         q_half = q_weight.shape[0] // 2
-        q_query = q_weight[:q_half, :]   # first half: query
-        q_gate = q_weight[q_half:, :]    # second half: gate
-        print(f"  {prefix}q_proj.weight: {q_weight.shape} -> split into query{q_query.shape} + gate{q_gate.shape}")
-        save_weight(q_query.permute(1, 0))  # Q_query FC weight
-        save_weight(q_gate.permute(1, 0))   # Q_gate FC weight
+        q_query = q_weight[:q_half, :]
+        q_gate  = q_weight[q_half:, :]
 
-        # Q norm
-        # Q norm (RMS norm: add 1.0 for offset format)
+        # nntrainer full-attn block actual consumption order
+        # layer3_wq_gate -> layer3_wq -> layer3_q_norm -> layer3_wk -> layer3_k_norm -> layer3_wv -> layer3_attention_out
+
+        # 1) q_gate
+        save_weight(q_gate.permute(1, 0))
+        print(f"  {prefix}q_proj.weight(gate): {q_gate.shape}")
+
+        # 2) q_query
+        save_weight(q_query.permute(1, 0))
+        print(f"  {prefix}q_proj.weight(query): {q_query.shape}")
+
+        # 3) q_norm (NO +1)
         norm_key = f"{prefix}q_norm.weight"
         if norm_key in params:
             save_weight(params[norm_key], is_rms=True)
-            print(f"  {norm_key} (+1.0): {params[norm_key].shape}")
+            print(f"  {norm_key} (no +1): {params[norm_key].shape}")
 
-        # O projection
+        # 4) k_proj
+        save_projection(f"{prefix}k_proj.weight", transpose=True)
+
+        # 5) k_norm (NO +1)
+        norm_key = f"{prefix}k_norm.weight"
+        if norm_key in params:
+            save_weight(params[norm_key], is_rms=True)
+            print(f"  {norm_key} (no +1): {params[norm_key].shape}")
+
+        # 6) v_proj
+        save_projection(f"{prefix}v_proj.weight", transpose=True)
+
+        # 7) o_proj
         save_projection(f"{prefix}o_proj.weight", transpose=True)
 
     def save_feed_forward(layer_prefix):
         """Save MLP weights: up_proj, gate_proj, down_proj"""
         for proj in ["up_proj", "gate_proj", "down_proj"]:
             save_projection(f"{layer_prefix}mlp.{proj}.weight", transpose=True)
-
+    
     # === Save weights in NNTrainer layer creation order ===
 
     # 1. Embedding
@@ -176,7 +216,7 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
 
         # Post-attention layernorm (RMS norm: add 1.0)
         save_weight(params[f"{layer_prefix}post_attention_layernorm.weight"], is_rms=True)
-        print(f"  {layer_prefix}post_attention_layernorm.weight (+1.0)")
+        print(f"  {layer_prefix}post_attention_layernorm.weight")
 
         # MLP
         save_feed_forward(layer_prefix)

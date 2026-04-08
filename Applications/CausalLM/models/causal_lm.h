@@ -119,7 +119,9 @@ protected:
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
   std::vector<unsigned int> EOS_TOKEN_ID;
-  unsigned int BOS_TOKEN_ID;
+  bool HAS_BOS_TOKEN = false;
+  unsigned int BOS_TOKEN_ID = 0;
+  unsigned int PAD_TOKEN_ID = 0;
   float TEMPERATURE;
   unsigned int TOP_K;
   float TOP_P;

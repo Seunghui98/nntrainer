@@ -52,7 +52,10 @@ public:
   createAttention(const int layer_id, int seq_len, int n_heads, int head_dim,
                   std::string query_name, std::string key_name,
                   std::string value_name) override;
-
+  
+  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
+                                   int hidden_dim,
+                                   std::string input_name) override;
   /**
    * @brief Create linear attention (Gated DeltaNet) decoder block
    */

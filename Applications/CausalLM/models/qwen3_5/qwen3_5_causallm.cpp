@@ -22,6 +22,53 @@
 
 namespace causallm {
 
+std::vector<LayerHandle> Qwen3_5Transformer::createMlp(const int layer_id,
+                                                       int dim,
+                                                       int hidden_dim,
+                                                       std::string input_name) {
+  std::vector<LayerHandle> layers;
+
+  // gate_proj
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+     withKey("unit", hidden_dim),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", input_name),
+     withKey("weight_initializer", "ones")}));
+
+  // up_proj
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+     withKey("unit", hidden_dim),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", input_name),
+     withKey("weight_initializer", "ones")}));
+
+  // IMPORTANT:
+  // swiglu implementation is assumed to be: silu(in0) * in1
+  // Therefore input order must be: gate, up
+  layers.push_back(createLayer(
+    "swiglu",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("input_layers",
+             "layer" + std::to_string(layer_id) + "_ffn_gate,"
+             "layer" + std::to_string(layer_id) + "_ffn_up")}));
+
+  // down_proj
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
+     withKey("unit", dim),
+     withKey("disable_bias", "true"),
+     withKey("input_layers",
+             "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("weight_initializer", "ones")}));
+
+  return layers;
+}
+
 void Qwen3_5Transformer::setupQwen35Parameters(json &cfg, json &nntr_cfg) {
   // Determine layer types from config
   // Qwen3.5 text_config has a "layer_types" field or we infer from pattern
@@ -79,14 +126,14 @@ void Qwen3_5Transformer::constructModel() {
     "input", {withKey("name", "input0"),
               withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
 
-  // Embedding layer
-  const std::string embedding_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
-  layers.push_back(createLayer(
-    embedding_type,
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
-     "scale=" + std::to_string(EMBEDDING_SCALE)}));
+    // Embedding layer
+    const std::string embedding_type =
+      TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
+    layers.push_back(createLayer(
+      embedding_type,
+      {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
+      "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
+      "scale=" + std::to_string(EMBEDDING_SCALE)}));
 
   // Build decoder layers
   for (int i = 0; i < NUM_LAYERS; ++i) {

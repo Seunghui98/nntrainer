@@ -44,11 +44,9 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
 
 void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                                json &nntr_cfg) {
-  // Initialize output list
   for (unsigned int i = 0; i < BATCH_SIZE; ++i)
     output_list.push_back("");
 
-  // allocate memory for the internal buffer
   ids_history = (unsigned int *)malloc(static_cast<size_t>(BATCH_SIZE) *
                                        MAX_SEQ_LEN * sizeof(unsigned int));
 
@@ -68,33 +66,67 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
     USE_KVCACHE = true;
     PRE_COMPUTED_CACHE_PATH =
       nntr_cfg["system_prompt"]["kvcache"]["pre_computed_cache_path"];
-    if (nntr_cfg["system_prompt"]["kvcache"].contains("sys_prompt_token_size"))
+    if (nntr_cfg["system_prompt"]["kvcache"].contains("sys_prompt_token_size") &&
+        !nntr_cfg["system_prompt"]["kvcache"]["sys_prompt_token_size"].is_null()) {
       SYS_PROMP_LEN =
         nntr_cfg["system_prompt"]["kvcache"]["sys_prompt_token_size"]
           .get<unsigned int>();
+    }
   }
 
-  if (generation_cfg["eos_token_id"].is_array()) {
-    EOS_TOKEN_ID =
-      generation_cfg["eos_token_id"].empty()
-        ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
-        : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+  // eos_token_id
+  if (generation_cfg.contains("eos_token_id") &&
+      !generation_cfg["eos_token_id"].is_null()) {
+    if (generation_cfg["eos_token_id"].is_array()) {
+      EOS_TOKEN_ID =
+        generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+    } else {
+      EOS_TOKEN_ID = {generation_cfg["eos_token_id"].get<unsigned int>()};
+    }
+  } else if (cfg.contains("eos_token_id") && !cfg["eos_token_id"].is_null()) {
+    if (cfg["eos_token_id"].is_array()) {
+      EOS_TOKEN_ID = cfg["eos_token_id"].get<std::vector<unsigned int>>();
+    } else {
+      EOS_TOKEN_ID = {cfg["eos_token_id"].get<unsigned int>()};
+    }
   } else {
-    EOS_TOKEN_ID.clear();
-    EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
+    throw std::invalid_argument("eos_token_id is required");
   }
-  BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
-                   ? cfg["bos_token_id"].get<unsigned int>()
-                   : generation_cfg["bos_token_id"].get<unsigned int>();
+
+  // bos_token_id (optional)
+  HAS_BOS_TOKEN = false;
+  BOS_TOKEN_ID = 0;
+
+  if (generation_cfg.contains("bos_token_id") &&
+      !generation_cfg["bos_token_id"].is_null()) {
+    BOS_TOKEN_ID = generation_cfg["bos_token_id"].get<unsigned int>();
+    HAS_BOS_TOKEN = true;
+  } else if (cfg.contains("bos_token_id") && !cfg["bos_token_id"].is_null()) {
+    BOS_TOKEN_ID = cfg["bos_token_id"].get<unsigned int>();
+    HAS_BOS_TOKEN = true;
+  }
+
+  // pad_token_id (optional but usually useful)
+  PAD_TOKEN_ID = 0;
+  if (generation_cfg.contains("pad_token_id") &&
+      !generation_cfg["pad_token_id"].is_null()) {
+    PAD_TOKEN_ID = generation_cfg["pad_token_id"].get<unsigned int>();
+  } else if (cfg.contains("pad_token_id") && !cfg["pad_token_id"].is_null()) {
+    PAD_TOKEN_ID = cfg["pad_token_id"].get<unsigned int>();
+  } else {
+    PAD_TOKEN_ID = EOS_TOKEN_ID.front();
+  }
+
   TOP_K = generation_cfg.contains("top_k")
             ? generation_cfg["top_k"].get<unsigned int>()
             : 20;
   TOP_P = generation_cfg.contains("top_p")
             ? generation_cfg["top_p"].get<float>()
-            : 0.95;
+            : 0.95f;
   TEMPERATURE = generation_cfg.contains("temperature")
                   ? generation_cfg["temperature"].get<float>()
-                  : 0.7;
+                  : 0.7f;
+
   global_token_len = 0;
 }
 
@@ -329,8 +361,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
   auto _input = tokenizer->Encode(prompt_);
+  if (HAS_BOS_TOKEN) {
   // insert bos token at the beginning of the input
   _input.insert(_input.begin(), BOS_TOKEN_ID);
+
+  // DEBUG: print input token IDs
+  std::cerr << "[DEBUG input] BOS=" << BOS_TOKEN_ID
+            << " num_tokens=" << _input.size() << " ids=[";
+  for (size_t i = 0; i < std::min(_input.size(), (size_t)20); ++i)
+    std::cerr << _input[i] << (i < 19 ? "," : "");
+  std::cerr << "]" << std::endl;
+  }
 #endif
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
