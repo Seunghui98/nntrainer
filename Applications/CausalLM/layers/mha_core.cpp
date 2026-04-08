@@ -837,6 +837,19 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
             nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
                                                 out_ptr, cos_->data(),
                                                 sin_->data(), convert_only);
+
+            // Copy non-rotary dims to output (partial_rotary_factor < 1.0)
+            // compute_rotary_emb_value only handles [0, half_*2) dims per head.
+            // Dims [half_*2, dim) need fp32→fp16 conversion without rotation.
+            unsigned int rotary_dim = half_ * 2;
+            if (rotary_dim < dim) {
+              for (unsigned int w = 0; w < in.width(); w += dim) {
+                for (unsigned int k = rotary_dim; k < dim; ++k) {
+                  out_ptr[w + k] =
+                    nntrainer::compute_fp32_to_fp16(in_ptr[w + k]);
+                }
+              }
+            }
           }
         }
       }
