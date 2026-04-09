@@ -11,10 +11,45 @@
 #include <cstring>
 #include <causal_conv1d.h>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 namespace causallm {
 
 static inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 static inline float silu(float x) { return x * sigmoid(x); }
+
+// Apply SiLU to a buffer in-place using SIMD
+static void silu_inplace(float *data, unsigned int len) {
+  unsigned int i = 0;
+#ifdef __AVX2__
+  for (; i + 7 < len; i += 8) {
+    alignas(32) float buf[8];
+    __m256 v = _mm256_loadu_ps(&data[i]);
+    _mm256_store_ps(buf, v);
+    for (int j = 0; j < 8; ++j)
+      buf[j] = buf[j] / (1.0f + std::exp(-buf[j]));
+    __m256 sig = _mm256_load_ps(buf);
+    _mm256_storeu_ps(&data[i], _mm256_mul_ps(v, sig));
+  }
+#elif defined(__ARM_NEON)
+  for (; i + 3 < len; i += 4) {
+    alignas(16) float buf[4];
+    float32x4_t v = vld1q_f32(&data[i]);
+    vst1q_f32(buf, v);
+    for (int j = 0; j < 4; ++j)
+      buf[j] = 1.0f / (1.0f + std::exp(-buf[j]));
+    float32x4_t sig = vld1q_f32(buf);
+    vst1q_f32(&data[i], vmulq_f32(v, sig));
+  }
+#endif
+  for (; i < len; ++i)
+    data[i] = silu(data[i]);
+}
 
 CausalConv1dLayer::CausalConv1dLayer() :
   Layer(),
@@ -89,27 +124,26 @@ void CausalConv1dLayer::incremental_forwarding(
       const float *x = in_ptr + t * channels;
       float *y = out_ptr + t * channels;
 
+      // Conv1d per channel: dot product of [state..., new_val] with kernel
       for (unsigned int ch = 0; ch < channels; ++ch) {
         float *ch_state = st_ptr + ch * state_width;
         const float *kernel = conv_w + ch * kernel_size;
 
-        // Dot product: [state..., new_val] . kernel
         float val = 0.0f;
-        for (unsigned int k = 0; k < state_width; ++k) {
+        for (unsigned int k = 0; k < state_width; ++k)
           val += ch_state[k] * kernel[k];
-        }
         val += x[ch] * kernel[state_width];
-
-        // SiLU activation
-        y[ch] = silu(val);
+        y[ch] = val;
 
         // Shift state left, append new value
-        for (unsigned int k = 0; k < state_width - 1; ++k) {
+        for (unsigned int k = 0; k < state_width - 1; ++k)
           ch_state[k] = ch_state[k + 1];
-        }
         if (state_width > 0)
           ch_state[state_width - 1] = x[ch];
       }
+
+      // Batched SiLU over all channels (SIMD optimized)
+      silu_inplace(y, channels);
     }
   }
 }

@@ -12,7 +12,34 @@
 #include <cmath>
 #include "attn_gate.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 namespace causallm {
+
+#ifdef __AVX2__
+static inline __m256 sigmoid_avx2(__m256 x) {
+  alignas(32) float buf[8];
+  _mm256_store_ps(buf, x);
+  for (int i = 0; i < 8; ++i)
+    buf[i] = 1.0f / (1.0f + std::exp(-buf[i]));
+  return _mm256_load_ps(buf);
+}
+#endif
+
+#ifdef __ARM_NEON
+static inline float32x4_t sigmoid_neon(float32x4_t x) {
+  alignas(16) float buf[4];
+  vst1q_f32(buf, x);
+  for (int i = 0; i < 4; ++i)
+    buf[i] = 1.0f / (1.0f + std::exp(-buf[i]));
+  return vld1q_f32(buf);
+}
+#endif
 
 static constexpr size_t OUT_IDX = 0;
 static constexpr size_t INPUT_IDX = 0;
@@ -40,7 +67,21 @@ void AttnGateLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       float *gate_ptr = gate.getData<float>() + gate.getIndex(b, 0, h, 0);
       float *out_ptr = out.getData<float>() + out.getIndex(b, 0, h, 0);
 
-      for (unsigned int w = 0; w < in.width(); ++w) {
+      unsigned int w = 0;
+#ifdef __AVX2__
+      for (; w + 7 < in.width(); w += 8) {
+        __m256 iv = _mm256_loadu_ps(&in_ptr[w]);
+        __m256 gv = _mm256_loadu_ps(&gate_ptr[w]);
+        _mm256_storeu_ps(&out_ptr[w], _mm256_mul_ps(iv, sigmoid_avx2(gv)));
+      }
+#elif defined(__ARM_NEON)
+      for (; w + 3 < in.width(); w += 4) {
+        float32x4_t iv = vld1q_f32(&in_ptr[w]);
+        float32x4_t gv = vld1q_f32(&gate_ptr[w]);
+        vst1q_f32(&out_ptr[w], vmulq_f32(iv, sigmoid_neon(gv)));
+      }
+#endif
+      for (; w < in.width(); ++w) {
         float sig = 1.0f / (1.0f + std::exp(-gate_ptr[w]));
         out_ptr[w] = in_ptr[w] * sig;
       }
