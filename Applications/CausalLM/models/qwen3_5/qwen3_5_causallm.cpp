@@ -36,7 +36,8 @@ std::vector<LayerHandle> Qwen3_5Transformer::createMlp(const int layer_id,
      withKey("unit", hidden_dim),
      withKey("disable_bias", "true"),
      withKey("input_layers", input_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // up_proj
   layers.push_back(createLayer(
@@ -45,7 +46,8 @@ std::vector<LayerHandle> Qwen3_5Transformer::createMlp(const int layer_id,
      withKey("unit", hidden_dim),
      withKey("disable_bias", "true"),
      withKey("input_layers", input_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // swiglu = silu(in0) * in1, input order: gate, up
   layers.push_back(createLayer(
@@ -63,7 +65,8 @@ std::vector<LayerHandle> Qwen3_5Transformer::createMlp(const int layer_id,
      withKey("disable_bias", "true"),
      withKey("input_layers",
              "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   return layers;
 }
@@ -244,14 +247,16 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
     "fully_connected",
     {withKey("name", V), withKey("unit", kv_dim),
      withKey("disable_bias", "true"), withKey("input_layers", value_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // K projection
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", K), withKey("unit", kv_dim),
      withKey("disable_bias", "true"), withKey("input_layers", key_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // K-reshaped-norm
   layers.push_back(createLayer(
@@ -265,14 +270,16 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
     "fully_connected",
     {withKey("name", Q), withKey("unit", q_dim),
      withKey("disable_bias", "true"), withKey("input_layers", query_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // Q_gate projection (gate part)
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", Q_gate), withKey("unit", q_dim),
      withKey("disable_bias", "true"), withKey("input_layers", query_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // Q-reshaped-norm
   layers.push_back(createLayer(
@@ -304,7 +311,8 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
     "fully_connected",
     {withKey("name", O), withKey("unit", DIM),
      withKey("disable_bias", "true"), withKey("input_layers", AG),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   return layers;
 }
@@ -335,7 +343,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("unit", conv_dim),
      withKey("disable_bias", "true"),
      withKey("input_layers", norm_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // Causal Conv1D + SiLU
   layers.push_back(createLayer(
@@ -352,7 +361,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("unit", LINEAR_NUM_V_HEADS),
      withKey("disable_bias", "true"),
      withKey("input_layers", norm_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // FC: in_proj_b (hidden → num_v_heads)
   layers.push_back(createLayer(
@@ -361,7 +371,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("unit", LINEAR_NUM_V_HEADS),
      withKey("disable_bias", "true"),
      withKey("input_layers", norm_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // FC: in_proj_z (hidden → value_dim)
   layers.push_back(createLayer(
@@ -370,7 +381,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("unit", LINEAR_NUM_V_HEADS * LINEAR_HEAD_V_DIM),
      withKey("disable_bias", "true"),
      withKey("input_layers", norm_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // GDN SSM Core (takes 4 inputs: conv_out, a, b, z)
   layers.push_back(createLayer(
@@ -391,7 +403,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("unit", DIM),
      withKey("disable_bias", "true"),
      withKey("input_layers", prefix + "_gdn_ssm"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // Residual add
   layers.push_back(createLayer(
