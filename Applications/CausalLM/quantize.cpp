@@ -181,13 +181,19 @@ void registerAllModels() {
  */
 std::map<std::string, DataType>
 buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
-                   DataType lmhead_dtype,
+                   DataType lmhead_dtype, bool tie_word_embeddings,
                    const std::vector<bool> &is_self_attn_layer) {
 
   std::map<std::string, DataType> dtype_map;
 
-  if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE)
-    dtype_map["embedding0"] = embd_dtype;
+  // tie_word_embeddings: embedding and lm_head share weights.
+  // Quantized shared weights are not supported, so keep both as FP32.
+  if (tie_word_embeddings) {
+    // Skip embedding0 and output_of_causallm regardless of user dtype request
+  } else {
+    if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE)
+      dtype_map["embedding0"] = embd_dtype;
+  }
 
   for (int i = 0; i < num_layers; ++i) {
     std::string prefix = "layer" + std::to_string(i);
@@ -219,7 +225,8 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
     }
   }
 
-  if (lmhead_dtype != DataType::FP32 && lmhead_dtype != DataType::NONE)
+  if (!tie_word_embeddings &&
+      lmhead_dtype != DataType::FP32 && lmhead_dtype != DataType::NONE)
     dtype_map["output_of_causallm"] = lmhead_dtype;
 
   return dtype_map;
@@ -305,6 +312,8 @@ int main(int argc, char *argv[]) {
     // Handle VLM nested config
     json text_cfg = cfg.contains("text_config") ? cfg["text_config"] : cfg;
     int num_layers = text_cfg["num_hidden_layers"].get<int>();
+    bool tie_word_embeddings = text_cfg.contains("tie_word_embeddings")
+      ? text_cfg["tie_word_embeddings"].get<bool>() : false;
 
     // Determine self-attention vs linear attention layers (Qwen3.5 hybrid)
     std::vector<bool> is_self_attn_layer(num_layers, true); // default: all self-attn
@@ -345,8 +354,12 @@ int main(int argc, char *argv[]) {
     std::cout << "  Weights loaded.\n";
 
     std::cout << "[4/5] Quantizing and saving to: " << dst_weight_path << "\n";
+    if (tie_word_embeddings) {
+      std::cout << "  NOTE: tie_word_embeddings=true, embedding/lm_head kept FP32\n";
+    }
     auto layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
-                                              lmhead_dtype, is_self_attn_layer);
+                                              lmhead_dtype, tie_word_embeddings,
+                                              is_self_attn_layer);
 
     std::cout << "  Layers to quantize: " << layer_dtype_map.size() << "\n";
     model->save_weight(dst_weight_path, DataType::NONE, layer_dtype_map);
