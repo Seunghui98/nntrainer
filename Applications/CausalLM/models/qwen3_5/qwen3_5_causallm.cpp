@@ -26,15 +26,10 @@ Tensor Qwen3_5Transformer::createMlp(const int layer_id, int dim,
                                       int hidden_dim, Tensor input) {
   using ml::train::createLayer;
 
-  // gate_proj
-  LayerHandle ffn_gate = createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")});
-  Tensor gate = ffn_gate(input);
+  // Weight converter saves: up_proj, gate_proj, down_proj
+  // Layer creation order must match converter save order for weight loading.
 
-  // up_proj
+  // up_proj (created first to match weight converter order)
   LayerHandle ffn_up = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
@@ -42,7 +37,15 @@ Tensor Qwen3_5Transformer::createMlp(const int layer_id, int dim,
      withKey("weight_initializer", "ones")});
   Tensor up = ffn_up(input);
 
-  // IMPORTANT: swiglu = silu(in0) * in1, so input order is: gate, up
+  // gate_proj (created second to match weight converter order)
+  LayerHandle ffn_gate = createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")});
+  Tensor gate = ffn_gate(input);
+
+  // swiglu = silu(in0) * in1, so input order is: gate, up
   LayerHandle swiglu = createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")});
@@ -155,43 +158,24 @@ Tensor Qwen3_5Transformer::createAttention(const int layer_id, int seq_len,
   unsigned int kv_dim = SELF_ATTN_HEAD_DIM * n_heads / GQA_SIZE;
   unsigned int q_dim = SELF_ATTN_HEAD_DIM * n_heads;
 
-  // V projection
-  LayerHandle v_proj = createLayer(
-    "fully_connected",
-    {withKey("name", prefix + "_wv"), withKey("unit", kv_dim),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor v = v_proj(value);
+  // Weight converter saves: q_gate, q, q_norm, k, k_norm, v, o
+  // Layer creation order MUST match for correct weight loading.
 
-  // K projection
-  LayerHandle k_proj = createLayer(
-    "fully_connected",
-    {withKey("name", prefix + "_wk"), withKey("unit", kv_dim),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor k = k_proj(key);
-
-  // K-reshaped-norm
-  LayerHandle k_norm = createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", prefix + "_k_norm"), withKey("packed", "false"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(SELF_ATTN_HEAD_DIM))});
-  Tensor k_normed = k_norm(k);
-
-  // Q projection (query part only)
-  LayerHandle q_proj = createLayer(
-    "fully_connected",
-    {withKey("name", prefix + "_wq"), withKey("unit", q_dim),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor q = q_proj(query);
-
-  // Q_gate projection (gate part - second half of q_proj)
+  // 1) Q_gate projection (gate part of q_proj, de-interleaved)
   LayerHandle q_gate_proj = createLayer(
     "fully_connected",
     {withKey("name", prefix + "_wq_gate"), withKey("unit", q_dim),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
   Tensor q_gate = q_gate_proj(query);
 
-  // Q-reshaped-norm (only applied to query, not gate)
+  // 2) Q projection (query part of q_proj, de-interleaved)
+  LayerHandle q_proj = createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_wq"), withKey("unit", q_dim),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor q = q_proj(query);
+
+  // 3) Q-reshaped-norm (only applied to query, not gate)
   LayerHandle q_norm = createLayer(
     "reshaped_rms_norm",
     {withKey("name", prefix + "_q_norm"), withKey("packed", "false"),
@@ -199,7 +183,29 @@ Tensor Qwen3_5Transformer::createAttention(const int layer_id, int seq_len,
      withKey("feature_size", std::to_string(SELF_ATTN_HEAD_DIM))});
   Tensor q_normed = q_norm(q);
 
-  // Attention core (with partial_rotary_factor=0.25 for Qwen3.5)
+  // 4) K projection
+  LayerHandle k_proj = createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_wk"), withKey("unit", kv_dim),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor k = k_proj(key);
+
+  // 5) K-reshaped-norm
+  LayerHandle k_norm = createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", prefix + "_k_norm"), withKey("packed", "false"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(SELF_ATTN_HEAD_DIM))});
+  Tensor k_normed = k_norm(k);
+
+  // 6) V projection
+  LayerHandle v_proj = createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_wv"), withKey("unit", kv_dim),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor v = v_proj(value);
+
+  // 7) Attention core (with partial_rotary_factor=0.25 for Qwen3.5)
   LayerHandle attn = createLayer(
     "mha_core",
     {withKey("name", prefix + "_attention"), withKey("num_heads", n_heads),
