@@ -323,6 +323,11 @@ void Qwen3_5CausalLM::constructModel() {
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
   model->addLayer(createLayer(lmhead_type, lmhead_prop));
+
+  // Debug: print model layer order to verify weight loading alignment
+  std::cerr << "\n=== [DEBUG] Model Layer Order (after compile) ===" << std::endl;
+  model->summarize(std::cerr, ML_TRAIN_SUMMARY_MODEL);
+  std::cerr << "=== [DEBUG] End Model Summary ===\n" << std::endl;
 }
 
 void Qwen3_5CausalLM::registerCustomLayers() {
