@@ -32,9 +32,9 @@ static void silu_inplace(float *data, unsigned int len) {
     __m256 v = _mm256_loadu_ps(&data[i]);
     _mm256_store_ps(buf, v);
     for (int j = 0; j < 8; ++j)
-      buf[j] = buf[j] / (1.0f + std::exp(-buf[j]));
+      buf[j] = 1.0f / (1.0f + std::exp(-buf[j]));  // sigmoid only
     __m256 sig = _mm256_load_ps(buf);
-    _mm256_storeu_ps(&data[i], _mm256_mul_ps(v, sig));
+    _mm256_storeu_ps(&data[i], _mm256_mul_ps(v, sig));  // v * sigmoid(v) = silu(v)
   }
 #elif defined(__ARM_NEON)
   for (; i + 3 < len; i += 4) {
