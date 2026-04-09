@@ -54,7 +54,7 @@ CausalConv1dLayer::CausalConv1dLayer() :
   wt_idx(std::numeric_limits<unsigned int>::max()),
   state_idx(std::numeric_limits<unsigned int>::max()),
   kernel_t_idx(std::numeric_limits<unsigned int>::max()),
-  kernel_transposed(false) {}
+  kernel_transposed(false), write_pos(0) {}
 
 void CausalConv1dLayer::setProperty(const std::vector<std::string> &values) {
   auto remain = loadProperties(values, conv_props);
@@ -126,11 +126,9 @@ void CausalConv1dLayer::incremental_forwarding(
   }
 
   const float *kt = kernel_t.getData<float>();
-  // write_pos tracked per batch; initialize to 0 on first call via zero-init state
-  // We use a simple static counter per layer (single-threaded inference)
-  static unsigned int write_pos = 0;
+  // Reset write_pos on prefill (from==0 with multiple tokens)
   if (from == 0 && to > 1)
-    write_pos = 0; // reset on prefill
+    write_pos = 0;
 
   for (unsigned int b = 0; b < batch_size; ++b) {
     const float *in_ptr = input.getData<float>() + b * input.getDim().getFeatureLen();

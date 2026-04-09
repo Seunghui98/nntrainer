@@ -89,6 +89,7 @@ private:
   unsigned int state_idx;      // circular buffer state
   unsigned int kernel_t_idx;   // transposed kernel tensor
   bool kernel_transposed;      // flag for first-run transpose
+  unsigned int write_pos;      // circular buffer write position (per-instance)
 };
 
 } // namespace causallm
