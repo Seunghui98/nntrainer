@@ -12,7 +12,6 @@
 #include <vector>
 
 #include <gdn_ssm_core.h>
-#include <cblas_interface.h>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -110,6 +109,36 @@ static void l2_normalize(float *data, unsigned int len, float eps = 1e-6f) {
 #endif
   for (; i < len; ++i)
     data[i] *= inv_norm;
+}
+
+// Transposed matrix-vector: out = A^T @ x
+// A is (rows, cols) row-major, x is (rows,), out is (cols,)
+// out[j] = sum_i A[i][j] * x[i]
+static void matvec_transposed(const float *A, const float *x, float *out,
+                              unsigned int rows, unsigned int cols) {
+  std::memset(out, 0, cols * sizeof(float));
+  for (unsigned int i = 0; i < rows; ++i) {
+    const float *row = A + i * cols;
+    float x_val = x[i];
+    unsigned int j = 0;
+#ifdef __AVX2__
+    __m256 xv = _mm256_set1_ps(x_val);
+    for (; j + 7 < cols; j += 8) {
+      __m256 o = _mm256_loadu_ps(&out[j]);
+      __m256 a = _mm256_loadu_ps(&row[j]);
+      _mm256_storeu_ps(&out[j], _mm256_fmadd_ps(a, xv, o));
+    }
+#elif defined(__ARM_NEON)
+    float32x4_t xv = vdupq_n_f32(x_val);
+    for (; j + 3 < cols; j += 4) {
+      float32x4_t o = vld1q_f32(&out[j]);
+      float32x4_t a = vld1q_f32(&row[j]);
+      vst1q_f32(&out[j], vfmaq_f32(o, a, xv));
+    }
+#endif
+    for (; j < cols; ++j)
+      out[j] += row[j] * x_val;
+  }
 }
 
 // SSM state update: S = decay*S + outer(k, delta)
@@ -361,12 +390,9 @@ void GdnSsmCoreLayer::incremental_forwarding(
         float beta_h = beta_val[h];
         float *o_h = y + h * head_v_dim;
 
-        // kv_mem = S^T @ k using BLAS sgemv
-        // S is (head_k_dim, head_v_dim) row-major
-        // S^T @ k = (head_v_dim, head_k_dim) @ (head_k_dim,) = (head_v_dim,)
+        // kv_mem = S^T @ k (SIMD optimized matvec)
         std::vector<float> kv_mem(head_v_dim, 0.0f);
-        nntrainer::__cblas_sgemv(0 /*RowMajor*/, true /*Trans*/, head_k_dim, head_v_dim,
-                      1.0f, S, head_v_dim, k_h, 1, 0.0f, kv_mem.data(), 1);
+        matvec_transposed(S, k_h, kv_mem.data(), head_k_dim, head_v_dim);
 
         // delta = beta * (v - kv_mem)
         std::vector<float> delta(head_v_dim);
@@ -393,10 +419,8 @@ void GdnSsmCoreLayer::incremental_forwarding(
         // S = decay*S + outer(k, delta) (SIMD optimized hot loop)
         ssm_state_update(S, k_h, delta.data(), decay, head_k_dim, head_v_dim);
 
-        // o = S^T @ q using BLAS sgemv
-        std::memset(o_h, 0, head_v_dim * sizeof(float));
-        nntrainer::__cblas_sgemv(0 /*RowMajor*/, true /*Trans*/, head_k_dim, head_v_dim,
-                      1.0f, S, head_v_dim, q_h, 1, 0.0f, o_h, 1);
+        // o = S^T @ q (SIMD optimized matvec)
+        matvec_transposed(S, q_h, o_h, head_k_dim, head_v_dim);
       }
 
       // Gated RMS norm + SiLU (fused, SIMD optimized)
