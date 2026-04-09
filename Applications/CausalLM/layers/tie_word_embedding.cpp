@@ -396,6 +396,22 @@ void TieWordEmbedding::save(std::ofstream &file,
                                      quant_weight.getData<uint8_t>(), N, K,
                                      nullptr);
             quant_weight.save(file);
+          } else if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
+            // Skip quantization for small tensors (width < 32)
+            if (K == 1 || N % 32 != 0 || K % 32 != 0) {
+              weight.save(file);
+            } else {
+              ///@note Embedding layer: no transpose needed (unlike FC layers)
+              nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                             {nntrainer::Tformat::NCHW, dtype});
+              std::vector<char> tmp(quant_weight.size());
+
+              nntrainer::quantize_q4_0(weight.getData<float>(), tmp.data(), N,
+                                       K, nullptr);
+              nntrainer::repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
+                                     quant_weight.size(), N, K);
+              quant_weight.save(file);
+            }
           } else {
             NNTR_THROW_IF(true, std::runtime_error)
               << "This dtype is not supported in save with quantization";
