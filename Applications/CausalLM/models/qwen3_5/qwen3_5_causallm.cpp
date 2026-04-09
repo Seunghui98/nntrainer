@@ -417,6 +417,14 @@ void Qwen3_5CausalLM::constructModel() {
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
   model->addLayer(createLayer(lmhead_type, lmhead_prop));
+
+  // Compile and initialize (addLayer API requires explicit compile/init)
+  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {
+    throw std::invalid_argument("Qwen3.5 model compilation failed.");
+  }
+  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
+    throw std::invalid_argument("Qwen3.5 model initialization failed.");
+  }
 }
 
 void Qwen3_5CausalLM::registerCustomLayers() {
