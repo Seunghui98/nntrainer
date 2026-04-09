@@ -354,7 +354,7 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("conv_channels", conv_dim),
      withKey("conv_kernel_size", LINEAR_CONV_KERNEL)}));
 
-  // FC: in_proj_a (hidden → num_v_heads, width=16 < Q4_0 block size 32)
+  // FC: in_proj_a (hidden → num_v_heads=16, not Q4_0 quantizable)
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", prefix + "_gdn_in_proj_a"),
@@ -362,10 +362,9 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("disable_bias", "true"),
      withKey("input_layers", norm_name),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE),
      withKey("packed", "false")}));
 
-  // FC: in_proj_b (hidden → num_v_heads, width=16 < Q4_0 block size 32)
+  // FC: in_proj_b (hidden → num_v_heads=16, not Q4_0 quantizable)
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", prefix + "_gdn_in_proj_b"),
@@ -373,7 +372,6 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
      withKey("disable_bias", "true"),
      withKey("input_layers", norm_name),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE),
      withKey("packed", "false")}));
 
   // FC: in_proj_z (hidden → value_dim)
