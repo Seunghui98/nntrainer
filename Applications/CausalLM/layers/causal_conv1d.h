@@ -4,13 +4,7 @@
  *
  * @file   causal_conv1d.h
  * @date   9 April 2026
- * @brief  Causal Conv1D layer with sliding window state for GatedDeltaNet
- * @see    https://github.com/nntrainer/nntrainer
- * @author Seunghui Lee <shsh1004.lee@samsung.com>
- * @note   1D depthwise causal convolution + SiLU activation.
- *         Maintains conv_state across incremental forwarding calls.
- *         Input:  (batch, 1, seq_len, channels)
- *         Output: (batch, 1, seq_len, channels)
+ * @brief  Causal Conv1D layer with circular buffer + channel SIMD vectorization
  */
 
 #ifndef __CAUSAL_CONV1D_LAYER_H__
@@ -26,41 +20,40 @@
 #include <layer_context.h>
 #include <layer_devel.h>
 #include <node_exporter.h>
-
 #include <base_properties.h>
 
 namespace causallm {
 
 namespace props {
-
 class ConvChannels : public nntrainer::PositiveIntegerProperty {
 public:
   ConvChannels(unsigned int value = 1) { set(value); };
   static constexpr const char *key = "conv_channels";
   using prop_tag = nntrainer::uint_prop_tag;
 };
-
 class ConvKernelSize : public nntrainer::PositiveIntegerProperty {
 public:
   ConvKernelSize(unsigned int value = 4) { set(value); };
   static constexpr const char *key = "conv_kernel_size";
   using prop_tag = nntrainer::uint_prop_tag;
 };
-
 } // namespace props
 
 /**
  * @brief Causal Conv1D Layer
  *
- * Depthwise 1D convolution with causal padding (state-based).
- * For each channel independently:
- *   output[ch] = dot(conv_state[ch] ++ input[ch], kernel[ch]) then SiLU
+ * Optimizations:
+ * - Circular buffer state (no shift-left per token)
+ * - Transposed kernel/state layout (kernel_size, channels) for channel SIMD
+ * - AVX2/NEON vectorized across channels
  *
  * Weights:
- *   0: conv_kernel (1, 1, channels, kernel_size)
+ *   0: conv_kernel - original (channels, kernel_size), transposed on load
  *
- * Tensors (internal state):
- *   0: conv_state (batch, 1, channels, kernel_size - 1)
+ * Tensors:
+ *   0: conv_state (kernel_size-1, channels) - transposed layout
+ *   1: write_pos (1) - circular buffer position
+ *   2: kernel_transposed (kernel_size, channels) - transposed layout for SIMD
  */
 WIN_EXPORT class CausalConv1dLayer final : public nntrainer::Layer {
 public:
@@ -92,8 +85,10 @@ private:
   std::tuple<props::ConvChannels, props::ConvKernelSize> conv_props;
   unsigned int channels;
   unsigned int kernel_size;
-  unsigned int wt_idx;
-  unsigned int state_idx;
+  unsigned int wt_idx;         // original kernel weight
+  unsigned int state_idx;      // circular buffer state
+  unsigned int kernel_t_idx;   // transposed kernel tensor
+  bool kernel_transposed;      // flag for first-run transpose
 };
 
 } // namespace causallm

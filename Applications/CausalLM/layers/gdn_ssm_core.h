@@ -110,7 +110,10 @@ private:
 
   enum WeightIdx { W_A_LOG = 0, W_DT_BIAS, W_NORM, NUM_WEIGHTS };
   std::array<unsigned int, NUM_WEIGHTS> wt_idx;
-  unsigned int state_idx; // recurrent_state
+  unsigned int state_idx;   // recurrent_state
+  unsigned int ws_qkv_idx;  // workspace: qkv_buf (conv_dim)
+  unsigned int ws_kv_idx;   // workspace: kv_mem (head_v_dim)
+  unsigned int ws_delta_idx; // workspace: delta (head_v_dim)
 };
 
 } // namespace causallm

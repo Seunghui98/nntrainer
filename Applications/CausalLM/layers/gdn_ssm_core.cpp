@@ -4,12 +4,11 @@
  *
  * @file   gdn_ssm_core.cpp
  * @date   9 April 2026
- * @brief  GDN SSM Core layer implementation with BLAS + SIMD optimization
+ * @brief  GDN SSM Core layer - optimized with SIMD + zero malloc hot path
  */
 
 #include <cmath>
 #include <cstring>
-#include <vector>
 
 #include <gdn_ssm_core.h>
 
@@ -23,211 +22,171 @@
 namespace causallm {
 
 // ============================================================
-// SIMD-optimized helper functions
+// SIMD helpers
 // ============================================================
 
 #ifdef __AVX2__
-static inline __m256 sigmoid_avx2(__m256 x) {
-  // sigmoid(x) = 1 / (1 + exp(-x))
-  // Approximate: use tanh-based identity: sigmoid(x) = 0.5*(1+tanh(x/2))
-  // For accuracy, use scalar exp path
+static inline __m256 fast_sigmoid_avx2(__m256 x) {
   alignas(32) float buf[8];
   _mm256_store_ps(buf, x);
   for (int i = 0; i < 8; ++i)
     buf[i] = 1.0f / (1.0f + std::exp(-buf[i]));
   return _mm256_load_ps(buf);
 }
-
-static inline __m256 silu_avx2(__m256 x) {
-  return _mm256_mul_ps(x, sigmoid_avx2(x));
-}
-#endif
-
-#ifdef __ARM_NEON
-static inline float32x4_t sigmoid_neon(float32x4_t x) {
-  alignas(16) float buf[4];
-  vst1q_f32(buf, x);
-  for (int i = 0; i < 4; ++i)
-    buf[i] = 1.0f / (1.0f + std::exp(-buf[i]));
-  return vld1q_f32(buf);
-}
-
-static inline float32x4_t silu_neon(float32x4_t x) {
-  return vmulq_f32(x, sigmoid_neon(x));
+static inline __m256 fast_silu_avx2(__m256 x) {
+  return _mm256_mul_ps(x, fast_sigmoid_avx2(x));
 }
 #endif
 
 static inline float softplus(float x) {
-  if (x > 20.0f)
-    return x;
-  return std::log(1.0f + std::exp(x));
+  return x > 20.0f ? x : std::log(1.0f + std::exp(x));
 }
-
 static inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 static inline float silu(float x) { return x * sigmoid(x); }
 
-// L2 normalize with SIMD
+// L2 normalize in-place
 static void l2_normalize(float *data, unsigned int len, float eps = 1e-6f) {
   float norm_sq = 0.0f;
   unsigned int i = 0;
-
 #ifdef __AVX2__
-  __m256 sum_v = _mm256_setzero_ps();
+  __m256 sv = _mm256_setzero_ps();
   for (; i + 7 < len; i += 8) {
     __m256 v = _mm256_loadu_ps(&data[i]);
-    sum_v = _mm256_fmadd_ps(v, v, sum_v);
+    sv = _mm256_fmadd_ps(v, v, sv);
   }
   alignas(32) float tmp[8];
-  _mm256_store_ps(tmp, sum_v);
+  _mm256_store_ps(tmp, sv);
   norm_sq = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
 #elif defined(__ARM_NEON)
-  float32x4_t sum_v = vdupq_n_f32(0);
+  float32x4_t sv = vdupq_n_f32(0);
   for (; i + 3 < len; i += 4) {
     float32x4_t v = vld1q_f32(&data[i]);
-    sum_v = vfmaq_f32(sum_v, v, v);
+    sv = vfmaq_f32(sv, v, v);
   }
-  norm_sq = vaddvq_f32(sum_v);
+  norm_sq = vaddvq_f32(sv);
 #endif
-  for (; i < len; ++i)
-    norm_sq += data[i] * data[i];
-
-  float inv_norm = 1.0f / std::sqrt(norm_sq + eps);
+  for (; i < len; ++i) norm_sq += data[i] * data[i];
+  float inv = 1.0f / std::sqrt(norm_sq + eps);
   i = 0;
-
 #ifdef __AVX2__
-  __m256 scale_v = _mm256_set1_ps(inv_norm);
-  for (; i + 7 < len; i += 8) {
-    __m256 v = _mm256_loadu_ps(&data[i]);
-    _mm256_storeu_ps(&data[i], _mm256_mul_ps(v, scale_v));
-  }
+  __m256 sc = _mm256_set1_ps(inv);
+  for (; i + 7 < len; i += 8)
+    _mm256_storeu_ps(&data[i], _mm256_mul_ps(_mm256_loadu_ps(&data[i]), sc));
 #elif defined(__ARM_NEON)
-  float32x4_t scale_v = vdupq_n_f32(inv_norm);
-  for (; i + 3 < len; i += 4) {
-    float32x4_t v = vld1q_f32(&data[i]);
-    vst1q_f32(&data[i], vmulq_f32(v, scale_v));
-  }
+  float32x4_t sc = vdupq_n_f32(inv);
+  for (; i + 3 < len; i += 4)
+    vst1q_f32(&data[i], vmulq_f32(vld1q_f32(&data[i]), sc));
 #endif
-  for (; i < len; ++i)
-    data[i] *= inv_norm;
+  for (; i < len; ++i) data[i] *= inv;
 }
 
-// Transposed matrix-vector: out = A^T @ x
-// A is (rows, cols) row-major, x is (rows,), out is (cols,)
-// out[j] = sum_i A[i][j] * x[i]
+// Transposed matvec: out = A^T @ x, A is (rows, cols) row-major
 static void matvec_transposed(const float *A, const float *x, float *out,
                               unsigned int rows, unsigned int cols) {
   std::memset(out, 0, cols * sizeof(float));
   for (unsigned int i = 0; i < rows; ++i) {
     const float *row = A + i * cols;
-    float x_val = x[i];
+    float xv = x[i];
     unsigned int j = 0;
 #ifdef __AVX2__
-    __m256 xv = _mm256_set1_ps(x_val);
+    __m256 xvv = _mm256_set1_ps(xv);
     for (; j + 7 < cols; j += 8) {
       __m256 o = _mm256_loadu_ps(&out[j]);
       __m256 a = _mm256_loadu_ps(&row[j]);
-      _mm256_storeu_ps(&out[j], _mm256_fmadd_ps(a, xv, o));
+      _mm256_storeu_ps(&out[j], _mm256_fmadd_ps(a, xvv, o));
     }
 #elif defined(__ARM_NEON)
-    float32x4_t xv = vdupq_n_f32(x_val);
+    float32x4_t xvv = vdupq_n_f32(xv);
     for (; j + 3 < cols; j += 4) {
       float32x4_t o = vld1q_f32(&out[j]);
       float32x4_t a = vld1q_f32(&row[j]);
-      vst1q_f32(&out[j], vfmaq_f32(o, a, xv));
+      vst1q_f32(&out[j], vfmaq_f32(o, a, xvv));
     }
 #endif
-    for (; j < cols; ++j)
-      out[j] += row[j] * x_val;
+    for (; j < cols; ++j) out[j] += row[j] * xv;
   }
 }
 
 // SSM state update: S = decay*S + outer(k, delta)
-// S is (head_k_dim, head_v_dim), row-major
 static void ssm_state_update(float *S, const float *k, const float *delta,
-                             float decay, unsigned int k_dim,
-                             unsigned int v_dim) {
+                             float decay, unsigned int k_dim, unsigned int v_dim) {
   for (unsigned int ki = 0; ki < k_dim; ++ki) {
-    float k_val = k[ki];
+    float kv = k[ki];
     float *row = S + ki * v_dim;
     unsigned int vi = 0;
-
 #ifdef __AVX2__
-    __m256 decay_v = _mm256_set1_ps(decay);
-    __m256 k_v = _mm256_set1_ps(k_val);
+    __m256 dv = _mm256_set1_ps(decay);
+    __m256 kvv = _mm256_set1_ps(kv);
     for (; vi + 7 < v_dim; vi += 8) {
       __m256 s = _mm256_loadu_ps(&row[vi]);
       __m256 d = _mm256_loadu_ps(&delta[vi]);
-      s = _mm256_fmadd_ps(k_v, d, _mm256_mul_ps(s, decay_v));
-      _mm256_storeu_ps(&row[vi], s);
+      _mm256_storeu_ps(&row[vi], _mm256_fmadd_ps(kvv, d, _mm256_mul_ps(s, dv)));
     }
 #elif defined(__ARM_NEON)
-    float32x4_t decay_v = vdupq_n_f32(decay);
-    float32x4_t k_v = vdupq_n_f32(k_val);
+    float32x4_t dv = vdupq_n_f32(decay);
+    float32x4_t kvv = vdupq_n_f32(kv);
     for (; vi + 3 < v_dim; vi += 4) {
       float32x4_t s = vld1q_f32(&row[vi]);
       float32x4_t d = vld1q_f32(&delta[vi]);
-      s = vfmaq_f32(vmulq_f32(s, decay_v), k_v, d);
-      vst1q_f32(&row[vi], s);
+      vst1q_f32(&row[vi], vfmaq_f32(vmulq_f32(s, dv), kvv, d));
     }
 #endif
     for (; vi < v_dim; ++vi)
-      row[vi] = decay * row[vi] + k_val * delta[vi];
+      row[vi] = decay * row[vi] + kv * delta[vi];
   }
 }
 
-// Gated RMS norm + SiLU: out = rms_norm(in, weight) * silu(z)
+// Fused gated RMS norm + SiLU: out = rms_norm(in, w) * silu(z)
 static void gated_rms_silu(const float *in, const float *z, float *out,
-                           const float *weight, unsigned int len,
-                           float eps = 1e-6f) {
-  // First compute RMS norm
+                           const float *w, unsigned int len, float eps = 1e-6f) {
   float sum_sq = 0.0f;
   unsigned int i = 0;
-
 #ifdef __AVX2__
-  __m256 sum_v = _mm256_setzero_ps();
+  __m256 sv = _mm256_setzero_ps();
   for (; i + 7 < len; i += 8) {
     __m256 v = _mm256_loadu_ps(&in[i]);
-    sum_v = _mm256_fmadd_ps(v, v, sum_v);
+    sv = _mm256_fmadd_ps(v, v, sv);
   }
   alignas(32) float tmp[8];
-  _mm256_store_ps(tmp, sum_v);
+  _mm256_store_ps(tmp, sv);
   sum_sq = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
 #elif defined(__ARM_NEON)
-  float32x4_t sum_v = vdupq_n_f32(0);
+  float32x4_t sv = vdupq_n_f32(0);
   for (; i + 3 < len; i += 4) {
     float32x4_t v = vld1q_f32(&in[i]);
-    sum_v = vfmaq_f32(sum_v, v, v);
+    sv = vfmaq_f32(sv, v, v);
   }
-  sum_sq = vaddvq_f32(sum_v);
+  sum_sq = vaddvq_f32(sv);
 #endif
-  for (; i < len; ++i)
-    sum_sq += in[i] * in[i];
-
+  for (; i < len; ++i) sum_sq += in[i] * in[i];
   float scale = 1.0f / std::sqrt(sum_sq / len + eps);
-
-  // Fused: out = (in * scale * weight) * silu(z)
   i = 0;
 #ifdef __AVX2__
-  __m256 scale_v = _mm256_set1_ps(scale);
+  __m256 sc = _mm256_set1_ps(scale);
   for (; i + 7 < len; i += 8) {
     __m256 x = _mm256_loadu_ps(&in[i]);
-    __m256 w = _mm256_loadu_ps(&weight[i]);
+    __m256 wv = _mm256_loadu_ps(&w[i]);
     __m256 zv = _mm256_loadu_ps(&z[i]);
-    __m256 normed = _mm256_mul_ps(_mm256_mul_ps(x, scale_v), w);
-    _mm256_storeu_ps(&out[i], _mm256_mul_ps(normed, silu_avx2(zv)));
+    __m256 normed = _mm256_mul_ps(_mm256_mul_ps(x, sc), wv);
+    _mm256_storeu_ps(&out[i], _mm256_mul_ps(normed, fast_silu_avx2(zv)));
   }
 #elif defined(__ARM_NEON)
-  float32x4_t scale_v = vdupq_n_f32(scale);
+  float32x4_t sc = vdupq_n_f32(scale);
   for (; i + 3 < len; i += 4) {
     float32x4_t x = vld1q_f32(&in[i]);
-    float32x4_t w = vld1q_f32(&weight[i]);
+    float32x4_t wv = vld1q_f32(&w[i]);
     float32x4_t zv = vld1q_f32(&z[i]);
-    float32x4_t normed = vmulq_f32(vmulq_f32(x, scale_v), w);
-    vst1q_f32(&out[i], vmulq_f32(normed, silu_neon(zv)));
+    // silu_neon inline
+    alignas(16) float sb[4];
+    vst1q_f32(sb, zv);
+    for (int j = 0; j < 4; ++j) sb[j] = 1.0f / (1.0f + std::exp(-sb[j]));
+    float32x4_t sig = vld1q_f32(sb);
+    float32x4_t normed = vmulq_f32(vmulq_f32(x, sc), wv);
+    vst1q_f32(&out[i], vmulq_f32(normed, vmulq_f32(zv, sig)));
   }
 #endif
   for (; i < len; ++i)
-    out[i] = in[i] * scale * weight[i] * silu(z[i]);
+    out[i] = in[i] * scale * w[i] * silu(z[i]);
 }
 
 // ============================================================
@@ -237,12 +196,11 @@ static void gated_rms_silu(const float *in, const float *z, float *out,
 GdnSsmCoreLayer::GdnSsmCoreLayer() :
   Layer(),
   ssm_props(props::SSMNumVHeads(), props::SSMHeadKDim(), props::SSMHeadVDim()),
-  num_v_heads(0),
-  head_k_dim(0),
-  head_v_dim(0),
-  key_dim(0),
-  value_dim(0),
-  state_idx(std::numeric_limits<unsigned int>::max()) {
+  num_v_heads(0), head_k_dim(0), head_v_dim(0), key_dim(0), value_dim(0),
+  state_idx(std::numeric_limits<unsigned int>::max()),
+  ws_qkv_idx(std::numeric_limits<unsigned int>::max()),
+  ws_kv_idx(std::numeric_limits<unsigned int>::max()),
+  ws_delta_idx(std::numeric_limits<unsigned int>::max()) {
   wt_idx.fill(std::numeric_limits<unsigned int>::max());
 }
 
@@ -256,12 +214,12 @@ void GdnSsmCoreLayer::finalize(nntrainer::InitLayerContext &context) {
   num_v_heads = std::get<props::SSMNumVHeads>(ssm_props).get();
   head_k_dim = std::get<props::SSMHeadKDim>(ssm_props).get();
   head_v_dim = std::get<props::SSMHeadVDim>(ssm_props).get();
-
   key_dim = num_v_heads * head_k_dim;
   value_dim = num_v_heads * head_v_dim;
 
   auto input_dims = context.getInputDimensions();
   unsigned int batch_size = input_dims[0].batch();
+  unsigned int conv_dim = input_dims[0].width();
 
   std::vector<nntrainer::TensorDim> output_dims(1);
   output_dims[0] = input_dims[0];
@@ -273,26 +231,40 @@ void GdnSsmCoreLayer::finalize(nntrainer::InitLayerContext &context) {
   auto act_type = nntrainer::TensorDim::TensorType(
     context.getFormat(), context.getActivationDataType());
 
+  // Weights
   wt_idx[W_A_LOG] = context.requestWeight(
     nntrainer::TensorDim(1, 1, 1, num_v_heads, wt_type),
-    nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE, 1.0f,
-    0.0f, "A_log", false);
-
+    nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE,
+    1.0f, 0.0f, "A_log", false);
   wt_idx[W_DT_BIAS] = context.requestWeight(
     nntrainer::TensorDim(1, 1, 1, num_v_heads, wt_type),
-    nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE, 1.0f,
-    0.0f, "dt_bias", false);
-
+    nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE,
+    1.0f, 0.0f, "dt_bias", false);
   wt_idx[W_NORM] = context.requestWeight(
     nntrainer::TensorDim(1, 1, 1, head_v_dim, wt_type),
-    nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE, 1.0f,
-    0.0f, "norm", false);
+    nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE,
+    1.0f, 0.0f, "norm", false);
 
+  // Recurrent state
   state_idx = context.requestTensor(
     nntrainer::TensorDim(batch_size, 1, num_v_heads * head_k_dim, head_v_dim,
                          act_type),
     "recurrent_state", nntrainer::Initializer::ZEROS, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
+
+  // Pre-allocated workspace tensors (ZERO malloc in hot path)
+  ws_qkv_idx = context.requestTensor(
+    nntrainer::TensorDim(1, 1, 1, conv_dim, act_type),
+    "ws_qkv", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  ws_kv_idx = context.requestTensor(
+    nntrainer::TensorDim(1, 1, 1, head_v_dim, act_type),
+    "ws_kv_mem", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  ws_delta_idx = context.requestTensor(
+    nntrainer::TensorDim(1, 1, 1, head_v_dim, act_type),
+    "ws_delta", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
 void GdnSsmCoreLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -307,32 +279,38 @@ void GdnSsmCoreLayer::incremental_forwarding(
   nntrainer::Tensor &b_tensor = context.getInput(2);
   nntrainer::Tensor &z_tensor = context.getInput(3);
   nntrainer::Tensor &output = context.getOutput(0);
-
   nntrainer::Tensor &recurrent_state = context.getTensor(state_idx);
 
   const float *a_log = context.getWeight(wt_idx[W_A_LOG]).getData<float>();
   const float *dt_bias = context.getWeight(wt_idx[W_DT_BIAS]).getData<float>();
   const float *norm_w = context.getWeight(wt_idx[W_NORM]).getData<float>();
 
+  // Pre-allocated workspace buffers (NO malloc in hot path)
+  float *qkv_buf = context.getTensor(ws_qkv_idx).getData<float>();
+  float *kv_mem = context.getTensor(ws_kv_idx).getData<float>();
+  float *delta = context.getTensor(ws_delta_idx).getData<float>();
+
   unsigned int batch_size = conv_out_tensor.getDim().batch();
   unsigned int seq_len = to - from;
   unsigned int conv_dim = conv_out_tensor.getDim().width();
 
+  // Stack-allocated small arrays (no malloc for 16 floats)
+  float beta_val[64];  // max 64 heads
+  float decay_val[64];
+
   for (unsigned int b = 0; b < batch_size; ++b) {
-    const float *conv_ptr =
-      conv_out_tensor.getData<float>() +
-      b * conv_out_tensor.getDim().getFeatureLen();
-    const float *a_ptr =
-      a_tensor.getData<float>() + b * a_tensor.getDim().getFeatureLen();
-    const float *b_ptr =
-      b_tensor.getData<float>() + b * b_tensor.getDim().getFeatureLen();
-    const float *z_ptr =
-      z_tensor.getData<float>() + b * z_tensor.getDim().getFeatureLen();
-    float *out_ptr =
-      output.getData<float>() + b * output.getDim().getFeatureLen();
-    float *state_ptr =
-      recurrent_state.getData<float>() +
-      b * recurrent_state.getDim().getFeatureLen();
+    const float *conv_ptr = conv_out_tensor.getData<float>() +
+                            b * conv_out_tensor.getDim().getFeatureLen();
+    const float *a_ptr = a_tensor.getData<float>() +
+                         b * a_tensor.getDim().getFeatureLen();
+    const float *b_ptr = b_tensor.getData<float>() +
+                         b * b_tensor.getDim().getFeatureLen();
+    const float *z_ptr = z_tensor.getData<float>() +
+                         b * z_tensor.getDim().getFeatureLen();
+    float *out_ptr = output.getData<float>() +
+                     b * output.getDim().getFeatureLen();
+    float *state_ptr = recurrent_state.getData<float>() +
+                       b * recurrent_state.getDim().getFeatureLen();
 
     for (unsigned int t = 0; t < seq_len; ++t) {
       const float *conv_t = conv_ptr + t * conv_dim;
@@ -341,21 +319,19 @@ void GdnSsmCoreLayer::incremental_forwarding(
       const float *z_t = z_ptr + t * value_dim;
       float *y = out_ptr + t * value_dim;
 
-      // Copy conv_out to mutable buffer, split into Q, K, V
-      std::vector<float> qkv_buf(conv_dim);
-      std::memcpy(qkv_buf.data(), conv_t, conv_dim * sizeof(float));
+      // Copy conv_out to workspace (pre-allocated, no malloc)
+      std::memcpy(qkv_buf, conv_t, conv_dim * sizeof(float));
+      float *q_data = qkv_buf;
+      float *k_data = qkv_buf + key_dim;
+      float *v_data = qkv_buf + 2 * key_dim;
 
-      float *q_data = qkv_buf.data();
-      float *k_data = qkv_buf.data() + key_dim;
-      float *v_data = qkv_buf.data() + 2 * key_dim;
-
-      // L2 normalize Q and K per head (SIMD-optimized)
+      // L2 normalize Q and K per head (batched)
       for (unsigned int h = 0; h < num_v_heads; ++h) {
         l2_normalize(q_data + h * head_k_dim, head_k_dim);
         l2_normalize(k_data + h * head_k_dim, head_k_dim);
       }
 
-      // Scale query
+      // Scale query (SIMD)
       float q_scale = 1.0f / std::sqrt((float)head_k_dim);
       unsigned int qi = 0;
 #ifdef __AVX2__
@@ -368,19 +344,16 @@ void GdnSsmCoreLayer::incremental_forwarding(
       for (; qi + 3 < key_dim; qi += 4)
         vst1q_f32(&q_data[qi], vmulq_f32(vld1q_f32(&q_data[qi]), qs));
 #endif
-      for (; qi < key_dim; ++qi)
-        q_data[qi] *= q_scale;
+      for (; qi < key_dim; ++qi) q_data[qi] *= q_scale;
 
-      // Compute beta and decay per head
-      std::vector<float> beta_val(num_v_heads);
-      std::vector<float> decay_val(num_v_heads);
+      // Beta and decay (stack arrays, no malloc)
       for (unsigned int h = 0; h < num_v_heads; ++h) {
         beta_val[h] = sigmoid(b_t[h]);
         float g = -std::exp(a_log[h]) * softplus(a_t[h] + dt_bias[h]);
         decay_val[h] = std::exp(g);
       }
 
-      // SSM state update + output per head (BLAS + SIMD optimized)
+      // Per-head SSM (workspace reused across heads)
       for (unsigned int h = 0; h < num_v_heads; ++h) {
         float *S = state_ptr + h * head_k_dim * head_v_dim;
         const float *q_h = q_data + h * head_k_dim;
@@ -390,40 +363,37 @@ void GdnSsmCoreLayer::incremental_forwarding(
         float beta_h = beta_val[h];
         float *o_h = y + h * head_v_dim;
 
-        // kv_mem = S^T @ k (SIMD optimized matvec)
-        std::vector<float> kv_mem(head_v_dim, 0.0f);
-        matvec_transposed(S, k_h, kv_mem.data(), head_k_dim, head_v_dim);
+        // kv_mem = S^T @ k (reuse workspace)
+        matvec_transposed(S, k_h, kv_mem, head_k_dim, head_v_dim);
 
-        // delta = beta * (v - kv_mem)
-        std::vector<float> delta(head_v_dim);
+        // delta = beta * (v - kv_mem) (reuse workspace, SIMD)
         unsigned int vi = 0;
 #ifdef __AVX2__
-        __m256 beta_v = _mm256_set1_ps(beta_h);
+        __m256 bv = _mm256_set1_ps(beta_h);
         for (; vi + 7 < head_v_dim; vi += 8) {
           __m256 vv = _mm256_loadu_ps(&v_h[vi]);
           __m256 km = _mm256_loadu_ps(&kv_mem[vi]);
-          _mm256_storeu_ps(&delta[vi],
-                           _mm256_mul_ps(beta_v, _mm256_sub_ps(vv, km)));
+          _mm256_storeu_ps(&delta[vi], _mm256_mul_ps(bv, _mm256_sub_ps(vv, km)));
         }
 #elif defined(__ARM_NEON)
-        float32x4_t beta_v = vdupq_n_f32(beta_h);
+        float32x4_t bv = vdupq_n_f32(beta_h);
         for (; vi + 3 < head_v_dim; vi += 4) {
           float32x4_t vv = vld1q_f32(&v_h[vi]);
           float32x4_t km = vld1q_f32(&kv_mem[vi]);
-          vst1q_f32(&delta[vi], vmulq_f32(beta_v, vsubq_f32(vv, km)));
+          vst1q_f32(&delta[vi], vmulq_f32(bv, vsubq_f32(vv, km)));
         }
 #endif
         for (; vi < head_v_dim; ++vi)
           delta[vi] = beta_h * (v_h[vi] - kv_mem[vi]);
 
-        // S = decay*S + outer(k, delta) (SIMD optimized hot loop)
-        ssm_state_update(S, k_h, delta.data(), decay, head_k_dim, head_v_dim);
+        // S = decay*S + outer(k, delta)
+        ssm_state_update(S, k_h, delta, decay, head_k_dim, head_v_dim);
 
-        // o = S^T @ q (SIMD optimized matvec)
+        // o = S^T @ q
         matvec_transposed(S, q_h, o_h, head_k_dim, head_v_dim);
       }
 
-      // Gated RMS norm + SiLU (fused, SIMD optimized)
+      // Gated RMS norm + SiLU (per head, fused SIMD)
       for (unsigned int h = 0; h < num_v_heads; ++h) {
         gated_rms_silu(y + h * head_v_dim, z_t + h * head_v_dim,
                        y + h * head_v_dim, norm_w, head_v_dim);
@@ -451,9 +421,7 @@ void GdnSsmCoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
 }
 
 #ifdef PLUGGABLE
-nntrainer::Layer *create_gdn_ssm_core_layer() {
-  return new GdnSsmCoreLayer();
-}
+nntrainer::Layer *create_gdn_ssm_core_layer() { return new GdnSsmCoreLayer(); }
 void destroy_gdn_ssm_core_layer(nntrainer::Layer *layer) { delete layer; }
 extern "C" {
 nntrainer::LayerPluggable ml_train_layer_pluggable{
