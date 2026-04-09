@@ -115,16 +115,11 @@ void Qwen3_5Transformer::constructModel() {
   // Use addLayer API (not Tensor API) to match support_qwen3_5_1 branch.
   // The topological sort produces different layer ordering between the two APIs,
   // which causes weight loading misalignment.
+  //
+  // NOTE: Only add layers here. setProperty/compile/initialize are called
+  // by Qwen3_5CausalLM::constructModel() after lm_head is added,
+  // matching the old support_qwen3_5_1 flow.
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
-
-  std::vector<std::string> model_props = {
-    withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
-    withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
-  if (MEMORY_SWAP) {
-    model_props.emplace_back(withKey("fsu", "true"));
-    model_props.emplace_back(withKey("fsu_lookahead", FSU_LOOKAHEAD));
-  }
-  model->setProperty(model_props);
 
   std::vector<LayerHandle> layers;
 
@@ -418,7 +413,18 @@ void Qwen3_5CausalLM::constructModel() {
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
   model->addLayer(createLayer(lmhead_type, lmhead_prop));
 
-  // Compile and initialize (addLayer API requires explicit compile/init)
+  // Set model properties AFTER addLayer, BEFORE compile
+  // (matches support_qwen3_5_1 flow: constructModel → setProperty → compile → init)
+  std::vector<std::string> model_props = {
+    withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
+    withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
+  if (MEMORY_SWAP) {
+    model_props.emplace_back(withKey("fsu", "true"));
+    model_props.emplace_back(withKey("fsu_lookahead", FSU_LOOKAHEAD));
+  }
+  model->setProperty(model_props);
+
+  // Compile and initialize
   if (model->compile(ml::train::ExecutionMode::INFERENCE)) {
     throw std::invalid_argument("Qwen3.5 model compilation failed.");
   }
