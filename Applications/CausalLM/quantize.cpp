@@ -207,8 +207,7 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       } else {
         // Linear attention (GDN) decomposed FC layers
         dtype_map[prefix + "_gdn_in_proj_qkv"] = fc_dtype;
-        dtype_map[prefix + "_gdn_in_proj_a"] = fc_dtype;
-        dtype_map[prefix + "_gdn_in_proj_b"] = fc_dtype;
+        // in_proj_a/b: width=num_v_heads(16), not divisible by 32 → skip Q4_0
         dtype_map[prefix + "_gdn_in_proj_z"] = fc_dtype;
         dtype_map[prefix + "_gdn_out_proj"] = fc_dtype;
       }
