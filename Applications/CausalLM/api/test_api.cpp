@@ -71,6 +71,34 @@ void printInfo(const std::string &label, const std::string &value) {
             << "\n";
 }
 
+/**
+ * @brief User-data passed to onStreamDelta() for accumulating the
+ *        streamed generation.
+ */
+struct StreamCollector {
+  std::string accumulated;
+  size_t delta_count = 0;
+};
+
+/**
+ * @brief CausalLmTokenCallback implementation: prints each decoded
+ *        delta immediately and stashes a copy in @p user_data.
+ *
+ * Returning 0 continues generation; returning non-zero would ask the
+ * native runner to cancel at the next token boundary.
+ */
+int onStreamDelta(const char *delta, void *user_data) {
+  auto *col = static_cast<StreamCollector *>(user_data);
+  if (delta != nullptr) {
+    std::cout << delta << std::flush;
+    if (col != nullptr) {
+      col->accumulated.append(delta);
+      col->delta_count += 1;
+    }
+  }
+  return 0;
+}
+
 void printLogo() {
   std::cout << "\n";
   std::cout << COLOR_BOLD << COLOR_MAGENTA;
@@ -94,8 +122,8 @@ void printUsage(const char *program_name) {
             << " <model_name> [prompt] [use_chat_template] [quantization] "
                "[verbose] \n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " <model_name> --chat-file <path.json> [quantization] "
-               "[verbose] \n\n";
+            << " <model_name> --chat-file <path.json> [--template name] "
+               "[quantization] [verbose] \n\n";
 
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
   std::cout << "  model_name        " << COLOR_BOLD << "REQUIRED" << COLOR_RESET
@@ -106,6 +134,9 @@ void printUsage(const char *program_name) {
   std::cout << "  --chat-file       " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
             << "  - JSON file with chat messages [{role, content}, ...]\n";
+  std::cout << "  --template        " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - Template name (e.g., default, tool_use)\n";
   std::cout << "  use_chat_template " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET << "  - 0/1 or true/false (default: 1)\n";
   std::cout << "  quantization      " << COLOR_GREEN << "OPTIONAL"
@@ -118,7 +149,9 @@ void printUsage(const char *program_name) {
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B --chat-file chat.json W32A32 1\n\n";
+            << " QWEN3-0.6B --chat-file chat.json W32A32 1\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
 
   std::cout << COLOR_YELLOW << "Chat file format (JSON):" << COLOR_RESET
             << "\n";
@@ -151,8 +184,7 @@ int main(int argc, char *argv[]) {
   std::string template_name = "default";
 
   // Parse --chat-file mode: <model> --chat-file <path> [--template name]
-  // [quant]
-  //                          [verbose]
+  // [quant] [verbose]
   if (argc >= 4 && std::string(argv[2]) == "--chat-file") {
     chat_file_path = argv[3];
     use_chat_template = true;
@@ -245,9 +277,10 @@ int main(int argc, char *argv[]) {
               << "\n";
   }
 
-  err = loadModel(CAUSAL_LM_BACKEND_CPU, model_type, quant_type);
+  CausalLmHandle handle = nullptr;
+  err = loadModelHandle(CAUSAL_LM_BACKEND_CPU, model_type, quant_type, &handle);
 
-  if (err != CAUSAL_LM_ERROR_NONE) {
+  if (err != CAUSAL_LM_ERROR_NONE || handle == nullptr) {
     printError("Failed to load model");
     std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
     return 1;
@@ -264,6 +297,7 @@ int main(int argc, char *argv[]) {
     std::ifstream chat_file(chat_file_path);
     if (!chat_file.is_open()) {
       printError("Cannot open chat file: " + chat_file_path);
+      destroyModelHandle(handle);
       return 1;
     }
 
@@ -272,6 +306,7 @@ int main(int argc, char *argv[]) {
       chat_file >> chat_json;
     } catch (const json::parse_error &e) {
       printError("JSON parse error: " + std::string(e.what()));
+      destroyModelHandle(handle);
       return 1;
     }
 
@@ -286,6 +321,7 @@ int main(int argc, char *argv[]) {
       messages_json = chat_json["chat"];
     } else {
       printError("Chat file must contain a JSON array or {\"chat\": [...]}");
+      destroyModelHandle(handle);
       return 1;
     }
 
@@ -308,7 +344,7 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "\n";
 
-    // Test applyChatTemplate with file messages
+    // Test applyChatTemplate with file messages (format only, no inference)
     const char *formattedText = nullptr;
     err = applyChatTemplate(file_msgs.data(), file_msgs.size(), true,
                             &formattedText);
@@ -322,154 +358,71 @@ int main(int argc, char *argv[]) {
       std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
     }
 
-    // Test runModelWithMessages with file messages
-    printSection("Test: runModelWithMessages from File");
-    std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
-              << "Running inference with messages...\n\n";
+    // Test inference with formatted prompt via streaming API
+    if (formattedText != nullptr) {
+      printSection("Test: Streaming Inference with Chat Template");
+      std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+                << "Running inference with formatted prompt...\n\n";
 
-    const char *msgOutput = nullptr;
-    if (verbose) {
       std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
-      std::cout << COLOR_BOLD << COLOR_GRAY;
-    }
+      std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
 
-    err = runModelWithMessages(file_msgs.data(), file_msgs.size(), true,
-                               &msgOutput);
+      StreamCollector collector;
+      err = runModelHandleStreaming(handle, formattedText, &onStreamDelta,
+                                   &collector);
 
-    if (verbose) {
       std::cout << COLOR_RESET << "\n\n";
+
+      if (err == CAUSAL_LM_ERROR_NONE && !collector.accumulated.empty()) {
+        printInfo("Streamed deltas", std::to_string(collector.delta_count));
+        printInfo("Total bytes",
+                  std::to_string(collector.accumulated.size()) + " bytes");
+        printSuccess("Chat template streaming inference works");
+      } else {
+        printError("Streaming inference failed");
+        std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+      }
     }
 
-    if (err == CAUSAL_LM_ERROR_NONE && msgOutput) {
-      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
-      std::cout << COLOR_BOLD << COLOR_GREEN << "  " << msgOutput << COLOR_RESET
-                << "\n\n";
-      printSuccess("runModelWithMessages works");
-    } else {
-      printError("runModelWithMessages failed");
-      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
-    }
-
-    // Skip to performance metrics
-    goto print_metrics;
-  }
-
-  // ── Test 1: applyChatTemplate (no inference, format only) ──
-  {
-    printSection("Test: applyChatTemplate");
-    std::cout << COLOR_CYAN << "📝 " << COLOR_RESET
-              << "Testing chat template formatting (no inference)...\n\n";
-
-    CausalLMChatMessage tmpl_msgs[] = {
-      {"system", "You are a helpful AI assistant."}, {"user", prompt}};
-
-    const char *formattedText = nullptr;
-    err = applyChatTemplate(tmpl_msgs, 2, true, &formattedText);
-    if (err == CAUSAL_LM_ERROR_NONE && formattedText) {
-      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Formatted prompt:\n";
-      std::cout << COLOR_BOLD << COLOR_YELLOW << formattedText << COLOR_RESET
-                << "\n\n";
-      printSuccess("applyChatTemplate works");
-    } else {
-      printError("applyChatTemplate failed");
-      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
-    }
-
-    // ── Test 2: runModel (single prompt, existing API) ──
-    printSection("Test: runModel (single prompt)");
+  } else {
+    // ── Normal mode: streaming inference with single prompt ──
+    printSection("Inference (Streaming)");
     std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
     std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
               << "\n\n";
 
     std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
-              << "Running inference...\n\n";
+              << "Running inference via runModelHandleStreaming()...\n\n";
 
-    const char *outputText = nullptr;
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
 
-    if (verbose) {
-      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
-      std::cout << COLOR_BOLD << COLOR_GRAY;
-    }
+    StreamCollector collector;
+    err = runModelHandleStreaming(handle, prompt, &onStreamDelta, &collector);
 
-    err = runModel(prompt, &outputText);
-
-    if (verbose) {
-      std::cout << COLOR_RESET << "\n\n";
-    }
+    std::cout << COLOR_RESET << "\n\n";
 
     if (err != CAUSAL_LM_ERROR_NONE) {
       printError("Failed to run model");
       std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+      destroyModelHandle(handle);
       return 1;
     }
 
-    if (outputText) {
-      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
-      std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
-      std::string out(outputText);
-      size_t pos = 0;
-      while (pos < out.length()) {
-        size_t newlinePos = out.find('\n', pos);
-        if (newlinePos == std::string::npos) {
-          newlinePos = out.length();
-        }
-        std::string line = out.substr(pos, newlinePos - pos);
-        std::cout << line;
-        if (newlinePos < out.length()) {
-          std::cout << "\n  ";
-          pos = newlinePos + 1;
-        } else {
-          pos = out.length();
-        }
-      }
-      std::cout << COLOR_RESET << "\n\n";
-    } else {
+    if (collector.accumulated.empty()) {
       printWarning("No output generated");
-    }
-
-    // ── Test 3: runModelWithMessages (chat template with messages) ──
-    printSection("Test: runModelWithMessages");
-    CausalLMChatMessage chat_msgs[] = {
-      {"system", "You are a helpful AI assistant."}, {"user", prompt}};
-
-    std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Messages:\n";
-    for (size_t i = 0; i < 2; ++i) {
-      std::cout << COLOR_YELLOW << "  [" << chat_msgs[i].role << "] "
-                << COLOR_RESET << chat_msgs[i].content << "\n";
-    }
-    std::cout << "\n";
-
-    std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
-              << "Running inference with messages...\n\n";
-
-    const char *msgOutput = nullptr;
-
-    if (verbose) {
-      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
-      std::cout << COLOR_BOLD << COLOR_GRAY;
-    }
-
-    err = runModelWithMessages(chat_msgs, 2, true, &msgOutput);
-
-    if (verbose) {
-      std::cout << COLOR_RESET << "\n\n";
-    }
-
-    if (err == CAUSAL_LM_ERROR_NONE && msgOutput) {
-      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
-      std::cout << COLOR_BOLD << COLOR_GREEN << "  " << msgOutput << COLOR_RESET
-                << "\n\n";
-      printSuccess("runModelWithMessages works");
     } else {
-      printError("runModelWithMessages failed");
-      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+      printInfo("Streamed deltas", std::to_string(collector.delta_count));
+      printInfo("Total bytes",
+                std::to_string(collector.accumulated.size()) + " bytes");
+      std::cout << "\n";
     }
-  } // end of normal mode tests
+  }
 
-print_metrics:
+  // ── Performance Metrics ──
   printSection("Performance Metrics");
   PerformanceMetrics metrics;
-  err = getPerformanceMetrics(&metrics);
+  err = getPerformanceMetricsHandle(handle, &metrics);
   if (err != CAUSAL_LM_ERROR_NONE) {
     printWarning("Failed to get metrics");
     std::cout << "  Error code: " << static_cast<int>(err) << "\n";
@@ -516,6 +469,8 @@ print_metrics:
     std::cout << COLOR_CYAN << "    Peak Mem:" << COLOR_RESET << "     "
               << metrics.peak_memory_kb / 1024 << " MB\n\n";
   }
+
+  destroyModelHandle(handle);
 
   printLine("═", 63);
   std::cout << COLOR_BOLD << COLOR_GREEN << "  ✓ Test completed successfully!"
