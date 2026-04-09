@@ -164,10 +164,10 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         save_projection(f"{prefix}o_proj.weight", transpose=True)
 
     def save_feed_forward(layer_prefix):
-        """Save MLP weights: gate_proj, up_proj, down_proj
+        """Save MLP weights: up_proj, gate_proj, down_proj
         NOTE: Must match createMlp() layer creation order (gate first, then up)
         """
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
+        for proj in ["up_proj", "gate_proj", "down_proj"]:
             save_projection(f"{layer_prefix}mlp.{proj}.weight", transpose=True)
     
     # === Save weights in NNTrainer layer creation order ===
