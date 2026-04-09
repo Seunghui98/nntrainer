@@ -58,54 +58,52 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         print(f"  {key}: {params[key].shape}")
 
     def save_linear_attn(layer_prefix):
-        """Save Gated DeltaNet (linear attention) layer weights.
+        """Save decomposed GDN (linear attention) weights.
 
-        Weight order must match GatedDeltaNetLayer::finalize() weight request order:
-          0: in_proj_qkv  (conv_dim, hidden_size) -> transposed to (hidden_size, conv_dim)
-          1: conv1d        (conv_dim, 1, conv_kernel) -> reshaped to (conv_dim, conv_kernel)
-          2: A_log          (num_v_heads)
-          3: dt_bias        (num_v_heads)
-          4: in_proj_a     (num_v_heads, hidden_size) -> transposed
-          5: in_proj_b     (num_v_heads, hidden_size) -> transposed
-          6: in_proj_z     (value_dim, hidden_size) -> transposed
-          7: norm           (head_v_dim)
-          8: out_proj      (hidden_size, value_dim) -> transposed
+        Decomposed into separate layers:
+          FC: in_proj_qkv  (fully_connected weight)
+          CausalConv1D:    conv1d kernel
+          FC: in_proj_a    (fully_connected weight)
+          FC: in_proj_b    (fully_connected weight)
+          FC: in_proj_z    (fully_connected weight)
+          GdnSsmCore:      A_log, dt_bias, norm
+          FC: out_proj     (fully_connected weight)
+
+        Order must match topological sort of addLayer graph.
         """
         prefix = f"{layer_prefix}linear_attn."
 
-        # in_proj_qkv: (conv_dim, hidden_size) -> (hidden_size, conv_dim)
+        # 1. FC: in_proj_qkv (hidden_size, conv_dim)
         save_projection(f"{prefix}in_proj_qkv.weight", transpose=True)
 
-        # conv1d: (conv_dim, 1, conv_kernel) -> flatten to (conv_dim, conv_kernel)
+        # 2. CausalConv1D: conv kernel (conv_dim, conv_kernel)
         conv_w = params[f"{prefix}conv1d.weight"]
         conv_w = conv_w.squeeze(1)  # (conv_dim, conv_kernel)
         save_weight(conv_w)
         print(f"  {prefix}conv1d.weight: {params[f'{prefix}conv1d.weight'].shape} -> {conv_w.shape}")
 
-        # A_log: (num_v_heads)
+        # 3. FC: in_proj_a (hidden_size, num_v_heads)
+        save_projection(f"{prefix}in_proj_a.weight", transpose=True)
+
+        # 4. FC: in_proj_b (hidden_size, num_v_heads)
+        save_projection(f"{prefix}in_proj_b.weight", transpose=True)
+
+        # 5. FC: in_proj_z (hidden_size, value_dim)
+        save_projection(f"{prefix}in_proj_z.weight", transpose=True)
+
+        # 6. GdnSsmCore: A_log (num_v_heads)
         save_weight(params[f"{prefix}A_log"])
         print(f"  {prefix}A_log: {params[f'{prefix}A_log'].shape}")
 
-        # dt_bias: (num_v_heads)
+        # 7. GdnSsmCore: dt_bias (num_v_heads)
         save_weight(params[f"{prefix}dt_bias"])
         print(f"  {prefix}dt_bias: {params[f'{prefix}dt_bias'].shape}")
 
-        # in_proj_a: (num_v_heads, hidden_size) -> (hidden_size, num_v_heads)
-        save_projection(f"{prefix}in_proj_a.weight", transpose=True)
-
-        # in_proj_b: (num_v_heads, hidden_size) -> (hidden_size, num_v_heads)
-        save_projection(f"{prefix}in_proj_b.weight", transpose=True)
-
-        # in_proj_z: (value_dim, hidden_size) -> (hidden_size, value_dim)
-        save_projection(f"{prefix}in_proj_z.weight", transpose=True)
-
-        # norm: (head_v_dim) - Qwen3_5RMSNormGated uses weight directly (NO +1.0)
-        # Unlike Qwen3_5RMSNorm which uses (1+weight), the gated norm is
-        # initialized to torch.ones and uses self.weight directly.
+        # 8. GdnSsmCore: norm (head_v_dim, NO +1.0)
         save_weight(params[f"{prefix}norm.weight"])
         print(f"  {prefix}norm.weight (no +1.0): {params[f'{prefix}norm.weight'].shape}")
 
-        # out_proj: (hidden_size, value_dim) -> (value_dim, hidden_size)
+        # 9. FC: out_proj (value_dim, hidden_size)
         save_projection(f"{prefix}out_proj.weight", transpose=True)
 
     def save_self_attn(layer_prefix):

@@ -17,7 +17,8 @@
 #include <app_context.h>
 #include <engine.h>
 #include <attn_gate.h>
-#include <gated_delta_net.h>
+#include <causal_conv1d.h>
+#include <gdn_ssm_core.h>
 #include <reshaped_rms_norm.h>
 
 namespace causallm {
@@ -312,55 +313,110 @@ std::vector<LayerHandle>
 Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
                                                std::string input_name) {
   std::vector<LayerHandle> layers;
+  auto prefix = "layer" + std::to_string(layer_id);
+  auto norm_name = prefix + "_attention_norm";
+  unsigned int conv_dim = 2 * LINEAR_NUM_V_HEADS * LINEAR_HEAD_K_DIM +
+                          LINEAR_NUM_V_HEADS * LINEAR_HEAD_V_DIM;
 
   // Input layernorm
   layers.push_back(createLayer(
     "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+    {withKey("name", norm_name),
      withKey("input_layers", input_name),
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false")}));
 
-  // Gated DeltaNet layer (linear attention)
+  // === Decomposed GDN: 5 FCs + causal_conv1d + gdn_ssm_core ===
+
+  // FC: in_proj_qkv (hidden → conv_dim)
   layers.push_back(createLayer(
-    "gated_delta_net",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_linear_attn"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("num_v_heads", LINEAR_NUM_V_HEADS),
-     withKey("head_k_dim", LINEAR_HEAD_K_DIM),
-     withKey("head_v_dim", LINEAR_HEAD_V_DIM),
-     withKey("conv_kernel", LINEAR_CONV_KERNEL)}));
+    "fully_connected",
+    {withKey("name", prefix + "_gdn_in_proj_qkv"),
+     withKey("unit", conv_dim),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", norm_name),
+     withKey("weight_initializer", "ones")}));
+
+  // Causal Conv1D + SiLU
+  layers.push_back(createLayer(
+    "causal_conv1d",
+    {withKey("name", prefix + "_gdn_conv1d"),
+     withKey("input_layers", prefix + "_gdn_in_proj_qkv"),
+     withKey("conv_channels", conv_dim),
+     withKey("conv_kernel_size", LINEAR_CONV_KERNEL)}));
+
+  // FC: in_proj_a (hidden → num_v_heads)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_gdn_in_proj_a"),
+     withKey("unit", LINEAR_NUM_V_HEADS),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", norm_name),
+     withKey("weight_initializer", "ones")}));
+
+  // FC: in_proj_b (hidden → num_v_heads)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_gdn_in_proj_b"),
+     withKey("unit", LINEAR_NUM_V_HEADS),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", norm_name),
+     withKey("weight_initializer", "ones")}));
+
+  // FC: in_proj_z (hidden → value_dim)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_gdn_in_proj_z"),
+     withKey("unit", LINEAR_NUM_V_HEADS * LINEAR_HEAD_V_DIM),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", norm_name),
+     withKey("weight_initializer", "ones")}));
+
+  // GDN SSM Core (takes 4 inputs: conv_out, a, b, z)
+  layers.push_back(createLayer(
+    "gdn_ssm_core",
+    {withKey("name", prefix + "_gdn_ssm"),
+     withKey("input_layers", prefix + "_gdn_conv1d," +
+                             prefix + "_gdn_in_proj_a," +
+                             prefix + "_gdn_in_proj_b," +
+                             prefix + "_gdn_in_proj_z"),
+     withKey("ssm_num_v_heads", LINEAR_NUM_V_HEADS),
+     withKey("ssm_head_k_dim", LINEAR_HEAD_K_DIM),
+     withKey("ssm_head_v_dim", LINEAR_HEAD_V_DIM)}));
+
+  // FC: out_proj (value_dim → hidden)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_gdn_out_proj"),
+     withKey("unit", DIM),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", prefix + "_gdn_ssm"),
+     withKey("weight_initializer", "ones")}));
 
   // Residual add
   layers.push_back(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
-     withKey("input_layers",
-             input_name + ",layer" + std::to_string(layer_id) +
-               "_linear_attn")}));
+    {withKey("name", prefix + "_decoder_add"),
+     withKey("input_layers", input_name + "," + prefix + "_gdn_out_proj")}));
 
   // FFN norm
   layers.push_back(createLayer(
     "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_decoder_add"),
+    {withKey("name", prefix + "_ffn_norm"),
+     withKey("input_layers", prefix + "_decoder_add"),
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false")}));
 
   // MLP
   auto ffn_layer = createMlp(layer_id, DIM, INTERMEDIATE_SIZE,
-                             "layer" + std::to_string(layer_id) + "_ffn_norm");
+                             prefix + "_ffn_norm");
   layers.insert(layers.end(), ffn_layer.begin(), ffn_layer.end());
 
   // Residual add
   layers.push_back(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) +
-                               "_decoder_add,layer" + std::to_string(layer_id) +
-                               "_ffn_down")}));
+    {withKey("name", prefix + "_decoder_output"),
+     withKey("input_layers", prefix + "_decoder_add," + prefix + "_ffn_down")}));
 
   return layers;
 }
@@ -380,7 +436,15 @@ void Qwen3_5Transformer::registerCustomLayers() {
 
   try {
     app_context->registerFactory(
-      nntrainer::createLayer<causallm::GatedDeltaNetLayer>);
+      nntrainer::createLayer<causallm::CausalConv1dLayer>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register factory, reason: " << e.what()
+              << std::endl;
+  }
+
+  try {
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::GdnSsmCoreLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

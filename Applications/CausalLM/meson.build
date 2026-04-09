@@ -31,6 +31,8 @@ causallm_layer_dependencies += [
     causallm_embedding_normalize_layer_dep,
     causallm_gated_delta_net_dep,
     causallm_attn_gate_dep,
+    causallm_causal_conv1d_dep,
+    causallm_gdn_ssm_core_dep,
 ]
 
 subdir('models')
