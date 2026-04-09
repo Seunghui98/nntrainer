@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include <gdn_ssm_core.h>
+#include <thread_manager.h>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -353,51 +354,58 @@ void GdnSsmCoreLayer::incremental_forwarding(
         decay_val[h] = std::exp(g);
       }
 
-      // Per-head SSM (workspace reused across heads)
-      for (unsigned int h = 0; h < num_v_heads; ++h) {
-        float *S = state_ptr + h * head_k_dim * head_v_dim;
-        const float *q_h = q_data + h * head_k_dim;
-        const float *k_h = k_data + h * head_k_dim;
-        const float *v_h = v_data + h * head_v_dim;
-        float decay = decay_val[h];
-        float beta_h = beta_val[h];
-        float *o_h = y + h * head_v_dim;
+      // Per-head SSM + gated RMS norm (ThreadManager parallelized)
+      // Each head is fully independent: separate S, q, k, v, output regions.
+      // kv_mem/delta are thread-local (stack-allocated per lambda).
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(
+        0, static_cast<size_t>(num_v_heads), [=](size_t h) {
+          float *S = state_ptr + h * head_k_dim * head_v_dim;
+          const float *q_h = q_data + h * head_k_dim;
+          const float *k_h = k_data + h * head_k_dim;
+          const float *v_h = v_data + h * head_v_dim;
+          float decay = decay_val[h];
+          float beta_h = beta_val[h];
+          float *o_h = y + h * head_v_dim;
 
-        // kv_mem = S^T @ k (reuse workspace)
-        matvec_transposed(S, k_h, kv_mem, head_k_dim, head_v_dim);
+          // Thread-local workspace (stack, no malloc)
+          float local_kv_mem[256]; // head_v_dim <= 256
+          float local_delta[256];
 
-        // delta = beta * (v - kv_mem) (reuse workspace, SIMD)
-        unsigned int vi = 0;
+          // kv_mem = S^T @ k
+          matvec_transposed(S, k_h, local_kv_mem, head_k_dim, head_v_dim);
+
+          // delta = beta * (v - kv_mem) (SIMD)
+          unsigned int vi = 0;
 #ifdef __AVX2__
-        __m256 bv = _mm256_set1_ps(beta_h);
-        for (; vi + 7 < head_v_dim; vi += 8) {
-          __m256 vv = _mm256_loadu_ps(&v_h[vi]);
-          __m256 km = _mm256_loadu_ps(&kv_mem[vi]);
-          _mm256_storeu_ps(&delta[vi], _mm256_mul_ps(bv, _mm256_sub_ps(vv, km)));
-        }
+          __m256 bv = _mm256_set1_ps(beta_h);
+          for (; vi + 7 < head_v_dim; vi += 8) {
+            __m256 vv = _mm256_loadu_ps(&v_h[vi]);
+            __m256 km = _mm256_loadu_ps(&local_kv_mem[vi]);
+            _mm256_storeu_ps(&local_delta[vi],
+                             _mm256_mul_ps(bv, _mm256_sub_ps(vv, km)));
+          }
 #elif defined(__ARM_NEON)
-        float32x4_t bv = vdupq_n_f32(beta_h);
-        for (; vi + 3 < head_v_dim; vi += 4) {
-          float32x4_t vv = vld1q_f32(&v_h[vi]);
-          float32x4_t km = vld1q_f32(&kv_mem[vi]);
-          vst1q_f32(&delta[vi], vmulq_f32(bv, vsubq_f32(vv, km)));
-        }
+          float32x4_t bv = vdupq_n_f32(beta_h);
+          for (; vi + 3 < head_v_dim; vi += 4) {
+            float32x4_t vv = vld1q_f32(&v_h[vi]);
+            float32x4_t km = vld1q_f32(&local_kv_mem[vi]);
+            vst1q_f32(&local_delta[vi],
+                       vmulq_f32(bv, vsubq_f32(vv, km)));
+          }
 #endif
-        for (; vi < head_v_dim; ++vi)
-          delta[vi] = beta_h * (v_h[vi] - kv_mem[vi]);
+          for (; vi < head_v_dim; ++vi)
+            local_delta[vi] = beta_h * (v_h[vi] - local_kv_mem[vi]);
 
-        // S = decay*S + outer(k, delta)
-        ssm_state_update(S, k_h, delta, decay, head_k_dim, head_v_dim);
+          // S = decay*S + outer(k, delta)
+          ssm_state_update(S, k_h, local_delta, decay, head_k_dim, head_v_dim);
 
-        // o = S^T @ q
-        matvec_transposed(S, q_h, o_h, head_k_dim, head_v_dim);
-      }
+          // o = S^T @ q
+          matvec_transposed(S, q_h, o_h, head_k_dim, head_v_dim);
 
-      // Gated RMS norm + SiLU (per head, fused SIMD)
-      for (unsigned int h = 0; h < num_v_heads; ++h) {
-        gated_rms_silu(y + h * head_v_dim, z_t + h * head_v_dim,
-                       y + h * head_v_dim, norm_w, head_v_dim);
-      }
+          // Gated RMS norm + SiLU (fused, in-place)
+          gated_rms_silu(o_h, z_t + h * head_v_dim, o_h, norm_w, head_v_dim);
+        });
     }
   }
 }
