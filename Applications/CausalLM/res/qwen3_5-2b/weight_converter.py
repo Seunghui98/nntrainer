@@ -132,21 +132,9 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         q_gate = torch.cat(q_gate_rows, dim=0)    # (2048, 2048)
 
         # NNTrainer execution order for self-attn block:
-        # layer_wq_gate -> layer_wq -> layer_q_norm -> layer_wk -> layer_k_norm -> layer_wv -> layer_attention_out
 
-        # 1) q_gate
-        save_weight(q_gate.permute(1, 0))
-        print(f"  {prefix}q_proj.weight(gate, de-interleaved): {q_gate.shape}")
-
-        # 2) q_query
-        save_weight(q_query.permute(1, 0))
-        print(f"  {prefix}q_proj.weight(query, de-interleaved): {q_query.shape}")
-
-        # 3) q_norm (NO +1)
-        norm_key = f"{prefix}q_norm.weight"
-        if norm_key in params:
-            save_weight(params[norm_key], is_rms=True)
-            print(f"  {norm_key} (no +1): {params[norm_key].shape}")
+        # 6) v_proj
+        save_projection(f"{prefix}v_proj.weight", transpose=True)
 
         # 4) k_proj
         save_projection(f"{prefix}k_proj.weight", transpose=True)
@@ -157,8 +145,19 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
             save_weight(params[norm_key], is_rms=True)
             print(f"  {norm_key} (no +1): {params[norm_key].shape}")
 
-        # 6) v_proj
-        save_projection(f"{prefix}v_proj.weight", transpose=True)
+        # 2) q_query
+        save_weight(q_query.permute(1, 0))
+        print(f"  {prefix}q_proj.weight(query, de-interleaved): {q_query.shape}")
+
+        # 1) q_gate
+        save_weight(q_gate.permute(1, 0))
+        print(f"  {prefix}q_proj.weight(gate, de-interleaved): {q_gate.shape}")
+
+        # 3) q_norm (NO +1)
+        norm_key = f"{prefix}q_norm.weight"
+        if norm_key in params:
+            save_weight(params[norm_key], is_rms=True)
+            print(f"  {norm_key} (no +1): {params[norm_key].shape}")
 
         # 7) o_proj
         save_projection(f"{prefix}o_proj.weight", transpose=True)
@@ -167,7 +166,7 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
         """Save MLP weights: up_proj, gate_proj, down_proj
         NOTE: Must match createMlp() layer creation order (gate first, then up)
         """
-        for proj in ["up_proj", "gate_proj", "down_proj"]:
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
             save_projection(f"{layer_prefix}mlp.{proj}.weight", transpose=True)
     
     # === Save weights in NNTrainer layer creation order ===
