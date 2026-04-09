@@ -86,9 +86,16 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
     EOS_TOKEN_ID.clear();
     EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
   }
-  BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
-                   ? cfg["bos_token_id"].get<unsigned int>()
-                   : generation_cfg["bos_token_id"].get<unsigned int>();
+  HAS_BOS_TOKEN = false;
+  BOS_TOKEN_ID = 0;
+  if (generation_cfg.contains("bos_token_id") &&
+      !generation_cfg["bos_token_id"].is_null()) {
+    BOS_TOKEN_ID = generation_cfg["bos_token_id"].get<unsigned int>();
+    HAS_BOS_TOKEN = true;
+  } else if (cfg.contains("bos_token_id") && !cfg["bos_token_id"].is_null()) {
+    BOS_TOKEN_ID = cfg["bos_token_id"].get<unsigned int>();
+    HAS_BOS_TOKEN = true;
+  }
   TOP_K = generation_cfg.contains("top_k")
             ? generation_cfg["top_k"].get<unsigned int>()
             : 20;
@@ -352,8 +359,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
   auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
+  if (HAS_BOS_TOKEN) {
+    _input.insert(_input.begin(), BOS_TOKEN_ID);
+  }
 #endif
 
   // | <------------------- MAX_SEQ_LEN -------------------> |

@@ -39,6 +39,7 @@
 #include "qwen3_cached_slim_moe_causallm.h"
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
+#include "qwen3_5_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "multilingual_tinybert_16mb.h"
@@ -156,6 +157,12 @@ int main(int argc, char *argv[]) {
     "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
                                                        nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen3_5ForConditionalGeneration",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen3_5CausalLM>(cfg, generation_cfg,
+                                                          nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {

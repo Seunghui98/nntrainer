@@ -52,13 +52,14 @@ MHACoreLayer::MHACoreLayer() :
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
     props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
     props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::AttnLogitSoftcapping(), props::IsCausal(), props::PartialRotaryFactor()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
   num_heads_Q(0),
   num_heads_KV(0),
   head_dim(0),
+  rotary_half(0),
   cache_shift(false) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -174,6 +175,10 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorLifespan::MAX_LIFESPAN);
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
+
+  float partial_rotary_factor =
+    std::get<props::PartialRotaryFactor>(mha_core_props).get();
+  rotary_half = static_cast<size_t>(head_dim * partial_rotary_factor) / 2;
 
   /** set Output dimension! - one output */
   std::vector<nntrainer::TensorDim> output_dims(1);
@@ -637,13 +642,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
                                     float theta, bool is_fp16) {
   // compute the freqs only when it is the first time to call this function
-#ifdef ENABLE_FP16
-  if (freqs_cos_fp16 != nullptr && freqs_cos_fp16->size() == seq_len)
+  if (freqs_cos != nullptr && freqs_cos->size() == seq_len &&
+      thetas.size() == rotary_half)
     return;
-#else
-  if (freqs_cos != nullptr && freqs_cos->size() == seq_len)
-    return;
-#endif
+  // Reset if rotary_half changed (different model loaded)
+  thetas.clear();
 
   if (thetas.empty()) {
     if (rope_scaling_type == "default")
@@ -654,75 +657,54 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
       NNTR_THROW_IF(true, std::invalid_argument) << "Unsupported rope type!";
   }
 
-  unsigned int half_ = head_dim / 2;
+  // cos / sin - size is rotary_half * 2 (rotary_dim), not full head_dim
+  unsigned int half_ = rotary_half;
+  unsigned int rotary_dim = rotary_half * 2;
 
-  if (!is_fp16) {
-    // cos / sin
-    auto cos = new std::vector<std::vector<float>>();
-    cos->assign(seq_len, std::vector<float>(head_dim, 0));
-    auto sin = new std::vector<std::vector<float>>();
-    sin->assign(seq_len, std::vector<float>(head_dim, 0));
+  // cos / sin (always compute float version)
+  auto cos = new std::vector<std::vector<float>>();
+  cos->assign(seq_len, std::vector<float>(rotary_dim, 0));
+  auto sin = new std::vector<std::vector<float>>();
+  sin->assign(seq_len, std::vector<float>(rotary_dim, 0));
 
-    // update cos / sin frequency
-    for (unsigned int i = 0; i < seq_len; ++i) {
+  // update cos / sin frequency
+  for (unsigned int i = 0; i < seq_len; ++i) {
 
 #ifdef USE_NEON
-      nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
-                                             (*cos)[i].data(), (*sin)[i].data(),
-                                             i, attention_scaling);
+    nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
+                                           (*cos)[i].data(), (*sin)[i].data(),
+                                           i, attention_scaling);
 #else
-      for (unsigned int j = 0; j < half_; ++j) {
-        float angle = i * thetas[j];
-        (*cos)[i][j] = std::cos(angle) * attention_scaling;
-        (*cos)[i][j + half_] =
-          std::cos(angle) * attention_scaling; // repeated 2 times
+    for (unsigned int j = 0; j < half_; ++j) {
+      float angle = i * thetas[j];
+      (*cos)[i][j] = std::cos(angle) * attention_scaling;
+      (*cos)[i][j + half_] =
+        std::cos(angle) * attention_scaling; // repeated 2 times
 
-        (*sin)[i][j] = std::sin(angle) * attention_scaling;
-        (*sin)[i][j + half_] =
-          std::sin(angle) * attention_scaling; // repeated 2 times
-      }
-#endif
+      (*sin)[i][j] = std::sin(angle) * attention_scaling;
+      (*sin)[i][j + half_] =
+        std::sin(angle) * attention_scaling; // repeated 2 times
     }
-    freqs_cos = cos;
-    freqs_sin = sin;
+#endif
   }
+  freqs_cos = cos;
+  freqs_sin = sin;
 
 #ifdef ENABLE_FP16
-  if (is_fp16) {
-    // cos / sin for FP16
-    auto cos_fp16 = new std::vector<std::vector<_FP16>>();
-    cos_fp16->assign(seq_len, std::vector<_FP16>(head_dim, 0));
-    auto sin_fp16 = new std::vector<std::vector<_FP16>>();
-    sin_fp16->assign(seq_len, std::vector<_FP16>(head_dim, 0));
+  // cos / sin for FP16 (convert from pre-computed float)
+  auto cos_fp16 = new std::vector<std::vector<_FP16>>();
+  cos_fp16->assign(seq_len, std::vector<_FP16>(rotary_dim, 0));
+  auto sin_fp16 = new std::vector<std::vector<_FP16>>();
+  sin_fp16->assign(seq_len, std::vector<_FP16>(rotary_dim, 0));
 
-    std::vector<float> cos_tmp(head_dim);
-    std::vector<float> sin_tmp(head_dim);
-
-    for (unsigned int i = 0; i < seq_len; ++i) {
-#ifdef USE_NEON
-      nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
-                                             cos_tmp.data(), sin_tmp.data(), i,
-                                             attention_scaling);
-#else
-      for (unsigned int j = 0; j < half_; ++j) {
-        float angle = i * thetas[j];
-        cos_tmp[j] = std::cos(angle) * attention_scaling;
-        cos_tmp[j + half_] =
-          std::cos(angle) * attention_scaling; // repeated 2 times
-
-        sin_tmp[j] = std::sin(angle) * attention_scaling;
-        sin_tmp[j + half_] =
-          std::sin(angle) * attention_scaling; // repeated 2 times
-      }
-#endif
-      for (unsigned int j = 0; j < head_dim; ++j) {
-        (*cos_fp16)[i][j] = (_FP16)cos_tmp[j];
-        (*sin_fp16)[i][j] = (_FP16)sin_tmp[j];
-      }
+  for (unsigned int i = 0; i < seq_len; ++i) {
+    for (unsigned int j = 0; j < rotary_dim; ++j) {
+      (*cos_fp16)[i][j] = (_FP16)(*cos)[i][j];
+      (*sin_fp16)[i][j] = (_FP16)(*sin)[i][j];
     }
-    freqs_cos_fp16 = cos_fp16;
-    freqs_sin_fp16 = sin_fp16;
   }
+  freqs_cos_fp16 = cos_fp16;
+  freqs_sin_fp16 = sin_fp16;
 #endif
 };
 
@@ -731,12 +713,13 @@ void MHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
   // no attention scaling
   attention_scaling = 1.0f;
 
-  // theta_i = 10000^(-2(i-1)/dim) for i = [1, 2, ... , dim/2]
-  // head_dim should be divisible by 2
-  unsigned int half_ = head_dim / 2;
-  for (unsigned int i = 0; i < half_; ++i) {
-    thetas.push_back(1.0 /
-                     (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+  // theta_i = 10000^(-2(i-1)/dim) for i = [1, 2, ... , rotary_half]
+  // Use rotary_half (= head_dim * partial_rotary_factor / 2) to support
+  // partial rotary embedding (e.g., Qwen3.5 uses partial_rotary_factor=0.25)
+  unsigned int rotary_dim = rotary_half * 2;
+  for (unsigned int i = 0; i < rotary_half; ++i) {
+    thetas.push_back(
+      1.0 / (std::pow(theta, (2 * i) / static_cast<float>(rotary_dim))));
   }
 }
 
@@ -839,7 +822,9 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                               unsigned int dim,
                                               unsigned int from,
                                               bool convert_only) {
-  unsigned int half_ = dim / 2;
+  // For convert_only (value cache), process all dims.
+  // For rotation (Q/K), use rotary_half for partial rotary support.
+  unsigned int half_ = convert_only ? dim / 2 : rotary_half;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
@@ -881,6 +866,16 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
             nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
                                                 out_ptr, cos_->data(),
                                                 sin_->data(), convert_only);
+            // For partial rotary: copy non-rotated dims to output
+            if (!convert_only && 2 * half_ < dim) {
+              unsigned int rot_dim = 2 * half_;
+              for (unsigned int w = 0; w < in.width(); w += dim) {
+                for (unsigned int j = rot_dim; j < dim; ++j) {
+                  out_ptr[w + j] =
+                    nntrainer::compute_fp32_to_fp16(in_ptr[w + j]);
+                }
+              }
+            }
           }
         }
       }
