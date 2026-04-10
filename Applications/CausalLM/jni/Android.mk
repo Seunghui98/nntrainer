@@ -22,6 +22,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
     $(LOCAL_PATH)/../models/qwen2 \
     $(LOCAL_PATH)/../models/qwen3 \
+    $(LOCAL_PATH)/../models/qwen3_5 \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
@@ -92,6 +93,12 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma3/function.cpp \
     ../models/tiny_bert/multilingual_tinybert_16mb.cpp \
+    ../models/qwen3_5/qwen3_5_causallm.cpp \
+    ../layers/gated_delta_net.cpp \
+    ../layers/attn_gate.cpp \
+    ../layers/causal_conv1d.cpp \
+    ../layers/gdn_ssm_core.cpp \
+    ../layers/gpt_oss_moe_layer_tm.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -166,5 +173,27 @@ LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES) \
     $(LOCAL_PATH)/../api
+
+include $(BUILD_EXECUTABLE)
+
+# Build nntr_quantize executable
+include $(CLEAR_VARS)
+
+LOCAL_ARM_NEON := true
+LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_CXXFLAGS += -std=c++17 -frtti
+LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_MODULE_TAGS := optional
+LOCAL_ARM_MODE := arm
+LOCAL_MODULE := nntr_quantize
+LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
+
+LOCAL_SRC_FILES := ../quantize.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
