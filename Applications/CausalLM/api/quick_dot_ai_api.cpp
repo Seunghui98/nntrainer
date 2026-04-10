@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file    causal_lm_api.cpp
+ * @file    quick_dot_ai_api.cpp
  * @date    21 Jan 2026
  * @brief   This is a C API for CausalLM application
  * @see     https://github.com/nntrainer/nntrainer
@@ -10,7 +10,7 @@
  * @bug     No known bugs except for NYI items
  */
 
-#include "causal_lm_api.h"
+#include "quick_dot_ai_api.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -93,6 +93,27 @@ struct RegisteredModel {
 static std::map<std::string, RegisteredModel> g_model_registry;
 static std::map<std::string, ModelArchConfig> g_arch_config_map;
 
+// Internal C++ registration functions — called from model_config.cpp
+// These bypass extern "C" PLT and write directly to our static maps.
+namespace quick_dot_ai {
+
+void register_arch(const char *arch_name, ModelArchConfig config) {
+  std::string name(arch_name);
+  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+  g_arch_config_map[name] = config;
+}
+
+void register_model(const char *model_name, const char *arch_name,
+                    ModelRuntimeConfig config) {
+  std::string name(model_name);
+  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+  std::string aname(arch_name);
+  std::transform(aname.begin(), aname.end(), aname.begin(), ::toupper);
+  g_model_registry[name] = {aname, config};
+}
+
+} // namespace quick_dot_ai
+
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
 // @note: Factory registration is singleton and persistent, but we do it once
@@ -149,7 +170,6 @@ static void register_models() {
         return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
                                                           nntr_cfg);
       });
-
     // Register built-in configurations
     register_builtin_model_configs();
   });
@@ -760,11 +780,12 @@ ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
   }
 
   try {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    auto &h = get_default_handle();
+    std::lock_guard<std::mutex> lock(h.mtx);
 
     auto chat_messages = convertMessages(messages, num_messages);
     g_formatted_template = apply_chat_template_messages(
-      g_architecture, chat_messages, add_generation_prompt);
+      h.architecture, chat_messages, add_generation_prompt);
 
     *formattedText = g_formatted_template.c_str();
 
@@ -779,14 +800,10 @@ ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
 ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
                                size_t num_messages, bool add_generation_prompt,
                                const char **outputText) {
-  if (!g_initialized || !g_model) {
-    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
-  }
   if (outputText == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
-  // Apply chat template to format the prompt
   const char *formattedInput = nullptr;
   ErrorCode err = applyChatTemplate(messages, num_messages,
                                     add_generation_prompt, &formattedInput);
@@ -794,9 +811,12 @@ ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
     return err;
   }
 
-  // Run inference with the formatted prompt
   return runModel(formattedInput, outputText);
 }
+/*============================================================================
+ * Legacy non-handle API implementation
+ *============================================================================*/
+
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
                     ModelQuantizationType quant_type) {
   return load_into_handle(get_default_handle(), compute, modeltype, quant_type);
@@ -930,4 +950,3 @@ ErrorCode destroyModelHandle(CausalLmHandle handle) {
   delete handle;
   return CAUSAL_LM_ERROR_NONE;
 }
-
