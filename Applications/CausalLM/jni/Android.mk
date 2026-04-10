@@ -178,78 +178,27 @@ include $(BUILD_EXECUTABLE)
 
 
 # Build nntr_quantize executable
+# Same pattern as nntrainer_causallm: compile only quantize.cpp and depend on
+# libcausallm_core.so which provides OpenMP runtime (statically linked via
+# -static-openmp at the .so build stage). This avoids BUILD_EXECUTABLE's
+# apparent inability to properly apply -static-openmp for executables.
 include $(CLEAR_VARS)
 
 LOCAL_ARM_NEON := true
-LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -Ilz4-nougat/lib -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
-LOCAL_LDFLAGS += -Llz4-nougat/lib/obj/local/$(TARGET_ARCH_ABI)/
+LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
 LOCAL_CXXFLAGS += -std=c++17 -frtti
 LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
-# Force static linking of libomp.a via whole-archive (bypasses --as-needed and
-# ensures __kmpc_fork_call and friends are embedded directly in the executable)
-LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -Wl,--whole-archive -l:libomp.a -Wl,--no-whole-archive -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
 LOCAL_MODULE_TAGS := optional
 LOCAL_ARM_MODE := arm
 LOCAL_MODULE := nntr_quantize
-LOCAL_LDLIBS := -llog -landroid
+LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
 
-# Source files: quantize.cpp + all sources (standalone executable)
-LOCAL_SRC_FILES := ../quantize.cpp \
-    ../models/causal_lm.cpp \
-    ../models/transformer.cpp \
-    ../models/sentence_transformer.cpp \
-    ../models/qwen2/qwen2_causallm.cpp \
-    ../models/qwen2/qwen2_embedding.cpp \
-    ../models/qwen3/qwen3_causallm.cpp \
-    ../models/qwen3/qwen3_embedding.cpp \
-    ../models/qwen3_5/qwen3_5_causallm.cpp \
-    ../models/qwen3_moe/qwen3_moe_causallm.cpp \
-    ../models/qwen3_slim_moe/qwen3_slim_moe_causallm.cpp \
-    ../models/qwen3_cached_slim_moe/qwen3_cached_slim_moe_causallm.cpp \
-    ../models/gpt_oss/gptoss_causallm.cpp \
-    ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
-    ../llm_util.cpp \
-    ../layers/embedding_layer.cpp \
-    ../layers/embedding_pooling_layer.cpp \
-    ../layers/embedding_normalize_layer.cpp \
-    ../layers/mha_core.cpp \
-    ../layers/gated_delta_net.cpp \
-    ../layers/attn_gate.cpp \
-    ../layers/causal_conv1d.cpp \
-    ../layers/gdn_ssm_core.cpp \
-    ../layers/gpt_oss_moe_layer_tm.cpp \
-    ../models/qwen3_moe/qwen_moe_layer.cpp \
-    ../layers/reshaped_rms_norm.cpp \
-    ../layers/rms_norm.cpp \
-    ../layers/swiglu.cpp \
-    ../layers/tie_word_embedding.cpp \
-    ../layers/lm_head.cpp \
-    ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../layers/qkv_layer.cpp \
-    ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
-    ../models/gpt_oss/gpt_oss_moe_layer.cpp \
-    ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
-    ../models/gemma3/gemma3_causallm.cpp \
-    ../models/gemma3/embedding_gemma.cpp \
-    ../models/gemma3/function.cpp \
-    ../models/tiny_bert/multilingual_tinybert_16mb.cpp \
+LOCAL_SRC_FILES := ../quantize.cpp
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_5 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3 \
-    $(LOCAL_PATH)/../models/tiny_bert \
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
