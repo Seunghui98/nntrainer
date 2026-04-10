@@ -133,8 +133,13 @@ void Qwen3_5Transformer::constructModel() {
               withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
 
   // Embedding layer
+  // When quantized (non-FP32), tie_word_embeddings cannot share weights
+  // because Q4_0 tensor layout differs from FP32, causing dimension mismatch
+  // in TensorPool::requestOrExtend. Use separate layers instead.
+  bool quantized_embedding = (EMBEDDING_DTYPE != "FP32");
+  bool use_tie = TIE_WORD_EMBEDDINGS && !quantized_embedding;
   const std::string embedding_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
+    use_tie ? "tie_word_embeddings" : "embedding_layer";
   layers.push_back(createLayer(
     embedding_type,
     {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
@@ -477,8 +482,12 @@ void Qwen3_5CausalLM::constructModel() {
   Qwen3_5Transformer::constructModel();
 
   // Add lm_head
+  // When quantized, use separate lm_head (no shared_from) since
+  // Q4_0 embedding and Q4_0 FC have different internal layouts.
+  bool quantized_embedding = (EMBEDDING_DTYPE != "FP32");
+  bool use_tie = TIE_WORD_EMBEDDINGS && !quantized_embedding;
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
+    use_tie ? "tie_word_embeddings" : "lm_head";
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
@@ -486,7 +495,7 @@ void Qwen3_5CausalLM::constructModel() {
     withKey("input_layers", "output_norm"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
-  if (TIE_WORD_EMBEDDINGS)
+  if (use_tie)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
   model->addLayer(createLayer(lmhead_type, lmhead_prop));
 

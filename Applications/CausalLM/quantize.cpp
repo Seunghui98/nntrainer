@@ -186,14 +186,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
 
   std::map<std::string, DataType> dtype_map;
 
-  // tie_word_embeddings: embedding and lm_head share weights.
-  // Quantized shared weights are not supported, so keep both as FP32.
-  if (tie_word_embeddings) {
-    // Skip embedding0 and output_of_causallm regardless of user dtype request
-  } else {
-    if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE)
-      dtype_map["embedding0"] = embd_dtype;
-  }
+  // When quantized + tie_word_embeddings, the model unties them automatically
+  // (separate embedding_layer + lm_head). So we can quantize both.
+  if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE)
+    dtype_map["embedding0"] = embd_dtype;
 
   for (int i = 0; i < num_layers; ++i) {
     std::string prefix = "layer" + std::to_string(i);
@@ -225,8 +221,7 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
     }
   }
 
-  if (!tie_word_embeddings &&
-      lmhead_dtype != DataType::FP32 && lmhead_dtype != DataType::NONE)
+  if (lmhead_dtype != DataType::FP32 && lmhead_dtype != DataType::NONE)
     dtype_map["output_of_causallm"] = lmhead_dtype;
 
   return dtype_map;
