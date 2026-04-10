@@ -352,7 +352,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
     {withKey("name", prefix + "_gdn_conv1d"),
      withKey("input_layers", prefix + "_gdn_in_proj_qkv"),
      withKey("conv_channels", conv_dim),
-     withKey("conv_kernel_size", LINEAR_CONV_KERNEL)}));
+     withKey("conv_kernel_size", LINEAR_CONV_KERNEL),
+     withKey("packed", "false")}));
 
   // FC: in_proj_a (hidden → num_v_heads=16, not Q4_0 quantizable)
   layers.push_back(createLayer(
@@ -394,7 +395,8 @@ Qwen3_5Transformer::createLinearAttentionBlock(const int layer_id,
                              prefix + "_gdn_in_proj_z"),
      withKey("ssm_num_v_heads", LINEAR_NUM_V_HEADS),
      withKey("ssm_head_k_dim", LINEAR_HEAD_K_DIM),
-     withKey("ssm_head_v_dim", LINEAR_HEAD_V_DIM)}));
+     withKey("ssm_head_v_dim", LINEAR_HEAD_V_DIM),
+     withKey("packed", "false")}));
 
   // FC: out_proj (value_dim → hidden)
   layers.push_back(createLayer(
