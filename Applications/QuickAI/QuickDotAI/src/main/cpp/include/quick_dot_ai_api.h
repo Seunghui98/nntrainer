@@ -19,8 +19,13 @@
 #define __QUICK_DOT_AI_API_H__
 
 /* ── Extended model types (src additions) ────────────────────── */
+
 #ifdef __CAUSAL_LM_API_H__
-/* Model types already defined from causal_lm_api.h */
+
+#ifndef CAUSAL_LM_MODEL_GAUSS2_5
+#define CAUSAL_LM_MODEL_GAUSS2_5 ((ModelType)1)
+#endif
+
 #else /* causal_lm_api.h not included — provide full definitions */
 
 #define __CAUSAL_LM_API_H__
@@ -58,16 +63,10 @@ typedef enum {
 
 typedef enum {
   CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
+  CAUSAL_LM_MODEL_GAUSS2_5 = 1,
 } ModelType;
 
 typedef struct {
-  // Add configuration options here as needed
-  bool use_chat_template; /// < @brief Whether to apply chat template to input
-  bool debug_mode; /// < @brief Check model file validity during initialization
-  bool verbose;    /// < @brief Whether to print output during generation
-  const char
-    *chat_template_name; /// < @brief Template name to select from array
-                         ///  (e.g., "default", "tool_use"). NULL for "default".
   bool use_chat_template;
   bool debug_mode;
   bool verbose;
@@ -83,22 +82,6 @@ typedef enum {
   CAUSAL_LM_QUANTIZATION_W32A32 = 4,
 } ModelQuantizationType;
 
-/**
- * @brief Chat message structure for chat template formatting
- * @note  Compatible with HuggingFace apply_chat_template() format
- */
-typedef struct {
-  const char *role;    /**< Message role: "system", "user", or "assistant" */
-  const char *content; /**< Message content text */
-} CausalLMChatMessage;
-
-/**
- * @brief Load a model
- * @param compute Backend compute type
- * @param modeltype Model type
- * @param quant_type Model quantization type
- * @return ErrorCode
- */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
                                ModelQuantizationType quant_type);
 
@@ -117,31 +100,6 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
 
-/**
- * @brief Run inference with chat template formatted messages
- * @param messages Array of chat messages with role and content
- * @param num_messages Number of messages in the array
- * @param add_generation_prompt Whether to append generation prompt at end
- * @param outputText Buffer to store output text (owned by the library)
- * @return ErrorCode
- */
-WIN_EXPORT ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
-                                          size_t num_messages,
-                                          bool add_generation_prompt,
-                                          const char **outputText);
-
-/**
- * @brief Apply chat template to messages without running inference
- * @param messages Array of chat messages with role and content
- * @param num_messages Number of messages in the array
- * @param add_generation_prompt Whether to append generation prompt at end
- * @param formattedText Buffer to store formatted text (owned by the library)
- * @return ErrorCode
- */
-WIN_EXPORT ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
-                                       size_t num_messages,
-                                       bool add_generation_prompt,
-                                       const char **formattedText);
 /*============================================================================
  * Handle-based API (for parallel multi-model execution)
  *
