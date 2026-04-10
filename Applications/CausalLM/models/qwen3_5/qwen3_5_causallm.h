@@ -66,7 +66,6 @@ protected:
   unsigned int LINEAR_HEAD_V_DIM;
   unsigned int LINEAR_CONV_KERNEL;
   unsigned int SELF_ATTN_HEAD_DIM;
-  bool force_untie_embedding = false; // set by CausalLM when dtypes differ
 };
 
 /**

@@ -133,10 +133,8 @@ void Qwen3_5Transformer::constructModel() {
               withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
 
   // Embedding layer
-  // force_untie_embedding is set when embedding/lm_head need different dtypes
   const std::string embedding_type =
-    (TIE_WORD_EMBEDDINGS && !force_untie_embedding) ? "tie_word_embeddings"
-                                                     : "embedding_layer";
+    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
   layers.push_back(createLayer(
     embedding_type,
     {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
@@ -475,16 +473,12 @@ void Qwen3_5Transformer::registerCustomLayers() {
 }
 
 void Qwen3_5CausalLM::constructModel() {
-  // When embedding and lm_head need different dtypes, untie shared weights
-  bool need_untie = TIE_WORD_EMBEDDINGS && (EMBEDDING_DTYPE != LMHEAD_DTYPE);
-  force_untie_embedding = need_untie;
-
   // Build hybrid model using addLayer API
   Qwen3_5Transformer::constructModel();
 
   // Add lm_head
   const std::string lmhead_type =
-    (TIE_WORD_EMBEDDINGS && !need_untie) ? "tie_word_embeddings" : "lm_head";
+    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
@@ -492,7 +486,7 @@ void Qwen3_5CausalLM::constructModel() {
     withKey("input_layers", "output_norm"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
-  if (TIE_WORD_EMBEDDINGS && !need_untie)
+  if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
   model->addLayer(createLayer(lmhead_type, lmhead_prop));
 

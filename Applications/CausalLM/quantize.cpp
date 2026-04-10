@@ -338,7 +338,6 @@ int main(int argc, char *argv[]) {
     if (nntr_cfg.contains("model_type"))
       architecture = resolve_architecture(nntr_cfg["model_type"], architecture);
 
-    // Step 2a: Load model with ORIGINAL (FP32) config to read tied weights
     auto model = causallm::Factory::Instance().create(architecture, cfg, generation_cfg, nntr_cfg);
     model->initialize();
     std::cout << "  Model initialized.\n";
@@ -347,58 +346,11 @@ int main(int argc, char *argv[]) {
     model->load_weight(src_weight_path);
     std::cout << "  Weights loaded.\n";
 
-    // Step 2b: If untie needed (different embedding/lm_head dtype),
-    //          save FP32 intermediate with lm_head weight duplicated,
-    //          then reload with target config.
-    bool need_untie = tie_word_embeddings &&
-      (dataTypeToStr(embd_dtype) != dataTypeToStr(lmhead_dtype));
-
-    if (need_untie) {
-      std::cout << "  NOTE: embedding(" << dataTypeToStr(embd_dtype)
-                << ") != lm_head(" << dataTypeToStr(lmhead_dtype)
-                << "), untying shared weights.\n";
-
-      // Save FP32 model first (tied structure)
-      std::string tmp_fp32 = dst_weight_path + ".tmp_fp32";
-      model->save_weight(tmp_fp32);
-
-      // Append a copy of the embedding weight for the lm_head (untied)
-      // The tied model skips lm_head on save, so we append it.
-      {
-        // Read the embedding weight from the existing FP32 binary
-        // (it's the first weight block in the file)
-        std::ifstream src_file(tmp_fp32, std::ios::binary);
-        auto src_fsize = std::filesystem::file_size(tmp_fp32);
-        std::vector<char> all_data(src_fsize);
-        src_file.read(all_data.data(), src_fsize);
-        src_file.close();
-
-        // The embedding weight is: vocab_size * hidden_size * sizeof(float)
-        size_t embd_weight_bytes =
-          static_cast<size_t>(text_cfg["vocab_size"].get<int>()) *
-          static_cast<size_t>(text_cfg["hidden_size"].get<int>()) *
-          sizeof(float);
-
-        // Append the same embedding weight as lm_head weight
-        std::ofstream append_file(tmp_fp32, std::ios::binary | std::ios::app);
-        // The embedding weight is at the start of the file
-        append_file.write(all_data.data(), embd_weight_bytes);
-        append_file.close();
-        std::cout << "  Appended lm_head weight copy ("
-                  << (embd_weight_bytes / (1024*1024)) << " MB)\n";
-      }
-
-      // Recreate model with TARGET dtypes (untied structure)
-      json target_nntr_cfg = nntr_cfg;
-      target_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
-      target_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
-      target_nntr_cfg["model_file_name"] = "tmp";
-      model = causallm::Factory::Instance().create(architecture, cfg, generation_cfg, target_nntr_cfg);
-      model->initialize();
-
-      // Load the untied FP32 binary
-      model->load_weight(tmp_fp32);
-      std::filesystem::remove(tmp_fp32);
+    // Force same dtype for embedding/lm_head when tie_word_embeddings
+    if (tie_word_embeddings && embd_dtype != lmhead_dtype) {
+      std::cout << "  NOTE: tie_word_embeddings=true, using embd_dtype("
+                << dataTypeToStr(embd_dtype) << ") for both embedding and lm_head\n";
+      lmhead_dtype = embd_dtype;
     }
 
     std::cout << "[4/5] Quantizing and saving to: " << dst_weight_path << "\n";
