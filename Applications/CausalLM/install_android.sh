@@ -209,7 +209,9 @@ log_info "Creating run script on device..."
 adb shell "cat > $INSTALL_DIR/run_causallm.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
-export OMP_NUM_THREADS=4
+export OMP_NUM_THREADS=\${OMP_NUM_THREADS:-4}
+export NNTR_NUM_THREADS=\${NNTR_NUM_THREADS:-\$OMP_NUM_THREADS}
+export BLAS_NUM_THREADS=\${BLAS_NUM_THREADS:-\$OMP_NUM_THREADS}
 cd $INSTALL_DIR
 ./nntrainer_causallm \$@
 EOF
@@ -221,7 +223,9 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
     adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
-export OMP_NUM_THREADS=4
+export OMP_NUM_THREADS=\${OMP_NUM_THREADS:-4}
+export NNTR_NUM_THREADS=\${NNTR_NUM_THREADS:-\$OMP_NUM_THREADS}
+export BLAS_NUM_THREADS=\${BLAS_NUM_THREADS:-\$OMP_NUM_THREADS}
 cd $INSTALL_DIR
 ./nntr_quantize \$@
 EOF
@@ -235,7 +239,9 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
-export OMP_NUM_THREADS=4
+export OMP_NUM_THREADS=\${OMP_NUM_THREADS:-4}
+export NNTR_NUM_THREADS=\${NNTR_NUM_THREADS:-\$OMP_NUM_THREADS}
+export BLAS_NUM_THREADS=\${BLAS_NUM_THREADS:-\$OMP_NUM_THREADS}
 cd $INSTALL_DIR
 ./test_api \$@
 EOF
