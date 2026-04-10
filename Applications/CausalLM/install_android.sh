@@ -156,6 +156,16 @@ adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm" "$INSTALL_DIR/" 2>&
 adb shell "chmod 755 $INSTALL_DIR/nntrainer_causallm"
 log_success "nntrainer_causallm pushed"
 
+# Push nntr_quantize executable
+if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
+    log_info "Pushing nntr_quantize..."
+    adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | tail -1
+    adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
+    log_success "nntr_quantize pushed"
+else
+    log_warning "nntr_quantize not found (run ./build_android.sh to build it)"
+fi
+
 # Push optional test_api if exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     log_info "Pushing test_api..."
@@ -205,6 +215,20 @@ cd $INSTALL_DIR
 EOF
 "
 adb shell "chmod 755 $INSTALL_DIR/run_causallm.sh"
+
+# Create nntr_quantize run script on device
+if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
+    adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export OMP_NUM_THREADS=4
+cd $INSTALL_DIR
+./nntr_quantize \$@
+EOF
+"
+    adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
+    log_info "Run script for nntr_quantize created"
+fi
 
 # Create test script on device if API lib exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
