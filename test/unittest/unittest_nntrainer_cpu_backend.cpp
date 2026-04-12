@@ -15,6 +15,7 @@
 #include <fallback_internal.h>
 #include <fp16.h>
 #include <gtest/gtest.h>
+#include <nntr_ggml_impl.h>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -1386,6 +1387,130 @@ DECLARE_transform_int4_test_K_N(1024, 648, 32);
 DECLARE_transform_int4_test_K_N(1024, 648, 64);
 DECLARE_transform_int4_test_K_N(1024, 648, 128);
 DECLARE_transform_int4_test_K_N(3072, 8192, 32);
+
+// Additional GEMV/GEMM tests for various matrix sizes to verify
+// multi-threaded GEMV and quantization optimizations
+TEST(nntrainer_cpu_backend_standalone, quant_GEMV_1x1024x2048) {
+  const unsigned int M = 1;
+  const unsigned int K = 1024;
+  const unsigned int N = 2048;
+  float q4_0_mse, q4_k_mse, q6_k_mse;
+  constexpr float eps = 1e-5;
+  run_quant_test(M, K, N, q4_0_mse, q4_k_mse, q6_k_mse, false);
+  ASSERT_LE(q4_0_mse, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, quant_GEMV_1x2048x512) {
+  const unsigned int M = 1;
+  const unsigned int K = 2048;
+  const unsigned int N = 512;
+  float q4_0_mse, q4_k_mse, q6_k_mse;
+  constexpr float eps = 1e-5;
+  run_quant_test(M, K, N, q4_0_mse, q4_k_mse, q6_k_mse, false);
+  ASSERT_LE(q4_0_mse, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, quant_GEMM_4x512x512) {
+  const unsigned int M = 4;
+  const unsigned int K = 512;
+  const unsigned int N = 512;
+  float q4_0_mse, q4_k_mse, q6_k_mse;
+  constexpr float eps = 1e-5;
+  run_quant_test(M, K, N, q4_0_mse, q4_k_mse, q6_k_mse, false);
+  ASSERT_LE(q4_0_mse, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, quant_GEMM_5x512x512) {
+  const unsigned int M = 5;
+  const unsigned int K = 512;
+  const unsigned int N = 512;
+  float q4_0_mse, q4_k_mse, q6_k_mse;
+  constexpr float eps = 1e-5;
+  run_quant_test(M, K, N, q4_0_mse, q4_k_mse, q6_k_mse, false);
+  ASSERT_LE(q4_0_mse, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, quant_GEMM_128x1024x2048) {
+  const unsigned int M = 128;
+  const unsigned int K = 1024;
+  const unsigned int N = 2048;
+  float q4_0_mse, q4_k_mse, q6_k_mse;
+  constexpr float eps = 1e-5;
+  run_quant_test(M, K, N, q4_0_mse, q4_k_mse, q6_k_mse, false);
+  ASSERT_LE(q4_0_mse, eps * M * K * N);
+}
+
+// Test quantization consistency: same input must produce same output
+TEST(nntrainer_cpu_backend_standalone, quant_q8_0_deterministic) {
+  nntrainer::init_backend();
+  const unsigned int K = 1024;
+  std::vector<float> activation = generate_random_vector<float>(K);
+
+  const int blocks_per_row = K / 32;
+  // block_q8_0 = 2 bytes (FP16 scale) + 32 bytes (int8 quants) = 34 bytes
+  const int qa_size = 34 * blocks_per_row;
+  std::vector<char> QA1(qa_size);
+  std::vector<char> QA2(qa_size);
+
+  nntr_quantize_row_q8_0(activation.data(), QA1.data(), K);
+  nntr_quantize_row_q8_0(activation.data(), QA2.data(), K);
+
+  ASSERT_EQ(memcmp(QA1.data(), QA2.data(), qa_size), 0)
+    << "Q8_0 quantization must be deterministic";
+}
+
+// Test GEMV and GEMM produce consistent results for the same weight+activation
+TEST(nntrainer_cpu_backend_standalone, quant_GEMV_vs_GEMM_consistency) {
+  nntrainer::init_backend();
+  const unsigned int K = 512;
+  const unsigned int N = 512;
+  constexpr float eps = 1e-5;
+
+  std::vector<float> activation = generate_random_vector<float>(K);
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  // Quantize weights to Q4_0
+  size_t q4_block_size = sizeof(block_q4_0);
+  size_t num_blocks_per_row = K / QK4_0;
+  size_t total_q4_size = q4_block_size * N * num_blocks_per_row;
+  std::vector<char> q4_weight(total_q4_size);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+  std::vector<char> repacked(total_q4_size);
+  nntrainer::repack_q4_0((uint8_t *)repacked.data(),
+                         (uint8_t *)q4_weight.data(), total_q4_size, N, K);
+
+  // GEMV: M=1
+  std::vector<float> out_gemv(N, 0.0f);
+  nntrainer::gemm_q4_0(1u, N, K, activation.data(), K,
+                       (void *)repacked.data(), N, out_gemv.data(), N);
+
+  // GEMM: M=2 with same first row
+  std::vector<float> activation_2rows(2 * K);
+  std::copy(activation.begin(), activation.end(), activation_2rows.begin());
+  std::copy(activation.begin(), activation.end(),
+            activation_2rows.begin() + K);
+  std::vector<float> out_gemm(2 * N, 0.0f);
+  nntrainer::gemm_q4_0(2u, N, K, activation_2rows.data(), K,
+                       (void *)repacked.data(), N, out_gemm.data(), N);
+
+  // First row of GEMM must match GEMV
+  float max_diff = 0.0f;
+  for (unsigned int i = 0; i < N; i++) {
+    float diff = std::abs(out_gemv[i] - out_gemm[i]);
+    max_diff = std::max(max_diff, diff);
+  }
+  ASSERT_LE(max_diff, eps * K)
+    << "GEMV and GEMM first row should produce identical results";
+
+  // Second row must also match (same input)
+  float row2_diff = 0.0f;
+  for (unsigned int i = 0; i < N; i++) {
+    float diff = std::abs(out_gemm[i] - out_gemm[N + i]);
+    row2_diff = std::max(row2_diff, diff);
+  }
+  ASSERT_LE(row2_diff, eps)
+    << "GEMM rows with identical input should produce identical results";
+}
 
 int main(int argc, char **argv) {
   int result = -1;

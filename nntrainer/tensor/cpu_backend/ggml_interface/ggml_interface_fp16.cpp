@@ -55,9 +55,9 @@ void __ggml_quantize_row_q8_0(const _FP16 *__restrict x, void *vy, int64_t k) {
 
 #if defined(__ARM_NEON)
   for (int i = 0; i < nb; i++) {
-    float16x8_t srcv[4];  // loaded source
-    float16x8_t asrcv[4]; // absolute value of source
-    float16x8_t amaxv[2]; // absolute max buffer
+    float16x8_t srcv[4];
+    float16x8_t asrcv[4];
+    float16x8_t amaxv[2];
 
     for (int j = 0; j < 4; j++) {
       srcv[j] = vld1q_f16(x + i * 32 + 8 * j);
@@ -67,10 +67,9 @@ void __ggml_quantize_row_q8_0(const _FP16 *__restrict x, void *vy, int64_t k) {
     }
 
     for (int j = 0; j < 2; j++) {
-      amaxv[j] =
-        vmaxq_f16(asrcv[2 * j], asrcv[2 * j + 1]); // 0, 1 <- 0, 1 VS 2, 3
+      amaxv[j] = vmaxq_f16(asrcv[2 * j], asrcv[2 * j + 1]);
     }
-    amaxv[0] = vmaxq_f16(amaxv[0], amaxv[1]); // 0 <- 0, 1
+    amaxv[0] = vmaxq_f16(amaxv[0], amaxv[1]);
 
     const float amax = static_cast<float>(vmaxvq_f16(amaxv[0]));
 
@@ -82,15 +81,8 @@ void __ggml_quantize_row_q8_0(const _FP16 *__restrict x, void *vy, int64_t k) {
     for (int j = 0; j < 4; j++) {
       const float16x8_t v = vmulq_n_f16(srcv[j], id);
       const int16x8_t vi = vcvtnq_s16_f16(v);
-
-      y[i].qs[8 * j + 0] = vgetq_lane_s16(vi, 0);
-      y[i].qs[8 * j + 1] = vgetq_lane_s16(vi, 1);
-      y[i].qs[8 * j + 2] = vgetq_lane_s16(vi, 2);
-      y[i].qs[8 * j + 3] = vgetq_lane_s16(vi, 3);
-      y[i].qs[8 * j + 4] = vgetq_lane_s16(vi, 4);
-      y[i].qs[8 * j + 5] = vgetq_lane_s16(vi, 5);
-      y[i].qs[8 * j + 6] = vgetq_lane_s16(vi, 6);
-      y[i].qs[8 * j + 7] = vgetq_lane_s16(vi, 7);
+      const int8x8_t vi8 = vqmovn_s16(vi);
+      vst1_s8(&y[i].qs[8 * j], vi8);
     }
   }
 #else
@@ -179,49 +171,12 @@ static void __ggml_quantize_mat_q8_0_4x8(const _FP16 *__restrict x,
     }
 
     for (int j = 0; j < 4; j++) {
-      float16x8_t v = vmulq_n_f16(srcv[0][j], id[0]);
-      int16x8_t vi = vcvtnq_s16_f16(v);
-      y[i].qs[32 * j + 0] = vgetq_lane_s16(vi, 0);
-      y[i].qs[32 * j + 1] = vgetq_lane_s16(vi, 1);
-      y[i].qs[32 * j + 2] = vgetq_lane_s16(vi, 2);
-      y[i].qs[32 * j + 3] = vgetq_lane_s16(vi, 3);
-      y[i].qs[32 * j + 4] = vgetq_lane_s16(vi, 4);
-      y[i].qs[32 * j + 5] = vgetq_lane_s16(vi, 5);
-      y[i].qs[32 * j + 6] = vgetq_lane_s16(vi, 6);
-      y[i].qs[32 * j + 7] = vgetq_lane_s16(vi, 7);
-
-      v = vmulq_n_f16(srcv[1][j], id[1]);
-      vi = vcvtnq_s16_f16(v);
-      y[i].qs[32 * j + 8] = vgetq_lane_s16(vi, 0);
-      y[i].qs[32 * j + 9] = vgetq_lane_s16(vi, 1);
-      y[i].qs[32 * j + 10] = vgetq_lane_s16(vi, 2);
-      y[i].qs[32 * j + 11] = vgetq_lane_s16(vi, 3);
-      y[i].qs[32 * j + 12] = vgetq_lane_s16(vi, 4);
-      y[i].qs[32 * j + 13] = vgetq_lane_s16(vi, 5);
-      y[i].qs[32 * j + 14] = vgetq_lane_s16(vi, 6);
-      y[i].qs[32 * j + 15] = vgetq_lane_s16(vi, 7);
-
-      v = vmulq_n_f16(srcv[2][j], id[2]);
-      vi = vcvtnq_s16_f16(v);
-      y[i].qs[32 * j + 16] = vgetq_lane_s16(vi, 0);
-      y[i].qs[32 * j + 17] = vgetq_lane_s16(vi, 1);
-      y[i].qs[32 * j + 18] = vgetq_lane_s16(vi, 2);
-      y[i].qs[32 * j + 19] = vgetq_lane_s16(vi, 3);
-      y[i].qs[32 * j + 20] = vgetq_lane_s16(vi, 4);
-      y[i].qs[32 * j + 21] = vgetq_lane_s16(vi, 5);
-      y[i].qs[32 * j + 22] = vgetq_lane_s16(vi, 6);
-      y[i].qs[32 * j + 23] = vgetq_lane_s16(vi, 7);
-
-      v = vmulq_n_f16(srcv[3][j], id[3]);
-      vi = vcvtnq_s16_f16(v);
-      y[i].qs[32 * j + 24] = vgetq_lane_s16(vi, 0);
-      y[i].qs[32 * j + 25] = vgetq_lane_s16(vi, 1);
-      y[i].qs[32 * j + 26] = vgetq_lane_s16(vi, 2);
-      y[i].qs[32 * j + 27] = vgetq_lane_s16(vi, 3);
-      y[i].qs[32 * j + 28] = vgetq_lane_s16(vi, 4);
-      y[i].qs[32 * j + 29] = vgetq_lane_s16(vi, 5);
-      y[i].qs[32 * j + 30] = vgetq_lane_s16(vi, 6);
-      y[i].qs[32 * j + 31] = vgetq_lane_s16(vi, 7);
+      for (int row = 0; row < 4; row++) {
+        const float16x8_t v = vmulq_n_f16(srcv[row][j], id[row]);
+        const int16x8_t vi = vcvtnq_s16_f16(v);
+        const int8x8_t vi8 = vqmovn_s16(vi);
+        vst1_s8(&y[i].qs[32 * j + 8 * row], vi8);
+      }
     }
   }
 #else
@@ -396,22 +351,22 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
   int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
   unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
-  std::vector<char> QA = std::vector<char>(qa_size);
+  std::vector<char> QA(qa_size);
 
-  // Quantize 4-divisible-M row portion with matrix-wise function
-  for (unsigned int i = 0; i < M4; i++) {
-    __ggml_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
-                                 K);
+  // Multi-threaded activation quantization
+  unsigned int thread_num = tm.getComputeThreadCount();
+  if (M4 > 0) {
+    tm.parallel_for(0, static_cast<size_t>(M4), [&](size_t i) {
+      __ggml_quantize_mat_q8_0_4x8(A + 4 * i * K,
+                                   QA.data() + i * qa_4_rows_size, K);
+    });
   }
-  // Quantize leftover 1 ~ 3 rows with row-wise function
+  // Quantize leftover 1 ~ 3 rows
   for (unsigned int i = M4 * 4; i < M; i++) {
     __ggml_quantize_row_q8_0(
       (_FP16 *)A + i * K,
       (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
   }
-
-  ///@todo Dynamic thread-number selection for GEMM problem size
-  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
     unsigned int M_step_start = (i * N) / thread_num;
     unsigned int M_step_end = ((i + 1) * N) / thread_num;
@@ -457,34 +412,44 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldb, _FP16 *C,
                                const unsigned int ldc) {
   int NB_COLS = 4;
-  std::vector<float> C32 = std::vector<float>(M * N);
+  auto &tm = ThreadManager::Global();
+  unsigned int thread_num = tm.getComputeThreadCount();
 
-  // q40 GEMV accuracy explodes?
-  if (M == 1) { // GEMV
+  if (M == 1) { // GEMV - multi-threaded with inline FP32→FP16 conversion
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
     unsigned int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_size = sizeof(block_q8_0) * blocks_per_row;
-    std::vector<char> QA = std::vector<char>(qa_size);
-    __ggml_quantize_row_q8_0(A, (void *)QA.data(), K);
+    std::vector<char> QA(qa_size);
+    __ggml_quantize_row_q8_0(A, QA.data(), K);
 
-    // Single-threaded GEMV (n_threads=1 in original)
-    unsigned int M_step_start = 0;
-    unsigned int M_step_end = N;
+    tm.parallel_for_chunked(thread_num, [=, &QA](size_t thread_idx) {
+      unsigned int M_step_start = (thread_idx * N) / thread_num;
+      unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
-    M_step_start = (M_step_start % NB_COLS)
-                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                     : M_step_start;
-    M_step_end = (M_step_end % NB_COLS)
-                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                   : M_step_end;
+      M_step_start = (M_step_start % NB_COLS)
+                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                       : M_step_start;
+      M_step_end = (M_step_end % NB_COLS)
+                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                     : M_step_end;
 
-    nntr_gemv_q4_0_4x8_q8_0(K, (float *)((C32.data()) + M_step_start), N,
-                            (void *)((char *)B + M_step_start * B_step),
-                            QA.data(), M, M_step_end - M_step_start);
+      unsigned int chunk_size = M_step_end - M_step_start;
+      if (chunk_size == 0)
+        return;
+
+      // Per-thread FP32 buffer on heap (avoids global M*N allocation)
+      std::vector<float> local_c32(chunk_size, 0.0f);
+
+      nntr_gemv_q4_0_4x8_q8_0(K, local_c32.data(), chunk_size,
+                              (void *)((char *)B + M_step_start * B_step),
+                              QA.data(), M, chunk_size);
+
+      // Inline FP32→FP16 conversion directly into output
+      __copy_f16_from_f32(local_c32.data(), C + M_step_start, chunk_size);
+    });
   } else {
     return __ggml_q4_0_4x8_q8_0_GEMM_BSTP(M, N, K, A, lda, B, ldb, C, ldc);
   }
-  __copy_f16_from_f32(C32.data(), C, M * N);
 }
 
 } // namespace nntrainer

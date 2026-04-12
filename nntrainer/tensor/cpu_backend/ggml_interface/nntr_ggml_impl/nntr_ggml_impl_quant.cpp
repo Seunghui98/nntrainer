@@ -562,14 +562,16 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
 
     y[i].d = nntr_fp32_to_fp16(d);
 
-    for (int j = 0; j < 8; j++) {
-      const float32x4_t v = vmulq_n_f32(srcv[j], id);
-      const int32x4_t vi = vcvtnq_s32_f32(v);
-
-      y[i].qs[4 * j + 0] = vgetq_lane_s32(vi, 0);
-      y[i].qs[4 * j + 1] = vgetq_lane_s32(vi, 1);
-      y[i].qs[4 * j + 2] = vgetq_lane_s32(vi, 2);
-      y[i].qs[4 * j + 3] = vgetq_lane_s32(vi, 3);
+    for (int j = 0; j < 4; j++) {
+      const float32x4_t v0 = vmulq_n_f32(srcv[2 * j], id);
+      const float32x4_t v1 = vmulq_n_f32(srcv[2 * j + 1], id);
+      const int32x4_t vi0 = vcvtnq_s32_f32(v0);
+      const int32x4_t vi1 = vcvtnq_s32_f32(v1);
+      const int16x4_t n0 = vqmovn_s32(vi0);
+      const int16x4_t n1 = vqmovn_s32(vi1);
+      const int16x8_t n16 = vcombine_s16(n0, n1);
+      const int8x8_t n8 = vqmovn_s16(n16);
+      vst1_s8(&y[i].qs[8 * j], n8);
     }
   }
 #elif defined __wasm_simd128__
