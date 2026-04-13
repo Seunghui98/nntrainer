@@ -45,27 +45,28 @@ def save_lfm2_for_nntrainer(params, config, dtype, file):
         print(f"  {key}: {params[key].shape}")
 
     def save_conv_block(layer_prefix):
-        """Save LFM2 conv block weights.
+        """Save decomposed LFM2 conv block weights.
 
         Layer order in constructModel (createConvBlock):
           1. RMSNorm (operator_norm)
-          2. LFM2Conv layer:
-             - weight[0]: in_proj  (hidden, 3*hidden)
-             - weight[1]: conv     (hidden, kernel_size)
-             - weight[2]: out_proj (hidden, hidden)
+          2. FC in_proj (hidden → 3*hidden)     [fully_connected weight]
+          3. LFM2Conv gated_conv:
+             - weight[0]: conv kernel (hidden, kernel_size)
+          4. FC out_proj (hidden → hidden)       [fully_connected weight]
         """
         prefix = f"{layer_prefix}conv."
 
-        # in_proj (hidden_size, 3*hidden_size) -> transpose to (hidden_size, 3*hidden_size)
+        # FC: in_proj (hidden_size, 3*hidden_size)
         save_projection(f"{prefix}in_proj.weight", transpose=True)
 
-        # conv1d kernel: HF stores as (hidden_size, 1, kernel_size)
+        # LFM2Conv: conv1d kernel (hidden_size, kernel_size)
+        # HF stores as (hidden_size, 1, kernel_size) → squeeze to (hidden_size, kernel_size)
         conv_w = params[f"{prefix}conv.weight"]
-        conv_w = conv_w.squeeze(1)  # -> (hidden_size, kernel_size)
+        conv_w = conv_w.squeeze(1)
         save_weight(conv_w)
         print(f"  {prefix}conv.weight: {params[f'{prefix}conv.weight'].shape} -> {conv_w.shape}")
 
-        # out_proj (hidden_size, hidden_size)
+        # FC: out_proj (hidden_size, hidden_size)
         save_projection(f"{prefix}out_proj.weight", transpose=True)
 
     def save_attention_block(layer_prefix):

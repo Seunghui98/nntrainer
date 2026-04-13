@@ -299,20 +299,45 @@ LFM2Transformer::createConvBlock(const int layer_id, std::string input_name) {
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false")}));
 
-  // LFM2 conv: in_proj(3H) → split B,C,x → B*x → conv1d → C*conv → out_proj
+  // Decomposed LFM2 conv:
+  //   FC in_proj (hidden → 3*hidden)  [uses optimized BLAS]
+  //   lfm2_conv  (3*hidden → hidden)  [lightweight: split+gate+conv]
+  //   FC out_proj (hidden → hidden)   [uses optimized BLAS]
+
+  // FC: in_proj (hidden_size → 3 * hidden_size)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_conv_in_proj"),
+     withKey("unit", 3 * DIM),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", norm_name),
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
+
+  // Gated conv: split B,C,x → B*x → depthwise_conv → C*conv
   layers.push_back(createLayer(
     "lfm2_conv",
-    {withKey("name", prefix + "_conv"),
-     withKey("input_layers", norm_name),
+    {withKey("name", prefix + "_conv_gated"),
+     withKey("input_layers", prefix + "_conv_in_proj"),
      withKey("hidden_size", DIM),
      withKey("conv_kernel_size", CONV_L_CACHE),
      withKey("packed", "false")}));
+
+  // FC: out_proj (hidden_size → hidden_size)
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_conv_out_proj"),
+     withKey("unit", DIM),
+     withKey("disable_bias", "true"),
+     withKey("input_layers", prefix + "_conv_gated"),
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)}));
 
   // Residual add
   layers.push_back(createLayer(
     "addition",
     {withKey("name", prefix + "_decoder_add"),
-     withKey("input_layers", input_name + "," + prefix + "_conv")}));
+     withKey("input_layers", input_name + "," + prefix + "_conv_out_proj")}));
 
   // FFN norm
   layers.push_back(createLayer(

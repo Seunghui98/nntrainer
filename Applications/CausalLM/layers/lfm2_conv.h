@@ -4,9 +4,15 @@
  *
  * @file   lfm2_conv.h
  * @date   13 April 2026
- * @brief  LFM2 double-gated short convolution layer
- * @note   Implements: in_proj(3H) -> split B,C,x -> B*x -> depthwise_conv1d ->
- *         C*conv_out -> out_proj
+ * @brief  LFM2 gated convolution layer (lightweight: gating + conv only)
+ * @note   The heavy in_proj and out_proj are separate FC layers.
+ *         This layer only does: split B,C,x -> B*x -> depthwise_conv1d -> C*conv
+ *
+ *         Input:  (batch, seq, 3 * hidden_size) from in_proj FC
+ *         Output: (batch, seq, hidden_size)
+ *
+ *         Weight[0]: conv kernel (hidden_size, conv_kernel_size)
+ *         Tensor[0]: conv_state circular buffer (hidden_size, conv_kernel_size)
  */
 
 #ifndef __LFM2_CONV_LAYER_H__
@@ -42,20 +48,18 @@ public:
 } // namespace props
 
 /**
- * @brief LFM2 Double-Gated Short Convolution Layer
+ * @brief LFM2 Gated Convolution Layer (lightweight)
  *
- * Forward pass:
- *   BCx = in_proj(input)             // (hidden, 3*hidden)
- *   B, C, x = split(BCx, 3)
- *   Bx = B * x                      // input gating
- *   conv_out = depthwise_conv1d(Bx)  // causal conv (circular buffer)
- *   y = C * conv_out                 // output gating
- *   output = out_proj(y)             // (hidden, hidden)
+ * Forward pass (input is already projected by FC in_proj):
+ *   input shape: (batch, seq, 3 * hidden_size)
+ *   B, C, x = split(input, 3)   // each (batch, seq, hidden_size)
+ *   Bx = B * x                   // input gating
+ *   conv_out = depthwise_conv1d(Bx)
+ *   output = C * conv_out         // output gating
+ *   output shape: (batch, seq, hidden_size)
  *
  * Weights:
- *   0: in_proj  (hidden_size, 3*hidden_size)
- *   1: conv     (hidden_size, conv_kernel_size)
- *   2: out_proj (hidden_size, hidden_size)
+ *   0: conv kernel (hidden_size, conv_kernel_size)
  *
  * Tensors:
  *   0: conv_state (hidden_size, conv_kernel_size) - circular buffer
@@ -87,7 +91,7 @@ private:
   std::tuple<props::LFM2HiddenSize, props::LFM2ConvKernel> lfm2_props;
   unsigned int hidden_size;
   unsigned int conv_kernel_size;
-  unsigned int write_pos; // circular buffer position (per-instance)
+  unsigned int write_pos;
 };
 
 } // namespace causallm
