@@ -353,13 +353,11 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
   unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
   std::vector<char> QA(qa_size);
 
-  // Multi-threaded activation quantization
-  unsigned int thread_num = tm.getComputeThreadCount();
-  if (M4 > 0) {
-    tm.parallel_for(0, static_cast<size_t>(M4), [&](size_t i) {
-      __ggml_quantize_mat_q8_0_4x8(A + 4 * i * K,
-                                   QA.data() + i * qa_4_rows_size, K);
-    });
+  // Sequential activation quantization (parallel_for overhead exceeds benefit
+  // for small per-task work on mobile memory subsystems)
+  for (unsigned int i = 0; i < M4; i++) {
+    __ggml_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
+                                 K);
   }
   // Quantize leftover 1 ~ 3 rows
   for (unsigned int i = M4 * 4; i < M; i++) {
@@ -367,6 +365,8 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
       (_FP16 *)A + i * K,
       (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
   }
+
+  unsigned int thread_num = tm.getComputeThreadCount();
   tm.parallel_for_chunked(thread_num, [=](size_t i) {
     unsigned int M_step_start = (i * N) / thread_num;
     unsigned int M_step_end = ((i + 1) * N) / thread_num;
@@ -412,41 +412,32 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldb, _FP16 *C,
                                const unsigned int ldc) {
   int NB_COLS = 4;
-  auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount();
 
-  if (M == 1) { // GEMV - multi-threaded with inline FP32→FP16 conversion
+  if (M == 1) { // GEMV
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
     unsigned int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_size = sizeof(block_q8_0) * blocks_per_row;
     std::vector<char> QA(qa_size);
     __ggml_quantize_row_q8_0(A, QA.data(), K);
 
-    tm.parallel_for_chunked(thread_num, [=, &QA](size_t thread_idx) {
-      unsigned int M_step_start = (thread_idx * N) / thread_num;
-      unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
+    // Use a small N-element FP32 buffer (not M*N) and convert inline
+    std::vector<float> C32(N);
 
-      M_step_start = (M_step_start % NB_COLS)
-                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                       : M_step_start;
-      M_step_end = (M_step_end % NB_COLS)
-                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                     : M_step_end;
+    unsigned int M_step_start = 0;
+    unsigned int M_step_end = N;
 
-      unsigned int chunk_size = M_step_end - M_step_start;
-      if (chunk_size == 0)
-        return;
+    M_step_start = (M_step_start % NB_COLS)
+                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                     : M_step_start;
+    M_step_end = (M_step_end % NB_COLS)
+                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                   : M_step_end;
 
-      // Per-thread FP32 buffer on heap (avoids global M*N allocation)
-      std::vector<float> local_c32(chunk_size, 0.0f);
+    nntr_gemv_q4_0_4x8_q8_0(K, C32.data() + M_step_start, N,
+                            (void *)((char *)B + M_step_start * B_step),
+                            QA.data(), M, M_step_end - M_step_start);
 
-      nntr_gemv_q4_0_4x8_q8_0(K, local_c32.data(), chunk_size,
-                              (void *)((char *)B + M_step_start * B_step),
-                              QA.data(), M, chunk_size);
-
-      // Inline FP32→FP16 conversion directly into output
-      __copy_f16_from_f32(local_c32.data(), C + M_step_start, chunk_size);
-    });
+    __copy_f16_from_f32(C32.data(), C, N);
   } else {
     return __ggml_q4_0_4x8_q8_0_GEMM_BSTP(M, N, K, A, lda, B, ldb, C, ldc);
   }
