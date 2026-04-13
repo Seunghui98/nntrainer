@@ -123,6 +123,7 @@ protected:
   float TEMPERATURE;
   unsigned int TOP_K;
   float TOP_P;
+  float REPETITION_PENALTY;
 
   std::vector<unsigned int> BAD_WORD_IDS; /**< List of bad word IDs */
   unsigned int NUM_BADWORDS;              /**< Number of bad words */

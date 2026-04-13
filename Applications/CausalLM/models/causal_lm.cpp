@@ -95,6 +95,9 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   TEMPERATURE = generation_cfg.contains("temperature")
                   ? generation_cfg["temperature"].get<float>()
                   : 0.7;
+  REPETITION_PENALTY = generation_cfg.contains("repetition_penalty")
+                         ? generation_cfg["repetition_penalty"].get<float>()
+                         : 1.1;
   global_token_len = 0;
 }
 
@@ -457,7 +460,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
-    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+    std::vector<unsigned int> ids_list(generate(
+      output_interval[0], do_sample, REPETITION_PENALTY, ids_history,
+      token_generation_idx));
     if (token_generation_idx < input_len) {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
         input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
