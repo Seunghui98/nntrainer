@@ -100,16 +100,20 @@ std::string formatted = tmpl.apply(messages);
 
 ### Chat Template (C API)
 
-The C API provides `runModelWithMessages()` and `applyChatTemplate()` for chat template formatting with role + content, matching the HuggingFace `apply_chat_template()` interface.
+The C API (`causal_lm_api.h`) provides chat template support through two functions:
 
-#### Basic Usage (Single Prompt)
+| Function | Description |
+|----------|-------------|
+| `applyChatTemplate()` | Format messages with chat template (no inference) |
+| `runModelWithMessages()` | Format messages + run inference (calls `applyChatTemplate` + `runModel` internally) |
+
+#### 1. Single Prompt (Existing)
 
 ```c
 #include "causal_lm_api.h"
 
 Config config = {.use_chat_template = true, .debug_mode = false, .verbose = true};
 setOptions(config);
-
 loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
           CAUSAL_LM_QUANTIZATION_W4A32);
 
@@ -118,19 +122,44 @@ runModel("what is machine learning?", &output);
 printf("%s\n", output);
 ```
 
-#### Chat Template with Messages (Role + Content)
+#### 2. Chat Template with Messages
+
+Pass an array of `CausalLMChatMessage` with role and content. Any number of messages is supported.
 
 ```c
-#include "causal_lm_api.h"
-
-loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
-          CAUSAL_LM_QUANTIZATION_W4A32);
-
+// System prompt + single user message
 CausalLMChatMessage msgs[] = {
-  {"system",    "You are a helpful AI assistant."},
-  {"user",      "What is machine learning?"},
-  {"assistant", "Machine learning is a subset of AI that learns from data."},
-  {"user",      "Can you give me a real-world example?"}
+  {"system", "You are a helpful AI assistant."},
+  {"user",   "What is machine learning?"}
+};
+
+const char *output;
+runModelWithMessages(msgs, 2, true, &output);
+printf("%s\n", output);
+```
+
+```c
+// Conversation history with multiple turns
+CausalLMChatMessage msgs[] = {
+  {"user",      "Hello, how are you?"},
+  {"assistant", "I'm doing great. How can I help you today?"},
+  {"user",      "What is deep learning?"},
+  {"assistant", "Deep learning is a subset of machine learning using neural networks."},
+  {"user",      "How is it different from traditional ML?"}
+};
+
+const char *output;
+runModelWithMessages(msgs, 5, true, &output);
+printf("%s\n", output);
+```
+
+```c
+// System prompt + conversation history
+CausalLMChatMessage msgs[] = {
+  {"system",    "You are a helpful AI assistant. Be concise."},
+  {"user",      "What is ML?"},
+  {"assistant", "Machine learning is a subset of AI."},
+  {"user",      "Give me an example."}
 };
 
 const char *output;
@@ -138,7 +167,9 @@ runModelWithMessages(msgs, 4, true, &output);
 printf("%s\n", output);
 ```
 
-#### Preview Formatted Prompt (No Inference)
+#### 3. Preview Formatted Prompt (No Inference)
+
+Use `applyChatTemplate()` to check how messages are formatted before running inference.
 
 ```c
 CausalLMChatMessage msgs[] = {
@@ -149,24 +180,27 @@ CausalLMChatMessage msgs[] = {
 const char *formatted;
 applyChatTemplate(msgs, 2, true, &formatted);
 printf("%s\n", formatted);
-// Output (Qwen3):
-// <|im_start|>system
-// You are a helpful AI assistant.<|im_end|>
-// <|im_start|>user
-// Hello!<|im_end|>
-// <|im_start|>assistant
 ```
 
-#### API Reference
+Output (Qwen3):
+```
+<|im_start|>system
+You are a helpful AI assistant.<|im_end|>
+<|im_start|>user
+Hello!<|im_end|>
+<|im_start|>assistant
+```
+
+#### Full API Reference
 
 | Function | Description |
 |----------|-------------|
+| `setOptions()` | Configure chat template, verbosity, debug mode |
 | `loadModel()` | Load model with backend, type, and quantization |
 | `runModel()` | Run inference with a single text prompt |
-| `runModelWithMessages()` | Run inference with chat template formatted messages |
-| `applyChatTemplate()` | Apply chat template without running inference |
+| `applyChatTemplate()` | Format messages with chat template (no inference) |
+| `runModelWithMessages()` | Format messages + run inference |
 | `getPerformanceMetrics()` | Get timing and memory usage of last run |
-| `setOptions()` | Configure chat template, verbosity, debug mode |
 
 ### Chat Template via CLI (nntr_config.json)
 
