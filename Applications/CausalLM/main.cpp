@@ -268,27 +268,52 @@ int main(int argc, char *argv[]) {
 
     // Determine input text
     if (argc >= 3) {
+      // CLI argument: join all remaining args (handles adb shell word splitting)
       input_text = argv[2];
+      for (int i = 3; i < argc; ++i) {
+        input_text += " ";
+        input_text += argv[i];
+      }
       // Apply chat template to raw user input if available
       if (chat_tmpl.isAvailable()) {
         input_text = chat_tmpl.apply(input_text);
       }
-    } else {
-      if (nntr_cfg.contains("chat_input")) {
-        if (architecture == "Gemma3ForCausalLM") {
-          input_text = causallm::gemma3::apply_function_gemma_template(
-            nntr_cfg["chat_input"]);
-        } else {
-          std::cerr << "[Warning] 'chat_input' is set but support for model "
-                       "architecture '"
-                    << architecture
-                    << "' is not implemented. Falling back to 'sample_input'."
-                    << std::endl;
-          input_text = nntr_cfg["sample_input"].get<std::string>();
+    } else if (nntr_cfg.contains("chat") && nntr_cfg["chat"].is_array()) {
+      // Multi-turn chat from nntr_config.json "chat" key
+      std::vector<causallm::ChatMessage> messages;
+      for (const auto &msg : nntr_cfg["chat"]) {
+        if (msg.contains("role") && msg.contains("content")) {
+          messages.push_back({msg["role"].get<std::string>(),
+                              msg["content"].get<std::string>()});
         }
+      }
+      if (!messages.empty() && chat_tmpl.isAvailable()) {
+        input_text = chat_tmpl.apply(messages);
+        std::cout << "[Info] Using multi-turn chat from nntr_config.json ("
+                  << messages.size() << " messages)" << std::endl;
+      } else if (!messages.empty()) {
+        // Fallback: use last user message content
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+          if (it->role == "user") {
+            input_text = it->content;
+            break;
+          }
+        }
+      }
+    } else if (nntr_cfg.contains("chat_input")) {
+      if (architecture == "Gemma3ForCausalLM") {
+        input_text = causallm::gemma3::apply_function_gemma_template(
+          nntr_cfg["chat_input"]);
       } else {
+        std::cerr << "[Warning] 'chat_input' is set but support for model "
+                     "architecture '"
+                  << architecture
+                  << "' is not implemented. Falling back to 'sample_input'."
+                  << std::endl;
         input_text = nntr_cfg["sample_input"].get<std::string>();
       }
+    } else {
+      input_text = nntr_cfg["sample_input"].get<std::string>();
     }
 
     auto model = causallm::Factory::Instance().create(architecture, cfg,
