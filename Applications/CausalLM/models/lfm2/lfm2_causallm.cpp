@@ -29,6 +29,16 @@ void LFM2Transformer::setupLFM2Parameters(json &cfg, json &nntr_cfg) {
                               ? cfg["num_hidden_layers"].get<unsigned int>()
                               : NUM_LAYERS;
 
+  // LFM2 config uses "tie_embedding" instead of "tie_word_embeddings"
+  if (!TIE_WORD_EMBEDDINGS && cfg.contains("tie_embedding")) {
+    TIE_WORD_EMBEDDINGS = cfg["tie_embedding"].get<bool>();
+  }
+
+  // LFM2 config uses "norm_eps" instead of "rms_norm_eps"
+  if (cfg.contains("norm_eps")) {
+    NORM_EPS = cfg["norm_eps"].get<float>();
+  }
+
   is_attn_layer.resize(num_layers, false);
 
   // Parse layer_types from config.json (e.g. ["conv","conv","full_attention",...])
