@@ -196,7 +196,29 @@ int main(int argc, char *argv[]) {
   }
   printSuccess("Model loaded successfully");
 
-  printSection("Inference");
+  // ── Test 1: applyChatTemplate (no inference, format only) ──
+  printSection("Test: applyChatTemplate");
+  std::cout << COLOR_CYAN << "📝 " << COLOR_RESET
+            << "Testing chat template formatting (no inference)...\n\n";
+
+  CausalLMChatMessage tmpl_msgs[] = {
+    {"system", "You are a helpful AI assistant."},
+    {"user", prompt}};
+
+  const char *formattedText = nullptr;
+  err = applyChatTemplate(tmpl_msgs, 2, true, &formattedText);
+  if (err == CAUSAL_LM_ERROR_NONE && formattedText) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Formatted prompt:\n";
+    std::cout << COLOR_BOLD << COLOR_YELLOW << formattedText << COLOR_RESET
+              << "\n\n";
+    printSuccess("applyChatTemplate works");
+  } else {
+    printError("applyChatTemplate failed");
+    std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+  }
+
+  // ── Test 2: runModel (single prompt, existing API) ──
+  printSection("Test: runModel (single prompt)");
   std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
   std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
             << "\n\n";
@@ -244,6 +266,46 @@ int main(int argc, char *argv[]) {
     std::cout << COLOR_RESET << "\n\n";
   } else {
     printWarning("No output generated");
+  }
+
+  // ── Test 3: runModelWithMessages (chat template with messages) ──
+  printSection("Test: runModelWithMessages");
+  CausalLMChatMessage chat_msgs[] = {
+    {"system", "You are a helpful AI assistant."},
+    {"user", prompt}};
+
+  std::cout << COLOR_CYAN << "📝 " << COLOR_RESET
+            << "Messages:\n";
+  for (size_t i = 0; i < 2; ++i) {
+    std::cout << COLOR_YELLOW << "  [" << chat_msgs[i].role << "] "
+              << COLOR_RESET << chat_msgs[i].content << "\n";
+  }
+  std::cout << "\n";
+
+  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+            << "Running inference with messages...\n\n";
+
+  const char *msgOutput = nullptr;
+
+  if (verbose) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GRAY;
+  }
+
+  err = runModelWithMessages(chat_msgs, 2, true, &msgOutput);
+
+  if (verbose) {
+    std::cout << COLOR_RESET << "\n\n";
+  }
+
+  if (err == CAUSAL_LM_ERROR_NONE && msgOutput) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GREEN << "  " << msgOutput << COLOR_RESET
+              << "\n\n";
+    printSuccess("runModelWithMessages works");
+  } else {
+    printError("runModelWithMessages failed");
+    std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
   }
 
   printSection("Performance Metrics");
