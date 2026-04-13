@@ -257,13 +257,22 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    if (!chat_json.is_array()) {
-      printError("Chat file must contain a JSON array of messages");
+    // Support both formats:
+    //   Array:  [{"role":"user","content":"Hi"}]
+    //   Object: {"chat": [{"role":"user","content":"Hi"}]}
+    json messages_json;
+    if (chat_json.is_array()) {
+      messages_json = chat_json;
+    } else if (chat_json.is_object() && chat_json.contains("chat") &&
+               chat_json["chat"].is_array()) {
+      messages_json = chat_json["chat"];
+    } else {
+      printError("Chat file must contain a JSON array or {\"chat\": [...]}");
       return 1;
     }
 
     // Store strings to keep pointers valid
-    for (const auto &msg : chat_json) {
+    for (const auto &msg : messages_json) {
       if (msg.contains("role") && msg.contains("content")) {
         role_strs.push_back(msg["role"].get<std::string>());
         content_strs.push_back(msg["content"].get<std::string>());
