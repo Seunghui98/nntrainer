@@ -33,6 +33,7 @@ causallm_layer_dependencies += [
     causallm_attn_gate_dep,
     causallm_causal_conv1d_dep,
     causallm_gdn_ssm_core_dep,
+    causallm_lfm2_conv_dep,
 ]
 
 subdir('models')

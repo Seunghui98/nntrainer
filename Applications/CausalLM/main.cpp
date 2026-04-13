@@ -40,6 +40,7 @@
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_5_causallm.h"
+#include "lfm2_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "multilingual_tinybert_16mb.h"
@@ -211,6 +212,11 @@ int main(int argc, char *argv[]) {
     "BertForMaskedLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::BertModel>(cfg, generation_cfg,
                                                         nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Lfm2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::LFM2CausalLM>(cfg, generation_cfg,
+                                                       nntr_cfg);
     });
 
   // Validate arguments

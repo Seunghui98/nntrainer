@@ -215,3 +215,17 @@ causallm_gdn_ssm_core_dep = declare_dependency(
     link_with: causallm_gdn_ssm_core,
     include_directories: causallm_layer_inc
 )
+
+causallm_lfm2_conv_src_abs = [meson.current_source_dir() / 'lfm2_conv.cpp']
+causallm_lfm2_conv = shared_library(
+    'lfm2_conv_layer',
+    causallm_lfm2_conv_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_lfm2_conv_dep = declare_dependency(
+    link_with: causallm_lfm2_conv,
+    include_directories: causallm_layer_inc
+)

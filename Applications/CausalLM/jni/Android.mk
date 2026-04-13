@@ -28,6 +28,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/tiny_bert \
+    $(LOCAL_PATH)/../models/lfm2 \
 
 # Prebuilt nntrainer libraries
 include $(CLEAR_VARS)
@@ -99,6 +100,8 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma3/function.cpp \
     ../models/tiny_bert/multilingual_tinybert_16mb.cpp \
+    ../models/lfm2/lfm2_causallm.cpp \
+    ../layers/lfm2_conv.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
