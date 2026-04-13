@@ -696,46 +696,6 @@ apply_chat_template_messages(const std::string &architecture,
   return result;
 }
 
-ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
-                               size_t num_messages, bool add_generation_prompt,
-                               const char **outputText) {
-  if (!g_initialized || !g_model) {
-    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
-  }
-  if (messages == nullptr || num_messages == 0 || outputText == nullptr) {
-    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-  }
-
-  try {
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    auto chat_messages = convertMessages(messages, num_messages);
-    std::string input = apply_chat_template_messages(
-      g_architecture, chat_messages, add_generation_prompt);
-
-#if defined(_WIN32)
-    g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
-                 g_verbose);
-#else
-    g_model->run(input, false, "", "", g_verbose);
-#endif
-
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
-    g_last_output = "";
-    if (causal_lm_model) {
-      g_last_output = causal_lm_model->getOutput(0);
-    }
-
-    *outputText = g_last_output.c_str();
-
-  } catch (const std::exception &e) {
-    std::cerr << "Exception in runModelWithMessages: " << e.what() << std::endl;
-    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
-  }
-
-  return CAUSAL_LM_ERROR_NONE;
-}
-
 ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
                             size_t num_messages, bool add_generation_prompt,
                             const char **formattedText) {
@@ -758,4 +718,27 @@ ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
   }
 
   return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
+                               size_t num_messages, bool add_generation_prompt,
+                               const char **outputText) {
+  if (!g_initialized || !g_model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+  if (outputText == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  // Apply chat template to format the prompt
+  const char *formattedInput = nullptr;
+  ErrorCode err =
+    applyChatTemplate(messages, num_messages, add_generation_prompt,
+                      &formattedInput);
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    return err;
+  }
+
+  // Run inference with the formatted prompt
+  return runModel(formattedInput, outputText);
 }
