@@ -79,9 +79,9 @@ To use chat templates, ensure `tokenizer_config.json` is in your model directory
 # <|im_start|>assistant
 ```
 
-### Multi-turn Conversations (API)
+### Multi-turn Conversations (C++ Internal)
 
-The C API supports multi-turn conversations through `ChatMessage`:
+The C++ `ChatTemplate` class supports multi-turn conversations directly:
 
 ```cpp
 #include "chat_template.h"
@@ -97,6 +97,101 @@ std::vector<causallm::ChatMessage> messages = {
 
 std::string formatted = tmpl.apply(messages);
 ```
+
+### Multi-turn Conversations (C API)
+
+The C API provides `runModelWithMessages()` and `applyChatTemplate()` for multi-turn conversations with role + content, matching the HuggingFace `apply_chat_template()` interface.
+
+#### Basic Usage (Single Prompt)
+
+```c
+#include "causal_lm_api.h"
+
+Config config = {.use_chat_template = true, .debug_mode = false, .verbose = true};
+setOptions(config);
+
+loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
+          CAUSAL_LM_QUANTIZATION_W4A32);
+
+const char *output;
+runModel("what is machine learning?", &output);
+printf("%s\n", output);
+```
+
+#### Multi-turn Chat (Role + Content)
+
+```c
+#include "causal_lm_api.h"
+
+loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
+          CAUSAL_LM_QUANTIZATION_W4A32);
+
+CausalLMChatMessage msgs[] = {
+  {"system",    "You are a helpful AI assistant."},
+  {"user",      "What is machine learning?"},
+  {"assistant", "Machine learning is a subset of AI that learns from data."},
+  {"user",      "Can you give me a real-world example?"}
+};
+
+const char *output;
+runModelWithMessages(msgs, 4, true, &output);
+printf("%s\n", output);
+```
+
+#### Preview Formatted Prompt (No Inference)
+
+```c
+CausalLMChatMessage msgs[] = {
+  {"system", "You are a helpful AI assistant."},
+  {"user",   "Hello!"}
+};
+
+const char *formatted;
+applyChatTemplate(msgs, 2, true, &formatted);
+printf("%s\n", formatted);
+// Output (Qwen3):
+// <|im_start|>system
+// You are a helpful AI assistant.<|im_end|>
+// <|im_start|>user
+// Hello!<|im_end|>
+// <|im_start|>assistant
+```
+
+#### API Reference
+
+| Function | Description |
+|----------|-------------|
+| `loadModel()` | Load model with backend, type, and quantization |
+| `runModel()` | Run inference with a single text prompt |
+| `runModelWithMessages()` | Run inference with multi-turn chat messages |
+| `applyChatTemplate()` | Apply chat template without running inference |
+| `getPerformanceMetrics()` | Get timing and memory usage of last run |
+| `setOptions()` | Configure chat template, verbosity, debug mode |
+
+### Multi-turn via CLI (nntr_config.json)
+
+Add a `"chat"` key to `nntr_config.json` to run multi-turn conversations from the command line without code changes:
+
+```json
+{
+  "chat": [
+    {"role": "system",    "content": "You are a helpful AI assistant."},
+    {"role": "user",      "content": "What is machine learning?"},
+    {"role": "assistant", "content": "Machine learning is a subset of AI..."},
+    {"role": "user",      "content": "Can you give me an example?"}
+  ]
+}
+```
+
+```bash
+# Run without prompt argument to use "chat" from nntr_config.json
+./nntr_causallm /path/to/model/
+
+# CLI argument takes priority over "chat" key
+./nntr_causallm /path/to/model/ "single prompt here"
+```
+
+Input priority: CLI argument > `"chat"` > `"chat_input"` > `"sample_input"`
 
 ## How to run
 
