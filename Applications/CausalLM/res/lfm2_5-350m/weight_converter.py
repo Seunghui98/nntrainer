@@ -138,10 +138,19 @@ def save_lfm2_for_nntrainer(params, config, dtype, file):
         # MLP
         save_feed_forward(layer_prefix)
 
-    # 4. Output norm (if exists - LFM2 might not have separate final norm)
+    # 4. Output norm
+    # LFM2 does NOT have a separate final norm (no model.norm.weight).
+    # NNTrainer model creates an output_norm RMSNorm layer before lm_head.
+    # Save identity weights: all zeros → becomes all 1.0 after +1.0 offset
+    # → RMSNorm with gamma=1.0 is identity.
     if "model.norm.weight" in params:
         save_weight(params["model.norm.weight"], is_rms=True)
         print(f"\nmodel.norm.weight (+1.0): {params['model.norm.weight'].shape}")
+    else:
+        # Save identity norm: zeros + 1.0 = all 1.0 (identity RMSNorm)
+        identity_norm = torch.zeros(hidden_size)
+        save_weight(identity_norm, is_rms=True)
+        print(f"\noutput_norm: synthetic identity (all 1.0), shape=({hidden_size},)")
 
     # 5. LM head (only if not tied)
     if not tie_embedding:
