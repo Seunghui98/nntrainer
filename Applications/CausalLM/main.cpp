@@ -277,6 +277,9 @@ int main(int argc, char *argv[]) {
       // Apply chat template to raw user input if available
       if (chat_tmpl.isAvailable()) {
         input_text = chat_tmpl.apply(input_text);
+        // Chat template already includes all formatting; clear system prompts
+        system_head_prompt = "";
+        system_tail_prompt = "";
       }
     } else if (nntr_cfg.contains("chat") && nntr_cfg["chat"].is_array()) {
       // Multi-turn chat from nntr_config.json "chat" key
@@ -289,6 +292,9 @@ int main(int argc, char *argv[]) {
       }
       if (!messages.empty() && chat_tmpl.isAvailable()) {
         input_text = chat_tmpl.apply(messages);
+        // Chat template already includes all formatting; clear system prompts
+        system_head_prompt = "";
+        system_tail_prompt = "";
         std::cout << "[Info] Using multi-turn chat from nntr_config.json ("
                   << messages.size() << " messages)" << std::endl;
       } else if (!messages.empty()) {
