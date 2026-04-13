@@ -109,6 +109,20 @@ Runs inference on the loaded model.
 - **inputTextPrompt**: The input text/prompt.
 - **outputText**: Pointer to store the result string.
 
+#### `ErrorCode applyChatTemplate(const CausalLMChatMessage *messages, size_t num_messages, bool add_generation_prompt, const char **formattedText)`
+Applies chat template to messages without running inference. Useful for debugging or verifying prompt formatting.
+- **messages**: Array of `CausalLMChatMessage` structs (role + content).
+- **num_messages**: Number of messages in the array.
+- **add_generation_prompt**: Whether to append generation prompt (e.g., `<|im_start|>assistant\n`).
+- **formattedText**: Pointer to store the formatted prompt string.
+
+#### `ErrorCode runModelWithMessages(const CausalLMChatMessage *messages, size_t num_messages, bool add_generation_prompt, const char **outputText)`
+Applies chat template to messages and runs inference. Internally calls `applyChatTemplate()` then `runModel()`.
+- **messages**: Array of `CausalLMChatMessage` structs (role + content).
+- **num_messages**: Number of messages in the array.
+- **add_generation_prompt**: Whether to append generation prompt.
+- **outputText**: Pointer to store the generated output string.
+
 #### `ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics)`
 Retrieves performance metrics of the last run.
 - **metrics**: Pointer to `PerformanceMetrics` struct to be filled.
@@ -117,45 +131,110 @@ Retrieves performance metrics of the last run.
 - `total_duration_ms`: Total execution time from start to finish.
 - `peak_memory_kb`: Peak resident set size (memory usage) in KB.
 
-## Usage Example
+## Usage Examples
+
+### 1. Single Prompt
 
 ```c
 #include "causal_lm_api.h"
 #include <stdio.h>
 
 int main() {
-    // 1. Set Options
-    Config config;
-    config.use_chat_template = true;
-    config.debug_mode = false;
+    Config config = {.use_chat_template = true, .debug_mode = false, .verbose = true};
     setOptions(config);
 
-    // 2. Load Model
-    // Automatically looks for files in "./models/qwen3-0.6b-w16a16/"
-    ErrorCode err = loadModel(CAUSAL_LM_BACKEND_CPU, 
-                              CAUSAL_LM_MODEL_QWEN3_0_6B, 
+    ErrorCode err = loadModel(CAUSAL_LM_BACKEND_CPU,
+                              CAUSAL_LM_MODEL_QWEN3_0_6B,
                               CAUSAL_LM_QUANTIZATION_W16A16);
-    
     if (err != CAUSAL_LM_ERROR_NONE) {
         printf("Failed to load model\n");
         return -1;
     }
 
-    // 3. Run Inference
-    const char* output = NULL;
+    const char *output = NULL;
     err = runModel("Hello, how are you?", &output);
-    
     if (err == CAUSAL_LM_ERROR_NONE) {
         printf("Response: %s\n", output);
     }
 
-    // 4. Check Metrics
-    PerformanceMetrics metrics;
-    if (getPerformanceMetrics(&metrics) == CAUSAL_LM_ERROR_NONE) {
-        printf("Generated %d tokens in %.2f ms\n", 
-               metrics.generation_tokens, metrics.generation_duration_ms);
-    }
+    return 0;
+}
+```
+
+### 2. Chat Template with Messages
+
+```c
+#include "causal_lm_api.h"
+#include <stdio.h>
+
+int main() {
+    Config config = {.use_chat_template = true, .debug_mode = false, .verbose = true};
+    setOptions(config);
+
+    loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
+              CAUSAL_LM_QUANTIZATION_W16A16);
+
+    // System prompt + user message
+    CausalLMChatMessage msgs[] = {
+        {"system", "You are a helpful AI assistant."},
+        {"user",   "What is machine learning?"}
+    };
+
+    const char *output;
+    runModelWithMessages(msgs, 2, true, &output);
+    printf("Response: %s\n", output);
 
     return 0;
 }
+```
+
+### 3. Conversation History
+
+```c
+    // Multiple user/assistant turns
+    CausalLMChatMessage msgs[] = {
+        {"user",      "Hello, how are you?"},
+        {"assistant", "I'm doing great. How can I help you today?"},
+        {"user",      "What is deep learning?"},
+        {"assistant", "Deep learning uses neural networks with many layers."},
+        {"user",      "How is it different from traditional ML?"}
+    };
+
+    const char *output;
+    runModelWithMessages(msgs, 5, true, &output);
+    printf("Response: %s\n", output);
+```
+
+### 4. Preview Formatted Prompt (No Inference)
+
+```c
+    CausalLMChatMessage msgs[] = {
+        {"system", "You are a helpful assistant."},
+        {"user",   "Hello!"}
+    };
+
+    const char *formatted;
+    applyChatTemplate(msgs, 2, true, &formatted);
+    printf("Formatted prompt:\n%s\n", formatted);
+
+    // Output (Qwen3):
+    // <|im_start|>system
+    // You are a helpful assistant.<|im_end|>
+    // <|im_start|>user
+    // Hello!<|im_end|>
+    // <|im_start|>assistant
+```
+
+### 5. Performance Metrics
+
+```c
+    PerformanceMetrics metrics;
+    if (getPerformanceMetrics(&metrics) == CAUSAL_LM_ERROR_NONE) {
+        printf("Prefill:     %d tokens, %.2f ms\n",
+               metrics.prefill_tokens, metrics.prefill_duration_ms);
+        printf("Generation:  %d tokens, %.2f ms\n",
+               metrics.generation_tokens, metrics.generation_duration_ms);
+        printf("Total:       %.2f ms\n", metrics.total_duration_ms);
+        printf("Peak Memory: %zu KB\n", metrics.peak_memory_kb);
+    }
 ```
