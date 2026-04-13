@@ -23,7 +23,7 @@ namespace causallm {
 using json = nlohmann::json;
 
 /**
- * @brief Chat message structure for multi-turn conversations
+ * @brief Chat message structure for chat template formatting
  */
 struct ChatMessage {
   std::string role;    // "system", "user", "assistant"
@@ -53,7 +53,7 @@ public:
   static ChatTemplate fromFile(const std::string &tokenizer_config_path);
 
   /**
-   * @brief Apply template to multi-turn messages
+   * @brief Apply chat template to messages with role and content
    * @param messages Vector of ChatMessage (role + content)
    * @param add_generation_prompt Whether to add generation prompt at end
    * @return Formatted prompt string

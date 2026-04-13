@@ -110,8 +110,8 @@ WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
 
 /**
- * @brief Chat message structure for multi-turn conversations
- * @note  Compatible with HuggingFace chat template format
+ * @brief Chat message structure for chat template formatting
+ * @note  Compatible with HuggingFace apply_chat_template() format
  */
 typedef struct {
   const char *role;    /**< Message role: "system", "user", or "assistant" */
@@ -119,7 +119,7 @@ typedef struct {
 } CausalLMChatMessage;
 
 /**
- * @brief Run inference with multi-turn chat messages
+ * @brief Run inference with chat template formatted messages
  * @param messages Array of chat messages with role and content
  * @param num_messages Number of messages in the array
  * @param add_generation_prompt Whether to append generation prompt at end

@@ -282,7 +282,7 @@ int main(int argc, char *argv[]) {
         system_tail_prompt = "";
       }
     } else if (nntr_cfg.contains("chat") && nntr_cfg["chat"].is_array()) {
-      // Multi-turn chat from nntr_config.json "chat" key
+      // Chat messages from nntr_config.json "chat" key
       std::vector<causallm::ChatMessage> messages;
       for (const auto &msg : nntr_cfg["chat"]) {
         if (msg.contains("role") && msg.contains("content")) {
@@ -295,7 +295,7 @@ int main(int argc, char *argv[]) {
         // Chat template already includes all formatting; clear system prompts
         system_head_prompt = "";
         system_tail_prompt = "";
-        std::cout << "[Info] Using multi-turn chat from nntr_config.json ("
+        std::cout << "[Info] Using chat template from nntr_config.json ("
                   << messages.size() << " messages)" << std::endl;
       } else if (!messages.empty()) {
         // Fallback: use last user message content

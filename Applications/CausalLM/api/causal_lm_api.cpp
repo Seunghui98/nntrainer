@@ -621,7 +621,7 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 }
 
 /*****************************************************************************
- * Multi-turn Chat Message API
+ * Chat Template API - role + content message support
  *****************************************************************************/
 
 /**
@@ -641,7 +641,7 @@ convertMessages(const CausalLMChatMessage *messages, size_t num_messages) {
 }
 
 /**
- * @brief Apply chat template to multi-turn messages with hardcoded fallback
+ * @brief Apply chat template to messages with hardcoded fallback
  */
 static std::string
 apply_chat_template_messages(const std::string &architecture,

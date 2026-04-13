@@ -79,9 +79,9 @@ To use chat templates, ensure `tokenizer_config.json` is in your model directory
 # <|im_start|>assistant
 ```
 
-### Multi-turn Conversations (C++ Internal)
+### Chat Template (C++ Internal)
 
-The C++ `ChatTemplate` class supports multi-turn conversations directly:
+The C++ `ChatTemplate` class supports formatting messages with role and content:
 
 ```cpp
 #include "chat_template.h"
@@ -98,9 +98,9 @@ std::vector<causallm::ChatMessage> messages = {
 std::string formatted = tmpl.apply(messages);
 ```
 
-### Multi-turn Conversations (C API)
+### Chat Template (C API)
 
-The C API provides `runModelWithMessages()` and `applyChatTemplate()` for multi-turn conversations with role + content, matching the HuggingFace `apply_chat_template()` interface.
+The C API provides `runModelWithMessages()` and `applyChatTemplate()` for chat template formatting with role + content, matching the HuggingFace `apply_chat_template()` interface.
 
 #### Basic Usage (Single Prompt)
 
@@ -118,7 +118,7 @@ runModel("what is machine learning?", &output);
 printf("%s\n", output);
 ```
 
-#### Multi-turn Chat (Role + Content)
+#### Chat Template with Messages (Role + Content)
 
 ```c
 #include "causal_lm_api.h"
@@ -163,14 +163,14 @@ printf("%s\n", formatted);
 |----------|-------------|
 | `loadModel()` | Load model with backend, type, and quantization |
 | `runModel()` | Run inference with a single text prompt |
-| `runModelWithMessages()` | Run inference with multi-turn chat messages |
+| `runModelWithMessages()` | Run inference with chat template formatted messages |
 | `applyChatTemplate()` | Apply chat template without running inference |
 | `getPerformanceMetrics()` | Get timing and memory usage of last run |
 | `setOptions()` | Configure chat template, verbosity, debug mode |
 
-### Multi-turn via CLI (nntr_config.json)
+### Chat Template via CLI (nntr_config.json)
 
-Add a `"chat"` key to `nntr_config.json` to run multi-turn conversations from the command line without code changes:
+Add a `"chat"` key to `nntr_config.json` to apply chat template formatting from the command line without code changes:
 
 ```json
 {
