@@ -745,9 +745,8 @@ ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
 
   // Apply chat template to format the prompt
   const char *formattedInput = nullptr;
-  ErrorCode err =
-    applyChatTemplate(messages, num_messages, add_generation_prompt,
-                      &formattedInput);
+  ErrorCode err = applyChatTemplate(messages, num_messages,
+                                    add_generation_prompt, &formattedInput);
   if (err != CAUSAL_LM_ERROR_NONE) {
     return err;
   }
