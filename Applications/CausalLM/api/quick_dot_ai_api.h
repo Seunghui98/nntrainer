@@ -68,9 +68,6 @@ typedef struct {
   const char
     *chat_template_name; /// < @brief Template name to select from array
                          ///  (e.g., "default", "tool_use"). NULL for "default".
-  bool use_chat_template;
-  bool debug_mode;
-  bool verbose;
 } Config;
 
 WIN_EXPORT ErrorCode setOptions(Config config);
