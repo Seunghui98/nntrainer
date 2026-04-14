@@ -167,8 +167,8 @@ WIN_EXPORT ErrorCode runModelHandle(CausalLmHandle handle,
  * @param metrics Pointer to a PerformanceMetrics struct to be filled
  * @return ErrorCode
  */
-WIN_EXPORT ErrorCode
-getPerformanceMetricsHandle(CausalLmHandle handle, PerformanceMetrics *metrics);
+WIN_EXPORT ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
+                                                 PerformanceMetrics *metrics);
 
 /**
  * @brief Release all resources owned by a handle.
@@ -229,9 +229,10 @@ WIN_EXPORT ErrorCode unloadModelHandle(CausalLmHandle handle);
  *                        callback on every invocation. May be NULL.
  * @return ErrorCode
  */
-WIN_EXPORT ErrorCode
-runModelHandleStreaming(CausalLmHandle handle, const char *inputTextPrompt,
-                        CausalLmTokenCallback callback, void *user_data);
+WIN_EXPORT ErrorCode runModelHandleStreaming(CausalLmHandle handle,
+                                             const char *inputTextPrompt,
+                                             CausalLmTokenCallback callback,
+                                             void *user_data);
 
 #ifdef __cplusplus
 }

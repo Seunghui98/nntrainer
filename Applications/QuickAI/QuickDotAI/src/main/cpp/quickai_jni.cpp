@@ -40,10 +40,10 @@ namespace {
 // ---------------------------------------------------------------------------
 
 struct JniCache {
-  jclass loadResultCls = nullptr;   // NativeCausalLm$LoadResult
+  jclass loadResultCls = nullptr; // NativeCausalLm$LoadResult
   jmethodID loadResultCtor = nullptr;
 
-  jclass runResultCls = nullptr;    // NativeCausalLm$RunResult
+  jclass runResultCls = nullptr; // NativeCausalLm$RunResult
   jmethodID runResultCtor = nullptr;
 
   jclass metricsResultCls = nullptr; // NativeCausalLm$MetricsResult
@@ -82,15 +82,15 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
   g_cache.runResultCls =
     find_global(env, "com/example/quickdotai/NativeCausalLm$RunResult");
   if (g_cache.runResultCls != nullptr) {
-    g_cache.runResultCtor = env->GetMethodID(
-      g_cache.runResultCls, "<init>", "(ILjava/lang/String;)V");
+    g_cache.runResultCtor = env->GetMethodID(g_cache.runResultCls, "<init>",
+                                             "(ILjava/lang/String;)V");
   }
 
-  g_cache.metricsResultCls = find_global(
-    env, "com/example/quickdotai/NativeCausalLm$MetricsResult");
+  g_cache.metricsResultCls =
+    find_global(env, "com/example/quickdotai/NativeCausalLm$MetricsResult");
   if (g_cache.metricsResultCls != nullptr) {
-    g_cache.metricsResultCtor = env->GetMethodID(
-      g_cache.metricsResultCls, "<init>", "(IIDIDDDJ)V");
+    g_cache.metricsResultCtor =
+      env->GetMethodID(g_cache.metricsResultCls, "<init>", "(IIDIDDDJ)V");
   }
 
   return JNI_VERSION_1_6;
@@ -123,8 +123,9 @@ Java_com_example_quickdotai_NativeCausalLm_setOptionsNative(
 // NativeQuickDotAI surfaces as CAUSAL_LM_ERROR_MODEL_LOAD_FAILED.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_quickdotai_NativeCausalLm_chdirNative(
-  JNIEnv *env, jobject /*thiz*/, jstring pathJ) {
+Java_com_example_quickdotai_NativeCausalLm_chdirNative(JNIEnv *env,
+                                                       jobject /*thiz*/,
+                                                       jstring pathJ) {
   if (pathJ == nullptr) {
     return EINVAL;
   }
@@ -155,8 +156,7 @@ Java_com_example_quickdotai_NativeCausalLm_loadModelHandleNative(
     return nullptr;
   }
   return env->NewObject(g_cache.loadResultCls, g_cache.loadResultCtor,
-                        static_cast<jint>(ec),
-                        reinterpret_cast<jlong>(handle));
+                        static_cast<jint>(ec), reinterpret_cast<jlong>(handle));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,14 +203,15 @@ Java_com_example_quickdotai_NativeCausalLm_getPerformanceMetricsHandleNative(
       g_cache.metricsResultCtor == nullptr) {
     return nullptr;
   }
-  return env->NewObject(
-    g_cache.metricsResultCls, g_cache.metricsResultCtor, static_cast<jint>(ec),
-    static_cast<jint>(m.prefill_tokens), static_cast<jdouble>(m.prefill_duration_ms),
-    static_cast<jint>(m.generation_tokens),
-    static_cast<jdouble>(m.generation_duration_ms),
-    static_cast<jdouble>(m.total_duration_ms),
-    static_cast<jdouble>(m.initialization_duration_ms),
-    static_cast<jlong>(m.peak_memory_kb));
+  return env->NewObject(g_cache.metricsResultCls, g_cache.metricsResultCtor,
+                        static_cast<jint>(ec),
+                        static_cast<jint>(m.prefill_tokens),
+                        static_cast<jdouble>(m.prefill_duration_ms),
+                        static_cast<jint>(m.generation_tokens),
+                        static_cast<jdouble>(m.generation_duration_ms),
+                        static_cast<jdouble>(m.total_duration_ms),
+                        static_cast<jdouble>(m.initialization_duration_ms),
+                        static_cast<jlong>(m.peak_memory_kb));
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +247,8 @@ Java_com_example_quickdotai_NativeCausalLm_destroyModelHandleNative(
 namespace {
 struct StreamCtx {
   JNIEnv *env;
-  jobject listener;   // local ref owned by the JNI entry frame
-  jmethodID onDelta;  // Ljava/lang/String;)V
+  jobject listener;  // local ref owned by the JNI entry frame
+  jmethodID onDelta; // Ljava/lang/String;)V
 };
 
 int stream_trampoline(const char *delta, void *user_data) {
