@@ -142,8 +142,7 @@ void printUsage(const char *program_name) {
             << COLOR_RESET
             << "  - JSON file with chat messages [{role, content}, ...]\n";
   std::cout << "  --template        " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET
-            << "  - Template name (e.g., default, tool_use)\n\n";
+            << COLOR_RESET << "  - Template name (e.g., default, tool_use)\n\n";
 
   std::cout << COLOR_YELLOW << "Examples:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
@@ -152,8 +151,9 @@ void printUsage(const char *program_name) {
             << " QWEN3-0.6B 1 W4A32 1 Hello\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B --chat-file chat.json W32A32 1\n";
-  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
+  std::cout
+    << "  " << COLOR_BOLD << program_name << COLOR_RESET
+    << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
 
   std::cout << COLOR_YELLOW << "Chat file format (JSON):" << COLOR_RESET
             << "\n";
