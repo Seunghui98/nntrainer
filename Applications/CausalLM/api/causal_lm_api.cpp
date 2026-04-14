@@ -49,6 +49,7 @@ static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
 static causallm::ChatTemplate g_chat_template;
 static std::string g_formatted_template;
+static std::string g_chat_template_name = "default";
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -291,6 +292,7 @@ ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
   g_verbose = config.verbose;
+  g_chat_template_name = (config.chat_template_name != nullptr) ? config.chat_template_name : "default";
   if (config.debug_mode) {
     // Ensure models are registered so we can validate them
     register_models();
@@ -478,7 +480,8 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     // Load chat template from tokenizer_config.json if available
     std::string tc_path = model_dir_path + "/tokenizer_config.json";
     if (check_file_exists(tc_path)) {
-      g_chat_template = causallm::ChatTemplate::fromFile(tc_path);
+      g_chat_template =
+        causallm::ChatTemplate::fromFile(tc_path, g_chat_template_name);
       if (g_chat_template.isAvailable()) {
         std::cout << "[Info] Chat template loaded from tokenizer_config.json"
                   << std::endl;
