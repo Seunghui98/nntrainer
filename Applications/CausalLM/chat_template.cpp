@@ -1823,9 +1823,8 @@ private:
 
 ChatTemplate::ChatTemplate() : available_(false) {}
 
-ChatTemplate
-ChatTemplate::fromFile(const std::string &tokenizer_config_path,
-                       const std::string &template_name) {
+ChatTemplate ChatTemplate::fromFile(const std::string &tokenizer_config_path,
+                                    const std::string &template_name) {
   ChatTemplate tmpl;
 
   std::ifstream file(tokenizer_config_path);
@@ -1863,9 +1862,9 @@ ChatTemplate::fromFile(const std::string &tokenizer_config_path,
       if (tmpl.template_str_.empty()) {
         for (const auto &entry : config["chat_template"]) {
           if (entry.is_object() && entry.contains("template")) {
-            std::string fallback_name =
-              entry.contains("name") ? entry["name"].get<std::string>()
-                                     : "(unnamed)";
+            std::string fallback_name = entry.contains("name")
+                                          ? entry["name"].get<std::string>()
+                                          : "(unnamed)";
             std::cerr << "[ChatTemplate] Template '" << template_name
                       << "' not found. Using '" << fallback_name << "'."
                       << std::endl;

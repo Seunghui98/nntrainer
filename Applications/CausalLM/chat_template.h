@@ -53,9 +53,8 @@ public:
    *        is a string. Defaults to "default".
    * @return ChatTemplate instance
    */
-  static ChatTemplate fromFile(
-    const std::string &tokenizer_config_path,
-    const std::string &template_name = "default");
+  static ChatTemplate fromFile(const std::string &tokenizer_config_path,
+                               const std::string &template_name = "default");
 
   /**
    * @brief Apply template to multi-turn messages
