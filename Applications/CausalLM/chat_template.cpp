@@ -1823,7 +1823,9 @@ private:
 
 ChatTemplate::ChatTemplate() : available_(false) {}
 
-ChatTemplate ChatTemplate::fromFile(const std::string &tokenizer_config_path) {
+ChatTemplate
+ChatTemplate::fromFile(const std::string &tokenizer_config_path,
+                       const std::string &template_name) {
   ChatTemplate tmpl;
 
   std::ifstream file(tokenizer_config_path);
@@ -1847,11 +1849,29 @@ ChatTemplate ChatTemplate::fromFile(const std::string &tokenizer_config_path) {
     if (config["chat_template"].is_string()) {
       tmpl.template_str_ = config["chat_template"].get<std::string>();
     } else if (config["chat_template"].is_array()) {
-      // Some models have an array of templates; use the first one
+      // Array of named templates: select by template_name
+      // First pass: find matching name
       for (const auto &entry : config["chat_template"]) {
-        if (entry.is_object() && entry.contains("template")) {
+        if (entry.is_object() && entry.contains("name") &&
+            entry.contains("template") &&
+            entry["name"].get<std::string>() == template_name) {
           tmpl.template_str_ = entry["template"].get<std::string>();
           break;
+        }
+      }
+      // Fallback: if requested name not found, use first template
+      if (tmpl.template_str_.empty()) {
+        for (const auto &entry : config["chat_template"]) {
+          if (entry.is_object() && entry.contains("template")) {
+            std::string fallback_name =
+              entry.contains("name") ? entry["name"].get<std::string>()
+                                     : "(unnamed)";
+            std::cerr << "[ChatTemplate] Template '" << template_name
+                      << "' not found. Using '" << fallback_name << "'."
+                      << std::endl;
+            tmpl.template_str_ = entry["template"].get<std::string>();
+            break;
+          }
         }
       }
     }

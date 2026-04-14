@@ -48,9 +48,14 @@ public:
   /**
    * @brief Load chat template from tokenizer_config.json
    * @param tokenizer_config_path Path to tokenizer_config.json
+   * @param template_name Template name to select when chat_template is an
+   *        array (e.g., "default", "tool_use"). Ignored if chat_template
+   *        is a string. Defaults to "default".
    * @return ChatTemplate instance
    */
-  static ChatTemplate fromFile(const std::string &tokenizer_config_path);
+  static ChatTemplate fromFile(
+    const std::string &tokenizer_config_path,
+    const std::string &template_name = "default");
 
   /**
    * @brief Apply template to multi-turn messages
