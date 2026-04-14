@@ -119,8 +119,8 @@ void printLogo() {
 void printUsage(const char *program_name) {
   std::cout << COLOR_YELLOW << "Usage:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " <model_name> [prompt] [use_chat_template] [quantization] "
-               "[verbose] \n";
+            << " <model_name> [use_chat_template] [quantization] [verbose] "
+               "[prompt...]\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " <model_name> --chat-file <path.json> [--template name] "
                "[quantization] [verbose] \n\n";
@@ -128,30 +128,32 @@ void printUsage(const char *program_name) {
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
   std::cout << "  model_name        " << COLOR_BOLD << "REQUIRED" << COLOR_RESET
             << "  - Model name (e.g., QWEN3-0.6B)\n";
-  std::cout << "  prompt            " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET
-            << "  - Input prompt (default: 'Hello, how are you?')\n";
-  std::cout << "  --chat-file       " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET
-            << "  - JSON file with chat messages [{role, content}, ...]\n";
-  std::cout << "  --template        " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET << "  - Template name (e.g., default, tool_use)\n";
   std::cout << "  use_chat_template " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET << "  - 0/1 or true/false (default: 1)\n";
   std::cout << "  quantization      " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
             << "  - W4A32/W16A16/W8A16/W32A32/UNKNOWN (default: UNKNOWN)\n";
   std::cout << "  verbose           " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET << "  - 0/1 or true/false (default: 0)\n\n";
+            << COLOR_RESET << "  - 0/1 or true/false (default: 0)\n";
+  std::cout << "  prompt...         " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - Input prompt (all remaining args joined with spaces)\n";
+  std::cout << "  --chat-file       " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - JSON file with chat messages [{role, content}, ...]\n";
+  std::cout << "  --template        " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - Template name (e.g., default, tool_use)\n\n";
 
   std::cout << COLOR_YELLOW << "Examples:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
+            << " QWEN3-0.6B 1 W32A32 1 What is machine learning?\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B 1 W4A32 1 Hello\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B --chat-file chat.json W32A32 1\n";
-  std::cout
-    << "  " << COLOR_BOLD << program_name << COLOR_RESET
-    << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
 
   std::cout << COLOR_YELLOW << "Chat file format (JSON):" << COLOR_RESET
             << "\n";
@@ -214,14 +216,12 @@ int main(int argc, char *argv[]) {
                  std::string(argv[next_arg]) == "true");
     }
   } else {
-    // Normal mode: <model> [prompt] [chat_template] [quant] [verbose]
+    // Normal mode: <model> [chat_template] [quant] [verbose] [prompt...]
     if (argc >= 3)
-      prompt = argv[2];
-    if (argc >= 4)
       use_chat_template =
-        (std::string(argv[3]) == "1" || std::string(argv[3]) == "true");
-    if (argc >= 5) {
-      quant_str = std::string(argv[4]);
+        (std::string(argv[2]) == "1" || std::string(argv[2]) == "true");
+    if (argc >= 4) {
+      quant_str = std::string(argv[3]);
       if (quant_str == "W4A32")
         quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
       else if (quant_str == "W16A16")
@@ -231,8 +231,18 @@ int main(int argc, char *argv[]) {
       else if (quant_str == "W32A32")
         quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
     }
-    if (argc >= 6)
-      verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
+    if (argc >= 5)
+      verbose = (std::string(argv[4]) == "1" || std::string(argv[4]) == "true");
+    // Join all remaining args as prompt (handles adb shell word splitting)
+    if (argc >= 6) {
+      std::string joined_prompt = argv[5];
+      for (int i = 6; i < argc; ++i) {
+        joined_prompt += " ";
+        joined_prompt += argv[i];
+      }
+      static std::string prompt_storage = joined_prompt;
+      prompt = prompt_storage.c_str();
+    }
   }
 
   printSection("Configuration");
