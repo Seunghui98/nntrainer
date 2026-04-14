@@ -135,8 +135,7 @@ void printUsage(const char *program_name) {
             << COLOR_RESET
             << "  - JSON file with chat messages [{role, content}, ...]\n";
   std::cout << "  --template        " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET
-            << "  - Template name (e.g., default, tool_use)\n";
+            << COLOR_RESET << "  - Template name (e.g., default, tool_use)\n";
   std::cout << "  use_chat_template " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET << "  - 0/1 or true/false (default: 1)\n";
   std::cout << "  quantization      " << COLOR_GREEN << "OPTIONAL"
@@ -150,8 +149,9 @@ void printUsage(const char *program_name) {
             << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B --chat-file chat.json W32A32 1\n";
-  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
+  std::cout
+    << "  " << COLOR_BOLD << program_name << COLOR_RESET
+    << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
 
   std::cout << COLOR_YELLOW << "Chat file format (JSON):" << COLOR_RESET
             << "\n";
@@ -369,7 +369,7 @@ int main(int argc, char *argv[]) {
 
       StreamCollector collector;
       err = runModelHandleStreaming(handle, formattedText, &onStreamDelta,
-                                   &collector);
+                                    &collector);
 
       std::cout << COLOR_RESET << "\n\n";
 
