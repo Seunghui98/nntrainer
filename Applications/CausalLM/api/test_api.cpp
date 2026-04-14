@@ -146,13 +146,24 @@ int main(int argc, char *argv[]) {
   std::string quant_str = "UNKNOWN";
   ModelQuantizationType quant_type = CAUSAL_LM_QUANTIZATION_UNKNOWN;
   bool verbose = true;
+  std::string template_name = "default";
 
-  // Parse --chat-file mode: <model> --chat-file <path> [quant] [verbose]
+  // Parse --chat-file mode: <model> --chat-file <path> [--template name] [quant]
+  //                          [verbose]
   if (argc >= 4 && std::string(argv[2]) == "--chat-file") {
     chat_file_path = argv[3];
     use_chat_template = true;
-    if (argc >= 5) {
-      quant_str = std::string(argv[4]);
+    int next_arg = 4;
+    // Check for --template option
+    if (next_arg < argc && std::string(argv[next_arg]) == "--template") {
+      next_arg++;
+      if (next_arg < argc) {
+        template_name = argv[next_arg];
+        next_arg++;
+      }
+    }
+    if (next_arg < argc) {
+      quant_str = std::string(argv[next_arg]);
       if (quant_str == "W4A32")
         quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
       else if (quant_str == "W16A16")
@@ -162,8 +173,10 @@ int main(int argc, char *argv[]) {
       else if (quant_str == "W32A32")
         quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
     }
-    if (argc >= 6) {
-      verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
+    next_arg++;
+    if (next_arg < argc) {
+      verbose =
+        (std::string(argv[next_arg]) == "1" || std::string(argv[next_arg]) == "true");
     }
   } else {
     // Normal mode: <model> [prompt] [chat_template] [quant] [verbose]
@@ -192,6 +205,7 @@ int main(int argc, char *argv[]) {
   printInfo("Use Chat Template", use_chat_template ? "true" : "false");
   printInfo("Quantization", quant_str);
   printInfo("Verbose", verbose ? "true" : "false");
+  printInfo("Template Name", template_name);
   if (!chat_file_path.empty()) {
     printInfo("Chat File", chat_file_path);
   }
@@ -203,6 +217,7 @@ int main(int argc, char *argv[]) {
   config.use_chat_template = use_chat_template;
   config.debug_mode = true;
   config.verbose = verbose;
+  config.chat_template_name = template_name.c_str();
   ErrorCode err = setOptions(config);
   if (err != CAUSAL_LM_ERROR_NONE) {
     printError("Failed to set options");
