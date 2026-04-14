@@ -31,8 +31,12 @@ def save_lfm2_for_nntrainer(params, config, dtype, file):
     total_floats = [0]
 
     def save_weight(weight, is_rms=False):
-        if is_rms:
-            weight = weight + 1.0
+        """Save weight tensor.
+        LFM2 RMSNorm: NO +1.0 offset needed.
+        nntrainer RMSNorm does: output = gamma * x / rms(x)
+        LFM2 HF RMSNorm: output = weight * x / rms(x)
+        Both use weight directly, so save as-is.
+        """
         arr = weight.detach().float().cpu().numpy().astype(dtype)
         arr.tofile(file)
         total_floats[0] += arr.size
@@ -148,9 +152,9 @@ def save_lfm2_for_nntrainer(params, config, dtype, file):
         save_weight(params["model.norm.weight"], is_rms=True)
         print(f"\nmodel.norm.weight (+1.0): {params['model.norm.weight'].shape}")
     else:
-        # Save identity norm: zeros + 1.0 = all 1.0 (identity RMSNorm)
-        identity_norm = torch.zeros(hidden_size)
-        save_weight(identity_norm, is_rms=True)
+        # Save identity norm: all 1.0 (gamma=1.0 is identity for RMSNorm)
+        identity_norm = torch.ones(hidden_size)
+        save_weight(identity_norm)
         print(f"\noutput_norm: synthetic identity (all 1.0), shape=({hidden_size},)")
 
     # 5. LM head (only if not tied)
