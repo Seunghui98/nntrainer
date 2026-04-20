@@ -151,6 +151,7 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   unsigned int global_token_len;
+  unsigned int NO_REPEAT_NGRAM_SIZE; /**< Block repeating n-grams (0 = off) */
 
   bool has_run_ = false;
 

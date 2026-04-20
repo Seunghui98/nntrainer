@@ -11,6 +11,7 @@
     "lora_target": [],
 
     "bad_word_ids": [],
+    "no_repeat_ngram_size": 3,
     "fsu": false,
     "fsu_lookahead": 2,
     "num_to_generate": 512,

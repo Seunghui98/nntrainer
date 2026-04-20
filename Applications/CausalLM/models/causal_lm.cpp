@@ -98,6 +98,11 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   TEMPERATURE = generation_cfg.contains("temperature")
                   ? generation_cfg["temperature"].get<float>()
                   : 0.7;
+  NO_REPEAT_NGRAM_SIZE =
+    nntr_cfg.contains("no_repeat_ngram_size")
+      ? nntr_cfg["no_repeat_ngram_size"].get<unsigned int>()
+      : 0;
+
   global_token_len = 0;
 }
 
@@ -229,6 +234,27 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
     if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
       applyRepetitionPenalty(logits, input_ids, NUM_INPUT_IDS,
                              repetition_penalty);
+    }
+
+    // block any token that would complete an n-gram already seen in history
+    if (NO_REPEAT_NGRAM_SIZE >= 2 && input_ids != nullptr &&
+        NUM_INPUT_IDS >= NO_REPEAT_NGRAM_SIZE - 1) {
+      const unsigned int prefix_len = NO_REPEAT_NGRAM_SIZE - 1;
+      const unsigned int *prefix = input_ids + NUM_INPUT_IDS - prefix_len;
+      for (unsigned int i = 0; i + prefix_len < NUM_INPUT_IDS; ++i) {
+        bool match = true;
+        for (unsigned int k = 0; k < prefix_len; ++k) {
+          if (input_ids[i + k] != prefix[k]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          unsigned int blocked = input_ids[i + prefix_len];
+          if (blocked < NUM_VOCAB)
+            logits[blocked] = -std::numeric_limits<float>::infinity();
+        }
+      }
     }
 
     // apply bad words penalty
@@ -515,7 +541,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
-    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample,
+                                                 1.0f, ids_history,
+                                                 token_generation_idx));
     if (token_generation_idx < input_len) {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
         input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
