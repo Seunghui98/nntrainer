@@ -12,22 +12,27 @@
 ## Expected GGUF tensor quantisation for --strict mode:
 ##     token_embd.weight                : Q6_K
 ##     blk.{i}.attn_norm.weight         : F32 or F16
-##     blk.{i}.attn_q.weight            : Q4_0
+##     blk.{i}.attn_q.weight            : Q4_0 / Q4_1 / Q8_0
 ##     blk.{i}.attn_q_norm.weight       : F32 or F16
-##     blk.{i}.attn_k.weight            : Q4_0
+##     blk.{i}.attn_k.weight            : Q4_0 / Q4_1 / Q8_0
 ##     blk.{i}.attn_k_norm.weight       : F32 or F16
-##     blk.{i}.attn_v.weight            : Q4_0
-##     blk.{i}.attn_output.weight       : Q4_0
+##     blk.{i}.attn_v.weight            : Q4_0 / Q4_1 / Q8_0
+##     blk.{i}.attn_output.weight       : Q4_0 / Q4_1 / Q8_0
 ##     blk.{i}.ffn_norm.weight          : F32 or F16
-##     blk.{i}.ffn_up.weight            : Q4_0
-##     blk.{i}.ffn_gate.weight          : Q4_0
-##     blk.{i}.ffn_down.weight          : Q4_0
+##     blk.{i}.ffn_up.weight            : Q4_0 / Q4_1 / Q8_0
+##     blk.{i}.ffn_gate.weight          : Q4_0 / Q4_1 / Q8_0
+##     blk.{i}.ffn_down.weight          : Q4_0 / Q4_1 / Q8_0
 ##     output_norm.weight               : F32 or F16
 ##     output.weight (only when not tied): Q6_K (rewritten as Q4_0 or Q6_K)
 ##
-## When --strict is not set, tensors that do not match the expected dtype are
-## dequantised to FP32 and re-quantised to the target dtype. Repacking for Q4_0
-## is always performed.
+## HuggingFace "Qxxx" GGUFs are commonly mixed: e.g. a Q4_0 GGUF usually has a
+## handful of Q4_1 / Q6_K tensors (most often @c ffn_down.weight) alongside the
+## Q4_0 majority. This converter therefore transparently dequantises Q4_1 and
+## Q8_0 tensors and re-quantises them to Q4_0 even in --strict mode, because
+## that is the semantically correct behaviour for these files.
+##
+## When --strict is not set, *any* supported GGUF dtype (F32/F16/Q4_0/Q4_1/
+## Q8_0/Q6_K) is accepted for FC weights and re-quantised to Q4_0.
 ##
 ## @author Claude (for jijoongmoon/nntrainer)
 
@@ -61,6 +66,7 @@ GGUF_F64 = 12
 GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
+GGML_Q4_1 = 3
 GGML_Q8_0 = 8
 GGML_Q6_K = 14
 
@@ -73,8 +79,14 @@ GGML_TYPE_NAMES = {
 
 QK4_0 = 32
 Q4_0_BLOCK_BYTES = 18         # uint16 d + 16 bytes qs
+Q4_1_BLOCK_BYTES = 20         # uint16 d + uint16 m + 16 bytes qs
+Q8_0_BLOCK_BYTES = 34         # uint16 d + 32 bytes int8
 QK_K = 256
 Q6_K_BLOCK_BYTES = 210        # 128 ql + 64 qh + 16 scales + uint16 d
+
+# FC-weight dtypes that we know how to dequantise to fp32 and re-quantise to
+# nntrainer's Q4_0. "Soft" matches: tensor is accepted even under --strict.
+FC_Q4_0_COMPATIBLE = {GGML_Q4_0, GGML_Q4_1, GGML_Q8_0}
 
 
 class GGUFReader:
@@ -169,8 +181,12 @@ class GGUFReader:
         if t == GGML_Q4_0:
             assert numel % QK4_0 == 0, "Q4_0 element count must divide 32"
             return (numel // QK4_0) * Q4_0_BLOCK_BYTES
+        if t == GGML_Q4_1:
+            assert numel % QK4_0 == 0, "Q4_1 element count must divide 32"
+            return (numel // QK4_0) * Q4_1_BLOCK_BYTES
         if t == GGML_Q8_0:
-            return (numel // 32) * 34
+            assert numel % 32 == 0, "Q8_0 element count must divide 32"
+            return (numel // 32) * Q8_0_BLOCK_BYTES
         if t == GGML_Q6_K:
             assert numel % QK_K == 0, "Q6_K element count must divide 256"
             return (numel // QK_K) * Q6_K_BLOCK_BYTES
@@ -199,6 +215,28 @@ def dequant_q4_0(buf: bytes, numel: int) -> np.ndarray:
     # Layout: for i in [0, 16): q[i] low -> elem i, q[i] high -> elem i+16
     out = np.concatenate([low, high], axis=1).astype(np.float32) * d
     return out.reshape(numel)
+
+
+def dequant_q4_1(buf: bytes, numel: int) -> np.ndarray:
+    """Dequantise a Q4_1 byte buffer into fp32. x = d*q + m, q in [0,15]."""
+    nb = numel // QK4_0
+    arr = np.frombuffer(buf, dtype=np.uint8).reshape(nb, Q4_1_BLOCK_BYTES)
+    d = arr[:, :2].copy().view(np.float16).astype(np.float32).reshape(nb, 1)
+    m = arr[:, 2:4].copy().view(np.float16).astype(np.float32).reshape(nb, 1)
+    q = arr[:, 4:]  # (nb, 16) nibbles
+    low = (q & 0x0F).astype(np.float32)
+    high = (q >> 4).astype(np.float32)
+    out = np.concatenate([low, high], axis=1) * d + m
+    return out.reshape(numel)
+
+
+def dequant_q8_0(buf: bytes, numel: int) -> np.ndarray:
+    """Dequantise a Q8_0 byte buffer into fp32."""
+    nb = numel // 32
+    arr = np.frombuffer(buf, dtype=np.uint8).reshape(nb, Q8_0_BLOCK_BYTES)
+    d = arr[:, :2].copy().view(np.float16).astype(np.float32).reshape(nb, 1)
+    q = arr[:, 2:].copy().view(np.int8).reshape(nb, 32).astype(np.float32)
+    return (q * d).reshape(numel)
 
 
 def dequant_q6_k(buf: bytes, numel: int) -> np.ndarray:
@@ -425,6 +463,10 @@ def _gguf_tensor_to_fp32(reader: GGUFReader, name: str) -> np.ndarray:
         arr = np.frombuffer(buf, dtype=np.float16).astype(np.float32)
     elif t == GGML_Q4_0:
         arr = dequant_q4_0(buf, numel)
+    elif t == GGML_Q4_1:
+        arr = dequant_q4_1(buf, numel)
+    elif t == GGML_Q8_0:
+        arr = dequant_q8_0(buf, numel)
     elif t == GGML_Q6_K:
         arr = dequant_q6_k(buf, numel)
     else:
@@ -472,16 +514,27 @@ def write_fc_q4_0(out, reader: GGUFReader, name: str,
             f"{name}: out_features={out_features} must be divisible by "
             f"interleave={interleave} (required by nntrainer repack_q4_0)")
     info = reader.tensors[name]
-    if info["type"] == GGML_Q4_0:
+    t = info["type"]
+    if t == GGML_Q4_0:
         raw, _ = reader.read_tensor_raw(name)
         expected = (out_features * in_features // QK4_0) * Q4_0_BLOCK_BYTES
         assert len(raw) == expected, \
             f"{name}: raw Q4_0 size {len(raw)} != expected {expected}"
+    elif t in FC_Q4_0_COMPATIBLE:
+        # Q4_1 / Q8_0: common mixed-quant variants in a "Q4_0" GGUF.
+        # Always dequantise and re-quantise to Q4_0 — this is semantically
+        # what the user asked for even under --strict.
+        print(f"  [requant] {name}: {GGML_TYPE_NAMES.get(t,'?')} -> Q4_0")
+        arr = _gguf_tensor_to_fp32(reader, name)
+        assert arr.shape == (out_features, in_features), \
+            f"{name} shape {arr.shape} != ({out_features},{in_features})"
+        raw = quantize_q4_0(arr)
     else:
         if strict:
             raise ValueError(
-                f"{name} is {GGML_TYPE_NAMES.get(info['type'],'?')} but Q4_0 "
-                "is required; re-run without --strict to requantise")
+                f"{name} is {GGML_TYPE_NAMES.get(t,'?')} but Q4_0 (or a "
+                "Q4_0-compatible type like Q4_1/Q8_0) is required; "
+                "re-run without --strict to requantise")
         arr = _gguf_tensor_to_fp32(reader, name)
         assert arr.shape == (out_features, in_features), \
             f"{name} shape {arr.shape} != ({out_features},{in_features})"
