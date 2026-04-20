@@ -103,9 +103,6 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
-  FFN_DOWN_DTYPE = nntr_cfg.contains("ffn_down_dtype")
-                     ? nntr_cfg["ffn_down_dtype"].get<std::string>()
-                     : FC_LAYER_DTYPE;
 
   /** Initialize model parameters */
   NUM_VOCAB = cfg["vocab_size"];
@@ -399,7 +396,6 @@ std::vector<LayerHandle> Transformer::createMlp(const int layer_id, int dim,
      withKey("unit", dim), withKey("disable_bias", "true"),
      withKey("input_layers",
              "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
-     withKey("weight_dtype", FFN_DOWN_DTYPE),
      withKey("weight_initializer", "ones")}));
 
   return layers;

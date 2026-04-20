@@ -33,9 +33,9 @@
 ##
 ## To preserve the precision of the mixed ffn_down tensor, pass
 ## @c --ffn-down-dtype q6_k . That writes every @c blk.{i}.ffn_down.weight as
-## Q6_K instead of Q4_0 (no repack needed). The generated @c nntr_config.json
-## gets @c "ffn_down_dtype": "Q6_K" which nntrainer's CausalLM transformer
-## plumbs into the ffn_down @c fully_connected layer's @c weight_dtype .
+## Q6_K instead of Q4_0 (no repack needed). Since all FC layers share
+## @c fc_layer_dtype in nntrainer's CausalLM, the loader side must also be set
+## to Q6_K for FC weights when using this option.
 ##
 ## When --strict is not set, *any* supported GGUF dtype (F32/F16/Q4_0/Q4_1/
 ## Q8_0/Q6_K) is accepted for FC weights and re-quantised to Q4_0.
@@ -690,13 +690,11 @@ def convert(args):
 
     # --- Drop a matching nntr_config.json next to it --------------------
     if args.emit_nntr_config:
-        ffn_down_dtype_str = "Q6_K" if args.ffn_down_dtype == "q6_k" else "Q4_0"
         cfg = {
             "model_type": "CausalLM",
             "model_tensor_type": "Q4_0-FP32",
             "model_file_name": os.path.basename(args.output),
             "fc_layer_dtype": "Q4_0",
-            "ffn_down_dtype": ffn_down_dtype_str,
             "embedding_dtype": "Q6_K",
             "lmhead_dtype": "Q6_K" if tied else "Q4_0",
             "lora_rank": 0,
@@ -742,8 +740,7 @@ def parse_args():
                     default="q4_0",
                     help="Target dtype for ffn_down.weight. Use 'q6_k' to "
                          "preserve the quality of Q4_1/Q6_K ffn_down tensors "
-                         "that ship in mixed HF GGUFs (requires matching "
-                         "ffn_down_dtype in nntr_config.json).")
+                         "that ship in mixed HF GGUFs.")
     ap.add_argument("--emit-nntr-config", action="store_true",
                     help="Also write nntr_config.json next to the .bin")
     args = ap.parse_args()
