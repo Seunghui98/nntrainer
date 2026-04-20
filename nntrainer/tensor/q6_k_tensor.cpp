@@ -23,7 +23,9 @@ Q6_K_Tensor::Q6_K_Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   NNTR_THROW_IF(d.batch() != 1 || d.channel() != 1 || d.width() % 256 != 0,
                 std::invalid_argument)
     << "Q6_K_Tensor must be 2 dimensional tensor with batch size 1 and "
-       "width must be divisible by 256";
+       "width must be divisible by 256  (got name='" << name
+    << "' dim=" << d.batch() << "x" << d.channel() << "x" << d.height()
+    << "x" << d.width() << ")";
 
   if (alloc_now)
     allocate();
