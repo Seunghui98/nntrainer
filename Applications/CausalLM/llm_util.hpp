@@ -17,6 +17,7 @@
 #include <algorithm> // sort
 #include <math.h>    // INFINITY
 #include <optional>
+#include <vector>
 
 #include <base_properties.h>
 #include <common.h>
@@ -95,10 +96,13 @@ std::vector<unsigned int> generate_multi_tokens(
 
 /**
  * @brief Apply repetition penalty to logits
+ * @param exempt_ids token IDs (e.g. EOS) that must NOT be penalised, so
+ *        repetition penalty never prevents the model from ending a turn.
  */
 void applyRepetitionPenalty(float *logits, unsigned int *input_ids,
                             unsigned int NUM_INPUT_IDS,
-                            float repetition_penalty = 1);
+                            float repetition_penalty = 1,
+                            const std::vector<unsigned int> &exempt_ids = {});
 
 /**
  * @brief Apply bad words penalty

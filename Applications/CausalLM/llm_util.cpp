@@ -54,12 +54,20 @@ std::vector<unsigned int> generate_multi_tokens(
 
 void applyRepetitionPenalty(float *logits, unsigned int *input_ids,
                             unsigned int NUM_INPUT_IDS,
-                            float repetition_penalty) {
+                            float repetition_penalty,
+                            const std::vector<unsigned int> &exempt_ids) {
   for (unsigned int i = 0; i < NUM_INPUT_IDS; ++i) {
-    if (logits[input_ids[i]] < 0) {
-      logits[input_ids[i]] *= repetition_penalty;
+    unsigned int tok = input_ids[i];
+    // Never penalise EOS-like tokens — otherwise the model can't end turns
+    // once they've appeared in history (e.g. <|im_end|> in the chat template).
+    if (std::find(exempt_ids.begin(), exempt_ids.end(), tok) !=
+        exempt_ids.end()) {
+      continue;
+    }
+    if (logits[tok] < 0) {
+      logits[tok] *= repetition_penalty;
     } else {
-      logits[input_ids[i]] /= repetition_penalty;
+      logits[tok] /= repetition_penalty;
     }
   }
 }

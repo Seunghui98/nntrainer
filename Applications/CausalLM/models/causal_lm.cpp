@@ -223,10 +223,10 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 
-    // apply repetition penalty
+    // apply repetition penalty (EOS tokens exempt so turns can still end)
     if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
       applyRepetitionPenalty(logits, input_ids, NUM_INPUT_IDS,
-                             repetition_penalty);
+                             repetition_penalty, EOS_TOKEN_ID);
     }
 
     // apply bad words penalty
