@@ -508,6 +508,21 @@ def write_embedding_q6k(out, reader: GGUFReader, name: str,
     out.write(quantize_q6_k(arr.reshape(-1, hidden)))
 
 
+def write_fc_fp32(out, reader: GGUFReader, name: str,
+                   out_features: int, in_features: int):
+    """Write a Linear(in, out) weight as plain FP32 (no quantisation).
+
+    Used for ARM-vs-x86 divergence debugging: if a model in Q4_0 loops on ARM
+    but the same model in FP32 doesn't, the ARM Q4_0 code path is implicated."""
+    arr = _gguf_tensor_to_fp32(reader, name).astype(np.float32, copy=False)
+    assert arr.shape == (out_features, in_features), \
+        f"{name} shape {arr.shape} != ({out_features},{in_features})"
+    info = reader.tensors[name]
+    if info["type"] not in (GGML_F32,):
+        print(f"  [dequant] {name}: {GGML_TYPE_NAMES.get(info['type'],'?')} -> FP32")
+    out.write(arr.tobytes())
+
+
 def write_fc_q6_k(out, reader: GGUFReader, name: str,
                    out_features: int, in_features: int):
     """Write a Linear(in, out) weight as nntrainer Q6_K.
@@ -627,12 +642,27 @@ def convert(args):
     print(f"  ffn        : {ff_dim}")
     print(f"  tied embed : {tied}")
     print(f"  target     : {args.target} (Q4_0 interleave={args.interleave})")
-    print(f"  ffn_down   : {args.ffn_down_dtype.upper()}")
+    fc_dtype = args.fc_dtype
+    # --ffn-down-dtype q6_k retains old behaviour (ffn_down only → Q6_K);
+    # --fc-dtype overrides that for every FC.
+    ffn_down_dtype = fc_dtype if fc_dtype != "q4_0" else args.ffn_down_dtype
+    print(f"  fc_dtype   : {fc_dtype.upper()}")
+    print(f"  ffn_down   : {ffn_down_dtype.upper()}")
     print()
 
     # --- Write the nntrainer .bin ---------------------------------------
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "wb") as out:
+        def write_fc(name, N_out, N_in, dtype):
+            if dtype == "q4_0":
+                write_fc_q4_0(out, reader, name, N_out, N_in,
+                              args.interleave, args.strict)
+            elif dtype == "q6_k":
+                write_fc_q6_k(out, reader, name, N_out, N_in)
+            elif dtype == "fp32":
+                write_fc_fp32(out, reader, name, N_out, N_in)
+            else:
+                raise ValueError(f"unknown fc dtype {dtype}")
         # 1. Embedding
         write_embedding_q6k(
             out, reader, QWEN3_TENSORS["token_embd"],
@@ -643,44 +673,24 @@ def convert(args):
             def n(k):
                 return QWEN3_TENSORS[k].format(i=i)
 
-            # layer{i}_attention_norm
             write_norm(out, reader, n("attn_norm"), hidden)
-            # layer{i}_wq
-            write_fc_q4_0(out, reader, n("attn_q"),
-                          q_size, hidden, args.interleave, args.strict)
-            # layer{i}_q_norm
+            write_fc(n("attn_q"),       q_size,  hidden,  fc_dtype)
             write_norm(out, reader, n("attn_q_norm"), head_dim)
-            # layer{i}_wk
-            write_fc_q4_0(out, reader, n("attn_k"),
-                          kv_size, hidden, args.interleave, args.strict)
-            # layer{i}_k_norm
+            write_fc(n("attn_k"),       kv_size, hidden,  fc_dtype)
             write_norm(out, reader, n("attn_k_norm"), head_dim)
-            # layer{i}_wv
-            write_fc_q4_0(out, reader, n("attn_v"),
-                          kv_size, hidden, args.interleave, args.strict)
-            # layer{i}_attention_out
-            write_fc_q4_0(out, reader, n("attn_output"),
-                          hidden, q_size, args.interleave, args.strict)
-            # layer{i}_ffn_norm
+            write_fc(n("attn_v"),       kv_size, hidden,  fc_dtype)
+            write_fc(n("attn_output"),  hidden,  q_size,  fc_dtype)
             write_norm(out, reader, n("ffn_norm"), hidden)
-            # layer{i}_ffn_up
-            write_fc_q4_0(out, reader, n("ffn_up"),
-                          ff_dim, hidden, args.interleave, args.strict)
-            # layer{i}_ffn_gate
-            write_fc_q4_0(out, reader, n("ffn_gate"),
-                          ff_dim, hidden, args.interleave, args.strict)
-            # layer{i}_ffn_down
-            if args.ffn_down_dtype == "q6_k":
-                write_fc_q6_k(out, reader, n("ffn_down"), hidden, ff_dim)
-            else:
-                write_fc_q4_0(out, reader, n("ffn_down"),
-                              hidden, ff_dim, args.interleave, args.strict)
+            write_fc(n("ffn_up"),       ff_dim,  hidden,  fc_dtype)
+            write_fc(n("ffn_gate"),     ff_dim,  hidden,  fc_dtype)
+            write_fc(n("ffn_down"),     hidden,  ff_dim,  ffn_down_dtype)
             print(f"  layer {i:2d}/{n_layers} written")
 
         # 3. output_norm
         write_norm(out, reader, QWEN3_TENSORS["output_norm"], hidden)
 
-        # 4. lm_head (only if NOT tied)
+        # 4. lm_head (only if NOT tied) — kept at Q4_0 so nntrainer's
+        # lmhead_dtype can stay Q4_0 even when FC is Q6_K/FP32.
         if not tied:
             write_fc_q4_0(out, reader, QWEN3_TENSORS["output"],
                           vocab, hidden, args.interleave, args.strict)
@@ -690,11 +700,12 @@ def convert(args):
 
     # --- Drop a matching nntr_config.json next to it --------------------
     if args.emit_nntr_config:
+        fc_dtype_cfg = {"q4_0": "Q4_0", "q6_k": "Q6_K", "fp32": "FP32"}[args.fc_dtype]
         cfg = {
             "model_type": "CausalLM",
-            "model_tensor_type": "Q4_0-FP32",
+            "model_tensor_type": f"{fc_dtype_cfg}-FP32",
             "model_file_name": os.path.basename(args.output),
-            "fc_layer_dtype": "Q4_0",
+            "fc_layer_dtype": fc_dtype_cfg,
             "embedding_dtype": "Q6_K",
             "lmhead_dtype": "Q6_K" if tied else "Q4_0",
             "lora_rank": 0,
@@ -736,11 +747,19 @@ def parse_args():
                          "(x86 -> q4_0x8, arm -> q4_0x4)")
     ap.add_argument("--strict", action="store_true",
                     help="Fail if GGUF tensor dtype differs from target dtype")
+    ap.add_argument("--fc-dtype", choices=["q4_0", "q6_k", "fp32"],
+                    default="q4_0",
+                    help="Target dtype for ALL FC weights. 'q6_k' ~= 6-bit, "
+                         "'fp32' = no quantisation (diagnostic). When not "
+                         "'q4_0', nntr_config.json's fc_layer_dtype is set "
+                         "accordingly so the runtime matches.")
     ap.add_argument("--ffn-down-dtype", choices=["q4_0", "q6_k"],
                     default="q4_0",
-                    help="Target dtype for ffn_down.weight. Use 'q6_k' to "
-                         "preserve the quality of Q4_1/Q6_K ffn_down tensors "
-                         "that ship in mixed HF GGUFs.")
+                    help="Like --fc-dtype but only applied to ffn_down. "
+                         "Overridden by --fc-dtype when that is not q4_0. "
+                         "(Note: nntrainer currently has a single "
+                         "fc_layer_dtype, so mixed Q4_0 FC + Q6_K ffn_down "
+                         "will not load cleanly without further changes.)")
     ap.add_argument("--emit-nntr-config", action="store_true",
                     help="Also write nntr_config.json next to the .bin")
     args = ap.parse_args()
