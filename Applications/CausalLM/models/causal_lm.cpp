@@ -242,8 +242,34 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
         std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
       outputs.push_back(argmax_idx);
     } else {
+      // Save raw EOS logits before top-k/top-p filtering.
+      // EOS tokens must never be excluded from the sampling pool — if the
+      // model's EOS logit falls below the top-k threshold (common with
+      // aggressive quantization), the loop would never stop.
+      std::vector<float> eos_raw(EOS_TOKEN_ID.size(), -1e9f);
+      for (size_t ei = 0; ei < EOS_TOKEN_ID.size(); ++ei) {
+        unsigned int eid = EOS_TOKEN_ID[ei];
+        if (eid < NUM_VOCAB)
+          eos_raw[ei] = logits[eid];
+      }
+
       // apply temperature & top-k & top-p to logits
       float max_logits = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P);
+
+      // Restore EOS tokens if they were masked to -inf by top-k filtering.
+      // Their probability is based on the model's own logit (temperature-
+      // scaled), not an artificial boost.
+      for (size_t ei = 0; ei < EOS_TOKEN_ID.size(); ++ei) {
+        unsigned int eid = EOS_TOKEN_ID[ei];
+        if (eid >= NUM_VOCAB) continue;
+        if (std::isinf(logits[eid]) && logits[eid] < 0.0f) {
+          float tscaled = (TEMPERATURE > 1e-5f) ? eos_raw[ei] / TEMPERATURE
+                                                : eos_raw[ei];
+          logits[eid] = tscaled;
+          max_logits = std::max(max_logits, tscaled);
+        }
+      }
+
       // transform logits to softmax
       float sum_exp_logits = 0;
       for (unsigned int i = 0; i < NUM_VOCAB; i++) {
