@@ -158,8 +158,12 @@ protected:
   int NUM_KEY_VALUE_HEADS;
   int NUM_TO_GENERATE;
   std::string MODEL_TENSOR_TYPE;
-  std::string EMBEDDING_DTYPE; /** embedding dtype */
-  std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
+  std::string EMBEDDING_DTYPE;  /** embedding dtype */
+  std::string FC_LAYER_DTYPE;   /** default FC weight dtype (Q4_0 etc.) */
+  std::string FFN_DOWN_DTYPE;   /** ffn_down FC dtype; falls back to
+                                     FC_LAYER_DTYPE when unset. Used to mix
+                                     Q6_K ffn_down into an otherwise Q4_0
+                                     model, as some HF GGUFs do. */
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;

@@ -4,6 +4,7 @@
     "model_file_name": "nntr_qwen3_1.7b_q40_embdq6k.bin",
 
     "fc_layer_dtype": "Q4_0",
+    "ffn_down_dtype": "Q4_0",
     "embedding_dtype": "Q6_K",
     "lmhead_dtype": "Q6_K",
 

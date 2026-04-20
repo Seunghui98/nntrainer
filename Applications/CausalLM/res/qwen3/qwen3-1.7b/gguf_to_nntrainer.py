@@ -31,6 +31,12 @@
 ## Q8_0 tensors and re-quantises them to Q4_0 even in --strict mode, because
 ## that is the semantically correct behaviour for these files.
 ##
+## To preserve the precision of the mixed ffn_down tensor, pass
+## @c --ffn-down-dtype q6_k . That writes every @c blk.{i}.ffn_down.weight as
+## Q6_K instead of Q4_0 (no repack needed). The generated @c nntr_config.json
+## gets @c "ffn_down_dtype": "Q6_K" which nntrainer's CausalLM transformer
+## plumbs into the ffn_down @c fully_connected layer's @c weight_dtype .
+##
 ## When --strict is not set, *any* supported GGUF dtype (F32/F16/Q4_0/Q4_1/
 ## Q8_0/Q6_K) is accepted for FC weights and re-quantised to Q4_0.
 ##
@@ -502,6 +508,34 @@ def write_embedding_q6k(out, reader: GGUFReader, name: str,
     out.write(quantize_q6_k(arr.reshape(-1, hidden)))
 
 
+def write_fc_q6_k(out, reader: GGUFReader, name: str,
+                   out_features: int, in_features: int):
+    """Write a Linear(in, out) weight as nntrainer Q6_K.
+
+    Q6_K is row-major, block_q6_K[out_features, in_features/QK_K]. No
+    repacking is required — this is the same layout nntrainer's Q6_K tensor
+    loads. When the source is already Q6_K we byte-copy; otherwise we
+    dequantise and re-quantise (lossy but much better than Q4_0)."""
+    if in_features % QK_K != 0:
+        raise ValueError(
+            f"{name}: in_features={in_features} must be divisible by "
+            f"QK_K={QK_K} to write as Q6_K")
+    info = reader.tensors[name]
+    t = info["type"]
+    if t == GGML_Q6_K:
+        raw, _ = reader.read_tensor_raw(name)
+        expected = (out_features * in_features // QK_K) * Q6_K_BLOCK_BYTES
+        assert len(raw) == expected, \
+            f"{name}: raw Q6_K size {len(raw)} != expected {expected}"
+        out.write(raw)
+        return
+    print(f"  [requant] {name}: {GGML_TYPE_NAMES.get(t,'?')} -> Q6_K")
+    arr = _gguf_tensor_to_fp32(reader, name)
+    assert arr.shape == (out_features, in_features), \
+        f"{name} shape {arr.shape} != ({out_features},{in_features})"
+    out.write(quantize_q6_k(arr.reshape(-1, in_features)))
+
+
 def write_fc_q4_0(out, reader: GGUFReader, name: str,
                    out_features: int, in_features: int,
                    interleave: int, strict: bool):
@@ -593,6 +627,7 @@ def convert(args):
     print(f"  ffn        : {ff_dim}")
     print(f"  tied embed : {tied}")
     print(f"  target     : {args.target} (Q4_0 interleave={args.interleave})")
+    print(f"  ffn_down   : {args.ffn_down_dtype.upper()}")
     print()
 
     # --- Write the nntrainer .bin ---------------------------------------
@@ -635,8 +670,11 @@ def convert(args):
             write_fc_q4_0(out, reader, n("ffn_gate"),
                           ff_dim, hidden, args.interleave, args.strict)
             # layer{i}_ffn_down
-            write_fc_q4_0(out, reader, n("ffn_down"),
-                          hidden, ff_dim, args.interleave, args.strict)
+            if args.ffn_down_dtype == "q6_k":
+                write_fc_q6_k(out, reader, n("ffn_down"), hidden, ff_dim)
+            else:
+                write_fc_q4_0(out, reader, n("ffn_down"),
+                              hidden, ff_dim, args.interleave, args.strict)
             print(f"  layer {i:2d}/{n_layers} written")
 
         # 3. output_norm
@@ -652,11 +690,13 @@ def convert(args):
 
     # --- Drop a matching nntr_config.json next to it --------------------
     if args.emit_nntr_config:
+        ffn_down_dtype_str = "Q6_K" if args.ffn_down_dtype == "q6_k" else "Q4_0"
         cfg = {
             "model_type": "CausalLM",
             "model_tensor_type": "Q4_0-FP32",
             "model_file_name": os.path.basename(args.output),
             "fc_layer_dtype": "Q4_0",
+            "ffn_down_dtype": ffn_down_dtype_str,
             "embedding_dtype": "Q6_K",
             "lmhead_dtype": "Q6_K" if tied else "Q4_0",
             "lora_rank": 0,
@@ -698,6 +738,12 @@ def parse_args():
                          "(x86 -> q4_0x8, arm -> q4_0x4)")
     ap.add_argument("--strict", action="store_true",
                     help="Fail if GGUF tensor dtype differs from target dtype")
+    ap.add_argument("--ffn-down-dtype", choices=["q4_0", "q6_k"],
+                    default="q4_0",
+                    help="Target dtype for ffn_down.weight. Use 'q6_k' to "
+                         "preserve the quality of Q4_1/Q6_K ffn_down tensors "
+                         "that ship in mixed HF GGUFs (requires matching "
+                         "ffn_down_dtype in nntr_config.json).")
     ap.add_argument("--emit-nntr-config", action="store_true",
                     help="Also write nntr_config.json next to the .bin")
     args = ap.parse_args()
