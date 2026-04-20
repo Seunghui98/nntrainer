@@ -151,6 +151,7 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   unsigned int global_token_len;
+  float REPEAT_PENALTY; /**< Repetition penalty from nntr_config (1.0 = off) */
 
   bool has_run_ = false;
 
