@@ -92,33 +92,32 @@ void BertTransformer::constructModel() {
               withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
 
   layers.push_back(createLayer(
-    "input",
-    {withKey("name", "token_type_ids"),
-     withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
+    "input", {withKey("name", "token_type_ids"),
+              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
 
   /** --------- Token / Position / TokenType Embeddings --------- */
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
-  layers.push_back(createLayer(
-    embedding_type,
-    {withKey("name", "embedding0"), withKey("in_dim", NUM_VOCAB),
-     withKey("weight_dtype", EMBEDDING_DTYPE), withKey("out_dim", DIM),
-     withKey("input_layers", "input0")}));
+  layers.push_back(
+    createLayer(embedding_type,
+                {withKey("name", "embedding0"), withKey("in_dim", NUM_VOCAB),
+                 withKey("weight_dtype", EMBEDDING_DTYPE),
+                 withKey("out_dim", DIM), withKey("input_layers", "input0")}));
 
-  layers.push_back(createLayer(
-    "embedding_layer",
-    {withKey("name", "position_embedding"),
-     withKey("in_dim", MAX_POSITION_EMBEDDINGS),
-     withKey("weight_dtype", EMBEDDING_DTYPE), withKey("out_dim", DIM),
-     withKey("input_layers", "position_ids")}));
+  layers.push_back(
+    createLayer("embedding_layer", {withKey("name", "position_embedding"),
+                                    withKey("in_dim", MAX_POSITION_EMBEDDINGS),
+                                    withKey("weight_dtype", EMBEDDING_DTYPE),
+                                    withKey("out_dim", DIM),
+                                    withKey("input_layers", "position_ids")}));
 
-  layers.push_back(createLayer(
-    "embedding_layer",
-    {withKey("name", "token_type_embedding"),
-     withKey("in_dim", TYPE_VOCAB_SIZE),
-     withKey("weight_dtype", EMBEDDING_DTYPE), withKey("out_dim", DIM),
-     withKey("input_layers", "token_type_ids")}));
+  layers.push_back(createLayer("embedding_layer",
+                               {withKey("name", "token_type_embedding"),
+                                withKey("in_dim", TYPE_VOCAB_SIZE),
+                                withKey("weight_dtype", EMBEDDING_DTYPE),
+                                withKey("out_dim", DIM),
+                                withKey("input_layers", "token_type_ids")}));
 
   layers.push_back(createLayer(
     "addition",
@@ -126,12 +125,11 @@ void BertTransformer::constructModel() {
      withKey("input_layers",
              "embedding0,position_embedding,token_type_embedding")}));
 
-  layers.push_back(createLayer(
-    "layer_normalization",
-    {withKey("name", "embedding_norm"),
-     withKey("epsilon", toStringPrecise(NORM_EPS)), withKey("axis", 3),
-     withKey("packed", "false"),
-     withKey("input_layers", "embedding_sum")}));
+  layers.push_back(createLayer("layer_normalization",
+                               {withKey("name", "embedding_norm"),
+                                withKey("epsilon", toStringPrecise(NORM_EPS)),
+                                withKey("axis", 3), withKey("packed", "false"),
+                                withKey("input_layers", "embedding_sum")}));
 
   /** --------- Encoder blocks --------- */
   for (int i = 0; i < NUM_LAYERS; ++i) {
@@ -139,8 +137,8 @@ void BertTransformer::constructModel() {
     if (i == 0)
       block = createTransformerDecoderBlock(0, "embedding_norm");
     else
-      block = createTransformerDecoderBlock(
-        i, "layer" + std::to_string(i - 1) + "_ffn_norm");
+      block = createTransformerDecoderBlock(i, "layer" + std::to_string(i - 1) +
+                                                 "_ffn_norm");
     layers.insert(layers.end(), block.begin(), block.end());
   }
 
@@ -156,18 +154,16 @@ BertTransformer::createTransformerDecoderBlock(const int layer_id,
   std::vector<LayerHandle> layers;
 
   // Self-attention sub-block
-  auto att_layers =
-    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM, input_name,
-                    input_name, input_name);
+  auto att_layers = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
+                                    input_name, input_name, input_name);
   layers.insert(layers.end(), att_layers.begin(), att_layers.end());
 
   // Residual (input + attention_out) + post LayerNorm
   layers.push_back(createLayer(
     "addition",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_res"),
-     withKey("input_layers",
-             input_name + ",layer" + std::to_string(layer_id) +
-               "_attention_out")}));
+     withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) +
+                               "_attention_out")}));
 
   layers.push_back(createLayer(
     "layer_normalization",
@@ -187,10 +183,9 @@ BertTransformer::createTransformerDecoderBlock(const int layer_id,
   layers.push_back(createLayer(
     "addition",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_res"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) +
-               "_attention_norm,layer" + std::to_string(layer_id) +
-               "_ffn_down")}));
+     withKey("input_layers", "layer" + std::to_string(layer_id) +
+                               "_attention_norm,layer" +
+                               std::to_string(layer_id) + "_ffn_down")}));
 
   layers.push_back(createLayer(
     "layer_normalization",
@@ -203,9 +198,10 @@ BertTransformer::createTransformerDecoderBlock(const int layer_id,
   return layers;
 }
 
-std::vector<LayerHandle> BertTransformer::createAttention(
-  const int layer_id, int seq_len, int n_heads, int head_dim,
-  std::string query_name, std::string key_name, std::string value_name) {
+std::vector<LayerHandle>
+BertTransformer::createAttention(const int layer_id, int seq_len, int n_heads,
+                                 int head_dim, std::string query_name,
+                                 std::string key_name, std::string value_name) {
 
   std::vector<LayerHandle> layers;
   auto Q = "layer" + std::to_string(layer_id) + "_wq";
@@ -249,9 +245,8 @@ std::vector<LayerHandle> BertTransformer::createAttention(
   // O layer (bias enabled for BERT)
   layers.push_back(createLayer(
     "fully_connected",
-    {withKey("name", O), withKey("unit", DIM),
-     withKey("disable_bias", "false"), withKey("input_layers", A),
-     withKey("weight_initializer", "ones")}));
+    {withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "false"),
+     withKey("input_layers", A), withKey("weight_initializer", "ones")}));
 
   return layers;
 }
@@ -280,8 +275,7 @@ std::vector<LayerHandle> BertTransformer::createMlp(const int layer_id, int dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "false"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_ffn_act"),
+     withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_act"),
      withKey("weight_initializer", "ones")}));
 
   return layers;
@@ -293,9 +287,9 @@ void BertTransformer::registerCustomLayers() {
 
 /** ================= MultilingualTinyBert ================= */
 
-std::vector<float *>
-MultilingualTinyBert::encode(const WSTR prompt, const WSTR system_prompt,
-                             const WSTR tail_prompt) {
+std::vector<float *> MultilingualTinyBert::encode(const WSTR prompt,
+                                                  const WSTR system_prompt,
+                                                  const WSTR tail_prompt) {
   if (!is_initialized) {
     throw std::runtime_error(
       "MultilingualTinyBert is not initialized. Please call "
@@ -346,8 +340,8 @@ MultilingualTinyBert::encode(const WSTR prompt, const WSTR system_prompt,
   std::vector<float *> label;
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
-  auto output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                             0, input_len, false);
+  auto output = model->incremental_inference(BATCH_SIZE, input, label,
+                                             input_len, 0, input_len, false);
   auto finish_prefill = std::chrono::high_resolution_clock::now();
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
@@ -365,8 +359,8 @@ MultilingualTinyBert::encode(const WSTR prompt, const WSTR system_prompt,
 }
 
 void MultilingualTinyBert::run(const WSTR prompt, bool do_sample,
-                               const WSTR system_prompt,
-                               const WSTR tail_prompt, bool log_output) {
+                               const WSTR system_prompt, const WSTR tail_prompt,
+                               bool log_output) {
   (void)do_sample;
 
   try {

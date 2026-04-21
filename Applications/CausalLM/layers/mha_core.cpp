@@ -343,7 +343,7 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         cache_value_dim, cache_value_step_dim);
     }
   }
-  
+
   // increase cache size
   cache_index += step_size;
 }
@@ -496,26 +496,27 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                     true);
 
   bool use_rope = theta > 0.0f;
-  if(use_rope) {
+  if (use_rope) {
     // apply rotary embedding for query
     apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                              false);
+                               false);
 
-  // append kcache with rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
-                             false);
+    // append kcache with rotary embedding
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
+                               cache_index, false);
 
-  // append vcache without rotary embedding
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                               cache_index, true);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    // append vcache without rotary embedding
+    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 cache_index, true);
+    } else if (query_step.getDataType() ==
+               ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+      b_cache_value_step.copyData(value_step);
 #else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+      NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
-     }
+    }
   } else {
     b_cache_key_step.copyData(key_step);
     b_cache_value_step.copyData(value_step);
