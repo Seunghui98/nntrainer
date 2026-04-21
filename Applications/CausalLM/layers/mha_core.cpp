@@ -495,9 +495,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                       cache_index * cache_value_dim.width(),
                                     true);
 
-  // apply rotary embedding for query
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                             false);
+  bool use_rope = theta > 0.0f;
+  if(use_rope) {
+    // apply rotary embedding for query
+    apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
+                              false);
 
   // append kcache with rotary embedding
   apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
@@ -513,6 +515,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+     }
+  } else {
+    b_cache_key_step.copyData(key_step);
+    b_cache_value_step.copyData(value_step);
   }
 
   /// @todo replace step_size into input height
