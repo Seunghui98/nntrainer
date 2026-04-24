@@ -225,7 +225,7 @@ int NetworkGraph::checkCompiledGraph() {
   /** Dimension of input layers must be known */
   for (auto iter = cbegin(); iter != cend(); iter++) {
     auto lnode = (*iter);
-    if (lnode->getNumInputConnections() == 0) {
+    if (lnode->getNumInputConnections() == 0 && lnode->getType() != "weight") {
       if (!lnode->hasInputShapeProperty()) {
         ml_loge("Layer with no inbound connection need input_shape property");
         return ML_ERROR_INVALID_PARAMETER;
@@ -1207,7 +1207,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
      * Set input dimension for all the layers.
      * For input layer, as input dimension is known, set input tensor.
      */
-    if (!is_input_node(lnode.get())) {
+    if (!is_input_node(lnode.get()) && lnode->getType() != "weight") {
       if (input_map.find(lnode->getName()) == input_map.end())
         throw std::runtime_error("Cannot find input buffers for the node");
       inputs = input_map.at(lnode->getName());
@@ -1420,7 +1420,7 @@ int NetworkGraph::reinitialize(
      * Set input dimension for all the layers.
      * For input layer, as input dimension is known, set input tensor.
      */
-    if (!is_input_node(lnode.get())) {
+    if (!is_input_node(lnode.get()) && lnode->getType() != "weight") {
       if (input_map.find(lnode->getName()) == input_map.end())
         throw std::runtime_error("Cannot find input buffers for the node");
       inputs = input_map.at(lnode->getName());
