@@ -71,7 +71,6 @@ std::vector<float *> MultilingualTinyBert::encode(const WSTR prompt,
         static_cast<float>(tokenized[i]);
       position_ids[static_cast<size_t>(b) * INIT_SEQ_LEN + i] =
         static_cast<float>(i);
-      token_type_ids[static_cast<size_t>(b) * INIT_SEQ_LEN + i] = 0.0f;
     }
   }
 
