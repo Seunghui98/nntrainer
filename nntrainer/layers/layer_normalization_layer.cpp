@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <numeric>
 
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <layer_normalization_layer.h>
 #include <nntrainer_error.h>
@@ -210,67 +211,54 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
 
   variance.add_i(epsilon);
   variance.pow(-0.5f, inv_std_dev);
+  deviation.multiply(inv_std_dev, output);
 #else
-  NNTR_THROW_IF(normalize_axes.size() != 1 || normalize_axes[0] != 3,
-                std::invalid_argument)
-    << "FP16 incremental LN path currently supports axis=3 only";
+  // FP16 build: the previous manual loop reinterpreted the deviation
+  // buffer as `_FP16*` regardless of the tensor's actual data type, so
+  // when callers run with FP32 tensors (e.g. multilingual TinyBERT with
+  // model_tensor_type=FP32-FP32) it read FP32 bytes as half-words and
+  // produced NaNs. It also used the wrong epsilon sign, indexed only
+  // (batch=0, channel=0), and ignored the [from, to) decode window.
+  //
+  // Mirror the dispatch used by ReshapedRMSNormLayer: when the tensor is
+  // FP32 and we normalize along the width axis, call the
+  // rms_norm_wrt_width_fp16_intrinsic on the centered deviation tensor —
+  // it accumulates in FP16 (NEON) and writes
+  //   output = deviation / sqrt(mean(deviation^2) + epsilon)
+  // per row, only for rows the current step populated.
+  const bool width_axis_only =
+    normalize_axes.size() == 1 &&
+    normalize_axes[0] == ml::train::TensorDim::getNumDim() - 1;
 
-  const unsigned int step_h = to - from;
-  const unsigned int axis_dim = deviation.getDim().width();
+  if (deviation.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      width_axis_only) {
+    const unsigned int W = input_dim.width();
+    const unsigned int row_dim_v = input_dim.height();
+    const unsigned int row_begin = (to > from && to <= row_dim_v) ? from : 0u;
+    const unsigned int row_end =
+      (to > from && to <= row_dim_v) ? to : row_dim_v;
+    const size_t row_count = row_end - row_begin;
 
-  nntrainer::TensorDim dev_step_dim = deviation.getDim();
-  dev_step_dim.height(step_h);
-  const size_t dev_offset = from * axis_dim;
-
-  nntrainer::Tensor deviation_step =
-    deviation.getSharedDataTensor(dev_step_dim, dev_offset, true);
-
-  TensorDim inv_step_dim = inv_std_dev.getDim();
-  inv_step_dim.height(step_h);
-  Tensor inv_std_step = inv_std_dev.getSharedDataTensor(
-    inv_step_dim, from * inv_std_dev.getDim().width(), true);
-
-  if (deviation.getDataType() == ml::train::TensorDim::DataType::FP16) {
-    for (unsigned int i = 0; i < (to - from); ++i) {
-      float sum = 0.0f;
-      const _FP16 *row = deviation_step.getData<_FP16>() + i * axis_dim;
-      for (unsigned int j = 0; j < axis_dim; ++j) {
-        float v = (float)row[j];
-        sum += v * v;
-      }
-      float inv = 1.0f / std::sqrt(sum / axis_dim + epsilon);
-
-      if (inv_std_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-        inv_std_step.getData<_FP16>()[i] = (_FP16)inv;
-      } else {
-        inv_std_step.getData<float>()[i] = inv;
+    for (unsigned int b = 0; b < input_dim.batch(); ++b) {
+      for (unsigned int c = 0; c < input_dim.channel(); ++c) {
+        const float *src = deviation.getAddress<float>(b, c, row_begin, 0);
+        float *dst = output.getAddress<float>(b, c, row_begin, 0);
+        nntrainer::rms_norm_wrt_width_fp16_intrinsic(src, dst, row_count, W,
+                                                     epsilon);
       }
     }
   } else {
-    TensorDim dev_fp16_dim = deviation_step.getDim();
-    dev_fp16_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-    Tensor dev_fp16(dev_fp16_dim, true);
-    dev_fp16.copyData(deviation_step);
-
-    for (unsigned int i = 0; i < (to - from); ++i) {
-      float sum = 0.0f;
-      const _FP16 *row = dev_fp16.getData<_FP16>() + i * axis_dim;
-      for (unsigned int j = 0; j < axis_dim; ++j) {
-        float v = (float)row[j];
-        sum += v * v;
-      }
-      float inv = 1.0f / std::sqrt(sum / axis_dim + epsilon);
-
-      if (inv_std_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-        inv_std_step.getData<_FP16>()[i] = (_FP16)inv;
-      } else {
-        inv_std_step.getData<float>()[i] = inv;
-      }
-    }
+    // Genuine FP16 tensors or non-width axes — fall back to the same
+    // tensor-op pipeline as the FP32 branch (the Tensor class handles
+    // dtype dispatch internally).
+    deviation.pow(2.0f, temp_full_size);
+    temp_full_size.average(normalize_axes, variance);
+    variance.add_i(epsilon);
+    variance.pow(-0.5f, inv_std_dev);
+    deviation.multiply(inv_std_dev, output);
   }
 #endif
 
-  deviation.multiply(inv_std_dev, output);
   output.multiply_i(gamma);
   output.add_i(beta);
 }
