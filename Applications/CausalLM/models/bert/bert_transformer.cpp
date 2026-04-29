@@ -11,9 +11,9 @@
  *  https://github.com/huggingface/transformers/blob/v4.52.3/src/transformers/models/bert/modeling_bert.py
  */
 
+#include <bert_transformer.h>
 #include <llm_util.hpp>
 #include <model.h>
-#include <bert_transformer.h>
 
 #include <app_context.h>
 

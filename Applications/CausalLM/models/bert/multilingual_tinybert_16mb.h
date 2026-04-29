@@ -30,7 +30,8 @@ namespace causallm {
  *        methods that feed three inputs (input_ids, position_ids,
  *        token_type_ids) into the underlying nntrainer model.
  */
-class MultilingualTinyBert : public SentenceTransformer, public BertTransformer {
+class MultilingualTinyBert : public SentenceTransformer,
+                             public BertTransformer {
 
 public:
   static constexpr const char *architectures = "MultilingualTinyBert";
@@ -43,14 +44,13 @@ public:
 
   virtual ~MultilingualTinyBert() = default;
 
-  void setupParameters(json &cfg, json &generation_cfg, json &nntr_cfg) override {
+  void setupParameters(json &cfg, json &generation_cfg,
+                       json &nntr_cfg) override {
     BertTransformer::setupParameters(cfg, generation_cfg, nntr_cfg);
   }
-  
-  void constructModel() override {
-    BertTransformer::constructModel();
-  }
-  
+
+  void constructModel() override { BertTransformer::constructModel(); }
+
   void registerCustomLayers() override {
     BertTransformer::registerCustomLayers();
   }
