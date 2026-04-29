@@ -228,8 +228,8 @@ int NetworkGraph::checkCompiledGraph() {
     /**
      * Weight layers may have input connections in the graph, but they do not
      * consume input tensors. They own their weights and expose them as output
-     * tensors instead. Therefore, treat weight-only layers as input-like nodes here
-     * to avoid looking up non-existent input tensors for them.
+     * tensors instead. Therefore, treat weight-only layers as input-like nodes
+     * here to avoid looking up non-existent input tensors for them.
      */
     if (lnode->getNumInputConnections() == 0 && lnode->getType() != "weight") {
       if (!lnode->hasInputShapeProperty()) {
@@ -1214,8 +1214,8 @@ int NetworkGraph::initialize(ExecutionMode mode,
      * For input layer, as input dimension is known, set input tensor.
      * Weight layers may have input connections in the graph, but they do not
      * consume input tensors. They own their weights and expose them as output
-     * tensors instead. Therefore, treat weight-only layers as input-like nodes here
-     * to avoid looking up non-existent input tensors for them.
+     * tensors instead. Therefore, treat weight-only layers as input-like nodes
+     * here to avoid looking up non-existent input tensors for them.
      */
     if (!is_input_node(lnode.get()) && lnode->getType() != "weight") {
       if (input_map.find(lnode->getName()) == input_map.end())
@@ -1432,9 +1432,9 @@ int NetworkGraph::reinitialize(
      *
      * Weight layers may have input connections in the graph, but they do not
      * consume input tensors. They own their weights and expose them as output
-     * tensors instead. Therefore, treat weight-only layers as input-like nodes here
-     * to avoid looking up non-existent input tensors for them.
-    */
+     * tensors instead. Therefore, treat weight-only layers as input-like nodes
+     * here to avoid looking up non-existent input tensors for them.
+     */
     if (!is_input_node(lnode.get()) && lnode->getType() != "weight") {
       if (input_map.find(lnode->getName()) == input_map.end())
         throw std::runtime_error("Cannot find input buffers for the node");
