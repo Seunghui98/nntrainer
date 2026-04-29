@@ -121,8 +121,7 @@ std::string resolve_architecture(std::string model_type,
       return "EmbeddingGemma";
     } else if (architecture == "Qwen2Model") {
       return "Qwen2Embedding";
-    } else if (architecture == "BertModel" ||
-               architecture == "BertForMaskedLM") {
+    } else if (architecture == "BertForMaskedLM") {
       return "MultilingualTinyBert";
     } else {
       throw std::invalid_argument(
