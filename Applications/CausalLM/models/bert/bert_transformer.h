@@ -83,6 +83,21 @@ protected:
    * @brief Type-vocab size for token_type_ids (BERT default: 2)
    */
   unsigned int TYPE_VOCAB_SIZE = 2;
+
+public:
+  /**
+   * @brief Encode the prompt and return the embedding output
+   */
+  virtual std::vector<float *> encode(const WSTR prompt,
+                                      const WSTR system_prompt = "",
+                                      const WSTR tail_prompt = "") = 0;
+
+  /**
+   * @brief run the BertTransformer model
+   */
+  void run(const WSTR prompt, bool do_sample = false,
+           const WSTR system_prompt = "", const WSTR tail_prmopt = "",
+           bool log_output = true) override;
 };
 
 } // namespace causallm

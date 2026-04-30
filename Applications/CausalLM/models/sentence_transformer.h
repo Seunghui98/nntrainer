@@ -54,9 +54,8 @@ public:
    * @param tail_prompt Tail prompt
    * @return SentenceTransformer output from the model
    */
-  virtual std::vector<float *> encode(const WSTR prompt,
-                                      const WSTR system_prompt = "",
-                                      const WSTR tail_prompt = "");
+  std::vector<float *> encode(const WSTR prompt, const WSTR system_prompt = "",
+                              const WSTR tail_prompt = "");
 
 protected:
   /**
