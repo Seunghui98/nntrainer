@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <numeric>
 
+#include <base_properties.h>
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <layer_normalization_layer.h>
@@ -22,7 +23,6 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <util_func.h>
-#include <base_properties.h>
 
 namespace nntrainer {
 
@@ -237,8 +237,9 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
       for (unsigned int c = 0; c < input_dim.channel(); ++c) {
         const float *src = deviation.getAddress<float>(b, c, row_begin, 0);
         float *dst = output.getAddress<float>(b, c, row_begin, 0);
-        // NOTE: rms_norm_wrt_width_fp16_intrinsic is reused here for Layer Normalization.
-        // Since 'deviation' is already centered (X - mean), computing:
+        // NOTE: rms_norm_wrt_width_fp16_intrinsic is reused here for Layer
+        // Normalization. Since 'deviation' is already centered (X - mean),
+        // computing:
         //   output = deviation / sqrt(mean(deviation^2) + epsilon)
         // is equivalent to Layer Norm's formula:
         //   output = (X - mean_X) / sqrt(variance + epsilon)
@@ -248,7 +249,8 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
     }
   } else {
     // Fallback: generic tensor operations for all data types.
-    // Used when: FP16 not enabled, non-FP32 tensor, or multi-axis normalization.
+    // Used when: FP16 not enabled, non-FP32 tensor, or multi-axis
+    // normalization.
     deviation.pow(2.0f, temp_full_size);
     temp_full_size.average(normalize_axes, variance);
     variance.add_i(epsilon);
