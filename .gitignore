@@ -7,6 +7,9 @@
 .cache/
 .idea/
 
+# meson subproject lock (created by `meson setup`)
+subprojects/.wraplock
+
 # jni build files
 libs/
 obj/
