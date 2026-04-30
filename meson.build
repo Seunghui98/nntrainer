@@ -800,3 +800,9 @@ endif
 if get_option('enable-benchmarks')
   subdir('benchmarks')
 endif
+
+# Standalone tools (converters, helpers). The subdir gates each tool on its
+# own preconditions (e.g. causal_lm_converter requires enable-transformer).
+if (get_option('platform') != 'tizen') and (get_option('platform') != 'windows')
+  subdir('tools')
+endif
