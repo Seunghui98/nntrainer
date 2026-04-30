@@ -129,9 +129,17 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                              ? cfg["sliding_window_pattern"].get<unsigned int>()
                              : 1;
   MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
-  ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
-  TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
-  NORM_EPS = cfg["rms_norm_eps"];
+  // Qwen3.5 puts rope_theta under "rope_parameters" instead of at the top
+  // level; subclass setupParameters can override afterwards. Provide safe
+  // defaults so the top-level read does not throw on hybrid configs.
+  ROPE_THETA = cfg.contains("rope_theta")
+                 ? cfg["rope_theta"].get<unsigned int>()
+                 : 10000;
+  TIE_WORD_EMBEDDINGS = cfg.contains("tie_word_embeddings")
+                          ? cfg["tie_word_embeddings"].get<bool>()
+                          : false;
+  NORM_EPS = cfg.contains("rms_norm_eps") ? cfg["rms_norm_eps"].get<float>()
+                                          : 1e-5f;
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
   return;

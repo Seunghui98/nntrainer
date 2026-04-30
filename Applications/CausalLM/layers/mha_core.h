@@ -171,6 +171,18 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
+/**
+ * @brief PartialRotaryFactor - fraction of head_dim to apply RoPE to
+ *        Default 1.0 = full RoPE. Qwen3.5 uses 0.25.
+ */
+class PartialRotaryFactor : public nntrainer::Property<float> {
+public:
+  PartialRotaryFactor(float value = 1.0f) { set(value); };
+  static constexpr const char *key =
+    "partial_rotary_factor";                  /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
 }; // namespace props
 
 /**
@@ -308,7 +320,8 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::AttnLogitSoftcapping, props::IsCausal,
+    props::PartialRotaryFactor>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -321,6 +334,8 @@ private:
   size_t num_heads_Q;
   size_t num_heads_KV;
   size_t head_dim;
+  size_t
+    rotary_half; /**< head_dim * partial_rotary_factor / 2 (RoPE rotated half) */
   bool cache_shift;
   float theta;
   size_t local_window_size;

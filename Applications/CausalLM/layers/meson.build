@@ -144,3 +144,48 @@ causallm_qkv_layer_dep = declare_dependency(
     link_with: causallm_qkv_layer,
     include_directories: causallm_layer_inc
 )
+
+# --- Qwen3.5 hybrid model layers ---
+
+causallm_attn_gate_src_abs = [meson.current_source_dir() / 'attn_gate.cpp']
+causallm_causal_conv1d_src_abs = [meson.current_source_dir() / 'causal_conv1d.cpp']
+causallm_gdn_ssm_core_src_abs = [meson.current_source_dir() / 'gdn_ssm_core.cpp']
+
+causallm_attn_gate = shared_library(
+    'attn_gate_layer',
+    causallm_attn_gate_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_attn_gate_dep = declare_dependency(
+    link_with: causallm_attn_gate,
+    include_directories: causallm_layer_inc
+)
+
+causallm_causal_conv1d = shared_library(
+    'causal_conv1d_layer',
+    causallm_causal_conv1d_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_causal_conv1d_dep = declare_dependency(
+    link_with: causallm_causal_conv1d,
+    include_directories: causallm_layer_inc
+)
+
+causallm_gdn_ssm_core = shared_library(
+    'gdn_ssm_core_layer',
+    causallm_gdn_ssm_core_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_gdn_ssm_core_dep = declare_dependency(
+    link_with: causallm_gdn_ssm_core,
+    include_directories: causallm_layer_inc
+)

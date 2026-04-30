@@ -52,13 +52,15 @@ MHACoreLayer::MHACoreLayer() :
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
     props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
     props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::AttnLogitSoftcapping(), props::IsCausal(),
+    props::PartialRotaryFactor()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
   num_heads_Q(0),
   num_heads_KV(0),
   head_dim(0),
+  rotary_half(0),
   cache_shift(false) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -174,6 +176,12 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorLifespan::MAX_LIFESPAN);
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
+
+  // partial_rotary_factor: fraction of head_dim that gets RoPE applied.
+  // Default 1.0 = full RoPE (rotary_half = head_dim/2). Qwen3.5 uses 0.25.
+  float partial_rotary_factor =
+    std::get<props::PartialRotaryFactor>(mha_core_props).get();
+  rotary_half = static_cast<size_t>(head_dim * partial_rotary_factor) / 2;
 
   /** set Output dimension! - one output */
   std::vector<nntrainer::TensorDim> output_dims(1);
@@ -657,7 +665,12 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
       NNTR_THROW_IF(true, std::invalid_argument) << "Unsupported rope type!";
   }
 
-  unsigned int half_ = head_dim / 2;
+  // Use rotary_half (= head_dim * partial_rotary_factor / 2) so partial RoPE
+  // (e.g. Qwen3.5 with factor 0.25) only rotates the first 2*rotary_half
+  // channels. With full RoPE this equals head_dim / 2, preserving behavior.
+  unsigned int half_ = static_cast<unsigned int>(rotary_half);
+  if (half_ == 0)
+    half_ = head_dim / 2;
 
   if (!is_fp16) {
     // cos / sin
@@ -734,12 +747,17 @@ void MHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
   // no attention scaling
   attention_scaling = 1.0f;
 
-  // theta_i = 10000^(-2(i-1)/dim) for i = [1, 2, ... , dim/2]
-  // head_dim should be divisible by 2
-  unsigned int half_ = head_dim / 2;
-  for (unsigned int i = 0; i < half_; ++i) {
+  // theta_i = 10000^(-2(i-1)/rotary_dim) for i = [1, 2, ... , rotary_half].
+  // For full RoPE (partial_rotary_factor=1.0), rotary_half == head_dim/2 and
+  // rotary_dim == head_dim, matching the original computation exactly.
+  // For partial RoPE (e.g., Qwen3.5 with 0.25), only the first 2*rotary_half
+  // channels of each head get rotated; the rest are left unchanged.
+  unsigned int rotary_dim = static_cast<unsigned int>(rotary_half) * 2;
+  if (rotary_dim == 0)
+    rotary_dim = head_dim;
+  for (unsigned int i = 0; i < rotary_half; ++i) {
     thetas.push_back(1.0 /
-                     (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+                     (std::pow(theta, (2 * i) / static_cast<float>(rotary_dim))));
   }
 }
 
@@ -842,7 +860,14 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                               unsigned int dim,
                                               unsigned int from,
                                               bool convert_only) {
-  unsigned int half_ = dim / 2;
+  // For convert_only (V cache write-through), process the full head_dim.
+  // For Q/K rotation, use rotary_half so partial RoPE (e.g. Qwen3.5 = 0.25)
+  // only touches the first 2*rotary_half channels.
+  unsigned int half_full = dim / 2;
+  unsigned int half_partial =
+    rotary_half ? static_cast<unsigned int>(rotary_half) : half_full;
+  unsigned int half_ = convert_only ? half_full : half_partial;
+  unsigned int rotated_dim = 2u * half_;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
@@ -884,6 +909,18 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
             nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
                                                 out_ptr, cos_->data(),
                                                 sin_->data(), convert_only);
+
+            // Partial RoPE: rotary kernel only writes first 2*half_ channels
+            // of each head. Copy/convert the non-rotated tail [rotated_dim,
+            // dim) from FP32 input to FP16 output unchanged.
+            if (!convert_only && rotated_dim < dim) {
+              for (unsigned int w = 0; w < in.width(); w += dim) {
+                for (unsigned int j = rotated_dim; j < dim; ++j) {
+                  out_ptr[w + j] =
+                    nntrainer::compute_fp32_to_fp16(in_ptr[w + j]);
+                }
+              }
+            }
           }
         }
       }
