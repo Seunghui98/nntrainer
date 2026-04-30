@@ -129,31 +129,215 @@ The output binary lands at
 
 ### Convert a model
 
+The converter is exposed as both a CLI (`python -m nntr_causal_lm_converter`)
+and a library (`from nntr_causal_lm_converter import convert`). Both produce
+the same three artifacts.
+
+#### CLI
+
 ```bash
 cd tools/causal_lm_converter
 
 # Dump the graph only (INI + runtime config, no weights). Fast; useful when
-# debugging the graph layout against the C++ side.
+# debugging the graph layout against the C++ side without paying the weight
+# materialization cost.
 python -m nntr_causal_lm_converter \
   --model /path/to/Qwen3-0.6B \
   --output ./out \
+  --model-name qwen3-0.6b \
   --init-seq-len 64 --max-seq-len 128
 
-# Convert weights too. Requires torch + transformers.
+# Full conversion: graph + weights + runtime config. Requires torch +
+# transformers (used only to load the HF state_dict; nothing about the
+# emitted artifact depends on torch at runtime).
 python -m nntr_causal_lm_converter \
   --model /path/to/Qwen3-0.6B \
   --output ./out \
-  --weights --dtype float32
+  --model-name qwen3-0.6b \
+  --weights --dtype float32 \
+  --init-seq-len 128 --max-seq-len 1024
 ```
 
-Outputs:
+CLI flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--model` | required | Path to a local HF model directory (must contain `config.json`; `model.safetensors` or `pytorch_model.bin` if `--weights`). HuggingFace Hub IDs work too if the model is cached locally. |
+| `--output` | required | Directory to write artifacts into (created if missing). |
+| `--model-name` | basename of `--model` | Stem used for `<name>.ini` / `<name>.safetensors`. |
+| `--init-seq-len` | 8 | Sequence length compiled into the graph (`input_shape = 1:1:N`). Pick the longest prompt you'll feed to `model->incremental_inference`. |
+| `--max-seq-len` | 8 | Total tokens (init + generation). Drives `mha_core`'s `max_timestep` and the runtime config. |
+| `--weights` | off | Also load the HF `state_dict` and write `<name>.safetensors`. |
+| `--dtype` | `float32` | Weight dtype written to the safetensors blob. `float16` halves the file size; the runner picks the matching tensor type from `nntr_config.json`. |
+
+#### Programmatic API
+
+```python
+import torch, json
+from transformers import AutoModelForCausalLM
+from nntr_causal_lm_converter import convert
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B",
+                                             torch_dtype=torch.float32).eval()
+hf_cfg = json.load(open("/path/to/Qwen3-0.6B/config.json"))
+
+paths = convert(
+    hf_config=hf_cfg,
+    output_dir="./out",
+    model_name="qwen3-0.6b",
+    init_seq_len=128,
+    max_seq_len=1024,
+    state_dict=model.state_dict(),
+    dtype="float32",
+)
+print(paths)
+# {'ini': './out/qwen3-0.6b.ini',
+#  'safetensors': './out/qwen3-0.6b.safetensors',
+#  'runtime_config': './out/nntr_config.json'}
+```
+
+The library entry point is useful when you want to:
+* drive conversion from a notebook or test harness,
+* feed a synthesized `state_dict` (e.g. quantized weights, randomly
+  initialized stand-ins for performance benchmarking),
+* fan out conversions for multiple seq-len configurations from one
+  `state_dict` load.
+
+#### What happens during conversion
+
+The converter is a four-stage pipeline; each stage maps to one Python module.
 
 ```
-out/
-├── Qwen3-0.6B.ini             # graph topology + layer properties
-├── Qwen3-0.6B.safetensors     # weights, name-keyed
-└── nntr_config.json           # batch / seq / dtype runtime hints
+HF config + state_dict
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 1: dispatch                                              │
+│    architectures.get_builder(hf_config["model_type"])           │
+│    → Qwen3Builder, ...                                          │
+└─────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 2: emit graph                                            │
+│    builder.build_sections() -> list[IniSection]                 │
+│    → ordered (Model, input0, embedding0, layer{0..N-1}_*,       │
+│       output_norm, lm_head)                                     │
+│    ini.render_ini(...)  -> "<model>.ini"                        │
+└─────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 3: bind + materialize weights                            │
+│    builder.build_weight_bindings() -> list[WeightBinding]       │
+│    → e.g. ("model.layers.0.self_attn.q_proj.weight",            │
+│            "layer0_wq:weight", transpose=True)                  │
+│    weights.materialize(bindings, state_dict, dtype)             │
+│    → transpose FC weights, dtype-cast, sanity-check coverage    │
+│    weights.write_safetensors(...) -> "<model>.safetensors"      │
+└─────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 4: runtime config                                        │
+│    RuntimeConfig(...).to_json() -> "nntr_config.json"           │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+Concretely, on a tiny Qwen3 (4 layers, hidden=128, vocab=512) the run
+looks like:
+
+```
+$ python -m nntr_causal_lm_converter \
+      --model ./hf_model --output ./out --model-name qwen3 \
+      --weights --init-seq-len 32 --max-seq-len 64
+  ini              -> ./out/qwen3.ini
+  safetensors      -> ./out/qwen3.safetensors
+  runtime_config   -> ./out/nntr_config.json
+
+$ ls -la ./out/
+-rw-r--r-- 1 user user      327 nntr_config.json
+-rw-r--r-- 1 user user    7,077 qwen3.ini
+-rw-r--r-- 1 user user 2,499,536 qwen3.safetensors
+```
+
+##### Layer-name conventions used by Stage 2
+
+These are not configurable: they match the existing
+`Applications/CausalLM/models/qwen3` C++ implementation so weight files are
+interchangeable.
+
+| Section name | INI `Type` | Notes |
+|---|---|---|
+| `Model` | `NeuralNetwork` | mandatory; runtime overrides batch/dtype via `setProperty`. |
+| `input0` | `input` | shape `1:1:<init_seq_len>`. |
+| `embedding0` | `embedding_layer` or `tie_word_embeddings` | switches based on `tie_word_embeddings`. |
+| `layer{i}_attention_norm` | `rms_norm` | pre-attn norm. |
+| `layer{i}_w{q,k,v}` | `fully_connected` | bias-less; `unit = head_dim * n_heads` (Q) or `head_dim * n_kv_heads` (K/V). |
+| `layer{i}_{q,k}_norm` | `reshaped_rms_norm` | Qwen3 per-head Q/K norm. |
+| `layer{i}_attention` | `mha_core` | inputs in `q,k,v` order; carries RoPE / GQA / max_timestep. |
+| `layer{i}_attention_out` | `fully_connected` | O projection; bias-less. |
+| `layer{i}_residual_attn` | `addition` | block input + attention out. |
+| `layer{i}_ffn_norm` | `rms_norm` | pre-MLP norm. |
+| `layer{i}_ffn_{up,gate}` | `fully_connected` | bias-less. |
+| `layer{i}_ffn_swiglu` | `swiglu` | takes `(up, gate)`. |
+| `layer{i}_ffn_down` | `fully_connected` | bias-less. |
+| `layer{i}_residual_ffn` | `addition` | post-attn residual + ffn down. |
+| `output_norm` | `rms_norm` | final norm. |
+| `lm_head` | `fully_connected` or `tie_word_embeddings` | tied variant carries `unit = vocab` and `shared_from = embedding0`. |
+
+##### Weight transformations applied by Stage 3
+
+| HF tensor | NNTrainer key | Transform |
+|---|---|---|
+| `model.embed_tokens.weight` | `embedding0:Embedding` | none (`[vocab, hidden]` matches) |
+| `model.layers.{i}.input_layernorm.weight` | `layer{i}_attention_norm:gamma` | none |
+| `model.layers.{i}.post_attention_layernorm.weight` | `layer{i}_ffn_norm:gamma` | none |
+| `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` | `layer{i}_w{q,k,v}:weight`, `layer{i}_attention_out:weight` | **transpose** `[out, in] → [in, out]` |
+| `model.layers.{i}.self_attn.{q,k}_norm.weight` | `layer{i}_{q,k}_norm:gamma` | none |
+| `model.layers.{i}.mlp.{up,gate,down}_proj.weight` | `layer{i}_ffn_{up,gate,down}:weight` | **transpose** |
+| `model.norm.weight` | `output_norm:gamma` | none |
+| `lm_head.weight` (untied only) | `lm_head:weight` | **transpose** |
+
+Tied embeddings: when `tie_word_embeddings` is true, the converter omits a
+binding for `lm_head` — the runtime resolves the `shared_from = embedding0`
+property and reuses the embedding weight buffer.
+
+#### Verifying conversion output
+
+Two quick checks before running the model:
+
+```bash
+# 1. Inspect the graph (no model construction, no torch).
+python -m nntr_causal_lm_converter.inspect ini out/qwen3-0.6b.ini --filter layer0_
+
+# 2. Inspect weight coverage. The number of tensors should equal:
+#      1 (embed) + N_layers * 11 (per-block tensors) + 1 (output_norm)
+#                + (1 if untied else 0)
+python -m nntr_causal_lm_converter.inspect safetensors out/qwen3-0.6b.safetensors
+```
+
+The smoke-load can be done without a forward pass:
+
+```bash
+build/tools/causal_lm_converter/runner/causal_lm_runner \
+    out/qwen3-0.6b.ini out/qwen3-0.6b.safetensors out/nntr_config.json \
+    --no-forward
+# [runner] OK (no forward)
+```
+
+If `--no-forward` succeeds but the full run fails, the failure is in the
+forward path (vocab / shape / NaN) rather than the load path — narrowing
+debugging significantly.
+
+#### Common conversion errors
+
+| Error | Cause | Fix |
+|---|---|---|
+| `KeyError: 5 HF tensors missing from state_dict` | Loading from HF Hub without `--weights` and then asking the runner for safetensors, or HF model uses an unexpected key (rare for Qwen3). | Re-run with `--weights`; check the inspector output for the missing tensors. |
+| `No builder registered for model_type='...'` | Architecture not yet supported. | Add an `ArchitectureBuilder` under `architectures/` (see "Extending" below). |
+| `hf_config missing required key 'num_hidden_layers'` | Local `config.json` is from a non-causal-LM checkpoint or has been edited. | Confirm the model is a CausalLM and `model_type` is supported. |
+| Empty / 8-byte safetensors | Incomplete write (out-of-disk during conversion). | Re-run conversion; the file is only flushed when complete. |
 
 ### Run end-to-end
 
