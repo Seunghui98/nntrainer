@@ -341,6 +341,13 @@ debugging significantly.
 
 ### Run end-to-end
 
+`causal_lm_runner` is a small CLI for build-and-run validation. It does
+**not** include a tokenizer — that lives next to your model
+(`tokenizer.json`) and is consumed by either the bundled Python helper or
+your own application.
+
+#### Smoke test (no tokenizer, no real input)
+
 ```bash
 build/tools/causal_lm_converter/runner/causal_lm_runner \
     out/Qwen3-0.6B.ini \
@@ -348,18 +355,94 @@ build/tools/causal_lm_converter/runner/causal_lm_runner \
     out/nntr_config.json
 ```
 
-Expected output ends with:
+The runner feeds **all-zero token IDs** (always within vocab) and prints the
+first 8 logits of position 0 so you can verify the graph is wired correctly:
 
 ```
-[runner] forward OK, first 8 logits: ...
+[runner] no --input-tokens; feeding all-zeros.
+[runner] forward OK, first 8 logits (position 0): 0.36 1.58 0.53 ...
 [runner] OK
 ```
 
-Use `--no-forward` to validate the load path without a forward pass:
+`--no-forward` validates the load path without running forward:
 
 ```bash
 .../causal_lm_runner out/<model>.ini out/<model>.safetensors out/nntr_config.json --no-forward
+# [runner] OK (no forward)
 ```
+
+#### Real input + next-token decoding
+
+Two things happen for "real" inference:
+
+1. **Tokenize the prompt** — turn text into integer token IDs using the HF
+   tokenizer that ships with the model. The bundled
+   `nntr_causal_lm_converter.tokenize` CLI does exactly this:
+
+   ```bash
+   python -m nntr_causal_lm_converter.tokenize encode \
+       --model ~/models/Qwen3-0.6B \
+       --prompt "Hello, world." \
+       --pad-to 128 > /tmp/prompt.ids
+   cat /tmp/prompt.ids
+   # 9707,11,1879,13,0,0,...,0
+   ```
+
+   `--pad-to N` right-pads with 0 so the length matches the INI's
+   `init_seq_len` (the runner refuses oversized inputs, warns on shorter).
+
+2. **Feed those IDs to the runner and ask for top-K next tokens**:
+
+   ```bash
+   ./causal_lm_runner \
+       out/qwen3-0.6b.ini \
+       out/qwen3-0.6b.safetensors \
+       out/nntr_config.json \
+       --input-tokens-file /tmp/prompt.ids \
+       --top-k 5
+   ```
+
+   Output:
+
+   ```
+   [runner] fed 128 tokens (first 16: 9707 11 1879 13 0 0 0 0 0 0 0 0 0 0 0 0)
+   [runner] forward OK, first 8 logits (position 0): ...
+   [runner] top-5 next-token logits (the row generation uses):
+     rank 1: token_id=72548  logit=3.05
+     rank 2: token_id=15299  logit=2.85
+     rank 3: token_id=135729 logit=2.64
+     rank 4: token_id=13246  logit=2.53
+     rank 5: token_id=16734  logit=2.51
+   ```
+
+   `argmax(top-K)` = the predicted next token. Decode it back to text with
+   the tokenize CLI:
+
+   ```bash
+   python -m nntr_causal_lm_converter.tokenize decode \
+       --model ~/models/Qwen3-0.6B --ids 72548
+   ```
+
+#### Runner CLI flags
+
+| Flag | Meaning |
+|---|---|
+| `--no-forward` | Skip the forward pass after loading. Smoke-test the load path only. |
+| `--input-tokens "1,2,3,..."` | Comma-separated token IDs to feed into the embedding layer. Truncated to `init_seq_len` (warned), zero-padded if shorter. |
+| `--input-tokens-file PATH` | Same as above but read from a file (whitespace- or comma-separated). |
+| `--top-k N` | After forward, print the top-N token IDs + logits for the **last** input position — this is the row generation argmaxes / samples to pick the next token. Requires `vocab_size` in `nntr_config.json` (the converter writes it automatically). |
+| `--print-shape` | Print the output buffer shape (`batch=1 vocab=151936 …`) for debugging. |
+
+#### What the runner does NOT do
+
+By design:
+- **Tokenization** — see the `tokenize` Python helper or use HF tokenizer in
+  your own app.
+- **Generation loop** — the runner runs *one* forward pass. Looping (with KV
+  cache, sampling, repetition penalty, EOS detection) belongs in your
+  application; the importer makes that trivial (see next section).
+- **Sampling / softmax** — output is raw logits. `argmax` is one line of C++;
+  temperature / top-p / top-k sampling is application policy.
 
 ## Embedding the importer in your own application
 

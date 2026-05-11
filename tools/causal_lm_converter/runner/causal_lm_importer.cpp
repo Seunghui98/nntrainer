@@ -124,6 +124,9 @@ RuntimeConfig parse_runtime_config(const std::string &json_path) {
   if (auto v = json_field(j, "model_file_name"); !v.empty()) {
     rc.model_file_name = v;
   }
+  if (auto v = json_field(j, "vocab_size"); !v.empty()) {
+    rc.vocab_size = static_cast<unsigned int>(std::stoul(v));
+  }
   return rc;
 }
 

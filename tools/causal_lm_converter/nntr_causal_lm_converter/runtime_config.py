@@ -21,6 +21,10 @@ class RuntimeConfig:
     init_seq_len: int = 8
     max_seq_len: int = 8
     num_to_generate: int = 0
+    # Vocabulary size of the converted model. We record it explicitly so the
+    # C++ runner can compute output shapes (last-token slice for top-K) even
+    # when the INI-loaded graph has no explicit output node.
+    vocab_size: int = 0
     embedding_dtype: str = "FP32"
     fc_layer_dtype: str = "FP32"
     lmhead_dtype: str = "FP32"

@@ -92,11 +92,16 @@ def convert(
         out["safetensors"] = st_path
 
     # 3. Runtime config.
+    # We record ``vocab_size`` so the C++ runner can compute the last-token
+    # logit slice for top-K decoding without having to re-parse the INI.
+    vocab = int(hf_config.get("vocab_size", 0)) if hasattr(hf_config, "get") \
+        else int(getattr(hf_config, "vocab_size", 0))
     rc = RuntimeConfig(
         batch_size=1,
         init_seq_len=init_seq_len,
         max_seq_len=max_seq_len,
         num_to_generate=max(0, max_seq_len - init_seq_len),
+        vocab_size=vocab,
         embedding_dtype="FP32" if dtype == "float32" else "FP16",
         fc_layer_dtype="FP32" if dtype == "float32" else "FP16",
         lmhead_dtype="FP32" if dtype == "float32" else "FP16",

@@ -17,9 +17,22 @@ def test_to_json_includes_required_keys():
         "max_seq_len",
         "model_tensor_type",
         "model_file_name",
+        "vocab_size",
     ):
         assert key in obj, f"missing {key}"
     assert obj["model_name"] == "qwen3_tiny"
+
+
+def test_vocab_size_default_is_zero():
+    """vocab_size 0 means 'not declared'. The runner falls back to a clear
+    error message rather than guessing."""
+    rc = RuntimeConfig()
+    assert json.loads(rc.to_json())["vocab_size"] == 0
+
+
+def test_vocab_size_propagates():
+    rc = RuntimeConfig(vocab_size=151936)
+    assert json.loads(rc.to_json())["vocab_size"] == 151936
 
 
 def test_extra_fields_merge_into_top_level():

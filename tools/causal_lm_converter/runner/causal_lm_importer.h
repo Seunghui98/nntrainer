@@ -57,6 +57,9 @@ struct RuntimeConfig {
   unsigned int batch_size      = 1;
   unsigned int init_seq_len    = 8;
   unsigned int max_seq_len     = 8;
+  /** Vocabulary size; 0 means "not declared in the JSON". Useful so callers
+   *  can compute the last-token logit slice without parsing the INI. */
+  unsigned int vocab_size      = 0;
   std::string  model_tensor_type = "FP32-FP32";
   std::string  model_file_name   = "model.safetensors";
 };

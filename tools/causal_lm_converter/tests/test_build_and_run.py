@@ -109,7 +109,7 @@ def test_convert_and_run_tiny_qwen3(
     )
     # Acceptance criteria from the runner itself.
     assert "[runner] OK" in proc.stdout, combined
-    assert "first 8 logits:" in proc.stdout, combined
+    assert "first 8 logits" in proc.stdout, combined
 
 
 def test_runner_no_forward_smoke(
@@ -135,6 +135,48 @@ def test_runner_no_forward_smoke(
     combined = proc.stdout + "\n" + proc.stderr
     assert proc.returncode == 0, combined
     assert "[runner] OK (no forward)" in proc.stdout
+
+
+def test_runner_top_k_and_input_tokens(
+    tmp_path, tiny_qwen3_cfg, runner_path, torch_available,
+):
+    """End-to-end: feed explicit token IDs, ask for top-K next-token logits.
+
+    Validates that:
+      * ``--input-tokens`` reaches the embedding layer (no shape errors)
+      * ``--print-shape`` reports a finite, vocab-sized buffer
+      * ``--top-k`` prints N rank lines that all decode as token IDs within
+        the model's vocab.
+    """
+    hf_cfg, sd = _build_tiny_qwen3_state_dict(tiny_qwen3_cfg)
+    from nntr_causal_lm_converter.cli import convert
+    out = convert(
+        hf_config=hf_cfg, output_dir=str(tmp_path), model_name="qwen3_topk",
+        init_seq_len=8, max_seq_len=16, state_dict=sd, dtype="float32",
+    )
+
+    # Feed deterministic token IDs that stay within vocab.
+    vocab = int(hf_cfg["vocab_size"])
+    tokens = ",".join(str(i % vocab) for i in range(8))
+
+    proc = subprocess.run(
+        [runner_path, out["ini"], out["safetensors"], out["runtime_config"],
+         "--input-tokens", tokens,
+         "--print-shape",
+         "--top-k", "3"],
+        capture_output=True, text=True, timeout=120,
+    )
+    combined = proc.stdout + "\n" + proc.stderr
+    assert proc.returncode == 0, combined
+    assert "fed 8 tokens" in proc.stdout, combined
+    assert f"vocab={vocab}" in proc.stdout, combined
+    # Top-3 must produce three rank lines, each with a valid token_id.
+    import re
+    ranks = re.findall(r"rank \d+: token_id=(\d+)\s+logit=([-\d\.eE]+)",
+                       proc.stdout)
+    assert len(ranks) == 3, f"expected 3 top-K rows, got {ranks!r}"
+    for tid, _ in ranks:
+        assert 0 <= int(tid) < vocab, f"token_id {tid} out of vocab {vocab}"
 
 
 def test_example_embedded_consumes_same_artifacts(
