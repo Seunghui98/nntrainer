@@ -423,6 +423,61 @@ Two things happen for "real" inference:
        --model ~/models/Qwen3-0.6B --ids 72548
    ```
 
+#### Multi-token generation
+
+For real continuations (not just one-step prediction), use the C++
+generation loop. We have to keep generation **inside the runner** so the
+model's KV cache is preserved across steps; spawning the runner once per
+token from Python would reset the cache and slow things down dramatically.
+
+```bash
+./causal_lm_runner out/qwen3-0.6b.ini out/qwen3-0.6b.safetensors \
+    out/nntr_config.json \
+    --input-tokens-file /tmp/prompt.ids \
+    --prompt-len 5      \
+    --generate 16
+# generated_tokens: 12366,13,1102,374,1101,279,1455,5526,3363,304,9822,13
+```
+
+`--prompt-len N` tells the runner how many of the input slots are real
+prompt tokens (the rest are padding); generated tokens are written into
+the slots after `prompt_len`. Generation is bounded by
+`init_seq_len - prompt_len` — the compiled graph cannot reach beyond its
+fixed input shape.
+
+The full prompt-to-text round-trip is wrapped by the
+`nntr_causal_lm_converter.run` Python driver (next subsection).
+
+#### One-shot prompt -> text driver
+
+```bash
+python -m nntr_causal_lm_converter.run \
+    --converted ./out                  \
+    --tokenizer ~/models/Qwen3-0.6B    \
+    --prompt "The capital of France is" \
+    --generate 16                      \
+    --top-k 5
+```
+
+What it does:
+1. Loads the HF tokenizer next to the model and encodes the prompt.
+2. Pads to `init_seq_len` (read from `nntr_config.json`).
+3. Spawns `causal_lm_runner` exactly once with `--input-tokens` +
+   `--prompt-len` + `--generate`.
+4. Parses the runner's `generated_tokens:` line.
+5. Decodes the IDs back to text and prints prompt / IDs / generation.
+
+```
+prompt:           'The capital of France is'
+prompt_token_ids: [791, 6864, 304, 9822, 374]
+generated_tokens: [12366, 13, 1102, 374, 1101, ...]
+generated_text:   ' Paris. It is also the most populous city in France.'
+full_text:        'The capital of France is Paris. It is also ...'
+```
+
+The driver auto-discovers the runner binary under `build/` (override with
+`--runner` or `NNTRAINER_BUILD_DIR`).
+
 #### Runner CLI flags
 
 | Flag | Meaning |
@@ -430,7 +485,9 @@ Two things happen for "real" inference:
 | `--no-forward` | Skip the forward pass after loading. Smoke-test the load path only. |
 | `--input-tokens "1,2,3,..."` | Comma-separated token IDs to feed into the embedding layer. Truncated to `init_seq_len` (warned), zero-padded if shorter. |
 | `--input-tokens-file PATH` | Same as above but read from a file (whitespace- or comma-separated). |
+| `--prompt-len N` | Number of real prompt tokens (the rest are padding). Generated tokens are written into slots `[prompt_len, init_seq_len)`. Defaults to `init_seq_len` when omitted; required for `--generate` to know where to start writing. |
 | `--top-k N` | After forward, print the top-N token IDs + logits for the **last** input position — this is the row generation argmaxes / samples to pick the next token. Requires `vocab_size` in `nntr_config.json` (the converter writes it automatically). |
+| `--generate N` | Greedy-decode N tokens after the prompt. Prints `generated_tokens: 12,34,...`. |
 | `--print-shape` | Print the output buffer shape (`batch=1 vocab=151936 …`) for debugging. |
 
 #### What the runner does NOT do

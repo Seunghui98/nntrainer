@@ -179,6 +179,48 @@ def test_runner_top_k_and_input_tokens(
         assert 0 <= int(tid) < vocab, f"token_id {tid} out of vocab {vocab}"
 
 
+def test_runner_generate_produces_n_tokens(
+    tmp_path, tiny_qwen3_cfg, runner_path, torch_available,
+):
+    """End-to-end: ``--generate N`` should print exactly N token IDs and
+    they must all be within vocab. This exercises the C++ generation loop's
+    KV-cache continuity across steps.
+    """
+    hf_cfg, sd = _build_tiny_qwen3_state_dict(tiny_qwen3_cfg)
+    from nntr_causal_lm_converter.cli import convert
+    out = convert(
+        hf_config=hf_cfg, output_dir=str(tmp_path), model_name="qwen3_gen",
+        # init_seq_len bigger than prompt_len so there's room for generation
+        # positions inside the compiled graph.
+        init_seq_len=16, max_seq_len=32, state_dict=sd, dtype="float32",
+    )
+
+    vocab = int(hf_cfg["vocab_size"])
+    prompt_len = 4
+    tokens = ",".join(str(i % vocab) for i in range(prompt_len))
+    n_generate = 6
+
+    proc = subprocess.run(
+        [runner_path, out["ini"], out["safetensors"], out["runtime_config"],
+         "--input-tokens", tokens,
+         "--prompt-len", str(prompt_len),
+         "--generate", str(n_generate)],
+        capture_output=True, text=True, timeout=120,
+    )
+    combined = proc.stdout + "\n" + proc.stderr
+    assert proc.returncode == 0, combined
+
+    # Parse `generated_tokens: 12,34,...` line.
+    import re
+    m = re.search(r"generated_tokens:\s*([\d,]+)", proc.stdout)
+    assert m is not None, f"missing generated_tokens line:\n{combined}"
+    gen = [int(x) for x in m.group(1).split(",") if x]
+    assert len(gen) == n_generate, (
+        f"expected {n_generate} tokens, got {len(gen)}: {gen}")
+    for tid in gen:
+        assert 0 <= tid < vocab, f"token_id {tid} out of vocab {vocab}"
+
+
 def test_example_embedded_consumes_same_artifacts(
     tmp_path, tiny_qwen3_cfg, example_embedded_path, torch_available,
 ):

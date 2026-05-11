@@ -12,7 +12,7 @@
  *   - End users have a one-shot "does my converted model load and forward?"
  *     diagnostic without writing any C++ themselves.
  *   - Quick interactive checks: feed a tokenized prompt and see the top-K
- *     next-token candidates with their logits.
+ *     next-token candidates, or auto-generate N tokens greedily.
  *
  * Pipeline (delegated to causal_lm::import_model):
  *   register_custom_layers -> createModel -> setProperty -> loadFromConfig
@@ -25,8 +25,12 @@
  *
  * Output handling:
  *   - Always prints the first 8 logits of position 0 (smoke check).
- *   - --top-k N  : print top-N tokens (id + logit) for the LAST position
- *                  -- this is what generation actually consumes for argmax.
+ *   - --top-k N   : print top-N tokens (id + logit) for the LAST input
+ *                   position -- this is what generation actually consumes.
+ *   - --generate N: greedy-decode N tokens after the prompt and print them
+ *                   as ``generated_tokens: 12,34,...``. Generation is done
+ *                   inside the runner (not Python) so the model's KV cache
+ *                   is preserved across steps.
  *   - --print-shape : print full output buffer length (debug aid).
  */
 
@@ -55,8 +59,14 @@ void usage(const char *argv0) {
     << "                           (length must match init_seq_len; padded\n"
     << "                            with 0s and warned if shorter)\n"
     << "  --input-tokens-file PATH read whitespace-separated token IDs from a file\n"
+    << "  --prompt-len N           number of *real* prompt tokens (the rest are\n"
+    << "                           padding). Required for --generate so the\n"
+    << "                           loop knows where to write generated tokens.\n"
+    << "                           Defaults to ``init_seq_len`` when omitted.\n"
     << "  --top-k N                print top-N next-token candidates for the\n"
     << "                           LAST input position (default: 0 = off)\n"
+    << "  --generate N             after the prompt, greedy-decode N tokens.\n"
+    << "                           Prints ``generated_tokens: 12,34,...``\n"
     << "  --print-shape            print the raw output buffer length\n";
 }
 
@@ -106,6 +116,8 @@ int main(int argc, char **argv) {
 
   bool run_forward = true;
   int top_k = 0;
+  int generate_n = 0;
+  int prompt_len = -1;  // -1 = "use init_seq_len"
   bool print_shape = false;
   std::vector<int> token_input;
 
@@ -115,6 +127,10 @@ int main(int argc, char **argv) {
       run_forward = false;
     } else if (a == "--top-k" && i + 1 < argc) {
       top_k = std::stoi(argv[++i]);
+    } else if (a == "--generate" && i + 1 < argc) {
+      generate_n = std::stoi(argv[++i]);
+    } else if (a == "--prompt-len" && i + 1 < argc) {
+      prompt_len = std::stoi(argv[++i]);
     } else if (a == "--print-shape") {
       print_shape = true;
     } else if (a == "--input-tokens" && i + 1 < argc) {
@@ -264,6 +280,95 @@ int main(int argc, char **argv) {
                     << "  logit=" << scored[i].first << std::endl;
         }
       }
+    }
+
+    // ---- Greedy generation loop ------------------------------------------
+    // We must generate inside the runner (not from Python via subprocess
+    // round-trips) so that the model's KV cache is preserved across steps.
+    //
+    // Step protocol matches Applications/CausalLM/models/causal_lm.cpp:
+    //   1. The initial forward above processed positions [0, prompt_len).
+    //   2. For each new token t in [prompt_len, prompt_len + N):
+    //        - argmax(last_logits) -> next_token
+    //        - write next_token into input[t] (the same buffer the graph
+    //          reads from; the embedding layer reads input[t] for position t)
+    //        - call incremental_inference(B, [input], {}, init_seq_len, t,
+    //          t+1). The model uses the cached K/V from previous steps.
+    //        - the returned output[0] is the logit row for position t.
+    if (generate_n > 0) {
+      if (rc.vocab_size == 0) {
+        throw std::runtime_error(
+          "vocab_size missing from nntr_config.json; "
+          "--generate requires it for argmax");
+      }
+      if (prompt_len < 0) {
+        // Default: assume the entire input is the prompt.
+        prompt_len = static_cast<int>(rc.init_seq_len);
+      }
+      if (prompt_len <= 0 ||
+          static_cast<size_t>(prompt_len) > rc.init_seq_len) {
+        throw std::runtime_error(
+          "--prompt-len out of range; must be in (0, init_seq_len]");
+      }
+      // The graph's input_shape is fixed at init_seq_len; the rest of the
+      // buffer past prompt_len is where generated tokens get written. We
+      // therefore can only generate up to (init_seq_len - prompt_len)
+      // tokens before we'd run out of positions.
+      const int max_gen =
+        static_cast<int>(rc.init_seq_len) - prompt_len;
+      if (generate_n > max_gen) {
+        std::cerr << "[runner] WARNING: --generate " << generate_n
+                  << " exceeds the " << max_gen
+                  << " positions available after prompt_len="
+                  << prompt_len << "; truncating." << std::endl;
+        generate_n = max_gen;
+      }
+
+      std::vector<int> generated;
+      generated.reserve(generate_n);
+
+      // ``out`` already holds the last-position logit row for the prompt.
+      // First generated token comes from picking argmax on it.
+      auto argmax_vocab = [&](float *row) {
+        int best = 0;
+        float best_v = row[0];
+        for (size_t v = 1; v < rc.vocab_size; ++v) {
+          if (row[v] > best_v) { best_v = row[v]; best = static_cast<int>(v); }
+        }
+        return best;
+      };
+
+      int next_id = argmax_vocab(out);
+      generated.push_back(next_id);
+
+      // Generation step loop.
+      // Position semantics: after the initial call we have logits "as if"
+      // we just consumed position prompt_len-1. We now want logits at
+      // position prompt_len (the slot the just-picked token occupies).
+      for (int step = 0; step < generate_n - 1; ++step) {
+        const int t = prompt_len + step;  // the token slot we are filling
+        if (static_cast<size_t>(t) >= rc.init_seq_len) break;
+        input[t] = static_cast<float>(next_id);
+
+        std::vector<float *> step_inputs = {input.data()};
+        auto step_out = model.incremental_inference(
+          rc.batch_size, step_inputs, /*labels=*/{}, rc.init_seq_len,
+          /*from=*/static_cast<unsigned int>(t),
+          /*to=*/static_cast<unsigned int>(t + 1));
+        if (step_out.empty() || step_out.front() == nullptr) {
+          throw std::runtime_error("generation step returned no outputs");
+        }
+        next_id = argmax_vocab(step_out.front());
+        generated.push_back(next_id);
+      }
+
+      // Print as a single CSV line so the Python wrapper can parse it
+      // with one regex.
+      std::cout << "generated_tokens:";
+      for (size_t i = 0; i < generated.size(); ++i) {
+        std::cout << (i ? "," : " ") << generated[i];
+      }
+      std::cout << std::endl;
     }
 
     std::cout << "[runner] OK" << std::endl;
