@@ -166,8 +166,26 @@ if __name__ == "__main__":
                         default="./nntr_kalm_embedding_fp32.bin")
     parser.add_argument("--data_type", type=str, default="float32")
     parser.add_argument("--safetensors", action="store_true",
-                        help="Save in safetensors format instead of binary")
+                        help="Also save in safetensors format alongside binary")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed for deterministic loading of random-init "
+                             "weights (KaLM-Embedding's custom modeling.py "
+                             "leaves some weights at random init — without a "
+                             "seed each load produces different state_dict).")
     args = parser.parse_args()
+
+    # Critical: KaLM-Embedding's modeling.py (loaded via trust_remote_code=True)
+    # does NOT load every parameter from the checkpoint. embed_tokens.weight in
+    # particular stays at random init, so each Python invocation produces a
+    # DIFFERENT state_dict. We seed all RNGs so both the .bin and .safetensors
+    # files come from the SAME deterministic weights and a separate Python
+    # reference (m.encode(...)) with the same seed will match nntrainer output.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    try:
+        torch.cuda.manual_seed_all(args.seed)
+    except Exception:
+        pass
 
     data_dtype = args.data_type
     model_path = args.model_path
@@ -179,15 +197,31 @@ if __name__ == "__main__":
                                 model_kwargs={"torch_dtype": data_dtype})
     model.eval()
 
+    # Take a SINGLE state_dict snapshot — both files must come from the same
+    # tensor instances so they are byte-identical.
+    state = model.state_dict()
+
+    # Print a small sanity check so the user can verify the seed actually made
+    # loading deterministic — the same seed must always print the same line.
+    emb_row0 = state["0.auto_model.embed_tokens.weight"][0, :4].tolist()
+    print(f"[seed={args.seed}] embed_tokens[0,:4] = {emb_row0}")
+    print(f"[seed={args.seed}] q_proj.bias[:4]    = "
+          f"{state['0.auto_model.layers.0.self_attn.q_proj.bias'][:4].tolist()}")
+
+    # Always write binary.
+    bin_name = output_name
+    if bin_name.endswith(".safetensors"):
+        bin_name = bin_name.replace(".safetensors", ".bin")
+    if not bin_name.endswith(".bin"):
+        bin_name += ".bin"
+    with open(bin_name, "wb") as f_model:
+        save_kalm_embedding_for_nntrainer(
+            state, config.num_hidden_layers, data_dtype, f_model)
+    print(f"Saved binary: {bin_name}")
+
+    # Optionally also write safetensors FROM THE SAME state_dict snapshot.
     if args.safetensors:
-        output_name = output_name.replace(".bin", ".safetensors")
-        if not output_name.endswith(".safetensors"):
-            output_name += ".safetensors"
+        st_name = bin_name.replace(".bin", ".safetensors")
         weights = collect_kalm_embedding_for_nntrainer(
-            model.state_dict(), config.num_hidden_layers, data_dtype)
-        save_safetensors(weights, output_name)
-    else:
-        with open(output_name, "wb") as f_model:
-            save_kalm_embedding_for_nntrainer(
-                model.state_dict(), config.num_hidden_layers, data_dtype, f_model)
-        print(f"Saved binary: {output_name}")
+            state, config.num_hidden_layers, data_dtype)
+        save_safetensors(weights, st_name)
