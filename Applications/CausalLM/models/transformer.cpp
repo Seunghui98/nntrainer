@@ -359,6 +359,28 @@ void Transformer::load_weight(const std::string &weight_path) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));
   }
+
+  // Post-load diagnostic: print first 4 floats of a few key weights, so a
+  // user can directly compare the binary path vs the safetensors path.
+  // Identical lines → both loaders deposit identical bytes.
+  static const std::set<std::string> probe = {
+    "embedding0:Embedding", "layer0_wq:weight", "layer0_wq:bias",
+    "layer0_attention_out:weight", "output_norm:gamma"};
+  model->forEachLayer(
+    [&](ml::train::Layer &, nntrainer::RunLayerContext &ctx, void *) {
+      for (unsigned int i = 0; i < ctx.getNumWeights(); ++i) {
+        const std::string &name = ctx.getWeightName(i);
+        if (!probe.count(name))
+          continue;
+        nntrainer::Tensor &w = ctx.getWeight(i);
+        float *p = w.getData<float>();
+        if (!p)
+          continue;
+        std::cerr << "[load_weight] " << name << " first 4 = " << p[0] << " "
+                  << p[1] << " " << p[2] << " " << p[3] << "\n";
+      }
+    },
+    nullptr);
 };
 
 void Transformer::save_weight(const std::string &weight_path) {
