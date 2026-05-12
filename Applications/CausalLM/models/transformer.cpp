@@ -228,12 +228,9 @@ static bool ends_with(const std::string &s, const std::string &suffix) {
 
 static void load_safetensors(ml::train::Model *model,
                              const std::string &weight_path) {
-  std::ifstream f(weight_path, std::ios::binary | std::ios::ate);
+  std::ifstream f(weight_path, std::ios::binary);
   if (!f.is_open())
     throw std::runtime_error("Cannot open safetensors file: " + weight_path);
-
-  std::streamsize file_size = f.tellg();
-  f.seekg(0, std::ios::beg);
 
   // Read 8-byte little-endian header length
   uint64_t header_len = 0;
@@ -247,9 +244,9 @@ static void load_safetensors(ml::train::Model *model,
   if (!f)
     throw std::runtime_error("Failed to read safetensors header");
 
-  const std::size_t data_base = 8 + header_len; // offset where tensor data starts
+  const std::size_t data_base = 8 + header_len;
 
-  // Parse JSON header — build name → (byte_offset, byte_size) map
+  // Parse JSON header — build name → (file_offset, byte_size) map
   json header = json::parse(header_str);
   std::map<std::string, std::pair<std::size_t, std::size_t>> st_map;
   for (auto it = header.begin(); it != header.end(); ++it) {
@@ -261,19 +258,13 @@ static void load_safetensors(ml::train::Model *model,
     st_map[it.key()] = {data_base + begin, end - begin};
   }
 
-  // Read entire file into memory for random access
-  std::vector<char> buf(static_cast<std::size_t>(file_size));
-  f.seekg(0, std::ios::beg);
-  f.read(buf.data(), file_size);
-  if (!f)
-    throw std::runtime_error("Failed to read safetensors file body");
-  f.close();
-
   // Allocate host memory before accessing tensor data pointers.
   // initialize(INFERENCE) sets up the graph but may defer memory allocation;
   // allocate() materialises the host buffers (same pattern as load_kvcache).
   model->allocate(ml::train::ExecutionMode::INFERENCE);
 
+  // Read each tensor directly into its host buffer by seeking to its offset.
+  // This avoids loading the entire file into memory at once.
   model->forEachLayer(
     [&](ml::train::Layer & /*layer*/, nntrainer::RunLayerContext &ctx,
         void *) {
@@ -294,7 +285,12 @@ static void load_safetensors(ml::train::Model *model,
             std::to_string(it->second.second) + " bytes, tensor expects " +
             std::to_string(w.bytes()) + " bytes");
 
-        std::memcpy(dst, buf.data() + it->second.first, it->second.second);
+        f.seekg(static_cast<std::streamoff>(it->second.first));
+        f.read(reinterpret_cast<char *>(dst),
+               static_cast<std::streamsize>(it->second.second));
+        if (!f)
+          throw std::runtime_error("Failed to read weight '" + name +
+                                   "' from safetensors file");
       }
     },
     nullptr);
