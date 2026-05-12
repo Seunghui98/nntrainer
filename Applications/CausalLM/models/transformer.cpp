@@ -228,6 +228,7 @@ static bool ends_with(const std::string &s, const std::string &suffix) {
 
 static void load_safetensors(ml::train::Model *model,
                              const std::string &weight_path) {
+  std::cerr << "[safetensors] opening: " << weight_path << std::endl;
   std::ifstream f(weight_path, std::ios::binary);
   if (!f.is_open())
     throw std::runtime_error("Cannot open safetensors file: " + weight_path);
@@ -237,17 +238,25 @@ static void load_safetensors(ml::train::Model *model,
   f.read(reinterpret_cast<char *>(&header_len), 8);
   if (!f)
     throw std::runtime_error("Failed to read safetensors header length");
+  std::cerr << "[safetensors] header_len=" << header_len << std::endl;
+
+  if (header_len == 0 || header_len > 64 * 1024 * 1024)
+    throw std::runtime_error("Safetensors header length out of range: " +
+                             std::to_string(header_len));
 
   // Read JSON header
   std::string header_str(header_len, '\0');
   f.read(&header_str[0], static_cast<std::streamsize>(header_len));
   if (!f)
     throw std::runtime_error("Failed to read safetensors header");
+  std::cerr << "[safetensors] header read ok" << std::endl;
 
   const std::size_t data_base = 8 + header_len;
 
   // Parse JSON header — build name → (file_offset, byte_size) map
   json header = json::parse(header_str);
+  std::cerr << "[safetensors] json parsed, entries=" << header.size() << std::endl;
+
   std::map<std::string, std::pair<std::size_t, std::size_t>> st_map;
   for (auto it = header.begin(); it != header.end(); ++it) {
     if (it.key() == "__metadata__")
@@ -257,6 +266,7 @@ static void load_safetensors(ml::train::Model *model,
     std::size_t end   = offsets[1].get<std::size_t>();
     st_map[it.key()] = {data_base + begin, end - begin};
   }
+  std::cerr << "[safetensors] st_map built, tensors=" << st_map.size() << std::endl;
 
   // Weight tensors are already allocated by initialize() -> allocateWeights().
   // Do NOT call model->allocate() here: it additionally allocates the full
@@ -265,6 +275,7 @@ static void load_safetensors(ml::train::Model *model,
 
   // Read each tensor directly into its host buffer by seeking to its offset.
   // This avoids loading the entire file into memory at once.
+  std::cerr << "[safetensors] starting forEachLayer..." << std::endl;
   model->forEachLayer(
     [&](ml::train::Layer & /*layer*/, nntrainer::RunLayerContext &ctx,
         void *) {
@@ -274,10 +285,13 @@ static void load_safetensors(ml::train::Model *model,
         if (it == st_map.end())
           continue; // shared/tied weight not stored separately, skip
 
+        std::cerr << "[safetensors] loading: " << name << std::endl;
         nntrainer::Tensor &w = ctx.getWeight(i);
         float *dst = w.getData<float>();
-        if (!dst)
+        if (!dst) {
+          std::cerr << "[safetensors] skip (no host ptr): " << name << std::endl;
           continue; // tensor not in host memory
+        }
 
         if (it->second.second != w.bytes())
           throw std::runtime_error(
@@ -291,9 +305,11 @@ static void load_safetensors(ml::train::Model *model,
         if (!f)
           throw std::runtime_error("Failed to read weight '" + name +
                                    "' from safetensors file");
+        std::cerr << "[safetensors] loaded: " << name << " (" << it->second.second << " bytes)" << std::endl;
       }
     },
     nullptr);
+  std::cerr << "[safetensors] done" << std::endl;
 }
 
 void Transformer::load_weight(const std::string &weight_path) {
