@@ -1,5 +1,5 @@
 ## @file weight_converter.py
-## @brief weight conversion script for qwen3 model
+## @brief weight conversion script for qwen3-0.6b model
 ## @author Eunju Yang <ej.yang@samsung.com>
 
 import argparse
@@ -9,10 +9,16 @@ import torch
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
-total_size = 0
+# Qwen3-0.6B uses tie_word_embeddings=True:
+#   - embedding0 layer type: tie_word_embeddings (mode::embedding)
+#     weight key: "embedding0:Embedding"
+#   - output_of_causallm layer type: tie_word_embeddings (mode::lm_head)
+#     read() is a no-op — shares weight with embedding0
+# So lm_head weight must NOT be written to the weight file.
 
-def save_qwen3_for_nntrainer(params, n_layers, dtype, file, tie_word_embeddings=False):
-    """Convert and save weights as nntrainer binary format for qwen3 model"""
+
+def save_qwen3_for_nntrainer(params, n_layers, dtype, file, tie_word_embeddings=True):
+    """Convert and save weights as nntrainer binary format for qwen3-0.6b model."""
 
     def save_weight(weight):
         np.array(weight, dtype=dtype).tofile(file)
@@ -49,14 +55,14 @@ def save_qwen3_for_nntrainer(params, n_layers, dtype, file, tie_word_embeddings=
 
     save_weight(params["model.norm.weight"])
 
-    # lm_head: only written when not tied (tied models share embedding0:Embedding)
-    # nntrainer key = "output_of_causallm:weight"
+    # lm_head is NOT written for tied models:
+    # TieWordEmbedding.read() is a no-op in lm_head mode — it shares embedding0.
     if not tie_word_embeddings:
         save_weight(params["lm_head.weight"].permute(1, 0))
 
 
-def collect_qwen3_for_nntrainer(params, n_layers, dtype, tie_word_embeddings=False):
-    """Collect weights as an ordered list of (nntrainer_name, tensor) tuples."""
+def collect_qwen3_for_nntrainer(params, n_layers, dtype, tie_word_embeddings=True):
+    """Collect weights as an ordered list of (nntrainer_name, ndarray) tuples."""
     weights = []
 
     def add(name, tensor, transpose=False):
@@ -67,11 +73,10 @@ def collect_qwen3_for_nntrainer(params, n_layers, dtype, tie_word_embeddings=Fal
         lora_key = f"{layer_name}{proj_name}.lora_A.default.weight"
         if lora_key in params:
             add(nntr_name, params[f"{layer_name}{proj_name}.base_layer.weight"], transpose)
-            # LoRA weights omitted for safetensors (base model only)
         else:
             add(nntr_name, params[f"{layer_name}{proj_name}.weight"], transpose)
 
-    # Embedding: nntrainer registers this weight as "Embedding" (capital E)
+    # Embedding layer registers weight as "Embedding" (capital E)
     add("embedding0:Embedding", params["model.embed_tokens.weight"])
 
     for i in range(n_layers):
@@ -92,8 +97,7 @@ def collect_qwen3_for_nntrainer(params, n_layers, dtype, tie_word_embeddings=Fal
 
     add("output_norm:gamma", params["model.norm.weight"])
 
-    # lm_head: only included when not tied
-    # For tied models the embedding weight is reused; lm_head.read() is a no-op
+    # No lm_head entry for tied models: TieWordEmbedding lm_head read() is no-op
     if not tie_word_embeddings:
         add("output_of_causallm:weight", params["lm_head.weight"], transpose=True)
 
@@ -104,7 +108,6 @@ def save_safetensors(weights, output_path):
     """Write weights to a .safetensors file (F32, name-keyed)."""
     metadata = {"format": "pt"}
 
-    # Compute data offsets
     offset = 0
     tensor_meta = {}
     raw_buffers = []
@@ -121,7 +124,6 @@ def save_safetensors(weights, output_path):
     header = {"__metadata__": metadata}
     header.update(tensor_meta)
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    # Pad to 8-byte alignment
     pad = (8 - len(header_bytes) % 8) % 8
     header_bytes += b" " * pad
 
@@ -136,8 +138,8 @@ def save_safetensors(weights, output_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="./Qwen3-4b")
-    parser.add_argument("--output_name", type=str, default="./nntr_qwen3_4b_fp32.bin")
+    parser.add_argument("--model_path", type=str, default="./Qwen3-0.6B")
+    parser.add_argument("--output_name", type=str, default="./nntr_qwen3_0.6b_fp32.bin")
     parser.add_argument("--data_type", type=str, default="float32")
     parser.add_argument("--safetensors", action="store_true",
                         help="Save in safetensors format instead of binary")
@@ -153,7 +155,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="float", trust_remote_code=True)
     model.eval()
 
-    is_tied = getattr(config, 'tie_word_embeddings', False)
+    is_tied = getattr(config, 'tie_word_embeddings', True)
     print(f"tie_word_embeddings: {is_tied}")
 
     if args.safetensors:

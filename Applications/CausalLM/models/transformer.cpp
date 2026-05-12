@@ -11,6 +11,7 @@
  */
 
 #include <fstream>
+#include <cstring>
 
 #include <app_context.h>
 #include <engine.h>
@@ -220,6 +221,85 @@ void Transformer::constructModel() {
   }
 };
 
+static bool ends_with(const std::string &s, const std::string &suffix) {
+  return s.size() >= suffix.size() &&
+         s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static void load_safetensors(ml::train::Model *model,
+                             const std::string &weight_path) {
+  std::ifstream f(weight_path, std::ios::binary | std::ios::ate);
+  if (!f.is_open())
+    throw std::runtime_error("Cannot open safetensors file: " + weight_path);
+
+  std::streamsize file_size = f.tellg();
+  f.seekg(0, std::ios::beg);
+
+  // Read 8-byte little-endian header length
+  uint64_t header_len = 0;
+  f.read(reinterpret_cast<char *>(&header_len), 8);
+  if (!f)
+    throw std::runtime_error("Failed to read safetensors header length");
+
+  // Read JSON header
+  std::string header_str(header_len, '\0');
+  f.read(&header_str[0], static_cast<std::streamsize>(header_len));
+  if (!f)
+    throw std::runtime_error("Failed to read safetensors header");
+
+  const std::size_t data_base = 8 + header_len; // offset where tensor data starts
+
+  // Parse JSON header — build name → (byte_offset, byte_size) map
+  json header = json::parse(header_str);
+  std::map<std::string, std::pair<std::size_t, std::size_t>> st_map;
+  for (auto it = header.begin(); it != header.end(); ++it) {
+    if (it.key() == "__metadata__")
+      continue;
+    auto &offsets = it.value()["data_offsets"];
+    std::size_t begin = offsets[0].get<std::size_t>();
+    std::size_t end   = offsets[1].get<std::size_t>();
+    st_map[it.key()] = {data_base + begin, end - begin};
+  }
+
+  // Read entire file into memory for random access
+  std::vector<char> buf(static_cast<std::size_t>(file_size));
+  f.seekg(0, std::ios::beg);
+  f.read(buf.data(), file_size);
+  if (!f)
+    throw std::runtime_error("Failed to read safetensors file body");
+  f.close();
+
+  // Allocate host memory before accessing tensor data pointers.
+  // initialize(INFERENCE) sets up the graph but may defer memory allocation;
+  // allocate() materialises the host buffers (same pattern as load_kvcache).
+  model->allocate(ml::train::ExecutionMode::INFERENCE);
+
+  model->forEachLayer(
+    [&](ml::train::Layer & /*layer*/, nntrainer::RunLayerContext &ctx,
+        void *) {
+      for (unsigned int i = 0; i < ctx.getNumWeights(); ++i) {
+        const std::string &name = ctx.getWeightName(i);
+        auto it = st_map.find(name);
+        if (it == st_map.end())
+          continue; // shared/tied weight not stored separately, skip
+
+        nntrainer::Tensor &w = ctx.getWeight(i);
+        float *dst = w.getData<float>();
+        if (!dst)
+          continue; // tensor not in host memory
+
+        if (it->second.second != w.bytes())
+          throw std::runtime_error(
+            "Size mismatch for weight '" + name + "': file has " +
+            std::to_string(it->second.second) + " bytes, tensor expects " +
+            std::to_string(w.bytes()) + " bytes");
+
+        std::memcpy(dst, buf.data() + it->second.first, it->second.second);
+      }
+    },
+    nullptr);
+}
+
 void Transformer::load_weight(const std::string &weight_path) {
 
   if (!is_initialized) {
@@ -229,7 +309,11 @@ void Transformer::load_weight(const std::string &weight_path) {
   }
 
   try {
-    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    if (ends_with(weight_path, ".safetensors")) {
+      load_safetensors(model.get(), weight_path);
+    } else {
+      model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    }
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));
