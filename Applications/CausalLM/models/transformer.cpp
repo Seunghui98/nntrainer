@@ -12,6 +12,9 @@
 
 #include <fstream>
 #include <cstring>
+#include <iostream>
+#include <set>
+#include <vector>
 
 #include <app_context.h>
 #include <engine.h>
@@ -269,19 +272,27 @@ static void load_safetensors(ml::train::Model *model,
   // large models. Binary loading (model->load(BIN)) also skips allocate().
 
   // Read each tensor directly into its host buffer by seeking to its offset.
+  // Track which model weights matched a safetensors entry. Any weight not
+  // matched stays at its initializer value (e.g. FC weight_initializer=ones),
+  // which silently corrupts output. Throw a clear error if any are missing.
+  std::vector<std::string> missing_in_st;
+  std::set<std::string> matched_keys;
   model->forEachLayer(
     [&](ml::train::Layer & /*layer*/, nntrainer::RunLayerContext &ctx,
         void *) {
       for (unsigned int i = 0; i < ctx.getNumWeights(); ++i) {
         const std::string &name = ctx.getWeightName(i);
-        auto it = st_map.find(name);
-        if (it == st_map.end())
-          continue; // shared/tied weight not stored separately, skip
-
         nntrainer::Tensor &w = ctx.getWeight(i);
         float *dst = w.getData<float>();
         if (!dst)
-          continue; // tensor not in host memory
+          continue; // tensor not in host memory (FSU / virtual)
+
+        auto it = st_map.find(name);
+        if (it == st_map.end()) {
+          missing_in_st.push_back(name);
+          continue;
+        }
+        matched_keys.insert(name);
 
         if (it->second.second != w.bytes())
           throw std::runtime_error(
@@ -298,6 +309,27 @@ static void load_safetensors(ml::train::Model *model,
       }
     },
     nullptr);
+
+  if (!missing_in_st.empty()) {
+    std::string msg =
+      "Safetensors is missing " + std::to_string(missing_in_st.size()) +
+      " model weight(s). First 10: ";
+    for (size_t i = 0; i < missing_in_st.size() && i < 10; ++i)
+      msg += "\n  - " + missing_in_st[i];
+    throw std::runtime_error(msg);
+  }
+
+  // Report extra keys in safetensors that no model weight requested.
+  std::vector<std::string> unused_in_st;
+  for (auto &kv : st_map)
+    if (!matched_keys.count(kv.first))
+      unused_in_st.push_back(kv.first);
+  if (!unused_in_st.empty()) {
+    std::cerr << "[load_safetensors] WARNING: " << unused_in_st.size()
+              << " safetensors entries unused by model. First 10:\n";
+    for (size_t i = 0; i < unused_in_st.size() && i < 10; ++i)
+      std::cerr << "  - " << unused_in_st[i] << "\n";
+  }
 }
 
 void Transformer::load_weight(const std::string &weight_path) {
