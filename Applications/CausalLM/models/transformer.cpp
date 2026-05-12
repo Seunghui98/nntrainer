@@ -306,6 +306,15 @@ static void load_safetensors(ml::train::Model *model,
         if (!f)
           throw std::runtime_error("Failed to read weight '" + name +
                                    "' from safetensors file");
+
+        // Diagnostic: print first 4 floats of a few key weights so the user
+        // can compare against an independent reference (Python state_dict).
+        if (name == "embedding0:Embedding" || name == "layer0_wq:weight" ||
+            name == "layer0_wq:bias" || name == "output_norm:gamma") {
+          std::cerr << "[load_safetensors] " << name << " first 4 = "
+                    << dst[0] << " " << dst[1] << " " << dst[2] << " "
+                    << dst[3] << "\n";
+        }
       }
     },
     nullptr);

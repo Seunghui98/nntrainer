@@ -82,7 +82,13 @@ def collect_kalm_embedding_for_nntrainer(params, n_layers, dtype):
     weights = []
 
     def add(name, tensor, transpose=False):
-        t = tensor.permute(1, 0) if transpose else tensor
+        # .contiguous() forces a memory-contiguous tensor before numpy()
+        # conversion. Without it, .numpy() on a permuted view can produce a
+        # non-contiguous array, and .astype()/.tobytes() then walks strides
+        # differently depending on numpy/PyTorch version — leading to bytes
+        # that do not match what the binary save_weight() writes via
+        # np.array(t, dtype=...).tofile().
+        t = tensor.permute(1, 0).contiguous() if transpose else tensor.contiguous()
         weights.append((name, t.detach().numpy().astype(dtype)))
 
     def add_projection(nntr_name, layer_name, proj_name, transpose=True):
