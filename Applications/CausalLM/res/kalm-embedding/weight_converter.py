@@ -3,12 +3,15 @@
 ## @author Seunghui Lee <shsh1004.lee@samsung.com>
 
 import argparse
+import os
 import struct
 import json
 import torch
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from sentence_transformers import SentenceTransformer
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 
 # Newer transformers versions removed rope_theta as a direct attribute on
 # Qwen2Config; patch __getattr__ so the KaLM custom modeling.py still works.
@@ -158,6 +161,42 @@ def save_safetensors(weights, output_path):
     print(f"Saved safetensors: {output_path} ({offset / 1e9:.2f} GB tensor data)")
 
 
+def load_checkpoint_state(model_path):
+    """Read trained weights directly from the safetensors checkpoint files.
+
+    KaLM-Embedding ships a custom modeling.py (trust_remote_code=True) and
+    the checkpoint stores keys WITHOUT the standard ``model.`` prefix
+    (e.g. ``embed_tokens.weight`` instead of ``model.embed_tokens.weight``).
+    transformers/SentenceTransformer's automatic key matching therefore
+    fails to load embed_tokens, q_proj.bias, etc., and those parameters
+    silently stay at random init. The previous workaround was to seed the
+    RNG to make the random init reproducible, but the resulting weights
+    were not the trained values.
+
+    Loading the safetensors checkpoint directly bypasses that bug and
+    gives the actual trained tensors. We then return them under the
+    ``0.auto_model.<original_key>`` namespace so the rest of the converter
+    (which was written against SentenceTransformer.state_dict()) needs no
+    further changes.
+    """
+    cache_dir = snapshot_download(model_path)
+    checkpoint = {}
+    for f in sorted(os.listdir(cache_dir)):
+        if f.endswith(".safetensors"):
+            checkpoint.update(load_file(os.path.join(cache_dir, f)))
+
+    if not checkpoint:
+        raise RuntimeError(f"No .safetensors files in {cache_dir}")
+
+    # Normalise to the prefix used by the converter functions.
+    state = {}
+    for k, v in checkpoint.items():
+        # Strip leading "model." if present so the mapping is uniform.
+        key = k[len("model."):] if k.startswith("model.") else k
+        state[f"0.auto_model.{key}"] = v
+    return state
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str,
@@ -167,25 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_type", type=str, default="float32")
     parser.add_argument("--safetensors", action="store_true",
                         help="Also save in safetensors format alongside binary")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Seed for deterministic loading of random-init "
-                             "weights (KaLM-Embedding's custom modeling.py "
-                             "leaves some weights at random init — without a "
-                             "seed each load produces different state_dict).")
     args = parser.parse_args()
-
-    # Critical: KaLM-Embedding's modeling.py (loaded via trust_remote_code=True)
-    # does NOT load every parameter from the checkpoint. embed_tokens.weight in
-    # particular stays at random init, so each Python invocation produces a
-    # DIFFERENT state_dict. We seed all RNGs so both the .bin and .safetensors
-    # files come from the SAME deterministic weights and a separate Python
-    # reference (m.encode(...)) with the same seed will match nntrainer output.
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    try:
-        torch.cuda.manual_seed_all(args.seed)
-    except Exception:
-        pass
 
     data_dtype = args.data_type
     model_path = args.model_path
@@ -193,20 +214,17 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
-    model = SentenceTransformer(model_path, trust_remote_code=True,
-                                model_kwargs={"torch_dtype": data_dtype})
-    model.eval()
 
-    # Take a SINGLE state_dict snapshot — both files must come from the same
-    # tensor instances so they are byte-identical.
-    state = model.state_dict()
+    # Load the *trained* weights straight from the checkpoint, bypassing
+    # SentenceTransformer's broken key matching.
+    state = load_checkpoint_state(model_path)
 
-    # Print a small sanity check so the user can verify the seed actually made
-    # loading deterministic — the same seed must always print the same line.
+    # Sanity check: print known-trained values so the user can confirm we
+    # are no longer reading random init.
     emb_row0 = state["0.auto_model.embed_tokens.weight"][0, :4].tolist()
-    print(f"[seed={args.seed}] embed_tokens[0,:4] = {emb_row0}")
-    print(f"[seed={args.seed}] q_proj.bias[:4]    = "
-          f"{state['0.auto_model.layers.0.self_attn.q_proj.bias'][:4].tolist()}")
+    bias4 = state["0.auto_model.layers.0.self_attn.q_proj.bias"][:4].tolist()
+    print(f"embed_tokens[0,:4] = {emb_row0}")
+    print(f"q_proj.bias[:4]    = {bias4}")
 
     # Always write binary.
     bin_name = output_name
@@ -219,7 +237,8 @@ if __name__ == "__main__":
             state, config.num_hidden_layers, data_dtype, f_model)
     print(f"Saved binary: {bin_name}")
 
-    # Optionally also write safetensors FROM THE SAME state_dict snapshot.
+    # Optionally also write safetensors from the SAME checkpoint state, so
+    # the two files share byte-identical data for every weight.
     if args.safetensors:
         st_name = bin_name.replace(".bin", ".safetensors")
         weights = collect_kalm_embedding_for_nntrainer(
