@@ -258,10 +258,10 @@ static void load_safetensors(ml::train::Model *model,
     st_map[it.key()] = {data_base + begin, end - begin};
   }
 
-  // Allocate host memory before accessing tensor data pointers.
-  // initialize(INFERENCE) sets up the graph but may defer memory allocation;
-  // allocate() materialises the host buffers (same pattern as load_kvcache).
-  model->allocate(ml::train::ExecutionMode::INFERENCE);
+  // Weight tensors are already allocated by initialize() -> allocateWeights().
+  // Do NOT call model->allocate() here: it additionally allocates the full
+  // activation tensor pool (seq_len * layers * hidden), which causes OOM on
+  // large models. Binary loading (model->load(BIN)) also skips allocate().
 
   // Read each tensor directly into its host buffer by seeking to its offset.
   // This avoids loading the entire file into memory at once.
