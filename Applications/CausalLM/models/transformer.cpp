@@ -12,6 +12,7 @@
 
 #include <fstream>
 #include <cstring>
+#include <iomanip>
 
 #include <app_context.h>
 #include <engine.h>
@@ -238,6 +239,14 @@ static void load_safetensors(ml::train::Model *model,
   f.read(reinterpret_cast<char *>(&header_len), 8);
   if (!f)
     throw std::runtime_error("Failed to read safetensors header length");
+  // Print raw bytes for diagnosis
+  {
+    unsigned char *b = reinterpret_cast<unsigned char *>(&header_len);
+    std::cerr << "[safetensors] first 8 bytes (hex): ";
+    for (int i = 0; i < 8; ++i)
+      std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)b[i] << " ";
+    std::cerr << std::dec << std::endl;
+  }
   std::cerr << "[safetensors] header_len=" << header_len << std::endl;
 
   if (header_len == 0 || header_len > 64 * 1024 * 1024)
