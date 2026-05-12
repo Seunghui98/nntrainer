@@ -10,6 +10,27 @@ import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 
+# Newer transformers versions removed rope_theta as a direct attribute on
+# Qwen2Config; patch __getattr__ so the KaLM custom modeling.py still works.
+try:
+    from transformers import Qwen2Config
+    _orig_getattr = getattr(Qwen2Config, "__getattr__", None)
+
+    def _qwen2_getattr_patch(self, name):
+        if name == "rope_theta":
+            # Fall back to rope_scaling dict or Qwen2 default (1 000 000)
+            rs = self.__dict__.get("rope_scaling") or {}
+            return rs.get("rope_theta", 1_000_000.0)
+        if _orig_getattr:
+            return _orig_getattr(self, name)
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    Qwen2Config.__getattr__ = _qwen2_getattr_patch
+except ImportError:
+    pass
+
 # KaLM-embedding uses Qwen2 architecture (Qwen2Model):
 #   - Q/K/V projections have biases (o_proj does NOT)
 #   - No q_norm / k_norm (Qwen3-specific)
