@@ -82,6 +82,10 @@ def save_gemma3_for_nntrainer(params, config, dtype, file, tie_word_embeddings):
     n_layers = config.num_hidden_layers
 
     def save_weight(weight, is_rms=False):
+        # Gemma3 ships with bfloat16 weights. numpy has no native bfloat16,
+        # so cast in torch first, then hand a contiguous float tensor to
+        # np.array().
+        weight = weight.to(torch.float32).contiguous()
         if is_rms:
             weight = weight + 1.0
         np.array(weight, dtype=dtype).tofile(file)
@@ -139,6 +143,10 @@ def collect_gemma3_for_nntrainer(params, config, dtype, tie_word_embeddings):
     weights = []
 
     def add(name, tensor, transpose=False, is_rms=False):
+        # Cast bfloat16 -> float32 in torch (numpy has no native bf16).
+        # The +1 RMS offset must happen in float so it's not silently
+        # truncated to bfloat16 precision.
+        tensor = tensor.to(torch.float32)
         if is_rms:
             tensor = tensor + 1.0
         # .contiguous() before .numpy() so the safetensors byte layout
