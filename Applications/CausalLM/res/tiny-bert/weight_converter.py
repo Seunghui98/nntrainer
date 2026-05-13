@@ -150,9 +150,9 @@ def collect_tinybert_for_nntrainer(params, n_layers, dtype, prefix="bert."):
     # Embeddings
     add("embedding0:Embedding",
         params[f"{prefix}embeddings.word_embeddings.weight"])
-    add("position_embedding0:Embedding",
+    add("position_embedding:Embedding",
         params[f"{prefix}embeddings.position_embeddings.weight"])
-    add("token_type_embedding0:Embedding",
+    add("token_type_embedding:Embedding",
         params[f"{prefix}embeddings.token_type_embeddings.weight"])
     add_layernorm("embedding_norm", f"{prefix}embeddings.LayerNorm")
 
@@ -165,8 +165,10 @@ def collect_tinybert_for_nntrainer(params, n_layers, dtype, prefix="bert."):
         add_fc(f"{pfx}_attention_out", f"{p}.attention.output.dense")
         add_layernorm(f"{pfx}_attention_norm",
                       f"{p}.attention.output.LayerNorm")
-        add_fc(f"{pfx}_ffn_up", f"{p}.intermediate.dense")
-        add_fc(f"{pfx}_ffn_down", f"{p}.output.dense")
+        # nntrainer BERT model registers the FFN dense layers as ffn_fc1
+        # (intermediate / up) and ffn_fc2 (output / down).
+        add_fc(f"{pfx}_ffn_fc1", f"{p}.intermediate.dense")
+        add_fc(f"{pfx}_ffn_fc2", f"{p}.output.dense")
         add_layernorm(f"{pfx}_ffn_norm", f"{p}.output.LayerNorm")
 
     # Pooler — sentence-embedding only; skipped silently if absent.
