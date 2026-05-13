@@ -165,10 +165,11 @@ def collect_tinybert_for_nntrainer(params, n_layers, dtype, prefix="bert."):
         add_fc(f"{pfx}_attention_out", f"{p}.attention.output.dense")
         add_layernorm(f"{pfx}_attention_norm",
                       f"{p}.attention.output.LayerNorm")
-        # nntrainer BERT model registers the FFN dense layers as ffn_fc1
-        # (intermediate / up) and ffn_fc2 (output / down).
+        # nntrainer BERT model uses mixed FFN names: ffn_fc1 for the
+        # intermediate (up) projection and ffn_down for the output (down)
+        # projection. Not symmetric, but that is the registered name.
         add_fc(f"{pfx}_ffn_fc1", f"{p}.intermediate.dense")
-        add_fc(f"{pfx}_ffn_fc2", f"{p}.output.dense")
+        add_fc(f"{pfx}_ffn_down", f"{p}.output.dense")
         add_layernorm(f"{pfx}_ffn_norm", f"{p}.output.LayerNorm")
 
     # Pooler — sentence-embedding only; skipped silently if absent.
