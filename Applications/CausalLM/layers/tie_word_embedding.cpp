@@ -11,6 +11,11 @@
  *
  */
 
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <vector>
+
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -267,6 +272,41 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
+  // ---- DIAGNOSTIC: dump LM head input ----
+  // Compare with PyTorch's `final_norm_out` / `lm_head_in` for the same
+  // prompt. If hidden states diverge from PyTorch the bug is somewhere
+  // in the 28 decoder blocks; if they match but the logits / sampled
+  // token still don't, the bug is in lm_head itself.
+  {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+      if (input_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        const float *p = input_.getData<float>();
+        const unsigned int W = input_.width();
+        std::cerr << "[lm_head probe] input (= output_norm out) dim="
+                  << input_.batch() << "x" << input_.channel() << "x"
+                  << input_.height() << "x" << W << "\n";
+        if (input_.height() >= 1) {
+          const float *p0 = p + 0 * W;
+          std::cerr << "[lm_head probe] input[t=0]    first4=" << p0[0]
+                    << " " << p0[1] << " " << p0[2] << " " << p0[3] << "\n";
+        }
+        if (input_.height() >= 2) {
+          const float *p1 = p + 1 * W;
+          std::cerr << "[lm_head probe] input[t=1]    first4=" << p1[0]
+                    << " " << p1[1] << " " << p1[2] << " " << p1[3] << "\n";
+        }
+        const unsigned int last = (to - from > 0) ? (to - from - 1) : 0;
+        if (input_.height() > last) {
+          const float *pl = p + last * W;
+          std::cerr << "[lm_head probe] input[t=last=" << last
+                    << "] first4=" << pl[0] << " " << pl[1] << " " << pl[2]
+                    << " " << pl[3] << "\n";
+        }
+      }
+    });
+  }
+
   ml::train::TensorDim input_dim = input_.getDim();
   ml::train::TensorDim hidden_dim = hidden_.getDim();
 
@@ -301,6 +341,42 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       nntrainer::Tensor &bias =
         context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
       hidden_step.add_i(bias);
+    }
+
+    // ---- DIAGNOSTIC: dump top-5 LM head logits ----
+    if (b == 0 &&
+        hidden_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      static std::once_flag once;
+      std::call_once(once, [&] {
+        const float *p = hidden_step.getData<float>();
+        const size_t V = hidden_step.width();
+        // Find top-5 indices by partial scan (O(V*5), V is vocab=151936).
+        std::vector<size_t> top5(5, 0);
+        std::vector<float> top5v(5, -std::numeric_limits<float>::infinity());
+        for (size_t i = 0; i < V; ++i) {
+          float x = p[i];
+          for (int j = 0; j < 5; ++j) {
+            if (x > top5v[j]) {
+              for (int k = 4; k > j; --k) {
+                top5v[k] = top5v[k - 1];
+                top5[k] = top5[k - 1];
+              }
+              top5v[j] = x;
+              top5[j] = i;
+              break;
+            }
+          }
+        }
+        std::cerr << "[lm_head probe] logits dim=" << hidden_step.batch()
+                  << "x" << hidden_step.channel() << "x"
+                  << hidden_step.height() << "x" << V << "\n";
+        std::cerr << "[lm_head probe] top-5 ids   = [" << top5[0] << ", "
+                  << top5[1] << ", " << top5[2] << ", " << top5[3] << ", "
+                  << top5[4] << "]\n";
+        std::cerr << "[lm_head probe] top-5 logit = [" << top5v[0] << ", "
+                  << top5v[1] << ", " << top5v[2] << ", " << top5v[3] << ", "
+                  << top5v[4] << "]\n";
+      });
     }
   }
 }
