@@ -112,13 +112,13 @@ void CausalLM::allocateAndBindKVCache() {
     // saved caches stay binary-compatible across the 3-input/5-input modes).
 #ifdef ENABLE_FP16
     const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
-#elif defined(_WIN32)
-    // Qwen3 generation currently produces invalid tokens on Windows with the
-    // UINT16 KV cache path. Keep the host-side cache in FP32 on Windows until
-    // that path is fixed.
-    const auto cache_dtype = ml::train::TensorDim::DataType::FP32;
 #else
-    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+    // The UINT16 KV cache path currently produces invalid Qwen3 tokens on
+    // every platform (the (de)quantization step around the cached K/V loses
+    // enough precision that the LM head samples gibberish even though the
+    // weights are loaded correctly). Stay on FP32 on every non-FP16 build
+    // until the UINT16 path is fixed.
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP32;
 #endif
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
