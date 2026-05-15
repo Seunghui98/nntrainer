@@ -835,11 +835,61 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
 
+  // Probe: QK^T scores right after compute_kcaches, before softmax. If
+  // these are all the same / all near zero / all NaN, the dot product is
+  // broken or Q·K alignment is wrong.
+  {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+      if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        const float *p = out_.getData<float>();
+        std::cerr << "[mha_core probe] QK^T (pre-softmax) first8="
+                  << p[0] << " " << p[1] << " " << p[2] << " " << p[3]
+                  << " " << p[4] << " " << p[5] << " " << p[6] << " "
+                  << p[7] << "\n";
+      }
+    });
+  }
+
   softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+
+  // Probe: softmax output. Should be probabilities in [0, 1] summing to 1
+  // per row. If all uniform → softmax saturated (Q·K were too small or
+  // identical). If one is 1 and rest 0 → temperature/scale wrong.
+  {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+      if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        const float *p = out_.getData<float>();
+        std::cerr << "[mha_core probe] softmax out first8="
+                  << p[0] << " " << p[1] << " " << p[2] << " " << p[3]
+                  << " " << p[4] << " " << p[5] << " " << p[6] << " "
+                  << p[7] << "\n";
+      }
+    });
+  }
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+
+  // Probe: final attention output that goes to attention_out FC. If this
+  // is uniform/zero, downstream layernorm + lm_head sees a featureless
+  // activation and the LM head will sample from its bias → repeated
+  // common suffix tokens, exactly the gibberish we observe.
+  {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+      if (attention_output_step.getDataType() ==
+          ml::train::TensorDim::DataType::FP32) {
+        const float *p = attention_output_step.getData<float>();
+        std::cerr << "[mha_core probe] attn_out (mha output) first8="
+                  << p[0] << " " << p[1] << " " << p[2] << " " << p[3]
+                  << " " << p[4] << " " << p[5] << " " << p[6] << " "
+                  << p[7] << "\n";
+      }
+    });
+  }
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
