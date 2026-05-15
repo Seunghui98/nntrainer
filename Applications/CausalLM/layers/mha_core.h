@@ -337,6 +337,24 @@ private:
    */
   bool use_external_cache = false;
 
+  /**
+   * @brief Active step size for the next external-cache forwarding() call.
+   *
+   * incremental_forwarding() is the inference entry point and knows the
+   * active range via its (_from, _to) parameters. forwarding() does not
+   * receive that range, so when it dispatches into the external-cache
+   * branch it would otherwise fall back to query.height() — which is the
+   * buffer size (INIT_SEQ_LEN), not the active token count. That writes
+   * past the live data into the padded portion of cache_key/cache_value
+   * and produces gibberish from the LM head.
+   *
+   * incremental_forwarding() sets this to (_to - _from) before calling
+   * forwarding() in external-cache mode; forwarding() uses it as the
+   * authoritative step size when set, and falls back to query.height()
+   * for the legacy training path.
+   */
+  unsigned int external_step_size = 0;
+
   /** intermal info */
   size_t num_heads_Q;
   size_t num_heads_KV;

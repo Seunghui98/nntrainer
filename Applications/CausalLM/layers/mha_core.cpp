@@ -301,7 +301,14 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     sink = context.getWeight(sink_idx);
   }
 
-  unsigned int step_size = query.height();
+  // When dispatched from incremental_forwarding() (inference path) we
+  // already know the active token count via external_step_size. Trusting
+  // query.height() instead would use the padded buffer size and write
+  // garbage past the live data — that's exactly what was causing Qwen3
+  // to emit gibberish like "andoivering..." after the external-cache
+  // migration.
+  unsigned int step_size =
+    (external_step_size != 0) ? external_step_size : query.height();
   unsigned int from = cache_index;
   unsigned int to = cache_index + step_size;
 
@@ -405,8 +412,13 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
   if (use_external_cache) {
+    // forwarding() doesn't see (_from, _to) — it falls back to
+    // query.height(), which is the padded buffer size (INIT_SEQ_LEN), not
+    // the active token count. Hand it the real step size via a member.
     cache_index = _from;
+    external_step_size = _to - _from;
     forwarding(context, training);
+    external_step_size = 0;
     return;
   }
 
