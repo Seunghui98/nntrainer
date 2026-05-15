@@ -999,6 +999,23 @@ public:
     return "cpu";
   }
 
+  /**
+   * @brief Get the effective layer managed by this layer node
+   *
+   * @details this is the layer inside the distribution layer if this layer
+   *          node is distributed.
+   *
+   *          Exposed publicly so callers iterating the graph (e.g. via
+   *          NeuralNetwork::forEachLayer) can dynamic_cast to the concrete
+   *          layer type when they need to call layer-specific methods. The
+   *          callback there is handed an ml::train::Layer & that actually
+   *          points at this LayerNode, so casting it to the concrete layer
+   *          type would always fail; getLayer() returns the wrapped
+   *          implementation that the cast can succeed on.
+   */
+  const nntrainer::Layer *getLayer() const;
+  nntrainer::Layer *getLayer();
+
 private:
   /**
    * @brief     Get the Input Layers object
@@ -1077,21 +1094,9 @@ properties in the context/graph unless intended. */
 
   std::array<TensorDim::DataType, 2> data_type;
 
-  /**
-   * @brief   Get the effective layer managed by this layer node
-   *
-   * @details this is layer inside the distribution layer if this layer node
-   * is distributed.
-   */
-  const nntrainer::Layer *getLayer() const;
-
-  /**
-   * @brief   Get the effective layer managed by this layer node
-   *
-   * @details this is layer inside the distribution layer if this layer node
-   * is distributed.
-   */
-  nntrainer::Layer *getLayer();
+  // getLayer() declarations moved to the public section above so callers
+  // iterating the graph (e.g. via NeuralNetwork::forEachLayer) can reach
+  // the wrapped layer implementation.
 
   /**
    * @brief anchor point to override if PRINT_SHAPE_INFO is enabled for
