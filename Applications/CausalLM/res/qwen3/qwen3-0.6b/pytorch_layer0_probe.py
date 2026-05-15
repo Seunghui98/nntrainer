@@ -125,6 +125,11 @@ def main():
           f"rope_theta={getattr(cfg, 'rope_theta', None)}")
 
     layer0 = model.model.layers[0].self_attn
+    layer0_block = model.model.layers[0]              # whole decoder block 0
+    last_layer_block = model.model.layers[-1]         # whole decoder block N-1
+    final_norm = model.model.norm                     # output_norm (RMSNorm)
+    lm_head = model.lm_head                           # LM head (Linear)
+
     store: Dict[str, torch.Tensor] = {}
     handles = [
         layer0.q_proj.register_forward_hook(make_hook("q_proj_out", store)),
@@ -138,6 +143,20 @@ def main():
         # Also keep o_proj's OUTPUT — useful if we ever want to chase a
         # downstream-FC bug.
         layer0.o_proj.register_forward_hook(make_hook("o_proj_out", store)),
+        # Decoder block 0 output — what feeds into block 1. If this still
+        # matches PyTorch, the bug is in a deeper layer.
+        layer0_block.register_forward_hook(make_hook("layer0_block_out", store)),
+        # Last decoder block output — what feeds into final RMSNorm. If
+        # this matches, the bug is in output_norm or lm_head; if not, the
+        # bug accumulates across decoder blocks.
+        last_layer_block.register_forward_hook(
+            make_hook("last_layer_block_out", store)),
+        # Final norm output — direct LM head input.
+        final_norm.register_forward_hook(make_hook("final_norm_out", store)),
+        # LM head INPUT (= final_norm output, sanity copy).
+        lm_head.register_forward_pre_hook(make_pre_hook("lm_head_in", store)),
+        # LM head OUTPUT = logits over the vocab.
+        lm_head.register_forward_hook(make_hook("lm_head_logits", store)),
     ]
 
     # q_norm / k_norm exist on Qwen3, not Qwen2.
@@ -202,6 +221,43 @@ def main():
     print("  attn_out probe, which is taken BEFORE attention_out FC.)")
     print("========================================")
     dump("o_proj_out (POST o_proj FC)", store["o_proj_out"])
+
+    print("\n========================================")
+    print(" Decoder block 0 output (input to block 1)")
+    print(" — compare with whatever nntrainer probe is set at end of layer 0")
+    print("========================================")
+    dump("layer0_block_out", store["layer0_block_out"])
+
+    print("\n========================================")
+    print(" Last decoder block output (input to final RMSNorm)")
+    print(" — accumulated across all 28 layers")
+    print("========================================")
+    dump("last_layer_block_out", store["last_layer_block_out"])
+
+    print("\n========================================")
+    print(" Final RMSNorm output / LM head INPUT")
+    print(" — this is the hidden state lm_head reads from. The C++ side")
+    print("   would have its own output_norm:gamma layer here.")
+    print("========================================")
+    dump("final_norm_out", store["final_norm_out"])
+    dump("lm_head_in (sanity = final_norm_out)", store["lm_head_in"])
+
+    print("\n========================================")
+    print(" LM head logits (next-token distribution per position)")
+    print(" — generate() picks argmax / samples from logits[t=last].")
+    print("========================================")
+    logits = store["lm_head_logits"]
+    last = logits.shape[1] - 1
+    if logits.dim() == 3:
+        top = torch.topk(logits[0, last], k=5)
+        print(f"\n[lm_head_logits at t=last={last}] shape={list(logits.shape)}")
+        print(f"    top-5 ids   = {top.indices.tolist()}")
+        print(f"    top-5 logit = {[f'{v:.4f}' for v in top.values.tolist()]}")
+        try:
+            top_tokens = [tok.decode([i]) for i in top.indices.tolist()]
+            print(f"    top-5 token = {top_tokens}")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
