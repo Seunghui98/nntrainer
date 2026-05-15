@@ -873,20 +873,40 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
 
-  // Probe: final attention output that goes to attention_out FC. If this
-  // is uniform/zero, downstream layernorm + lm_head sees a featureless
-  // activation and the LM head will sample from its bias → repeated
-  // common suffix tokens, exactly the gibberish we observe.
+  // Probe: final attention output that goes to attention_out FC. Dump
+  // multiple token positions to see if attention output is varying or
+  // collapsed across positions.
   {
     static std::once_flag once;
     std::call_once(once, [&] {
       if (attention_output_step.getDataType() ==
           ml::train::TensorDim::DataType::FP32) {
         const float *p = attention_output_step.getData<float>();
-        std::cerr << "[mha_core probe] attn_out (mha output) first8="
+        const unsigned int W = attention_output_step.width();
+        const unsigned int H = attention_output_step.height();
+        std::cerr << "[mha_core probe] attn_out dim="
+                  << attention_output_step.batch() << "x"
+                  << attention_output_step.channel() << "x" << H << "x" << W
+                  << "\n";
+        // Token 0 (only attends to itself → should equal V[0])
+        std::cerr << "[mha_core probe] attn_out[t=0] first4="
                   << p[0] << " " << p[1] << " " << p[2] << " " << p[3]
-                  << " " << p[4] << " " << p[5] << " " << p[6] << " "
-                  << p[7] << "\n";
+                  << "\n";
+        // Token 1 (attends to tokens 0, 1 → mix of V[0] and V[1])
+        if (H >= 2) {
+          const float *p1 = p + W;
+          std::cerr << "[mha_core probe] attn_out[t=1] first4="
+                    << p1[0] << " " << p1[1] << " " << p1[2] << " " << p1[3]
+                    << "\n";
+        }
+        // Token H-1 (LAST — this is what lm_head extracts)
+        if (H >= 3) {
+          const float *pl = p + (H - 1) * W;
+          std::cerr << "[mha_core probe] attn_out[t=last=" << (H - 1)
+                    << "] first4="
+                    << pl[0] << " " << pl[1] << " " << pl[2] << " " << pl[3]
+                    << "\n";
+        }
       }
     });
   }
