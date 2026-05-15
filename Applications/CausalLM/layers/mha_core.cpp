@@ -783,6 +783,27 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   bool use_rope = theta > 0.0f;
   if (use_rope) {
+    // PRE-ROPE probe: K values for token 0 and token 1, head 0, dim 0..3.
+    // If K[0] and K[1] (pre-rope) look like meaningful different vectors,
+    // input to RoPE is fine. After RoPE we re-probe to see if rotation
+    // mangled things.
+    {
+      static std::once_flag once;
+      std::call_once(once, [&] {
+        if (key_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+            key_step.height() >= 2) {
+          const float *p = key_step.getData<float>();
+          const unsigned int W = key_step.width();
+          std::cerr << "[mha_core probe] PRE-rope K[t=0,h=0] first4="
+                    << p[0] << " " << p[1] << " " << p[2] << " " << p[3]
+                    << "\n";
+          std::cerr << "[mha_core probe] PRE-rope K[t=1,h=0] first4="
+                    << p[W + 0] << " " << p[W + 1] << " " << p[W + 2] << " "
+                    << p[W + 3] << "\n";
+        }
+      });
+    }
+
     // apply rotary embedding for query
     apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
                                true);
@@ -790,6 +811,43 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // append kcache with rotary embedding
     apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
                                cache_index, true);
+
+    // POST-ROPE probe: rotated K written into the cache slice.
+    // K[0] should rotate by position 0 (≈ identity for first dim pair).
+    // K[1] should rotate by position 1 — values should differ from PRE-rope
+    // K[1] for non-first dims.
+    {
+      static std::once_flag once;
+      std::call_once(once, [&] {
+        if (b_cache_key_step.getDataType() ==
+              ml::train::TensorDim::DataType::FP32 &&
+            b_cache_key_step.height() >= 2) {
+          const float *p = b_cache_key_step.getData<float>();
+          const unsigned int W = b_cache_key_step.width();
+          std::cerr << "[mha_core probe] POST-rope K[t=0,h=0] first4="
+                    << p[0] << " " << p[1] << " " << p[2] << " " << p[3]
+                    << "\n";
+          std::cerr << "[mha_core probe] POST-rope K[t=1,h=0] first4="
+                    << p[W + 0] << " " << p[W + 1] << " " << p[W + 2] << " "
+                    << p[W + 3] << "\n";
+          // Also dump Q after rotation
+          if (query_step.getDataType() ==
+                ml::train::TensorDim::DataType::FP32 &&
+              query_step.height() >= 2) {
+            const float *q = query_step.getData<float>();
+            const unsigned int QW = query_step.width();
+            std::cerr << "[mha_core probe] POST-rope Q[t=0,h=0] first4="
+                      << q[0] << " " << q[1] << " " << q[2] << " " << q[3]
+                      << "\n";
+            std::cerr << "[mha_core probe] POST-rope Q[t=1,h=0] first4="
+                      << q[QW + 0] << " " << q[QW + 1] << " " << q[QW + 2]
+                      << " " << q[QW + 3] << "\n";
+          }
+          std::cerr << "[mha_core probe] theta=" << theta
+                    << " head_dim=" << head_dim << "\n";
+        }
+      });
+    }
 
     // append vcache without rotary embedding
     if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
