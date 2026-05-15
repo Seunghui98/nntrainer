@@ -752,6 +752,35 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                       cache_index * cache_value_dim.width(),
                                     true);
 
+  // Diagnostic: dump first 4 floats of query/key/cache slot on the very
+  // first call. If query/key are all zeros or wildly out of range, the FC
+  // before us produced bad data. If b_cache_key_step does not pick up our
+  // writes on the next call, the external cache binding is broken.
+  {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+      auto dump = [](const char *tag, nntrainer::Tensor &t) {
+        if (t.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+            t.getData<float>() == nullptr) {
+          std::cerr << "[mha_core probe] " << tag << " NOT FP32 or null\n";
+          return;
+        }
+        const float *p = t.getData<float>();
+        std::cerr << "[mha_core probe] " << tag << " dim="
+                  << t.batch() << "x" << t.channel() << "x" << t.height()
+                  << "x" << t.width() << " first4="
+                  << p[0] << " " << p[1] << " " << p[2] << " " << p[3] << "\n";
+      };
+      dump("query_step", query_step);
+      dump("key_step", key_step);
+      dump("value_step", value_step);
+      dump("cache_key", cache_key);
+      dump("b_cache_key_step (slice at write pos)", b_cache_key_step);
+      std::cerr << "[mha_core probe] cache_index=" << cache_index
+                << " from=" << from << " to=" << to << "\n";
+    });
+  }
+
   bool use_rope = theta > 0.0f;
   if (use_rope) {
     // apply rotary embedding for query
