@@ -3,6 +3,14 @@
 ##        uses and dumps layer 0 Q/K/V (pre-rope, post-rope) and attention
 ##        output for token positions 0, 1, and last.
 ##
+## Requirements
+## ============
+## transformers >= 4.51 (Qwen3 architecture support was added in 4.51).
+## If you see "KeyError: 'qwen3'" or "model type `qwen3` … is out of date",
+## upgrade:
+##     pip install -U transformers tokenizers
+##     # or, in a conda env: pip install -U 'transformers>=4.51'
+##
 ## Compare against the nntrainer side `[mha_core probe]` lines:
 ##   PyTorch q_proj output[0, t, 0:4]   ↔ nntrainer query_step / Q[t,h=0]
 ##   PyTorch k_proj output[0, t, 0:4]   ↔ nntrainer key_step / K[t,h=0]
@@ -18,10 +26,31 @@
 ##                                  [--prompt "..."]
 
 import argparse
+import sys
 from typing import Dict
 
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _check_transformers_version():
+    """Qwen3 native support landed in transformers 4.51. Older releases will
+    fail with KeyError: 'qwen3' inside AutoConfig.from_pretrained. Surface a
+    helpful upgrade hint instead of the cryptic stack trace."""
+    try:
+        major, minor, *_ = transformers.__version__.split(".")
+        major_i, minor_i = int(major), int(minor)
+    except Exception:
+        return
+    if (major_i, minor_i) < (4, 51):
+        print(
+            f"\n[fatal] transformers=={transformers.__version__} is too old "
+            "to understand Qwen3 (need >= 4.51).\n"
+            "        Run:  pip install -U 'transformers>=4.51' tokenizers\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 def make_hook(name: str, store: Dict[str, torch.Tensor]):
@@ -39,6 +68,8 @@ def fmt(t: torch.Tensor, n: int = 4) -> str:
 
 
 def main():
+    _check_transformers_version()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument(
@@ -47,6 +78,8 @@ def main():
                  "language model.<|im_end|>\n<|im_start|>assistant\n"),
         help="Same prompt the C++ nntr_causallm runs.")
     args = parser.parse_args()
+
+    print(f"transformers=={transformers.__version__}, torch=={torch.__version__}")
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
