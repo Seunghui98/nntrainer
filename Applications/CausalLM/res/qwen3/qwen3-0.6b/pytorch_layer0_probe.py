@@ -54,13 +54,45 @@ def _check_transformers_version():
 
 
 def make_hook(name: str, store: Dict[str, torch.Tensor]):
+    """register_forward_hook → captures the module's OUTPUT tensor."""
     def _hook(_module, _inp, output):
-        # Output of an nn.Linear is just the projected tensor.
         if isinstance(output, tuple):
             store[name] = output[0].detach().cpu()
         else:
             store[name] = output.detach().cpu()
     return _hook
+
+
+def make_pre_hook(name: str, store: Dict[str, torch.Tensor]):
+    """register_forward_pre_hook → captures the module's INPUT tensor.
+    o_proj's input is the attention output BEFORE the final FC — that's
+    what compares directly with nntrainer's `attn_out` probe."""
+    def _hook(_module, inputs):
+        x = inputs[0] if isinstance(inputs, tuple) else inputs
+        store[name] = x.detach().cpu()
+    return _hook
+
+
+def to_seq_first(t: torch.Tensor) -> torch.Tensor:
+    """Normalise a hook tensor to [B, seq, hidden] so t[:, p, :] always
+    means token-p activation for token p across all heads.
+
+    HuggingFace Qwen3 calls q_norm / k_norm on a 4D tensor whose layout
+    depends on the model version:
+      a) [B, seq, n_heads, head_dim]   — norm applied before transpose
+      b) [B, n_heads, seq, head_dim]   — norm applied after transpose
+    Either way, return [B, seq, n_heads * head_dim].
+    """
+    if t.dim() != 4:
+        return t
+
+    B, A, S, D = t.shape
+    # If A < S we assume A = n_heads (layout b: [B, n_heads, seq, head_dim]).
+    # Heads (16) is always < seq for the prompts we run.
+    if A < S:
+        t = t.permute(0, 2, 1, 3).contiguous()  # → [B, seq, n_heads, head_dim]
+    # else layout (a): already [B, seq, n_heads, head_dim].
+    return t.view(t.shape[0], t.shape[1], -1)
 
 
 def fmt(t: torch.Tensor, n: int = 4) -> str:
@@ -98,7 +130,14 @@ def main():
         layer0.q_proj.register_forward_hook(make_hook("q_proj_out", store)),
         layer0.k_proj.register_forward_hook(make_hook("k_proj_out", store)),
         layer0.v_proj.register_forward_hook(make_hook("v_proj_out", store)),
-        layer0.o_proj.register_forward_hook(make_hook("o_proj_in",  store)),
+        # PRE-hook on o_proj captures its INPUT, i.e. the attention output
+        # BEFORE the final FC — directly comparable to nntrainer's
+        # `attn_out` probe lines.
+        layer0.o_proj.register_forward_pre_hook(
+            make_pre_hook("attn_output_pre_oproj", store)),
+        # Also keep o_proj's OUTPUT — useful if we ever want to chase a
+        # downstream-FC bug.
+        layer0.o_proj.register_forward_hook(make_hook("o_proj_out", store)),
     ]
 
     # q_norm / k_norm exist on Qwen3, not Qwen2.
@@ -123,12 +162,8 @@ def main():
     positions = sorted({0, 1, n_tok - 1})
 
     def dump(label: str, t: torch.Tensor):
-        # Most outputs are [batch=1, seq, hidden]. q_norm / k_norm on Qwen3
-        # are reshaped to per-head before the norm, so flatten head dim back.
-        if t.dim() == 4:
-            # [b, n_heads, seq, head_dim] → [b, seq, n_heads * head_dim]
-            t = t.permute(0, 2, 1, 3).contiguous().view(t.shape[0],
-                                                       t.shape[2], -1)
+        # Normalise to [B, seq, hidden] so t[:, p, :] indexes token p.
+        t = to_seq_first(t)
         print(f"\n[{label}] shape={list(t.shape)}")
         for p in positions:
             if p < t.shape[1]:
@@ -158,7 +193,15 @@ def main():
     print(" (POST-attention POST-softmax mixed-V — compare with nntrainer's")
     print("  attn_out[t=0/1/last] probe lines)")
     print("========================================")
-    dump("o_proj_in (attention output)", store["o_proj_in"])
+    dump("attn_output_pre_oproj (BEFORE o_proj FC)",
+         store["attn_output_pre_oproj"])
+
+    print("\n========================================")
+    print(" Layer 0 o_proj output (POST final attention FC)")
+    print(" (Listed for reference — NOT directly comparable to nntrainer's")
+    print("  attn_out probe, which is taken BEFORE attention_out FC.)")
+    print("========================================")
+    dump("o_proj_out (POST o_proj FC)", store["o_proj_out"])
 
 
 if __name__ == "__main__":
