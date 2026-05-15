@@ -34,6 +34,7 @@
 
 #include <common.h>
 #include <layer_context.h>
+#include <layer_node.h>
 #include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
@@ -172,10 +173,21 @@ void CausalLM::setKVCachePosition(unsigned int pos) {
   throw std::runtime_error(
     "loading a non-zero KV cache position is not supported on Windows yet");
 #endif
+  // forEachLayer hands us the LayerNode (which inherits ml::train::Layer);
+  // the actual MHACoreLayer instance is owned *inside* the node and reachable
+  // via LayerNode::getLayer(). dynamic_cast<MHACoreLayer&>(layer_node) would
+  // fail (LayerNode and MHACoreLayer are siblings under ml::train::Layer, not
+  // parent/child) and throw std::bad_cast.
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
-      if (l.getType() == causallm::MHACoreLayer::type)
-        dynamic_cast<causallm::MHACoreLayer &>(l).setCacheIndex(pos);
+      if (l.getType() != causallm::MHACoreLayer::type)
+        return;
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+      if (node == nullptr)
+        return;
+      auto *core = dynamic_cast<causallm::MHACoreLayer *>(node->getLayer());
+      if (core != nullptr)
+        core->setCacheIndex(pos);
     };
   model->forEachLayer(fn, nullptr);
 }
