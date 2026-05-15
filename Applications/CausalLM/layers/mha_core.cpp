@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -585,6 +586,30 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
                                    size_t sequence_len, unsigned int num_head,
                                    unsigned int group_size,
                                    unsigned int head_dim) {
+
+  // One-shot diagnostic so we can see at runtime which compute path the
+  // build actually took. Should print "compute_kcaches: in=FP32 cache=FP32"
+  // exactly once on a healthy Linux/Windows non-FP16 build after the FP32
+  // KV cache fix; if cache=UINT16 still appears, the fix did not actually
+  // land in the running binary.
+  {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+      const char *in_dt =
+        in.getDataType() == ml::train::TensorDim::DataType::FP32   ? "FP32"
+        : in.getDataType() == ml::train::TensorDim::DataType::FP16 ? "FP16"
+                                                                   : "OTHER";
+      const char *cache_dt =
+        cache.getDataType() == ml::train::TensorDim::DataType::FP32   ? "FP32"
+        : cache.getDataType() == ml::train::TensorDim::DataType::FP16 ? "FP16"
+        : cache.getDataType() == ml::train::TensorDim::DataType::UINT16
+          ? "UINT16"
+          : "OTHER";
+      std::cerr << "[mha_core] compute_kcaches dispatch: in=" << in_dt
+                << " cache=" << cache_dt
+                << " (Qwen3 needs both FP32 on non-FP16 builds)\n";
+    });
+  }
 
   // Dispatch based on data type (FP32 or FP16)
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
