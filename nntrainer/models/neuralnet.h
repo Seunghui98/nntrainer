@@ -728,15 +728,6 @@ private:
   void saveModelIni(const std::string &file_path);
 
   /**
-   * @brief Convert a NNTrainer binary weight file to safetensors format.
-   *
-   * @param bin_path  Path to an existing .bin model weight file.
-   * @param st_path   Output path for the resulting .safetensors file.
-   */
-  void convertBinToSafetensors(const std::string &bin_path,
-                               const std::string &st_path);
-
-  /**
    * @brief print function for neuralnet
    * @param[in] out outstream
    * @param[in] flags bit combination of Neuralnet::PrintOption

@@ -1097,12 +1097,6 @@ void NeuralNetwork::load(const std::string &file_path,
   }
 }
 
-void NeuralNetwork::convertBinToSafetensors(const std::string &bin_path,
-                                            const std::string &st_path) {
-  load(bin_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
-  save(st_path, ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
-}
-
 float NeuralNetwork::getLoss() {
   loss = 0.0f;
 
