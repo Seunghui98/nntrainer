@@ -1060,6 +1060,30 @@ void NeuralNetwork::load(const std::string &file_path,
             node->read(local_file, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
           } else {
+#if defined(_WIN32)
+            HANDLE hFile =
+              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+              << "CreateFileA failed for safetensors file: " << f_path;
+
+            HANDLE hMap =
+              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+              << "CreateFileMapping failed for safetensors file: " << f_path;
+
+            char *view =
+              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+            NNTR_THROW_IF((view == nullptr), std::runtime_error)
+              << "MapViewOfFile failed for safetensors file: " << f_path;
+
+            node->read(view, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+
+            UnmapViewOfFile(view);
+            CloseHandle(hMap);
+            CloseHandle(hFile);
+#else
             int fd = ::open(f_path.c_str(), O_RDONLY);
             NNTR_THROW_IF((fd == -1), std::invalid_argument)
               << "Cannot open safetensors file: " << f_path;
@@ -1083,6 +1107,7 @@ void NeuralNetwork::load(const std::string &file_path,
 
             (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
             ::munmap(mmap_ptr, f_size);
+#endif
           }
         });
       }
