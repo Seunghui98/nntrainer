@@ -371,8 +371,12 @@ void Transformer::save_weight(const std::string &weight_path) {
       "initialize() before save_weight().");
   }
 
+  ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN;
+  if (ends_with(weight_path, ".safetensors"))
+    format = ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
+
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    model->save(weight_path, format);
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights: " +
                              std::string(e.what()));
@@ -454,20 +458,26 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   ml::train::TensorDim cache_dim(
     {BATCH_SIZE, 1, max_timestep, kv_width},
     {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
-#else
-  // Must match CausalLM::allocateAndBindKVCache(). The UINT16 KV cache path
-  // currently produces invalid Qwen3 tokens (the precision loss around the
-  // cached K/V is enough to push the LM head into gibberish on every
-  // platform we have run it on), so non-FP16 builds keep the placeholder in
-  // FP32 until that path is fixed.
-  ml::train::TensorDim cache_dim(
-    {BATCH_SIZE, 1, max_timestep, kv_width},
-    {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP32});
-#endif
 
   Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
   Tensor cache_v(cache_dim, "cache_v_l" + std::to_string(layer_id));
   return {cache_k, cache_v};
+#else
+  const std::string cache_shape = std::to_string(BATCH_SIZE) +
+                                  ":1:" + std::to_string(max_timestep) + ":" +
+                                  std::to_string(kv_width);
+
+  LayerHandle cache_k_input(createLayer(
+    "input",
+    {withKey("name", "cache_k_l" + std::to_string(layer_id)),
+     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
+  LayerHandle cache_v_input(createLayer(
+    "input",
+    {withKey("name", "cache_v_l" + std::to_string(layer_id)),
+     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
+
+  return {cache_k_input(Tensor()), cache_v_input(Tensor())};
+#endif
 }
 
 Tensor Transformer::createAttention(const int layer_id, int seq_len,

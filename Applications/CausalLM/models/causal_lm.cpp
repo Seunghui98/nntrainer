@@ -113,12 +113,7 @@ void CausalLM::allocateAndBindKVCache() {
 #ifdef ENABLE_FP16
     const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
 #else
-    // The UINT16 KV cache path currently produces invalid Qwen3 tokens on
-    // every platform (the (de)quantization step around the cached K/V loses
-    // enough precision that the LM head samples gibberish even though the
-    // weights are loaded correctly). Stay on FP32 on every non-FP16 build
-    // until the UINT16 path is fixed.
-    const auto cache_dtype = ml::train::TensorDim::DataType::FP32;
+    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
 #endif
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
@@ -160,6 +155,12 @@ void CausalLM::allocateAndBindKVCache() {
       << "allocateAndBindKVCache: cache_k_l" << i << " / cache_v_l" << i
       << " input placeholder not found in compiled graph";
 
+    NNTR_THROW_IF(kp->getDataType() != kc.getDataType() ||
+                    vp->getDataType() != vc.getDataType(),
+                  std::runtime_error)
+      << "allocateAndBindKVCache: cache placeholder dtype mismatch for layer "
+      << i;
+
     kp->setData(kc.getMemoryData(), kc.getOffset(), false);
     vp->setData(vc.getMemoryData(), vc.getOffset(), false);
   }
@@ -167,27 +168,10 @@ void CausalLM::allocateAndBindKVCache() {
 
 void CausalLM::setKVCachePosition(unsigned int pos) {
   kv_cache.setPosition(pos);
-#if defined(_WIN32)
-  if (pos == 0)
-    return;
-  throw std::runtime_error(
-    "loading a non-zero KV cache position is not supported on Windows yet");
-#endif
-  // forEachLayer hands us the LayerNode (which inherits ml::train::Layer);
-  // the actual MHACoreLayer instance is owned *inside* the node and reachable
-  // via LayerNode::getLayer(). dynamic_cast<MHACoreLayer&>(layer_node) would
-  // fail (LayerNode and MHACoreLayer are siblings under ml::train::Layer, not
-  // parent/child) and throw std::bad_cast.
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
-      if (l.getType() != causallm::MHACoreLayer::type)
-        return;
-      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
-      if (node == nullptr)
-        return;
-      auto *core = dynamic_cast<causallm::MHACoreLayer *>(node->getLayer());
-      if (core != nullptr)
-        core->setCacheIndex(pos);
+      if (l.getType() == causallm::MHACoreLayer::type)
+        l.setProperty({"cache_index=" + std::to_string(pos)});
     };
   model->forEachLayer(fn, nullptr);
 }

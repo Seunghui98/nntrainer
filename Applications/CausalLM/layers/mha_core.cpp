@@ -27,6 +27,7 @@ static std::mutex rope_init_mtx;
 #include <nntrainer_error.h>
 #include <node_exporter.h>
 #include <thread_manager.h>
+#include <util_func.h>
 
 #include <cstdint>
 
@@ -225,15 +226,6 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     ml::train::TensorDim cache_value_dim(
       {batch_size, 1, max_timestep, num_heads_KV * head_dim},
       {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-#elif defined(_WIN32)
-    // Keep MHA's internal cache type aligned with the external placeholders:
-    // the UINT16 KV cache path currently corrupts Qwen3 generation on Windows.
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP32});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP32});
 #else
     ml::train::TensorDim cache_key_dim(
       {batch_size, 1, max_timestep, num_heads_KV * head_dim},
@@ -1673,10 +1665,6 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   ml::train::TensorDim kv_cache_dim = kv_dim;
 #ifdef ENABLE_FP16
   kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-#elif defined(_WIN32)
-  // See the cache dtype choice in finalize(): Windows uses FP32 while the
-  // UINT16 Qwen3 cache path is being fixed.
-  kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP32);
 #else
   kv_cache_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
 #endif
@@ -1702,7 +1690,19 @@ void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
 }
 
 void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
-  auto remain_props = loadProperties(values, mha_core_props);
+  std::vector<std::string> props;
+  props.reserve(values.size());
+  for (const auto &value : values) {
+    std::string key;
+    std::string parsed_value;
+    if (nntrainer::getKeyValue(value, key, parsed_value) == ML_ERROR_NONE &&
+        key == "cache_index") {
+      setCacheIndex(static_cast<unsigned int>(std::stoul(parsed_value)));
+    } else {
+      props.push_back(value);
+    }
+  }
+  auto remain_props = loadProperties(props, mha_core_props);
   LayerImpl::setProperty(remain_props);
 }
 
