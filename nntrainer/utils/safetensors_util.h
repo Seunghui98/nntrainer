@@ -5,6 +5,9 @@
  * @brief  Util helpers for the safetensors format.
  * @file   safetensors_util.h
  * @date   18 May 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #ifndef __SAFETENSORS_UTIL_H__
