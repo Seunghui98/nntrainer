@@ -66,6 +66,9 @@ std::string buildHeader(const std::vector<TensorEntry> &entries) {
 
 namespace {
 
+/**
+ * @brief Lightweight JSON scanner for parsing safetensors headers.
+ */
 class Scanner {
 public:
   explicit Scanner(const std::string &s) : src(s), pos(0) {}

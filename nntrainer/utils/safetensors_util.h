@@ -22,6 +22,9 @@
 
 namespace nntrainer::safetensors {
 
+/**
+ * @brief Metadata entry for a single tensor in a safetensors file.
+ */
 struct TensorEntry {
   std::string name;
   std::string dtype;
