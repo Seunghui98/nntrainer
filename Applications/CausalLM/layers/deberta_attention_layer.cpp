@@ -21,15 +21,12 @@
 
 #include <algorithm> // std::min, std::max
 #include <cmath>     // std::log, std::ceil, std::sqrt, std::tanh, std::abs
-#include <future>    // std::future
 #include <limits>    // std::numeric_limits
 #include <mutex>     // std::lock_guard, std::mutex
 #include <vector>    // std::vector
 
-#include <engine.h>
 #include <fp16.h>
 #include <nntrainer_error.h>
-#include <omp.h>
 
 #include <node_exporter.h>
 
@@ -107,6 +104,69 @@ static thread_local RelativeIndexValue tl_rel_index_value{};
  */
 static thread_local std::vector<float> tl_key_cache_fp32_buf;
 
+static void compute_kcaches_fp32_reference(
+  const float *in, const float *kcache, float *output, int num_rows,
+  int num_cache_head, int head_dim, int gqa_size, size_t local_window_size,
+  int head_start = 0, int head_end = -1) {
+  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  const int window = static_cast<int>(
+    std::min(static_cast<size_t>(num_rows), local_window_size));
+  const int start_row = num_rows - window;
+  const float inv_sqrt_head_dim =
+    1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int g = 0; g < gqa_size; ++g) {
+      const float *query = in + (n * gqa_size + g) * head_dim;
+      for (int row = start_row; row < num_rows; ++row) {
+        const float *key = kcache + (row * num_cache_head + n) * head_dim;
+        float sum = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+          sum += query[d] * key[d];
+        }
+        output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
+               g] = sum * inv_sqrt_head_dim;
+      }
+    }
+  }
+}
+
+static void compute_vcache_fp32_transposed_reference(
+  int row_num, const float *in, const float *vcache, float *output,
+  int num_cache_head, int gqa_size, int head_dim, size_t local_window_size,
+  int head_start = 0, int head_end = -1) {
+  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  const int window = static_cast<int>(
+    std::min(static_cast<size_t>(row_num + 1), local_window_size));
+  const int start_row = row_num + 1 - window;
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      float *out = output + (n * gqa_size + h) * head_dim;
+      std::fill(out, out + head_dim, 0.0f);
+
+      for (int row = start_row; row <= row_num; ++row) {
+        const float *score =
+          in + row * num_cache_head * gqa_size + n * gqa_size + h;
+        const float *value = vcache + (row * num_cache_head + n) * head_dim;
+        const float weight = *score;
+
+        for (int d = 0; d < head_dim; ++d) {
+          out[d] += weight * value[d];
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
 /**
@@ -127,7 +187,9 @@ DebertaAttentionLayer::DebertaAttentionLayer() :
   max_relative_positions(0),
   position_buckets(0),
   local_window_size(0),
-  attn_logit_softcapping(0.0f) {
+  attn_logit_softcapping(0.0f),
+  bucket_table_max_seq_len(0),
+  bucket_table_ready(false) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -208,10 +270,10 @@ void DebertaAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
 #else
   ml::train::TensorDim cache_key_dim(
     {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
-    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+    {context.getFormat(), key_dim.getDataType()});
   ml::train::TensorDim cache_value_dim(
     {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
-    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+    {context.getFormat(), value_dim.getDataType()});
 #endif
 
   tensor_idx[AttentionParams::cache_key] = context.requestTensor(
@@ -239,7 +301,7 @@ void DebertaAttentionLayer::setProperty(
 void DebertaAttentionLayer::prepare_bucket_table(unsigned int max_seq_len) {
   const bool relative_attention =
     std::get<props::RelativeAttention>(deberta_props).get();
-  if (!relative_attention || position_buckets == 0)
+  if (!relative_attention || position_buckets <= 0)
     return;
 
   std::lock_guard<std::mutex> lock(bucket_mtx);
@@ -262,7 +324,7 @@ void DebertaAttentionLayer::prepare_bucket_table(unsigned int max_seq_len) {
 }
 
 int DebertaAttentionLayer::lookup_bucket(int relative_pos) const {
-  if (!bucket_table_ready || position_buckets == 0)
+  if (!bucket_table_ready || position_buckets <= 0)
     return relative_pos;
 
   const int offset = static_cast<int>(bucket_table_max_seq_len);
@@ -352,7 +414,7 @@ void DebertaAttentionLayer::incremental_forwarding(
 void DebertaAttentionLayer::compute_kcaches(
   nntrainer::Tensor &in, nntrainer::Tensor &cache, nntrainer::Tensor &out,
   unsigned int from, size_t sequence_len, unsigned int num_head,
-  unsigned int group_size, unsigned int head_dim, BS::thread_pool<> &pool) {
+  unsigned int group_size, unsigned int head_dim) {
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (sequence_len == 1) {
@@ -360,38 +422,44 @@ void DebertaAttentionLayer::compute_kcaches(
       const unsigned int num_cache_head = num_head / group_size;
 
       const float *in_data = in.getData<float>();
-      const uint16_t *cache_data = cache.getData<uint16_t>();
       float *out_data = out.getData<float>();
 
 #pragma omp parallel for schedule(static)
       for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
-        nntrainer::compute_kcaches<uint16_t>(
-          in_data, cache_data, out_data, row_to_compute, num_cache_head,
-          head_dim, group_size, tile_size, local_window_size, head_kv,
-          head_kv + 1);
+        if (cache.getDataType() == ml::train::TensorDim::DataType::FP32) {
+          compute_kcaches_fp32_reference(
+            in_data, cache.getData<float>(), out_data, row_to_compute,
+            num_cache_head, head_dim, group_size, local_window_size, head_kv,
+            head_kv + 1);
+        } else {
+          nntrainer::compute_kcaches<uint16_t>(
+            in_data, cache.getData<uint16_t>(), out_data, row_to_compute,
+            num_cache_head, head_dim, group_size, tile_size, local_window_size,
+            head_kv, head_kv + 1);
+        }
       }
 
     } else {
-      std::vector<std::future<void>> futures;
       const unsigned int seq = static_cast<unsigned int>(sequence_len);
 
       for (unsigned int i = 0; i < seq; ++i) {
         float *input_addr = in.getData<float>() + num_head * head_dim * i;
-        uint16_t *cache_addr = cache.getData<uint16_t>();
         const int row_to_compute = from + sequence_len;
         const size_t out_start_row = i * (from + sequence_len);
         float *output_addr = out.getData<float>() + out_start_row * num_head;
 
-        futures.emplace_back(pool.submit_task([=]() {
+        if (cache.getDataType() == ml::train::TensorDim::DataType::FP32) {
+          compute_kcaches_fp32_reference(
+            input_addr, cache.getData<float>(), output_addr, row_to_compute,
+            num_head / group_size, head_dim, group_size, local_window_size);
+        } else {
+          uint16_t *cache_addr = cache.getData<uint16_t>();
           nntrainer::compute_kcaches<uint16_t>(
             input_addr, cache_addr, output_addr, row_to_compute,
             num_head / group_size, head_dim, group_size, tile_size,
             local_window_size);
-        }));
+        }
       }
-
-      for (auto &fut : futures)
-        fut.get();
     }
 
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -411,7 +479,6 @@ void DebertaAttentionLayer::compute_kcaches(
           group_size, tile_size, local_window_size, head_kv, head_kv + 1);
       }
     } else {
-      std::vector<std::future<void>> futures;
       const unsigned int seq = static_cast<unsigned int>(sequence_len);
 
       for (unsigned int i = 0; i < seq; ++i) {
@@ -421,16 +488,11 @@ void DebertaAttentionLayer::compute_kcaches(
         const size_t out_start_row = i * (from + sequence_len);
         _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
 
-        futures.emplace_back(pool.submit_task([=]() {
-          nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
-                                     row_to_compute, num_head / group_size,
-                                     head_dim, group_size, tile_size,
-                                     local_window_size);
-        }));
+        nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
+                                   row_to_compute, num_head / group_size,
+                                   head_dim, group_size, tile_size,
+                                   local_window_size);
       }
-
-      for (auto &fut : futures)
-        fut.get();
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -443,8 +505,7 @@ void DebertaAttentionLayer::compute_kcaches(
  */
 void DebertaAttentionLayer::softmax_triangle(nntrainer::Tensor &qk_out,
                                              size_t row, size_t num_head,
-                                             unsigned int from,
-                                             BS::thread_pool<> &pool) {
+                                             unsigned int from) {
   if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
     float *qk_out_ = qk_out.getData<float>();
 
@@ -463,17 +524,12 @@ void DebertaAttentionLayer::softmax_triangle(nntrainer::Tensor &qk_out,
       const size_t end_row = from + row;
       nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
     } else {
-      std::vector<std::future<void>> futures;
       for (unsigned int i = 0; i < row; ++i) {
         const unsigned int to = from + row;
         const size_t start_row = i * to;
         const size_t end_row = (i + 1) * to;
-        futures.push_back(pool.submit_task([=]() {
-          nntrainer::softmax_row(qk_out_, start_row, end_row, num_head);
-        }));
+        nntrainer::softmax_row(qk_out_, start_row, end_row, num_head);
       }
-      for (auto &fut : futures)
-        fut.get();
     }
 
   } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -495,17 +551,12 @@ void DebertaAttentionLayer::softmax_triangle(nntrainer::Tensor &qk_out,
       const size_t end_row = from + row;
       nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
     } else {
-      std::vector<std::future<void>> futures;
       for (unsigned int i = 0; i < row; ++i) {
         const unsigned int to = from + row;
         const size_t start_row = i * to;
         const size_t end_row = (i + 1) * to;
-        futures.push_back(pool.submit_task([=]() {
-          nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
-        }));
+        nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
       }
-      for (auto &fut : futures)
-        fut.get();
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -518,72 +569,70 @@ void DebertaAttentionLayer::softmax_triangle(nntrainer::Tensor &qk_out,
  */
 void DebertaAttentionLayer::compute_fp16vcache_transposed(
   nntrainer::Tensor &in, nntrainer::Tensor &vcache, nntrainer::Tensor &output,
-  int from, int num_cache_head, int gqa_size, int head_dim, int to,
-  BS::thread_pool<> &pool) {
+  int from, int num_cache_head, int gqa_size, int head_dim, int to) {
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if ((to - from) != 1) {
-      std::vector<std::future<void>> futures;
       const int seq = to - from;
-      futures.reserve(seq);
 
       for (int i = 0; i < seq; ++i) {
-        futures.push_back(pool.submit_task([=]() {
-          const size_t start_idx = i * to;
-          const float *input =
-            in.getData<float>() + start_idx * num_cache_head * gqa_size;
-          float *out = output.getData<float>() +
-                       i * (num_cache_head * gqa_size * head_dim);
-          const int row_num = to - 1;
+        const size_t start_idx = i * to;
+        const float *input =
+          in.getData<float>() + start_idx * num_cache_head * gqa_size;
+        float *out =
+          output.getData<float>() + i * (num_cache_head * gqa_size * head_dim);
+        const int row_num = to - 1;
 
+        if (vcache.getDataType() == ml::train::TensorDim::DataType::FP32) {
+          compute_vcache_fp32_transposed_reference(
+            row_num, input, vcache.getData<float>(), out, num_cache_head,
+            gqa_size, head_dim, local_window_size);
+        } else {
           nntrainer::compute_fp16vcache_fp32_transposed(
             row_num, input, vcache.getData<uint16_t>(), out, num_cache_head,
             gqa_size, head_dim, local_window_size);
-        }));
+        }
       }
-
-      for (auto &fut : futures)
-        fut.get();
 
     } else {
       const int row_num = to - 1;
 
       const float *in_data = in.getData<float>();
-      const uint16_t *vcache_data = vcache.getData<uint16_t>();
       float *output_data = output.getData<float>();
 
 #pragma omp parallel for schedule(static)
       for (int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
-        nntrainer::compute_fp16vcache_fp32_transposed(
-          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
-          head_dim, local_window_size, head_kv, head_kv + 1);
+        if (vcache.getDataType() == ml::train::TensorDim::DataType::FP32) {
+          compute_vcache_fp32_transposed_reference(
+            row_num, in_data, vcache.getData<float>(), output_data,
+            num_cache_head, gqa_size, head_dim, local_window_size, head_kv,
+            head_kv + 1);
+        } else {
+          nntrainer::compute_fp16vcache_fp32_transposed(
+            row_num, in_data, vcache.getData<uint16_t>(), output_data,
+            num_cache_head, gqa_size, head_dim, local_window_size, head_kv,
+            head_kv + 1);
+        }
       }
     }
 
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     if ((to - from) != 1) {
-      std::vector<std::future<void>> futures;
       const int seq = to - from;
-      futures.reserve(seq);
 
       for (int i = 0; i < seq; ++i) {
-        futures.push_back(pool.submit_task([=]() {
-          const size_t start_idx = i * to;
-          const _FP16 *input =
-            in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
-          _FP16 *out = output.getData<_FP16>() +
-                       i * (num_cache_head * gqa_size * head_dim);
-          const int row_num = to - 1;
+        const size_t start_idx = i * to;
+        const _FP16 *input =
+          in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
+        _FP16 *out =
+          output.getData<_FP16>() + i * (num_cache_head * gqa_size * head_dim);
+        const int row_num = to - 1;
 
-          nntrainer::compute_fp16vcache_transposed(
-            row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
-            gqa_size, head_dim, local_window_size);
-        }));
+        nntrainer::compute_fp16vcache_transposed(
+          row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
+          gqa_size, head_dim, local_window_size);
       }
-
-      for (auto &fut : futures)
-        fut.get();
 
     } else {
       const int row_num = to - 1;
@@ -677,10 +726,10 @@ void DebertaAttentionLayer::add_relative_attn_score(
         }
 
         if (p2c) {
-          const int rel_rev = static_cast<int>(k) - static_cast<int>(q + from);
-          const int bucketed_rev = lookup_bucket(rel_rev);
+          const int rel = static_cast<int>(q + from) - static_cast<int>(k);
+          const int bucketed = lookup_bucket(rel);
           rel_idx_local.p2c_idx[static_cast<size_t>(q) * S_k + k] =
-            clampv(-bucketed_rev + static_cast<int>(att_span), 0,
+            clampv(-bucketed + static_cast<int>(att_span), 0,
                    static_cast<int>(rel_len_q) - 1);
         }
       }
@@ -711,7 +760,10 @@ void DebertaAttentionLayer::add_relative_attn_score(
 #endif
 
     std::vector<float> &key_cache_fp32_buf = tl_key_cache_fp32_buf;
-    const float *key_unpacked_ptr = nullptr;
+    const float *key_unpacked_ptr =
+      key_cache.getDataType() == ml::train::TensorDim::DataType::FP32
+        ? key_cache.getData<float>()
+        : nullptr;
 
     /**
      * p2c path needs key-cache values in FP32 for dot(q_rel, k_cache).
@@ -751,7 +803,7 @@ void DebertaAttentionLayer::add_relative_attn_score(
     }
 
     NNTR_THROW_IF(p2c && key_unpacked_ptr == nullptr, std::invalid_argument)
-      << "FP32 p2c path expected UINT16 or FP16 key cache";
+      << "FP32 p2c path expected FP32, UINT16, or FP16 key cache";
 
 #pragma omp parallel for schedule(static)
     for (unsigned int q_idx = 0; q_idx < S_q; ++q_idx) {
@@ -878,9 +930,6 @@ void DebertaAttentionLayer::one_batch_incremental_forwarding(
   ml::train::TensorDim &cache_value_dim,
   ml::train::TensorDim &cache_value_step_dim) {
 
-  auto &pool =
-    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
-
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
     batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
@@ -908,7 +957,7 @@ void DebertaAttentionLayer::one_batch_incremental_forwarding(
   const unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
   compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
-                  gqa_size, head_dim, pool);
+                  gqa_size, head_dim);
 
   const bool relative_attention =
     std::get<props::RelativeAttention>(deberta_props).get();
@@ -939,11 +988,10 @@ void DebertaAttentionLayer::one_batch_incremental_forwarding(
 #endif
     add_relative_attn_score(context, out_, query_step, b_cached_key, from, to);
   }
-  softmax_triangle(out_, to - from, num_heads_Q, from, pool);
+  softmax_triangle(out_, to - from, num_heads_Q, from);
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                from, num_heads_KV, gqa_size, head_dim, to,
-                                pool);
+                                from, num_heads_KV, gqa_size, head_dim, to);
 }
 
 void DebertaAttentionLayer::setBatch(nntrainer::RunLayerContext &context,
@@ -964,8 +1012,8 @@ void DebertaAttentionLayer::updateTensorsByInputDimensions(
   k_dim.setDataType(ml::train::TensorDim::DataType::FP16);
   v_dim.setDataType(ml::train::TensorDim::DataType::FP16);
 #else
-  k_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
-  v_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
+  k_dim.setDataType(input_dimensions[INPUT_IDX_K].getDataType());
+  v_dim.setDataType(input_dimensions[INPUT_IDX_V].getDataType());
 #endif
 
   context.updateInput(INPUT_IDX_Q, input_dimensions[INPUT_IDX_Q]);

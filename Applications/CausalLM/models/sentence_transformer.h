@@ -72,6 +72,13 @@ protected:
   std::pair<Tensor, Tensor> constructModel() override;
 
   /**
+   * @brief Construct the base transformer module before SentenceTransformer
+   * modules are appended.
+   * @return {input_tensor, output_tensor} pair for the base encoder/decoder.
+   */
+  virtual std::pair<Tensor, Tensor> constructTransformerModule();
+
+  /**
    * @brief Map of module type suffix to layer type name
    * @note This map is used to dynamically resolve the nntrainer layer type from
    * the module configuration type suffix.

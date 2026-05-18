@@ -13,9 +13,20 @@
 #ifndef __SHARED_FULLY_CONNECTED_LAYER_H__
 #define __SHARED_FULLY_CONNECTED_LAYER_H__
 
+#pragma once
+#ifndef WIN_EXPORT
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+#endif
+
 #include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
+
+#include <array>
 
 namespace causallm {
 
@@ -48,7 +59,7 @@ public:
  * @brief   A fully connected layer that skips reading weights from file
  *          (intended for use with shared_from weights)
  */
-class SharedFullyConnectedLayer : public nntrainer::LayerImpl {
+class WIN_EXPORT SharedFullyConnectedLayer : public nntrainer::LayerImpl {
 public:
   SharedFullyConnectedLayer();
 

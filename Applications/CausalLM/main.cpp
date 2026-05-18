@@ -169,7 +169,9 @@ std::string resolve_architecture(std::string model_type,
     } else if (architecture == "TimmViT" ||
                architecture == "vit_base_patch16_siglip_224") {
       return "TimmViT";
-    } else if (architecture == "deberta-v2") {
+    } else if (architecture == "deberta-v2" ||
+               architecture == "DebertaV2Model" ||
+               architecture == "DebertaV2ForMaskedLM") {
       return "DebertaV2";
     } else {
       throw std::invalid_argument(
@@ -260,6 +262,11 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "DebertaV2", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg,
+                                                   nntr_cfg);
+    });
 #if !defined(_WIN32) && !defined(__ANDROID__)
   causallm::Factory::Instance().registerModel(
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -271,11 +278,6 @@ int main(int argc, char *argv[]) {
     "TimmViT", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::TimmViTTransformer>(cfg, generation_cfg,
                                                             nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "DebertaV2", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg,
-                                                   nntr_cfg);
     });
 
   // Validate arguments

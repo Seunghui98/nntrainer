@@ -14,12 +14,20 @@
 #ifndef __DEBERTA_ATTENTION_LAYER_H__
 #define __DEBERTA_ATTENTION_LAYER_H__
 
+#pragma once
+#ifndef WIN_EXPORT
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+#endif
+
 #include <array>
 #include <mutex>
 #include <tuple>
 #include <vector>
 
-#include <bs_thread_pool_manager.hpp>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -113,7 +121,7 @@ public:
  * @class DebertaAttentionLayer
  * @brief DeBERTa Attention Layer
  */
-class DebertaAttentionLayer : public nntrainer::LayerImpl {
+class WIN_EXPORT DebertaAttentionLayer : public nntrainer::LayerImpl {
 public:
   /**
    * @brief Construct a new Deberta Attention Layer object
@@ -197,14 +205,13 @@ public:
   void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
                        nntrainer::Tensor &out, unsigned int from,
                        size_t sequence_len, unsigned int num_heads,
-                       unsigned int group_size, unsigned int head_dim,
-                       BS::thread_pool<> &pool);
+                       unsigned int group_size, unsigned int head_dim);
 
   /**
    * @brief softmax helper for score tensor
    */
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, BS::thread_pool<> &pool);
+                        unsigned int from);
 
   /**
    * @brief wrapper around nntrainer::compute_fp16vcache_transposed
@@ -213,8 +220,7 @@ public:
                                      nntrainer::Tensor &vcache,
                                      nntrainer::Tensor &output, int from,
                                      int num_cache_head, int gqa_size,
-                                     int head_dim, int to,
-                                     BS::thread_pool<> &pool);
+                                     int head_dim, int to);
 
 private:
   enum InputIndex {
