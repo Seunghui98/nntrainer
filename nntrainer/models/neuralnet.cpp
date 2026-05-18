@@ -54,6 +54,7 @@
 #include <remap_realizer.h>
 #include <slice_realizer.h>
 #include <util_func.h>
+#include <safetensors_util.h>
 
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
@@ -683,6 +684,55 @@ void NeuralNetwork::save(
       "saving with ONNX format is not supported yet.");
     break;
   }
+   case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    // Build the tensor entry list (graph order, deduped by pointer)
+    std::vector<safetensors::TensorEntry> entries;
+    std::unordered_set<const Tensor *> visited_st;
+    size_t data_offset = 0;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!visited_st.insert(&weight->getVariableRef()).second)
+          continue;
+        const auto &t = weight->getVariableRef();
+        const auto &dim = t.getDim();
+        const size_t nbytes = t.getMemoryBytes();
+        safetensors::TensorEntry entry;
+        entry.name = t.getName();
+        entry.dtype = safetensors::dtypeToString(dim.getDataType());
+        entry.shape = {dim.batch(), dim.channel(), dim.height(), dim.width()};
+        entry.offset_start = data_offset;
+        entry.offset_end = data_offset + nbytes;
+        entries.push_back(std::move(entry));
+        data_offset += nbytes;
+      }
+    }
+
+    // Write: [8-byte header_size][header (padded to 8)][raw weight data]
+    const std::string header_json = safetensors::buildHeader(entries);
+    const uint64_t header_size = static_cast<uint64_t>(header_json.size());
+
+    auto st_file = checkedOpenStream<std::ofstream>(
+      file_path, std::ios::out | std::ios::binary | std::ios::trunc);
+    st_file.write(reinterpret_cast<const char *>(&header_size),
+                  sizeof(header_size));
+    st_file.write(header_json.data(), static_cast<std::streamsize>(header_json.size()));
+
+    visited_st.clear();
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!visited_st.insert(&weight->getVariableRef()).second)
+          continue;
+        const auto &t = weight->getVariableRef();
+        const size_t nbytes = t.getMemoryBytes();
+        st_file.write(reinterpret_cast<const char *>(t.getData<char>()),
+                      static_cast<std::streamsize>(nbytes));
+      }
+    }
+    st_file.close();
+    break;
+  }
   default:
     throw nntrainer::exception::not_supported(
       "saving with given format is not supported yet");
@@ -945,6 +995,111 @@ void NeuralNetwork::load(const std::string &file_path,
     }
 
     qnn_load.join();
+    break;
+  }
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    NNTR_THROW_IF(!initialized, std::runtime_error)
+      << "Cannot load safetensors if not initialized yet, path: " << file_path;
+
+    const auto f_path = (v.size() == 2) ? v[1] : v[0];
+
+    // Read header_size (8 bytes) + header JSON
+    std::ifstream st_file(f_path, std::ios::in | std::ios::binary);
+    NNTR_THROW_IF(!st_file.is_open(), std::runtime_error)
+      << "Cannot open safetensors file: " << f_path;
+
+    uint64_t header_size = 0;
+    st_file.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+    NNTR_THROW_IF(!st_file, std::runtime_error)
+      << "Failed to read safetensors header length from: " << f_path;
+
+    std::string header_json(header_size, '\0');
+    st_file.read(header_json.data(), static_cast<std::streamsize>(header_size));
+    NNTR_THROW_IF(!st_file, std::runtime_error)
+      << "Failed to read safetensors header from: " << f_path;
+    st_file.close();
+
+    // data_base: byte offset in file where the data section starts
+    const size_t data_base = sizeof(uint64_t) + static_cast<size_t>(header_size);
+
+    // Parse header: name -> (offset_start, size_in_bytes)
+    auto name_offset_map = safetensors::parseHeader(header_json);
+
+    // Assign file offsets to each weight by name
+    std::unordered_set<const Tensor *> visited_st;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!visited_st.insert(&weight->getVariableRef()).second)
+          continue;
+        const std::string &name = weight->getName();
+        auto it = name_offset_map.find(name);
+        if (it == name_offset_map.end())
+          continue;
+        const size_t file_off = data_base + it->second.first;
+        weight->getVariableRef().setFileOffset(file_off);
+      }
+    }
+
+    if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
+      model_file_fd = ::open(f_path.c_str(), O_RDONLY);
+      NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
+        << "Cannot open safetensors file: " << f_path;
+
+      std::vector<std::thread> threads;
+      threads.reserve(model_graph.size());
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        auto node = *iter;
+        threads.emplace_back([&, node]() {
+          if (!MMAP_READ) {
+            auto local_file =
+              checkedOpenStream<std::ifstream>(f_path, std::ios::in | std::ios::binary);
+            node->read(local_file, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+          } else {
+            int fd = ::open(f_path.c_str(), O_RDONLY);
+            NNTR_THROW_IF((fd == -1), std::invalid_argument)
+              << "Cannot open safetensors file: " << f_path;
+
+            struct stat st {};
+            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+              << "Cannot stat safetensors file: " << f_path;
+
+            const size_t f_size = static_cast<size_t>(st.st_size);
+            void *mmap_ptr =
+              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd);
+            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+              << "mmap failed for safetensors file: " << f_path;
+
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+
+            char *view = static_cast<char *>(mmap_ptr);
+            node->read(view, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            ::munmap(mmap_ptr, f_size);
+          }
+        });
+      }
+      for (auto &t : threads) {
+        if (t.joinable())
+          t.join();
+      }
+    } else {
+      // TRAINING mode: sequential read
+      std::ifstream st_in(f_path, std::ios::in | std::ios::binary);
+      NNTR_THROW_IF(!st_in.is_open(), std::runtime_error)
+        << "Cannot open safetensors file for training load: " << f_path;
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        (*iter)->read(st_in, false, exec_mode, fsu_mode);
+      }
+    }
+
+    ml_logi("read safetensors model file: %s", f_path.c_str());
     break;
   }
   default:
