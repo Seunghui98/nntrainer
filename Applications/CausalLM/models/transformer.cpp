@@ -28,6 +28,17 @@
 
 namespace causallm {
 
+ml::train::ModelFormat
+Transformer::formatFromExtension(const std::string &weight_path) {
+  const auto dot = weight_path.find_last_of('.');
+  if (dot != std::string::npos) {
+    const std::string ext = weight_path.substr(dot + 1);
+    if (ext == "safetensors")
+      return ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
+  }
+  return ml::train::ModelFormat::MODEL_FORMAT_BIN;
+}
+
 std::string LoadBytesFromFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
@@ -209,7 +220,7 @@ void Transformer::load_weight(const std::string &weight_path) {
   }
 
   try {
-    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    model->load(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));
@@ -225,7 +236,7 @@ void Transformer::save_weight(const std::string &weight_path) {
   }
 
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    model->save(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights: " +
                              std::string(e.what()));
@@ -244,7 +255,7 @@ void Transformer::save_weight(
   }
 
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, dtype,
+    model->save(weight_path, formatFromExtension(weight_path), dtype,
                 layer_dtype_map);
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights with dtype: " +
