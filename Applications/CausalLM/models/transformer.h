@@ -187,7 +187,8 @@ protected:
   /*
    * @brief support formatFromExtension (bin/safetensors)
    */
-  virtual ml::train::ModelFormat formatFromExtension(const std::string &weight_path);
+  virtual ml::train::ModelFormat
+  formatFromExtension(const std::string &weight_path);
 
   /**
    * @brief register Outputs
