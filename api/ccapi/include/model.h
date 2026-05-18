@@ -98,7 +98,7 @@ for inference and training without any configurations*/
   MODEL_FORMAT_ONNX = ML_TRAIN_MODEL_FORMAT_ONNX, /**< ONNX file */
 
   MODEL_FORMAT_QNN = ML_TRAIN_MODEL_FORMAT_QNN, /**< qnn binary file */
-  
+
   MODEL_FORMAT_SAFETENSORS =
     ML_TRAIN_MODEL_FORMAT_SAFETENSORS, /**< safetensors file */
 };

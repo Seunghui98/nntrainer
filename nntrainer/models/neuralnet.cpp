@@ -52,9 +52,9 @@
 #include <profiler.h>
 #include <recurrent_realizer.h>
 #include <remap_realizer.h>
+#include <safetensors_util.h>
 #include <slice_realizer.h>
 #include <util_func.h>
-#include <safetensors_util.h>
 
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
@@ -684,7 +684,7 @@ void NeuralNetwork::save(
       "saving with ONNX format is not supported yet.");
     break;
   }
-   case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
     // Build the tensor entry list (graph order, deduped by pointer)
     std::vector<safetensors::TensorEntry> entries;
     std::unordered_set<const Tensor *> visited_st;
@@ -716,7 +716,8 @@ void NeuralNetwork::save(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
     st_file.write(reinterpret_cast<const char *>(&header_size),
                   sizeof(header_size));
-    st_file.write(header_json.data(), static_cast<std::streamsize>(header_json.size()));
+    st_file.write(header_json.data(),
+                  static_cast<std::streamsize>(header_json.size()));
 
     visited_st.clear();
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
@@ -1020,7 +1021,8 @@ void NeuralNetwork::load(const std::string &file_path,
     st_file.close();
 
     // data_base: byte offset in file where the data section starts
-    const size_t data_base = sizeof(uint64_t) + static_cast<size_t>(header_size);
+    const size_t data_base =
+      sizeof(uint64_t) + static_cast<size_t>(header_size);
 
     // Parse header: name -> (offset_start, size_in_bytes)
     auto name_offset_map = safetensors::parseHeader(header_json);
@@ -1053,8 +1055,8 @@ void NeuralNetwork::load(const std::string &file_path,
         auto node = *iter;
         threads.emplace_back([&, node]() {
           if (!MMAP_READ) {
-            auto local_file =
-              checkedOpenStream<std::ifstream>(f_path, std::ios::in | std::ios::binary);
+            auto local_file = checkedOpenStream<std::ifstream>(
+              f_path, std::ios::in | std::ios::binary);
             node->read(local_file, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
           } else {
