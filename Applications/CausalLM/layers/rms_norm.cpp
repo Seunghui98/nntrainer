@@ -13,6 +13,9 @@
 
 #include <cmath>
 #include <iostream>
+#include <mutex>
+#include <set>
+#include <string>
 
 #include "rms_norm.h"
 
@@ -79,6 +82,35 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     std::cout << context.getName() << " \n input:" << in_step
               << "output:" << out_step << "gamma:" << gamma << std::endl;
 #endif
+  }
+
+  // -------- DIAGNOSTIC: per-layer residual stream probe --------
+  // Print input[t=0] / output[t=0] first4 ONCE per unique layer name.
+  // For `layer{i}_attention_norm` the input is the previous decoder block's
+  // output — directly comparable to PyTorch's `layer{i-1}_block_out`.
+  // For `output_norm` the output is directly comparable to PyTorch's
+  // `final_norm_out`.
+  {
+    static std::mutex probe_mtx;
+    static std::set<std::string> seen;
+    const std::string &nm = context.getName();
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> lk(probe_mtx);
+      if (seen.insert(nm).second)
+        first = true;
+    }
+    if (first &&
+        in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const float *pi = in.getData<float>();
+      const float *po = out.getData<float>();
+      const unsigned int W = in.width();
+      std::cerr << "[rms_norm probe " << nm << "] in[t=0] first4="
+                << pi[0] << " " << pi[1] << " " << pi[2] << " " << pi[3]
+                << " | out[t=0] first4="
+                << po[0] << " " << po[1] << " " << po[2] << " " << po[3]
+                << " (W=" << W << ")\n";
+    }
   }
 }
 

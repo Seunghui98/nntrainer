@@ -4,6 +4,7 @@ causallm_src = [
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
+    meson.current_source_dir() / 'kv_cache_manager.cpp',
 ]
 
 executable_src = [
@@ -42,6 +43,14 @@ endif
 
 tokenizer_dependencies = []
 tokenizer_path = meson.current_source_dir() / 'lib' / 'libtokenizers_c.a'
+tokenizer_windows_path = meson.build_root() / 'tokenizers_c_win' / 'target' / 'release' / 'tokenizers_c.lib'
+tokenizer_windows_link_args = [
+    tokenizer_windows_path,
+    'bcrypt.lib',
+    'ntdll.lib',
+    'userenv.lib',
+    'ws2_32.lib'
+]
 
 cpp_args = []
 
@@ -49,24 +58,40 @@ if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
 endif
 
-causallm = shared_library('causallm',
-    causallm_src,
-    dependencies: [
-        nntrainer_dep,
-        nntrainer_ccapi_dep,
-        causallm_layer_dependencies, 
-        tokenizer_dependencies
-    ],
-    include_directories: causallm_inc,
-    install: true,
-    install_dir: application_install_dir,
-    link_args: [tokenizer_path],
-    cpp_args: cpp_args
-)
+if get_option('platform') == 'windows'
+    causallm = static_library('causallm',
+        causallm_src,
+        dependencies: [
+            nntrainer_dep,
+            nntrainer_ccapi_dep,
+            causallm_layer_dependencies,
+            tokenizer_dependencies
+        ],
+        include_directories: causallm_inc,
+        install: true,
+        cpp_args: cpp_args
+    )
+else
+    causallm = shared_library('causallm',
+        causallm_src,
+        dependencies: [
+            nntrainer_dep,
+            nntrainer_ccapi_dep,
+            causallm_layer_dependencies,
+            tokenizer_dependencies
+        ],
+        include_directories: causallm_inc,
+        install: true,
+        install_dir: application_install_dir,
+        link_args: [tokenizer_path],
+        cpp_args: cpp_args
+    )
+endif
 
 causallm_dep = declare_dependency(
     link_with: [causallm],
-    include_directories: causallm_inc
+    include_directories: causallm_inc,
+    link_args: get_option('platform') == 'windows' ? tokenizer_windows_link_args : []
 )
 
 e = executable('nntr_causallm',
@@ -98,3 +123,21 @@ test_api = executable('test_api',
     build_by_default: true,
     install: false,
 )
+
+# KVCacheManager unit tests
+if get_option('enable-test')
+  unittest_kv_cache_manager = executable(
+    'unittest_kv_cache_manager',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_kv_cache_manager', unittest_kv_cache_manager,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_cache_manager'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+endif

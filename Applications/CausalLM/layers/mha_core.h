@@ -295,6 +295,18 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @brief Set the cache index for external cache mode.
+   *        Must be called before forwarding() when use_external_cache is true.
+   * @param[in] idx current write position in the KV cache
+   */
+  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+
+  /**
+   * @brief Get the current cache index
+   */
+  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+
   inline static const std::string type = "mha_core";
 
 private:
@@ -315,6 +327,33 @@ private:
 
   float epsilon;            /** to avoid overflow */
   unsigned int cache_index; /** idx of kv cache */
+
+  /**
+   * @brief Whether to use externally provided cache tensors
+   *        (true when num_inputs >= 5, i.e., Q, K, V + cache_key + cache_value)
+   *        In external mode mha_core does not allocate its own cache tensors,
+   *        and reads cache slots from input[3] (cache_key) and input[4]
+   *        (cache_value) which are bound by the host via setExternalTensors.
+   */
+  bool use_external_cache = false;
+
+  /**
+   * @brief Active step size for the next external-cache forwarding() call.
+   *
+   * incremental_forwarding() is the inference entry point and knows the
+   * active range via its (_from, _to) parameters. forwarding() does not
+   * receive that range, so when it dispatches into the external-cache
+   * branch it would otherwise fall back to query.height() — which is the
+   * buffer size (INIT_SEQ_LEN), not the active token count. That writes
+   * past the live data into the padded portion of cache_key/cache_value
+   * and produces gibberish from the LM head.
+   *
+   * incremental_forwarding() sets this to (_to - _from) before calling
+   * forwarding() in external-cache mode; forwarding() uses it as the
+   * authoritative step size when set, and falls back to query.height()
+   * for the legacy training path.
+   */
+  unsigned int external_step_size = 0;
 
   /** intermal info */
   size_t num_heads_Q;
@@ -400,11 +439,12 @@ private:
    * @param[out] out output tensor
    * @param[in] dim hidden dim size
    * @param[in] from sequence order
-   * @param[in] convert_only - conversion only
+   * @param[in] apply_rope true to apply rotary embedding, false to only store
+   *                       the tensor into the cache dtype
    */
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
-                                  bool convert_only = false);
+                                  bool apply_rope = true);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,
