@@ -2,9 +2,9 @@
 /**
  * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
  *
+ * @brief  safetensors dtype mapping + JSON header build/parse helpers.
  * @file   safetensors_util.cpp
  * @date   18 May 2026
- * @brief  safetensors dtype mapping + JSON header build/parse helpers.
  */
 
 #include "safetensors_util.h"

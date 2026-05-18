@@ -2,9 +2,9 @@
 /**
  * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
  *
+ * @brief  Util helpers for the safetensors format.
  * @file   safetensors_util.h
  * @date   18 May 2026
- * @brief  Minimal helpers for the safetensors on-disk format.
  */
 
 #ifndef __SAFETENSORS_UTIL_H__
