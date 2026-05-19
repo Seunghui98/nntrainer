@@ -293,8 +293,9 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     sink = context.getWeight(sink_idx);
   }
 
-  unsigned int step_size =
-    (incremental_step_size > 0) ? incremental_step_size : (unsigned int)query.height();
+  unsigned int step_size = (incremental_step_size > 0)
+                             ? incremental_step_size
+                             : (unsigned int)query.height();
   unsigned int from = cache_index;
   unsigned int to = cache_index + step_size;
 
