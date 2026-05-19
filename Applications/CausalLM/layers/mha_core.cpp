@@ -293,7 +293,21 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     sink = context.getWeight(sink_idx);
   }
 
-  unsigned int step_size = query.height();
+// 기존:
+// unsigned int step_size = query.height();
+// 교체:
+unsigned int step_size =
+    (external_step_size > 0) ? external_step_size : (unsigned int)query.height();
+
+// ← 기존 call_once 대신 이걸로 교체:
+{
+  static std::atomic<int> _cnt{0};
+  int n = _cnt.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) {
+    std::cerr << "[forwarding #" << n << "] step_size=" << step_size
+              << " cache_index=" << cache_index << "\n";
+  }
+}
   unsigned int from = cache_index;
   unsigned int to = cache_index + step_size;
 
@@ -396,11 +410,18 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
+  // if (use_external_cache) {
+  //   cache_index = _from;
+  //   forwarding(context, training);
+  //   return;
+  // }
   if (use_external_cache) {
     cache_index = _from;
+    external_step_size = _to - _from;  // ← 추가: 1 for generation, L for prefill
     forwarding(context, training);
+    external_step_size = 0;            // ← 추가: reset
     return;
-  }
+}
 
   /// @todo replace step_size into input height
   unsigned int step_size = _to - _from;
@@ -565,6 +586,16 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
                                    size_t sequence_len, unsigned int num_head,
                                    unsigned int group_size,
                                    unsigned int head_dim) {
+  // ← 여기에 추가:
+  {
+    static std::once_flag _once;
+    std::call_once(_once, [&] {
+      std::cerr << "[compute_kcaches] in=" << (int)in.getDataType()
+                << " cache=" << (int)cache.getDataType()
+                << " seq_len=" << sequence_len << "\n";
+      // DataType::FP32 == 1, UINT16 == 3, FP16 == 2
+    });
+  }
 
   // Dispatch based on data type (FP32 or FP16)
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
