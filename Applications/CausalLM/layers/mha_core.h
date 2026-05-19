@@ -387,6 +387,9 @@ private:
   float scale = 1.0f;
   unsigned int original_max_position_embeddings = 4096;
 
+  /** set by incremental_forwarding, used by forwarding */
+  unsigned int incremental_step_size = 0;
+
   /****************** ROTARY EMBEDDING *****************/
   /** static variable - they are all expected to be initialized once */
   /**
