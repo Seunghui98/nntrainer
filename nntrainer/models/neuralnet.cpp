@@ -802,7 +802,7 @@ void NeuralNetwork::load(const std::string &file_path,
         void *mmap_ptr = ::mmap(nullptr, shared_f_size, PROT_READ, MAP_PRIVATE,
                                 model_file_fd, 0);
         NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-          << "mmap failed for shared model view: " << strerror(errno);
+          << "mmap failed for shared model view";
 
         // Hint: many model loads touch scattered regions -> RANDOM helps
         // reduce readahead
