@@ -761,7 +761,56 @@ void NeuralNetwork::load(const std::string &file_path,
       model_file_fd = open(f_path.c_str(), O_RDONLY);
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
-      // std::vector<std::future<void>> futures;
+
+      // Map the model file ONCE and share the view across all node threads.
+      // The previous per-thread mapping reserved N * file_size of virtual
+      // address space (N = number of graph nodes). For large source files
+      // (e.g. FP32 weights for quantization) on 39-bit-VA Android kernels
+      // this exhausts the per-process VA and mmap() returns MAP_FAILED with
+      // ENOMEM in nearly every thread, terminating the process.
+      char *shared_view = nullptr;
+#if defined(_WIN32)
+      HANDLE shared_hFile = INVALID_HANDLE_VALUE;
+      HANDLE shared_hMap = NULL;
+      if (MMAP_READ) {
+        shared_hFile =
+          CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        NNTR_THROW_IF((shared_hFile == INVALID_HANDLE_VALUE),
+                      std::runtime_error)
+          << "CreateFileA failed";
+
+        shared_hMap =
+          CreateFileMapping(shared_hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        NNTR_THROW_IF((shared_hMap == NULL), std::runtime_error)
+          << "CreateFileMapping failed";
+
+        shared_view = static_cast<char *>(
+          MapViewOfFile(shared_hMap, FILE_MAP_READ, 0, 0, 0));
+        NNTR_THROW_IF((shared_view == nullptr), std::runtime_error)
+          << "MapViewOfFile failed";
+      }
+#else
+      size_t shared_f_size = 0;
+      if (MMAP_READ) {
+        struct stat st {};
+        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1),
+                      std::invalid_argument)
+          << "Cannot get file info (fstat): " << f_path;
+
+        shared_f_size = static_cast<size_t>(st.st_size);
+        void *mmap_ptr = ::mmap(nullptr, shared_f_size, PROT_READ, MAP_PRIVATE,
+                                model_file_fd, 0);
+        NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+          << "mmap failed for shared model view: " << strerror(errno);
+
+        // Hint: many model loads touch scattered regions -> RANDOM helps
+        // reduce readahead
+        (void)::posix_madvise(mmap_ptr, shared_f_size, POSIX_MADV_RANDOM);
+        shared_view = static_cast<char *>(mmap_ptr);
+      }
+#endif
+
       std::vector<std::thread> threads;
       threads.reserve(model_graph.size());
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -776,69 +825,31 @@ void NeuralNetwork::load(const std::string &file_path,
             node->read(local_model_file, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
           } else {
-#if defined(_WIN32)
-            // Map per-ask, then unmap immediately after: enables early release
-            // of pages
-            HANDLE hFile =
-              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
-              << "CreateFileA failed";
-
-            HANDLE hMap =
-              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
-              << "CreateFileMapping failed";
-
-            char *view =
-              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-            NNTR_THROW_IF((view == nullptr), std::runtime_error)
-              << "MapViewOfFile failed";
-
-            node->read(view, false, exec_mode, fsu_mode,
+            node->read(shared_view, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
-
-            // Early unmap: let the OS reclaim the working set ASAP
-            UnmapViewOfFile(view);
-            CloseHandle(hMap);
-            CloseHandle(hFile);
-#else
-            // POSIX: map per-task, advise kernel, drop pages, unmap
-            int fd = ::open(f_path.c_str(), O_RDONLY);
-            NNTR_THROW_IF((fd == -1), std::invalid_argument)
-              << "Cannot open file : " << f_path;
-
-            struct stat st {};
-            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-              << "Cannot get file info (fstat): " << f_path;
-
-            size_t f_size = static_cast<size_t>(st.st_size);
-            void *mmap_ptr =
-              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            ::close(fd); // fd not needed after mmap
-            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-              << "mmap failed";
-
-            // Hint: many model loads touch scattered regions -> RANDOM helps
-            // reduce readahead
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
-
-            char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
-
-            // Early drop: pages no longer needed; helps lower peak RSS during
-            // overlap
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
-
-            ::munmap(mmap_ptr, f_size);
-#endif
           }
         });
       }
       for (auto &t : threads) {
         if (t.joinable())
           t.join();
+      }
+
+      if (MMAP_READ) {
+#if defined(_WIN32)
+        if (shared_view != nullptr)
+          UnmapViewOfFile(shared_view);
+        if (shared_hMap != NULL)
+          CloseHandle(shared_hMap);
+        if (shared_hFile != INVALID_HANDLE_VALUE)
+          CloseHandle(shared_hFile);
+#else
+        if (shared_view != nullptr) {
+          (void)::posix_madvise(shared_view, shared_f_size,
+                                POSIX_MADV_DONTNEED);
+          ::munmap(shared_view, shared_f_size);
+        }
+#endif
       }
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
