@@ -401,12 +401,19 @@ void printUsage(const char *prog) {
  * The dtype map assigns:
  *   - embedding0             -> embd_dtype
  *   - All FC layers (wq, wk, wv, attention_out, ffn_*) -> fc_dtype
- *   - output_of_causallm     -> lmhead_dtype
+ *   - output_of_causallm     -> lmhead_dtype (only when NOT tied)
  *   - RMSNorm / other layers -> FP32 (not quantized)
+ *
+ * When tie_word_embeddings is true, output_of_causallm shares its weight with
+ * embedding0 and its save() is a no-op — including it in the map is harmless
+ * but misleading, and the serialized nntr_config should advertise a single
+ * shared dtype for the two layers. We omit it here and let the caller copy
+ * embd_dtype into lmhead_dtype in the rewritten nntr_config.
  */
 std::map<std::string, DataType>
 buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
-                   DataType lmhead_dtype, bool include_lmhead) {
+                   DataType lmhead_dtype, bool include_lmhead,
+                   bool tie_word_embeddings) {
 
   std::map<std::string, DataType> dtype_map;
 
@@ -433,13 +440,108 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
     }
   }
 
-  // LM Head layer
-  if (include_lmhead && lmhead_dtype != DataType::FP32 &&
-      lmhead_dtype != DataType::NONE) {
+  // LM Head layer (only when not tied to the embedding — the tied layer
+  // shares the embedding weight and TieWordEmbedding::save() is a no-op for
+  // the lm_head mode anyway).
+  if (include_lmhead && !tie_word_embeddings &&
+      lmhead_dtype != DataType::FP32 && lmhead_dtype != DataType::NONE) {
     dtype_map["output_of_causallm"] = lmhead_dtype;
   }
 
   return dtype_map;
+}
+
+/**
+ * @brief Validate the requested quantization plan against what the loaded
+ *        source model and the per-layer save paths actually support.
+ *
+ * The CausalLM model is configured with the *source* dtypes read from
+ * nntr_config.json, so the in-memory weight type of each layer matches
+ * whatever the source .bin holds. The quantize-on-save path
+ * (NeuralNetwork::save with a layer_dtype_map) only handles FP32 -> {Q4_0,
+ * Q6_K} re-quantization today. Re-quantizing an already-quantized weight
+ * (Q6_K -> Q4_0, etc.) is rejected at the layer level with
+ *
+ *     "Save with quantization only supports for FP32 weight."
+ *
+ * The exception is thrown deep in NeuralNetwork::save, so without an up-front
+ * check we either burn time loading the whole model just to throw, or trip a
+ * corrupt save path. Validate here and report the offending mismatch before
+ * any work happens.
+ *
+ * Tied embeddings get an extra restriction: TieWordEmbedding::save only knows
+ * how to serialize Q6_K (and passes through FP32). The lm_head side shares
+ * the embedding weight and is a save no-op, so the embedding dtype is what
+ * gets written for both. Q4_0 / Q4_K requests on a tied model are therefore
+ * rejected with guidance to use Q6_K.
+ */
+void validateRequestedDtypes(const json &nntr_cfg, DataType fc_dtype,
+                             DataType embd_dtype, DataType lmhead_dtype,
+                             bool tie_word_embeddings) {
+
+  auto src_dtype = [&nntr_cfg](const char *key,
+                               const char *fallback_key) -> DataType {
+    std::string s;
+    if (nntr_cfg.contains(key) && nntr_cfg[key].is_string())
+      s = nntr_cfg[key].get<std::string>();
+    else if (fallback_key && nntr_cfg.contains(fallback_key) &&
+             nntr_cfg[fallback_key].is_string())
+      s = nntr_cfg[fallback_key].get<std::string>();
+    else
+      return DataType::FP32;
+    return strToDataType(s);
+  };
+
+  const DataType src_fc = src_dtype("fc_layer_dtype", nullptr);
+  const DataType src_embd = src_dtype("embedding_dtype", nullptr);
+  const DataType src_lmhead = src_dtype("lmhead_dtype", "embedding_dtype");
+
+  // Layer save() accepts (target == src) and (target == NONE / FP32, i.e.
+  // "no conversion requested") as passthroughs; both fall through to a
+  // verbatim weight.save(). The only path that actually re-encodes a weight
+  // requires the source to be FP32, so reject (src=quantized, dst=different
+  // quantized). dst=FP32 against a quantized source is *not* a true
+  // re-quantization either (no dequantizer in save), but the layer treats it
+  // as passthrough, so leave it alone here.
+  auto reject_requant = [](const char *name, DataType src, DataType dst) {
+    if (src != DataType::FP32 && dst != DataType::FP32 &&
+        dst != DataType::NONE && dst != src) {
+      throw std::runtime_error(
+        std::string("Cannot re-quantize ") + name + " from " +
+        dataTypeToStr(src) + " to " + dataTypeToStr(dst) +
+        ": the per-layer save path only supports FP32 -> {Q4_0, Q6_K}. "
+        "Re-run the source-model converter with --fc-dtype fp32 (or the "
+        "equivalent option for the embedding) so the .bin is plain FP32, "
+        "then re-quantize.");
+    }
+  };
+  reject_requant("fc_layer_dtype", src_fc, fc_dtype);
+  reject_requant("embedding_dtype", src_embd, embd_dtype);
+  reject_requant("lmhead_dtype", src_lmhead, lmhead_dtype);
+
+  if (tie_word_embeddings) {
+    if (embd_dtype != lmhead_dtype) {
+      throw std::runtime_error(
+        "tie_word_embeddings=true but --embd_dtype (" +
+        dataTypeToStr(embd_dtype) + ") and --lmhead_dtype (" +
+        dataTypeToStr(lmhead_dtype) +
+        ") differ. With tied embeddings the two layers share one weight and "
+        "must use the same dtype.");
+    }
+    auto reject_tied = [](DataType dt, const char *opt) {
+      if (dt == DataType::Q4_0 || dt == DataType::Q4_K) {
+        throw std::runtime_error(
+          std::string("tie_word_embeddings=true is incompatible with ") +
+          opt + "=" + dataTypeToStr(dt) +
+          ". TieWordEmbedding only supports Q6_K (or FP32) for quantization "
+          "because the shared weight has to serve both the embedding lookup "
+          "and the lm_head matmul. Re-run with --embd_dtype Q6_K "
+          "--lmhead_dtype Q6_K.");
+      }
+    };
+    reject_tied(embd_dtype, "--embd_dtype");
+    reject_tied(lmhead_dtype, "--lmhead_dtype");
+  }
 }
 
 /**
@@ -603,11 +705,19 @@ int main(int argc, char *argv[]) {
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
     int num_layers = cfg["num_hidden_layers"].get<int>();
+    // tie_word_embeddings is optional in some configs (e.g. pure embedding
+    // models or BERT-style encoders that don't declare it). Default to false
+    // so existing flows keep their current behaviour.
+    bool tie_word_embeddings = cfg.contains("tie_word_embeddings") &&
+                               cfg["tie_word_embeddings"].is_boolean() &&
+                               cfg["tie_word_embeddings"].get<bool>();
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
 
     std::cout << "  Architecture: " << architecture << "\n";
     std::cout << "  Num layers:   " << num_layers << "\n";
+    std::cout << "  Tied embed:   " << (tie_word_embeddings ? "yes" : "no")
+              << "\n";
     std::cout << "  Source:       " << src_weight_path << "\n";
     std::cout << "  Target:       " << dst_weight_path << "\n";
     std::cout << "  FC dtype:     " << dataTypeToStr(fc_dtype) << "\n";
@@ -615,6 +725,16 @@ int main(int argc, char *argv[]) {
     std::cout << "  LMHead dtype: " << dataTypeToStr(lmhead_dtype) << "\n";
     std::cout << "  Target ISA:   " << isaToStr(target_isa) << "\n";
     std::cout << "\n";
+
+    // Validate the requested combination *before* paying the cost of loading
+    // the model. The per-layer save path can only re-quantize FP32 sources,
+    // and tied embeddings have no Q4_0/Q4_K serializer — without an up-front
+    // check we'd either burn a 2GB load just to throw deep in save(), or hit
+    // a partially-corrupt output file. NeuralNetwork::load() additionally
+    // segfaults via mmap if the bin is smaller than the graph expects
+    // (one symptom of the same class of mismatch).
+    validateRequestedDtypes(nntr_cfg, fc_dtype, embd_dtype, lmhead_dtype,
+                            tie_word_embeddings);
 
     // =========================================================================
     // Step 2: Register models & create model instance
@@ -657,8 +777,9 @@ int main(int argc, char *argv[]) {
       include_lmhead = false;
     }
 
-    auto layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
-                                              lmhead_dtype, include_lmhead);
+    auto layer_dtype_map =
+      buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype, lmhead_dtype,
+                         include_lmhead, tie_word_embeddings);
     addSentenceTransformerLayerDtypes(layer_dtype_map, nntr_cfg, model_path,
                                       fc_dtype);
 
@@ -686,13 +807,40 @@ int main(int argc, char *argv[]) {
     // =========================================================================
     std::cout << "[5/5] Generating nntr_config.json...\n";
 
+    // Resolve the dtype each bucket was actually written with: layer save()
+    // passes the weight through verbatim when the requested target matches
+    // the in-memory dtype (e.g. when a Q6_K source is "quantized to FP32"),
+    // so the output .bin keeps the source's dtype rather than the option
+    // value. Reflect that in the rewritten nntr_config so the next run
+    // creates layers with the right weight type.
+    auto effective_dtype = [](DataType requested, const json &src_cfg,
+                              const char *key,
+                              const char *fallback_key) -> std::string {
+      if (requested != DataType::FP32 && requested != DataType::NONE)
+        return dataTypeToStr(requested);
+      if (src_cfg.contains(key) && src_cfg[key].is_string())
+        return src_cfg[key].get<std::string>();
+      if (fallback_key && src_cfg.contains(fallback_key) &&
+          src_cfg[fallback_key].is_string())
+        return src_cfg[fallback_key].get<std::string>();
+      return dataTypeToStr(requested);
+    };
+
     json new_nntr_cfg = nntr_cfg;
     new_nntr_cfg["model_file_name"] = output_bin_name;
-    new_nntr_cfg["fc_layer_dtype"] = dataTypeToStr(fc_dtype);
-    new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
-    new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
-    new_nntr_cfg["model_tensor_type"] =
-      buildModelTensorType(dataTypeToStr(fc_dtype));
+    const std::string effective_fc =
+      effective_dtype(fc_dtype, nntr_cfg, "fc_layer_dtype", nullptr);
+    const std::string effective_embd =
+      effective_dtype(embd_dtype, nntr_cfg, "embedding_dtype", nullptr);
+    const std::string effective_lmhead =
+      tie_word_embeddings
+        ? effective_embd
+        : effective_dtype(lmhead_dtype, nntr_cfg, "lmhead_dtype",
+                          "embedding_dtype");
+    new_nntr_cfg["fc_layer_dtype"] = effective_fc;
+    new_nntr_cfg["embedding_dtype"] = effective_embd;
+    new_nntr_cfg["lmhead_dtype"] = effective_lmhead;
+    new_nntr_cfg["model_tensor_type"] = buildModelTensorType(effective_fc);
 
     std::string output_config_path = output_dir + "/nntr_config.json";
 

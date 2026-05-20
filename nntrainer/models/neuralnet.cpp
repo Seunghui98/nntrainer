@@ -27,10 +27,12 @@
 #include <cmath>
 #include <compute_ops.h>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -745,6 +747,34 @@ void NeuralNetwork::load(const std::string &file_path,
       << "Cannot load if not initialized yet, path: " << file_path
       << " format: " << static_cast<unsigned>(format);
     auto f_path = (v.size() == 2) ? v[1] : v[0];
+
+    // Validate that the file is large enough to satisfy every weight read
+    // scheduled above. The inference path below dispatches one thread per
+    // graph node and reads from `weight_file_offset .. weight_file_offset +
+    // weight_bytes` via either ifstream::read or mmap+memcpy. mmap silently
+    // succeeds for offsets past EOF, and the subsequent memcpy then SIGSEGVs
+    // (the user-visible symptom is a bare "segmentation fault" partway
+    // through Tensor::read on whichever node happened to draw the last
+    // shard). Catching the size mismatch here surfaces the real problem —
+    // the .bin doesn't match the model the graph expects — instead of a
+    // cryptic crash inside a worker thread.
+    {
+      std::error_code ec;
+      auto on_disk = std::filesystem::file_size(f_path, ec);
+      if (!ec && on_disk < start_from) {
+        std::ostringstream msg;
+        msg << "model weight file is smaller than the graph expects: "
+            << f_path << " is " << on_disk << " bytes but the compiled graph "
+            << "requires at least " << start_from
+            << " bytes for its weights. The most common cause is a config "
+               "vs. .bin mismatch — e.g. nntr_config.json declares "
+               "embedding_dtype/fc_layer_dtype/lmhead_dtype values that "
+               "don't agree with what the .bin was actually written with, "
+               "or tie_word_embeddings differs between config.json and the "
+               "converter that produced the .bin.";
+        throw std::runtime_error(msg.str());
+      }
+    }
 
     auto model_file =
       checkedOpenStream<std::ifstream>(f_path, std::ios::in | std::ios::binary);
