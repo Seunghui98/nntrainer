@@ -43,7 +43,9 @@
 #include <weight_layer.h>
 
 #include <cmath>
+#include <chrono>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -420,12 +422,39 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+  // [TEMP DEBUG] per-layer-type timing for the Gen-phase regression hunt.
+  // Sums wall-clock spent in forwarding_op for every node, broken down by
+  // layer type. Dumped to stderr at function exit so each
+  // incremental_inference call produces exactly one line per token.
+  std::map<std::string, std::pair<unsigned int, long long>> type_us;
+  auto loop_start = std::chrono::steady_clock::now();
+
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
+    auto node_start = std::chrono::steady_clock::now();
     forwarding_op(*iter, training);
+    auto node_end = std::chrono::steady_clock::now();
+    auto &slot = type_us[ln->getType()];
+    slot.first++;
+    slot.second +=
+      std::chrono::duration_cast<std::chrono::microseconds>(node_end -
+                                                            node_start)
+        .count();
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
+
+  auto loop_end = std::chrono::steady_clock::now();
+  auto loop_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(loop_end - loop_start)
+      .count();
+  std::cerr << "[GRAPH] from=" << from << " to=" << to
+            << " loop_us=" << loop_us << " by_type:";
+  for (auto &kv : type_us) {
+    std::cerr << " " << kv.first << "=" << kv.second.second << "us(n="
+              << kv.second.first << ")";
+  }
+  std::cerr << "\n";
 
   sharedConstTensors out;
   for (unsigned int i = 0; i < graph.getNumOutputNodes(); ++i) {

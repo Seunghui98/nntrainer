@@ -24,6 +24,7 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstring>
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <system_error>
 
@@ -493,9 +495,37 @@ NeuralNetwork::incremental_forwarding(unsigned int from, unsigned int to,
     << " label_batch: " << label[0]->batch()
     << " target_batch: " << current_batch;
 
-  model_graph.setInputsLabels(input, label);
+  // [TEMP DEBUG] one-time input_list dump — confirms whether the 56
+  // cache_k_l<i>/cache_v_l<i> placeholders end up in input_list (and thus
+  // get re-bound on every setInputsLabels call).
+  {
+    static bool dumped = false;
+    if (!dumped) {
+      auto in_dims = model_graph.getInputDimension();
+      std::cerr << "[NN] inputs=" << input.size()
+                << " input_list_size=" << in_dims.size()
+                << " label_size=" << label.size() << "\n";
+      dumped = true;
+    }
+  }
 
-  return incremental_forwarding(from, to, training);
+  auto t_set_in_begin = std::chrono::steady_clock::now();
+  model_graph.setInputsLabels(input, label);
+  auto t_set_in_end = std::chrono::steady_clock::now();
+
+  auto out = incremental_forwarding(from, to, training);
+
+  auto t_fwd_end = std::chrono::steady_clock::now();
+  std::cerr << "[FWD] from=" << from << " to=" << to
+            << " setInputs_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                 t_set_in_end - t_set_in_begin)
+                 .count()
+            << " (graph timing on previous line)"
+            << "\n";
+  (void)t_fwd_end;
+
+  return out;
 }
 
 /**
