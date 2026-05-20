@@ -85,8 +85,7 @@ public:
   void save(std::ofstream &file, nntrainer::RunLayerContext &run_context,
             bool opt_var, ml::train::ExecutionMode mode, bool trainable,
             nntrainer::TensorDim::DataType definedWeightDataType,
-            ml::train::ISA target_isa =
-              ml::train::ISA::DEFAULT) const override;
+            ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
 
   /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)

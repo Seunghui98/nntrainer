@@ -479,13 +479,12 @@ void DebertaAttentionLayer::compute_kcaches(
       _FP16 *out_data = out.getData<_FP16>();
 
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(num_cache_head),
-                      [=](size_t head_kv) {
-                        nntrainer::compute_kcaches(
-                          in_data, cache_data, out_data, num_rows,
-                          num_cache_head, head_dim, group_size, tile_size,
-                          local_window_size, head_kv, head_kv + 1);
-                      });
+      tm.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_kcaches(
+            in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
+            group_size, tile_size, local_window_size, head_kv, head_kv + 1);
+        });
     } else {
       const unsigned int seq = static_cast<unsigned int>(sequence_len);
 
