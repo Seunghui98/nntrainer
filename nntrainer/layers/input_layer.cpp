@@ -22,6 +22,7 @@
  */
 
 #include <input_layer.h>
+#include <iostream>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -80,6 +81,26 @@ void InputLayer::finalize(InitLayerContext &context) {
 
   context.setOutputDimensions(output_dims);
   is_inplace = output_dims == context.getInputDimensions();
+
+  // [TEMP DEBUG — remove after KV-cache placeholder is_inplace verification]
+  // Confirms whether each InputLayer ends up in-place after finalize. For
+  // the cache_k_l<i> / cache_v_l<i> placeholders auto-created by the
+  // symbolic-graph compile, is_inplace=0 means InputLayer::forwarding will
+  // copyData() the full cache buffer on every forward — the suspected ARM
+  // Gen-phase regression.
+  {
+    const auto &in_dims = context.getInputDimensions();
+    auto dt_to_int = [](ml::train::TensorDim::DataType dt) {
+      return static_cast<int>(dt);
+    };
+    std::cerr << "[InputLayer::finalize] name=" << context.getName()
+              << " is_inplace=" << is_inplace;
+    if (!in_dims.empty())
+      std::cerr << " in_dtype=" << dt_to_int(in_dims[0].getDataType());
+    if (!output_dims.empty())
+      std::cerr << " out_dtype=" << dt_to_int(output_dims[0].getDataType());
+    std::cerr << "\n";
+  }
 }
 
 void InputLayer::updateTensorsByInputDimensions(
