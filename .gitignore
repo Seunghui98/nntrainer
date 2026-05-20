@@ -71,3 +71,6 @@ test/jni/googletest/
 ctre-unicode.hpp
 encoder.hpp
 json.hpp
+
+# meson subproject wrap lock (created during `meson setup`)
+subprojects/.wraplock
