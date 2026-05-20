@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <app_context.h>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <engine.h>
@@ -548,12 +549,21 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
        ++token_generation_idx) {
 
+    // [TEMP DEBUG] Gen-phase per-step breakdown. The earlier [GRAPH] /
+    // [FWD] instrumentation showed model_graph.incremental_forwarding is
+    // back to ~10 ms/tok (matching the pre-refactor numbers), so the
+    // missing ~19 ms/tok must be in this loop body around the actual
+    // forward call. Time each sub-stage and dump one line per token.
+    auto t0 = std::chrono::steady_clock::now();
     allocateAndBindKVCache();
+    auto t1 = std::chrono::steady_clock::now();
     auto output_interval =
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
+    auto t2 = std::chrono::steady_clock::now();
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+    auto t3 = std::chrono::steady_clock::now();
     if (token_generation_idx < input_len) {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
         input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
@@ -569,12 +579,23 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                       log_output);
     }
+    auto t4 = std::chrono::steady_clock::now();
     ++generation_cnt;
 
     // output should be deallocated after use
     for (auto out : output_interval) {
       delete[] out;
     }
+    auto t5 = std::chrono::steady_clock::now();
+    auto us = [](auto a, auto b) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+        .count();
+    };
+    std::cerr << "[GEN] tok=" << token_generation_idx
+              << " allocBind_us=" << us(t0, t1)
+              << " ii_us=" << us(t1, t2) << " gen_us=" << us(t2, t3)
+              << " regOut_us=" << us(t3, t4) << " freeOut_us=" << us(t4, t5)
+              << " total_us=" << us(t0, t5) << "\n";
 
     // check FINISH
     for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
