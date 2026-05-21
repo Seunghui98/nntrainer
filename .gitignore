@@ -7,6 +7,10 @@
 .cache/
 .idea/
 
+# meson subproject wrap-lock artifacts
+subprojects/.wraplock
+subprojects/packagecache/
+
 # jni build files
 libs/
 obj/
