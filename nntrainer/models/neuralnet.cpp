@@ -783,7 +783,8 @@ void NeuralNetwork::load(const std::string &file_path,
 #if !defined(_WIN32)
       if (MMAP_READ) {
         struct stat st {};
-        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1), std::invalid_argument)
+        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1),
+                      std::invalid_argument)
           << "Cannot get file info (fstat): " << f_path;
         shared_mmap_size = static_cast<size_t>(st.st_size);
         shared_mmap_ptr = ::mmap(nullptr, shared_mmap_size, PROT_READ,
