@@ -763,28 +763,18 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
-      // Map the .bin once and let every worker thread share the same view.
-      // The previous per-thread mmap pattern requested (graph_size * f_size)
-      // worth of virtual address space — e.g. ~100 nodes × ~3 GB for
-      // Qwen3-0.6B = ~300 GB. Linux desktops absorb that via overcommit,
-      // but Android tightens both the per-process virtual-memory limit and
-      // vm.max_map_count, so a fraction of the workers' mmap() calls return
-      // MAP_FAILED. With the call site inside a std::thread, the resulting
-      // throw bubbles to terminate() (the long "mmap failed" wall users see
-      // on-device).
+      // Share a single read-only mmap across load workers. Per-worker mmap of the
+      // full weight file can exceed Android's virtual memory or mmap-count limits
+      // for large models.
       //
-      // One mmap, shared read-only, MAP_PRIVATE — workers do not race
-      // because each weight reads from its own pre-assigned file_offset.
-      // POSIX_MADV_DONTNEED can't move here from the worker site safely
-      // (other threads may still be reading their slices), so we drop the
-      // whole region in one shot right before munmap.
+      // Each worker reads from its own file_offset, so sharing the mapped region is
+      // safe. Drop the region only after all workers have joined.  
       void *shared_mmap_ptr = MAP_FAILED;
       size_t shared_mmap_size = 0;
 #if !defined(_WIN32)
       if (MMAP_READ) {
         struct stat st {};
-        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1),
-                      std::invalid_argument)
+        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1), std::invalid_argument)
           << "Cannot get file info (fstat): " << f_path;
         shared_mmap_size = static_cast<size_t>(st.st_size);
         shared_mmap_ptr = ::mmap(nullptr, shared_mmap_size, PROT_READ,
