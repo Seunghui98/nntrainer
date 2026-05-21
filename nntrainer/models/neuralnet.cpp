@@ -763,18 +763,19 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
-      // Share a single read-only mmap across load workers. Per-worker mmap of the
-      // full weight file can exceed Android's virtual memory or mmap-count limits
-      // for large models.
+      // Share a single read-only mmap across load workers. Per-worker mmap of
+      // the full weight file can exceed Android's virtual memory or mmap-count
+      // limits for large models.
       //
-      // Each worker reads from its own file_offset, so sharing the mapped region is
-      // safe. Drop the region only after all workers have joined.  
+      // Each worker reads from its own file_offset, so sharing the mapped
+      // region is safe. Drop the region only after all workers have joined.
       void *shared_mmap_ptr = MAP_FAILED;
       size_t shared_mmap_size = 0;
 #if !defined(_WIN32)
       if (MMAP_READ) {
         struct stat st {};
-        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1), std::invalid_argument)
+        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1),
+                      std::invalid_argument)
           << "Cannot get file info (fstat): " << f_path;
         shared_mmap_size = static_cast<size_t>(st.st_size);
         shared_mmap_ptr = ::mmap(nullptr, shared_mmap_size, PROT_READ,
