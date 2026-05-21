@@ -762,6 +762,40 @@ void NeuralNetwork::load(const std::string &file_path,
       model_file_fd = open(f_path.c_str(), O_RDONLY);
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
+
+      // Map the .bin once and let every worker thread share the same view.
+      // The previous per-thread mmap pattern requested (graph_size * f_size)
+      // worth of virtual address space — e.g. ~100 nodes × ~3 GB for
+      // Qwen3-0.6B = ~300 GB. Linux desktops absorb that via overcommit,
+      // but Android tightens both the per-process virtual-memory limit and
+      // vm.max_map_count, so a fraction of the workers' mmap() calls return
+      // MAP_FAILED. With the call site inside a std::thread, the resulting
+      // throw bubbles to terminate() (the long "mmap failed" wall users see
+      // on-device).
+      //
+      // One mmap, shared read-only, MAP_PRIVATE — workers do not race
+      // because each weight reads from its own pre-assigned file_offset.
+      // POSIX_MADV_DONTNEED can't move here from the worker site safely
+      // (other threads may still be reading their slices), so we drop the
+      // whole region in one shot right before munmap.
+      void *shared_mmap_ptr = MAP_FAILED;
+      size_t shared_mmap_size = 0;
+#if !defined(_WIN32)
+      if (MMAP_READ) {
+        struct stat st {};
+        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1), std::invalid_argument)
+          << "Cannot get file info (fstat): " << f_path;
+        shared_mmap_size = static_cast<size_t>(st.st_size);
+        shared_mmap_ptr = ::mmap(nullptr, shared_mmap_size, PROT_READ,
+                                 MAP_PRIVATE, model_file_fd, 0);
+        NNTR_THROW_IF((shared_mmap_ptr == MAP_FAILED), std::runtime_error)
+          << "mmap failed for " << f_path << " (" << shared_mmap_size
+          << " bytes)";
+        (void)::posix_madvise(shared_mmap_ptr, shared_mmap_size,
+                              POSIX_MADV_RANDOM);
+      }
+#endif
+
       // std::vector<std::future<void>> futures;
       std::vector<std::thread> threads;
       threads.reserve(model_graph.size());
@@ -804,35 +838,11 @@ void NeuralNetwork::load(const std::string &file_path,
             CloseHandle(hMap);
             CloseHandle(hFile);
 #else
-            // POSIX: map per-task, advise kernel, drop pages, unmap
-            int fd = ::open(f_path.c_str(), O_RDONLY);
-            NNTR_THROW_IF((fd == -1), std::invalid_argument)
-              << "Cannot open file : " << f_path;
-
-            struct stat st {};
-            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-              << "Cannot get file info (fstat): " << f_path;
-
-            size_t f_size = static_cast<size_t>(st.st_size);
-            void *mmap_ptr =
-              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            ::close(fd); // fd not needed after mmap
-            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-              << "mmap failed";
-
-            // Hint: many model loads touch scattered regions -> RANDOM helps
-            // reduce readahead
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
-
-            char *view = static_cast<char *>(mmap_ptr);
+            // POSIX: read from the parent-owned shared mmap. No per-thread
+            // mmap/munmap — see the comment on shared_mmap_ptr above.
+            char *view = static_cast<char *>(shared_mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
-
-            // Early drop: pages no longer needed; helps lower peak RSS during
-            // overlap
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
-
-            ::munmap(mmap_ptr, f_size);
 #endif
           }
         });
@@ -841,6 +851,14 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+
+#if !defined(_WIN32)
+      if (shared_mmap_ptr != MAP_FAILED) {
+        (void)::posix_madvise(shared_mmap_ptr, shared_mmap_size,
+                              POSIX_MADV_DONTNEED);
+        ::munmap(shared_mmap_ptr, shared_mmap_size);
+      }
+#endif
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
