@@ -179,6 +179,17 @@ e_quantize = executable('nntr_quantize',
 )
 
 
+safetensors_info_src = [
+    meson.current_source_dir() / 'safetensors_info.cpp',
+]
+
+e_safetensors_info = executable('nntr_safetensors_info',
+    safetensors_info_src,
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep],
+)
+
+
 test_api_src = [
     meson.current_source_dir() / 'api' / 'test_api.cpp',
 ]
