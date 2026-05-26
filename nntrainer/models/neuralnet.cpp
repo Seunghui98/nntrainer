@@ -26,6 +26,7 @@
 #include "model_common_properties.h"
 #include <cmath>
 #include <compute_ops.h>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -50,8 +51,6 @@
 #include <optional>
 #include <previous_input_realizer.h>
 #include <profiler.h>
-#include <cpu_backend.h>
-#include <quantizer.h>
 #include <recurrent_realizer.h>
 #include <remap_realizer.h>
 #include <safetensors_util.h>
@@ -626,8 +625,8 @@ namespace {
 /**
  * @brief Resolve the data type a weight will actually be stored as.
  *
- * Mirrors the per-weight policy of Layer::save: bias-like tensors (height == 1)
- * are not block-quantized and stay in their original type.
+ * Mirrors the per-weight policy of the layer save overrides: bias-like tensors
+ * (height == 1) are not block-quantized and stay in their original type.
  */
 TensorDim::DataType resolveStoredDtype(const Tensor &weight,
                                        TensorDim::DataType requested) {
@@ -640,60 +639,6 @@ TensorDim::DataType resolveStoredDtype(const Tensor &weight,
     return weight.getDataType();
 
   return requested;
-}
-
-/**
- * @brief Produce the on-disk tensor bytes for @p weight stored as @p target.
- *
- * Quantization here reuses the exact same routines as the BIN save path
- * (Layer::save) so that the two formats yield byte-identical payloads.
- * Returns nullptr when no conversion is needed (caller writes @p weight as-is).
- */
-std::shared_ptr<Tensor> quantizeWeightForSave(const Tensor &weight,
-                                              TensorDim::DataType target,
-                                              ml::train::ISA target_isa) {
-  if (target == weight.getDataType())
-    return nullptr;
-
-  const TensorDim dim = weight.getDim();
-  const unsigned int K = dim.height();
-  const unsigned int N = dim.width();
-
-  if (target == TensorDim::DataType::Q4_0) {
-    NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
-                  std::runtime_error)
-      << "Save with quantization only supports FP32 source weight.";
-    NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
-      << "Q4_0 quantization requires both width and height to be divisible "
-         "by 32, but got height="
-      << K << ", width=" << N;
-
-    Tensor weight_t = weight.transpose("0:2:1");
-    auto quant_weight = std::make_shared<Tensor>(
-      dim.batch(), dim.channel(), K, N,
-      TensorDim::TensorType{Tformat::NCHW, TensorDim::DataType::Q4_0});
-    std::vector<char> tmp(quant_weight->size());
-    quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K, nullptr);
-    repack_q4_0(quant_weight->getData<uint8_t>(), tmp.data(),
-                quant_weight->size(), N, K, target_isa);
-    return quant_weight;
-  }
-
-  if (target == TensorDim::DataType::Q4_K ||
-      target == TensorDim::DataType::Q6_K) {
-    NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
-                  std::runtime_error)
-      << "Save with quantization only supports FP32 source weight.";
-    const QScheme qscheme = (target == TensorDim::DataType::Q4_K)
-                              ? QScheme::Q4_Kx8
-                              : QScheme::Q6_K;
-    auto quantizer = Quantization::createQuantizer(qscheme);
-    return std::make_shared<Tensor>(quantizer->quantize(weight, target));
-  }
-
-  NNTR_THROW_IF(true, std::runtime_error)
-    << "Unsupported target data type for safetensors quantization.";
-  return nullptr;
 }
 
 } // namespace
@@ -764,66 +709,105 @@ void NeuralNetwork::save(
     break;
   }
   case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
-    // Resolve, per weight, the data type it will be stored as (honoring
-    // layer_dtype_map) and materialize quantized payloads where needed so the
-    // header byte offsets are exact. Quantized payloads reuse the same
-    // routines as the BIN save path, keeping the two formats byte-identical.
-    struct Payload {
-      const char *data;
-      size_t size;
-      std::shared_ptr<Tensor> owned; // keeps a quantized copy alive
-    };
-
+    // Delegate the data section to the same per-layer save() the BIN path
+    // uses, so the quantized bytes are byte-identical to the .bin output.
+    // Each layer override applies its own correct quantization policy
+    // (e.g. embedding / tie-word-embedding quantize without transpose, and
+    // shared weights are written once on first access), which a generic
+    // quantizer in this loop could not replicate. The data is written to a
+    // temporary file first so exact per-weight byte sizes are known before
+    // the header (which records the offsets) is emitted.
+    const std::string tmp_path = file_path + ".nntrtmp";
     std::vector<safetensors::TensorEntry> entries;
-    std::vector<Payload> payloads;
-    std::unordered_set<const Tensor *> visited_st;
-    size_t data_offset = 0;
 
-    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-      const auto &layer_node = *iter;
-      auto it = layer_dtype_map.find(layer_node->getName());
-      const auto requested = (it != layer_dtype_map.end()) ? it->second : dtype;
+    {
+      auto tmp_file = checkedOpenStream<std::ofstream>(
+        tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
-      for (auto weight : layer_node->getRunContext().getWeights()) {
-        if (!visited_st.insert(&weight->getVariableRef()).second)
-          continue;
-        const auto &t = weight->getVariableRef();
-        const auto &dim = t.getDim();
+      std::unordered_set<const Tensor *> visited_st;
+      size_t data_offset = 0;
 
-        const auto stored = resolveStoredDtype(t, requested);
-        auto quantized = quantizeWeightForSave(t, stored, target_isa);
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           iter++) {
+        const auto &layer_node = *iter;
+        auto it = layer_dtype_map.find(layer_node->getName());
+        const auto requested =
+          (it != layer_dtype_map.end()) ? it->second : dtype;
+        auto &rc = layer_node->getRunContext();
 
-        Payload p;
-        if (quantized) {
-          p.owned = quantized;
-          p.data = quantized->getData<char>();
-          p.size = quantized->getMemoryBytes();
-        } else {
-          p.data = t.getData<char>();
-          p.size = t.getMemoryBytes();
+        // Collect the weights this layer will actually write: first-access
+        // only (shared weights are saved once), deduped across the graph.
+        struct WInfo {
+          const Tensor *t;
+          TensorDim::DataType stored;
+        };
+        std::vector<WInfo> wlist;
+        for (unsigned int i = 0; i < rc.getNumWeights(); ++i) {
+          if (!rc.isGradientFirstAccess(i))
+            continue;
+          const Tensor &t = rc.getWeight(i);
+          if (!visited_st.insert(&t).second)
+            continue;
+          wlist.push_back({&t, resolveStoredDtype(t, requested)});
         }
 
-        safetensors::TensorEntry entry;
-        entry.name = t.getName();
-        entry.offset_start = data_offset;
-        entry.offset_end = data_offset + p.size;
-        if (safetensors::isQuantized(stored)) {
-          // Store quantized blobs as opaque bytes (U8) with a 1-D byte shape,
-          // preserving native type and logical shape via extension fields.
-          entry.dtype = safetensors::dtypeToString(stored); // "U8"
-          entry.shape = {p.size};
-          entry.nntr_dtype = safetensors::nntrDtypeName(stored);
-          entry.nntr_shape = {dim.batch(), dim.channel(), dim.height(),
-                              dim.width()};
-        } else {
-          entry.dtype = safetensors::dtypeToString(stored);
-          entry.shape = {dim.batch(), dim.channel(), dim.height(), dim.width()};
+        // Write this layer's weights exactly as the BIN path would.
+        const auto start = static_cast<size_t>(tmp_file.tellp());
+        layer_node->save(tmp_file, false, exec_mode, requested, target_isa);
+        const auto layer_bytes =
+          static_cast<size_t>(tmp_file.tellp()) - start;
+
+        // Map the written bytes back to per-weight header entries. At most one
+        // weight per layer is block-quantized; the rest are stored as-is, so
+        // the quantized weight's size is whatever remains.
+        size_t known = 0;
+        int quant_count = 0;
+        for (const auto &w : wlist) {
+          if (safetensors::isQuantized(w.stored))
+            ++quant_count;
+          else
+            known += w.t->getMemoryBytes();
+        }
+        NNTR_THROW_IF(quant_count > 1, std::runtime_error)
+          << "safetensors save: layer '" << layer_node->getName()
+          << "' has multiple quantized weights, which is not supported.";
+
+        size_t assigned = 0;
+        for (const auto &w : wlist) {
+          const auto &dim = w.t->getDim();
+          const bool is_quant = safetensors::isQuantized(w.stored);
+          const size_t wsize =
+            is_quant ? (layer_bytes - known) : w.t->getMemoryBytes();
+
+          safetensors::TensorEntry entry;
+          entry.name = w.t->getName();
+          entry.offset_start = data_offset;
+          entry.offset_end = data_offset + wsize;
+          if (is_quant) {
+            // Quantized blobs are opaque bytes (U8) with a 1-D byte shape;
+            // the native type and logical shape live in extension fields.
+            entry.dtype = safetensors::dtypeToString(w.stored); // "U8"
+            entry.shape = {wsize};
+            entry.nntr_dtype = safetensors::nntrDtypeName(w.stored);
+            entry.nntr_shape = {dim.batch(), dim.channel(), dim.height(),
+                                dim.width()};
+          } else {
+            entry.dtype = safetensors::dtypeToString(w.stored);
+            entry.shape = {dim.batch(), dim.channel(), dim.height(),
+                           dim.width()};
+          }
+          entries.push_back(std::move(entry));
+          data_offset += wsize;
+          assigned += wsize;
         }
 
-        entries.push_back(std::move(entry));
-        payloads.push_back(std::move(p));
-        data_offset += p.size;
+        NNTR_THROW_IF(assigned != layer_bytes, std::runtime_error)
+          << "safetensors save: byte accounting mismatch for layer '"
+          << layer_node->getName() << "' (wrote " << layer_bytes
+          << ", mapped " << assigned << ").";
       }
+
+      tmp_file.close();
     }
 
     // Embed an nntrainer dtype summary so a quantized file can be inspected
@@ -846,10 +830,12 @@ void NeuralNetwork::save(
     st_file.write(header_json.data(),
                   static_cast<std::streamsize>(header_json.size()));
 
-    for (const auto &p : payloads)
-      st_file.write(p.data, static_cast<std::streamsize>(p.size));
-
+    {
+      std::ifstream data_in(tmp_path, std::ios::in | std::ios::binary);
+      st_file << data_in.rdbuf();
+    }
     st_file.close();
+    std::remove(tmp_path.c_str());
     break;
   }
   default:
