@@ -384,7 +384,8 @@ std::string inspect(const std::string &json) {
 
   out << "\ntensors: " << entries.size() << "\n";
   out << "  " << std::left << std::setw(static_cast<int>(name_w)) << "name"
-      << "  " << std::setw(8) << "dtype" << "  " << std::setw(12) << "bytes"
+      << "  " << std::setw(8) << "dtype"
+      << "  " << std::setw(12) << "bytes"
       << "  shape\n";
   for (const auto &e : entries) {
     const std::string dt = e.nntr_dtype.empty() ? e.dtype : e.nntr_dtype;
