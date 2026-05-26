@@ -91,8 +91,8 @@ TEST(SafetensorsUtil, build_parse_round_trip_p) {
   quant.nntr_shape = {1, 1, 32, 32};
   entries.push_back(quant);
 
-  std::map<std::string, std::string> meta = {{"nntr_format",
-                                              "nntr-safetensors-v1"}};
+  std::map<std::string, std::string> meta = {
+    {"nntr_format", "nntr-safetensors-v1"}};
   const std::string header = st::buildHeader(entries, meta);
 
   // Offsets-only parser still works (used by the weight loader).
@@ -183,9 +183,8 @@ TEST(SafetensorsQuant, q4_0_payload_matches_bin_p) {
 
   auto nn = createFcNN(W, U);
   const std::string bin_path = "st_quant_test.bin";
-  ASSERT_NO_THROW(
-    nn->save(bin_path, ModelFormat::MODEL_FORMAT_BIN, DataType::NONE,
-             dtype_map));
+  ASSERT_NO_THROW(nn->save(bin_path, ModelFormat::MODEL_FORMAT_BIN,
+                           DataType::NONE, dtype_map));
 
   const std::string st_path = "st_quant_test.safetensors";
   ASSERT_NO_THROW(nn->save(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS,
