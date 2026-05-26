@@ -615,7 +615,8 @@ int main(int argc, char *argv[]) {
       // sure the generated/explicit name ends with ".safetensors".
       const std::string bin_ext = ".bin";
       auto pos = output_bin_name.rfind(bin_ext);
-      if (pos != std::string::npos && pos + bin_ext.size() == output_bin_name.size())
+      if (pos != std::string::npos &&
+          pos + bin_ext.size() == output_bin_name.size())
         output_bin_name = output_bin_name.substr(0, pos) + ".safetensors";
       else if (output_bin_name.find(".safetensors") == std::string::npos)
         output_bin_name += ".safetensors";
@@ -739,11 +740,14 @@ int main(int argc, char *argv[]) {
     // CausalLM; tokenizer files are needed for generation) so the output
     // directory is self-contained and runnable on its own.
     if (output_dir != model_path) {
-      const char *aux_files[] = {
-        "config.json",       "generation_config.json",
-        "tokenizer.json",    "tokenizer_config.json",
-        "special_tokens_map.json", "vocab.json",
-        "merges.txt",        "modules.json"};
+      const char *aux_files[] = {"config.json",
+                                 "generation_config.json",
+                                 "tokenizer.json",
+                                 "tokenizer_config.json",
+                                 "special_tokens_map.json",
+                                 "vocab.json",
+                                 "merges.txt",
+                                 "modules.json"};
       for (const char *fname : aux_files) {
         std::filesystem::path src = std::filesystem::path(model_path) / fname;
         if (!std::filesystem::exists(src))
