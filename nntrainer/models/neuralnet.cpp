@@ -752,8 +752,7 @@ void NeuralNetwork::save(
         // Write this layer's weights exactly as the BIN path would.
         const auto start = static_cast<size_t>(tmp_file.tellp());
         layer_node->save(tmp_file, false, exec_mode, requested, target_isa);
-        const auto layer_bytes =
-          static_cast<size_t>(tmp_file.tellp()) - start;
+        const auto layer_bytes = static_cast<size_t>(tmp_file.tellp()) - start;
 
         // Map the written bytes back to per-weight header entries. At most one
         // weight per layer is block-quantized; the rest are stored as-is, so
@@ -801,8 +800,8 @@ void NeuralNetwork::save(
 
         NNTR_THROW_IF(assigned != layer_bytes, std::runtime_error)
           << "safetensors save: byte accounting mismatch for layer '"
-          << layer_node->getName() << "' (wrote " << layer_bytes
-          << ", mapped " << assigned << ").";
+          << layer_node->getName() << "' (wrote " << layer_bytes << ", mapped "
+          << assigned << ").";
       }
 
       tmp_file.close();
