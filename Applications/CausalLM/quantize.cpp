@@ -734,6 +734,27 @@ int main(int argc, char *argv[]) {
 
     std::cout << "  Config saved to: " << output_config_path << "\n";
 
+    // When writing to a separate directory, copy the auxiliary files the
+    // runtime needs (config.json / generation_config.json are required by
+    // CausalLM; tokenizer files are needed for generation) so the output
+    // directory is self-contained and runnable on its own.
+    if (output_dir != model_path) {
+      const char *aux_files[] = {
+        "config.json",       "generation_config.json",
+        "tokenizer.json",    "tokenizer_config.json",
+        "special_tokens_map.json", "vocab.json",
+        "merges.txt",        "modules.json"};
+      for (const char *fname : aux_files) {
+        std::filesystem::path src = std::filesystem::path(model_path) / fname;
+        if (!std::filesystem::exists(src))
+          continue;
+        std::filesystem::copy_file(
+          src, std::filesystem::path(output_dir) / fname,
+          std::filesystem::copy_options::overwrite_existing);
+        std::cout << "  Copied " << fname << " to output directory\n";
+      }
+    }
+
     // =========================================================================
     // Done
     // =========================================================================
@@ -748,9 +769,7 @@ int main(int argc, char *argv[]) {
                    "nntr_config.json\n";
       std::cout << "  2. nntr_causallm " << model_path << "\n";
     } else {
-      std::cout << "  1. Copy config.json and generation_config.json to "
-                << output_dir << "\n";
-      std::cout << "  2. nntr_causallm " << output_dir << "\n\n";
+      std::cout << "  nntr_causallm " << output_dir << "\n\n";
     }
 
   } catch (const std::exception &e) {

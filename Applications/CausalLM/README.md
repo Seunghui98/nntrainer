@@ -354,8 +354,9 @@ After quantization, run the quantized model:
 mv /path/to/model/nntr_config_quantized.json /path/to/model/nntr_config.json
 nntr_causallm /path/to/model
 
-# If output is in a different directory:
-cp /path/to/model/config.json /path/to/model/generation_config.json /output/dir/
+# If output is in a different directory (-o), the tool copies config.json,
+# generation_config.json and the tokenizer files automatically, so the
+# output directory is self-contained:
 nntr_causallm /output/dir
 ```
 
