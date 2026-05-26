@@ -507,7 +507,18 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
                    ? "graph_input"
                    : "graph_input_" + std::to_string(&inp - &inputs[0]);
     }
-    nntrainer::Tensor *placeholder = getTensor(inp_name);
+
+    // getTensor() throws std::out_of_range when the name is absent (the
+    // pool registers inputs as "<layer>:<var>", so a bare input-layer name
+    // such as "input0" misses). Absorb it so the binding loop sees a
+    // yes/no answer and can fall back to a fresh eager tensor, instead of
+    // letting the exception abort compile().
+    nntrainer::Tensor *placeholder = nullptr;
+    try {
+      placeholder = getTensor(inp_name);
+    } catch (const std::exception &) {
+      placeholder = nullptr;
+    }
     if (placeholder != nullptr) {
       inp.impl_->bound_tensor = placeholder;
       inp.impl_->dim = placeholder->getDim();
