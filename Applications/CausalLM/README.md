@@ -312,9 +312,14 @@ nntr_quantize <model_path> [options]
 | `--fc_dtype <type>` | Target dtype for FC (fully-connected) layers | `Q4_0` |
 | `--embd_dtype <type>` | Target dtype for embedding layer | `FP32` |
 | `--lmhead_dtype <type>` | Target dtype for LM head layer | Same as `embd_dtype` |
-| `--output_bin <name>` | Output `.bin` filename | Auto-generated |
+| `--output_bin <name>` | Output weight filename | Auto-generated |
+| `--output_format <bin\|safetensors>` | Output weight container format | `bin` |
 | `--config <path>` | Use a target `nntr_config.json` for dtype settings | – |
 | `--isa <x86|ARM|DEFAULT>` | Target ISA for quantization | `DEFAULT` |
+
+> The input weight format (`.bin` or `.safetensors`) is auto-detected from the
+> file referenced by `model_file_name` in `nntr_config.json`, so any of the four
+> input/output combinations is supported.
 
 ### Examples
 ```bash
@@ -332,6 +337,9 @@ nntr_quantize /path/to/qwen3-4b -o /output/qwen3-4b-q4
 
 # Use a pre-configured target nntr_config.json:
 nntr_quantize /path/to/qwen3-4b --config /path/to/target_nntr_config.json
+
+# Quantize FC layers to Q4_0 and write a .safetensors file instead of .bin:
+nntr_quantize /path/to/qwen3-4b --fc_dtype Q4_0 --output_format safetensors
 ```
 
 ### Output
@@ -350,3 +358,98 @@ nntr_causallm /path/to/model
 cp /path/to/model/config.json /path/to/model/generation_config.json /output/dir/
 nntr_causallm /output/dir
 ```
+
+## Quantized Safetensors Format
+
+NNTrainer can store quantized weights (`Q4_0` / `Q4_K` / `Q6_K`) in the
+[safetensors](https://github.com/huggingface/safetensors) container in addition
+to the raw `.bin` format. The quantized payload is byte-for-byte identical to
+the `.bin` payload — only the container differs.
+
+### How it fits together
+
+```
+                      ┌──────────────────────────────┐
+   FP32 weights ─────▶│          nntr_quantize         │
+ (.bin / .safetensors)│  GgmlQuantizer (Q4_0/Q4_K/Q6_K)│
+                      └───────────────┬────────────────┘
+                                      │  --output_format
+                          ┌───────────┴───────────┐
+                          ▼                         ▼
+                  quantized .bin           quantized .safetensors
+                                            (self-describing header)
+                                                    │
+                  ┌─────────────────────────────────┤
+                  ▼                                  ▼
+       nntr_safetensors_info               nntr_causallm (runtime)
+       (header-only inspection)        1. read header  → byte offsets
+                                       2. mmap data section (no full read)
+                                       3. weight tensors point at the
+                                          quantized blocks directly
+```
+
+At load time the runtime only parses the (small) JSON header to obtain each
+tensor's byte offset, then memory-maps the data section — the large file is
+**never read twice**.
+
+### Header layout
+
+A safetensors file is `[8-byte header length][JSON header][packed tensor data]`.
+Quantized tensors are stored as opaque byte blobs so that standard safetensors
+tooling can still read the file, while the native nntrainer type and logical
+(pre-quantization) shape are preserved in extension fields:
+
+```json
+{
+  "__metadata__": { "format": "nntrainer", "nntr_format": "nntr-safetensors-v1" },
+  "layer0_wq:weight": {
+    "dtype": "U8",
+    "shape": [2359296],
+    "nntr_dtype": "Q4_0",
+    "nntr_shape": [1, 1, 1024, 4096],
+    "data_offsets": [0, 2359296]
+  },
+  "output_norm:weight": {
+    "dtype": "F32",
+    "shape": [1, 1, 1, 1024],
+    "data_offsets": [2359296, 2363392]
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `dtype` | Standard safetensors dtype. `U8` for any block-quantized tensor. |
+| `shape` | Standard shape. For quantized tensors this is the raw byte length. |
+| `nntr_dtype` | Native nntrainer type (`Q4_0` / `Q4_K` / `Q6_K`). Absent for FP32/FP16. |
+| `nntr_shape` | Logical (pre-quantization) `[N, C, H, W]` shape. Absent for FP32/FP16. |
+| `data_offsets` | `[start, end)` byte range within the data section. |
+
+FP32/FP16 tensors are written with their standard `dtype`/`shape` and no
+extension fields, so plain (non-quantized) files stay fully standard.
+
+### Inspecting a file
+
+Use `nntr_safetensors_info` to read just the header and print the embedded
+metadata plus a per-tensor table — no weight data is loaded:
+
+```bash
+nntr_safetensors_info /path/to/model.safetensors
+```
+
+```
+file: model.safetensors
+header bytes: 24960
+
+metadata:
+  format = nntrainer
+  nntr_format = nntr-safetensors-v1
+
+tensors: 2
+  name                 dtype     bytes         shape
+  layer0_wq:weight     Q4_0      2359296       [1,1,1024,4096]
+  output_norm:weight   F32       4096          [1,1,1,1024]
+```
+
+This makes a quantized `.safetensors` file self-describing: the quantization
+type of each weight is visible without an accompanying `nntr_config.json`.

@@ -16,7 +16,8 @@
  * @date   04 March 2026
  * @brief  Quantization utility for CausalLM models.
  *         Reads a FP32 model and converts weights to a target data type,
- *         saving both the quantized .bin file and a new nntr_config.json.
+ *         saving the quantized weights (.bin or .safetensors) and a new
+ *         nntr_config.json.
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -34,9 +35,10 @@
  *     --fc_dtype <type>   Target dtype for FC layers (default: Q4_0)
  *     --embd_dtype <type> Target dtype for embedding layer (default: FP32)
  *     --lmhead_dtype <type> Target dtype for LM head layer (default: FP32)
- *     --output_bin <name> Output bin filename (auto-generated if omitted)
+ *     --output_bin <name> Output weight filename (auto-generated if omitted)
+ *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
  *
- *   Supported data types: FP32, FP16, Q4_0, Q6_K
+ *   Supported data types: FP32, FP16, Q4_0, Q4_K, Q6_K
  *
  *   Example:
  *     # Quantize Qwen3-4B to Q4_0 FC layers (embedding stays FP32):
@@ -354,8 +356,10 @@ void printUsage(const char *prog) {
        "quantized weights\n"
     << "                        (default: DEFAULT). Options: DEFAULT, X86, "
        "ARM.\n"
-    << "  --output_bin <name>   Output .bin filename (auto-generated if "
+    << "  --output_bin <name>   Output weight filename (auto-generated if "
        "omitted)\n"
+    << "  --output_format <fmt> Output container: 'bin' (default) or "
+       "'safetensors'\n"
     << "  --config <path>       Use a target nntr_config.json instead of\n"
     << "                        individual dtype options. The fc_layer_dtype,\n"
     << "                        embedding_dtype, and lmhead_dtype fields\n"
@@ -510,6 +514,7 @@ int main(int argc, char *argv[]) {
   std::string isa_str = "DEFAULT";
   std::string output_bin_name = "";
   std::string target_config_path = "";
+  std::string output_format = "bin";
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -525,6 +530,13 @@ int main(int argc, char *argv[]) {
       isa_str = argv[++i];
     } else if (arg == "--output_bin" && i + 1 < argc) {
       output_bin_name = argv[++i];
+    } else if (arg == "--output_format" && i + 1 < argc) {
+      output_format = toLower(argv[++i]);
+      if (output_format != "bin" && output_format != "safetensors") {
+        std::cerr << "Unknown output format: " << output_format
+                  << " (expected 'bin' or 'safetensors')\n";
+        return EXIT_FAILURE;
+      }
     } else if (arg == "--config" && i + 1 < argc) {
       target_config_path = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
@@ -592,11 +604,21 @@ int main(int argc, char *argv[]) {
       output_dir = model_path;
     std::filesystem::create_directories(output_dir);
 
-    // Determine output bin filename
+    // Determine output filename
     std::string original_bin = nntr_cfg["model_file_name"].get<std::string>();
     if (output_bin_name.empty()) {
       output_bin_name = generateOutputBinName(
         original_bin, dataTypeToStr(fc_dtype), dataTypeToStr(embd_dtype));
+    }
+    if (output_format == "safetensors") {
+      // The output format is decided by the file extension on save, so make
+      // sure the generated/explicit name ends with ".safetensors".
+      const std::string bin_ext = ".bin";
+      auto pos = output_bin_name.rfind(bin_ext);
+      if (pos != std::string::npos && pos + bin_ext.size() == output_bin_name.size())
+        output_bin_name = output_bin_name.substr(0, pos) + ".safetensors";
+      else if (output_bin_name.find(".safetensors") == std::string::npos)
+        output_bin_name += ".safetensors";
     }
 
     std::string src_weight_path = model_path + "/" + original_bin;
