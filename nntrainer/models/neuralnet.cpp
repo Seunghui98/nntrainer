@@ -26,6 +26,7 @@
 #include "model_common_properties.h"
 #include <cmath>
 #include <compute_ops.h>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -619,6 +620,29 @@ void NeuralNetwork::backwarding(int iteration,
   }
 }
 
+namespace {
+
+/**
+ * @brief Resolve the data type a weight will actually be stored as.
+ *
+ * Mirrors the per-weight policy of the layer save overrides: bias-like tensors
+ * (height == 1) are not block-quantized and stay in their original type.
+ */
+TensorDim::DataType resolveStoredDtype(const Tensor &weight,
+                                       TensorDim::DataType requested) {
+  if (requested == TensorDim::DataType::NONE ||
+      requested == weight.getDataType())
+    return weight.getDataType();
+
+  if (nntrainer::safetensors::isQuantized(requested) &&
+      weight.getDim().height() == 1)
+    return weight.getDataType();
+
+  return requested;
+}
+
+} // namespace
+
 void NeuralNetwork::save(
   const std::string &file_path, ml::train::ModelFormat format,
   TensorDim::DataType dtype,
@@ -685,53 +709,159 @@ void NeuralNetwork::save(
     break;
   }
   case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
-    // Build the tensor entry list (graph order, deduped by pointer)
+    // Delegate the data section to the same per-layer save() the BIN path
+    // uses so the quantized bytes are byte-identical: each layer override
+    // applies its own quantization policy (e.g. embedding/tie-word-embedding
+    // do not transpose, shared weights are written once on first access),
+    // which a generic quantizer here could not replicate. Bytes go to a temp
+    // file first so per-weight sizes are known before the header is written.
+    const std::string tmp_path = file_path + ".nntrtmp";
     std::vector<safetensors::TensorEntry> entries;
-    std::unordered_set<const Tensor *> visited_st;
-    size_t data_offset = 0;
-    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-      auto weights = (*iter)->getRunContext().getWeights();
-      for (auto weight : weights) {
-        if (!visited_st.insert(&weight->getVariableRef()).second)
-          continue;
-        const auto &t = weight->getVariableRef();
-        const auto &dim = t.getDim();
-        const size_t nbytes = t.getMemoryBytes();
-        safetensors::TensorEntry entry;
-        entry.name = t.getName();
-        entry.dtype = safetensors::dtypeToString(dim.getDataType());
-        entry.shape = {dim.batch(), dim.channel(), dim.height(), dim.width()};
-        entry.offset_start = data_offset;
-        entry.offset_end = data_offset + nbytes;
-        entries.push_back(std::move(entry));
-        data_offset += nbytes;
+
+    {
+      auto tmp_file = checkedOpenStream<std::ofstream>(
+        tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
+
+      std::unordered_set<const Tensor *> visited_st;
+      size_t data_offset = 0;
+
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           iter++) {
+        const auto &layer_node = *iter;
+        auto it = layer_dtype_map.find(layer_node->getName());
+        const auto requested =
+          (it != layer_dtype_map.end()) ? it->second : dtype;
+        auto &rc = layer_node->getRunContext();
+
+        // Collect the weights this layer will actually write: first-access
+        // only (shared weights are saved once), deduped across the graph.
+        struct WInfo {
+          const Tensor *t;
+          TensorDim::DataType stored;
+        };
+        std::vector<WInfo> wlist;
+        for (unsigned int i = 0; i < rc.getNumWeights(); ++i) {
+          if (!rc.isGradientFirstAccess(i))
+            continue;
+          const Tensor &t = rc.getWeight(i);
+          if (!visited_st.insert(&t).second)
+            continue;
+          wlist.push_back({&t, resolveStoredDtype(t, requested)});
+        }
+
+        // Write this layer's weights exactly as the BIN path would.
+        const auto start = static_cast<size_t>(tmp_file.tellp());
+        layer_node->save(tmp_file, false, exec_mode, requested, target_isa);
+        const auto layer_bytes =
+          static_cast<size_t>(tmp_file.tellp()) - start;
+
+        // Map the written bytes back to per-weight header entries. At most one
+        // weight per layer is block-quantized; the rest are stored as-is, so
+        // the quantized weight's size is whatever remains.
+        size_t known = 0;
+        int quant_count = 0;
+        for (const auto &w : wlist) {
+          if (safetensors::isQuantized(w.stored))
+            ++quant_count;
+          else
+            known += w.t->getMemoryBytes();
+        }
+        NNTR_THROW_IF(quant_count > 1, std::runtime_error)
+          << "safetensors save: layer '" << layer_node->getName()
+          << "' has multiple quantized weights, which is not supported.";
+
+        size_t assigned = 0;
+        for (const auto &w : wlist) {
+          const auto &dim = w.t->getDim();
+          const bool is_quant = safetensors::isQuantized(w.stored);
+          const size_t wsize =
+            is_quant ? (layer_bytes - known) : w.t->getMemoryBytes();
+
+          safetensors::TensorEntry entry;
+          entry.name = w.t->getName();
+          entry.offset_start = data_offset;
+          entry.offset_end = data_offset + wsize;
+          if (is_quant) {
+            // Quantized blobs are opaque bytes (U8) with a 1-D byte shape;
+            // the native type and logical shape live in extension fields.
+            entry.dtype = safetensors::dtypeToString(w.stored); // "U8"
+            entry.shape = {wsize};
+            entry.nntr_dtype = safetensors::nntrDtypeName(w.stored);
+            entry.nntr_shape = {dim.batch(), dim.channel(), dim.height(),
+                                dim.width()};
+          } else {
+            entry.dtype = safetensors::dtypeToString(w.stored);
+            entry.shape = {dim.batch(), dim.channel(), dim.height(),
+                           dim.width()};
+          }
+          entries.push_back(std::move(entry));
+          data_offset += wsize;
+          assigned += wsize;
+        }
+
+        NNTR_THROW_IF(assigned != layer_bytes, std::runtime_error)
+          << "safetensors save: byte accounting mismatch for layer '"
+          << layer_node->getName() << "' (wrote " << layer_bytes
+          << ", mapped " << assigned << ").";
       }
+
+      tmp_file.close();
+    }
+
+    // Embed an nntrainer dtype summary so a quantized file can be inspected
+    // and identified without an accompanying nntr_config.json.
+    std::map<std::string, std::string> metadata;
+    bool any_quant = false;
+    bool any_q4_0 = false;
+    for (const auto &e : entries) {
+      any_quant = any_quant || !e.nntr_dtype.empty();
+      any_q4_0 = any_q4_0 || e.nntr_dtype == "Q4_0";
+    }
+    if (any_quant)
+      metadata["nntr_format"] = "nntr-safetensors-v1";
+    // Q4_0 is repacked into an ISA-specific layout (x86: q4_0x8, ARM: q4_0x4)
+    // that is indistinguishable from the header alone, so record which one was
+    // produced. DEFAULT resolves to the build platform's layout. Only emitted
+    // when a Q4_0 tensor is present, since no other type depends on the ISA.
+    if (any_q4_0) {
+      const char *isa_str;
+      switch (target_isa) {
+      case ml::train::ISA::X86:
+        isa_str = "x86";
+        break;
+      case ml::train::ISA::ARM:
+        isa_str = "arm";
+        break;
+      default: // DEFAULT -> the compiled backend's layout
+#if defined(__aarch64__) || defined(__arm__)
+        isa_str = "arm";
+#else
+        isa_str = "x86";
+#endif
+        break;
+      }
+      metadata["nntr_q4_0_isa"] = isa_str;
     }
 
     // Write: [8-byte header_size][header (padded to 8)][raw weight data]
-    const std::string header_json = safetensors::buildHeader(entries);
+    const std::string header_json = safetensors::buildHeader(entries, metadata);
     const uint64_t header_size = static_cast<uint64_t>(header_json.size());
-
+    // safetensors layout: [8-byte header length][header JSON][tensor raw data]
     auto st_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
+    // [8-byte header length]
     st_file.write(reinterpret_cast<const char *>(&header_size),
                   sizeof(header_size));
+    // [header JSON: per-tensor dtype/shape/offsets + __metadata__]
     st_file.write(header_json.data(),
                   static_cast<std::streamsize>(header_json.size()));
-
-    visited_st.clear();
-    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-      auto weights = (*iter)->getRunContext().getWeights();
-      for (auto weight : weights) {
-        if (!visited_st.insert(&weight->getVariableRef()).second)
-          continue;
-        const auto &t = weight->getVariableRef();
-        const size_t nbytes = t.getMemoryBytes();
-        st_file.write(reinterpret_cast<const char *>(t.getData<char>()),
-                      static_cast<std::streamsize>(nbytes));
-      }
+    // [tensor raw data]
+    {
+      std::ifstream data_in(tmp_path, std::ios::in | std::ios::binary);
+      st_file << data_in.rdbuf();
     }
     st_file.close();
+    std::remove(tmp_path.c_str());
     break;
   }
   default:
