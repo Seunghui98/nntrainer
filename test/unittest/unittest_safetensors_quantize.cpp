@@ -290,6 +290,99 @@ TEST(SafetensorsQuant, q4_0_records_target_isa_p) {
   remove(st_path.c_str());
 }
 
+// ===========================================================================
+// Header inspector (logic backing the nntr_safetensors_info tool)
+// ===========================================================================
+
+static st::TensorEntry makeEntry(const std::string &name,
+                                 const std::string &dtype,
+                                 std::vector<size_t> shape, size_t off_start,
+                                 size_t off_end,
+                                 const std::string &nntr_dtype = "",
+                                 std::vector<size_t> nntr_shape = {}) {
+  st::TensorEntry e;
+  e.name = name;
+  e.dtype = dtype;
+  e.shape = std::move(shape);
+  e.offset_start = off_start;
+  e.offset_end = off_end;
+  e.nntr_dtype = nntr_dtype;
+  e.nntr_shape = std::move(nntr_shape);
+  return e;
+}
+
+/**
+ * @brief inspect() reports a per-tensor table that mixes quantized and FP32
+ *        entries, showing native type / logical shape / byte size for each.
+ */
+TEST(SafetensorsInspect, mixed_quant_and_fp32_table_p) {
+  std::vector<st::TensorEntry> entries = {
+    makeEntry("layer0_wq:weight", "U8", {4608}, 0, 4608, "Q4_0",
+              {1, 1, 64, 128}),
+    makeEntry("norm:weight", "F32", {1, 1, 1, 128}, 4608, 5120),
+  };
+
+  const std::string report =
+    st::inspect(st::buildHeader(entries, {{"nntr_format",
+                                           "nntr-safetensors-v1"}}));
+
+  EXPECT_NE(report.find("tensors: 2"), std::string::npos);
+  // quantized weight: native type, byte size, logical shape
+  EXPECT_NE(report.find("layer0_wq:weight"), std::string::npos);
+  EXPECT_NE(report.find("Q4_0"), std::string::npos);
+  EXPECT_NE(report.find("4608"), std::string::npos);
+  EXPECT_NE(report.find("[1,1,64,128]"), std::string::npos);
+  // FP32 weight: standard dtype + its shape
+  EXPECT_NE(report.find("norm:weight"), std::string::npos);
+  EXPECT_NE(report.find("F32"), std::string::npos);
+  EXPECT_NE(report.find("[1,1,1,128]"), std::string::npos);
+}
+
+/**
+ * @brief The Q4_0 repack ISA recorded under __metadata__ is surfaced.
+ */
+TEST(SafetensorsInspect, shows_q4_0_isa_metadata_p) {
+  std::vector<st::TensorEntry> entries = {
+    makeEntry("fc:weight", "U8", {576}, 0, 576, "Q4_0", {1, 1, 32, 32})};
+
+  const std::string report = st::inspect(st::buildHeader(
+    entries, {{"nntr_format", "nntr-safetensors-v1"}, {"nntr_q4_0_isa",
+                                                       "arm"}}));
+
+  EXPECT_NE(report.find("nntr_q4_0_isa = arm"), std::string::npos);
+}
+
+/**
+ * @brief A header without a __metadata__ block renders "(none)".
+ */
+TEST(SafetensorsInspect, no_metadata_renders_none_p) {
+  const std::string header =
+    R"({"w":{"dtype":"F32","shape":[1,1,2,2],"data_offsets":[0,16]}})";
+  const std::string report = st::inspect(header);
+
+  EXPECT_NE(report.find("(none)"), std::string::npos);
+  EXPECT_NE(report.find("tensors: 1"), std::string::npos);
+}
+
+/**
+ * @brief Tensors are listed in ascending data-offset order regardless of the
+ *        order they appear in the header.
+ */
+TEST(SafetensorsInspect, sorts_tensors_by_offset_p) {
+  std::vector<st::TensorEntry> entries = {
+    makeEntry("second", "F32", {1, 1, 1, 4}, 16, 32),
+    makeEntry("first", "F32", {1, 1, 1, 4}, 0, 16),
+  };
+
+  const std::string report = st::inspect(st::buildHeader(entries));
+
+  const auto pos_first = report.find("first");
+  const auto pos_second = report.find("second");
+  ASSERT_NE(pos_first, std::string::npos);
+  ASSERT_NE(pos_second, std::string::npos);
+  EXPECT_LT(pos_first, pos_second);
+}
+
 int main(int argc, char **argv) {
   int result = -1;
   try {
