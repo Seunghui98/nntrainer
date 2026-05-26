@@ -402,7 +402,11 @@ tooling can still read the file, while the native nntrainer type and logical
 
 ```json
 {
-  "__metadata__": { "format": "nntrainer", "nntr_format": "nntr-safetensors-v1" },
+  "__metadata__": {
+    "format": "nntrainer",
+    "nntr_format": "nntr-safetensors-v1",
+    "nntr_q4_0_isa": "arm"
+  },
   "layer0_wq:weight": {
     "dtype": "U8",
     "shape": [2359296],
@@ -429,6 +433,13 @@ tooling can still read the file, while the native nntrainer type and logical
 FP32/FP16 tensors are written with their standard `dtype`/`shape` and no
 extension fields, so plain (non-quantized) files stay fully standard.
 
+`Q4_0` is repacked into an ISA-specific layout (x86: `q4_0x8`, ARM: `q4_0x4`)
+that the header bytes alone cannot distinguish, so files containing a `Q4_0`
+tensor record `nntr_q4_0_isa` (`x86` / `arm`) under `__metadata__`. This is the
+layout chosen by `--isa` (with `DEFAULT` resolving to the build platform), so a
+file cross-quantized on x86 with `--isa ARM` is tagged `arm` and is identifiable
+before it is loaded on the wrong architecture.
+
 ### Inspecting a file
 
 Use `nntr_safetensors_info` to read just the header and print the embedded
@@ -445,6 +456,7 @@ header bytes: 24960
 metadata:
   format = nntrainer
   nntr_format = nntr-safetensors-v1
+  nntr_q4_0_isa = arm
 
 tensors: 2
   name                 dtype     bytes         shape

@@ -261,6 +261,35 @@ TEST(SafetensorsQuant, fp32_save_has_no_nntr_extension_p) {
   remove(st_path.c_str());
 }
 
+/**
+ * @brief A Q4_0 safetensors records the target ISA in __metadata__ so the
+ *        (ISA-specific) repack layout is identifiable. Explicit ISA::ARM must
+ *        be tagged "arm" even when produced on a non-ARM host.
+ */
+TEST(SafetensorsQuant, q4_0_records_target_isa_p) {
+  const unsigned int W = 32;
+  const unsigned int U = 32;
+  std::map<std::string, DataType> dtype_map = {{"dense", DataType::Q4_0}};
+
+  auto nn = createFcNN(W, U);
+  const std::string st_path = "st_isa_test.safetensors";
+  ASSERT_NO_THROW(nn->save(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS,
+                           DataType::NONE, dtype_map, ml::train::ISA::ARM));
+
+  std::ifstream stf(st_path, std::ios::binary);
+  ASSERT_TRUE(stf.is_open());
+  uint64_t header_size = 0;
+  stf.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+  std::string header_json(header_size, '\0');
+  stf.read(header_json.data(), static_cast<std::streamsize>(header_size));
+
+  auto md = st::parseMetadata(header_json);
+  ASSERT_EQ(md.count("nntr_q4_0_isa"), 1u);
+  EXPECT_EQ(md["nntr_q4_0_isa"], "arm");
+
+  remove(st_path.c_str());
+}
+
 int main(int argc, char **argv) {
   int result = -1;
   try {
