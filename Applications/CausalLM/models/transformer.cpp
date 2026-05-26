@@ -304,7 +304,7 @@ void Transformer::save_weight(
   }
 
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, dtype,
+    model->save(weight_path, formatFromExtension(weight_path), dtype,
                 layer_dtype_map, target_isa);
 
   } catch (const std::exception &e) {
