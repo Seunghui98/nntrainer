@@ -44,6 +44,8 @@
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include "multilingual_tinybert_16mb.h"
 #endif
+#include "ouro_causallm.h"
+#include "ouro_embedding.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
 #if !defined(_WIN32)
@@ -165,6 +167,8 @@ std::string resolve_architecture(std::string model_type,
     } else if (architecture == "Gemma3ForCausalLM" ||
                architecture == "Gemma3TextModel") {
       return "EmbeddingGemma";
+    } else if (architecture == "OuroModel") {
+      return "OuroEmbedding";
     } else if (architecture == "Qwen2Model") {
       return "Qwen2Embedding";
     } else if (architecture == "BertForMaskedLM") {
@@ -206,6 +210,16 @@ int main(int argc, char *argv[]) {
     "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
                                                   nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "OuroForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::OuroCausalLM>(cfg, generation_cfg,
+                                                      nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "OuroEmbedding", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::OuroEmbedding>(cfg, generation_cfg,
+                                                       nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
