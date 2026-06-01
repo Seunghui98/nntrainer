@@ -7,14 +7,15 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   OuroEmbedding builds the Ouro graph for sentence-embedding usage:
- *           1. Token embedding (vocab -> intermediate_size).
- *           2. embed_projection (intermediate_size -> hidden_size).
- *           3. UT loop with shared_from weight tying.
- *           4. Pooling + L2 Normalize.
+ * @note   OuroEmbedding plugs the Ouro Universal-Transformer backbone into
+ *         SentenceTransformer. The backbone graph (token embedding,
+ *         embed_projection, UT loop with shared_from weight tying, per-step
+ *         RMSNorm) is built by constructTransformerModule(); pooling and
+ *         L2 normalization are appended by SentenceTransformer::constructModel
+ *         from modules.json (1_Pooling, 2_Normalize).
  *         The KV cache contains TOTAL_UT_STEPS * NUM_LAYERS slots; the
  *         SentenceTransformer base binds them through kvCacheSlotCount()
- *         and attentionNodeName().
+ *         and attentionNodeName() overrides below.
  */
 
 #ifndef __OURO_EMBEDDING_H__
@@ -40,13 +41,14 @@ public:
 
   virtual ~OuroEmbedding() = default;
 
-  /**
-   * @brief embed -> embed_projection -> UT loop with per-step output_norm
-   *        -> pooling -> normalize.
-   */
-  std::pair<Tensor, Tensor> constructModel() override;
-
 protected:
+  /**
+   * @brief Build the Ouro backbone: embed -> embed_projection -> UT loop ->
+   *        per-step output_norm. SentenceTransformer::constructModel adds
+   *        pooling + normalize on top of this from modules.json.
+   */
+  std::pair<Tensor, Tensor> constructTransformerModule() override;
+
   /**
    * @brief One cache slot per (UT step, layer).
    */
