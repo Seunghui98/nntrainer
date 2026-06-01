@@ -18,22 +18,20 @@
 #include <nntrainer_error.h>
 #include <tensor.h>
 
-#include <ouro_causallm.h>
 #include <llm_util.hpp>
+#include <ouro_causallm.h>
 
 namespace causallm {
 
 std::pair<Tensor, Tensor> OuroCausalLM::constructModel() {
 
-  // Input
   Tensor x =
     Tensor({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
 
-  // Ouro uses embed_tokens (vocab → intermediate_size) + embed_projection
-  // (intermediate_size → hidden_size)
-  const unsigned int EMBED_PROJ_DIM = INTERMEDIATE_SIZE; // 1536
+  // Ouro: embed_tokens (vocab -> intermediate_size) + embed_projection
+  // (intermediate_size -> hidden_size).
+  const unsigned int EMBED_PROJ_DIM = INTERMEDIATE_SIZE;
 
-  // Embedding: vocab → EMBED_PROJ_DIM (intermediate_size)
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
@@ -45,39 +43,23 @@ std::pair<Tensor, Tensor> OuroCausalLM::constructModel() {
      "scale=" + std::to_string(EMBEDDING_SCALE)}));
   Tensor h = embedding(x);
 
-  // Embed projection: EMBED_PROJ_DIM → DIM (intermediate_size → hidden_size)
   LayerHandle embed_proj(createLayer(
     "fully_connected",
-    {withKey("name", "embed_projection"),
-     withKey("unit", DIM),
+    {withKey("name", "embed_projection"), withKey("unit", DIM),
      withKey("disable_bias", "true"),
      withKey("weight_dtype", FC_LAYER_DTYPE)}));
   h = embed_proj(h);
 
-  // Transformer decoder blocks (UT step 0: create new blocks)
-  for (int i = 0; i < NUM_LAYERS; ++i) {
-    h = createTransformerDecoderBlock(i, h);
+  // Universal-Transformer unroll. Weights of UT step k>0 are tied to step 0
+  // via shared_from inside createOuroDecoderBlock / applyOuroOutputNorm, so
+  // only one set of parameters is stored.
+  for (int ut = 0; ut < static_cast<int>(TOTAL_UT_STEPS); ++ut) {
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      h = createOuroDecoderBlock(i, ut, h);
+    }
+    h = applyOuroOutputNorm(ut, h);
   }
 
-  // TODO: UT loop unrolling (total_ut_steps > 1)
-  // For subsequent UT steps, create decoder blocks with shared_from
-  // pointing to the first step's blocks. This requires extending
-  // createTransformerDecoderBlock to accept a shared_from_prefix parameter.
-  // Example for UT step 1:
-  //   for (int i = 0; i < NUM_LAYERS; ++i) {
-  //     h = createTransformerDecoderBlock(
-  //       i + NUM_LAYERS, h, /*shared_from_prefix=*/"layer" +
-  //       std::to_string(i));
-  //   }
-
-  // Final RMSNorm
-  LayerHandle out_norm(createLayer(
-    "rms_norm", {withKey("name", "output_norm"),
-                 withKey("epsilon", std::to_string(NORM_EPS)),
-                 withKey("packed", "false")}));
-  h = out_norm(h);
-
-  // LM Head
   const std::string lmhead_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
 
@@ -96,6 +78,73 @@ std::pair<Tensor, Tensor> OuroCausalLM::constructModel() {
   h = lmhead(h);
 
   return {x, h};
+}
+
+void OuroCausalLM::allocateAndBindKVCache() {
+  const unsigned int total_slots =
+    static_cast<unsigned int>(TOTAL_UT_STEPS) *
+    static_cast<unsigned int>(NUM_LAYERS);
+
+  if (!kv_cache.isAllocated()) {
+#ifdef ENABLE_FP16
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+    const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+    kv_cache.allocate(total_slots, BATCH_SIZE, max_timestep,
+                      static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
+                      static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+    kv_cache_bound = false;
+  }
+
+  if (kv_cache_bound)
+    return;
+
+  auto find_cache_placeholder = [this](const std::string &base_name) {
+    for (const auto &suffix : {":0", ":input0", ":out0", ""}) {
+      auto *tensor = model->getTensor(base_name + suffix);
+      if (tensor != nullptr)
+        return tensor;
+    }
+    return static_cast<nntrainer::Tensor *>(nullptr);
+  };
+
+  for (int ut = 0; ut < static_cast<int>(TOTAL_UT_STEPS); ++ut) {
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      const int flat = ut * NUM_LAYERS + i;
+      const std::string attn_name =
+        (ut == 0)
+          ? ("layer" + std::to_string(i) + "_attention")
+          : ("layer" + std::to_string(i) + "_ut" + std::to_string(ut) +
+             "_attention");
+
+      auto &kc = kv_cache.getKeyCache(flat);
+      auto &vc = kv_cache.getValueCache(flat);
+
+      auto *kp = model->getTensor(attn_name + ":input3");
+      auto *vp = model->getTensor(attn_name + ":input4");
+      if (kp == nullptr)
+        kp = find_cache_placeholder("cache_k_l" + std::to_string(flat));
+      if (vp == nullptr)
+        vp = find_cache_placeholder("cache_v_l" + std::to_string(flat));
+
+      NNTR_THROW_IF(kp == nullptr || vp == nullptr, std::runtime_error)
+        << "OuroCausalLM::allocateAndBindKVCache: cache_k_l" << flat
+        << " / cache_v_l" << flat << " input placeholder not found (attn="
+        << attn_name << ")";
+      NNTR_THROW_IF(kp->getDataType() != kc.getDataType() ||
+                      vp->getDataType() != vc.getDataType(),
+                    std::runtime_error)
+        << "OuroCausalLM::allocateAndBindKVCache: dtype mismatch at slot "
+        << flat;
+
+      kp->setData(kc.getMemoryData(), kc.getOffset(), false);
+      vp->setData(vc.getMemoryData(), vc.getOffset(), false);
+    }
+  }
+
+  kv_cache_bound = true;
 }
 
 } // namespace causallm

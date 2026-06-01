@@ -7,11 +7,14 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   OuroCausalLM overrides constructModel() to add:
- *   - embed_projection layer (EMBED_PROJ_DIM → DIM)
- *   - UT loop unrolling with shared_from weight sharing
- *   The extra RMSNorm layers are handled by
- *   OuroTransformer::createTransformerDecoderBlock().
+ * @note   OuroCausalLM builds the full Ouro decoder-only graph:
+ *           1. Token embedding (vocab -> intermediate_size).
+ *           2. embed_projection (intermediate_size -> hidden_size).
+ *           3. UT loop: total_ut_steps iterations of the Ouro decoder stack
+ *              with extra RMSNorms and weight sharing via shared_from.
+ *           4. LM head.
+ *         The KV cache is allocated with TOTAL_UT_STEPS * NUM_LAYERS slots
+ *         so each (step, layer) pair owns a private cache_k/cache_v.
  */
 
 #ifndef __OURO_CAUSAL_LM_H__
@@ -24,11 +27,6 @@ namespace causallm {
 
 /**
  * @brief OuroCausalLM class
- *
- * Overrides constructModel() to handle Ouro-specific architecture:
- * 1. Embedding with EMBED_PROJ_DIM output + embed_projection (EMBED_PROJ_DIM → DIM)
- * 2. UT loop unrolling with shared_from weight sharing
- * 3. Extra RMSNorm layers via OuroTransformer::createTransformerDecoderBlock()
  */
 class OuroCausalLM : public CausalLM, public OuroTransformer {
 
@@ -43,12 +41,17 @@ public:
   virtual ~OuroCausalLM() = default;
 
   /**
-   * @brief Override constructModel for Ouro-specific architecture
-   *
-   * Creates: embedding(EMBED_PROJ_DIM) → embed_projection → UT loop
-   * decoder blocks → output_norm → lm_head
+   * @brief Build the Ouro graph: embed -> embed_projection -> UT loop ->
+   *        per-step output_norm -> lm_head.
    */
   std::pair<Tensor, Tensor> constructModel() override;
+
+protected:
+  /**
+   * @brief Allocate TOTAL_UT_STEPS * NUM_LAYERS KV cache slots and bind
+   *        each one to the corresponding `layer<i>[_ut<k>]_attention` node.
+   */
+  void allocateAndBindKVCache() override;
 };
 
 } // namespace causallm
