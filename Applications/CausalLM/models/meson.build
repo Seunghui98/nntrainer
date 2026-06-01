@@ -8,6 +8,7 @@ causallm_inc += include_directories('.')
 
 subdir('deberta_v2')
 subdir('gpt_oss')
+subdir('ouro')
 subdir('qwen2')
 subdir('qwen3')
 subdir('qwen3_moe')
