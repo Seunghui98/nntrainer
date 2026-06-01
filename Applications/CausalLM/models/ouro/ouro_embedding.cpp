@@ -58,8 +58,14 @@ std::pair<Tensor, Tensor> OuroEmbedding::constructModel() {
     h = applyOuroOutputNorm(ut, h);
   }
 
+  // Pooling: mean over the (actual) sequence positions, matching
+  // sentence-transformers 1_Pooling/config.json. Without the explicit
+  // pooling_mode_mean_tokens flag the layer falls through to setZero().
   LayerHandle pooling(createLayer(
-    "embedding_pooling", {withKey("name", "embedding_pooling")}));
+    "embedding_pooling",
+    {withKey("name", "embedding_pooling"),
+     withKey("pooling_mode_mean_tokens", "true"),
+     withKey("word_embedding_dimension", DIM)}));
   h = pooling(h);
 
   LayerHandle normalize(createLayer(
