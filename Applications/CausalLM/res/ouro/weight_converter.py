@@ -232,8 +232,18 @@ def parse_args():
     parser.add_argument(
         "--output_name",
         type=str,
-        default="./nntr_ouro_fp32.safetensors",
-        help="Output weight file path. Suffix selects format (.safetensors or .bin).",
+        default="./nntr_ouro_fp32",
+        help="Output weight file path (without extension; the extension is "
+             "added based on --format). If a suffix is given (.bin / "
+             ".safetensors) it is respected when --format is 'auto'.",
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="safetensors",
+        choices=["safetensors", "bin", "both", "auto"],
+        help="Output format. 'safetensors' (default) / 'bin' / 'both' / "
+             "'auto' (infer from --output_name suffix; .safetensors otherwise).",
     )
     parser.add_argument(
         "--data_type",
@@ -276,12 +286,26 @@ def main():
     )
 
     output_name = args.output_name
-    if output_name.endswith(".bin"):
-        save_binary(weights, output_name)
-    else:
-        save_safetensors(
-            weights, get_safetensors_output_name(output_name), args.data_type
-        )
+
+    def strip_ext(path: str) -> str:
+        for ext in (".safetensors", ".bin"):
+            if path.endswith(ext):
+                return path[: -len(ext)]
+        return path
+
+    fmt = args.format
+    if fmt == "auto":
+        if output_name.endswith(".bin"):
+            fmt = "bin"
+        else:
+            fmt = "safetensors"
+
+    base = strip_ext(output_name)
+
+    if fmt in ("bin", "both"):
+        save_binary(weights, base + ".bin")
+    if fmt in ("safetensors", "both"):
+        save_safetensors(weights, base + ".safetensors", args.data_type)
 
 
 if __name__ == "__main__":
