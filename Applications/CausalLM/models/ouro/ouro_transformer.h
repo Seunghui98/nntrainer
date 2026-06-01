@@ -43,7 +43,7 @@ public:
 
   /**
    * @brief Backward-compatible single-step block creator. Equivalent to
-   *        createOuroDecoderBlock(layer_id, /*current_ut=*/0, input).
+   *        createOuroDecoderBlock(layer_id, current_ut=0, input).
    */
   Tensor createTransformerDecoderBlock(const int layer_id,
                                        Tensor input) override;
