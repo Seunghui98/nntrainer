@@ -63,94 +63,105 @@ def collect_ouro_for_nntrainer(
     """
     weights: List[Tuple[str, np.ndarray]] = []
 
+    # AutoModelForCausalLM wraps OuroModel under self.model, so keys are
+    # "model.<...>". AutoModel returns OuroModel directly, so keys are just
+    # "<...>". Detect once and reuse.
+    if "model.embed_tokens.weight" in params:
+        base = "model."
+    elif "embed_tokens.weight" in params:
+        base = ""
+    else:
+        sample_keys = list(params.keys())[:5]
+        raise KeyError(
+            "Could not locate embed_tokens.weight in the state_dict. "
+            f"First keys: {sample_keys}"
+        )
+
+    def must_get(key: str) -> torch.Tensor:
+        full = base + key
+        if full not in params:
+            raise KeyError(f"Missing key: {full}")
+        return params[full]
+
     def add(name: str, tensor: torch.Tensor, transpose: bool = False) -> None:
         weights.append((name, tensor_to_numpy(tensor, dtype, transpose=transpose)))
 
     # 1. Embedding: HF [vocab, embed_dim=intermediate_size] -> nntrainer same layout
-    embed_tokens = _maybe_get(
-        params, "model.embed_tokens.weight", "embed_tokens.weight"
-    )
-    if embed_tokens is None:
-        raise KeyError("model.embed_tokens.weight not found in state_dict")
-    add("embedding0:Embedding", embed_tokens)
+    add("embedding0:Embedding", must_get("embed_tokens.weight"))
 
     # 2. embed_projection: HF Linear(embed_dim, hidden_size) -> transpose for FC
-    embed_proj = _maybe_get(
-        params, "model.embed_projection.weight", "embed_projection.weight"
-    )
-    if embed_proj is None:
-        raise KeyError("model.embed_projection.weight not found in state_dict")
-    add("embed_projection:weight", embed_proj, transpose=True)
+    add("embed_projection:weight", must_get("embed_projection.weight"),
+        transpose=True)
 
     # 3. Per-layer decoder weights (step 0 names only)
     for layer_idx in range(n_layers):
-        prefix_hf = f"model.layers.{layer_idx}."
+        prefix_hf = f"layers.{layer_idx}."
         prefix_nn = f"layer{layer_idx}"
 
         # Attention pre-norm + post-attention norm (Ouro extra)
         add(
             f"{prefix_nn}_attention_norm:gamma",
-            params[f"{prefix_hf}input_layernorm.weight"],
+            must_get(f"{prefix_hf}input_layernorm.weight"),
         )
 
         # Q/K/V/O projections
         add(
             f"{prefix_nn}_wq:weight",
-            params[f"{prefix_hf}self_attn.q_proj.weight"],
+            must_get(f"{prefix_hf}self_attn.q_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_wk:weight",
-            params[f"{prefix_hf}self_attn.k_proj.weight"],
+            must_get(f"{prefix_hf}self_attn.k_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_wv:weight",
-            params[f"{prefix_hf}self_attn.v_proj.weight"],
+            must_get(f"{prefix_hf}self_attn.v_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_attention_out:weight",
-            params[f"{prefix_hf}self_attn.o_proj.weight"],
+            must_get(f"{prefix_hf}self_attn.o_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_attention_norm_2:gamma",
-            params[f"{prefix_hf}input_layernorm_2.weight"],
+            must_get(f"{prefix_hf}input_layernorm_2.weight"),
         )
 
         # FFN pre-norm + post-FFN norm (Ouro extra)
         add(
             f"{prefix_nn}_ffn_norm:gamma",
-            params[f"{prefix_hf}post_attention_layernorm.weight"],
+            must_get(f"{prefix_hf}post_attention_layernorm.weight"),
         )
 
         # SwiGLU MLP: gate / up / down
         add(
             f"{prefix_nn}_ffn_up:weight",
-            params[f"{prefix_hf}mlp.up_proj.weight"],
+            must_get(f"{prefix_hf}mlp.up_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_ffn_gate:weight",
-            params[f"{prefix_hf}mlp.gate_proj.weight"],
+            must_get(f"{prefix_hf}mlp.gate_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_ffn_down:weight",
-            params[f"{prefix_hf}mlp.down_proj.weight"],
+            must_get(f"{prefix_hf}mlp.down_proj.weight"),
             transpose=True,
         )
         add(
             f"{prefix_nn}_ffn_norm_2:gamma",
-            params[f"{prefix_hf}post_attention_layernorm_2.weight"],
+            must_get(f"{prefix_hf}post_attention_layernorm_2.weight"),
         )
 
     # 4. Final RMSNorm (applied at the end of each UT step; step 0 name)
-    add("output_norm:gamma", params["model.norm.weight"])
+    add("output_norm:gamma", must_get("norm.weight"))
 
-    # 5. LM head (only when not tied). For the OuroModel embedding architecture
-    #    there is no lm_head; this branch matters only for OuroForCausalLM.
+    # 5. LM head (only when not tied). lm_head lives at the top level even when
+    #    AutoModelForCausalLM is used.
     if not tie_word_embeddings:
         lm_head = _maybe_get(params, "lm_head.weight")
         if lm_head is not None:
