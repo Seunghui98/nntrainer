@@ -7,13 +7,16 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   This ouro_transformer.h constructs a class for Ouro model which
- * extends Transformer with extra RMSNorm layers in the decoder block.
- * @note   Key differences from base Transformer decoder block:
- *   - Extra RMSNorm after attention: input_layernorm_2
- *   - Extra RMSNorm after FFN: post_attention_layernorm_2
- * @note   The UT loop and embedding projection are handled in
- * OuroCausalLM/OuroEmbedding's constructModel() override.
+ * @note   OuroTransformer extends the base Transformer with:
+ *           1. Extra RMSNorm after attention (input_layernorm_2) and after
+ *              FFN (post_attention_layernorm_2).
+ *           2. Universal-Transformer loop unrolling. The whole decoder stack
+ *              is iterated `total_ut_steps` times; weights of step k>0 are
+ *              tied to step 0 through nntrainer's `shared_from` mechanism.
+ *           3. Final RMSNorm applied at the end of each UT step (matches HF
+ *              `self.norm(hidden_states)` placed inside the UT loop).
+ *         The embedding-projection and the final pooling/lm_head are added
+ *         by OuroEmbedding / OuroCausalLM in their constructModel().
  */
 
 #ifndef __OURO_TRANSFORMER_H__
@@ -25,13 +28,6 @@ namespace causallm {
 
 /**
  * @brief OuroTransformer class
- *
- * Ouro model extends the base Transformer with extra RMSNorm layers
- * in the decoder block. Only createTransformerDecoderBlock is overridden
- * to add the extra normalization layers.
- *
- * The UT loop unrolling and embedding projection are handled separately
- * in OuroCausalLM and OuroEmbedding via their constructModel() overrides.
  */
 class OuroTransformer : virtual public Transformer {
 
@@ -39,27 +35,84 @@ public:
   static constexpr const char *architectures = "OuroTransformer";
 
   OuroTransformer(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg) {}
+    Transformer(cfg, generation_cfg, nntr_cfg) {
+    setupOuroParameters(cfg);
+  }
 
   virtual ~OuroTransformer() = default;
 
   /**
-   * @brief Create one Ouro decoder block with extra RMSNorm layers
-   *
-   * Structure:
-   *   residual = x
-   *   x = input_layernorm(x)
-   *   x = attention(x)
-   *   x = input_layernorm_2(x)       ← extra
-   *   x = residual + x
-   *   residual = x
-   *   x = post_attention_layernorm(x)
-   *   x = mlp(x)
-   *   x = post_attention_layernorm_2(x) ← extra
-   *   x = residual + x
+   * @brief Backward-compatible single-step block creator. Equivalent to
+   *        createOuroDecoderBlock(layer_id, /*current_ut=*/0, input).
    */
   Tensor createTransformerDecoderBlock(const int layer_id,
                                        Tensor input) override;
+
+protected:
+  /**
+   * @brief Build one Ouro decoder block at UT step `current_ut`.
+   *        For current_ut == 0 the leaf layers get the canonical names
+   *        ("layer<i>_<role>"). For current_ut > 0 they receive
+   *        "layer<i>_ut<k>_<role>" + `shared_from=layer<i>_<role>` so the
+   *        underlying weight tensors are shared with step 0.
+   */
+  virtual Tensor createOuroDecoderBlock(int layer_id, int current_ut,
+                                        Tensor input);
+
+  /**
+   * @brief UT-aware variant of Transformer::createAttention. Replicates the
+   *        Q/K/V/O projection layout but routes the cache placeholders to
+   *        a unique flat id (current_ut * NUM_LAYERS + layer_id) so each
+   *        (step, layer) pair owns a separate KV cache slot.
+   */
+  virtual Tensor createOuroAttention(int layer_id, int current_ut, int seq_len,
+                                     int n_heads, int head_dim, Tensor q,
+                                     Tensor k, Tensor v);
+
+  /**
+   * @brief UT-aware variant of Transformer::createMlp.
+   */
+  virtual Tensor createOuroMlp(int layer_id, int current_ut, int dim,
+                               int hidden_dim, Tensor input);
+
+  /**
+   * @brief UT-aware variant of Transformer::createKVCachePlaceholders. The
+   *        placeholder names are "cache_k_l<flat_id>" / "cache_v_l<flat_id>"
+   *        where flat_id = current_ut * NUM_LAYERS + layer_id.
+   */
+  std::pair<Tensor, Tensor>
+  createOuroKVCachePlaceholders(int layer_id, int current_ut, int n_heads);
+
+  /**
+   * @brief Apply the final RMSNorm. Step 0 keeps the canonical name
+   *        "output_norm"; step k>0 uses "output_norm_ut<k>" tied to
+   *        "output_norm" via shared_from.
+   */
+  Tensor applyOuroOutputNorm(int current_ut, Tensor input);
+
+  /**
+   * @brief Parse Ouro-specific config fields (total_ut_steps). Called from
+   *        the constructor so it is available before constructModel() runs.
+   */
+  void setupOuroParameters(json &cfg);
+
+  /**
+   * @brief Compose a leaf layer name. step 0 -> "layer<i>_<role>",
+   *        step k>0 -> "layer<i>_ut<k>_<role>".
+   */
+  std::string ouroNodeName(int layer_id, int current_ut,
+                           const std::string &role) const;
+
+  /**
+   * @brief Step-0 name "layer<i>_<role>" used as shared_from target.
+   */
+  std::string ouroSharedFromName(int layer_id,
+                                 const std::string &role) const;
+
+  /**
+   * @brief total_ut_steps from config.json (default 1).
+   */
+  unsigned int TOTAL_UT_STEPS = 1;
 };
 
 } // namespace causallm

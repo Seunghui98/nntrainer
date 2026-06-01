@@ -7,11 +7,14 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   OuroEmbedding overrides constructModel() to add:
- *   - embed_projection layer (EMBED_PROJ_DIM → DIM)
- *   - UT loop unrolling with shared_from weight sharing
- *   The extra RMSNorm layers are handled by
- *   OuroTransformer::createTransformerDecoderBlock().
+ * @note   OuroEmbedding builds the Ouro graph for sentence-embedding usage:
+ *           1. Token embedding (vocab -> intermediate_size).
+ *           2. embed_projection (intermediate_size -> hidden_size).
+ *           3. UT loop with shared_from weight tying.
+ *           4. Pooling + L2 Normalize.
+ *         The KV cache contains TOTAL_UT_STEPS * NUM_LAYERS slots; the
+ *         SentenceTransformer base binds them through kvCacheSlotCount()
+ *         and attentionNodeName().
  */
 
 #ifndef __OURO_EMBEDDING_H__
@@ -24,11 +27,6 @@ namespace causallm {
 
 /**
  * @brief OuroEmbedding class
- *
- * Overrides constructModel() to handle Ouro-specific architecture:
- * 1. Embedding with EMBED_PROJ_DIM output + embed_projection (EMBED_PROJ_DIM → DIM)
- * 2. UT loop unrolling with shared_from weight sharing
- * 3. Extra RMSNorm layers via OuroTransformer::createTransformerDecoderBlock()
  */
 class OuroEmbedding : public SentenceTransformer, public OuroTransformer {
 
@@ -43,12 +41,33 @@ public:
   virtual ~OuroEmbedding() = default;
 
   /**
-   * @brief Override constructModel for Ouro-specific architecture
-   *
-   * Creates: embedding(EMBED_PROJ_DIM) → embed_projection → UT loop
-   * decoder blocks → output_norm → pooling → normalize
+   * @brief embed -> embed_projection -> UT loop with per-step output_norm
+   *        -> pooling -> normalize.
    */
   std::pair<Tensor, Tensor> constructModel() override;
+
+protected:
+  /**
+   * @brief One cache slot per (UT step, layer).
+   */
+  unsigned int kvCacheSlotCount() const override {
+    return static_cast<unsigned int>(TOTAL_UT_STEPS) *
+           static_cast<unsigned int>(NUM_LAYERS);
+  }
+
+  /**
+   * @brief Map flat slot -> "layer<i>_attention" for step 0,
+   *        "layer<i>_ut<k>_attention" otherwise.
+   */
+  std::string attentionNodeName(unsigned int slot) const override {
+    const int layers = NUM_LAYERS;
+    const int ut = static_cast<int>(slot) / layers;
+    const int i = static_cast<int>(slot) % layers;
+    if (ut == 0)
+      return "layer" + std::to_string(i) + "_attention";
+    return "layer" + std::to_string(i) + "_ut" + std::to_string(ut) +
+           "_attention";
+  }
 };
 
 } // namespace causallm
