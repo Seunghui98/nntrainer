@@ -17,6 +17,7 @@
 #include <sentence_transformer.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <utility>
@@ -271,7 +272,16 @@ void SentenceTransformer::run(const WSTR prompt, bool do_sample,
                               bool log_output) {
 
   try {
+    auto start_total = std::chrono::high_resolution_clock::now();
+
     std::vector<float *> results = encode(prompt, system_prompt, tail_prompt);
+
+    auto finish_total = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      finish_total - start_total);
+    performance_metrics.total_duration_ms = total_duration.count();
+    performance_metrics.peak_memory_kb = getPeakMemoryKb();
+    has_run_ = true;
 
     if (log_output) {
 
@@ -289,6 +299,24 @@ void SentenceTransformer::run(const WSTR prompt, bool do_sample,
           std::cout << ", ...";
         std::cout << "] (Total DIM: " << DIM << ")" << std::endl;
       }
+
+      const double prefill_tps =
+        (performance_metrics.prefill_duration_ms > 0.0)
+          ? (static_cast<double>(performance_metrics.prefill_tokens) /
+             performance_metrics.prefill_duration_ms * 1000.0)
+          : 0.0;
+      std::cout << "\n\n";
+      std::cout
+        << "================[ Embedding with NNTrainer ]================\n";
+      std::cout << "prefill: " << performance_metrics.prefill_tokens
+                << " tokens, " << performance_metrics.prefill_duration_ms
+                << " ms, " << prefill_tps << " TPS\n";
+      std::cout << "total: " << performance_metrics.total_duration_ms
+                << " ms\n";
+      std::cout << "peak memory: " << performance_metrics.peak_memory_kb
+                << " KB\n";
+      std::cout
+        << "============================================================\n";
     }
 
     // output should be deallocated after use.
@@ -366,8 +394,16 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   // start: 0, end: input_len (process all tokens at once)
   // This performs a single forward pass for the entire prompt sequence to get
   // embeddings.
+  auto start_prefill = std::chrono::high_resolution_clock::now();
   std::vector<float *> output = model->incremental_inference(
     BATCH_SIZE, input, label, input_len, 0, input_len, false);
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+
+  auto prefill_duration =
+    std::chrono::duration_cast<std::chrono::milliseconds>(finish_prefill -
+                                                          start_prefill);
+  performance_metrics.prefill_tokens = input_len;
+  performance_metrics.prefill_duration_ms = prefill_duration.count();
 
   return output;
 }
