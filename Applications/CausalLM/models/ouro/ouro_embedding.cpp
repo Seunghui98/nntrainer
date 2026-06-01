@@ -12,8 +12,6 @@
 
 #include <app_context.h>
 #include <common.h>
-#include <embedding_normalize_layer.h>
-#include <embedding_pooling_layer.h>
 #include <layer_context.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
@@ -24,7 +22,7 @@
 
 namespace causallm {
 
-std::pair<Tensor, Tensor> OuroEmbedding::constructModel() {
+std::pair<Tensor, Tensor> OuroEmbedding::constructTransformerModule() {
 
   Tensor x =
     Tensor({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
@@ -58,20 +56,8 @@ std::pair<Tensor, Tensor> OuroEmbedding::constructModel() {
     h = applyOuroOutputNorm(ut, h);
   }
 
-  // Pooling: mean over the (actual) sequence positions, matching
-  // sentence-transformers 1_Pooling/config.json. Without the explicit
-  // pooling_mode_mean_tokens flag the layer falls through to setZero().
-  LayerHandle pooling(createLayer(
-    "embedding_pooling",
-    {withKey("name", "embedding_pooling"),
-     withKey("pooling_mode_mean_tokens", "true"),
-     withKey("word_embedding_dimension", DIM)}));
-  h = pooling(h);
-
-  LayerHandle normalize(createLayer(
-    "embedding_normalize", {withKey("name", "embedding_normalize_layer")}));
-  h = normalize(h);
-
+  // Pooling + normalize are appended by SentenceTransformer::constructModel
+  // based on modules.json (1_Pooling, 2_Normalize).
   return {x, h};
 }
 
