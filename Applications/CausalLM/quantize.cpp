@@ -74,6 +74,8 @@
 #include "gptoss_cached_slim_causallm.h"
 #endif
 #include "gptoss_causallm.h"
+#include "ouro_causallm.h"
+#include "ouro_embedding.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
 #if !defined(_WIN32)
@@ -241,6 +243,8 @@ std::string resolve_architecture(std::string model_type,
       return "EmbeddingGemma";
     else if (architecture == "Qwen2Model")
       return "Qwen2Embedding";
+    else if (architecture == "OuroModel")
+      return "OuroEmbedding";
     else
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
@@ -341,6 +345,16 @@ void registerAllModels() {
                           return std::make_unique<causallm::EmbeddingGemma>(
                             cfg, generation_cfg, nntr_cfg);
                         });
+  factory.registerModel("OuroForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::OuroCausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+  factory.registerModel("OuroEmbedding",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::OuroEmbedding>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
 }
 
 /**
@@ -433,7 +447,16 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
   // Gemma4 PLE projection
   dtype_map["per_layer_input_projection"] = fc_dtype;
 
-  // Transformer decoder layers
+  // Embed projection (Ouro-style models: intermediate_size -> hidden_size FC
+  // between the token embedding and the first decoder block). Harmless for
+  // models without one: the lookup falls through to the default dtype.
+  if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
+    dtype_map["embed_projection"] = fc_dtype;
+  }
+
+  // Transformer decoder layers. Only step-0 names are emitted; UT-step k>0
+  // nodes (e.g. Ouro's `layer<i>_ut<k>_wq`) share weights via shared_from
+  // and their Layer::save is a no-op, so they need no dtype entry.
   for (int i = 0; i < num_layers; ++i) {
     std::string prefix = "layer" + std::to_string(i);
 
