@@ -153,7 +153,9 @@ static std::string apply_chat_template(const std::string &architecture,
     try {
       nlohmann::json request =
         nlohmann::json::array({{{"role", "user"}, {"content", input}}});
-      return g_chat_template->apply(request);
+      causallm::ChatTemplate::Options opts;
+      opts.template_name = g_chat_template_name;
+      return g_chat_template->apply(request, opts);
     } catch (const std::exception &e) {
       std::cerr << "[Warning] Failed to apply chat template: " << e.what()
                 << ". Falling back to hardcoded templates." << std::endl;
