@@ -683,8 +683,7 @@ TEST(nntrainerGraphUnitTest, weight_layer_compile_and_initialize) {
 
   model->addLayer(ml::train::createLayer(
     "weight",
-    {nntrainer::withKey("name", "wt0"),
-     nntrainer::withKey("dim", "1:1:4"),
+    {nntrainer::withKey("name", "wt0"), nntrainer::withKey("dim", "1:1:4"),
      nntrainer::withKey("input_shape", "1:1:4"),
      nntrainer::withKey("tensor_dtype", "FP32"),
      nntrainer::withKey("weight_name", "test_weight")}));
