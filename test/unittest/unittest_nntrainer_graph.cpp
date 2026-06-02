@@ -672,6 +672,31 @@ TEST(nntrainerGraphUnitTest, topological_sort_complex_multi_output) {
                              "fc4", "fc3", "fc5"});
 }
 
+TEST(nntrainerGraphUnitTest, weight_layer_compile_and_initialize) {
+  /* A standalone WeightLayer node must compile and initialize without error.
+   * This exercises the skip added to initialize() so that weight-only nodes
+   * are not treated as regular non-input layers that require an entry in the
+   * input buffer map. Without the fix, initialize() throws "Cannot find input
+   * buffers for the node" even when input_shape is provided. */
+  std::unique_ptr<ml::train::Model> model =
+    ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  model->addLayer(ml::train::createLayer(
+    "weight",
+    {nntrainer::withKey("name", "wt0"),
+     nntrainer::withKey("dim", "1:1:4"),
+     nntrainer::withKey("input_shape", "1:1:4"),
+     nntrainer::withKey("tensor_dtype", "FP32"),
+     nntrainer::withKey("weight_name", "test_weight")}));
+
+  model->setProperty({nntrainer::withKey("batch_size", 1),
+                      nntrainer::withKey("model_tensor_type", "FP32-FP32")});
+
+  EXPECT_EQ(model->compile(ml::train::ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  EXPECT_EQ(model->initialize(ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
+}
+
 int main(int argc, char **argv) {
   int result = -1;
 
