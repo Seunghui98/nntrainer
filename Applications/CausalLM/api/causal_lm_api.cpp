@@ -641,10 +641,9 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 /**
  * @brief Apply chat template to messages with hardcoded fallback
  */
-static std::string
-apply_chat_template_messages(const std::string &architecture,
-                             const nlohmann::json &messages,
-                             bool add_generation_prompt) {
+static std::string apply_chat_template_messages(const std::string &architecture,
+                                                const nlohmann::json &messages,
+                                                bool add_generation_prompt) {
   if (g_chat_template) {
     try {
       causallm::ChatTemplate::Options opts;
@@ -717,10 +716,9 @@ ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
 
     nlohmann::json chat_messages = nlohmann::json::array();
     for (size_t i = 0; i < num_messages; ++i) {
-      chat_messages.push_back(
-        nlohmann::json{{"role", messages[i].role ? messages[i].role : ""},
-                       {"content",
-                        messages[i].content ? messages[i].content : ""}});
+      chat_messages.push_back(nlohmann::json{
+        {"role", messages[i].role ? messages[i].role : ""},
+        {"content", messages[i].content ? messages[i].content : ""}});
     }
 
     g_formatted_template = apply_chat_template_messages(
