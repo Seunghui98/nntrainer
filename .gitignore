@@ -28,6 +28,9 @@ Applications/CausalLM/res/deberta_v2/*
 Applications/CausalLM/res/lfm2_vl/*
 !Applications/CausalLM/res/lfm2_vl/README.md
 !Applications/CausalLM/res/lfm2_vl/*.py
+!Applications/CausalLM/res/ouro/
+Applications/CausalLM/res/ouro/*
+!Applications/CausalLM/res/ouro/weight_converter.py
 Applications/**/tokenizers-cpp-build/*
 
 # QuickAI ships tiny source-level Android resource files (strings, themes,
