@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <ddtree.h>
+#include <ddtree_compact.h>
 #include <ddtree_sliding.h>
 #include <ddtree_types.h>
 
@@ -239,6 +240,58 @@ TEST(DDTreeFollow, ImmediateReject) {
   Accepted a = followVerified(cm, posterior.data());
   EXPECT_EQ(a.indices, (std::vector<int32_t>{0}));
   EXPECT_EQ(a.nextToken, 5);
+}
+
+TEST(DDTreeCompact, SubsetReorderRowMajor) {
+  using nntrainer::ddtree::compactTail;
+  // 1 prefix row then a tail of 4 rows, each row = 2 elems. seqStride=2.
+  const int rowElems = 2, seqStride = 2, past = 1, tailLen = 4;
+  std::vector<float> buf = {
+    -1, -1, // row 0 (prefix, untouched)
+    10, 11, // tail idx 0
+    20, 21, // tail idx 1
+    30, 31, // tail idx 2
+    40, 41, // tail idx 3
+  };
+  std::vector<int32_t> keep = {0, 2, 3}; // keep tail rows 0,2,3
+  compactTail(buf.data(), sizeof(float), seqStride, rowElems, past, tailLen,
+              keep.data(), (int)keep.size());
+  EXPECT_EQ(buf[2], 10); EXPECT_EQ(buf[3], 11); // dst0 = src0
+  EXPECT_EQ(buf[4], 30); EXPECT_EQ(buf[5], 31); // dst1 = src2
+  EXPECT_EQ(buf[6], 40); EXPECT_EQ(buf[7], 41); // dst2 = src3
+  EXPECT_EQ(buf[0], -1); // prefix untouched
+}
+
+TEST(DDTreeCompact, IdentityNoOp) {
+  using nntrainer::ddtree::compactTail;
+  std::vector<float> buf = {0, 1, 2, 3};
+  std::vector<int32_t> keep = {0, 1};
+  compactTail(buf.data(), sizeof(float), 2, 2, 0, 2, keep.data(), 2);
+  EXPECT_EQ(buf, (std::vector<float>{0, 1, 2, 3}));
+}
+
+TEST(DDTreeCompact, EmptyKeepNoOp) {
+  using nntrainer::ddtree::compactTail;
+  std::vector<float> buf = {9, 9};
+  std::vector<int32_t> keep;
+  compactTail(buf.data(), sizeof(float), 2, 2, 0, 1, keep.data(), 0);
+  EXPECT_EQ(buf, (std::vector<float>{9, 9}));
+}
+
+TEST(DDTreeCompact, WorksWithSeqStrideGreaterThanRow) {
+  using nntrainer::ddtree::compactTail;
+  // seqStride 3 but rowElems 2 (padded rows). 3 tail rows.
+  const int rowElems = 2, seqStride = 3, past = 0, tailLen = 3;
+  std::vector<float> buf = {
+    10, 11, 99, // tail 0 (col 2 = pad)
+    20, 21, 99, // tail 1
+    30, 31, 99, // tail 2
+  };
+  std::vector<int32_t> keep = {2, 0};
+  compactTail(buf.data(), sizeof(float), seqStride, rowElems, past, tailLen,
+              keep.data(), 2);
+  EXPECT_EQ(buf[0], 30); EXPECT_EQ(buf[1], 31); // dst0 = src2
+  EXPECT_EQ(buf[3], 10); EXPECT_EQ(buf[4], 11); // dst1 = src0
 }
 
 /**
