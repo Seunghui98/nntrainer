@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <ddtree.h>
+#include <ddtree_sliding.h>
 #include <ddtree_types.h>
 
 TEST(DDTreeScaffold, ConfigDefaults) {
@@ -143,6 +144,62 @@ TEST(DDTreeCompile, IdsPositionsAndMask) {
     for (int j = 0; j < L; ++j) {
       float expected = t.visibility[i * L + j] ? 0.0f : cfg.maskFillValue;
       EXPECT_EQ(mask[i * stride + past + j], expected);
+    }
+}
+
+TEST(DDTreeSliding, NoSlidingLayersPassthrough) {
+  using nntrainer::ddtree::makeSlidingMasks;
+  using nntrainer::ddtree::SlidingMasks;
+  std::vector<float> full(4, 0.0f);
+  std::vector<int32_t> pos = {0, 1};
+  std::vector<float> slide(4, -1.0f);
+  DDTreeConfig cfg;
+  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(),
+                                    /*currentLength=*/2, /*kvLength=*/2,
+                                    /*slidingWindow=*/8,
+                                    /*hasSlidingLayers=*/false, cfg, slide.data());
+  EXPECT_FALSE(m.hasSliding);
+  EXPECT_EQ(m.full, full.data());
+}
+
+TEST(DDTreeSliding, WindowZeroFullEqualsSliding) {
+  using nntrainer::ddtree::makeSlidingMasks;
+  using nntrainer::ddtree::SlidingMasks;
+  std::vector<float> full(4, 0.0f);
+  std::vector<int32_t> pos = {0, 1};
+  std::vector<float> slide(4, -1.0f);
+  DDTreeConfig cfg;
+  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), 2, 2,
+                                    /*slidingWindow=*/0,
+                                    /*hasSlidingLayers=*/true, cfg, slide.data());
+  EXPECT_TRUE(m.hasSliding);
+  EXPECT_EQ(m.sliding, m.full);
+}
+
+TEST(DDTreeSliding, PositiveWindowVisibility) {
+  using nntrainer::ddtree::makeSlidingMasks;
+  using nntrainer::ddtree::SlidingMasks;
+  // past=1, cur=2, kv=3. query=[5,6]; key[:past]=arange=[0], key[past:]=[5,6].
+  const int past = 1, cur = 2, kv = 3, window = 2;
+  std::vector<int32_t> pos = {5, 6};
+  std::vector<float> full(static_cast<size_t>(cur) * kv, 0.0f); // all visible
+  std::vector<float> slide(static_cast<size_t>(cur) * kv, 123.0f);
+  DDTreeConfig cfg;
+  cfg.maskFillValue = -1e30f;
+  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
+                                    /*hasSlidingLayers=*/true, cfg, slide.data());
+  ASSERT_TRUE(m.hasSliding);
+  ASSERT_NE(m.sliding, m.full);
+
+  auto vis = [&](int qi, int kj) {
+    int q = pos[qi];
+    int k = (kj < past) ? kj : pos[kj - past];
+    return (k <= q) && (k > q - window);
+  };
+  for (int i = 0; i < cur; ++i)
+    for (int j = 0; j < kv; ++j) {
+      float expected = vis(i, j) ? 0.0f : cfg.maskFillValue;
+      EXPECT_EQ(m.sliding[i * kv + j], expected) << "i=" << i << " j=" << j;
     }
 }
 
