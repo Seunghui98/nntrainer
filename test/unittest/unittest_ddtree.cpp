@@ -100,6 +100,52 @@ TEST(DDTreeBuild, BudgetExceedsVocabTopkClamped) {
   EXPECT_LE(t.nodeCount, 100);
 }
 
+TEST(DDTreeCompile, IdsPositionsAndMask) {
+  using nntrainer::ddtree::compile;
+  using nntrainer::ddtree::CompiledTree;
+
+  DDTreeConfig cfg;
+  cfg.budget = 3;
+  cfg.maskFillValue = -1e30f;
+  auto logits = kSmallLogits();
+  DDTreeStructure t = buildTree(logits.data(), 2, 3, cfg);
+
+  const int past = 2;
+  const int start = 5;
+  const int32_t rootToken = 99;
+  const int L = t.currentLength;
+  std::vector<int32_t> ids(L), pos(L);
+  const int stride = past + L;
+  std::vector<float> mask(static_cast<size_t>(L) * stride, 7.0f); // sentinel
+
+  CompiledTree c = compile(rootToken, start, past, t, cfg, ids.data(),
+                           pos.data(), mask.data(), stride);
+  EXPECT_EQ(c.pastLength, past);
+  EXPECT_EQ(c.currentLength, L);
+
+  // ids[0] = root; ids[i] = node token.
+  EXPECT_EQ(ids[0], rootToken);
+  for (int i = 1; i < L; ++i)
+    EXPECT_EQ(ids[i], t.nodeTokenIds[i - 1]);
+
+  // pos[0] = start; pos[i] = start + depth.
+  EXPECT_EQ(pos[0], start);
+  for (int i = 1; i < L; ++i)
+    EXPECT_EQ(pos[i], start + t.nodeDepths[i - 1]);
+
+  // Prefix block [0, past) fully visible (== 0) for every row.
+  for (int i = 0; i < L; ++i)
+    for (int j = 0; j < past; ++j)
+      EXPECT_EQ(mask[i * stride + j], 0.0f);
+
+  // Tree block [past, past+L) == visibility ? 0 : fill.
+  for (int i = 0; i < L; ++i)
+    for (int j = 0; j < L; ++j) {
+      float expected = t.visibility[i * L + j] ? 0.0f : cfg.maskFillValue;
+      EXPECT_EQ(mask[i * stride + past + j], expected);
+    }
+}
+
 /**
  * @brief Main gtest
  */

@@ -154,5 +154,36 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
   return t;
 }
 
+CompiledTree compile(int32_t rootTokenId, int start, int pastLength,
+                     const DDTreeStructure &tree, const DDTreeConfig &cfg,
+                     int32_t *verifyInputIds, int32_t *verifyPositionIds,
+                     float *attentionMask, int attnMaskRowStride) {
+  const int cur = tree.currentLength;
+
+  // verify_input_ids: [root, node tokens...] (ddtree.py 197-200).
+  verifyInputIds[0] = rootTokenId;
+  for (int i = 1; i < cur; ++i)
+    verifyInputIds[i] = tree.nodeTokenIds[i - 1];
+
+  // verify_position_ids: [start, start+depth...] (ddtree.py 202-206).
+  verifyPositionIds[0] = start;
+  for (int i = 1; i < cur; ++i)
+    verifyPositionIds[i] = start + tree.nodeDepths[i - 1];
+
+  // Mask (ddtree.py 195, 211-213): prefix block 0 (visible); tree block
+  // filled with maskFillValue then opened (0) where visibility == 1.
+  for (int i = 0; i < cur; ++i) {
+    float *r = attentionMask + static_cast<size_t>(i) * attnMaskRowStride;
+    for (int j = 0; j < pastLength; ++j)
+      r[j] = 0.0f;
+    for (int j = 0; j < cur; ++j)
+      r[pastLength + j] =
+        tree.visibility[static_cast<size_t>(i) * cur + j] ? 0.0f
+                                                          : cfg.maskFillValue;
+  }
+
+  return CompiledTree{pastLength, cur};
+}
+
 } // namespace ddtree
 } // namespace nntrainer
