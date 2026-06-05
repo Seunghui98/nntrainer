@@ -203,6 +203,44 @@ TEST(DDTreeSliding, PositiveWindowVisibility) {
     }
 }
 
+// root(0) -> {10:1}; node1 -> {20:2}; node2 -> {}.
+static std::vector<std::unordered_map<int32_t, int32_t>> kChain() {
+  std::vector<std::unordered_map<int32_t, int32_t>> cm(3);
+  cm[0][10] = 1;
+  cm[1][20] = 2;
+  return cm;
+}
+
+TEST(DDTreeFollow, FullAccept) {
+  using nntrainer::ddtree::Accepted;
+  using nntrainer::ddtree::followVerified;
+  auto cm = kChain();
+  std::vector<int32_t> posterior = {10, 20, 77}; // root->1->2, then bonus 77
+  Accepted a = followVerified(cm, posterior.data());
+  EXPECT_EQ(a.indices, (std::vector<int32_t>{0, 1, 2}));
+  EXPECT_EQ(a.nextToken, 77);
+}
+
+TEST(DDTreeFollow, PartialAccept) {
+  using nntrainer::ddtree::Accepted;
+  using nntrainer::ddtree::followVerified;
+  auto cm = kChain();
+  std::vector<int32_t> posterior = {10, 999, 77}; // root->1, then 999 not a child
+  Accepted a = followVerified(cm, posterior.data());
+  EXPECT_EQ(a.indices, (std::vector<int32_t>{0, 1}));
+  EXPECT_EQ(a.nextToken, 999);
+}
+
+TEST(DDTreeFollow, ImmediateReject) {
+  using nntrainer::ddtree::Accepted;
+  using nntrainer::ddtree::followVerified;
+  auto cm = kChain();
+  std::vector<int32_t> posterior = {5, 20, 77}; // root token 5 not a child of root
+  Accepted a = followVerified(cm, posterior.data());
+  EXPECT_EQ(a.indices, (std::vector<int32_t>{0}));
+  EXPECT_EQ(a.nextToken, 5);
+}
+
 /**
  * @brief Main gtest
  */

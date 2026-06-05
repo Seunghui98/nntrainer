@@ -185,5 +185,25 @@ CompiledTree compile(int32_t rootTokenId, int start, int pastLength,
   return CompiledTree{pastLength, cur};
 }
 
+Accepted followVerified(
+  const std::vector<std::unordered_map<int32_t, int32_t>> &childMaps,
+  const int32_t *posterior) {
+  // ddtree.py 282-293.
+  Accepted a;
+  a.indices.push_back(0);
+  int currentIndex = 0;
+  int32_t nextToken = posterior[currentIndex];
+  while (true) {
+    auto it = childMaps[currentIndex].find(nextToken);
+    if (it == childMaps[currentIndex].end())
+      break;
+    currentIndex = it->second;
+    a.indices.push_back(currentIndex);
+    nextToken = posterior[currentIndex];
+  }
+  a.nextToken = nextToken;
+  return a;
+}
+
 } // namespace ddtree
 } // namespace nntrainer
