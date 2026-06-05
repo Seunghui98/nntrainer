@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Dump DDTree golden vectors for buildTree parity tests.
+
+This is a faithful, dependency-free transcription of ``build_ddtree_tree`` from
+``/home/shsh1004/littlesd_inference/ddtree.py``. torch/numpy are unavailable on
+this machine (the reference venv targets a missing python3.10 and the system
+python has no numpy), so the two torch ops are replaced by exact stdlib
+equivalents:
+
+  * ``torch.topk``      -> sort by (logit desc, index asc)  [matches CPU topk]
+  * ``torch.logsumexp`` -> m + log(sum(exp(x - m)))
+
+Crucially, the best-first heap uses Python's native tuple ordering, exactly as
+``ddtree.py`` does via ``heapq`` on ``(-logw, ranks, parent, depth, rank, logw)``
+-- so the tie-break semantics under test are reproduced verbatim. Inputs are
+chosen with well-separated logits so fp32-vs-fp64 rounding never flips an
+ordering (except where an exact tie is intended to exercise the tie-break).
+
+The authoritative end-to-end token parity lives in the gemma4 trace-replay test
+(plan Task 13); this file locks tree structure / visibility.
+"""
+import heapq
+import json
+import math
+import os
+
+
+def build_ddtree_tree(draft_logits, budget):
+    """Transcription of ddtree.py build_ddtree_tree (lines 92-174)."""
+    depth_limit = len(draft_logits)
+    vocab = len(draft_logits[0]) if depth_limit else 0
+
+    if budget <= 0 or depth_limit == 0:
+        return [], [], [-1], [{}], [[1]]
+
+    topk = min(budget, vocab)
+
+    # Per-row top-k log-probs (fp-equivalent of torch.topk + logsumexp).
+    top_log_probs = []
+    top_token_ids = []
+    for row in draft_logits:
+        order = sorted(range(vocab), key=lambda i: (-row[i], i))[:topk]
+        m = max(row)
+        lse = m + math.log(sum(math.exp(x - m) for x in row))
+        top_token_ids.append([order[r] for r in range(topk)])
+        top_log_probs.append([row[order[r]] - lse for r in range(topk)])
+
+    first_logw = float(top_log_probs[0][0])
+    heap = [(-first_logw, (0,), 0, 1, 0, first_logw)]
+
+    node_token_ids = []
+    node_depths = []
+    parents = [-1]
+    child_maps = [dict()]
+    node_count = 0
+
+    while heap and node_count < budget:
+        _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
+
+        token_id = int(top_token_ids[depth - 1][rank])
+        current_index = node_count + 1
+        node_token_ids.append(token_id)
+        node_depths.append(depth)
+        parents.append(parent_index)
+        child_maps.append(dict())
+        child_maps[parent_index][token_id] = current_index
+        node_count += 1
+
+        if rank + 1 < topk:
+            sibling_ranks = ranks[:-1] + (rank + 1,)
+            sibling_logw = (logw - float(top_log_probs[depth - 1][rank])
+                            + float(top_log_probs[depth - 1][rank + 1]))
+            heapq.heappush(
+                heap,
+                (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1,
+                 sibling_logw))
+
+        if depth < depth_limit:
+            child_ranks = ranks + (0,)
+            child_logw = logw + float(top_log_probs[depth][0])
+            heapq.heappush(
+                heap,
+                (-child_logw, child_ranks, current_index, depth + 1, 0,
+                 child_logw))
+
+    current_length = 1 + node_count
+    vis = [[0] * current_length for _ in range(current_length)]
+    vis[0][0] = 1
+    for index in range(1, current_length):
+        parent_index = parents[index]
+        for j in range(index):
+            vis[index][j] = vis[parent_index][j]
+        vis[index][index] = 1
+
+    return node_token_ids, node_depths, parents, child_maps, vis
+
+
+def dump_build(name, logits, budget):
+    ntids, ndepths, parents, _child_maps, vis = build_ddtree_tree(logits, budget)
+    return {
+        "name": name,
+        "logits": logits,
+        "budget": budget,
+        "depth": len(logits),
+        "vocab": len(logits[0]),
+        "node_token_ids": [int(x) for x in ntids],
+        "node_depths": [int(x) for x in ndepths],
+        "parents": [int(x) for x in parents],
+        "visibility": vis,
+    }
+
+
+if __name__ == "__main__":
+    cases = []
+    cases.append(dump_build("small", [[2.0, 1.0, 0.0], [0.0, -1.0, 1.0]], 3))
+    # equal logits force exact-tie heap entries -> exercises tie-break order.
+    cases.append(dump_build("tie", [[1.0, 1.0, 0.0], [0.5, 0.5, 0.5]], 4))
+    cases.append(
+        dump_build("budget_gt_vocab", [[2.0, 1.0, 0.0], [0.0, -1.0, 1.0]], 100))
+    cases.append(
+        dump_build("full_fill",
+                   [[3.0, 2.0, 1.0, 0.0], [3.0, 2.0, 1.0, 0.0],
+                    [3.0, 2.0, 1.0, 0.0]], 8))
+
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    # Human-readable JSON (for inspection).
+    out_json = os.path.join(here, "build_golden.json")
+    with open(out_json, "w") as f:
+        json.dump(cases, f, indent=2)
+
+    # Flat, whitespace-delimited format the C++ test parses with ifstream >>.
+    # Per case:
+    #   CASE <name>
+    #   DIMS <depth> <vocab> <budget>
+    #   LOGITS <depth*vocab floats, row-major>
+    #   NODES <count> <token ids...>
+    #   DEPTHS <count> <depths...>
+    #   PARENTS <len> <parents...>
+    #   VIS <L> <L*L ints, row-major>
+    # File starts with: NCASES <n>
+    out_txt = os.path.join(here, "build_golden.txt")
+    with open(out_txt, "w") as f:
+        f.write("NCASES %d\n" % len(cases))
+        for c in cases:
+            flat_logits = [x for row in c["logits"] for x in row]
+            flat_vis = [x for row in c["visibility"] for x in row]
+            L = len(c["visibility"])
+            f.write("CASE %s\n" % c["name"])
+            f.write("DIMS %d %d %d\n" % (c["depth"], c["vocab"], c["budget"]))
+            f.write("LOGITS " + " ".join(repr(x) for x in flat_logits) + "\n")
+            f.write("NODES %d %s\n" %
+                    (len(c["node_token_ids"]),
+                     " ".join(str(x) for x in c["node_token_ids"])))
+            f.write("DEPTHS %d %s\n" %
+                    (len(c["node_depths"]),
+                     " ".join(str(x) for x in c["node_depths"])))
+            f.write("PARENTS %d %s\n" %
+                    (len(c["parents"]), " ".join(str(x) for x in c["parents"])))
+            f.write("VIS %d %s\n" % (L, " ".join(str(x) for x in flat_vis)))
+    print("wrote", out_json, "and", out_txt, "with", len(cases), "cases")
