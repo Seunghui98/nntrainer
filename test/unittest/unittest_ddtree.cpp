@@ -10,6 +10,7 @@
 
 #include <ddtree.h>
 #include <ddtree_compact.h>
+#include <ddtree_sampling.h>
 #include <ddtree_sliding.h>
 #include <ddtree_types.h>
 
@@ -292,6 +293,26 @@ TEST(DDTreeCompact, WorksWithSeqStrideGreaterThanRow) {
               keep.data(), 2);
   EXPECT_EQ(buf[0], 30); EXPECT_EQ(buf[1], 31); // dst0 = src2
   EXPECT_EQ(buf[3], 10); EXPECT_EQ(buf[4], 11); // dst1 = src0
+}
+
+TEST(DDTreeSampling, ArgmaxAndGreedyRows) {
+  using nntrainer::ddtree::argmaxRow;
+  using nntrainer::ddtree::sampleGreedy;
+  std::vector<float> logits = {
+    0.1f, 0.9f, 0.2f, // row 0 -> token 1
+    5.0f, 1.0f, 2.0f, // row 1 -> token 0
+  };
+  EXPECT_EQ(argmaxRow(logits.data(), 3), 1);
+  std::vector<int32_t> out(2);
+  sampleGreedy(logits.data(), 2, 3, out.data());
+  EXPECT_EQ(out[0], 1);
+  EXPECT_EQ(out[1], 0);
+}
+
+TEST(DDTreeSampling, ArgmaxTieLowestIndex) {
+  using nntrainer::ddtree::argmaxRow;
+  std::vector<float> logits = {2.0f, 2.0f, 1.0f}; // tie -> lowest index 0
+  EXPECT_EQ(argmaxRow(logits.data(), 3), 0);
 }
 
 /**
