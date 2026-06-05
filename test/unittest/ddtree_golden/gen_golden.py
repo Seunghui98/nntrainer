@@ -23,6 +23,13 @@ import heapq
 import json
 import math
 import os
+import struct
+
+
+def f32(x):
+    """Round a Python float to float32 precision, matching ddtree.py's
+    top_log_probs.to(torch.float32) and the C++ core's fp32 storage (spec 6.2)."""
+    return struct.unpack("f", struct.pack("f", x))[0]
 
 
 def build_ddtree_tree(draft_logits, budget):
@@ -41,9 +48,11 @@ def build_ddtree_tree(draft_logits, budget):
     for row in draft_logits:
         order = sorted(range(vocab), key=lambda i: (-row[i], i))[:topk]
         m = max(row)
-        lse = m + math.log(sum(math.exp(x - m) for x in row))
+        # logsumexp accumulated in fp64 then rounded to fp32 (C++ casts the
+        # double log_z to float); top_log_probs stored fp32.
+        lse = f32(m + math.log(sum(math.exp(x - m) for x in row)))
         top_token_ids.append([order[r] for r in range(topk)])
-        top_log_probs.append([row[order[r]] - lse for r in range(topk)])
+        top_log_probs.append([f32(f32(row[order[r]]) - lse) for r in range(topk)])
 
     first_logw = float(top_log_probs[0][0])
     heap = [(-first_logw, (0,), 0, 1, 0, first_logw)]

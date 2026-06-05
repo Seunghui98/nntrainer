@@ -5,7 +5,9 @@
  */
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include <ddtree.h>
@@ -313,6 +315,69 @@ TEST(DDTreeSampling, ArgmaxTieLowestIndex) {
   using nntrainer::ddtree::argmaxRow;
   std::vector<float> logits = {2.0f, 2.0f, 1.0f}; // tie -> lowest index 0
   EXPECT_EQ(argmaxRow(logits.data(), 3), 0);
+}
+
+// Parses one golden case from the flat build_golden.txt format and asserts
+// buildTree reproduces it. See gen_golden.py for the format.
+TEST(DDTreeBuild, MatchesPythonGolden) {
+  const std::string path = std::string(DDTREE_GOLDEN_DIR) + "/build_golden.txt";
+  std::ifstream in(path);
+  ASSERT_TRUE(in.good()) << "missing golden file: " << path;
+
+  std::string tok;
+  int ncases = 0;
+  in >> tok >> ncases;
+  ASSERT_EQ(tok, "NCASES");
+  ASSERT_GT(ncases, 0);
+
+  for (int ci = 0; ci < ncases; ++ci) {
+    std::string name;
+    int depth = 0, vocab = 0, budget = 0;
+    in >> tok >> name;
+    ASSERT_EQ(tok, "CASE") << "case " << ci;
+    in >> tok >> depth >> vocab >> budget;
+    ASSERT_EQ(tok, "DIMS") << name;
+
+    std::vector<float> logits(static_cast<size_t>(depth) * vocab);
+    in >> tok;
+    ASSERT_EQ(tok, "LOGITS") << name;
+    for (auto &v : logits)
+      in >> v;
+
+    auto readVec = [&](const char *label) {
+      std::string t;
+      int n = 0;
+      in >> t >> n;
+      EXPECT_EQ(t, label) << name;
+      std::vector<int32_t> v(n);
+      for (auto &x : v)
+        in >> x;
+      return v;
+    };
+    std::vector<int32_t> expNodes = readVec("NODES");
+    std::vector<int32_t> expDepths = readVec("DEPTHS");
+    std::vector<int32_t> expParents = readVec("PARENTS");
+
+    int L = 0;
+    in >> tok >> L;
+    ASSERT_EQ(tok, "VIS") << name;
+    std::vector<int32_t> expVis(static_cast<size_t>(L) * L);
+    for (auto &x : expVis)
+      in >> x;
+
+    DDTreeConfig cfg;
+    cfg.budget = budget;
+    DDTreeStructure t = buildTree(logits.data(), depth, vocab, cfg);
+
+    EXPECT_EQ(t.nodeTokenIds, expNodes) << name;
+    EXPECT_EQ(t.nodeDepths, expDepths) << name;
+    EXPECT_EQ(t.parents, expParents) << name;
+    EXPECT_EQ(t.currentLength, L) << name;
+    ASSERT_EQ(t.visibility.size(), expVis.size()) << name;
+    for (size_t k = 0; k < t.visibility.size(); ++k)
+      EXPECT_EQ(static_cast<int32_t>(t.visibility[k]), expVis[k])
+        << name << " vis@" << k;
+  }
 }
 
 /**
