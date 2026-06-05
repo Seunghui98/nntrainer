@@ -121,6 +121,25 @@ foreach target: test_target
   )
 endforeach
 
+# DDTree core tests need a compile-time path to the Python golden vectors,
+# so this target is defined standalone (the shared loop above can't set
+# per-target cpp_args).
+ddtree_golden_dir = meson.current_source_dir() / 'ddtree_golden'
+unittest_ddtree_exe = executable(
+  'unittest_ddtree',
+  'unittest_ddtree.cpp',
+  include_directories: include_directories('models'),
+  cpp_args: '-DDDTREE_GOLDEN_DIR="' + ddtree_golden_dir + '"',
+  dependencies: unittest_nntrainer_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_ddtree', unittest_ddtree_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_ddtree')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')

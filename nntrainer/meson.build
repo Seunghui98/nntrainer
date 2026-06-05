@@ -50,7 +50,8 @@ nntrainer_elements = [
   'optimizers',
   'tensor',
   'utils',
-  'graph'
+  'graph',
+  'ddtree'
 ]
 
 if get_option('enable-opencl')
