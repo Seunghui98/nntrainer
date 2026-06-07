@@ -135,7 +135,7 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 6,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 7,
                 std::invalid_argument)
     << "Multi head Attention layer needs 3..6 inputs. "
        "(query, key, value; optional mask; external cache_key + cache_value; "
@@ -289,6 +289,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   attn_mask_ = nullptr;
+  tree_pos_ = nullptr;
   if (!use_external_cache) {
     return;
   }
@@ -308,6 +309,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor &mask_in = context.getInput(5);
     if (mask_in.size() != 0)
       attn_mask_ = &mask_in;
+  }
+  if (context.getNumInputs() > 6) {
+    nntrainer::Tensor &pos_in = context.getInput(6);
+    if (pos_in.size() != 0)
+      tree_pos_ = &pos_in;
   }
 
   nntrainer::Tensor sink;
@@ -473,6 +479,7 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // verify). Present only when a 4th MASK input is bound (numInputs == 4;
   // external cache uses slots 3/4 and is handled in forwarding()).
   attn_mask_ = nullptr;
+  tree_pos_ = nullptr;
   if (context.getNumInputs() > INOUT_INDEX::MASK) {
     nntrainer::Tensor &mask_in = context.getInput(INOUT_INDEX::MASK);
     if (mask_in.size() != 0)
@@ -1137,6 +1144,10 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   unsigned int half_ = dim / 2;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+  const float *rope_pos =
+    (tree_pos_ != nullptr && tree_pos_->size() >= in.height())
+      ? tree_pos_->getData<float>()
+      : nullptr;
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (freqs_fp32 == nullptr) {
@@ -1151,9 +1162,11 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
         for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &freqs_fp32->cos[from + h];
-            sin_ = &freqs_fp32->sin[from + h];
+          unsigned int pos_h =
+            rope_pos ? (unsigned int)(rope_pos[h] + 0.5f) : (from + h);
+          if (pos_h < max_timestep) {
+            cos_ = &freqs_fp32->cos[pos_h];
+            sin_ = &freqs_fp32->sin[pos_h];
           }
           float *in_ptr = in.getData<float>() +
                           b * in.channel() * in.height() * in.width() +
@@ -1202,9 +1215,11 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
         for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &freqs_fp16->cos[from + h];
-            sin_ = &freqs_fp16->sin[from + h];
+          unsigned int pos_h =
+            rope_pos ? (unsigned int)(rope_pos[h] + 0.5f) : (from + h);
+          if (pos_h < max_timestep) {
+            cos_ = &freqs_fp16->cos[pos_h];
+            sin_ = &freqs_fp16->sin[pos_h];
           }
           _FP16 *in_ptr = in.getData<_FP16>() +
                           b * in.channel() * in.height() * in.width() +

@@ -392,6 +392,9 @@ private:
   /** transient: additive attention mask for the current incremental_forwarding
       pass (DDTree non-causal tree verify); nullptr on the normal causal path. */
   nntrainer::Tensor *attn_mask_ = nullptr;
+  /** transient: per-token RoPE positions (DDTree tree depths) for the verify
+      pass; nullptr on the normal contiguous path (then position = from + row). */
+  nntrainer::Tensor *tree_pos_ = nullptr;
 
   enum INOUT_INDEX {
     /** input index */
