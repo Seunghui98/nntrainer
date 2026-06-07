@@ -135,11 +135,11 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 6,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3, 4, or 5 inputs. "
-       "(query, key, value; mask is optional; external cache_key + cache_value "
-       "for external cache mode)";
+    << "Multi head Attention layer needs 3..6 inputs. "
+       "(query, key, value; optional mask; external cache_key + cache_value; "
+       "optional DDTree mask at slot 5 in external-cache mode)";
 
   use_external_cache = (context.getNumInputs() >= 5);
   ml::train::TensorDim::TensorType activation_type = {
@@ -300,6 +300,15 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 
   nntrainer::Tensor &cache_key = context.getInput(3);
   nntrainer::Tensor &cache_value = context.getInput(4);
+
+  // DDTree additive mask for the external-cache verify path: optional 6th
+  // input (slot 5). Present only when the graph wires it; base decode
+  // (5 inputs) leaves attn_mask_ == nullptr (reset at function top).
+  if (context.getNumInputs() > 5) {
+    nntrainer::Tensor &mask_in = context.getInput(5);
+    if (mask_in.size() != 0)
+      attn_mask_ = &mask_in;
+  }
 
   nntrainer::Tensor sink;
   if (use_sink) {
