@@ -14,6 +14,7 @@
 #define __KV_CACHE_MANAGER_H__
 
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -111,6 +112,17 @@ public:
    * @brief Reset position to 0 (for new inference session)
    */
   void reset();
+
+  /**
+   * @brief Reorder the appended KV tail [pastLen, pastLen+tailLen) to the
+   *        accepted DDTree path, then set position = pastLen +
+   *        keepIndices.size(). tailLen is inferred as getPosition() -
+   *        pastLen. Operates on every layer's key & value cache, all batches.
+   * @param[in] pastLen     start of the appended window
+   * @param[in] keepIndices tail-relative accepted indices (includes root 0)
+   */
+  void compactTail(unsigned int pastLen,
+                   const std::vector<int32_t> &keepIndices);
 
   /**
    * @brief Get the full key cache tensor for a layer (for direct access)

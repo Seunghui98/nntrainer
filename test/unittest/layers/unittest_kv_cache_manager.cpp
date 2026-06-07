@@ -10,9 +10,11 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <cstdint>
 #include <cstdio>
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
 
 #include <kv_cache_manager.h>
 #include <tensor.h>
@@ -313,6 +315,33 @@ TEST_F(KVCacheManagerTest, typical_inference_flow) {
   float *kd = k_full.getData<float>();
   EXPECT_FLOAT_EQ(kd[0], 0.0f); // l=0, b=0, i=0
   EXPECT_FLOAT_EQ(kd[1], 1.0f); // l=0, b=0, i=1
+}
+
+TEST_F(KVCacheManagerTest, CompactTailReordersAppendedWindow) {
+  const unsigned int past = 3;
+  const unsigned int tail = 4;
+
+  // Write recognisable values into tail rows [past, past+tail) of layer 0,
+  // batch 0: row r, col c -> (r+1)*100 + c.
+  nntrainer::Tensor &k0 = manager.getKeyCache(0);
+  float *base = k0.getData<float>();
+  const unsigned int width = KV_WIDTH;
+  for (unsigned int r = 0; r < tail; ++r)
+    for (unsigned int c = 0; c < width; ++c)
+      base[(past + r) * width + c] = static_cast<float>((r + 1) * 100 + c);
+
+  manager.setPosition(past + tail);
+  std::vector<int32_t> keep = {0, 2, 3}; // drop tail row 1
+  manager.compactTail(past, keep);
+
+  EXPECT_EQ(manager.getPosition(),
+            past + static_cast<unsigned int>(keep.size()));
+  // New tail rows now hold old rows {0, 2, 3}.
+  EXPECT_FLOAT_EQ(base[(past + 0) * width + 0], 100.0f);
+  EXPECT_FLOAT_EQ(base[(past + 1) * width + 0], 300.0f);
+  EXPECT_FLOAT_EQ(base[(past + 2) * width + 0], 400.0f);
+  // Column offsets track with the reordered row.
+  EXPECT_FLOAT_EQ(base[(past + 1) * width + 5], 305.0f);
 }
 
 int main(int argc, char **argv) {
