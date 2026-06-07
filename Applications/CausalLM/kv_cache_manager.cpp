@@ -98,8 +98,9 @@ void KVCacheManager::compactTail(unsigned int pastLen,
                                  const std::vector<int32_t> &keepIndices) {
   const int tailLen = static_cast<int>(cache_pos_ - pastLen);
   const int keepCount = static_cast<int>(keepIndices.size());
+  // FP32 is 4 bytes; FP16 and the UINT16 fp16-storage proxy are both 2 bytes.
   const int elemSize =
-    (dtype_ == ml::train::TensorDim::DataType::FP16) ? 2 : 4;
+    (dtype_ == ml::train::TensorDim::DataType::FP32) ? 4 : 2;
 
   for (auto &lc : layer_caches_) {
     for (nntrainer::Tensor *cache : {&lc.key_cache, &lc.value_cache}) {
