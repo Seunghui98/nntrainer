@@ -334,6 +334,80 @@ void CausalLM::registerCustomLayers() {
   }
 }
 
+void CausalLM::runDDTreeDump(const WSTR &prompt) {
+  // Phase A: prefill, then self-draft (greedy rollout) for HORIZON steps,
+  // dumping per-position draft logits [HORIZON, NUM_VOCAB] to NNTR_DDTREE_DUMP.
+  const int HORIZON = 15;
+  allocateAndBindKVCache();
+
+  auto _input = tokenizer->Encode(prompt);
+  unsigned int init_len = static_cast<unsigned int>(_input.size());
+
+  float *input_sample =
+    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+  for (unsigned int i = 0; i < init_len; ++i)
+    input_sample[i] = static_cast<float>(_input[i]);
+
+  auto build_inputs = [&]() {
+    std::vector<std::pair<std::string, float *>> ci;
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      ci.emplace_back(
+        "cache_k_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+      ci.emplace_back(
+        "cache_v_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+    }
+    std::sort(ci.begin(), ci.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::vector<float *> in;
+    in.push_back(input_sample);
+    for (const auto &c : ci)
+      in.push_back(c.second);
+    return in;
+  };
+  std::vector<float *> label;
+  std::vector<float *> input = build_inputs();
+
+  setKVCachePosition(0);
+  auto out = model->incremental_inference(BATCH_SIZE, input, label, init_len, 0,
+                                          init_len);
+  unsigned int root = static_cast<unsigned int>(
+    std::distance(out[0], std::max_element(out[0], out[0] + NUM_VOCAB)));
+  for (auto p : out)
+    delete[] p;
+
+  std::vector<float> draft((size_t)HORIZON * NUM_VOCAB);
+  unsigned int cur = root;
+  for (int d = 0; d < HORIZON; ++d) {
+    input_sample[0] = static_cast<float>(cur);
+    unsigned int pos = init_len + d;
+    auto o = model->incremental_inference(BATCH_SIZE, input, label, 1, pos,
+                                          pos + 1);
+    std::copy(o[0], o[0] + NUM_VOCAB, &draft[(size_t)d * NUM_VOCAB]);
+    cur = static_cast<unsigned int>(
+      std::distance(o[0], std::max_element(o[0], o[0] + NUM_VOCAB)));
+    for (auto p : o)
+      delete[] p;
+  }
+
+  setKVCachePosition(init_len); // rollback tentative draft KV
+
+  const char *dp = std::getenv("NNTR_DDTREE_DUMP");
+  std::ofstream f(dp, std::ios::binary);
+  f.write(reinterpret_cast<char *>(draft.data()),
+          (std::streamsize)(draft.size() * sizeof(float)));
+  f.close();
+  std::ofstream m(std::string(dp) + ".meta");
+  m << "root=" << root << " start=" << init_len << " vocab=" << NUM_VOCAB
+    << " horizon=" << HORIZON << "\n";
+  m.close();
+  free(input_sample);
+  std::cout << "[DDTREE] dumped draft_logits [" << HORIZON << "," << NUM_VOCAB
+            << "] root=" << root << " start=" << init_len << " -> " << dp
+            << "\n";
+}
+
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
@@ -341,6 +415,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
+  }
+
+  // DDTree runtime debug harness (dormant): only when NNTR_DDTREE_DUMP set.
+  if (std::getenv("NNTR_DDTREE_DUMP")) {
+    runDDTreeDump(prompt);
+    return;
   }
 
   // Allocate the host-owned KV cache and bind it to mha_core's external cache

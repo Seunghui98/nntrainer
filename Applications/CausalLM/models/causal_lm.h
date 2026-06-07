@@ -125,6 +125,12 @@ protected:
    */
   void registerCustomLayers() override;
 
+  /**
+   * @brief DDTree runtime debug harness (dormant; activated via env
+   *        NNTR_DDTREE_DUMP). Phase A: prefill + self-draft, dump logits.
+   */
+  void runDDTreeDump(const WSTR &prompt);
+
   /** internal buffer */
   std::vector<std::string>
     output_list;             /**< List of output names for the model */
