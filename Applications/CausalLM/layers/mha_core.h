@@ -267,6 +267,20 @@ public:
     ml::train::TensorDim &cache_key_step_dim,
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step);
+
+  /**
+   * @brief Add an additive attention mask to a non-causal QK score tensor and
+   *        apply a numerically-stable full softmax over keys [0, to) per
+   *        (query, head). Pure (no layer state) so it is unit testable.
+   *        qk_out layout: rows = step_size * to, width = num_head; logical
+   *        (query i, key j, head h) -> qk[(i*to + j)*num_head + h].
+   *        mask layout: row-major [step_size, kv_len]; mask(i,j)=mask[i*kv_len+j]
+   *        (kv_len = mask.width() must be >= to). FP32 (FP16 guarded).
+   */
+  WIN_EXPORT static void
+  add_mask_and_softmax_full(nntrainer::Tensor &qk_out,
+                            const nntrainer::Tensor &mask, size_t step_size,
+                            unsigned int to, size_t num_head);
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
@@ -375,6 +389,9 @@ private:
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
   bool skip_prefill = false;
+  /** transient: additive attention mask for the current incremental_forwarding
+      pass (DDTree non-causal tree verify); nullptr on the normal causal path. */
+  nntrainer::Tensor *attn_mask_ = nullptr;
 
   enum INOUT_INDEX {
     /** input index */

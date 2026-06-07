@@ -13,6 +13,7 @@
  */
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -287,6 +288,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+  attn_mask_ = nullptr;
   if (!use_external_cache) {
     return;
   }
@@ -457,6 +459,16 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     context.getInput(INOUT_INDEX::VALUE); // projected value
   nntrainer::Tensor &output =
     context.getOutput(INOUT_INDEX::OUTPUT); // output to be projected
+
+  // DDTree additive attention mask (internal-cache, non-causal tree
+  // verify). Present only when a 4th MASK input is bound (numInputs == 4;
+  // external cache uses slots 3/4 and is handled in forwarding()).
+  attn_mask_ = nullptr;
+  if (context.getNumInputs() > INOUT_INDEX::MASK) {
+    nntrainer::Tensor &mask_in = context.getInput(INOUT_INDEX::MASK);
+    if (mask_in.size() != 0)
+      attn_mask_ = &mask_in;
+  }
 
   nntrainer::Tensor &cache_key =
     context.getTensor(tensor_idx[AttentionParams::cache_key]);
@@ -763,11 +775,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
-  // out_ stores the output of Q * K
+  // out_ stores the output of Q * K. With an additive mask the score
+  // grid must be the full non-causal (step_size * cache_to) layout so
+  // add_mask_and_softmax_full can index (query, key) directly.
+  const bool use_additive_mask = (attn_mask_ != nullptr);
   nntrainer::Tensor out_(
     1, 1,
-    is_causal ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
-              : (step_size * cache_to),
+    (is_causal && !use_additive_mask)
+      ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
+      : (step_size * cache_to),
     num_heads_Q, query_step.getTensorType());
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
@@ -775,7 +791,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
 
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  if (use_additive_mask) {
+    add_mask_and_softmax_full(out_, *attn_mask_, step_size, cache_to,
+                              num_heads_Q);
+  } else {
+    softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  }
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
@@ -1189,6 +1210,71 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
         }
       }
     }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
+void MHACoreLayer::add_mask_and_softmax_full(nntrainer::Tensor &qk_out,
+                                             const nntrainer::Tensor &mask,
+                                             size_t step_size, unsigned int to,
+                                             size_t num_head) {
+  const unsigned int kv_len = mask.width();
+
+  if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *qk = qk_out.getData<float>();
+    const float *mrow = mask.getData<float>();
+
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, step_size, [=](size_t i) {
+      for (size_t h = 0; h < num_head; ++h) {
+        float maxv = -std::numeric_limits<float>::infinity();
+        for (unsigned int j = 0; j < to; ++j) {
+          float v = qk[(i * to + j) * num_head + h] + mrow[i * kv_len + j];
+          qk[(i * to + j) * num_head + h] = v;
+          if (v > maxv)
+            maxv = v;
+        }
+        float sum = 0.0f;
+        for (unsigned int j = 0; j < to; ++j) {
+          float e = std::exp(qk[(i * to + j) * num_head + h] - maxv);
+          qk[(i * to + j) * num_head + h] = e;
+          sum += e;
+        }
+        const float inv = 1.0f / sum;
+        for (unsigned int j = 0; j < to; ++j)
+          qk[(i * to + j) * num_head + h] *= inv;
+      }
+    });
+  } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *qk = qk_out.getData<_FP16>();
+    const _FP16 *mrow = mask.getData<_FP16>();
+
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, step_size, [=](size_t i) {
+      for (size_t h = 0; h < num_head; ++h) {
+        float maxv = -std::numeric_limits<float>::infinity();
+        for (unsigned int j = 0; j < to; ++j) {
+          float v = (float)qk[(i * to + j) * num_head + h] +
+                    (float)mrow[i * kv_len + j];
+          qk[(i * to + j) * num_head + h] = (_FP16)v;
+          if (v > maxv)
+            maxv = v;
+        }
+        float sum = 0.0f;
+        for (unsigned int j = 0; j < to; ++j) {
+          float e = std::exp((float)qk[(i * to + j) * num_head + h] - maxv);
+          qk[(i * to + j) * num_head + h] = (_FP16)e;
+          sum += e;
+        }
+        const float inv = 1.0f / sum;
+        for (unsigned int j = 0; j < to; ++j)
+          qk[(i * to + j) * num_head + h] =
+            (_FP16)((float)qk[(i * to + j) * num_head + h] * inv);
+      }
+    });
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif

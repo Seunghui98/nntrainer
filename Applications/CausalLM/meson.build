@@ -215,6 +215,21 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_mha_core_mask = executable(
+    'unittest_mha_core_mask',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_mha_core_mask.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_layer_dependencies, causallm_dep],
+    include_directories: causallm_inc + causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_mha_core_mask', unittest_mha_core_mask,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_mha_core_mask'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']
   platform = get_option('platform')
