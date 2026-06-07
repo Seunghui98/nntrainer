@@ -19,12 +19,17 @@
 #include <tensor.h>
 #include <tensor_dim.h>
 #include <thread_manager.h>
+#include <algorithm>
+#include <iostream>
 #include <tie_word_embedding.h>
 #include <util_func.h>
 
 #include <vector>
 
 namespace causallm {
+
+float *TieWordEmbedding::s_verify_dump_ = nullptr;
+
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -355,6 +360,28 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       nntrainer::Tensor &bias =
         context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
       hidden_step.add_i(bias);
+    }
+  }
+
+  // DDTree verify: also compute ALL positions' logits into the external
+  // buffer (set via setVerifyDump). Graph output stays height=1. One-shot.
+  if (s_verify_dump_ != nullptr &&
+      weight.getDataType() != nntrainer::TensorDim::DataType::Q4_0) {
+    const unsigned int unit_ = hidden_.width();
+    const unsigned int H = to - from;
+    ml::train::TensorDim rin = input_.getDim();
+    rin.batch(1);
+    rin.height(1);
+    ml::train::TensorDim rout = hidden_.getDim();
+    rout.batch(1);
+    rout.height(1);
+    for (unsigned int p = 0; p < H; ++p) {
+      nntrainer::Tensor in_p =
+        input_.getSharedDataTensor(rin, p * input_.width(), true);
+      nntrainer::Tensor out_p(rout, true);
+      in_p.dot(weight, out_p, false, true);
+      std::copy(out_p.getData<float>(), out_p.getData<float>() + unit_,
+                s_verify_dump_ + (size_t)p * unit_);
     }
   }
 }

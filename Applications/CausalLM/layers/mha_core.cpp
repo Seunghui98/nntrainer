@@ -38,6 +38,10 @@ inline float convert_scalar(uint16_t h) {
 
 namespace causallm {
 
+nntrainer::Tensor *MHACoreLayer::s_verify_mask_ = nullptr;
+nntrainer::Tensor *MHACoreLayer::s_verify_pos_ = nullptr;
+
+
 #define tile_size 4
 
 static void compute_kcaches_fp32_reference(
@@ -288,8 +292,13 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
-  attn_mask_ = nullptr;
-  tree_pos_ = nullptr;
+  if (s_verify_mask_ != nullptr) {
+    attn_mask_ = s_verify_mask_;
+    tree_pos_ = s_verify_pos_;
+  } else {
+    attn_mask_ = nullptr;
+    tree_pos_ = nullptr;
+  }
   if (!use_external_cache) {
     return;
   }
@@ -804,6 +813,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
+  // For the masked tree verify, compute_kcaches / compute_fp16vcache_transposed
+  // must use the full non-causal (step_size * cache_to) layout that out_ was
+  // allocated with and add_mask_and_softmax_full reads. They branch on is_causal,
+  // so temporarily force it false here (restored below).
+  const bool ddtree_saved_causal = is_causal;
+  if (use_additive_mask)
+    is_causal = false;
+
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
 
@@ -817,6 +834,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+
+  is_causal = ddtree_saved_causal;
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(

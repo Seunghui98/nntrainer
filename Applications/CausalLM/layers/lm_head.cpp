@@ -11,6 +11,7 @@
  *
  */
 
+#include <algorithm>
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <lm_head.h>
@@ -160,6 +161,28 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         context.getWeight(weight_idx[LmHeadParams::bias]);
       hidden_step.add_i(bias);
     }
+  }
+
+  // DDTree verify: also compute ALL positions' logits into the external
+  // buffer (set via setVerifyDump). Graph output stays height=1. One-shot.
+  if (verify_dump_ != nullptr) {
+    const unsigned int unit_ = hidden_.width();
+    const unsigned int H = to - from;
+    ml::train::TensorDim row_in_dim = input_.getDim();
+    row_in_dim.batch(1);
+    row_in_dim.height(1);
+    ml::train::TensorDim row_out_dim = hidden_.getDim();
+    row_out_dim.batch(1);
+    row_out_dim.height(1);
+    for (unsigned int p = 0; p < H; ++p) {
+      nntrainer::Tensor in_p =
+        input_.getSharedDataTensor(row_in_dim, p * input_.width(), true);
+      nntrainer::Tensor out_p(row_out_dim, true);
+      in_p.dot(weight, out_p, false, false);
+      std::copy(out_p.getData<float>(), out_p.getData<float>() + unit_,
+                verify_dump_ + (size_t)p * unit_);
+    }
+    verify_dump_ = nullptr;
   }
 }
 

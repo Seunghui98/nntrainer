@@ -151,6 +151,11 @@ public:
 
   inline static const std::string type = "tie_word_embeddings";
 
+  /** DDTree verify: when set, incremental_forwarding_lmhead also writes
+   *  ALL positions' logits [height, unit] into this external buffer (one-shot).*/
+  static void setGlobalVerifyDump(float *buf) { s_verify_dump_ = buf; }
+
+
 private:
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Unit, nntrainer::props::Scale>
@@ -170,6 +175,9 @@ private:
   incremental_forwarding_lmhead(nntrainer::RunLayerContext &context,
                                 unsigned int from, unsigned int to,
                                 bool training);
+
+private:
+  static float *s_verify_dump_;
 };
 } // namespace causallm
 

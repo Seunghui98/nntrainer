@@ -36,6 +36,9 @@
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
+#include <ddtree.h>
+#include <ddtree_types.h>
+#include <tie_word_embedding.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
 
@@ -393,19 +396,93 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
 
   setKVCachePosition(init_len); // rollback tentative draft KV
 
-  const char *dp = std::getenv("NNTR_DDTREE_DUMP");
-  std::ofstream f(dp, std::ios::binary);
-  f.write(reinterpret_cast<char *>(draft.data()),
-          (std::streamsize)(draft.size() * sizeof(float)));
-  f.close();
-  std::ofstream m(std::string(dp) + ".meta");
-  m << "root=" << root << " start=" << init_len << " vocab=" << NUM_VOCAB
-    << " horizon=" << HORIZON << "\n";
-  m.close();
+  const std::string dp = std::getenv("NNTR_DDTREE_DUMP");
+  { // dump draft logits (Phase A)
+    std::ofstream f(dp, std::ios::binary);
+    f.write(reinterpret_cast<char *>(draft.data()),
+            (std::streamsize)(draft.size() * sizeof(float)));
+  }
+
+  // ---- Phase B: build the DDTree from the runtime draft logits ----
+  nntrainer::ddtree::DDTreeConfig cfg;
+  cfg.budget = 31;
+  cfg.depthLimit = HORIZON;
+  cfg.maskFillValue = std::numeric_limits<float>::lowest();
+  nntrainer::ddtree::DDTreeStructure tree =
+    nntrainer::ddtree::buildTree(draft.data(), HORIZON, (int)NUM_VOCAB, cfg);
+  const int cl = tree.currentLength;
+  const int past = (int)init_len;
+  std::vector<int32_t> vii(cl), vpi(cl);
+  const int stride = past + cl;
+  std::vector<float> cmask((size_t)cl * stride);
+  nntrainer::ddtree::compile((int32_t)root, past, past, tree, cfg, vii.data(),
+                             vpi.data(), cmask.data(), stride);
+
+  // ---- Phase C: verify forward (tree mask + per-node RoPE positions) ----
+  for (int i = 0; i < cl; ++i)
+    input_sample[i] = static_cast<float>(vii[i]);
+
+  nntrainer::Tensor maskT(1, 1, (unsigned int)cl, (unsigned int)stride);
+  std::copy(cmask.begin(), cmask.end(), maskT.getData<float>());
+  nntrainer::Tensor posT(1, 1, 1, (unsigned int)cl);
+  for (int i = 0; i < cl; ++i)
+    posT.getData<float>()[i] = static_cast<float>(vpi[i]);
+
+  std::vector<float> node_logits((size_t)cl * NUM_VOCAB);
+  // Inject tree mask + RoPE positions (all mha) and the all-position lm-head dump
+  // via process-global setters (cross-.so dynamic_cast is unreliable).
+  causallm::MHACoreLayer::setGlobalDDTreeVerify(&maskT, &posT);
+  causallm::TieWordEmbedding::setGlobalVerifyDump(node_logits.data());
+
+  setKVCachePosition(init_len);
+  auto vout = model->incremental_inference(BATCH_SIZE, input, label, (unsigned)cl,
+                                           init_len, init_len + (unsigned)cl);
+  for (auto p : vout)
+    delete[] p;
+
+  causallm::MHACoreLayer::setGlobalDDTreeVerify(nullptr, nullptr);
+  causallm::TieWordEmbedding::setGlobalVerifyDump(nullptr);
+
+  // posterior = argmax per node (target prediction at each tree node)
+  std::vector<int> posterior(cl);
+  for (int i = 0; i < cl; ++i) {
+    float *row = &node_logits[(size_t)i * NUM_VOCAB];
+    posterior[i] =
+      (int)std::distance(row, std::max_element(row, row + NUM_VOCAB));
+  }
+
+  { // dump node logits (binary) + tree/verify json
+    std::ofstream nf(dp + ".nodes.f32", std::ios::binary);
+    nf.write(reinterpret_cast<char *>(node_logits.data()),
+             (std::streamsize)(node_logits.size() * sizeof(float)));
+    std::ofstream j(dp + ".json");
+    auto arr = [&](const char *k, const std::vector<int32_t> &v) {
+      j << "\"" << k << "\":[";
+      for (size_t i = 0; i < v.size(); ++i) j << (i ? "," : "") << v[i];
+      j << "],";
+    };
+    auto arri = [&](const char *k, const std::vector<int> &v) {
+      j << "\"" << k << "\":[";
+      for (size_t i = 0; i < v.size(); ++i) j << (i ? "," : "") << v[i];
+      j << "]";
+    };
+    j << "{\"current_length\":" << cl << ",\"start\":" << past
+      << ",\"root\":" << root << ",\"vocab\":" << NUM_VOCAB << ",";
+    arr("node_token_ids", tree.nodeTokenIds);
+    arr("node_depths", tree.nodeDepths);
+    arr("verify_input_ids", vii);
+    arr("verify_position_ids", vpi);
+    arri("posterior", posterior);
+    j << "}\n";
+  }
+  std::ofstream(dp + ".meta")
+    << "root=" << root << " start=" << init_len << " vocab=" << NUM_VOCAB
+    << " horizon=" << HORIZON << " current_length=" << cl << "\n";
+
   free(input_sample);
-  std::cout << "[DDTREE] dumped draft_logits [" << HORIZON << "," << NUM_VOCAB
-            << "] root=" << root << " start=" << init_len << " -> " << dp
-            << "\n";
+  std::cout << "[DDTREE] draft[" << HORIZON << "," << NUM_VOCAB
+            << "] + verify nodes=" << cl << " root=" << root
+            << " start=" << init_len << " -> " << dp << "{,.nodes.f32,.json}\n";
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,

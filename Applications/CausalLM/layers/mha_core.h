@@ -248,6 +248,14 @@ public:
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
                              bool training) override;
 
+  /** DDTree: set/clear the global tree additive-mask + RoPE positions used
+   *  by every mha forward until cleared. */
+  static void setGlobalDDTreeVerify(nntrainer::Tensor *mask,
+                                    nntrainer::Tensor *pos) {
+    s_verify_mask_ = mask;
+    s_verify_pos_ = pos;
+  }
+
   void one_batch_incremental_forwarding(
     const unsigned int batch, const unsigned int _from, const unsigned int from,
     const unsigned int to, nntrainer::Tensor &query_step,
@@ -395,6 +403,11 @@ private:
   /** transient: per-token RoPE positions (DDTree tree depths) for the verify
       pass; nullptr on the normal contiguous path (then position = from + row). */
   nntrainer::Tensor *tree_pos_ = nullptr;
+  /** DDTree verify injection (process-global; harness sets/clears around a
+   *  verify forward, shared by all mha layers). Avoids cross-.so RTTI. */
+  static nntrainer::Tensor *s_verify_mask_;
+  static nntrainer::Tensor *s_verify_pos_;
+
 
   enum INOUT_INDEX {
     /** input index */
