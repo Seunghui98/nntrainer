@@ -496,6 +496,15 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
       for (size_t z = 0; z < acc.indices.size(); ++z) r << (z ? "," : "") << acc.indices[z];
       r << "],\"node_depths\":[";
       for (size_t z = 0; z < tree.nodeDepths.size(); ++z) r << (z ? "," : "") << tree.nodeDepths[z];
+      // Full 32-node tree fields (index 0 == root): parents/token-ids/posterior
+      // let a renderer reconstruct exact parent->child edges and explain why a
+      // branch was (not) accepted. lengths == current_length (cl).
+      r << "],\"parents\":[";
+      for (int z = 0; z < cl; ++z) r << (z ? "," : "") << tree.parents[z];
+      r << "],\"node_tokens\":[";
+      for (int z = 0; z < cl; ++z) r << (z ? "," : "") << vii[z];
+      r << "],\"posterior\":[";
+      for (int z = 0; z < cl; ++z) r << (z ? "," : "") << posterior[z];
       r << "]}";
       brecs.push_back(r.str());
     }
