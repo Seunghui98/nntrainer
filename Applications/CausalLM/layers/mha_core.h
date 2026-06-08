@@ -48,6 +48,15 @@
 
 namespace causallm {
 
+/**
+ * @brief Sentinel local-window size meaning "full attention" (no sliding
+ *        window). Used both as the SlidingWindow property default and in
+ *        selectVerifyMask() so a layer with this window is treated as a
+ *        full-attention layer. Centralizing it prevents the selection logic
+ *        from silently breaking if the sentinel value ever changes.
+ */
+static constexpr size_t kNoSlidingWindow = UINT_MAX;
+
 namespace props {
 
 /**
@@ -70,7 +79,7 @@ public:
  */
 class SlidingWindow : public nntrainer::Property<unsigned int> {
 public:
-  SlidingWindow(unsigned int value = UINT_MAX) { set(value); };
+  SlidingWindow(unsigned int value = kNoSlidingWindow) { set(value); };
   static constexpr const char *key =
     "sliding_window";                        /**< unique key to access */
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
@@ -248,13 +257,29 @@ public:
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
                              bool training) override;
 
-  /** DDTree: set/clear the global tree additive-mask + RoPE positions used
-   *  by every mha forward until cleared. */
-  static void setGlobalDDTreeVerify(nntrainer::Tensor *mask,
+  /** DDTree: set/clear the global tree additive-mask(s) + RoPE positions used
+   *  by every mha forward until cleared. `sliding` may be null (full-attention
+   *  only models, e.g. Qwen3): then every layer uses `full`. Sliding-attention
+   *  layers (finite local_window_size) use `sliding`; full layers use `full`. */
+  static void setGlobalDDTreeVerify(nntrainer::Tensor *full,
+                                    nntrainer::Tensor *sliding,
                                     nntrainer::Tensor *pos) {
-    s_verify_mask_ = mask;
+    s_verify_mask_ = full;
+    s_verify_sliding_ = sliding;
     s_verify_pos_ = pos;
   }
+
+  /** DDTree per-layer verify-mask selection (pure, no layer state, so it is
+   *  unit testable). Given the active full/sliding global masks and a layer's
+   *  local window size, return the mask that layer must use this verify pass:
+   *  sliding layers (finite local_window_size) use `sliding` when a sliding
+   *  mask is present; full-attention layers (kNoSlidingWindow) and full-only
+   *  models
+   *  (sliding == nullptr) use `full`. Returns nullptr iff `full` is nullptr
+   *  (no verify pass active). */
+  WIN_EXPORT static nntrainer::Tensor *
+  selectVerifyMask(nntrainer::Tensor *full, nntrainer::Tensor *sliding,
+                   size_t local_window_size);
 
   void one_batch_incremental_forwarding(
     const unsigned int batch, const unsigned int _from, const unsigned int from,
@@ -406,6 +431,7 @@ private:
   /** DDTree verify injection (process-global; harness sets/clears around a
    *  verify forward, shared by all mha layers). Avoids cross-.so RTTI. */
   static nntrainer::Tensor *s_verify_mask_;
+  static nntrainer::Tensor *s_verify_sliding_;
   static nntrainer::Tensor *s_verify_pos_;
 
 

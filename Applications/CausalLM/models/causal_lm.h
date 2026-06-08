@@ -131,6 +131,10 @@ protected:
    */
   void runDDTreeDump(const WSTR &prompt);
 
+  /** DDTree sliding-window support. Base = full-attention only (e.g. Qwen3). */
+  virtual bool ddtreeHasSlidingLayers() const { return false; }
+  virtual int  ddtreeSlidingWindow() const { return 0; }
+
   /** internal buffer */
   std::vector<std::string>
     output_list;             /**< List of output names for the model */

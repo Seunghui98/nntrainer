@@ -39,6 +39,7 @@ inline float convert_scalar(uint16_t h) {
 namespace causallm {
 
 nntrainer::Tensor *MHACoreLayer::s_verify_mask_ = nullptr;
+nntrainer::Tensor *MHACoreLayer::s_verify_sliding_ = nullptr;
 nntrainer::Tensor *MHACoreLayer::s_verify_pos_ = nullptr;
 
 
@@ -293,7 +294,15 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   if (s_verify_mask_ != nullptr) {
-    attn_mask_ = s_verify_mask_;
+    // gemma-style models: sliding layers (finite local_window_size) use the
+    // sliding mask; full-attention layers (kNoSlidingWindow) use the full mask.
+    // When s_verify_sliding_ is null (full-attention-only models, e.g. Qwen3),
+    // every layer uses the full mask. (Selection is factored into the pure
+    // selectVerifyMask() helper so it can be unit tested directly.)
+    attn_mask_ =
+      selectVerifyMask(s_verify_mask_, s_verify_sliding_, local_window_size);
+    // RoPE positions are layer-independent; only the additive mask varies by
+    // attention type, so every layer shares the same tree positions.
     tree_pos_ = s_verify_pos_;
   } else {
     attn_mask_ = nullptr;
@@ -776,7 +785,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   }
 
   unsigned int step_size = to - from;
-  bool is_prefill = !from || step_size > 1;
+  // The DDTree masked verify forward processes multiple tree tokens in one step
+  // (step_size > 1) but, unlike the prompt prefill, needs the attention output
+  // of every token. It is uniquely identified by the additive verify mask. The
+  // skip_prefill optimization (used by gemma4's KV-shared layers to avoid the
+  // prompt prefill) must NOT fire here, or those layers would return stale
+  // attention outputs and corrupt the verify posterior.
+  const bool is_ddtree_verify = (attn_mask_ != nullptr);
+  bool is_prefill = (!from || step_size > 1) && !is_ddtree_verify;
   if (skip_prefill && is_prefill)
     return;
 
@@ -1257,6 +1273,16 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
   }
+}
+
+nntrainer::Tensor *MHACoreLayer::selectVerifyMask(nntrainer::Tensor *full,
+                                                  nntrainer::Tensor *sliding,
+                                                  size_t local_window_size) {
+  if (full == nullptr)
+    return nullptr;
+  const bool layer_is_sliding =
+    (sliding != nullptr) && (local_window_size != kNoSlidingWindow);
+  return layer_is_sliding ? sliding : full;
 }
 
 void MHACoreLayer::add_mask_and_softmax_full(nntrainer::Tensor &qk_out,

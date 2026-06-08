@@ -38,6 +38,7 @@
 #include <lm_head.h>
 #include <mha_core.h>
 #include <ddtree.h>
+#include <ddtree_sliding.h>
 #include <ddtree_types.h>
 #include <tie_word_embedding.h>
 #include <nntrainer_error.h>
@@ -344,7 +345,10 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
   // argmax posterior -> followVerified -> KVCacheManager::compactTail] loop.
   const int HORIZON = 15;
   const int BUDGET = 31;
-  const unsigned int MAX_NEW = 64;
+  // Honor the res-dir config's num_to_generate so a longer generation (more
+  // DDTree blocks) can be requested without recompiling; fall back to 64.
+  const unsigned int MAX_NEW =
+    NUM_TO_GENERATE > 0 ? (unsigned int)NUM_TO_GENERATE : 64u;
   allocateAndBindKVCache();
 
   auto _input = tokenizer->Encode(prompt);
@@ -375,17 +379,29 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
 
   std::vector<int> tokens(_input.begin(), _input.end());
 
-  // ---- prefill: cache [0, init_len) ----
+  // ---- prefill ----
   for (unsigned int i = 0; i < init_len; ++i)
     input_sample[i] = static_cast<float>(_input[i]);
+
+  unsigned int pos; // tokens[pos] == current block root
   setKVCachePosition(0);
-  {
+  if (SKIP_PREFILL && init_len > 1) {
+    // Prefill only the first init_len-1 tokens; the last prompt token becomes
+    // the root of the first DDTree block (matches the greedy SKIP_PREFILL path
+    // required by gemma4's KV-shared layers). Do NOT sample a prefill argmax.
+    auto o = model->incremental_inference(BATCH_SIZE, input, label,
+                                          init_len - 1, 0, init_len - 1, false);
+    for (auto p : o)
+      delete[] p;
+    pos = init_len - 1; // tokens[pos] == last prompt token (already in `tokens`)
+  } else {
     auto o = model->incremental_inference(BATCH_SIZE, input, label, init_len, 0,
                                           init_len);
     tokens.push_back((int)std::distance(
       o[0], std::max_element(o[0], o[0] + NUM_VOCAB)));
     for (auto p : o)
       delete[] p;
+    pos = init_len; // tokens[pos] == current block root
   }
 
   nntrainer::ddtree::DDTreeConfig cfg;
@@ -393,7 +409,6 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
   cfg.depthLimit = HORIZON;
   cfg.maskFillValue = std::numeric_limits<float>::lowest();
 
-  unsigned int pos = init_len; // tokens[pos] == current block root
   unsigned int generated = 0;
   bool stop = false;
   std::vector<int> accept_lengths;
@@ -425,6 +440,30 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
       dam.push_back((int)cur);
     }
 
+    // ---- Phase C parity dump: per-block raw draft logits (env NNTR_DDTREE_LOGITS) ----
+    // Write the exact [HORIZON, NUM_VOCAB] fp32 draft buffer that is fed into
+    // buildTree so the python ddtree_ref can consume the IDENTICAL logits and
+    // reproduce the 32-node tree element-by-element. Dump EVERY block to
+    // <NNTR_DDTREE_LOGITS>.<blockIdx>.bin (+ .<blockIdx>.bin.meta.json) using a
+    // running block index (== brecs.size() before this block's record is pushed).
+    if (const char *lp = std::getenv("NNTR_DDTREE_LOGITS")) {
+      const size_t blockIdx = brecs.size();
+      const std::string base =
+        std::string(lp) + "." + std::to_string(blockIdx) + ".bin";
+      std::ofstream lf(base, std::ios::binary);
+      lf.write(reinterpret_cast<const char *>(draft.data()),
+               (std::streamsize)((size_t)HORIZON * NUM_VOCAB * sizeof(float)));
+      lf.close();
+      std::ofstream sj(base + ".meta.json");
+      sj << "{\"HORIZON\":" << HORIZON << ",\"NUM_VOCAB\":" << NUM_VOCAB
+         << ",\"BUDGET\":" << BUDGET << ",\"root\":" << root
+         << ",\"pos\":" << pos << ",\"pastLength\":" << pos
+         << ",\"block\":" << blockIdx << "}\n";
+      sj.close();
+      std::cout << "[DDTREE] dumped block-" << blockIdx << " draft logits ["
+                << HORIZON << "," << NUM_VOCAB << "] -> " << base << "\n";
+    }
+
     // ---- build + compile the tree ----
     nntrainer::ddtree::DDTreeStructure tree =
       nntrainer::ddtree::buildTree(draft.data(), HORIZON, (int)NUM_VOCAB, cfg);
@@ -436,6 +475,22 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
     nntrainer::ddtree::compile((int32_t)root, past, past, tree, cfg, vii.data(),
                                vpi.data(), cmask.data(), stride);
 
+    // ---- sliding-window variant for gemma-style models (no-op for Qwen3) ----
+    // makeSlidingMasks is the single source of truth: when sliding_window<=0 it
+    // returns sliding==full (pointing back into cmask) rather than a distinct
+    // buffer, so we honor sliding_masks.hasSliding / .sliding instead of
+    // assuming smask always holds the sliding variant.
+    std::vector<float> smask;
+    const bool has_sliding = ddtreeHasSlidingLayers();
+    const int sliding_window = ddtreeSlidingWindow();
+    nntrainer::ddtree::SlidingMasks sliding_masks;
+    if (has_sliding) {
+      smask.resize((size_t)cl * stride);
+      sliding_masks = nntrainer::ddtree::makeSlidingMasks(
+        cmask.data(), vpi.data(), cl, stride, sliding_window,
+        /*hasSlidingLayers=*/true, cfg, smask.data());
+    }
+
     // ---- masked verify forward -> node logits ----
     for (int i = 0; i < cl; ++i)
       input_sample[i] = static_cast<float>(vii[i]);
@@ -446,7 +501,17 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
       posT.getData<float>()[i] = static_cast<float>(vpi[i]);
     std::vector<float> node_logits((size_t)cl * NUM_VOCAB);
 
-    causallm::MHACoreLayer::setGlobalDDTreeVerify(&maskT, &posT);
+    nntrainer::Tensor slidingT;
+    if (sliding_masks.hasSliding) {
+      // sliding_masks.sliding may alias cmask (window<=0) or point at smask
+      // (finite window); copy from whichever the core returned.
+      slidingT = nntrainer::Tensor(1, 1, (unsigned int)cl, (unsigned int)stride);
+      std::copy(sliding_masks.sliding,
+                sliding_masks.sliding + (size_t)cl * stride,
+                slidingT.getData<float>());
+    }
+    causallm::MHACoreLayer::setGlobalDDTreeVerify(
+      &maskT, sliding_masks.hasSliding ? &slidingT : nullptr, &posT);
     causallm::TieWordEmbedding::setGlobalVerifyDump(node_logits.data());
     setKVCachePosition(pos);
     {
@@ -456,7 +521,7 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
       for (auto p : v)
         delete[] p;
     }
-    causallm::MHACoreLayer::setGlobalDDTreeVerify(nullptr, nullptr);
+    causallm::MHACoreLayer::setGlobalDDTreeVerify(nullptr, nullptr, nullptr);
     causallm::TieWordEmbedding::setGlobalVerifyDump(nullptr);
 
     // ---- posterior (argmax per node) + accepted path ----
@@ -466,6 +531,34 @@ void CausalLM::runDDTreeDump(const WSTR &prompt) {
       posterior[i] =
         (int32_t)std::distance(r, std::max_element(r, r + NUM_VOCAB));
     }
+
+    // ---- Diagnostic: dump verify node_logits (env NNTR_DDTREE_NODELOGITS) ----
+    // Decisive test for decode divergence: the masked tree-verify forward's
+    // per-node logits are the "verify" logits; the self-draft sequential
+    // rollout's per-step logits (the `draft` buffer, dumped via
+    // NNTR_DDTREE_LOGITS) are the "ground-truth" sequential logits. For an
+    // accepted node fed the SAME token at the SAME position as a sequential
+    // draft step, the two logit rows should be ~identical. We dump the full
+    // [cl, NUM_VOCAB] fp32 verify buffer per block to
+    // <NNTR_DDTREE_NODELOGITS>.<blockIdx>.bin (+ sidecar) so an offline harness
+    // can compute max_abs_diff(verify_node, sequential_draft_step) exactly.
+    if (const char *np = std::getenv("NNTR_DDTREE_NODELOGITS")) {
+      const size_t blockIdx = brecs.size();
+      const std::string base =
+        std::string(np) + "." + std::to_string(blockIdx) + ".bin";
+      std::ofstream nf(base, std::ios::binary);
+      nf.write(reinterpret_cast<const char *>(node_logits.data()),
+               (std::streamsize)((size_t)cl * NUM_VOCAB * sizeof(float)));
+      nf.close();
+      std::ofstream sj(base + ".meta.json");
+      sj << "{\"cl\":" << cl << ",\"NUM_VOCAB\":" << NUM_VOCAB
+         << ",\"root\":" << root << ",\"pos\":" << pos
+         << ",\"block\":" << blockIdx << "}\n";
+      sj.close();
+      std::cout << "[DDTREE] dumped block-" << blockIdx << " verify node_logits ["
+                << cl << "," << NUM_VOCAB << "] -> " << base << "\n";
+    }
+
     nntrainer::ddtree::Accepted acc =
       nntrainer::ddtree::followVerified(tree.childMaps, posterior.data());
     const int alen = (int)acc.indices.size();
@@ -799,6 +892,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
+  // Optional authoritative greedy token-id capture (env NNTR_GREEDY_IDS): record
+  // each step's batch-0 argmax id so a DDTree run can be compared token-for-token
+  // (not just via reconstructed stdout text). Dormant unless the env var is set.
+  std::vector<unsigned int> greedy_ids_dump;
+  const bool dump_greedy_ids = std::getenv("NNTR_GREEDY_IDS") != nullptr;
+
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
        ++token_generation_idx) {
@@ -809,6 +908,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+
+    if (dump_greedy_ids)
+      greedy_ids_dump.push_back(ids_list[0]);
 
     // Feed the newly generated token back as the next input token.
     // token_generation_idx always starts at input_len + 1, so we are
@@ -850,6 +952,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // Always release the input buffer after the generation loop, whether
   // the loop exited early (EOS found) or ran to the maximum token limit.
   free(input_sample);
+
+  if (dump_greedy_ids) {
+    std::ofstream gf(std::getenv("NNTR_GREEDY_IDS"));
+    gf << "{\"gen_ids\":[";
+    for (size_t i = 0; i < greedy_ids_dump.size(); ++i)
+      gf << (i ? "," : "") << greedy_ids_dump[i];
+    gf << "]}\n";
+    gf.close();
+    std::cout << "[GREEDY] dumped " << greedy_ids_dump.size()
+              << " greedy token ids -> " << std::getenv("NNTR_GREEDY_IDS")
+              << "\n";
+  }
 
   global_token_len += (generation_cnt + init_len);
 
