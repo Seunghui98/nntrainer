@@ -43,13 +43,6 @@ void MultiOutLayer::incremental_forwarding(RunLayerContext &context,
                                            unsigned int from, unsigned int to,
                                            bool training) {
   if (!context.getInPlace()) {
-    if (from) {
-      NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-        << "incremental step size is not 1";
-      from = 0;
-      to = 1;
-    }
-
     const Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
     TensorDim input_dim = input_.getDim();
     TensorDim input_step_dim = {input_dim.batch(), input_dim.channel(),

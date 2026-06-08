@@ -121,10 +121,8 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
   unsigned int out_dim = std::get<props::OutDim>(embedding_props);
 
   if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
+    to = to - from;
     from = 0;
-    to = 1;
   }
 
   Tensor &weight = context.getWeight(weight_idx);
