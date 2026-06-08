@@ -47,12 +47,18 @@ App: `build-app` with `-Denable-app=true -Denable-transformer=true -Denable-fp16
 6. lm_head/TieWordEmbedding emit last-token logits only -> verify uses a separate
    all-position dump buffer.
 
+## Debug output & dump interpretation
+- See `DDTREE-DEBUG-OUTPUT.md`: per-block `blocks.json` field meanings, the full
+  32-node tree dump (parents/node_tokens/posterior) + `render_blocks.py` ASCII
+  renderer added in this session, and the open sliding-window runtime task.
+
 ## Possible next work (not done)
 - Clean up env-gated debug dumps in `runDDTreeDump` (block/cache diagnostics) if a
   production path is wanted; or promote `runDDTreeDump` to a real `runDDTree` decode
   mode (currently dump-only, greedy, self-draft).
-- Sliding-window models (gemma) path: `makeSlidingMasks` exists but untested
-  (qwen3-0.6b is full-attention).
+- Sliding-window models (gemma) RUNTIME wiring: core `makeSlidingMasks` is done +
+  unit-tested but not wired into runDDTreeDump/mha_core. See `DDTREE-DEBUG-OUTPUT.md`
+  §4 for the exact steps. (qwen3-0.6b is full-attention, so unaffected.)
 - Real DFlash draft model (not self-draft) for true speculative speedup + Task 13/14
   trace parity (needs the littlebit-draft checkpoint, absent here).
 - ARM build (only x86_64 tested here).
