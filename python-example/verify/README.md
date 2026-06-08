@@ -78,3 +78,38 @@ unless env `NNTR_DDTREE_DUMP` is set; triggered from `CausalLM::run`. Uses
 process-global setters `MHACoreLayer::setGlobalDDTreeVerify(mask,pos)` and
 `TieWordEmbedding::setGlobalVerifyDump(buf)` (cross-.so `dynamic_cast` is
 unreliable — use `getType()` + these statics).
+
+---
+
+## gemma4-E2B verification (tree parity + decode)
+
+The Qwen3 suite above proves the **core algorithm** + the original full-attention runtime. The
+scripts below extend the same kind of element-by-element proof to **gemma4-E2B** (Gemma 3n E2B,
+Q4_0), whose runtime adds per-layer sliding masks, KV-shared layers and `skip_prefill`. See
+`docs/superpowers/plans/DDTREE-GEMMA4-COMPLETE.md` for the full record.
+
+All gemma4 scripts consume the env-gated runtime dumps (dormant otherwise):
+`NNTR_DDTREE_DUMP=<p>` (`<p>.blocks.json`), `NNTR_DDTREE_LOGITS=<p>` (`<p>.<i>.bin` raw fp32 draft
+logits per block), `NNTR_DDTREE_NODELOGITS=<p>`, `NNTR_GREEDY_IDS=<p>`.
+
+### Comparison harnesses (pass/fail)
+| Script | What it proves |
+|---|---|
+| `compare_gemma4_tree.py <draft.0.bin> <blocks.json>` | block-0 tree (parents/tokens/depths/positions/visibility/posterior/accepted/next) recomputed by `ddtree_ref` from the runtime's own logits == the runtime dump, exactly. |
+| `compare_gemma4_tree_all.py <draft-prefix> <blocks.json>` | the same, looped over **every block** of a long generation (e.g. 42 blocks at 512 tokens) — exits non-zero on any field/cell mismatch. |
+| `compare_verify_vs_sequential.py` | at a decode divergence, dumps masked-verify vs sequential logits and reports `max_abs_diff` — used to prove the only divergence is a Q4_0 near-tie (≈1.4 noise in Q4_0, ≈0.003 in fp32), not a bug. |
+
+### Visualization (human-readable)
+| Script | Output |
+|---|---|
+| `visualize_ddtree_parity.py <blocks.json> <draft-prefix> [--block N] [--model <dir>] [--log OUT] [--tamper]` | per-block parity summary; per-node field table (py/nt side-by-side); full NxN visibility matrix (Python \| nntrainer); ASCII tree with accepted path. `--tamper` is an **integrity self-test**: corrupting an nntr value yields DIFF and perturbing the input logits changes the Python tree — proving the comparison is a genuine recomputation, not a copy. |
+| `render_blocks.py <blocks.json> [--model <dir>] [--block N]` | renders a `blocks.json` tree as ASCII (no logits needed). |
+| `gemma4_tree_parity.log` | a committed example report: 7 blocks, 7168/7168 visibility cells identical, with block-2's 32x32 matrix side-by-side. |
+
+### Example
+```bash
+RES=Applications/CausalLM/res/gemma4/gemma4-e2b
+NNTR_DDTREE_DUMP=/tmp/g4 NNTR_DDTREE_LOGITS=/tmp/g4.draft ./build-app/Applications/CausalLM/nntr_causallm $RES
+python compare_gemma4_tree_all.py /tmp/g4.draft /tmp/g4.blocks.json          # CI: ALL BLOCKS OK
+python visualize_ddtree_parity.py /tmp/g4.blocks.json /tmp/g4.draft --block 2 --model $RES --tamper
+```
