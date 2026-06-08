@@ -24,6 +24,13 @@ Applications/**/res/*
 !Applications/CausalLM/res/deberta_v2/
 Applications/CausalLM/res/deberta_v2/*
 !Applications/CausalLM/res/deberta_v2/weight_converter.py
+!Applications/CausalLM/res/gemma4/
+Applications/CausalLM/res/gemma4/*
+!Applications/CausalLM/res/gemma4/gemma4-e2b/
+Applications/CausalLM/res/gemma4/gemma4-e2b/*
+!Applications/CausalLM/res/gemma4/gemma4-e2b/gguf_to_nntrainer.py
+!Applications/CausalLM/res/gemma4/gemma4-e2b/nntr_config.json
+!Applications/CausalLM/res/gemma4/gemma4-e2b/README.md
 Applications/**/tokenizers-cpp-build/*
 
 # CTag
