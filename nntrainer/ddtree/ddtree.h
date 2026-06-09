@@ -2,7 +2,8 @@
 /**
  * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
  *
- * @brief  DDTree core: candidate-tree build, verify-buffer compile, accepted-path follow
+ * @brief  DDTree core: candidate-tree build, verify-buffer compile,
+ * accepted-path follow
  * @file   ddtree.h
  * @date   05 June 2026
  * @see    https://github.com/nntrainer/nntrainer

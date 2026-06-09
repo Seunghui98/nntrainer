@@ -25,7 +25,8 @@ void compactTail(void *cacheBase, int elemSizeBytes, int seqStrideElems,
 
   auto *base = static_cast<uint8_t *>(cacheBase);
   const size_t rowBytes = static_cast<size_t>(rowElems) * elemSizeBytes;
-  const size_t strideBytes = static_cast<size_t>(seqStrideElems) * elemSizeBytes;
+  const size_t strideBytes =
+    static_cast<size_t>(seqStrideElems) * elemSizeBytes;
 
   // Gather kept rows into a packed temporary (index_select semantics).
   std::vector<uint8_t> tmp(static_cast<size_t>(keepCount) * rowBytes);
@@ -33,12 +34,14 @@ void compactTail(void *cacheBase, int elemSizeBytes, int seqStrideElems,
     const int src = keepIndices[d];
     const uint8_t *srcRow =
       base + (static_cast<size_t>(pastLen) + src) * strideBytes;
-    std::memcpy(tmp.data() + static_cast<size_t>(d) * rowBytes, srcRow, rowBytes);
+    std::memcpy(tmp.data() + static_cast<size_t>(d) * rowBytes, srcRow,
+                rowBytes);
   }
   // Write back into [pastLen, pastLen+keepCount).
   for (int d = 0; d < keepCount; ++d) {
     uint8_t *dstRow = base + (static_cast<size_t>(pastLen) + d) * strideBytes;
-    std::memcpy(dstRow, tmp.data() + static_cast<size_t>(d) * rowBytes, rowBytes);
+    std::memcpy(dstRow, tmp.data() + static_cast<size_t>(d) * rowBytes,
+                rowBytes);
   }
 }
 

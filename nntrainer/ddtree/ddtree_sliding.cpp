@@ -2,7 +2,8 @@
 /**
  * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
  *
- * @brief  Sliding-window attention-mask implementation for the DDTree verify pass
+ * @brief  Sliding-window attention-mask implementation for the DDTree verify
+ * pass
  * @file   ddtree_sliding.cpp
  * @date   05 June 2026
  * @see    https://github.com/nntrainer/nntrainer
@@ -18,9 +19,9 @@ namespace ddtree {
 
 SlidingMasks makeSlidingMasks(float *attentionMask,
                               const int32_t *verifyPositionIds,
-                              int currentLength, int kvLength, int slidingWindow,
-                              bool hasSlidingLayers, const DDTreeConfig &cfg,
-                              float *slidingBuffer) {
+                              int currentLength, int kvLength,
+                              int slidingWindow, bool hasSlidingLayers,
+                              const DDTreeConfig &cfg, float *slidingBuffer) {
   SlidingMasks out;
   out.full = attentionMask;
 
@@ -50,7 +51,8 @@ SlidingMasks makeSlidingMasks(float *attentionMask,
       const int k = (j < past) ? j : verifyPositionIds[j - past];
       const bool visible = (k <= q) && (k > q - slidingWindow);
       if (!visible)
-        slidingBuffer[static_cast<size_t>(i) * kvLength + j] = cfg.maskFillValue;
+        slidingBuffer[static_cast<size_t>(i) * kvLength + j] =
+          cfg.maskFillValue;
     }
   }
   out.sliding = slidingBuffer;
@@ -59,7 +61,8 @@ SlidingMasks makeSlidingMasks(float *attentionMask,
 
 void makeSlidingVisibility(const uint8_t *treeVisibility,
                            const int32_t *verifyPositionIds, int currentLength,
-                           int kvLength, int slidingWindow, uint8_t *outVisible) {
+                           int kvLength, int slidingWindow,
+                           uint8_t *outVisible) {
   const int past = kvLength - currentLength;
   for (int i = 0; i < currentLength; ++i) {
     const int q = verifyPositionIds[i];

@@ -27,15 +27,17 @@ namespace ddtree {
  * @param currentLength     number of tree nodes (rows)
  * @param kvLength          pastLength + currentLength (mask columns)
  * @param slidingWindow     model sliding_window (<=0 => full==sliding)
- * @param hasSlidingLayers  true iff model layer_types contains "sliding_attention"
+ * @param hasSlidingLayers  true iff model layer_types contains
+ * "sliding_attention"
  * @param cfg               uses cfg.maskFillValue
- * @param slidingBuffer     [currentLength, kvLength] scratch for sliding variant
+ * @param slidingBuffer     [currentLength, kvLength] scratch for sliding
+ * variant
  */
 SlidingMasks makeSlidingMasks(float *attentionMask,
                               const int32_t *verifyPositionIds,
-                              int currentLength, int kvLength, int slidingWindow,
-                              bool hasSlidingLayers, const DDTreeConfig &cfg,
-                              float *slidingBuffer);
+                              int currentLength, int kvLength,
+                              int slidingWindow, bool hasSlidingLayers,
+                              const DDTreeConfig &cfg, float *slidingBuffer);
 
 /**
  * @brief Sliding-window visibility as a plain 0/1 bitmap (format-neutral).
@@ -51,10 +53,11 @@ SlidingMasks makeSlidingMasks(float *attentionMask,
  *   - prefix column (j < past): treeVisible = 1, key position k = j;
  *   - tree column   (j >= past): treeVisible = treeVisibility[i][j-past],
  *     key position k = verifyPositionIds[j-past];
- *   windowVisible = (slidingWindow <= 0) ? 1 : (k <= q && k > q - slidingWindow),
- *   with query position q = verifyPositionIds[i].
+ *   windowVisible = (slidingWindow <= 0) ? 1 : (k <= q && k > q -
+ * slidingWindow), with query position q = verifyPositionIds[i].
  *
- * @param treeVisibility    [currentLength*currentLength] row-major 0/1 (buildTree)
+ * @param treeVisibility    [currentLength*currentLength] row-major 0/1
+ * (buildTree)
  * @param verifyPositionIds [currentLength] absolute query positions (compile)
  * @param currentLength     number of tree nodes (rows)
  * @param kvLength          pastLength + currentLength (mask columns)
@@ -63,7 +66,8 @@ SlidingMasks makeSlidingMasks(float *attentionMask,
  */
 void makeSlidingVisibility(const uint8_t *treeVisibility,
                            const int32_t *verifyPositionIds, int currentLength,
-                           int kvLength, int slidingWindow, uint8_t *outVisible);
+                           int kvLength, int slidingWindow,
+                           uint8_t *outVisible);
 
 } // namespace ddtree
 } // namespace nntrainer

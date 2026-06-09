@@ -40,7 +40,8 @@ TEST(DDTreeBuild, EmptyBudgetReturnsRootOnly) {
   std::vector<float> logits(8, 0.0f); // depthLimit=2, vocab=4, unused here
   DDTreeConfig cfg;
   cfg.budget = 0;
-  DDTreeStructure t = buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/4, cfg);
+  DDTreeStructure t =
+    buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/4, cfg);
   EXPECT_EQ(t.nodeCount, 0);
   EXPECT_EQ(t.currentLength, 1);
   ASSERT_EQ(t.parents.size(), 1u);
@@ -55,7 +56,8 @@ TEST(DDTreeBuild, ZeroDepthReturnsRootOnly) {
   std::vector<float> logits(1, 0.0f);
   DDTreeConfig cfg;
   cfg.budget = 8;
-  DDTreeStructure t = buildTree(logits.data(), /*depthLimit=*/0, /*vocab=*/4, cfg);
+  DDTreeStructure t =
+    buildTree(logits.data(), /*depthLimit=*/0, /*vocab=*/4, cfg);
   EXPECT_EQ(t.currentLength, 1);
   EXPECT_EQ(t.visibility[0], 1u);
 }
@@ -65,7 +67,7 @@ TEST(DDTreeBuild, ZeroDepthReturnsRootOnly) {
 // Depth 1 logits: token2 highest, token0 next, token1 lowest.
 static std::vector<float> kSmallLogits() {
   return {
-    2.0f, 1.0f, 0.0f,  // depth 0
+    2.0f, 1.0f,  0.0f, // depth 0
     0.0f, -1.0f, 1.0f, // depth 1
   };
 }
@@ -74,7 +76,8 @@ TEST(DDTreeBuild, SmallTreeStructure) {
   DDTreeConfig cfg;
   cfg.budget = 3;
   auto logits = kSmallLogits();
-  DDTreeStructure t = buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/3, cfg);
+  DDTreeStructure t =
+    buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/3, cfg);
 
   // budget 3 -> 3 nodes, currentLength 4.
   EXPECT_EQ(t.nodeCount, 3);
@@ -106,7 +109,8 @@ TEST(DDTreeBuild, BudgetExceedsVocabTopkClamped) {
   cfg.budget = 100; // > vocab
   auto logits = kSmallLogits();
   // Must not read past topk = min(budget, vocab) = 3 columns; no crash.
-  DDTreeStructure t = buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/3, cfg);
+  DDTreeStructure t =
+    buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/3, cfg);
   EXPECT_GE(t.nodeCount, 1);
   EXPECT_LE(t.nodeCount, 100);
 }
@@ -164,10 +168,11 @@ TEST(DDTreeSliding, NoSlidingLayersPassthrough) {
   std::vector<int32_t> pos = {0, 1};
   std::vector<float> slide(4, -1.0f);
   DDTreeConfig cfg;
-  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(),
-                                    /*currentLength=*/2, /*kvLength=*/2,
-                                    /*slidingWindow=*/8,
-                                    /*hasSlidingLayers=*/false, cfg, slide.data());
+  SlidingMasks m =
+    makeSlidingMasks(full.data(), pos.data(),
+                     /*currentLength=*/2, /*kvLength=*/2,
+                     /*slidingWindow=*/8,
+                     /*hasSlidingLayers=*/false, cfg, slide.data());
   EXPECT_FALSE(m.hasSliding);
   EXPECT_EQ(m.full, full.data());
 }
@@ -179,9 +184,10 @@ TEST(DDTreeSliding, WindowZeroFullEqualsSliding) {
   std::vector<int32_t> pos = {0, 1};
   std::vector<float> slide(4, -1.0f);
   DDTreeConfig cfg;
-  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), 2, 2,
-                                    /*slidingWindow=*/0,
-                                    /*hasSlidingLayers=*/true, cfg, slide.data());
+  SlidingMasks m =
+    makeSlidingMasks(full.data(), pos.data(), 2, 2,
+                     /*slidingWindow=*/0,
+                     /*hasSlidingLayers=*/true, cfg, slide.data());
   EXPECT_TRUE(m.hasSliding);
   EXPECT_EQ(m.sliding, m.full);
 }
@@ -196,8 +202,9 @@ TEST(DDTreeSliding, PositiveWindowVisibility) {
   std::vector<float> slide(static_cast<size_t>(cur) * kv, 123.0f);
   DDTreeConfig cfg;
   cfg.maskFillValue = -1e30f;
-  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
-                                    /*hasSlidingLayers=*/true, cfg, slide.data());
+  SlidingMasks m =
+    makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
+                     /*hasSlidingLayers=*/true, cfg, slide.data());
   ASSERT_TRUE(m.hasSliding);
   ASSERT_NE(m.sliding, m.full);
 
@@ -233,9 +240,9 @@ TEST(DDTreeSliding, VisibilityMatchesThresholdedMask) {
       for (int j = 0; j < cur; ++j)
         full[i * kv + past + j] = treeVis[i * cur + j] ? 0.0f : fill;
     std::vector<float> slide(static_cast<size_t>(cur) * kv, 0.0f);
-    SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
-                                      /*hasSlidingLayers=*/true, cfg,
-                                      slide.data());
+    SlidingMasks m =
+      makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
+                       /*hasSlidingLayers=*/true, cfg, slide.data());
     ASSERT_TRUE(m.hasSliding);
 
     std::vector<uint8_t> vis01(static_cast<size_t>(cur) * kv, 9);
@@ -283,7 +290,8 @@ TEST(DDTreeFollow, PartialAccept) {
   using nntrainer::ddtree::Accepted;
   using nntrainer::ddtree::followVerified;
   auto cm = kChain();
-  std::vector<int32_t> posterior = {10, 999, 77}; // root->1, then 999 not a child
+  std::vector<int32_t> posterior = {10, 999,
+                                    77}; // root->1, then 999 not a child
   Accepted a = followVerified(cm, posterior.data());
   EXPECT_EQ(a.indices, (std::vector<int32_t>{0, 1}));
   EXPECT_EQ(a.nextToken, 999);
@@ -293,7 +301,8 @@ TEST(DDTreeFollow, ImmediateReject) {
   using nntrainer::ddtree::Accepted;
   using nntrainer::ddtree::followVerified;
   auto cm = kChain();
-  std::vector<int32_t> posterior = {5, 20, 77}; // root token 5 not a child of root
+  std::vector<int32_t> posterior = {5, 20,
+                                    77}; // root token 5 not a child of root
   Accepted a = followVerified(cm, posterior.data());
   EXPECT_EQ(a.indices, (std::vector<int32_t>{0}));
   EXPECT_EQ(a.nextToken, 5);
@@ -313,9 +322,12 @@ TEST(DDTreeCompact, SubsetReorderRowMajor) {
   std::vector<int32_t> keep = {0, 2, 3}; // keep tail rows 0,2,3
   compactTail(buf.data(), sizeof(float), seqStride, rowElems, past, tailLen,
               keep.data(), (int)keep.size());
-  EXPECT_EQ(buf[2], 10); EXPECT_EQ(buf[3], 11); // dst0 = src0
-  EXPECT_EQ(buf[4], 30); EXPECT_EQ(buf[5], 31); // dst1 = src2
-  EXPECT_EQ(buf[6], 40); EXPECT_EQ(buf[7], 41); // dst2 = src3
+  EXPECT_EQ(buf[2], 10);
+  EXPECT_EQ(buf[3], 11); // dst0 = src0
+  EXPECT_EQ(buf[4], 30);
+  EXPECT_EQ(buf[5], 31); // dst1 = src2
+  EXPECT_EQ(buf[6], 40);
+  EXPECT_EQ(buf[7], 41); // dst2 = src3
   EXPECT_EQ(buf[0], -1); // prefix untouched
 }
 
@@ -347,8 +359,10 @@ TEST(DDTreeCompact, WorksWithSeqStrideGreaterThanRow) {
   std::vector<int32_t> keep = {2, 0};
   compactTail(buf.data(), sizeof(float), seqStride, rowElems, past, tailLen,
               keep.data(), 2);
-  EXPECT_EQ(buf[0], 30); EXPECT_EQ(buf[1], 31); // dst0 = src2
-  EXPECT_EQ(buf[3], 10); EXPECT_EQ(buf[4], 11); // dst1 = src0
+  EXPECT_EQ(buf[0], 30);
+  EXPECT_EQ(buf[1], 31); // dst0 = src2
+  EXPECT_EQ(buf[3], 10);
+  EXPECT_EQ(buf[4], 11); // dst1 = src0
 }
 
 TEST(DDTreeSampling, ArgmaxAndGreedyRows) {

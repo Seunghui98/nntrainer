@@ -49,7 +49,7 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
                       [row](int32_t a, int32_t b) {
                         if (row[a] != row[b])
                           return row[a] > row[b]; // logit desc
-                        return a < b;             // tie: lower token index first
+                        return a < b; // tie: lower token index first
                       });
 
     // logsumexp in double for accuracy; result stored as fp32 (parity §6.2).
@@ -69,8 +69,9 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
     }
   }
 
-  // Heap entry mirrors the Python tuple (-logw, ranks, parent, depth, rank, logw).
-  // Comparison is the Python tuple order; ranks is variable-length lexicographic.
+  // Heap entry mirrors the Python tuple (-logw, ranks, parent, depth, rank,
+  // logw). Comparison is the Python tuple order; ranks is variable-length
+  // lexicographic.
   struct Entry {
     double negLogw;
     std::vector<int32_t> ranks;
@@ -84,7 +85,8 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
     if (a.negLogw != b.negLogw)
       return a.negLogw < b.negLogw;
     if (a.ranks != b.ranks)
-      return a.ranks < b.ranks; // std::vector lexicographic (prefix sorts first)
+      return a.ranks <
+             b.ranks; // std::vector lexicographic (prefix sorts first)
     if (a.parentIndex != b.parentIndex)
       return a.parentIndex < b.parentIndex;
     if (a.depth != b.depth)
@@ -100,7 +102,8 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
   std::priority_queue<Entry, std::vector<Entry>, decltype(comp)> heap(comp);
 
   const double firstLogw = static_cast<double>(topLogProbs[0][0]);
-  heap.push(Entry{-firstLogw, {0}, /*parent*/ 0, /*depth*/ 1, /*rank*/ 0, firstLogw});
+  heap.push(
+    Entry{-firstLogw, {0}, /*parent*/ 0, /*depth*/ 1, /*rank*/ 0, firstLogw});
 
   t.parents.assign(cfg.budget + 1, 0);
   t.parents[0] = -1;
@@ -183,9 +186,9 @@ CompiledTree compile(int32_t rootTokenId, int start, int pastLength,
     for (int j = 0; j < pastLength; ++j)
       r[j] = 0.0f;
     for (int j = 0; j < cur; ++j)
-      r[pastLength + j] =
-        tree.visibility[static_cast<size_t>(i) * cur + j] ? 0.0f
-                                                          : cfg.maskFillValue;
+      r[pastLength + j] = tree.visibility[static_cast<size_t>(i) * cur + j]
+                            ? 0.0f
+                            : cfg.maskFillValue;
   }
 
   return CompiledTree{pastLength, cur};
