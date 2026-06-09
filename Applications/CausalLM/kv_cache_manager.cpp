@@ -12,7 +12,10 @@
 
 #include "kv_cache_manager.h"
 
+#include <cstdint>
 #include <stdexcept>
+
+#include <ddtree_compact.h>
 
 namespace causallm {
 
@@ -90,6 +93,45 @@ void KVCacheManager::advance(unsigned int step_size) {
 }
 
 void KVCacheManager::reset() { cache_pos_ = 0; }
+
+void KVCacheManager::compactTail(unsigned int pastLen,
+                                 const std::vector<int32_t> &keepIndices) {
+  const int tailLen = static_cast<int>(cache_pos_ - pastLen);
+  const int keepCount = static_cast<int>(keepIndices.size());
+  // FP32 is 4 bytes; FP16 and the UINT16 fp16-storage proxy are both 2 bytes.
+  const int elemSize = (dtype_ == ml::train::TensorDim::DataType::FP32) ? 4 : 2;
+
+  for (auto &lc : layer_caches_) {
+    for (nntrainer::Tensor *cache : {&lc.key_cache, &lc.value_cache}) {
+      ml::train::TensorDim dim = cache->getDim();
+      const int width = static_cast<int>(dim.width());
+      const int batchStride = static_cast<int>(dim.getFeatureLen());
+
+      void *base = nullptr;
+      if (dtype_ == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+        base = static_cast<void *>(cache->getData<_FP16>());
+#else
+        throw std::runtime_error(
+          "KVCacheManager::compactTail: FP16 cache requires an fp16 build");
+#endif
+      } else {
+        base = static_cast<void *>(cache->getData<float>());
+      }
+
+      for (unsigned int b = 0; b < dim.batch(); ++b) {
+        void *batchBase = static_cast<uint8_t *>(base) +
+                          static_cast<size_t>(b) * batchStride * elemSize;
+        nntrainer::ddtree::compactTail(batchBase, elemSize,
+                                       width, // seqStrideElems
+                                       width, // rowElems
+                                       static_cast<int>(pastLen), tailLen,
+                                       keepIndices.data(), keepCount);
+      }
+    }
+  }
+  setPosition(pastLen + static_cast<unsigned int>(keepCount));
+}
 
 nntrainer::Tensor &KVCacheManager::getKeyCache(unsigned int layer_idx) {
   if (layer_idx >= layer_caches_.size()) {
