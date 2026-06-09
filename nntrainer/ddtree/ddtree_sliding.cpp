@@ -51,5 +51,28 @@ SlidingMasks makeSlidingMasks(float *attentionMask,
   return out;
 }
 
+void makeSlidingVisibility(const uint8_t *treeVisibility,
+                           const int32_t *verifyPositionIds, int currentLength,
+                           int kvLength, int slidingWindow, uint8_t *outVisible) {
+  const int past = kvLength - currentLength;
+  for (int i = 0; i < currentLength; ++i) {
+    const int q = verifyPositionIds[i];
+    for (int j = 0; j < kvLength; ++j) {
+      // Tree visibility: prefix columns are always visible; tree columns follow
+      // the buildTree visibility bitmap.
+      const bool treeVisible =
+        (j < past)
+          ? true
+          : treeVisibility[static_cast<size_t>(i) * currentLength + (j - past)];
+      // Window restriction on absolute key positions (== makeSlidingMasks).
+      const int k = (j < past) ? j : verifyPositionIds[j - past];
+      const bool windowVisible =
+        (slidingWindow <= 0) ? true : ((k <= q) && (k > q - slidingWindow));
+      outVisible[static_cast<size_t>(i) * kvLength + j] =
+        (treeVisible && windowVisible) ? 1 : 0;
+    }
+  }
+}
+
 } // namespace ddtree
 } // namespace nntrainer

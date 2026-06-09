@@ -32,6 +32,34 @@ SlidingMasks makeSlidingMasks(float *attentionMask,
                               bool hasSlidingLayers, const DDTreeConfig &cfg,
                               float *slidingBuffer);
 
+/**
+ * @brief Sliding-window visibility as a plain 0/1 bitmap (format-neutral).
+ *
+ * Equivalent to thresholding makeSlidingMasks()'s sliding output, but emitted
+ * directly as 0/1 and independent of cfg.maskFillValue / the fp32 additive
+ * layout. Intended for consumers (e.g. a QNN runtime) that build their own
+ * integer/gating masks and want the full and sliding masks in the same 0/1 form
+ * as @c DDTreeStructure::visibility, without an fp32 additive round-trip.
+ *
+ * out[i][j] = treeVisible(i,j) AND windowVisible(i,j), where for column j
+ * (with past = kvLength - currentLength):
+ *   - prefix column (j < past): treeVisible = 1, key position k = j;
+ *   - tree column   (j >= past): treeVisible = treeVisibility[i][j-past],
+ *     key position k = verifyPositionIds[j-past];
+ *   windowVisible = (slidingWindow <= 0) ? 1 : (k <= q && k > q - slidingWindow),
+ *   with query position q = verifyPositionIds[i].
+ *
+ * @param treeVisibility    [currentLength*currentLength] row-major 0/1 (buildTree)
+ * @param verifyPositionIds [currentLength] absolute query positions (compile)
+ * @param currentLength     number of tree nodes (rows)
+ * @param kvLength          pastLength + currentLength (mask columns)
+ * @param slidingWindow     model sliding_window (<=0 => window unrestricted)
+ * @param outVisible        [currentLength*kvLength] out, row-major 0/1
+ */
+void makeSlidingVisibility(const uint8_t *treeVisibility,
+                           const int32_t *verifyPositionIds, int currentLength,
+                           int kvLength, int slidingWindow, uint8_t *outVisible);
+
 } // namespace ddtree
 } // namespace nntrainer
 

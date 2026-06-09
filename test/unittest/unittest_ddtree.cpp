@@ -207,6 +207,54 @@ TEST(DDTreeSliding, PositiveWindowVisibility) {
     }
 }
 
+TEST(DDTreeSliding, VisibilityMatchesThresholdedMask) {
+  using nntrainer::ddtree::makeSlidingMasks;
+  using nntrainer::ddtree::makeSlidingVisibility;
+  using nntrainer::ddtree::SlidingMasks;
+  // Linear chain: node0(root), node1 child of 0, node2 child of 1.
+  // tree visibility (cur=3) is lower-triangular incl diagonal.
+  const int past = 2, cur = 3, kv = past + cur, window = 3;
+  std::vector<uint8_t> treeVis = {1, 0, 0, 1, 1, 0, 1, 1, 1};
+  std::vector<int32_t> pos = {10, 11, 12}; // tree query/key positions
+
+  // The 0/1 helper must equal makeSlidingMasks()'s fp32 sliding output
+  // thresholded, for ANY non-zero maskFillValue (it must be fill-independent).
+  for (float fill : {-1e30f, -7.5f}) {
+    DDTreeConfig cfg;
+    cfg.maskFillValue = fill;
+    std::vector<float> full(static_cast<size_t>(cur) * kv, 0.0f);
+    for (int i = 0; i < cur; ++i)
+      for (int j = 0; j < cur; ++j)
+        full[i * kv + past + j] = treeVis[i * cur + j] ? 0.0f : fill;
+    std::vector<float> slide(static_cast<size_t>(cur) * kv, 0.0f);
+    SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
+                                      /*hasSlidingLayers=*/true, cfg,
+                                      slide.data());
+    ASSERT_TRUE(m.hasSliding);
+
+    std::vector<uint8_t> vis01(static_cast<size_t>(cur) * kv, 9);
+    makeSlidingVisibility(treeVis.data(), pos.data(), cur, kv, window,
+                          vis01.data());
+    for (int idx = 0; idx < cur * kv; ++idx) {
+      uint8_t expect = (m.sliding[idx] == 0.0f) ? 1 : 0;
+      EXPECT_EQ(vis01[idx], expect) << "fill=" << fill << " idx=" << idx;
+    }
+  }
+}
+
+TEST(DDTreeSliding, VisibilityWindowUnrestrictedEqualsTree) {
+  using nntrainer::ddtree::makeSlidingVisibility;
+  // window <= 0 -> no window restriction -> out == tree visibility (prefix
+  // columns always visible, tree columns follow treeVis).
+  const int past = 1, cur = 2, kv = past + cur;
+  std::vector<uint8_t> treeVis = {1, 0, 1, 1};
+  std::vector<int32_t> pos = {3, 4};
+  std::vector<uint8_t> out(static_cast<size_t>(cur) * kv, 9);
+  makeSlidingVisibility(treeVis.data(), pos.data(), cur, kv, /*window=*/0,
+                        out.data());
+  EXPECT_EQ(out, (std::vector<uint8_t>{1, 1, 0, 1, 1, 1}));
+}
+
 // root(0) -> {10:1}; node1 -> {20:2}; node2 -> {}.
 static std::vector<std::unordered_map<int32_t, int32_t>> kChain() {
   std::vector<std::unordered_map<int32_t, int32_t>> cm(3);
