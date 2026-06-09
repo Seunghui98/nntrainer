@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file unittest_ddtree.cpp
- * @brief Unit tests for the DDTree speculative-decoding core.
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Unit tests for the DDTree speculative-decoding core
+ * @file   unittest_ddtree.cpp
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <gtest/gtest.h>
 

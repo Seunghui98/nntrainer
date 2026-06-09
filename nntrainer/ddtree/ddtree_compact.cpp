@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree_compact.cpp
- * @brief KV tail reorder helper. Mirrors _compact_appended_window semantics.
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  KV tail reorder implementation for DDTree compaction
+ * @file   ddtree_compact.cpp
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <ddtree_compact.h>
 

@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree_sampling.h
- * @brief Convenience greedy sampling (temperature 0). The caller owns real
- *        sampling; this mirrors sample(logits, temperature=0) == argmax.
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Convenience greedy (temperature-0) sampling helpers for DDTree
+ * @file   ddtree_sampling.h
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #ifndef __NNTRAINER_DDTREE_SAMPLING_H__
 #define __NNTRAINER_DDTREE_SAMPLING_H__

@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree_sliding.cpp
- * @brief Sliding-window mask stage. Mirrors ddtree.py 219-255.
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Sliding-window attention-mask implementation for the DDTree verify pass
+ * @file   ddtree_sliding.cpp
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <ddtree_sliding.h>
 

@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree_sliding.h
- * @brief Sliding-window additive-mask stage
- *        (== prepare_ddtree_attention_mask_for_target).
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Sliding-window attention-mask stage for the DDTree verify pass
+ * @file   ddtree_sliding.h
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #ifndef __NNTRAINER_DDTREE_SLIDING_H__
 #define __NNTRAINER_DDTREE_SLIDING_H__

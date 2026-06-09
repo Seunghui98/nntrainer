@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree_compact.h
- * @brief Reusable, model-agnostic KV tail reorder (== _compact_appended_window).
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Reusable, model-agnostic KV tail reorder for DDTree compaction
+ * @file   ddtree_compact.h
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #ifndef __NNTRAINER_DDTREE_COMPACT_H__
 #define __NNTRAINER_DDTREE_COMPACT_H__

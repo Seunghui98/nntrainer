@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Plain-old-data structures for the DDTree speculative-decoding core
  * @file   ddtree_types.h
- * @brief  Plain-old-data structures for the DDTree speculative-decoding core.
- *         Pure host logic; no nntrainer/Tensor dependency. Mirrors ddtree.py.
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #ifndef __NNTRAINER_DDTREE_TYPES_H__
 #define __NNTRAINER_DDTREE_TYPES_H__

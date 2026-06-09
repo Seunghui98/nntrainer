@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree.h
- * @brief DDTree core: tree build, verify-buffer compile, accepted-path follow.
- *        Pure host logic mirroring ddtree.py (build/compile/follow).
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  DDTree core: candidate-tree build, verify-buffer compile, accepted-path follow
+ * @file   ddtree.h
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #ifndef __NNTRAINER_DDTREE_H__
 #define __NNTRAINER_DDTREE_H__

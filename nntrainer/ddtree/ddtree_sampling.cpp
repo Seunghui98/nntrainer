@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree_sampling.cpp
- * @brief Greedy sampling convenience helpers.
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  Greedy (temperature-0) sampling helper implementation for DDTree
+ * @file   ddtree_sampling.cpp
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <ddtree_sampling.h>
 

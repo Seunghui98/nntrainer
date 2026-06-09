@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file ddtree.cpp
- * @brief DDTree core implementation. Mirrors ddtree.py bit-for-bit.
+ * Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
+ *
+ * @brief  DDTree core implementation (buildTree / compile / followVerified)
+ * @file   ddtree.cpp
+ * @date   05 June 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Seunghui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <ddtree.h>
 
