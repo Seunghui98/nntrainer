@@ -357,6 +357,8 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
     NUM_TO_GENERATE > 0 ? (unsigned int)NUM_TO_GENERATE : 64u;
   allocateAndBindKVCache();
 
+  auto start_total = std::chrono::high_resolution_clock::now();
+
   // reset decode output state for this run
   output_list.assign(BATCH_SIZE, "");
   pending_ids_.clear();
@@ -391,6 +393,7 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
   std::vector<int> tokens(_input.begin(), _input.end());
 
   // ---- prefill ----
+  auto start_prefill = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < init_len; ++i)
     input_sample[i] = static_cast<float>(_input[i]);
 
@@ -416,19 +419,33 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
     pos = init_len; // tokens[pos] == current block root
   }
 
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
+
   nntrainer::ddtree::DDTreeConfig cfg;
   cfg.budget = BUDGET;
   cfg.depthLimit = HORIZON;
+#ifdef ENABLE_FP16
+  // fp16 attention: use the fp16 lowest (finite) so the additive verify mask
+  // never overflows to -inf/NaN in fp16 score arithmetic. Any sufficiently
+  // negative value fully masks (softmax -> 0), so this stays lossless vs greedy.
+  cfg.maskFillValue = -65504.0f;
+#else
   cfg.maskFillValue = std::numeric_limits<float>::lowest();
+#endif
 
   unsigned int generated = 0;
   unsigned int blocks = 0;
   bool stop = false;
+  std::vector<int> accept_lengths;
 
   auto is_eos = [&](int t) {
     return std::find(EOS_TOKEN_ID.begin(), EOS_TOKEN_ID.end(),
                      (unsigned int)t) != EOS_TOKEN_ID.end();
   };
+
+  auto start_generation = std::chrono::high_resolution_clock::now();
 
   while (generated < MAX_NEW && !stop &&
          pos + 1 + (unsigned)HORIZON + 64 < MAX_SEQ_LEN) {
@@ -540,7 +557,10 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
     pos += (unsigned int)alen;
     generated += (unsigned int)alen;
     ++blocks;
+    accept_lengths.push_back(alen);
   }
+
+  auto finish_generation = std::chrono::high_resolution_clock::now();
 
   // Emit the generated tokens (tokens[init_len:]) through the normal output
   // path so they accumulate in output_list and stream to stdout, exactly like
@@ -550,9 +570,65 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
                     eos_list, log_output);
 
   free(input_sample);
-  if (log_output)
-    std::cout << "\n[DDTree] generated " << (tokens.size() - init_len)
-              << " tokens in " << blocks << " blocks\n";
+
+  auto decode_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_generation - start_generation);
+  auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_generation - start_total);
+  size_t peak_memory = getPeakMemoryKb();
+  const unsigned int decode_tokens = (unsigned int)(tokens.size() - init_len);
+  // Self-draft cost: HORIZON single-token draft forwards + 1 verify forward
+  // (which processes the whole tree at once) per block.
+  const unsigned long draft_forwards =
+    (unsigned long)blocks * (unsigned long)HORIZON;
+  const unsigned long verify_forwards = (unsigned long)blocks;
+  const unsigned long total_forwards = draft_forwards + verify_forwards;
+  const double mean_block = blocks ? (double)decode_tokens / blocks : 0.0;
+  int max_block = 0;
+  for (int a : accept_lengths)
+    max_block = std::max(max_block, a);
+  const double prefill_tps =
+    prefill_duration.count()
+      ? (double)init_len / prefill_duration.count() * 1000
+      : 0.0;
+  const double decode_tps =
+    decode_duration.count()
+      ? (double)decode_tokens / decode_duration.count() * 1000
+      : 0.0;
+  const double fwd_per_token =
+    decode_tokens ? (double)total_forwards / decode_tokens : 0.0;
+
+  performance_metrics.prefill_tokens = init_len;
+  performance_metrics.prefill_duration_ms = prefill_duration.count();
+  performance_metrics.generation_tokens = decode_tokens;
+  performance_metrics.generation_duration_ms = decode_duration.count();
+  performance_metrics.total_duration_ms = total_duration.count();
+  performance_metrics.peak_memory_kb = peak_memory;
+
+  if (log_output) {
+    std::cout << "\n\n";
+    std::cout << "===============[ DDTree 16-tok / 32-tree ]================\n";
+    std::cout << "prefill: " << init_len << " tokens, "
+              << prefill_duration.count() << " ms, " << prefill_tps << " TPS\n";
+    std::cout << "decode: " << decode_tokens << " tokens, "
+              << decode_duration.count() << " ms, " << decode_tps << " TPS\n";
+    std::cout << "blocks: " << blocks << ", mean tokens/block: " << mean_block
+              << ", max: " << max_block << "\n";
+    std::cout << "forwards: " << draft_forwards << " draft + " << verify_forwards
+              << " verify = " << total_forwards << " (" << fwd_per_token
+              << " fwd/token)\n";
+    std::cout << "total: " << total_duration.count() << " ms\n";
+    std::cout << "peak memory: " << peak_memory << " KB\n";
+    std::cout << "==========================================================\n";
+    // machine-parseable summary for benchmark scripts.
+    std::cout << "[DDTREE_METRICS] decode_tokens=" << decode_tokens
+              << " decode_ms=" << decode_duration.count()
+              << " decode_tps=" << decode_tps << " blocks=" << blocks
+              << " mean_tokens_per_block=" << mean_block
+              << " fwd_per_token=" << fwd_per_token
+              << " prefill_ms=" << prefill_duration.count()
+              << " peak_kb=" << peak_memory << "\n";
+  }
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
