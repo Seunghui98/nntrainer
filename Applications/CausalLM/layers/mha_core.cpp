@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -36,6 +37,10 @@ inline float convert_scalar(uint16_t h) {
 }
 
 namespace causallm {
+
+nntrainer::Tensor *MHACoreLayer::s_verify_mask_ = nullptr;
+nntrainer::Tensor *MHACoreLayer::s_verify_sliding_ = nullptr;
+nntrainer::Tensor *MHACoreLayer::s_verify_pos_ = nullptr;
 
 #define tile_size 4
 
@@ -134,11 +139,11 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 7,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3, 4, or 5 inputs. "
-       "(query, key, value; mask is optional; external cache_key + cache_value "
-       "for external cache mode)";
+    << "Multi head Attention layer needs 3..6 inputs. "
+       "(query, key, value; optional mask; external cache_key + cache_value; "
+       "optional DDTree mask at slot 5 in external-cache mode)";
 
   use_external_cache = (context.getNumInputs() >= 5);
   ml::train::TensorDim::TensorType activation_type = {
@@ -287,6 +292,21 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+  if (s_verify_mask_ != nullptr) {
+    // gemma-style models: sliding layers (finite local_window_size) use the
+    // sliding mask; full-attention layers (kNoSlidingWindow) use the full mask.
+    // When s_verify_sliding_ is null (full-attention-only models, e.g. Qwen3),
+    // every layer uses the full mask. (Selection is factored into the pure
+    // selectVerifyMask() helper so it can be unit tested directly.)
+    attn_mask_ =
+      selectVerifyMask(s_verify_mask_, s_verify_sliding_, local_window_size);
+    // RoPE positions are layer-independent; only the additive mask varies by
+    // attention type, so every layer shares the same tree positions.
+    tree_pos_ = s_verify_pos_;
+  } else {
+    attn_mask_ = nullptr;
+    tree_pos_ = nullptr;
+  }
   if (!use_external_cache) {
     return;
   }
@@ -298,6 +318,20 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 
   nntrainer::Tensor &cache_key = context.getInput(3);
   nntrainer::Tensor &cache_value = context.getInput(4);
+
+  // DDTree additive mask for the external-cache verify path: optional 6th
+  // input (slot 5). Present only when the graph wires it; base decode
+  // (5 inputs) leaves attn_mask_ == nullptr (reset at function top).
+  if (context.getNumInputs() > 5) {
+    nntrainer::Tensor &mask_in = context.getInput(5);
+    if (mask_in.size() != 0)
+      attn_mask_ = &mask_in;
+  }
+  if (context.getNumInputs() > 6) {
+    nntrainer::Tensor &pos_in = context.getInput(6);
+    if (pos_in.size() != 0)
+      tree_pos_ = &pos_in;
+  }
 
   nntrainer::Tensor sink;
   if (use_sink) {
@@ -457,6 +491,17 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     context.getInput(INOUT_INDEX::VALUE); // projected value
   nntrainer::Tensor &output =
     context.getOutput(INOUT_INDEX::OUTPUT); // output to be projected
+
+  // DDTree additive attention mask (internal-cache, non-causal tree
+  // verify). Present only when a 4th MASK input is bound (numInputs == 4;
+  // external cache uses slots 3/4 and is handled in forwarding()).
+  attn_mask_ = nullptr;
+  tree_pos_ = nullptr;
+  if (context.getNumInputs() > INOUT_INDEX::MASK) {
+    nntrainer::Tensor &mask_in = context.getInput(INOUT_INDEX::MASK);
+    if (mask_in.size() != 0)
+      attn_mask_ = &mask_in;
+  }
 
   nntrainer::Tensor &cache_key =
     context.getTensor(tensor_idx[AttentionParams::cache_key]);
@@ -739,7 +784,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   }
 
   unsigned int step_size = to - from;
-  bool is_prefill = !from || step_size > 1;
+  // The DDTree masked verify forward processes multiple tree tokens in one step
+  // (step_size > 1) but, unlike the prompt prefill, needs the attention output
+  // of every token. It is uniquely identified by the additive verify mask. The
+  // skip_prefill optimization (used by gemma4's KV-shared layers to avoid the
+  // prompt prefill) must NOT fire here, or those layers would return stale
+  // attention outputs and corrupt the verify posterior.
+  const bool is_ddtree_verify = (attn_mask_ != nullptr);
+  bool is_prefill = (!from || step_size > 1) && !is_ddtree_verify;
   if (skip_prefill && is_prefill)
     return;
 
@@ -763,23 +815,42 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
-  // out_ stores the output of Q * K
+  // out_ stores the output of Q * K. With an additive mask the score
+  // grid must be the full non-causal (step_size * cache_to) layout so
+  // add_mask_and_softmax_full can index (query, key) directly.
+  const bool use_additive_mask = (attn_mask_ != nullptr);
   nntrainer::Tensor out_(
     1, 1,
-    is_causal ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
-              : (step_size * cache_to),
+    (is_causal && !use_additive_mask)
+      ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
+      : (step_size * cache_to),
     num_heads_Q, query_step.getTensorType());
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
+  // For the masked tree verify, compute_kcaches / compute_fp16vcache_transposed
+  // must use the full non-causal (step_size * cache_to) layout that out_ was
+  // allocated with and add_mask_and_softmax_full reads. They branch on
+  // is_causal, so temporarily force it false here (restored below).
+  const bool ddtree_saved_causal = is_causal;
+  if (use_additive_mask)
+    is_causal = false;
+
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
 
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  if (use_additive_mask) {
+    add_mask_and_softmax_full(out_, *attn_mask_, step_size, cache_to,
+                              num_heads_Q);
+  } else {
+    softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  }
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+
+  is_causal = ddtree_saved_causal;
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
@@ -1107,6 +1178,10 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   unsigned int half_ = dim / 2;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+  const float *rope_pos =
+    (tree_pos_ != nullptr && tree_pos_->size() >= in.height())
+      ? tree_pos_->getData<float>()
+      : nullptr;
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (freqs_fp32 == nullptr) {
@@ -1121,9 +1196,11 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
         for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &freqs_fp32->cos[from + h];
-            sin_ = &freqs_fp32->sin[from + h];
+          unsigned int pos_h =
+            rope_pos ? (unsigned int)(rope_pos[h] + 0.5f) : (from + h);
+          if (pos_h < max_timestep) {
+            cos_ = &freqs_fp32->cos[pos_h];
+            sin_ = &freqs_fp32->sin[pos_h];
           }
           float *in_ptr = in.getData<float>() +
                           b * in.channel() * in.height() * in.width() +
@@ -1172,9 +1249,11 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
         for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &freqs_fp16->cos[from + h];
-            sin_ = &freqs_fp16->sin[from + h];
+          unsigned int pos_h =
+            rope_pos ? (unsigned int)(rope_pos[h] + 0.5f) : (from + h);
+          if (pos_h < max_timestep) {
+            cos_ = &freqs_fp16->cos[pos_h];
+            sin_ = &freqs_fp16->sin[pos_h];
           }
           _FP16 *in_ptr = in.getData<_FP16>() +
                           b * in.channel() * in.height() * in.width() +
@@ -1189,6 +1268,81 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
         }
       }
     }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
+nntrainer::Tensor *MHACoreLayer::selectVerifyMask(nntrainer::Tensor *full,
+                                                  nntrainer::Tensor *sliding,
+                                                  size_t local_window_size) {
+  if (full == nullptr)
+    return nullptr;
+  const bool layer_is_sliding =
+    (sliding != nullptr) && (local_window_size != kNoSlidingWindow);
+  return layer_is_sliding ? sliding : full;
+}
+
+void MHACoreLayer::add_mask_and_softmax_full(nntrainer::Tensor &qk_out,
+                                             const nntrainer::Tensor &mask,
+                                             size_t step_size, unsigned int to,
+                                             size_t num_head) {
+  const unsigned int kv_len = mask.width();
+
+  if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *qk = qk_out.getData<float>();
+    const float *mrow = mask.getData<float>();
+
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, step_size, [=](size_t i) {
+      for (size_t h = 0; h < num_head; ++h) {
+        float maxv = -std::numeric_limits<float>::infinity();
+        for (unsigned int j = 0; j < to; ++j) {
+          float v = qk[(i * to + j) * num_head + h] + mrow[i * kv_len + j];
+          qk[(i * to + j) * num_head + h] = v;
+          if (v > maxv)
+            maxv = v;
+        }
+        float sum = 0.0f;
+        for (unsigned int j = 0; j < to; ++j) {
+          float e = std::exp(qk[(i * to + j) * num_head + h] - maxv);
+          qk[(i * to + j) * num_head + h] = e;
+          sum += e;
+        }
+        const float inv = 1.0f / sum;
+        for (unsigned int j = 0; j < to; ++j)
+          qk[(i * to + j) * num_head + h] *= inv;
+      }
+    });
+  } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *qk = qk_out.getData<_FP16>();
+    const _FP16 *mrow = mask.getData<_FP16>();
+
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, step_size, [=](size_t i) {
+      for (size_t h = 0; h < num_head; ++h) {
+        float maxv = -std::numeric_limits<float>::infinity();
+        for (unsigned int j = 0; j < to; ++j) {
+          float v = (float)qk[(i * to + j) * num_head + h] +
+                    (float)mrow[i * kv_len + j];
+          qk[(i * to + j) * num_head + h] = (_FP16)v;
+          if (v > maxv)
+            maxv = v;
+        }
+        float sum = 0.0f;
+        for (unsigned int j = 0; j < to; ++j) {
+          float e = std::exp((float)qk[(i * to + j) * num_head + h] - maxv);
+          qk[(i * to + j) * num_head + h] = (_FP16)e;
+          sum += e;
+        }
+        const float inv = 1.0f / sum;
+        for (unsigned int j = 0; j < to; ++j)
+          qk[(i * to + j) * num_head + h] =
+            (_FP16)((float)qk[(i * to + j) * num_head + h] * inv);
+      }
+    });
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
