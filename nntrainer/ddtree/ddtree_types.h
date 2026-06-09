@@ -19,8 +19,10 @@
 namespace nntrainer {
 namespace ddtree {
 
-/** Runtime configuration. budget = max tree nodes minus 1 ("32 tree" = budget
- * 31). */
+/**
+ * @brief Runtime configuration. budget = max tree nodes minus 1 ("32 tree" ==
+ * budget 31).
+ */
 struct DDTreeConfig {
   int budget = 31;    /**< heap expansion cap; "32 tree" == budget 31 */
   int depthLimit = 0; /**< draft horizon = block_size - 1 */
@@ -28,7 +30,9 @@ struct DDTreeConfig {
     0; /**< additive-mask -inf == finfo(dtype).min (fp32 or fp16 min) */
 };
 
-/** Output of buildTree (== build_ddtree_tree). currentLength = 1 + nodeCount.
+/**
+ * @brief Output of buildTree (== build_ddtree_tree). currentLength =
+ * 1 + nodeCount.
  */
 struct DDTreeStructure {
   std::vector<int32_t> nodeTokenIds; /**< [nodeCount] */
@@ -42,14 +46,18 @@ struct DDTreeStructure {
   int currentLength = 1;
 };
 
-/** Slice lengths returned by compile (== compile_ddtree_tree). */
+/**
+ * @brief Slice lengths returned by compile (== compile_ddtree_tree).
+ */
 struct CompiledTree {
   int pastLength = 0;
   int currentLength = 0;
 };
 
-/** Result of makeSlidingMasks. When hasSliding is false, use `full` for all
- * layers. */
+/**
+ * @brief Result of makeSlidingMasks. When hasSliding is false, use `full` for
+ * all layers.
+ */
 struct SlidingMasks {
   float *full = nullptr; /**< full-attention layers */
   float *sliding =
@@ -57,7 +65,9 @@ struct SlidingMasks {
   bool hasSliding = false; /**< true => select full vs sliding per layer type */
 };
 
-/** Result of followVerified (== follow_verified_tree). */
+/**
+ * @brief Result of followVerified (== follow_verified_tree).
+ */
 struct Accepted {
   std::vector<int32_t>
     indices;             /**< accepted node indices, indices[0]==0 (root) */

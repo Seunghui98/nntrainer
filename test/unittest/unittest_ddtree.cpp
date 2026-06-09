@@ -40,8 +40,7 @@ TEST(DDTreeBuild, EmptyBudgetReturnsRootOnly) {
   std::vector<float> logits(8, 0.0f); // depthLimit=2, vocab=4, unused here
   DDTreeConfig cfg;
   cfg.budget = 0;
-  DDTreeStructure t =
-    buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/4, cfg);
+  DDTreeStructure t = buildTree(logits.data(), 2, 4, cfg);
   EXPECT_EQ(t.nodeCount, 0);
   EXPECT_EQ(t.currentLength, 1);
   ASSERT_EQ(t.parents.size(), 1u);
@@ -56,8 +55,7 @@ TEST(DDTreeBuild, ZeroDepthReturnsRootOnly) {
   std::vector<float> logits(1, 0.0f);
   DDTreeConfig cfg;
   cfg.budget = 8;
-  DDTreeStructure t =
-    buildTree(logits.data(), /*depthLimit=*/0, /*vocab=*/4, cfg);
+  DDTreeStructure t = buildTree(logits.data(), 0, 4, cfg);
   EXPECT_EQ(t.currentLength, 1);
   EXPECT_EQ(t.visibility[0], 1u);
 }
@@ -76,8 +74,7 @@ TEST(DDTreeBuild, SmallTreeStructure) {
   DDTreeConfig cfg;
   cfg.budget = 3;
   auto logits = kSmallLogits();
-  DDTreeStructure t =
-    buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/3, cfg);
+  DDTreeStructure t = buildTree(logits.data(), 2, 3, cfg);
 
   // budget 3 -> 3 nodes, currentLength 4.
   EXPECT_EQ(t.nodeCount, 3);
@@ -109,8 +106,7 @@ TEST(DDTreeBuild, BudgetExceedsVocabTopkClamped) {
   cfg.budget = 100; // > vocab
   auto logits = kSmallLogits();
   // Must not read past topk = min(budget, vocab) = 3 columns; no crash.
-  DDTreeStructure t =
-    buildTree(logits.data(), /*depthLimit=*/2, /*vocab=*/3, cfg);
+  DDTreeStructure t = buildTree(logits.data(), 2, 3, cfg);
   EXPECT_GE(t.nodeCount, 1);
   EXPECT_LE(t.nodeCount, 100);
 }
@@ -168,11 +164,8 @@ TEST(DDTreeSliding, NoSlidingLayersPassthrough) {
   std::vector<int32_t> pos = {0, 1};
   std::vector<float> slide(4, -1.0f);
   DDTreeConfig cfg;
-  SlidingMasks m =
-    makeSlidingMasks(full.data(), pos.data(),
-                     /*currentLength=*/2, /*kvLength=*/2,
-                     /*slidingWindow=*/8,
-                     /*hasSlidingLayers=*/false, cfg, slide.data());
+  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), 2, 2, 8, false,
+                                    cfg, slide.data());
   EXPECT_FALSE(m.hasSliding);
   EXPECT_EQ(m.full, full.data());
 }
@@ -185,9 +178,7 @@ TEST(DDTreeSliding, WindowZeroFullEqualsSliding) {
   std::vector<float> slide(4, -1.0f);
   DDTreeConfig cfg;
   SlidingMasks m =
-    makeSlidingMasks(full.data(), pos.data(), 2, 2,
-                     /*slidingWindow=*/0,
-                     /*hasSlidingLayers=*/true, cfg, slide.data());
+    makeSlidingMasks(full.data(), pos.data(), 2, 2, 0, true, cfg, slide.data());
   EXPECT_TRUE(m.hasSliding);
   EXPECT_EQ(m.sliding, m.full);
 }
@@ -202,9 +193,8 @@ TEST(DDTreeSliding, PositiveWindowVisibility) {
   std::vector<float> slide(static_cast<size_t>(cur) * kv, 123.0f);
   DDTreeConfig cfg;
   cfg.maskFillValue = -1e30f;
-  SlidingMasks m =
-    makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
-                     /*hasSlidingLayers=*/true, cfg, slide.data());
+  SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
+                                    true, cfg, slide.data());
   ASSERT_TRUE(m.hasSliding);
   ASSERT_NE(m.sliding, m.full);
 
@@ -240,9 +230,8 @@ TEST(DDTreeSliding, VisibilityMatchesThresholdedMask) {
       for (int j = 0; j < cur; ++j)
         full[i * kv + past + j] = treeVis[i * cur + j] ? 0.0f : fill;
     std::vector<float> slide(static_cast<size_t>(cur) * kv, 0.0f);
-    SlidingMasks m =
-      makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
-                       /*hasSlidingLayers=*/true, cfg, slide.data());
+    SlidingMasks m = makeSlidingMasks(full.data(), pos.data(), cur, kv, window,
+                                      true, cfg, slide.data());
     ASSERT_TRUE(m.hasSliding);
 
     std::vector<uint8_t> vis01(static_cast<size_t>(cur) * kv, 9);
@@ -263,8 +252,7 @@ TEST(DDTreeSliding, VisibilityWindowUnrestrictedEqualsTree) {
   std::vector<uint8_t> treeVis = {1, 0, 1, 1};
   std::vector<int32_t> pos = {3, 4};
   std::vector<uint8_t> out(static_cast<size_t>(cur) * kv, 9);
-  makeSlidingVisibility(treeVis.data(), pos.data(), cur, kv, /*window=*/0,
-                        out.data());
+  makeSlidingVisibility(treeVis.data(), pos.data(), cur, kv, 0, out.data());
   EXPECT_EQ(out, (std::vector<uint8_t>{1, 1, 0, 1, 1, 1}));
 }
 

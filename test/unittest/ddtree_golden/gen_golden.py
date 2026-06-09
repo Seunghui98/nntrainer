@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""Dump DDTree golden vectors for buildTree parity tests.
-
-This is a faithful, dependency-free transcription of ``build_ddtree_tree`` from
-``/home/shsh1004/littlesd_inference/ddtree.py``. torch/numpy are unavailable on
-this machine (the reference venv targets a missing python3.10 and the system
-python has no numpy), so the two torch ops are replaced by exact stdlib
-equivalents:
-
-  * ``torch.topk``      -> sort by (logit desc, index asc)  [matches CPU topk]
-  * ``torch.logsumexp`` -> m + log(sum(exp(x - m)))
-
-Crucially, the best-first heap uses Python's native tuple ordering, exactly as
-``ddtree.py`` does via ``heapq`` on ``(-logw, ranks, parent, depth, rank, logw)``
--- so the tie-break semantics under test are reproduced verbatim. Inputs are
-chosen with well-separated logits so fp32-vs-fp64 rounding never flips an
-ordering (except where an exact tie is intended to exercise the tie-break).
-
-The authoritative end-to-end token parity lives in the gemma4 trace-replay test
-(plan Task 13); this file locks tree structure / visibility.
-"""
+# SPDX-License-Identifier: Apache-2.0
+##
+# @file   gen_golden.py
+# @date   05 June 2026
+# @brief  Dump DDTree golden vectors for the buildTree parity unit tests.
+# @author Seunghui Lee <shsh1004.lee@samsung.com>
+#
+# A faithful, dependency-free transcription of ``build_ddtree_tree`` from the
+# DDTree Python reference. It avoids torch/numpy so the golden vectors can be
+# regenerated in any environment, replacing the two torch ops with exact
+# standard-library equivalents:
+#
+#   * ``torch.topk``      -> sort by (logit desc, index asc)  [matches CPU topk]
+#   * ``torch.logsumexp`` -> m + log(sum(exp(x - m)))
+#
+# The best-first heap uses Python's native tuple ordering, exactly as the
+# reference does via ``heapq`` on ``(-logw, ranks, parent, depth, rank, logw)``
+# -- so the tie-break semantics under test are reproduced verbatim. Inputs use
+# well-separated logits so fp32-vs-fp64 rounding never flips an ordering (except
+# where an exact tie is intended to exercise the tie-break).
+#
+# This file locks tree structure / visibility; end-to-end token parity is
+# covered separately by the runtime trace-replay test.
 import heapq
 import json
 import math
