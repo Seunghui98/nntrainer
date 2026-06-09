@@ -133,6 +133,16 @@ public:
 
 protected:
   void allocateAndBindKVCache() override;
+
+  bool ddtreeHasSlidingLayers() const override {
+    for (const auto &t : layer_types)
+      if (t == "sliding_attention")
+        return true;
+    return false;
+  }
+  int ddtreeSlidingWindow() const override {
+    return static_cast<int>(SLIDING_WINDOW);
+  }
 };
 } // namespace causallm
 
