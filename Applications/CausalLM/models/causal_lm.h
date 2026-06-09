@@ -125,6 +125,22 @@ protected:
    */
   void registerCustomLayers() override;
 
+  /**
+   * @brief Run the DDTree tree speculative-decode loop (enabled by the
+   *        "ddtree" config flag): prefill -> [self-draft horizon rollout ->
+   *        buildTree/compile -> masked verify forward -> argmax posterior ->
+   *        followVerified -> KV-cache tail compaction -> commit accepted path]
+   *        until num_to_generate tokens or EOS. Generated tokens are emitted
+   *        through registerOutputs(), exactly like the autoregressive path.
+   * @param prompt input prompt
+   * @param log_output stream decoded tokens to stdout while generating
+   */
+  void runDDTree(const WSTR &prompt, bool log_output);
+
+  /** DDTree sliding-window support. Base = full-attention only (e.g. Qwen3). */
+  virtual bool ddtreeHasSlidingLayers() const { return false; }
+  virtual int ddtreeSlidingWindow() const { return 0; }
+
   /** internal buffer */
   std::vector<std::string>
     output_list;             /**< List of output names for the model */
@@ -147,6 +163,7 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   bool SKIP_PREFILL;
+  bool DDTREE_ENABLE; /**< Run the DDTree speculative-decode loop in run() */
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */

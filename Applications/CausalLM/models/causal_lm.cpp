@@ -29,15 +29,20 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <utility>
 #include <vector>
 
 #include <common.h>
+#include <ddtree.h>
+#include <ddtree_sliding.h>
+#include <ddtree_types.h>
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
+#include <tie_word_embedding.h>
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
@@ -69,6 +74,9 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
                    ? nntr_cfg["skip_prefill"].get<bool>()
                    : false;
+
+  DDTREE_ENABLE =
+    nntr_cfg.contains("ddtree") ? nntr_cfg["ddtree"].get<bool>() : false;
 
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
@@ -334,6 +342,219 @@ void CausalLM::registerCustomLayers() {
   }
 }
 
+void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
+  // DDTree self-draft tree speculative decode:
+  // prefill -> [self-draft horizon rollout -> buildTree/compile -> masked
+  // verify forward -> argmax posterior -> followVerified ->
+  // KVCacheManager::compactTail -> commit accepted path] until num_to_generate
+  // tokens or EOS. Greedy (argmax); lossless vs the autoregressive greedy path
+  // modulo genuine near-ties.
+  const int HORIZON = 15;
+  const int BUDGET = 31;
+  // Honor the res-dir config's num_to_generate so a longer generation (more
+  // DDTree blocks) can be requested without recompiling; fall back to 64.
+  const unsigned int MAX_NEW =
+    NUM_TO_GENERATE > 0 ? (unsigned int)NUM_TO_GENERATE : 64u;
+  allocateAndBindKVCache();
+
+  // reset decode output state for this run
+  output_list.assign(BATCH_SIZE, "");
+  pending_ids_.clear();
+  std::vector<bool> eos_list(BATCH_SIZE, false);
+
+  auto _input = tokenizer->Encode(prompt);
+  const unsigned int init_len = static_cast<unsigned int>(_input.size());
+  float *input_sample =
+    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+
+  auto build_inputs = [&]() {
+    std::vector<std::pair<std::string, float *>> ci;
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      ci.emplace_back(
+        "cache_k_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+      ci.emplace_back(
+        "cache_v_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+    }
+    std::sort(ci.begin(), ci.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::vector<float *> in;
+    in.push_back(input_sample);
+    for (const auto &c : ci)
+      in.push_back(c.second);
+    return in;
+  };
+  std::vector<float *> label;
+  std::vector<float *> input = build_inputs();
+
+  std::vector<int> tokens(_input.begin(), _input.end());
+
+  // ---- prefill ----
+  for (unsigned int i = 0; i < init_len; ++i)
+    input_sample[i] = static_cast<float>(_input[i]);
+
+  unsigned int pos; // tokens[pos] == current block root
+  setKVCachePosition(0);
+  if (SKIP_PREFILL && init_len > 1) {
+    // Prefill only the first init_len-1 tokens; the last prompt token becomes
+    // the root of the first DDTree block (matches the greedy SKIP_PREFILL path
+    // required by gemma4's KV-shared layers). Do NOT sample a prefill argmax.
+    auto o = model->incremental_inference(BATCH_SIZE, input, label,
+                                          init_len - 1, 0, init_len - 1, false);
+    for (auto p : o)
+      delete[] p;
+    pos =
+      init_len - 1; // tokens[pos] == last prompt token (already in `tokens`)
+  } else {
+    auto o = model->incremental_inference(BATCH_SIZE, input, label, init_len, 0,
+                                          init_len);
+    tokens.push_back(
+      (int)std::distance(o[0], std::max_element(o[0], o[0] + NUM_VOCAB)));
+    for (auto p : o)
+      delete[] p;
+    pos = init_len; // tokens[pos] == current block root
+  }
+
+  nntrainer::ddtree::DDTreeConfig cfg;
+  cfg.budget = BUDGET;
+  cfg.depthLimit = HORIZON;
+  cfg.maskFillValue = std::numeric_limits<float>::lowest();
+
+  unsigned int generated = 0;
+  unsigned int blocks = 0;
+  bool stop = false;
+
+  auto is_eos = [&](int t) {
+    return std::find(EOS_TOKEN_ID.begin(), EOS_TOKEN_ID.end(),
+                     (unsigned int)t) != EOS_TOKEN_ID.end();
+  };
+
+  while (generated < MAX_NEW && !stop &&
+         pos + 1 + (unsigned)HORIZON + 64 < MAX_SEQ_LEN) {
+    const unsigned int root = (unsigned int)tokens[pos];
+
+    // ---- self-draft: greedy HORIZON rollout from cache [0,pos) ----
+    setKVCachePosition(pos);
+    std::vector<float> draft((size_t)HORIZON * NUM_VOCAB);
+    unsigned int cur = root;
+    for (int d = 0; d < HORIZON; ++d) {
+      input_sample[0] = static_cast<float>(cur);
+      auto o = model->incremental_inference(BATCH_SIZE, input, label, 1,
+                                            pos + d, pos + d + 1);
+      std::copy(o[0], o[0] + NUM_VOCAB, &draft[(size_t)d * NUM_VOCAB]);
+      cur = (unsigned int)std::distance(
+        o[0], std::max_element(o[0], o[0] + NUM_VOCAB));
+      for (auto p : o)
+        delete[] p;
+    }
+
+    // ---- build + compile the tree ----
+    nntrainer::ddtree::DDTreeStructure tree =
+      nntrainer::ddtree::buildTree(draft.data(), HORIZON, (int)NUM_VOCAB, cfg);
+    const int cl = tree.currentLength;
+    const int past = (int)pos;
+    const int stride = past + cl;
+    std::vector<int32_t> vii(cl), vpi(cl);
+    std::vector<float> cmask((size_t)cl * stride);
+    nntrainer::ddtree::compile((int32_t)root, past, past, tree, cfg, vii.data(),
+                               vpi.data(), cmask.data(), stride);
+
+    // ---- sliding-window variant for gemma-style models (no-op for Qwen3) ----
+    // makeSlidingMasks is the single source of truth: when sliding_window<=0 it
+    // returns sliding==full (pointing back into cmask) rather than a distinct
+    // buffer, so we honor sliding_masks.hasSliding / .sliding instead of
+    // assuming smask always holds the sliding variant.
+    std::vector<float> smask;
+    const bool has_sliding = ddtreeHasSlidingLayers();
+    const int sliding_window = ddtreeSlidingWindow();
+    nntrainer::ddtree::SlidingMasks sliding_masks;
+    if (has_sliding) {
+      smask.resize((size_t)cl * stride);
+      sliding_masks = nntrainer::ddtree::makeSlidingMasks(
+        cmask.data(), vpi.data(), cl, stride, sliding_window,
+        true, // hasSlidingLayers
+        cfg, smask.data());
+    }
+
+    // ---- masked verify forward -> node logits ----
+    for (int i = 0; i < cl; ++i)
+      input_sample[i] = static_cast<float>(vii[i]);
+    nntrainer::Tensor maskT(1, 1, (unsigned int)cl, (unsigned int)stride);
+    std::copy(cmask.begin(), cmask.end(), maskT.getData<float>());
+    nntrainer::Tensor posT(1, 1, 1, (unsigned int)cl);
+    for (int i = 0; i < cl; ++i)
+      posT.getData<float>()[i] = static_cast<float>(vpi[i]);
+    std::vector<float> node_logits((size_t)cl * NUM_VOCAB);
+
+    nntrainer::Tensor slidingT;
+    if (sliding_masks.hasSliding) {
+      // sliding_masks.sliding may alias cmask (window<=0) or point at smask
+      // (finite window); copy from whichever the core returned.
+      slidingT =
+        nntrainer::Tensor(1, 1, (unsigned int)cl, (unsigned int)stride);
+      std::copy(sliding_masks.sliding,
+                sliding_masks.sliding + (size_t)cl * stride,
+                slidingT.getData<float>());
+    }
+    causallm::MHACoreLayer::setGlobalDDTreeVerify(
+      &maskT, sliding_masks.hasSliding ? &slidingT : nullptr, &posT);
+    causallm::TieWordEmbedding::setGlobalVerifyDump(node_logits.data());
+    setKVCachePosition(pos);
+    {
+      auto v = model->incremental_inference(
+        BATCH_SIZE, input, label, (unsigned)cl, pos, pos + (unsigned)cl);
+      for (auto p : v)
+        delete[] p;
+    }
+    causallm::MHACoreLayer::setGlobalDDTreeVerify(nullptr, nullptr, nullptr);
+    causallm::TieWordEmbedding::setGlobalVerifyDump(nullptr);
+
+    // ---- posterior (argmax per node) + accepted path ----
+    std::vector<int32_t> posterior(cl);
+    for (int i = 0; i < cl; ++i) {
+      float *r = &node_logits[(size_t)i * NUM_VOCAB];
+      posterior[i] =
+        (int32_t)std::distance(r, std::max_element(r, r + NUM_VOCAB));
+    }
+
+    nntrainer::ddtree::Accepted acc =
+      nntrainer::ddtree::followVerified(tree.childMaps, posterior.data());
+    const int alen = (int)acc.indices.size();
+
+    // ---- compact KV tail to the accepted path ----
+    kv_cache.setPosition(pos + (unsigned)cl);
+    kv_cache.compactTail(pos, acc.indices); // sets position = pos + alen
+
+    // ---- commit tokens: accepted[1..] then bonus next token ----
+    for (int k = 1; k < alen; ++k)
+      tokens.push_back(vii[acc.indices[k]]);
+    tokens.push_back(acc.nextToken);
+
+    for (int k = 1; k < alen; ++k)
+      if (is_eos(vii[acc.indices[k]]))
+        stop = true;
+    if (is_eos(acc.nextToken))
+      stop = true;
+
+    pos += (unsigned int)alen;
+    generated += (unsigned int)alen;
+    ++blocks;
+  }
+
+  // Emit the generated tokens (tokens[init_len:]) through the normal output
+  // path so they accumulate in output_list and stream to stdout, exactly like
+  // the autoregressive generation loop.
+  for (unsigned int i = init_len; i < tokens.size(); ++i)
+    registerOutputs(tokenizer, {static_cast<unsigned int>(tokens[i])}, i,
+                    eos_list, log_output);
+
+  free(input_sample);
+  if (log_output)
+    std::cout << "\n[DDTree] generated " << (tokens.size() - init_len)
+              << " tokens in " << blocks << " blocks\n";
+}
+
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
@@ -341,6 +562,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
+  }
+
+  // DDTree tree speculative decoding: enabled by the "ddtree" config flag.
+  if (DDTREE_ENABLE) {
+    runDDTree(prompt, log_output);
+    return;
   }
 
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
@@ -574,6 +801,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
+  // Optional authoritative greedy token-id capture (env NNTR_GREEDY_IDS):
+  // record each step's batch-0 argmax id so a DDTree run can be compared
+  // token-for-token (not just via reconstructed stdout text). Dormant unless
+  // the env var is set.
+  std::vector<unsigned int> greedy_ids_dump;
+  const bool dump_greedy_ids = std::getenv("NNTR_GREEDY_IDS") != nullptr;
+
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
        ++token_generation_idx) {
@@ -584,6 +818,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+
+    if (dump_greedy_ids)
+      greedy_ids_dump.push_back(ids_list[0]);
 
     // Feed the newly generated token back as the next input token.
     // token_generation_idx always starts at input_len + 1, so we are
@@ -625,6 +862,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // Always release the input buffer after the generation loop, whether
   // the loop exited early (EOS found) or ran to the maximum token limit.
   free(input_sample);
+
+  if (dump_greedy_ids) {
+    std::ofstream gf(std::getenv("NNTR_GREEDY_IDS"));
+    gf << "{\"gen_ids\":[";
+    for (size_t i = 0; i < greedy_ids_dump.size(); ++i)
+      gf << (i ? "," : "") << greedy_ids_dump[i];
+    gf << "]}\n";
+    gf.close();
+    std::cout << "[GREEDY] dumped " << greedy_ids_dump.size()
+              << " greedy token ids -> " << std::getenv("NNTR_GREEDY_IDS")
+              << "\n";
+  }
 
   global_token_len += (generation_cnt + init_len);
 
