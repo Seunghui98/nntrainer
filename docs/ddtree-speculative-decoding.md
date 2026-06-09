@@ -81,9 +81,9 @@ extends, while the budget bounds how many nodes are spent across that depth.
 
 | Component | Owner | Responsibility |
 |---|---|---|
-| Tree core (CPU) | nntrainer `ddtree::` | `buildTree`, `compile`, `makeSlidingMasks`, `followVerified`, `compactTail` — invoked, not reimplemented |
+| Tree core (CPU) | nntrainer `ddtree::` | `buildTree`, `compile`, `makeSlidingVisibility` (0/1) / `makeSlidingMasks` (fp32), `followVerified`, `compactTail` — invoked, not reimplemented |
 | Forward passes (NPU) | Quick.AI QNN graphs | Draft forward and verify forward |
-| Mask conversion (CPU) | Quick.AI | Translate `visibility` (0/1) and sliding masks (fp32) to the QNN `uint16` format |
+| Mask conversion (CPU) | Quick.AI | Translate the 0/1 `visibility` (full) and `makeSlidingVisibility` (sliding) bitmaps to the QNN `uint16` format |
 
 Design principles:
 
@@ -199,7 +199,28 @@ SlidingMasks makeSlidingMasks(float *attentionMask, const int32_t *verifyPositio
     out-of-window keys masked; `out.sliding` points to it.
 - Visibility rule: `visible = (k <= q) && (k > q - window)`, where `k` and `q`
   are key and query positions.
-- Quick.AI thresholds this fp32 result into `uint16` (see §9).
+- This output is an **fp32 additive** mask whose hidden value is
+  `cfg.maskFillValue`. A `uint16`/gating consumer must therefore set
+  `cfg.maskFillValue` to a non-zero sentinel before calling, then threshold the
+  result. For QNN, prefer `makeSlidingVisibility` (§5.3.1), which avoids both.
+
+### 5.3.1 `makeSlidingVisibility` — sliding as a 0/1 bitmap (recommended for QNN)
+
+```cpp
+void makeSlidingVisibility(const uint8_t *treeVisibility,
+                           const int32_t *verifyPositionIds, int currentLength,
+                           int kvLength, int slidingWindow, uint8_t *outVisible);
+```
+
+- **When** — instead of `makeSlidingMasks` when the consumer builds its own
+  integer/gating mask (e.g. QNN `uint16`).
+- **What** — emits the sliding visibility directly as a `[currentLength, kvLength]`
+  **0/1** bitmap (`out[i][j] = treeVisible(i,j) AND windowVisible(i,j)`), so the
+  full mask (`tree.visibility`) and the sliding mask are produced in the same 0/1
+  form. No fp32 additive round-trip and **no `cfg.maskFillValue` dependence**.
+- Takes `tree.visibility` (from `buildTree`) and `verifyPositionIds` (from
+  `compile`) as inputs; equivalent to thresholding `makeSlidingMasks`'s sliding
+  output (validated by `unittest_ddtree`, `DDTreeSliding.VisibilityMatchesThresholdedMask`).
 
 ### 5.4 `followVerified` — select the accepted path (STEP 6)
 
@@ -410,16 +431,24 @@ for (int i = 0; i < cur; ++i) {
 }
 ```
 
-### Sliding mask — thresholded from `makeSlidingMasks`
+### Sliding mask — derived from `makeSlidingVisibility` (recommended)
+
+Uses the 0/1 helper, so the sliding mask is built exactly like the full mask —
+no fp32 additive round-trip and no `cfg.maskFillValue` dependence:
 
 ```cpp
-// After compile() has produced the fp32 full mask:
-auto sm = ddtree::makeSlidingMasks(fullFp32, verifyPos, cur, past + cur,
-                                   slidingWindow, hasSliding, cfg, slidingBuf);
-if (sm.hasSliding)
-  for (int idx = 0; idx < cur * (past + cur); ++idx)
-    sliding_attention_mask[idx] = (sm.sliding[idx] == 0.0f) ? 65535 : 0;
+std::vector<uint8_t> svis((size_t)cur * (past + cur));
+ddtree::makeSlidingVisibility(tree.visibility.data(), verifyPos, cur, past + cur,
+                              slidingWindow, /*out*/ svis.data());
+for (int idx = 0; idx < cur * (past + cur); ++idx)
+  sliding_attention_mask[idx] = svis[idx] ? 65535 : 0;
 ```
+
+> Alternative (fp32 path): `makeSlidingMasks` returns an fp32 additive mask;
+> thresholding it requires a **non-zero** `cfg.maskFillValue` (the default `0`
+> makes hidden and visible indistinguishable) and a contiguous
+> `[currentLength, kvLength]` mask (`attnMaskRowStride == past + cur`). Prefer
+> `makeSlidingVisibility` to avoid both pitfalls.
 
 ### Position IDs
 
@@ -516,13 +545,14 @@ while (generating) {
   compile(root_token, /*start*/ kv_len, past, tree, cfg,
           vids.data(), vpos.data(), fmask.data(), past + cur);
 
-  // STEP 4: mask conversion (CPU, Quick.AI)
+  // STEP 4: mask conversion (CPU, Quick.AI) — full + sliding both from 0/1 visibility
   fill_tree_mask_uint16(tree.visibility, past, cur, /*out*/ verification_attention_mask);
   if (has_sliding) {
-    std::vector<float> sbuf((size_t)cur * (past + cur));
-    auto sm = makeSlidingMasks(fmask.data(), vpos.data(), cur, past + cur,
-                               sliding_window, true, cfg, sbuf.data());
-    threshold_to_uint16(sm.sliding, /*out*/ sliding_attention_mask);
+    std::vector<uint8_t> svis((size_t)cur * (past + cur));
+    makeSlidingVisibility(tree.visibility.data(), vpos.data(), cur, past + cur,
+                          sliding_window, /*out*/ svis.data());
+    for (int idx = 0; idx < cur * (past + cur); ++idx)
+      sliding_attention_mask[idx] = svis[idx] ? 65535 : 0;
   }
   fill_positions(vpos, /*out*/ verification_position_ids);
 
