@@ -34,6 +34,11 @@ namespace causallm {
  */
 WIN_EXPORT class LmHeadLayer : public nntrainer::LayerImpl {
 public:
+  /** DDTree verify: when set, incremental_forwarding also writes ALL
+   *  positions' logits [height, unit] into this external buffer (one-shot).
+   *  Graph output tensor stays height=1 so the base path is unchanged. */
+  void setVerifyDump(float *buf) { verify_dump_ = buf; }
+
   /**
    * @brief     Constructor of Embedding Layer
    */
@@ -122,6 +127,7 @@ public:
 private:
   std::tuple<nntrainer::props::Unit> lmhead_props;
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
+  float *verify_dump_ = nullptr; /**< DDTree verify all-position dump */
   bool skip_prefill = false;
 };
 } // namespace causallm
