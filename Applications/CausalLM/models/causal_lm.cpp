@@ -364,6 +364,10 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
   pending_ids_.clear();
   std::vector<bool> eos_list(BATCH_SIZE, false);
 
+  // echo the (already templated) input prompt, like the autoregressive run().
+  if (log_output)
+    std::cout << prompt << std::endl;
+
   auto _input = tokenizer->Encode(prompt);
   const unsigned int init_len = static_cast<unsigned int>(_input.size());
   float *input_sample =
@@ -429,7 +433,8 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
 #ifdef ENABLE_FP16
   // fp16 attention: use the fp16 lowest (finite) so the additive verify mask
   // never overflows to -inf/NaN in fp16 score arithmetic. Any sufficiently
-  // negative value fully masks (softmax -> 0), so this stays lossless vs greedy.
+  // negative value fully masks (softmax -> 0), so this stays lossless vs
+  // greedy.
   cfg.maskFillValue = -65504.0f;
 #else
   cfg.maskFillValue = std::numeric_limits<float>::lowest();
@@ -543,21 +548,29 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
     kv_cache.setPosition(pos + (unsigned)cl);
     kv_cache.compactTail(pos, acc.indices); // sets position = pos + alen
 
-    // ---- commit tokens: accepted[1..] then bonus next token ----
-    for (int k = 1; k < alen; ++k)
-      tokens.push_back(vii[acc.indices[k]]);
-    tokens.push_back(acc.nextToken);
-
-    for (int k = 1; k < alen; ++k)
-      if (is_eos(vii[acc.indices[k]]))
+    // ---- commit tokens: accepted[1..] then bonus next token, truncating at
+    // the first EOS so the emitted sequence matches autoregressive greedy ----
+    int committed = 0;
+    for (int k = 1; k < alen; ++k) {
+      const int tok = vii[acc.indices[k]];
+      tokens.push_back(tok);
+      ++committed;
+      if (is_eos(tok)) {
         stop = true;
-    if (is_eos(acc.nextToken))
-      stop = true;
+        break;
+      }
+    }
+    if (!stop) {
+      tokens.push_back(acc.nextToken);
+      ++committed;
+      if (is_eos(acc.nextToken))
+        stop = true;
+    }
 
     pos += (unsigned int)alen;
-    generated += (unsigned int)alen;
+    generated += (unsigned int)committed;
     ++blocks;
-    accept_lengths.push_back(alen);
+    accept_lengths.push_back(committed);
   }
 
   auto finish_generation = std::chrono::high_resolution_clock::now();
@@ -614,9 +627,9 @@ void CausalLM::runDDTree(const WSTR &prompt, bool log_output) {
               << decode_duration.count() << " ms, " << decode_tps << " TPS\n";
     std::cout << "blocks: " << blocks << ", mean tokens/block: " << mean_block
               << ", max: " << max_block << "\n";
-    std::cout << "forwards: " << draft_forwards << " draft + " << verify_forwards
-              << " verify = " << total_forwards << " (" << fwd_per_token
-              << " fwd/token)\n";
+    std::cout << "forwards: " << draft_forwards << " draft + "
+              << verify_forwards << " verify = " << total_forwards << " ("
+              << fwd_per_token << " fwd/token)\n";
     std::cout << "total: " << total_duration.count() << " ms\n";
     std::cout << "peak memory: " << peak_memory << " KB\n";
     std::cout << "==========================================================\n";
