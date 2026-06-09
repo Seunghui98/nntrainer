@@ -1318,15 +1318,23 @@ void MHACoreLayer::add_mask_and_softmax_full(nntrainer::Tensor &qk_out,
   } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     _FP16 *qk = qk_out.getData<_FP16>();
-    const _FP16 *mrow = mask.getData<_FP16>();
+    // The additive verify mask is allocated FP32 (causal_lm.cpp builds it via
+    // getData<float>()), so read it by its own dtype. Reading an FP32 mask as
+    // _FP16 reinterprets each 4-byte float as two 2-byte halfs -> garbage mask
+    // -> wrong tree-verify logits (this broke DDTree on the Android fp16 path).
+    const bool mask_fp16 =
+      mask.getDataType() == ml::train::TensorDim::DataType::FP16;
+    const float *mrow_f = mask_fp16 ? nullptr : mask.getData<float>();
+    const _FP16 *mrow_h = mask_fp16 ? mask.getData<_FP16>() : nullptr;
 
     auto &tm = nntrainer::ThreadManager::Global();
     tm.parallel_for(0, step_size, [=](size_t i) {
       for (size_t h = 0; h < num_head; ++h) {
         float maxv = -std::numeric_limits<float>::infinity();
         for (unsigned int j = 0; j < to; ++j) {
-          float v = (float)qk[(i * to + j) * num_head + h] +
-                    (float)mrow[i * kv_len + j];
+          const float m =
+            mask_fp16 ? (float)mrow_h[i * kv_len + j] : mrow_f[i * kv_len + j];
+          float v = (float)qk[(i * to + j) * num_head + h] + m;
           qk[(i * to + j) * num_head + h] = (_FP16)v;
           if (v > maxv)
             maxv = v;
