@@ -121,15 +121,15 @@ foreach target: test_target
   )
 endforeach
 
-# DDTree core tests need a compile-time path to the Python golden vectors,
-# so this target is defined standalone (the shared loop above can't set
-# per-target cpp_args).
-ddtree_golden_dir = meson.current_source_dir() / 'ddtree_golden'
+# DDTree core tests embed the golden vectors (ddtree_golden/build_golden.h), so
+# this target is defined standalone to add that directory to its include path
+# (the shared loop above can't set per-target include dirs). Embedding avoids a
+# build-time data-file path that would not resolve when a cross-compiled binary
+# runs on a separate test runner.
 unittest_ddtree_exe = executable(
   'unittest_ddtree',
   'unittest_ddtree.cpp',
-  include_directories: include_directories('models'),
-  cpp_args: '-DDDTREE_GOLDEN_DIR="' + ddtree_golden_dir + '"',
+  include_directories: include_directories('models', 'ddtree_golden'),
   dependencies: unittest_nntrainer_deps,
   install: get_option('enable-test'),
   install_dir: application_install_dir
