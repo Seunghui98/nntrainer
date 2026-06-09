@@ -127,8 +127,13 @@ if __name__ == "__main__":
     cases.append(dump_build("small", [[2.0, 1.0, 0.0], [0.0, -1.0, 1.0]], 3))
     # equal logits force exact-tie heap entries -> exercises tie-break order.
     cases.append(dump_build("tie", [[1.0, 1.0, 0.0], [0.5, 0.5, 0.5]], 4))
+    # budget > vocab clamps topk to vocab. The logits are widely separated so
+    # every heap-ordering decision has a large margin (~0.4): log-sum-exp is
+    # computed in double then stored fp32 (parity spec), so a near-tie here
+    # could let x86/ARM64 libm rounding flip the fp32 logZ and reorder nodes,
+    # breaking the bit-exact golden comparison cross-architecture.
     cases.append(
-        dump_build("budget_gt_vocab", [[2.0, 1.0, 0.0], [0.0, -1.0, 1.0]], 100))
+        dump_build("budget_gt_vocab", [[8.0, 5.0, 2.0], [6.0, 5.0, 4.0]], 100))
     cases.append(
         dump_build("full_fill",
                    [[3.0, 2.0, 1.0, 0.0], [3.0, 2.0, 1.0, 0.0],
