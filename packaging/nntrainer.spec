@@ -608,6 +608,11 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/nntr_ggml_impl.h
 %{_includedir}/nntrainer/nntr_ggml_impl_common.h
 %{_includedir}/nntrainer/nntr_ggml_impl_utils.h
+%{_includedir}/nntrainer/ddtree_types.h
+%{_includedir}/nntrainer/ddtree.h
+%{_includedir}/nntrainer/ddtree_sliding.h
+%{_includedir}/nntrainer/ddtree_compact.h
+%{_includedir}/nntrainer/ddtree_sampling.h
 %{_includedir}/nntrainer/thread_manager.h
 %{_includedir}/nntrainer/thread_manager_util.h
 %{_includedir}/nntrainer/safetensors_util.h
