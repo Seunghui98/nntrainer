@@ -100,3 +100,9 @@
 /usr/include/nntrainer/nntr_ggml_impl.h
 /usr/include/nntrainer/nntr_ggml_impl_common.h
 /usr/include/nntrainer/nntr_ggml_impl_utils.h
+# ddtree (tree speculative decoding) core
+/usr/include/nntrainer/ddtree_types.h
+/usr/include/nntrainer/ddtree.h
+/usr/include/nntrainer/ddtree_sliding.h
+/usr/include/nntrainer/ddtree_compact.h
+/usr/include/nntrainer/ddtree_sampling.h
