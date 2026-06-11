@@ -2,151 +2,242 @@
 SPDX-License-Identifier: Apache-2.0
 Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
 
-@file weights_converter.py
-@date 08 May 2025
-@this script is tested on transformers 4.53.2
-@brief gpt-oss-20b
+@file weight_converter.py
+@brief gpt-oss-20b weight conversion script
 @author Eunju Yang <ej.yang@samsung.com>
-
-
-@note
-
-- weight(FP32/FP16) should be transposed
-- vector should not be transposed
-
--expected save order
-   * embed_tokens.weight
-   * model.layers
-       model.layers.0
-               model.layers.0.input_layernorm.weight
-               model.layers.0.self_attn
-                   model.layers.0.self_attn.q_proj (bias = true)
-                   model.layers.0.self_attn.k_proj (bias = true)
-                   model.layers.0.self_attn.v_proj (bias = true)
-                   model.layers.0.self_attn.sinks
-                   model.layers.0.self_attn.o_proj (bias = true)
-               model.layers.0.experts
-                   model.layers.0.mlp.experts.router (bias = true)
-                   model.layers.0.mlp.experts.0 (enforce to split)
-                       model.layers.0.mlp.experts.0.up_proj (split from gate_up_proj) (bias = true)
-                       model.layers.0.mlp.experts.0.gate_proj (split from gate_up_proj) (bias = true)
-                       model.layers.0.mlp.experts.0.down_proj (bias = true)
 """
 
-import torch
+import argparse
+import json
+import struct
+
 import numpy as np
+import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
-total_size = 0
-def save_gpt_oss_for_nntrainer(params, config, dtype, file):  
-    """Convert and save weights as nntrainer format for multi-head attention model"""  
 
+SAFETENSORS_DTYPE_MAP = {
+    "float32": "F32",
+}
+
+
+def tensor_to_numpy(tensor, dtype, transpose=False):
+    if transpose:
+        tensor = tensor.permute(1, 0)
+    if isinstance(tensor, torch.Tensor):
+        tensor = tensor.detach().cpu().float()
+    return np.ascontiguousarray(np.array(tensor, dtype=dtype))
+
+
+def get_safetensors_output_name(output_name):
+    if output_name.endswith(".bin"):
+        return output_name[:-4] + ".safetensors"
+    if output_name.endswith(".safetensors"):
+        return output_name
+    return output_name + ".safetensors"
+
+
+def save_gpt_oss_for_nntrainer(params, config, dtype, file):
+    """Convert and save weights as nntrainer binary format for GPT-OSS."""
     n_layers = config.num_hidden_layers
     n_experts = config.num_local_experts
 
-    print(dtype)
-      
     def save_weight(weight_name, is_transpose=False):
-        
-        if is_transpose:
-            print(weight_name, params[weight_name].permute(1,0).shape, params[weight_name].permute(1,0).flatten()[:3], params[weight_name].permute(1,0).flatten()[-3:])
-            np.array(params[weight_name].permute(1,0).float(), dtype=dtype).tofile(file)  
-        else:
-            print(weight_name, params[weight_name].shape, params[weight_name].flatten()[:3], params[weight_name].flatten()[-3:])
-            np.array(params[weight_name].float(), dtype=dtype).tofile(file)  
+        arr = tensor_to_numpy(params[weight_name], dtype, transpose=is_transpose)
+        arr.tofile(file)
 
-    def save_projection(layer_name, proj_name):  
-        """Helper function to handle base/lora weight saving"""  
-        lora_key = f"{layer_name}{proj_name}.lora_A.default.weight"  
-        if lora_key in params:  
+    def save_projection(layer_name, proj_name):
+        lora_a = f"{layer_name}{proj_name}.lora_A.default.weight"
+        if lora_a in params:
             save_weight(f"{layer_name}{proj_name}.base_layer.weight", True)
             save_weight(f"{layer_name}{proj_name}.lora_A.default.weight", True)
-            save_weight(f"{layer_name}{proj_name}.lora_B.default.weight", True)  
-        else:  
-            save_weight(f"{layer_name}{proj_name}.weight", True)  
+            save_weight(f"{layer_name}{proj_name}.lora_B.default.weight", True)
+        else:
+            save_weight(f"{layer_name}{proj_name}.weight", True)
 
-    def save_attention(layer_name):  
-        """Save attention layer weights"""  
-          
-        # Save Q/K/V projections using helper  
-        for proj in ["q_proj", "k_proj", "v_proj"]:  
-            # save projection weight
-            save_projection(layer_name, f"self_attn.{proj}")  
-            # save projection bias
+    def save_attention(layer_name):
+        for proj in ["q_proj", "k_proj", "v_proj"]:
+            save_projection(layer_name, f"self_attn.{proj}")
             save_weight(f"{layer_name}self_attn.{proj}.bias")
-        
-        # save attention sink
+
         save_weight(f"{layer_name}self_attn.sinks")
-        
-        # Save O_proj projections using helper  
-        for proj in ["o_proj"]:
-            # save projection weight
-            save_projection(layer_name, f"self_attn.{proj}")  
-            # save projection bias
-            save_weight(f"{layer_name}self_attn.{proj}.bias")
-        
-    def save_feed_forward(layer_name):  
-        """Save feed forward layer weights"""  
-        
-        save_weight(f"{layer_name}mlp.router.weight", True)  
-        save_weight(f"{layer_name}mlp.router.bias")  
-          
-        # Save MoE projections using helper  
-        for num_expert in range(n_experts):
-            # save up_proj (weight should not be transposed)
-            up_proj_weight = params[f"{layer_name}mlp.experts.gate_up_proj"][...,1::2][num_expert]
-            up_proj_bias = params[f"{layer_name}mlp.experts.gate_up_proj_bias"][...,1::2][num_expert]
-            print(f"{layer_name}mlp.experts.gate_up_proj.up", up_proj_weight.shape, up_proj_weight[0,:3], up_proj_weight[-1,-3:])
-            print(f"{layer_name}mlp.experts.gate_up_proj.up_bias", up_proj_bias.shape, up_proj_bias[:3], up_proj_bias[-3:])
-            np.array(up_proj_weight.float(), dtype=dtype).tofile(file)  
-            np.array(up_proj_bias.float(), dtype=dtype).tofile(file)
-            
-            # save gate_proj
-            gate_proj_weight = params[f"{layer_name}mlp.experts.gate_up_proj"][...,::2][num_expert]
-            gate_proj_bias = params[f"{layer_name}mlp.experts.gate_up_proj_bias"][...,::2][num_expert]
-            print(f"{layer_name}mlp.experts.gate_up.gate_proj", gate_proj_weight.shape, gate_proj_weight[0,:3], gate_proj_weight[-1,-3:])
-            print(f"{layer_name}mlp.experts.gate_up_proj.gate_bias", gate_proj_bias.shape, gate_proj_bias[:3], gate_proj_bias[-3:])
-            np.array(gate_proj_weight.float(), dtype=dtype).tofile(file)  
-            np.array(gate_proj_bias.float(), dtype=dtype).tofile(file)
-            
-            # save down_proj
-            down_proj_weight = params[f"{layer_name}mlp.experts.down_proj"][num_expert]
-            down_proj_bias = params[f"{layer_name}mlp.experts.down_proj_bias"][num_expert]
-            print(f"{layer_name}mlp.experts.down_proj", down_proj_weight.shape, down_proj_weight[0,:3], down_proj_weight[-1,-3:])
-            print(f"{layer_name}mlp.experts.down_proj_bias", down_proj_bias.shape, down_proj_bias[:3], down_proj_bias[-3:])
-            np.array(down_proj_weight.float(), dtype=dtype).tofile(file)  
-            np.array(down_proj_bias.float(), dtype=dtype).tofile(file)
-            
 
-            
+        save_projection(layer_name, "self_attn.o_proj")
+        save_weight(f"{layer_name}self_attn.o_proj.bias")
 
-    ####################################################################
-    # Save embedding layer  
-    save_weight("model.embed_tokens.weight")  
+    def save_feed_forward(layer_name):
+        save_weight(f"{layer_name}mlp.router.weight", True)
+        save_weight(f"{layer_name}mlp.router.bias")
 
-    # Process all layers  
-    for layer_idx in range(n_layers):  
-        layer_prefix = f"model.layers.{layer_idx}."  
-        save_weight(f"{layer_prefix}input_layernorm.weight")  
-        save_attention(layer_prefix)  
-        save_weight(f"{layer_prefix}post_attention_layernorm.weight")  
-        save_feed_forward(layer_prefix)  
+        gate_up = params[f"{layer_name}mlp.experts.gate_up_proj"]
+        gate_up_bias = params[f"{layer_name}mlp.experts.gate_up_proj_bias"]
+        down = params[f"{layer_name}mlp.experts.down_proj"]
+        down_bias = params[f"{layer_name}mlp.experts.down_proj_bias"]
 
-    # Save final layers  
-    save_weight("model.norm.weight")  
+        for expert_idx in range(n_experts):
+            up_w = gate_up[..., 1::2][expert_idx]
+            up_b = gate_up_bias[..., 1::2][expert_idx]
+            tensor_to_numpy(up_w, dtype).tofile(file)
+            tensor_to_numpy(up_b, dtype).tofile(file)
+
+            gate_w = gate_up[..., ::2][expert_idx]
+            gate_b = gate_up_bias[..., ::2][expert_idx]
+            tensor_to_numpy(gate_w, dtype).tofile(file)
+            tensor_to_numpy(gate_b, dtype).tofile(file)
+
+            down_w = down[expert_idx]
+            down_b = down_bias[expert_idx]
+            tensor_to_numpy(down_w, dtype).tofile(file)
+            tensor_to_numpy(down_b, dtype).tofile(file)
+
+    save_weight("model.embed_tokens.weight")
+
+    for layer_idx in range(n_layers):
+        layer_prefix = f"model.layers.{layer_idx}."
+        save_weight(f"{layer_prefix}input_layernorm.weight")
+        save_attention(layer_prefix)
+        save_weight(f"{layer_prefix}post_attention_layernorm.weight")
+        save_feed_forward(layer_prefix)
+
+    save_weight("model.norm.weight")
     save_weight("lm_head.weight", True)
 
 
+def collect_gpt_oss_for_nntrainer(params, config, dtype):
+    """Collect weights as ordered (nntrainer_name, ndarray) pairs for safetensors."""
+    n_layers = config.num_hidden_layers
+    n_experts = config.num_local_experts
+    tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
+    weights = []
+
+    def add(name, tensor, transpose=False):
+        arr = tensor_to_numpy(tensor, dtype, transpose=transpose)
+        weights.append((name, arr))
+
+    def add_projection(nntr_name, layer_name, proj_name):
+        lora_a = f"{layer_name}{proj_name}.lora_A.default.weight"
+        if lora_a in params:
+            add(nntr_name, params[f"{layer_name}{proj_name}.base_layer.weight"], transpose=True)
+            return
+        add(nntr_name, params[f"{layer_name}{proj_name}.weight"], transpose=True)
+
+    add("embedding0:Embedding", params["model.embed_tokens.weight"])
+
+    for layer_idx in range(n_layers):
+        hf_prefix = f"model.layers.{layer_idx}."
+        nntr_prefix = f"layer{layer_idx}"
+
+        add(f"{nntr_prefix}_attention_norm:gamma", params[f"{hf_prefix}input_layernorm.weight"])
+
+        add_projection(f"{nntr_prefix}_wq:weight", hf_prefix, "self_attn.q_proj")
+        add(f"{nntr_prefix}_wq:bias", params[f"{hf_prefix}self_attn.q_proj.bias"])
+        add_projection(f"{nntr_prefix}_wk:weight", hf_prefix, "self_attn.k_proj")
+        add(f"{nntr_prefix}_wk:bias", params[f"{hf_prefix}self_attn.k_proj.bias"])
+        add_projection(f"{nntr_prefix}_wv:weight", hf_prefix, "self_attn.v_proj")
+        add(f"{nntr_prefix}_wv:bias", params[f"{hf_prefix}self_attn.v_proj.bias"])
+
+        # attention sink lives on the mha_core layer in nntrainer.
+        add(f"{nntr_prefix}_attention:sink", params[f"{hf_prefix}self_attn.sinks"])
+
+        add_projection(f"{nntr_prefix}_attention_out:weight", hf_prefix, "self_attn.o_proj")
+        add(f"{nntr_prefix}_attention_out:bias", params[f"{hf_prefix}self_attn.o_proj.bias"])
+
+        add(
+            f"{nntr_prefix}_ffn_norm:gamma",
+            params[f"{hf_prefix}post_attention_layernorm.weight"],
+        )
+
+        # MoE layer is named "layer{N}_ffn_down" in nntrainer.
+        moe = f"{nntr_prefix}_ffn_down"
+        add(f"{moe}:gate", params[f"{hf_prefix}mlp.router.weight"], transpose=True)
+        add(f"{moe}:gate_bias", params[f"{hf_prefix}mlp.router.bias"])
+
+        gate_up = params[f"{hf_prefix}mlp.experts.gate_up_proj"]
+        gate_up_bias = params[f"{hf_prefix}mlp.experts.gate_up_proj_bias"]
+        down = params[f"{hf_prefix}mlp.experts.down_proj"]
+        down_bias = params[f"{hf_prefix}mlp.experts.down_proj_bias"]
+
+        for i in range(n_experts):
+            add(f"{moe}:expert_up_{i}", gate_up[..., 1::2][i])
+            add(f"{moe}:expert_up_bias_{i}", gate_up_bias[..., 1::2][i])
+            add(f"{moe}:expert_gate_{i}", gate_up[..., ::2][i])
+            add(f"{moe}:expert_gate_bias_{i}", gate_up_bias[..., ::2][i])
+            add(f"{moe}:expert_down_{i}", down[i])
+            add(f"{moe}:expert_down_bias_{i}", down_bias[i])
+
+    add("output_norm:gamma", params["model.norm.weight"])
+    if not tie_word_embeddings:
+        add("output_of_causallm:weight", params["lm_head.weight"], transpose=True)
+
+    return weights
+
+
+def save_safetensors(weights, output_path, dtype):
+    if dtype not in SAFETENSORS_DTYPE_MAP:
+        raise ValueError(f"Unsupported safetensors dtype: {dtype}")
+
+    safetensors_dtype = SAFETENSORS_DTYPE_MAP[dtype]
+    metadata = {"format": "pt"}
+
+    offset = 0
+    tensor_meta = {}
+    raw_buffers = []
+
+    for name, arr in weights:
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        nbytes = arr.nbytes
+        tensor_meta[name] = {
+            "dtype": safetensors_dtype,
+            "shape": list(arr.shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        raw_buffers.append(arr.tobytes(order="C"))
+        offset += nbytes
+
+    header = {"__metadata__": metadata}
+    header.update(tensor_meta)
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad = (8 - len(header_bytes) % 8) % 8
+    header_bytes += b" " * pad
+
+    with open(output_path, "wb") as output_file:
+        output_file.write(struct.pack("<Q", len(header_bytes)))
+        output_file.write(header_bytes)
+        for buffer in raw_buffers:
+            output_file.write(buffer)
+
+    print(f"Saved safetensors: {output_path}")
+    print(f"Tensor data size: {offset / 1e9:.2f} GB")
+
+
 if __name__ == "__main__":
-    data_dtype = "float32"
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    model_path = "."
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    config = AutoConfig.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=data_dtype, trust_remote_code=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default=".")
+    parser.add_argument("--output_name", type=str, default="./nntr_gpt_oss_20b.bin")
+    parser.add_argument("--data_type", type=str, default="float32", choices=["float32"])
+    parser.add_argument(
+        "--safetensors",
+        action="store_true",
+        help="Save weights in safetensors format instead of binary format",
+    )
+    args = parser.parse_args()
+
+    AutoTokenizer.from_pretrained(args.model_path)
+    config = AutoConfig.from_pretrained(args.model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path, torch_dtype=args.data_type, trust_remote_code=True
+    )
     model.eval()
 
+    params = model.state_dict()
 
-    with open("./nntr_gpt_oss_20b.bin", "wb") as f_model :
-        save_gpt_oss_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
+    if args.safetensors:
+        safetensors_path = get_safetensors_output_name(args.output_name)
+        weights = collect_gpt_oss_for_nntrainer(params, config, args.data_type)
+        save_safetensors(weights, safetensors_path, args.data_type)
+    else:
+        with open(args.output_name, "wb") as f_model:
+            save_gpt_oss_for_nntrainer(params, config, args.data_type, f_model)
+        print(f"Saved binary: {args.output_name}")
