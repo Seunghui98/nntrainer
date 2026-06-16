@@ -740,8 +740,11 @@ void DebertaAttentionLayer::add_relative_attn_score(
         if (p2c) {
           const int rel = static_cast<int>(q + from) - static_cast<int>(k);
           const int bucketed = lookup_bucket(rel);
+          // HF gathers key·pos_query with clamp(-r_pos+span) and then
+          // transposes (q<->k); the net effective index for score[q,k] is
+          // clamp(bucketed(q-k)+span), matching the c2p index.
           rel_idx_local.p2c_idx[static_cast<size_t>(q) * S_k + k] =
-            clampv(-bucketed + static_cast<int>(att_span), 0,
+            clampv(bucketed + static_cast<int>(att_span), 0,
                    static_cast<int>(rel_len_q) - 1);
         }
       }
