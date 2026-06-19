@@ -115,6 +115,23 @@ public:
   virtual ~BertDecoder() = default;
 
   /**
+   * @brief Override the (otherwise hardcoded FP32) weight tensor types so the
+   *        decoder graph can be built to load quantized weights.
+   *
+   * Must be called BEFORE initialize() (the dtypes are baked into the graph at
+   * compile time). The ScreenAICaption orchestrator calls this with the values
+   * from nntr_config when running a quantized model.
+   *
+   * @param model_tensor_type "<weight>-<activation>" (e.g. "Q4_0-FP32").
+   * @param fc_layer_dtype FC weight dtype string (e.g. "Q4_0").
+   */
+  void setTensorTypes(const std::string &model_tensor_type,
+                      const std::string &fc_layer_dtype) {
+    MODEL_TENSOR_TYPE = model_tensor_type;
+    FC_LAYER_DTYPE = fc_layer_dtype;
+  }
+
+  /**
    * @brief Initialize the decoder model (register layers, build graph,
    * compile).
    */
