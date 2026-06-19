@@ -14,9 +14,12 @@ subdir('qwen3_moe')
 subdir('qwen3_slim_moe')
 subdir('gemma3')
 subdir('timm_vit')
+subdir('siglip2')
 subdir('gemma4')
 if get_option('platform') != 'windows'
     subdir('bert')
     subdir('gpt_oss_cached_slim')
     subdir('qwen3_cached_slim_moe')
+    subdir('screenai_caption')
+    subdir('bert_decoder')
 endif

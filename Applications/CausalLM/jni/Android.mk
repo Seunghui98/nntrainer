@@ -29,6 +29,9 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/timm_vit \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
+    $(LOCAL_PATH)/../models/siglip2 \
+    $(LOCAL_PATH)/../models/bert_decoder \
+    $(LOCAL_PATH)/../models/screenai_caption \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
 
@@ -105,6 +108,9 @@ LOCAL_SRC_FILES := \
     ../models/deberta_v2/deberta_v2.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../models/siglip2/siglip2_vision_encoder.cpp \
+    ../models/bert_decoder/bert_decoder.cpp \
+    ../models/screenai_caption/screenai_caption.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
