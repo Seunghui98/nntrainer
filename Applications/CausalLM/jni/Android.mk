@@ -243,7 +243,11 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../layers/deberta_attention_layer.cpp \
-    ../layers/shared_fully_connected_layer.cpp
+    ../layers/shared_fully_connected_layer.cpp \
+    ../models/timm_vit/timm_vit_transformer.cpp \
+    ../models/siglip2/siglip2_vision_encoder.cpp \
+    ../models/bert_decoder/bert_decoder.cpp \
+    ../models/screenai_caption/screenai_caption.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -262,6 +266,10 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
+    $(LOCAL_PATH)/../models/timm_vit \
+    $(LOCAL_PATH)/../models/siglip2 \
+    $(LOCAL_PATH)/../models/bert_decoder \
+    $(LOCAL_PATH)/../models/screenai_caption \
 
 include $(BUILD_EXECUTABLE)
 
