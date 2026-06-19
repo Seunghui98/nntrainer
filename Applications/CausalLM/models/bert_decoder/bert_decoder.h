@@ -124,11 +124,19 @@ public:
    *
    * @param model_tensor_type "<weight>-<activation>" (e.g. "Q4_0-FP32").
    * @param fc_layer_dtype FC weight dtype string (e.g. "Q4_0").
+   * @param embedding_dtype embedding lookup-table weight dtype string
+   *        (e.g. "Q4_0", "Q6_K", or "FP32"). Defaults to "FP32" so callers that
+   *        do not quantize embeddings keep the original behaviour. The
+   *        word/pos/type embedding_layer createLayer calls pass EMBEDDING_DTYPE
+   *        as their per-layer weight_dtype, so the decoder graph is built to
+   *        load embeddings at this dtype.
    */
   void setTensorTypes(const std::string &model_tensor_type,
-                      const std::string &fc_layer_dtype) {
+                      const std::string &fc_layer_dtype,
+                      const std::string &embedding_dtype = "FP32") {
     MODEL_TENSOR_TYPE = model_tensor_type;
     FC_LAYER_DTYPE = fc_layer_dtype;
+    EMBEDDING_DTYPE = embedding_dtype;
   }
 
   /**

@@ -553,7 +553,12 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
  * plus the LM-head transform FC lmhead_dense.
  *
  * Embeddings (-> embd_dtype): decoder uses word_emb / pos_emb / type_emb
- * embedding_layer lookup tables.
+ * embedding_layer lookup tables. These are fully quantizable: the CausalLM
+ * embedding_layer supports Q4_0 and Q6_K lookup/save (Q4_0 requires the
+ * embedding width % 32 == 0 — BD_DIM = 256, so OK), and the decoder graph is
+ * built with EMBEDDING_DTYPE = embd_dtype (wired from nntr_config via
+ * BertDecoder::setTensorTypes). embd_dtype is fully configurable (FP32 / Q4_0 /
+ * Q6_K) through --embd_dtype.
  *
  * IMPORTANT — encoder is intentionally NOT quantized. The SigLIP2 encoder's
  * patch_embed_conv is a 4D conv kernel, and nntrainer's conv2d layer forces its
@@ -565,9 +570,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
  * would write Q4_0 blocks the FP32 encoder graph cannot load. We quantize the
  * DECODER (pure FC, no conv) only.
  *
- * Deliberately left FP32 (NOT quantized):
- *   - the entire encoder (patch_embed_conv, all enc_layer{i}_* FCs,
- *     enc_to_dec_proj, pos_embedding, LayerNorms),
+ * Deliberately left FP32 (NOT quantized), regardless of fc/embd dtype:
+ *   - the entire encoder (patch_embed_conv [4D conv, explicitly weight_dtype
+ *     FP32], all enc_layer{i}_* FCs, enc_to_dec_proj, pos_embedding,
+ *     LayerNorms),
  *   - all decoder LayerNorms (emb_ln, *_self_ln, *_cross_ln, *_ffn_ln,
  *     lmhead_ln),
  *   - lm_head_proj (tied to word_emb, no own weight) and lmhead_bias.

@@ -231,11 +231,18 @@ std::pair<std::vector<Tensor>, Tensor> BertDecoder::constructDecoderGraph() {
   h = lmh_ln(h);
 
   // lm_head_proj: tie_word_embeddings (shares word_emb weights, transpose=true)
-  // unit=30522, disable_bias=true, shared_from=word_emb (the embedding layer)
+  // unit=30522, disable_bias=true, shared_from=word_emb (the embedding layer).
+  // The shared weight tensor (word_emb:Embedding) must be requested with the
+  // SAME dtype by both sites. tie_word_embeddings otherwise resolves its weight
+  // dtype from the model's GLOBAL weight type (e.g. Q4_0), while the embedding
+  // layer uses its per-layer EMBEDDING_DTYPE — a mismatch (e.g. embedding Q6_K
+  // vs global Q4_0) makes requestOrExtend throw "tensor dimension mismatch for
+  // word_emb:Embedding". Pin the tie layer to EMBEDDING_DTYPE so they agree.
   LayerHandle lm_proj(createLayer(
     "tie_word_embeddings",
     {withKey("name", "lm_head_proj"), withKey("unit", BD_NUM_VOCAB),
-     withKey("disable_bias", "true"), withKey("shared_from", "word_emb")}));
+     withKey("disable_bias", "true"), withKey("weight_dtype", EMBEDDING_DTYPE),
+     withKey("shared_from", "word_emb")}));
   Tensor logits = lm_proj(h);
 
   // lm_head_bias: learnable bias [1,1,1,30522] loaded from weight file
@@ -605,7 +612,17 @@ void BertDecoder::prefillCrossCache(const float *enc_hidden, int token_id) {
       throw std::runtime_error("prefillCrossCache: weight/bias for " + fc +
                                " not found in compiled graph");
 
-    nntrainer::Tensor proj; // [1,1,196,kv_width] FP32
+    // Pre-allocate the FP32 output. For an FP32 weight, Tensor::dot ->
+    // dotFloat allocates `proj` itself (via calculateFlattenDot). For a
+    // quantized weight (Q4_0/Q6_K/Q4_K), Tensor::dot routes to dotQnK, which
+    // writes directly into output.getData<float>() WITHOUT allocating it —
+    // passing a default-constructed (empty) tensor segfaults in the quantized
+    // GEMM. Allocate proj = [1,1,BD_ENC_LEN,kv_width] FP32 up front so both the
+    // FP32 and the quantized paths have a valid destination buffer.
+    nntrainer::TensorDim proj_dim(
+      {BD_BATCH_SIZE, 1, BD_ENC_LEN, kv_width},
+      {nntrainer::Tformat::NCHW, nntrainer::TensorDim::DataType::FP32});
+    nntrainer::Tensor proj(proj_dim, true /* allocate */);
     enc.dot(*w, proj, false, false);
     proj.add_i(*b); // broadcast bias over rows
     dst_cache.copyData(proj);

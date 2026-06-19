@@ -371,6 +371,12 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
   const int embed_dim = DIM;
 
   // Conv2D with bias (SigLIP2 delta from timm_vit which had disable_bias=true)
+  // Pin the conv kernel to FP32 explicitly. conv2d resolves its weight dtype
+  // from the model's global weight type (LayerNode applies the per-layer
+  // weight_dtype property to tensor_type[1], which conv2d reads via
+  // context.getWeightDataType()). A Q4_0 weight type is rejected for this 4D
+  // kernel ("Q4_0_Tensor must be 2 dimensional"), so even if the encoder were
+  // ever built with a quantized global type, this keeps the conv FP32.
   LayerHandle conv(createLayer(
     "conv2d", {withKey("name", "patch_embed_conv"),
                withKey("kernel_size", {std::to_string(PATCH_SIZE),
@@ -378,7 +384,8 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
                withKey("filters", std::to_string(embed_dim)),
                withKey("stride", {std::to_string(PATCH_SIZE),
                                   std::to_string(PATCH_SIZE)}),
-               withKey("padding", "valid"), withKey("disable_bias", "false")}));
+               withKey("padding", "valid"), withKey("disable_bias", "false"),
+               withKey("weight_dtype", "FP32")}));
   Tensor h = conv(input);
 
   // Reshape from [1, embed_dim, H/P, W/P] -> [1, 1, embed_dim, num_patches]
