@@ -117,7 +117,7 @@ MHACoreLayer::MHACoreLayer() :
     props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
     props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::AttnLogitSoftcapping(), props::IsCausal(), props::CrossAttention()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -200,17 +200,15 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Weight for Sink */
   use_sink = std::get<props::UseSink>(mha_core_props).get();
   if (use_sink) {
-#if ENABLE_FP16 && defined(__ANDROID__)
-    nntrainer::TensorDim sink_dim(
-      1, 1, 1, num_heads_Q,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       ml::train::TensorDim::DataType::FP16));
-#else
+    // The sink weight must match the attention compute precision. On Android
+    // (ENABLE_FP16) the attention math now accumulates in fp32 over the
+    // fp16-stored K/V cache (see forwarding()/incremental_forwarding()), so the
+    // sink stays in the activation (fp32) type on every platform. Keeping it
+    // fp32 here matches the fp32 softmax_row/softmax_row_inplace sink overload.
     nntrainer::TensorDim sink_dim(
       1, 1, 1, num_heads_Q,
       nntrainer::TensorDim::TensorType(context.getFormat(),
                                        context.getActivationDataType()));
-#endif
     sink_idx = context.requestWeight(sink_dim, nntrainer::Initializer::ZEROS,
                                      nntrainer::WeightRegularizer::NONE, 0.0f,
                                      0.0f, "sink");
@@ -221,6 +219,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
+
+  /** Static read-only cross-attention mode (Option B); default false. */
+  cross_attention = std::get<props::CrossAttention>(mha_core_props).get();
 
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =
@@ -307,8 +308,25 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   unsigned int step_size = (incremental_step_size > 0)
                              ? incremental_step_size
                              : (unsigned int)query.height();
-  unsigned int from = cache_index;
-  unsigned int to = cache_index + step_size;
+
+  // Static read-only cross-attention (Option B): the encoder K/V cache
+  // (inputs 3/4) is already fully populated with enc_len rows. The query must
+  // attend over ALL enc_len rows independent of cache_index, and the cache is
+  // neither written nor advanced. We drive the existing kernel by pinning the
+  // read window to the full cache height: with `from = enc_len - step_size`,
+  // `to = enc_len` the (non-causal) kernel reads rows [0, enc_len) for each of
+  // the step_size query rows. Self-attention (cross_attention == false) keeps
+  // the original from/to derived from cache_index unchanged.
+  unsigned int enc_len = (unsigned int)cache_key.height();
+  // Defensive: for cross-attention, step_size must not exceed enc_len to
+  // prevent unsigned underflow in `from = enc_len - step_size`.
+  // The app only uses step_size==1, but guard against hypothetical multi-row
+  // cross paths (e.g. batch-prefill of the decoder query).
+  NNTR_THROW_IF(cross_attention && step_size > enc_len, std::invalid_argument)
+    << "mha_core cross-attention: step_size (" << step_size << ") > enc_len ("
+    << enc_len << "); would underflow `from`";
+  unsigned int from = cross_attention ? (enc_len - step_size) : cache_index;
+  unsigned int to = cross_attention ? enc_len : (cache_index + step_size);
 
   auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
@@ -343,38 +361,20 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
     if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-#if ENABLE_FP16 && defined(__ANDROID__)
-      nntrainer::TensorDim Q_step_dim = query_step_dim;
-      nntrainer::TensorDim K_step_dim = key_step_dim;
-      nntrainer::TensorDim V_step_dim = value_step_dim;
-      nntrainer::TensorDim O_step_dim = output_step_dim;
-      Q_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      K_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-
-      nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
-      nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
-      nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
-      nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
-
-      Q_step.copyData(query_step);
-      K_step.copyData(key_step);
-      V_step.copyData(value_step);
-
-      if (use_sink) {
-        one_batch_incremental_forwarding(
-          batch, from, from, to, Q_step, K_step, V_step, O_step, cache_key,
-          cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
-          cache_value_step_dim, sink);
-      } else {
-        one_batch_incremental_forwarding(batch, from, from, to, Q_step, K_step,
-                                         V_step, O_step, cache_key, cache_value,
-                                         cache_key_dim, cache_key_step_dim,
-                                         cache_value_dim, cache_value_step_dim);
-      }
-      output_step.copyData(O_step);
-#else
+      // FP32-accumulation attention over the fp16-stored K/V cache.
+      //
+      // Previously the Android (ENABLE_FP16) path converted Q/K/V to fp16 and
+      // ran the all-fp16 NEON kernels, accumulating QK^T and the V-weighted sum
+      // in fp16. That lost too much precision and diverged from the desktop
+      // result (caption token parity broke). We now pass the fp32 Q/K/V through
+      // directly on every platform: compute_kcaches()/softmax_triangle()/
+      // compute_fp16vcache_transposed() then dispatch on the fp32 query and use
+      // compute_kcaches_fp32_reference + fp32 softmax_row +
+      // compute_fp16vcache_fp32_transposed, which read the fp16 cache converted
+      // to fp32 and accumulate in fp32 -- exactly matching the desktop path.
+      // The cache STORAGE stays fp16 (allocateAndBindKVCache unchanged); only
+      // the math precision changes. This is the same data flow as the desktop
+      // build, so behavior is identical across platforms.
       if (use_sink) {
         one_batch_incremental_forwarding(
           batch, from, from, to, query_step, key_step, value_step, output_step,
@@ -386,7 +386,6 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
           cache_key, cache_value, cache_key_dim, cache_key_step_dim,
           cache_value_dim, cache_value_step_dim);
       }
-#endif
     } else {
       one_batch_incremental_forwarding(
         batch, from, from, to, query_step, key_step, value_step, output_step,
@@ -395,7 +394,10 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     }
   }
 
-  cache_index += step_size;
+  // Cross-attention is a static read-only pass: it neither writes nor advances
+  // the cache. Only self-attention advances the write position.
+  if (!cross_attention)
+    cache_index += step_size;
 }
 
 /**
@@ -508,37 +510,11 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
     if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-#if ENABLE_FP16 && defined(__ANDROID__)
-      nntrainer::TensorDim Q_step_dim = query_step_dim;
-      nntrainer::TensorDim K_step_dim = key_step_dim;
-      nntrainer::TensorDim V_step_dim = value_step_dim;
-      nntrainer::TensorDim O_step_dim = output_step_dim;
-      Q_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      K_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-
-      nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
-      nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
-      nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
-      nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
-
-      Q_step.copyData(query_step);
-      K_step.copyData(key_step);
-      V_step.copyData(value_step);
-      if (use_sink) {
-        one_batch_incremental_forwarding(
-          batch, _from, from, to, Q_step, K_step, V_step, O_step, cache_key,
-          cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
-          cache_value_step_dim, sink);
-      } else {
-        one_batch_incremental_forwarding(batch, _from, from, to, Q_step, K_step,
-                                         V_step, O_step, cache_key, cache_value,
-                                         cache_key_dim, cache_key_step_dim,
-                                         cache_value_dim, cache_value_step_dim);
-      }
-      output_step.copyData(O_step);
-#else
+      // FP32-accumulation attention over the fp16-stored K/V cache (same
+      // rationale as forwarding(); see the comment there). On Android
+      // (ENABLE_FP16) we no longer down-cast Q/K/V to fp16; the fp32 query
+      // routes the compute helpers through the fp32-reference accumulation,
+      // reading the fp16 cache converted to fp32. Cache storage stays fp16.
       if (use_sink) {
         one_batch_incremental_forwarding(
           batch, _from, from, to, query_step, key_step, value_step, output_step,
@@ -550,7 +526,6 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           cache_key, cache_value, cache_key_dim, cache_key_step_dim,
           cache_value_dim, cache_value_step_dim);
       }
-#endif
     } else {
       one_batch_incremental_forwarding(
         batch, _from, from, to, query_step, key_step, value_step, output_step,
@@ -710,36 +685,44 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    *  |<-------------b_cached_key--------------->|
    */
 
-  // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
-  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
-    cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + cache_index * cache_key_dim.width(),
-    true);
-  nntrainer::Tensor b_cache_value_step =
-    cache_value.getSharedDataTensor(cache_value_step_dim,
-                                    batch * cache_value_dim.getFeatureLen() +
-                                      cache_index * cache_value_dim.width(),
+  // Static read-only cross-attention (Option B): the encoder K/V cache is
+  // already fully populated (enc_len rows). Skip the cache write (do NOT copy
+  // key_step/value_step in) and read the full cache height. For self-attention
+  // (cross_attention == false) the original write-then-read path is unchanged.
+  if (!cross_attention) {
+    // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
+    nntrainer::Tensor b_cache_key_step =
+      cache_key.getSharedDataTensor(cache_key_step_dim,
+                                    batch * cache_key_dim.getFeatureLen() +
+                                      cache_index * cache_key_dim.width(),
                                     true);
+    nntrainer::Tensor b_cache_value_step =
+      cache_value.getSharedDataTensor(cache_value_step_dim,
+                                      batch * cache_value_dim.getFeatureLen() +
+                                        cache_index * cache_value_dim.width(),
+                                      true);
 
-  // append kcache with or without rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
-                             !use_rope);
+    // append kcache with or without rotary embedding
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
+                               cache_index, !use_rope);
 
-  // append vcache without rotary embedding
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                               cache_index, true);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    // append vcache without rotary embedding
+    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 cache_index, true);
+    } else if (query_step.getDataType() ==
+               ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+      b_cache_value_step.copyData(value_step);
 #else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+      NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+    }
   }
 
   unsigned int step_size = to - from;
   bool is_prefill = !from || step_size > 1;
-  if (skip_prefill && is_prefill)
+  if (!cross_attention && skip_prefill && is_prefill)
     return;
 
   // apply rotary embedding for query
@@ -749,8 +732,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   }
 
   /// @todo replace step_size into input height
-  unsigned int cache_from = cache_index;
-  unsigned int cache_to = cache_from + step_size;
+  // Cross-attention reads the full encoder cache [0, enc_len): forwarding()
+  // passes from = enc_len - step_size and to = enc_len, so the non-causal
+  // kernel's row_to_compute = cache_from + step_size resolves to enc_len for
+  // every query row. Self-attention keeps the cache_index-based window.
+  unsigned int cache_from = cross_attention ? from : cache_index;
+  unsigned int cache_to = cross_attention ? to : (cache_from + step_size);
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
