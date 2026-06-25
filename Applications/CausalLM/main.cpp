@@ -54,6 +54,9 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "timm_vit/timm_vit_transformer.h"
+#if !defined(_WIN32)
+#include "bert_decoder/bert_decoder.h"
+#endif
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -210,6 +213,70 @@ std::string resolve_architecture(std::string model_type,
 }
 
 /**
+ * @brief Minimal .npy float32 reader (skips the header, reads `count` floats).
+ */
+static std::vector<float> readNpyF32(const std::string &path, size_t count) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    throw std::runtime_error("Cannot open npy: " + path);
+  char magic[8];
+  in.read(magic, 8);
+  if (magic[0] != '\x93' || std::string(magic + 1, 5) != "NUMPY")
+    throw std::runtime_error("Not a .npy file: " + path);
+  uint16_t hlen = 0;
+  in.read(reinterpret_cast<char *>(&hlen), 2);
+  in.seekg(hlen, std::ios::cur);
+  std::vector<float> data(count);
+  in.read(reinterpret_cast<char *>(data.data()),
+          static_cast<std::streamsize>(count * sizeof(float)));
+  if (!in)
+    throw std::runtime_error("Short read from npy: " + path);
+  return data;
+}
+
+/**
+ * @brief --decoder-init-parity handler: inject a golden encoder output
+ *        [1,196,256], run one decode step from the start token (101) at
+ *        position 0, and save logits to nntr_decoder_init_logits.npy. Reads
+ *        nntr_config.json so the graph loads fp32 OR quantized (Q4_0/Q6_K)
+ *        weights.
+ */
+static int runDecoderInitParity(const std::string &model_dir) {
+  std::string weight_file = model_dir + "/nntr_bert_decoder_fp32.bin";
+  std::string mtt = "FP32-FP32", fc_dt = "FP32", embd_dt = "FP32";
+  try {
+    json nntr = causallm::LoadJsonFile(model_dir + "/nntr_config.json");
+    mtt = nntr.value("model_tensor_type", mtt);
+    fc_dt = nntr.value("fc_layer_dtype", fc_dt);
+    embd_dt = nntr.value("embedding_dtype", embd_dt);
+    if (nntr.contains("model_file_name"))
+      weight_file =
+        model_dir + "/" + nntr["model_file_name"].get<std::string>();
+  } catch (const std::exception &) {
+    // No nntr_config.json — fall back to the FP32 defaults above.
+  }
+
+  try {
+    constexpr size_t ENC_COUNT = 1u * 196 * 256; // 50176
+    auto enc = readNpyF32(model_dir + "/golden.encoder_hidden.npy", ENC_COUNT);
+
+    auto dec = std::make_unique<causallm::BertDecoder>();
+    dec->setTensorTypes(mtt, fc_dt, embd_dt);
+    dec->initialize();
+    dec->load_weight(weight_file);
+
+    int argmax =
+      dec->decodeStep(enc.data(), 101, "nntr_decoder_init_logits.npy");
+    std::cout << "[parity] tensor_type=" << mtt << " fc=" << fc_dt
+              << " embd=" << embd_dt << " -> argmax=" << argmax << "\n";
+    return EXIT_SUCCESS;
+  } catch (const std::exception &e) {
+    std::cerr << "[parity] FAILED: " << e.what() << "\n";
+    return EXIT_FAILURE;
+  }
+}
+
+/**
  * @brief Entry point for loading, initializing, and running a CausalLM model.
  */
 int main(int argc, char *argv[]) {
@@ -315,6 +382,9 @@ int main(int argc, char *argv[]) {
                  "chat_input if omitted)\n";
     return EXIT_FAILURE;
   }
+
+  if (argc >= 3 && std::string(argv[1]) == "--decoder-init-parity")
+    return runDecoderInitParity(argv[2]);
 
   const std::string model_path = argv[1];
   std::string input_text;
