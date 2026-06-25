@@ -398,6 +398,35 @@ public:
    */
   template <typename T = float>
   static Tensor &swish(Tensor const &t_in, Tensor &t_out) {
+    /**
+     * Fused SiLU/swish: out = x * sigmoid(x) = x / (1 + exp(-x)).
+     * Fast path for contiguous FP32: SiLU is exactly swiglu(out, x, ones) where
+     * swiglu computes X = (Y / (1 + exp(-Y))) * Z. Reuse the vectorized
+     * cpu_backend swiglu (NEON exp_ps on ARM) by streaming a small reusable
+     * ones buffer, which avoids an N-sized allocation while keeping the fast
+     * exp path.
+     */
+    if (t_in.getDataType() == TensorDim::DataType::FP32 &&
+        t_out.getDataType() == TensorDim::DataType::FP32 &&
+        t_in.getContiguous() && t_out.getContiguous()) {
+      const unsigned int n = t_in.size();
+      float *in = t_in.getData<float>();
+      float *out = t_out.getData<float>();
+      constexpr unsigned int CH = 8192;
+      static thread_local float ones[CH];
+      static thread_local bool ones_init = false;
+      if (!ones_init) {
+        for (unsigned int i = 0; i < CH; ++i)
+          ones[i] = 1.0f;
+        ones_init = true;
+      }
+      for (unsigned int off = 0; off < n; off += CH) {
+        unsigned int m = (n - off < CH) ? (n - off) : CH;
+        swiglu(m, out + off, in + off, ones);
+      }
+      return t_out;
+    }
+
     t_in.apply<T>([&](T x) { return sigmoid<T>(x); }, t_out);
     t_out.multiply_i(t_in);
 
