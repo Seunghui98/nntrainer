@@ -151,9 +151,9 @@ void ComputeOps::transpose_matrix_fp32(unsigned int, unsigned int,
   NI(transpose_matrix_fp32);
 }
 
-void ComputeOps::nearest_upsample_fp32(const float *, float *,
-                                        size_t, size_t, size_t, size_t,
-                                        unsigned int, unsigned int) {
+void ComputeOps::nearest_upsample_fp32(const float *, float *, size_t, size_t,
+                                       size_t, size_t, unsigned int,
+                                       unsigned int) {
   NI(nearest_upsample_fp32);
 }
 
@@ -410,9 +410,9 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
                                                 float *, float *) {
   NI(compute_rotary_embedding_value);
 }
-void ComputeOps::nearest_upsample_fp16(const _FP16 *, _FP16 *,
-                                        size_t, size_t, size_t, size_t,
-                                        unsigned int, unsigned int) {
+void ComputeOps::nearest_upsample_fp16(const _FP16 *, _FP16 *, size_t, size_t,
+                                       size_t, size_t, unsigned int,
+                                       unsigned int) {
   NI(nearest_upsample_fp16);
 }
 #endif // ENABLE_FP16

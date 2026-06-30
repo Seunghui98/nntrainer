@@ -1453,9 +1453,9 @@ TEST(nntrainer_fallback_kleidiai,
 // Tests for nearest_upsample (row-replicate memcpy upsample)
 //==============================================================================
 
-static void ref_nearest_upsample(const float *src, float *dst,
-                                  size_t N, size_t C, size_t Hi, size_t Wi,
-                                  unsigned int ksh, unsigned int ksw) {
+static void ref_nearest_upsample(const float *src, float *dst, size_t N,
+                                 size_t C, size_t Hi, size_t Wi,
+                                 unsigned int ksh, unsigned int ksw) {
   const size_t Ho = Hi * ksh, Wo = Wi * ksw;
   for (size_t b = 0; b < N; ++b) {
     for (size_t c = 0; c < C; ++c) {
@@ -1473,38 +1473,42 @@ static void ref_nearest_upsample(const float *src, float *dst,
 }
 
 TEST(nntrainer_fallback, nearest_upsample_2x2) {
-  const size_t N=2, C=3, Hi=4, Wi=4;
-  const unsigned int ksh=2, ksw=2;
-  std::vector<float> src(N*C*Hi*Wi), dst(N*C*Hi*ksh*Wi*ksw), ref(N*C*Hi*ksh*Wi*ksw);
+  const size_t N = 2, C = 3, Hi = 4, Wi = 4;
+  const unsigned int ksh = 2, ksw = 2;
+  std::vector<float> src(N * C * Hi * Wi), dst(N * C * Hi * ksh * Wi * ksw),
+    ref(N * C * Hi * ksh * Wi * ksw);
   std::iota(src.begin(), src.end(), 1.0f);
-  nntrainer::__fallback_nearest_upsample_fp32(src.data(), dst.data(),
-                                               N, C, Hi, Wi, ksh, ksw);
+  nntrainer::__fallback_nearest_upsample_fp32(src.data(), dst.data(), N, C, Hi,
+                                              Wi, ksh, ksw);
   ref_nearest_upsample(src.data(), ref.data(), N, C, Hi, Wi, ksh, ksw);
   for (size_t i = 0; i < dst.size(); ++i)
     EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;
 }
 
 TEST(nntrainer_fallback, nearest_upsample_3x3) {
-  const size_t N=1, C=2, Hi=3, Wi=3;
-  const unsigned int ksh=3, ksw=3;
-  std::vector<float> src(N*C*Hi*Wi), dst(N*C*Hi*ksh*Wi*ksw), ref(N*C*Hi*ksh*Wi*ksw);
+  const size_t N = 1, C = 2, Hi = 3, Wi = 3;
+  const unsigned int ksh = 3, ksw = 3;
+  std::vector<float> src(N * C * Hi * Wi), dst(N * C * Hi * ksh * Wi * ksw),
+    ref(N * C * Hi * ksh * Wi * ksw);
   std::mt19937 rng(13);
   std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-  for (auto &v : src) v = dist(rng);
-  nntrainer::__fallback_nearest_upsample_fp32(src.data(), dst.data(),
-                                               N, C, Hi, Wi, ksh, ksw);
+  for (auto &v : src)
+    v = dist(rng);
+  nntrainer::__fallback_nearest_upsample_fp32(src.data(), dst.data(), N, C, Hi,
+                                              Wi, ksh, ksw);
   ref_nearest_upsample(src.data(), ref.data(), N, C, Hi, Wi, ksh, ksw);
   for (size_t i = 0; i < dst.size(); ++i)
     EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;
 }
 
 TEST(nntrainer_fallback, nearest_upsample_asymmetric) {
-  const size_t N=1, C=4, Hi=5, Wi=6;
-  const unsigned int ksh=2, ksw=4;
-  std::vector<float> src(N*C*Hi*Wi), dst(N*C*Hi*ksh*Wi*ksw), ref(N*C*Hi*ksh*Wi*ksw);
+  const size_t N = 1, C = 4, Hi = 5, Wi = 6;
+  const unsigned int ksh = 2, ksw = 4;
+  std::vector<float> src(N * C * Hi * Wi), dst(N * C * Hi * ksh * Wi * ksw),
+    ref(N * C * Hi * ksh * Wi * ksw);
   std::iota(src.begin(), src.end(), 0.0f);
-  nntrainer::__fallback_nearest_upsample_fp32(src.data(), dst.data(),
-                                               N, C, Hi, Wi, ksh, ksw);
+  nntrainer::__fallback_nearest_upsample_fp32(src.data(), dst.data(), N, C, Hi,
+                                              Wi, ksh, ksw);
   ref_nearest_upsample(src.data(), ref.data(), N, C, Hi, Wi, ksh, ksw);
   for (size_t i = 0; i < dst.size(); ++i)
     EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;

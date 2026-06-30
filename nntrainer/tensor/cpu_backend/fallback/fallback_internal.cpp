@@ -1267,10 +1267,9 @@ void __fallback_gemm_qs8d32p_qs4c32p_packed(size_t m, size_t n, size_t k,
   throw std::runtime_error("NYI : __fallback_gemm_qs8d32p_qs4c32p_packed");
 }
 
-
-void __fallback_nearest_upsample_fp32(const float *src, float *dst,
-                                       size_t N, size_t C, size_t Hi, size_t Wi,
-                                       unsigned int ksh, unsigned int ksw) {
+void __fallback_nearest_upsample_fp32(const float *src, float *dst, size_t N,
+                                      size_t C, size_t Hi, size_t Wi,
+                                      unsigned int ksh, unsigned int ksw) {
   const size_t Wo = Wi * ksw;
   for (size_t b = 0; b < N; ++b) {
     for (size_t c = 0; c < C; ++c) {
@@ -1293,9 +1292,9 @@ void __fallback_nearest_upsample_fp32(const float *src, float *dst,
 }
 
 #ifdef ENABLE_FP16
-void __fallback_nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
-                                       size_t N, size_t C, size_t Hi, size_t Wi,
-                                       unsigned int ksh, unsigned int ksw) {
+void __fallback_nearest_upsample_fp16(const _FP16 *src, _FP16 *dst, size_t N,
+                                      size_t C, size_t Hi, size_t Wi,
+                                      unsigned int ksh, unsigned int ksw) {
   const size_t Wo = Wi * ksw;
   for (size_t b = 0; b < N; ++b) {
     for (size_t c = 0; c < C; ++c) {

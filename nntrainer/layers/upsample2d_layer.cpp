@@ -11,8 +11,8 @@
  * @bug    No known bugs except for NYI items
  */
 
-#include <cstring>
 #include <cpu_backend.h>
+#include <cstring>
 #include <layer_context.h>
 #include <node_exporter.h>
 #include <type_traits>
@@ -71,11 +71,13 @@ static void upsampleForwardT(
       const size_t Hi = in.height(), Wi = in.width();
       const unsigned int ksh = kernel_size[0], ksw = kernel_size[1];
       if constexpr (std::is_same_v<T, float>) {
-        getComputeOps()->nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh, ksw);
+        getComputeOps()->nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh,
+                                               ksw);
       }
 #ifdef ENABLE_FP16
       else if constexpr (std::is_same_v<T, _FP16>) {
-        getComputeOps()->nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh, ksw);
+        getComputeOps()->nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh,
+                                               ksw);
       }
 #endif
       break;

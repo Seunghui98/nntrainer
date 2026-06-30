@@ -1217,13 +1217,13 @@ void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
 
-void nearest_upsample_fp32(const float *src, float *dst,
-                           size_t N, size_t C, size_t Hi, size_t Wi,
-                           unsigned int ksh, unsigned int ksw);
+void nearest_upsample_fp32(const float *src, float *dst, size_t N, size_t C,
+                           size_t Hi, size_t Wi, unsigned int ksh,
+                           unsigned int ksw);
 #ifdef ENABLE_FP16
-void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
-                           size_t N, size_t C, size_t Hi, size_t Wi,
-                           unsigned int ksh, unsigned int ksw);
+void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst, size_t N, size_t C,
+                           size_t Hi, size_t Wi, unsigned int ksh,
+                           unsigned int ksw);
 #endif
 
 /**

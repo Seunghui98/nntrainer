@@ -122,9 +122,9 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
-  void nearest_upsample_fp32(const float *src, float *dst,
-                              size_t N, size_t C, size_t Hi, size_t Wi,
-                              unsigned int ksh, unsigned int ksw) override {
+  void nearest_upsample_fp32(const float *src, float *dst, size_t N, size_t C,
+                             size_t Hi, size_t Wi, unsigned int ksh,
+                             unsigned int ksw) override {
     nntrainer::nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh, ksw);
   }
 
@@ -304,9 +304,9 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
-  void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
-                              size_t N, size_t C, size_t Hi, size_t Wi,
-                              unsigned int ksh, unsigned int ksw) override {
+  void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst, size_t N, size_t C,
+                             size_t Hi, size_t Wi, unsigned int ksh,
+                             unsigned int ksw) override {
     nntrainer::nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh, ksw);
   }
 

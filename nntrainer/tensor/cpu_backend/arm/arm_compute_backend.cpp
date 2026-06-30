@@ -524,19 +524,19 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   neon::clamp(input, output, length, lower_bound, upper_bound);
 }
 
-void nearest_upsample_fp32(const float *src, float *dst,
-                           size_t N, size_t C, size_t Hi, size_t Wi,
-                           unsigned int ksh, unsigned int ksw) {
+void nearest_upsample_fp32(const float *src, float *dst, size_t N, size_t C,
+                           size_t Hi, size_t Wi, unsigned int ksh,
+                           unsigned int ksw) {
   __fallback_nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh, ksw);
 }
 
 #ifdef ENABLE_FP16
-void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
-                           size_t N, size_t C, size_t Hi, size_t Wi,
-                           unsigned int ksh, unsigned int ksw) {
+void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst, size_t N, size_t C,
+                           size_t Hi, size_t Wi, unsigned int ksh,
+                           unsigned int ksw) {
   __fallback_nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh, ksw);
 }
-#endif  // ENABLE_FP16
+#endif // ENABLE_FP16
 
 template <>
 void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
