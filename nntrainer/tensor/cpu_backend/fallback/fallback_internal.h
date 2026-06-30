@@ -1252,14 +1252,14 @@ void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
  * @brief Scalar stride-1 max pool for one [Hi,Wi] plane -> [Ho,Wo].
  *        Two-pass separable algorithm (row then col).
  */
-void __fallback_maxpool2d_s1_fp32(const float *in, float *out,
-                                   int Hi, int Wi, int Ho, int Wo,
-                                   int ph, int pw, int pad_t, int pad_l);
+void __fallback_maxpool2d_s1_fp32(const float *in, float *out, int Hi, int Wi,
+                                  int Ho, int Wo, int ph, int pw, int pad_t,
+                                  int pad_l);
 
 #ifdef ENABLE_FP16
-void __fallback_maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
-                                   int Hi, int Wi, int Ho, int Wo,
-                                   int ph, int pw, int pad_t, int pad_l);
+void __fallback_maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out, int Hi, int Wi,
+                                  int Ho, int Wo, int ph, int pw, int pad_t,
+                                  int pad_l);
 #endif
 
 /**

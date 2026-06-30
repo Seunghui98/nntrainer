@@ -1453,19 +1453,21 @@ TEST(nntrainer_fallback_kleidiai,
 // Tests for maxpool2d_s1 (stride-1 max pool)
 //==============================================================================
 
-static void ref_maxpool2d_s1(const float *in, float *out,
-                              int Hi, int Wi, int Ho, int Wo,
-                              int ph, int pw, int pad_t, int pad_l) {
+static void ref_maxpool2d_s1(const float *in, float *out, int Hi, int Wi,
+                             int Ho, int Wo, int ph, int pw, int pad_t,
+                             int pad_l) {
   const float ninf = std::numeric_limits<float>::lowest();
   for (int oh = 0; oh < Ho; ++oh) {
     for (int ow = 0; ow < Wo; ++ow) {
       float v = ninf;
       for (int kh = 0; kh < ph; ++kh) {
         int ih = oh - pad_t + kh;
-        if (ih < 0 || ih >= Hi) continue;
+        if (ih < 0 || ih >= Hi)
+          continue;
         for (int kw = 0; kw < pw; ++kw) {
           int iw = ow - pad_l + kw;
-          if (iw < 0 || iw >= Wi) continue;
+          if (iw < 0 || iw >= Wi)
+            continue;
           v = std::max(v, in[ih * Wi + iw]);
         }
       }
@@ -1481,9 +1483,10 @@ TEST(nntrainer_fallback, maxpool2d_s1_no_pad) {
   std::vector<float> in(Hi * Wi), out(Ho * Wo), ref(Ho * Wo);
   std::mt19937 rng(42);
   std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
-  for (auto &v : in) v = dist(rng);
-  nntrainer::__fallback_maxpool2d_s1_fp32(in.data(), out.data(),
-                                           Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
+  for (auto &v : in)
+    v = dist(rng);
+  nntrainer::__fallback_maxpool2d_s1_fp32(in.data(), out.data(), Hi, Wi, Ho, Wo,
+                                          ph, pw, pad_t, pad_l);
   ref_maxpool2d_s1(in.data(), ref.data(), Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
   for (int i = 0; i < Ho * Wo; ++i)
     EXPECT_FLOAT_EQ(out[i], ref[i]) << "at i=" << i;
@@ -1495,9 +1498,10 @@ TEST(nntrainer_fallback, maxpool2d_s1_same_pad) {
   std::vector<float> in(Hi * Wi), out(Ho * Wo), ref(Ho * Wo);
   std::mt19937 rng(99);
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-  for (auto &v : in) v = dist(rng);
-  nntrainer::__fallback_maxpool2d_s1_fp32(in.data(), out.data(),
-                                           Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
+  for (auto &v : in)
+    v = dist(rng);
+  nntrainer::__fallback_maxpool2d_s1_fp32(in.data(), out.data(), Hi, Wi, Ho, Wo,
+                                          ph, pw, pad_t, pad_l);
   ref_maxpool2d_s1(in.data(), ref.data(), Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
   for (int i = 0; i < Ho * Wo; ++i)
     EXPECT_FLOAT_EQ(out[i], ref[i]) << "at i=" << i;
@@ -1509,9 +1513,10 @@ TEST(nntrainer_fallback, maxpool2d_s1_5x5_kernel) {
   std::vector<float> in(Hi * Wi), out(Ho * Wo), ref(Ho * Wo);
   std::mt19937 rng(7);
   std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
-  for (auto &v : in) v = dist(rng);
-  nntrainer::__fallback_maxpool2d_s1_fp32(in.data(), out.data(),
-                                           Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
+  for (auto &v : in)
+    v = dist(rng);
+  nntrainer::__fallback_maxpool2d_s1_fp32(in.data(), out.data(), Hi, Wi, Ho, Wo,
+                                          ph, pw, pad_t, pad_l);
   ref_maxpool2d_s1(in.data(), ref.data(), Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
   for (int i = 0; i < Ho * Wo; ++i)
     EXPECT_FLOAT_EQ(out[i], ref[i]) << "at i=" << i;

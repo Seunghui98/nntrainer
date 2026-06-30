@@ -524,9 +524,8 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   neon::clamp(input, output, length, lower_bound, upper_bound);
 }
 
-void maxpool2d_s1_fp32(const float *in, float *out,
-                       int Hi, int Wi, int Ho, int Wo,
-                       int ph, int pw, int pad_t, int pad_l) {
+void maxpool2d_s1_fp32(const float *in, float *out, int Hi, int Wi, int Ho,
+                       int Wo, int ph, int pw, int pad_t, int pad_l) {
   std::vector<float> tmp((size_t)Hi * Wi);
   const float ninf = std::numeric_limits<float>::lowest();
 
@@ -545,8 +544,7 @@ void maxpool2d_s1_fp32(const float *in, float *out,
 #ifdef __ARM_NEON
       for (; w + 4 <= w1; w += 4)
         vst1q_f32(trow + w,
-                  vmaxq_f32(vld1q_f32(trow + w),
-                            vld1q_f32(irow + w + shift)));
+                  vmaxq_f32(vld1q_f32(trow + w), vld1q_f32(irow + w + shift)));
 #endif
       for (; w < w1; ++w)
         if (irow[w + shift] > trow[w])
@@ -568,8 +566,7 @@ void maxpool2d_s1_fp32(const float *in, float *out,
 #ifdef __ARM_NEON
       for (; w + 4 <= Wo; w += 4)
         vst1q_f32(orow + w,
-                  vmaxq_f32(vld1q_f32(orow + w),
-                            vld1q_f32(trow + w)));
+                  vmaxq_f32(vld1q_f32(orow + w), vld1q_f32(trow + w)));
 #endif
       for (; w < Wo; ++w)
         if (trow[w] > orow[w])
@@ -579,9 +576,8 @@ void maxpool2d_s1_fp32(const float *in, float *out,
 }
 
 #ifdef ENABLE_FP16
-void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
-                       int Hi, int Wi, int Ho, int Wo,
-                       int ph, int pw, int pad_t, int pad_l) {
+void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out, int Hi, int Wi, int Ho,
+                       int Wo, int ph, int pw, int pad_t, int pad_l) {
   std::vector<_FP16> tmp((size_t)Hi * Wi);
   const _FP16 ninf = std::numeric_limits<_FP16>::lowest();
 
@@ -632,7 +628,7 @@ void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
     }
   }
 }
-#endif  // ENABLE_FP16
+#endif // ENABLE_FP16
 
 template <>
 void compute_kcaches(const float *in, const uint16_t *kcache, float *output,

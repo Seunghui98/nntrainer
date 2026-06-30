@@ -1267,10 +1267,9 @@ void __fallback_gemm_qs8d32p_qs4c32p_packed(size_t m, size_t n, size_t k,
   throw std::runtime_error("NYI : __fallback_gemm_qs8d32p_qs4c32p_packed");
 }
 
-
-void __fallback_maxpool2d_s1_fp32(const float *in, float *out,
-                                   int Hi, int Wi, int Ho, int Wo,
-                                   int ph, int pw, int pad_t, int pad_l) {
+void __fallback_maxpool2d_s1_fp32(const float *in, float *out, int Hi, int Wi,
+                                  int Ho, int Wo, int ph, int pw, int pad_t,
+                                  int pad_l) {
   const float ninf = std::numeric_limits<float>::lowest();
   std::vector<float> tmp((size_t)Hi * Wi);
 
@@ -1309,9 +1308,9 @@ void __fallback_maxpool2d_s1_fp32(const float *in, float *out,
 }
 
 #ifdef ENABLE_FP16
-void __fallback_maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
-                                   int Hi, int Wi, int Ho, int Wo,
-                                   int ph, int pw, int pad_t, int pad_l) {
+void __fallback_maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out, int Hi, int Wi,
+                                  int Ho, int Wo, int ph, int pw, int pad_t,
+                                  int pad_l) {
   const _FP16 ninf = std::numeric_limits<_FP16>::lowest();
   std::vector<_FP16> tmp((size_t)Hi * Wi);
 

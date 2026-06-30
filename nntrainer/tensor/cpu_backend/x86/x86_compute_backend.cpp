@@ -506,16 +506,14 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   nntrainer::avx2::clamp(input, output, length, lower_bound, upper_bound);
 }
 
-void maxpool2d_s1_fp32(const float *in, float *out,
-                       int Hi, int Wi, int Ho, int Wo,
-                       int ph, int pw, int pad_t, int pad_l) {
+void maxpool2d_s1_fp32(const float *in, float *out, int Hi, int Wi, int Ho,
+                       int Wo, int ph, int pw, int pad_t, int pad_l) {
   __fallback_maxpool2d_s1_fp32(in, out, Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
 }
 
 #ifdef ENABLE_FP16
-void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
-                       int Hi, int Wi, int Ho, int Wo,
-                       int ph, int pw, int pad_t, int pad_l) {
+void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out, int Hi, int Wi, int Ho,
+                       int Wo, int ph, int pw, int pad_t, int pad_l) {
   __fallback_maxpool2d_s1_fp16(in, out, Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
 }
 #endif

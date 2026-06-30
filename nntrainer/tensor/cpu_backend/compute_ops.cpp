@@ -151,8 +151,8 @@ void ComputeOps::transpose_matrix_fp32(unsigned int, unsigned int,
   NI(transpose_matrix_fp32);
 }
 
-void ComputeOps::maxpool2d_s1_fp32(const float *, float *,
-                                    int, int, int, int, int, int, int, int) {
+void ComputeOps::maxpool2d_s1_fp32(const float *, float *, int, int, int, int,
+                                   int, int, int, int) {
   NI(maxpool2d_s1_fp32);
 }
 
@@ -409,8 +409,8 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
                                                 float *, float *) {
   NI(compute_rotary_embedding_value);
 }
-void ComputeOps::maxpool2d_s1_fp16(const _FP16 *, _FP16 *,
-                                    int, int, int, int, int, int, int, int) {
+void ComputeOps::maxpool2d_s1_fp16(const _FP16 *, _FP16 *, int, int, int, int,
+                                   int, int, int, int) {
   NI(maxpool2d_s1_fp16);
 }
 #endif // ENABLE_FP16

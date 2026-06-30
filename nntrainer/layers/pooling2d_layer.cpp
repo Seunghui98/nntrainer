@@ -465,7 +465,8 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
     break;
   }
 
-  const unsigned int map_size = (unsigned int)in_height * (unsigned int)in_width;
+  const unsigned int map_size =
+    (unsigned int)in_height * (unsigned int)in_width;
   const unsigned int out_map = output.height() * output.width();
   const int height_stride_end = height - patch_height - pt;
   const int width_stride_end = width - patch_width - pl;
@@ -490,15 +491,15 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
         T *out_c = out_data + (size_t)c * out_map;
         if (neon_max) {
           if constexpr (std::is_same_v<T, float>) {
-            getComputeOps()->maxpool2d_s1_fp32(in_c, out_c, in_height, in_width,
-                                               Ho, Wo, (int)patch_height,
-                                               (int)patch_width, (int)pt, (int)pl);
+            getComputeOps()->maxpool2d_s1_fp32(
+              in_c, out_c, in_height, in_width, Ho, Wo, (int)patch_height,
+              (int)patch_width, (int)pt, (int)pl);
           }
 #ifdef ENABLE_FP16
           else if constexpr (std::is_same_v<T, _FP16>) {
-            getComputeOps()->maxpool2d_s1_fp16(in_c, out_c, in_height, in_width,
-                                               Ho, Wo, (int)patch_height,
-                                               (int)patch_width, (int)pt, (int)pl);
+            getComputeOps()->maxpool2d_s1_fp16(
+              in_c, out_c, in_height, in_width, Ho, Wo, (int)patch_height,
+              (int)patch_width, (int)pt, (int)pl);
           }
 #endif
           continue;

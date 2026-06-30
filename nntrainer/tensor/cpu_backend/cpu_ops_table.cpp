@@ -122,9 +122,9 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
-  void maxpool2d_s1_fp32(const float *in, float *out,
-                          int Hi, int Wi, int Ho, int Wo,
-                          int ph, int pw, int pad_t, int pad_l) override {
+  void maxpool2d_s1_fp32(const float *in, float *out, int Hi, int Wi, int Ho,
+                         int Wo, int ph, int pw, int pad_t,
+                         int pad_l) override {
     nntrainer::maxpool2d_s1_fp32(in, out, Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
   }
 
@@ -304,9 +304,9 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
-  void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
-                          int Hi, int Wi, int Ho, int Wo,
-                          int ph, int pw, int pad_t, int pad_l) override {
+  void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out, int Hi, int Wi, int Ho,
+                         int Wo, int ph, int pw, int pad_t,
+                         int pad_l) override {
     nntrainer::maxpool2d_s1_fp16(in, out, Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
   }
 

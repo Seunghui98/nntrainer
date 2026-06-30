@@ -135,9 +135,9 @@ public:
    * @brief Stride-1 max pool FP32.
    *        Single-channel kernel: in/out point to [Hi*Wi] / [Ho*Wo] planes.
    */
-  virtual void maxpool2d_s1_fp32(const float *in, float *out,
-                                  int Hi, int Wi, int Ho, int Wo,
-                                  int ph, int pw, int pad_t, int pad_l);
+  virtual void maxpool2d_s1_fp32(const float *in, float *out, int Hi, int Wi,
+                                 int Ho, int Wo, int ph, int pw, int pad_t,
+                                 int pad_l);
 
   // ===========================================================================
   // FP32 Data conversion / Copy
@@ -323,9 +323,9 @@ public:
                                      const _FP16 *src, unsigned int ld_src,
                                      _FP16 *dst, unsigned int ld_dst);
 
-  virtual void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
-                                  int Hi, int Wi, int Ho, int Wo,
-                                  int ph, int pw, int pad_t, int pad_l);
+  virtual void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out, int Hi, int Wi,
+                                 int Ho, int Wo, int ph, int pw, int pad_t,
+                                 int pad_l);
 
   // ===========================================================================
   // FP16 Data conversion
