@@ -129,6 +129,17 @@ public:
                                      float *dst, unsigned int ld_dst);
 
   // ===========================================================================
+  // FP32 Pooling ops
+  // ===========================================================================
+  /**
+   * @brief Stride-1 max pool FP32.
+   *        Single-channel kernel: in/out point to [Hi*Wi] / [Ho*Wo] planes.
+   */
+  virtual void maxpool2d_s1_fp32(const float *in, float *out,
+                                  int Hi, int Wi, int Ho, int Wo,
+                                  int ph, int pw, int pad_t, int pad_l);
+
+  // ===========================================================================
   // FP32 Data conversion / Copy
   // ===========================================================================
   virtual void scopy_u8(const unsigned int N, const uint8_t *X,
@@ -311,6 +322,10 @@ public:
   virtual void transpose_matrix_fp16(const unsigned int M, const unsigned int N,
                                      const _FP16 *src, unsigned int ld_src,
                                      _FP16 *dst, unsigned int ld_dst);
+
+  virtual void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
+                                  int Hi, int Wi, int Ho, int Wo,
+                                  int ph, int pw, int pad_t, int pad_l);
 
   // ===========================================================================
   // FP16 Data conversion

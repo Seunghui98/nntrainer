@@ -524,6 +524,116 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   neon::clamp(input, output, length, lower_bound, upper_bound);
 }
 
+void maxpool2d_s1_fp32(const float *in, float *out,
+                       int Hi, int Wi, int Ho, int Wo,
+                       int ph, int pw, int pad_t, int pad_l) {
+  std::vector<float> tmp((size_t)Hi * Wi);
+  const float ninf = std::numeric_limits<float>::lowest();
+
+  // Row pass
+  for (int ih = 0; ih < Hi; ++ih) {
+    const float *irow = in + (size_t)ih * Wi;
+    float *trow = tmp.data() + (size_t)ih * Wi;
+    for (int w = 0; w < Wi; ++w)
+      trow[w] = ninf;
+    for (int kw = 0; kw < pw; ++kw) {
+      const int shift = kw - pad_l;
+      const int w0 = (shift < 0) ? -shift : 0;
+      const int w1r = Wi - shift;
+      const int w1 = (Wo < w1r) ? Wo : w1r;
+      int w = w0;
+#ifdef __ARM_NEON
+      for (; w + 4 <= w1; w += 4)
+        vst1q_f32(trow + w,
+                  vmaxq_f32(vld1q_f32(trow + w),
+                            vld1q_f32(irow + w + shift)));
+#endif
+      for (; w < w1; ++w)
+        if (irow[w + shift] > trow[w])
+          trow[w] = irow[w + shift];
+    }
+  }
+
+  // Col pass
+  for (int oh = 0; oh < Ho; ++oh) {
+    float *orow = out + (size_t)oh * Wo;
+    for (int w = 0; w < Wo; ++w)
+      orow[w] = ninf;
+    for (int kh = 0; kh < ph; ++kh) {
+      const int ih = oh - pad_t + kh;
+      if (ih < 0 || ih >= Hi)
+        continue;
+      const float *trow = tmp.data() + (size_t)ih * Wi;
+      int w = 0;
+#ifdef __ARM_NEON
+      for (; w + 4 <= Wo; w += 4)
+        vst1q_f32(orow + w,
+                  vmaxq_f32(vld1q_f32(orow + w),
+                            vld1q_f32(trow + w)));
+#endif
+      for (; w < Wo; ++w)
+        if (trow[w] > orow[w])
+          orow[w] = trow[w];
+    }
+  }
+}
+
+#ifdef ENABLE_FP16
+void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
+                       int Hi, int Wi, int Ho, int Wo,
+                       int ph, int pw, int pad_t, int pad_l) {
+  std::vector<_FP16> tmp((size_t)Hi * Wi);
+  const _FP16 ninf = std::numeric_limits<_FP16>::lowest();
+
+  // Row pass
+  for (int ih = 0; ih < Hi; ++ih) {
+    const _FP16 *irow = in + (size_t)ih * Wi;
+    _FP16 *trow = tmp.data() + (size_t)ih * Wi;
+    for (int w = 0; w < Wi; ++w)
+      trow[w] = ninf;
+    for (int kw = 0; kw < pw; ++kw) {
+      const int shift = kw - pad_l;
+      const int w0 = (shift < 0) ? -shift : 0;
+      const int w1r = Wi - shift;
+      const int w1 = (Wo < w1r) ? Wo : w1r;
+      int w = w0;
+#ifdef __ARM_NEON
+      for (; w + 8 <= w1; w += 8)
+        vst1q_f16((__fp16 *)trow + w,
+                  vmaxq_f16(vld1q_f16((const __fp16 *)trow + w),
+                            vld1q_f16((const __fp16 *)irow + w + shift)));
+#endif
+      for (; w < w1; ++w)
+        if (irow[w + shift] > trow[w])
+          trow[w] = irow[w + shift];
+    }
+  }
+
+  // Col pass
+  for (int oh = 0; oh < Ho; ++oh) {
+    _FP16 *orow = out + (size_t)oh * Wo;
+    for (int w = 0; w < Wo; ++w)
+      orow[w] = ninf;
+    for (int kh = 0; kh < ph; ++kh) {
+      const int ih = oh - pad_t + kh;
+      if (ih < 0 || ih >= Hi)
+        continue;
+      const _FP16 *trow = tmp.data() + (size_t)ih * Wi;
+      int w = 0;
+#ifdef __ARM_NEON
+      for (; w + 8 <= Wo; w += 8)
+        vst1q_f16((__fp16 *)orow + w,
+                  vmaxq_f16(vld1q_f16((const __fp16 *)orow + w),
+                            vld1q_f16((const __fp16 *)trow + w)));
+#endif
+      for (; w < Wo; ++w)
+        if (trow[w] > orow[w])
+          orow[w] = trow[w];
+    }
+  }
+}
+#endif  // ENABLE_FP16
+
 template <>
 void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,

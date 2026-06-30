@@ -14,9 +14,10 @@
  */
 
 #include <cstring>
-#include <limits>
+#include <type_traits>
 
 #include <common_properties.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <nntr_threads.h>
 #include <nntrainer_error.h>
@@ -24,6 +25,7 @@
 #include <node_exporter.h>
 #include <pooling2d_layer.h>
 #include <util_func.h>
+
 namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -323,7 +325,10 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
   auto &pooling_type = std::get<props::PoolingType>(pooling2d_props).get();
 
   unsigned int channel = in.channel();
-  auto [pt, pb, pl, pr] = padding;
+  auto pt = padding[0];
+  auto pb = padding[1];
+  auto pl = padding[2];
+  auto pr = padding[3];
 
   int in_height = in.height();
   int in_width = in.width();
@@ -460,44 +465,66 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
     break;
   }
 
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    const float *in_data = in.getData<float>();
-    float *out_data = output.getData<float>();
+  const unsigned int map_size = (unsigned int)in_height * (unsigned int)in_width;
+  const unsigned int out_map = output.height() * output.width();
+  const int height_stride_end = height - patch_height - pt;
+  const int width_stride_end = width - patch_width - pl;
 
-    unsigned int map_size = in_height * in_width;
+  // For inference the channels are independent, so run them in parallel -- the
+  // surrounding forwarding() only parallelizes over batch, which is 1 here, so
+  // pooling was effectively single-threaded. Training keeps the original serial
+  // order so pool_helper (max indices) is written in the expected sequence.
+  // NEON-vectorized stride-1 max pooling fast path (inference only): the SPPF
+  // maxpools are 5x5 stride-1. For other configs / training fall back to the
+  // generic pool_fn.
+  const bool neon_max = !training &&
+                        pooling_type == props::PoolingTypeInfo::Enum::max &&
+                        stride[0].get() == 1 && stride[1].get() == 1;
+  const int Ho = (int)output.height(), Wo = (int)output.width();
 
-    int height_stride_end = height - patch_height - pt;
-    int width_stride_end = width - patch_width - pl;
-    for (unsigned int i = 0; i < channel; ++i) {
-      const float *in_data_channel_sliced = in_data + i * map_size;
-      for (int j = -(int)pt; j <= height_stride_end; j += stride[0]) {
-        for (int k = -(int)pl; k <= width_stride_end; k += stride[1]) {
-          float pool_value = pool_fn_fp32(in_data_channel_sliced, i, j, k);
-          *out_data = pool_value;
-          out_data++;
+  auto run = [&]<typename T>(const T *in_data, T *out_data,
+                             const typename PoolFunc<T>::Type &pool_fn) {
+    auto job = [&](unsigned int cs, unsigned int ce, unsigned int, void *) {
+      for (unsigned int c = cs; c < ce; ++c) {
+        const T *in_c = in_data + (size_t)c * map_size;
+        T *out_c = out_data + (size_t)c * out_map;
+        if (neon_max) {
+          if constexpr (std::is_same_v<T, float>) {
+            getComputeOps()->maxpool2d_s1_fp32(in_c, out_c, in_height, in_width,
+                                               Ho, Wo, (int)patch_height,
+                                               (int)patch_width, (int)pt, (int)pl);
+          }
+#ifdef ENABLE_FP16
+          else if constexpr (std::is_same_v<T, _FP16>) {
+            getComputeOps()->maxpool2d_s1_fp16(in_c, out_c, in_height, in_width,
+                                               Ho, Wo, (int)patch_height,
+                                               (int)patch_width, (int)pt, (int)pl);
+          }
+#endif
+          continue;
         }
+        unsigned int oi = 0;
+        for (int j = -(int)pt; j <= height_stride_end; j += stride[0])
+          for (int k = -(int)pl; k <= width_stride_end; k += stride[1])
+            out_c[oi++] = pool_fn(in_c, (int)c, j, k);
+      }
+    };
+    if (!training) {
+      auto workers = ParallelBatch(job, channel, nullptr);
+      if (workers.getNumWorkers() > 1) {
+        workers.run();
+        return;
       }
     }
+    job(0, channel, 0, nullptr);
+  };
+
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    run(in.getData<float>(), output.getData<float>(), pool_fn_fp32);
   }
 #ifdef ENABLE_FP16
   else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
-    const _FP16 *in_data = in.getData<_FP16>();
-    _FP16 *out_data = output.getData<_FP16>();
-
-    unsigned int map_size = in_height * in_width;
-
-    int height_stride_end = height - patch_height - pt;
-    int width_stride_end = width - patch_width - pl;
-    for (unsigned int i = 0; i < channel; ++i) {
-      const _FP16 *in_data_channel_sliced = in_data + i * map_size;
-      for (int j = -pt; j <= height_stride_end; j += stride[0]) {
-        for (int k = -pl; k <= width_stride_end; k += stride[1]) {
-          _FP16 pool_value = pool_fn_fp16(in_data_channel_sliced, i, j, k);
-          *out_data = pool_value;
-          out_data++;
-        }
-      }
-    }
+    run(in.getData<_FP16>(), output.getData<_FP16>(), pool_fn_fp16);
   }
 #endif
   else {

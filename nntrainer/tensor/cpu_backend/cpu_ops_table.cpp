@@ -122,6 +122,11 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
+  void maxpool2d_s1_fp32(const float *in, float *out,
+                          int Hi, int Wi, int Ho, int Wo,
+                          int ph, int pw, int pad_t, int pad_l) override {
+    nntrainer::maxpool2d_s1_fp32(in, out, Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
+  }
 
   // FP32 Data conversion / Copy
   void scopy_u8(unsigned int N, const uint8_t *X, unsigned int iX, uint8_t *Y,
@@ -298,6 +303,11 @@ public:
                              unsigned int lds, _FP16 *d,
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
+  }
+  void maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
+                          int Hi, int Wi, int Ho, int Wo,
+                          int ph, int pw, int pad_t, int pad_l) override {
+    nntrainer::maxpool2d_s1_fp16(in, out, Hi, Wi, Ho, Wo, ph, pw, pad_t, pad_l);
   }
 
   void scopy_int4_to_float16(unsigned int N, const uint8_t *X, unsigned int iX,

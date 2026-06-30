@@ -1267,4 +1267,87 @@ void __fallback_gemm_qs8d32p_qs4c32p_packed(size_t m, size_t n, size_t k,
   throw std::runtime_error("NYI : __fallback_gemm_qs8d32p_qs4c32p_packed");
 }
 
+
+void __fallback_maxpool2d_s1_fp32(const float *in, float *out,
+                                   int Hi, int Wi, int Ho, int Wo,
+                                   int ph, int pw, int pad_t, int pad_l) {
+  const float ninf = std::numeric_limits<float>::lowest();
+  std::vector<float> tmp((size_t)Hi * Wi);
+
+  // Row pass: tmp[ih][w] = max over pw-wide horizontal window of in
+  for (int ih = 0; ih < Hi; ++ih) {
+    const float *irow = in + (size_t)ih * Wi;
+    float *trow = tmp.data() + (size_t)ih * Wi;
+    for (int w = 0; w < Wi; ++w)
+      trow[w] = ninf;
+    for (int kw = 0; kw < pw; ++kw) {
+      const int shift = kw - pad_l;
+      const int w0 = (shift < 0) ? -shift : 0;
+      const int w1r = Wi - shift;
+      const int w1 = (Wo < w1r) ? Wo : w1r;
+      for (int w = w0; w < w1; ++w)
+        if (irow[w + shift] > trow[w])
+          trow[w] = irow[w + shift];
+    }
+  }
+
+  // Col pass: out[oh][w] = max over ph-tall vertical window of tmp
+  for (int oh = 0; oh < Ho; ++oh) {
+    float *orow = out + (size_t)oh * Wo;
+    for (int w = 0; w < Wo; ++w)
+      orow[w] = ninf;
+    for (int kh = 0; kh < ph; ++kh) {
+      const int ih = oh - pad_t + kh;
+      if (ih < 0 || ih >= Hi)
+        continue;
+      const float *trow = tmp.data() + (size_t)ih * Wi;
+      for (int w = 0; w < Wo; ++w)
+        if (trow[w] > orow[w])
+          orow[w] = trow[w];
+    }
+  }
+}
+
+#ifdef ENABLE_FP16
+void __fallback_maxpool2d_s1_fp16(const _FP16 *in, _FP16 *out,
+                                   int Hi, int Wi, int Ho, int Wo,
+                                   int ph, int pw, int pad_t, int pad_l) {
+  const _FP16 ninf = std::numeric_limits<_FP16>::lowest();
+  std::vector<_FP16> tmp((size_t)Hi * Wi);
+
+  // Row pass
+  for (int ih = 0; ih < Hi; ++ih) {
+    const _FP16 *irow = in + (size_t)ih * Wi;
+    _FP16 *trow = tmp.data() + (size_t)ih * Wi;
+    for (int w = 0; w < Wi; ++w)
+      trow[w] = ninf;
+    for (int kw = 0; kw < pw; ++kw) {
+      const int shift = kw - pad_l;
+      const int w0 = (shift < 0) ? -shift : 0;
+      const int w1r = Wi - shift;
+      const int w1 = (Wo < w1r) ? Wo : w1r;
+      for (int w = w0; w < w1; ++w)
+        if (irow[w + shift] > trow[w])
+          trow[w] = irow[w + shift];
+    }
+  }
+
+  // Col pass
+  for (int oh = 0; oh < Ho; ++oh) {
+    _FP16 *orow = out + (size_t)oh * Wo;
+    for (int w = 0; w < Wo; ++w)
+      orow[w] = ninf;
+    for (int kh = 0; kh < ph; ++kh) {
+      const int ih = oh - pad_t + kh;
+      if (ih < 0 || ih >= Hi)
+        continue;
+      const _FP16 *trow = tmp.data() + (size_t)ih * Wi;
+      for (int w = 0; w < Wo; ++w)
+        if (trow[w] > orow[w])
+          orow[w] = trow[w];
+    }
+  }
+}
+#endif
+
 } // namespace nntrainer
