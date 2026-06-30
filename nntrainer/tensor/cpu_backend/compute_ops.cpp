@@ -151,6 +151,12 @@ void ComputeOps::transpose_matrix_fp32(unsigned int, unsigned int,
   NI(transpose_matrix_fp32);
 }
 
+void ComputeOps::slice_contiguous_fp32(const float *, float *, unsigned int,
+                                       size_t, size_t, size_t, size_t, size_t,
+                                       size_t, size_t, size_t) {
+  NI(slice_contiguous_fp32);
+}
+
 void ComputeOps::scopy_u8(unsigned int, const uint8_t *, unsigned int,
                           uint8_t *, unsigned int) {
   NI(scopy_u8);
@@ -403,6 +409,11 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
                                                 unsigned int, _FP16 *, _FP16 *,
                                                 float *, float *) {
   NI(compute_rotary_embedding_value);
+}
+void ComputeOps::slice_contiguous_fp16(const _FP16 *, _FP16 *, unsigned int,
+                                       size_t, size_t, size_t, size_t, size_t,
+                                       size_t, size_t, size_t) {
+  NI(slice_contiguous_fp16);
 }
 #endif // ENABLE_FP16
 

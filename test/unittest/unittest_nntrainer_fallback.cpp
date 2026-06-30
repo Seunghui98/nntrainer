@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -1446,6 +1448,94 @@ TEST(nntrainer_fallback_kleidiai,
 
   constexpr float eps = 1e-3;
   EXPECT_LE(mse, eps * m * n * k);
+}
+
+//==============================================================================
+// Tests for slice_contiguous (axis-based memcpy slice)
+//==============================================================================
+
+static void ref_slice_contiguous(const float *src, float *dst,
+                                 unsigned int axis, size_t start, size_t N,
+                                 size_t Ci, size_t Hi, size_t Wi, size_t Co,
+                                 size_t Ho, size_t Wo) {
+  const size_t in_chw = Ci * Hi * Wi, out_chw = Co * Ho * Wo;
+  switch (axis) {
+  case 0:
+    std::memcpy(dst, src + start * in_chw, N * out_chw * sizeof(float));
+    break;
+  case 1:
+    for (size_t b = 0; b < N; ++b)
+      std::memcpy(dst + b * out_chw, src + b * in_chw + start * Hi * Wi,
+                  Co * Hi * Wi * sizeof(float));
+    break;
+  case 2:
+    for (size_t b = 0; b < N; ++b)
+      for (size_t c = 0; c < Co; ++c)
+        std::memcpy(dst + (b * Co + c) * Ho * Wo,
+                    src + (b * Ci + c) * Hi * Wi + start * Wi,
+                    Ho * Wo * sizeof(float));
+    break;
+  case 3:
+    for (size_t b = 0; b < N; ++b)
+      for (size_t c = 0; c < Co; ++c)
+        for (size_t h = 0; h < Ho; ++h)
+          std::memcpy(dst + ((b * Co + c) * Ho + h) * Wo,
+                      src + ((b * Ci + c) * Hi + h) * Wi + start,
+                      Wo * sizeof(float));
+    break;
+  }
+}
+
+TEST(nntrainer_fallback, slice_contiguous_axis0) {
+  const size_t N = 1, Ci = 3, Hi = 5, Wi = 5, Co = 3, Ho = 5, Wo = 5, start = 1;
+  std::vector<float> src(4 * Ci * Hi * Wi), dst(N * Co * Ho * Wo),
+    ref(N * Co * Ho * Wo);
+  std::iota(src.begin(), src.end(), 0.0f);
+  nntrainer::__fallback_slice_contiguous_fp32(src.data(), dst.data(), 0, start,
+                                              N, Ci, Hi, Wi, Co, Ho, Wo);
+  ref_slice_contiguous(src.data(), ref.data(), 0, start, N, Ci, Hi, Wi, Co, Ho,
+                       Wo);
+  for (size_t i = 0; i < dst.size(); ++i)
+    EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;
+}
+
+TEST(nntrainer_fallback, slice_contiguous_axis1) {
+  const size_t N = 2, Ci = 8, Hi = 4, Wi = 4, Co = 3, Ho = 4, Wo = 4, start = 2;
+  std::vector<float> src(N * Ci * Hi * Wi), dst(N * Co * Ho * Wo),
+    ref(N * Co * Ho * Wo);
+  std::iota(src.begin(), src.end(), 1.0f);
+  nntrainer::__fallback_slice_contiguous_fp32(src.data(), dst.data(), 1, start,
+                                              N, Ci, Hi, Wi, Co, Ho, Wo);
+  ref_slice_contiguous(src.data(), ref.data(), 1, start, N, Ci, Hi, Wi, Co, Ho,
+                       Wo);
+  for (size_t i = 0; i < dst.size(); ++i)
+    EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;
+}
+
+TEST(nntrainer_fallback, slice_contiguous_axis2) {
+  const size_t N = 2, Ci = 2, Hi = 6, Wi = 4, Co = 2, Ho = 3, Wo = 4, start = 1;
+  std::vector<float> src(N * Ci * Hi * Wi), dst(N * Co * Ho * Wo),
+    ref(N * Co * Ho * Wo);
+  std::iota(src.begin(), src.end(), 0.5f);
+  nntrainer::__fallback_slice_contiguous_fp32(src.data(), dst.data(), 2, start,
+                                              N, Ci, Hi, Wi, Co, Ho, Wo);
+  ref_slice_contiguous(src.data(), ref.data(), 2, start, N, Ci, Hi, Wi, Co, Ho,
+                       Wo);
+  for (size_t i = 0; i < dst.size(); ++i)
+    EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;
+}
+
+TEST(nntrainer_fallback, slice_contiguous_axis3) {
+  const size_t N = 2, Ci = 2, Hi = 4, Wi = 6, Co = 2, Ho = 4, Wo = 2, start = 3;
+  std::vector<float> src(N * Ci * Hi * Wi), dst(N * Co * Ho * Wo),
+    ref(N * Co * Ho * Wo);
+  std::iota(src.begin(), src.end(), 2.0f);
+  nntrainer::__fallback_slice_contiguous_fp32(src.data(), dst.data(), 3, start,
+                                              N, Ci, Hi, Wi, Co, Ho, Wo);
+  ref_slice_contiguous(src.data(), ref.data(), 3, start, N, Ci, Hi, Wi, Co, Ho,
+                       Wo);
+  for (size_t i = 0; i < dst.size(); ++i)
+    EXPECT_FLOAT_EQ(dst[i], ref[i]) << "at i=" << i;
 }
 
 //==============================================================================
