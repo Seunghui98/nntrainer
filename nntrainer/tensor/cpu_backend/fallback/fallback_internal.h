@@ -1245,6 +1245,24 @@ void __fallback_clamp(const T *input, T *output, size_t length,
 void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
                                     uint8_t *q4_0_weight);
 
+// ===========================================================================
+// Contiguous slice (memcpy)
+// ===========================================================================
+/**
+ * @brief Contiguous tensor slice along a given axis using memcpy.
+ */
+void __fallback_slice_contiguous_fp32(const float *src, float *dst,
+                                      unsigned int axis, size_t start, size_t N,
+                                      size_t Ci, size_t Hi, size_t Wi,
+                                      size_t Co, size_t Ho, size_t Wo);
+
+#ifdef ENABLE_FP16
+void __fallback_slice_contiguous_fp16(const _FP16 *src, _FP16 *dst,
+                                      unsigned int axis, size_t start, size_t N,
+                                      size_t Ci, size_t Hi, size_t Wi,
+                                      size_t Co, size_t Ho, size_t Wo);
+#endif
+
 /**
  * @brief Transform data from in-memory layout osv32_isv2 to block_q4_0x8 or
  * block_q4_0x4 (for ARM backend) in-memory layout.

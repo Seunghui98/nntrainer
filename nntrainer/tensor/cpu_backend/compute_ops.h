@@ -129,6 +129,17 @@ public:
                                      float *dst, unsigned int ld_dst);
 
   // ===========================================================================
+  // FP32 Data copy ops
+  // ===========================================================================
+  /**
+   * @brief Contiguous tensor slice along axis using memcpy.
+   */
+  virtual void slice_contiguous_fp32(const float *src, float *dst,
+                                     unsigned int axis, size_t start, size_t N,
+                                     size_t Ci, size_t Hi, size_t Wi, size_t Co,
+                                     size_t Ho, size_t Wo);
+
+  // ===========================================================================
   // FP32 Data conversion / Copy
   // ===========================================================================
   virtual void scopy_u8(const unsigned int N, const uint8_t *X,
@@ -311,6 +322,11 @@ public:
   virtual void transpose_matrix_fp16(const unsigned int M, const unsigned int N,
                                      const _FP16 *src, unsigned int ld_src,
                                      _FP16 *dst, unsigned int ld_dst);
+
+  virtual void slice_contiguous_fp16(const _FP16 *src, _FP16 *dst,
+                                     unsigned int axis, size_t start, size_t N,
+                                     size_t Ci, size_t Hi, size_t Wi, size_t Co,
+                                     size_t Ho, size_t Wo);
 
   // ===========================================================================
   // FP16 Data conversion

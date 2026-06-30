@@ -1306,6 +1306,19 @@ template <typename T = float>
 void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief Contiguous slice FP32 (fallback backend).
+ */
+void slice_contiguous_fp32(const float *src, float *dst, unsigned int axis,
+                           size_t start, size_t N, size_t Ci, size_t Hi,
+                           size_t Wi, size_t Co, size_t Ho, size_t Wo);
+
+#ifdef ENABLE_FP16
+void slice_contiguous_fp16(const _FP16 *src, _FP16 *dst, unsigned int axis,
+                           size_t start, size_t N, size_t Ci, size_t Hi,
+                           size_t Wi, size_t Co, size_t Ho, size_t Wo);
+#endif
 } /* namespace nntrainer */
 
 /**

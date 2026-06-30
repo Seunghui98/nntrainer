@@ -506,6 +506,22 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   nntrainer::avx2::clamp(input, output, length, lower_bound, upper_bound);
 }
 
+void slice_contiguous_fp32(const float *src, float *dst, unsigned int axis,
+                           size_t start, size_t N, size_t Ci, size_t Hi,
+                           size_t Wi, size_t Co, size_t Ho, size_t Wo) {
+  __fallback_slice_contiguous_fp32(src, dst, axis, start, N, Ci, Hi, Wi, Co, Ho,
+                                   Wo);
+}
+
+#ifdef ENABLE_FP16
+void slice_contiguous_fp16(const _FP16 *src, _FP16 *dst, unsigned int axis,
+                           size_t start, size_t N, size_t Ci, size_t Hi,
+                           size_t Wi, size_t Co, size_t Ho, size_t Wo) {
+  __fallback_slice_contiguous_fp16(src, dst, axis, start, N, Ci, Hi, Wi, Co, Ho,
+                                   Wo);
+}
+#endif
+
 void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
   nntrainer::avx2::create_q4_0_weights(int4_weight, q4_0_weight);
 }

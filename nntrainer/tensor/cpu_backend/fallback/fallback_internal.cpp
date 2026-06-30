@@ -659,6 +659,76 @@ void __fallback_clamp(const float *input, float *output, size_t length,
   }
 }
 
+void __fallback_slice_contiguous_fp32(const float *src, float *dst,
+                                      unsigned int axis, size_t start, size_t N,
+                                      size_t Ci, size_t Hi, size_t Wi,
+                                      size_t Co, size_t Ho, size_t Wo) {
+  const size_t in_chw = Ci * Hi * Wi, out_chw = Co * Ho * Wo;
+  switch (axis) {
+  case 0:
+    std::memcpy(dst, src + start * in_chw, N * out_chw * sizeof(float));
+    return;
+  case 1:
+    for (size_t b = 0; b < N; ++b)
+      std::memcpy(dst + b * out_chw, src + b * in_chw + start * Hi * Wi,
+                  Co * Hi * Wi * sizeof(float));
+    return;
+  case 2:
+    for (size_t b = 0; b < N; ++b)
+      for (size_t c = 0; c < Co; ++c)
+        std::memcpy(dst + (b * Co + c) * Ho * Wo,
+                    src + (b * Ci + c) * Hi * Wi + start * Wi,
+                    Ho * Wo * sizeof(float));
+    return;
+  case 3:
+    for (size_t b = 0; b < N; ++b)
+      for (size_t c = 0; c < Co; ++c)
+        for (size_t h = 0; h < Ho; ++h)
+          std::memcpy(dst + ((b * Co + c) * Ho + h) * Wo,
+                      src + ((b * Ci + c) * Hi + h) * Wi + start,
+                      Wo * sizeof(float));
+    return;
+  default:
+    break;
+  }
+}
+
+#ifdef ENABLE_FP16
+void __fallback_slice_contiguous_fp16(const _FP16 *src, _FP16 *dst,
+                                      unsigned int axis, size_t start, size_t N,
+                                      size_t Ci, size_t Hi, size_t Wi,
+                                      size_t Co, size_t Ho, size_t Wo) {
+  const size_t in_chw = Ci * Hi * Wi, out_chw = Co * Ho * Wo;
+  switch (axis) {
+  case 0:
+    std::memcpy(dst, src + start * in_chw, N * out_chw * sizeof(_FP16));
+    return;
+  case 1:
+    for (size_t b = 0; b < N; ++b)
+      std::memcpy(dst + b * out_chw, src + b * in_chw + start * Hi * Wi,
+                  Co * Hi * Wi * sizeof(_FP16));
+    return;
+  case 2:
+    for (size_t b = 0; b < N; ++b)
+      for (size_t c = 0; c < Co; ++c)
+        std::memcpy(dst + (b * Co + c) * Ho * Wo,
+                    src + (b * Ci + c) * Hi * Wi + start * Wi,
+                    Ho * Wo * sizeof(_FP16));
+    return;
+  case 3:
+    for (size_t b = 0; b < N; ++b)
+      for (size_t c = 0; c < Co; ++c)
+        for (size_t h = 0; h < Ho; ++h)
+          std::memcpy(dst + ((b * Co + c) * Ho + h) * Wo,
+                      src + ((b * Ci + c) * Hi + h) * Wi + start,
+                      Wo * sizeof(_FP16));
+    return;
+  default:
+    break;
+  }
+}
+#endif
+
 void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
                                     uint8_t *q4_0_weight) {
   for (int i = 0; i < 8; i++) {

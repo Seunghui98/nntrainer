@@ -456,4 +456,20 @@ void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
                                          idx_variant, lower_bound, upper_bound);
 }
 
+void slice_contiguous_fp32(const float *src, float *dst, unsigned int axis,
+                           size_t start, size_t N, size_t Ci, size_t Hi,
+                           size_t Wi, size_t Co, size_t Ho, size_t Wo) {
+  __fallback_slice_contiguous_fp32(src, dst, axis, start, N, Ci, Hi, Wi, Co, Ho,
+                                   Wo);
+}
+
+#ifdef ENABLE_FP16
+void slice_contiguous_fp16(const _FP16 *src, _FP16 *dst, unsigned int axis,
+                           size_t start, size_t N, size_t Ci, size_t Hi,
+                           size_t Wi, size_t Co, size_t Ho, size_t Wo) {
+  __fallback_slice_contiguous_fp16(src, dst, axis, start, N, Ci, Hi, Wi, Co, Ho,
+                                   Wo);
+}
+#endif
+
 } /* namespace nntrainer */

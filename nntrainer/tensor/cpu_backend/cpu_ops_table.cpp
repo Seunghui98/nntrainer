@@ -122,6 +122,13 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
+  void slice_contiguous_fp32(const float *src, float *dst, unsigned int axis,
+                             size_t start, size_t N, size_t Ci, size_t Hi,
+                             size_t Wi, size_t Co, size_t Ho,
+                             size_t Wo) override {
+    nntrainer::slice_contiguous_fp32(src, dst, axis, start, N, Ci, Hi, Wi, Co,
+                                     Ho, Wo);
+  }
 
   // FP32 Data conversion / Copy
   void scopy_u8(unsigned int N, const uint8_t *X, unsigned int iX, uint8_t *Y,
@@ -298,6 +305,13 @@ public:
                              unsigned int lds, _FP16 *d,
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
+  }
+  void slice_contiguous_fp16(const _FP16 *src, _FP16 *dst, unsigned int axis,
+                             size_t start, size_t N, size_t Ci, size_t Hi,
+                             size_t Wi, size_t Co, size_t Ho,
+                             size_t Wo) override {
+    nntrainer::slice_contiguous_fp16(src, dst, axis, start, N, Ci, Hi, Wi, Co,
+                                     Ho, Wo);
   }
 
   void scopy_int4_to_float16(unsigned int N, const uint8_t *X, unsigned int iX,
