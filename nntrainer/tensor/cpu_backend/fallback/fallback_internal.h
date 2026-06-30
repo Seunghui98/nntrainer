@@ -1245,6 +1245,22 @@ void __fallback_clamp(const T *input, T *output, size_t length,
 void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
                                     uint8_t *q4_0_weight);
 
+// ===========================================================================
+// Nearest-neighbor upsample (memcpy)
+// ===========================================================================
+/**
+ * @brief Nearest-neighbor 2D upsample using row-replicate memcpy.
+ */
+void __fallback_nearest_upsample_fp32(const float *src, float *dst,
+                                       size_t N, size_t C, size_t Hi, size_t Wi,
+                                       unsigned int ksh, unsigned int ksw);
+
+#ifdef ENABLE_FP16
+void __fallback_nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
+                                       size_t N, size_t C, size_t Hi, size_t Wi,
+                                       unsigned int ksh, unsigned int ksw);
+#endif
+
 /**
  * @brief Transform data from in-memory layout osv32_isv2 to block_q4_0x8 or
  * block_q4_0x4 (for ARM backend) in-memory layout.

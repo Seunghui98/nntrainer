@@ -506,6 +506,20 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   nntrainer::avx2::clamp(input, output, length, lower_bound, upper_bound);
 }
 
+void nearest_upsample_fp32(const float *src, float *dst,
+                           size_t N, size_t C, size_t Hi, size_t Wi,
+                           unsigned int ksh, unsigned int ksw) {
+  __fallback_nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh, ksw);
+}
+
+#ifdef ENABLE_FP16
+void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
+                           size_t N, size_t C, size_t Hi, size_t Wi,
+                           unsigned int ksh, unsigned int ksw) {
+  __fallback_nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh, ksw);
+}
+#endif
+
 void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
   nntrainer::avx2::create_q4_0_weights(int4_weight, q4_0_weight);
 }

@@ -1267,4 +1267,55 @@ void __fallback_gemm_qs8d32p_qs4c32p_packed(size_t m, size_t n, size_t k,
   throw std::runtime_error("NYI : __fallback_gemm_qs8d32p_qs4c32p_packed");
 }
 
+
+void __fallback_nearest_upsample_fp32(const float *src, float *dst,
+                                       size_t N, size_t C, size_t Hi, size_t Wi,
+                                       unsigned int ksh, unsigned int ksw) {
+  const size_t Wo = Wi * ksw;
+  for (size_t b = 0; b < N; ++b) {
+    for (size_t c = 0; c < C; ++c) {
+      const float *sp = src + (b * C + c) * Hi * Wi;
+      float *dp = dst + (b * C + c) * Hi * ksh * Wo;
+      for (size_t hi = 0; hi < Hi; ++hi) {
+        const float *srow = sp + hi * Wi;
+        float *drow0 = dp + hi * ksh * Wo;
+        for (size_t wi = 0; wi < Wi; ++wi) {
+          float v = srow[wi];
+          float *o = drow0 + wi * ksw;
+          for (unsigned int k = 0; k < ksw; ++k)
+            o[k] = v;
+        }
+        for (unsigned int kh = 1; kh < ksh; ++kh)
+          std::memcpy(dp + (hi * ksh + kh) * Wo, drow0, Wo * sizeof(float));
+      }
+    }
+  }
+}
+
+#ifdef ENABLE_FP16
+void __fallback_nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
+                                       size_t N, size_t C, size_t Hi, size_t Wi,
+                                       unsigned int ksh, unsigned int ksw) {
+  const size_t Wo = Wi * ksw;
+  for (size_t b = 0; b < N; ++b) {
+    for (size_t c = 0; c < C; ++c) {
+      const _FP16 *sp = src + (b * C + c) * Hi * Wi;
+      _FP16 *dp = dst + (b * C + c) * Hi * ksh * Wo;
+      for (size_t hi = 0; hi < Hi; ++hi) {
+        const _FP16 *srow = sp + hi * Wi;
+        _FP16 *drow0 = dp + hi * ksh * Wo;
+        for (size_t wi = 0; wi < Wi; ++wi) {
+          _FP16 v = srow[wi];
+          _FP16 *o = drow0 + wi * ksw;
+          for (unsigned int k = 0; k < ksw; ++k)
+            o[k] = v;
+        }
+        for (unsigned int kh = 1; kh < ksh; ++kh)
+          std::memcpy(dp + (hi * ksh + kh) * Wo, drow0, Wo * sizeof(_FP16));
+      }
+    }
+  }
+}
+#endif
+
 } // namespace nntrainer

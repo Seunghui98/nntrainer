@@ -456,4 +456,18 @@ void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
                                          idx_variant, lower_bound, upper_bound);
 }
 
+void nearest_upsample_fp32(const float *src, float *dst, size_t N, size_t C,
+                           size_t Hi, size_t Wi, unsigned int ksh,
+                           unsigned int ksw) {
+  __fallback_nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh, ksw);
+}
+
+#ifdef ENABLE_FP16
+void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst, size_t N, size_t C,
+                           size_t Hi, size_t Wi, unsigned int ksh,
+                           unsigned int ksw) {
+  __fallback_nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh, ksw);
+}
+#endif
+
 } /* namespace nntrainer */

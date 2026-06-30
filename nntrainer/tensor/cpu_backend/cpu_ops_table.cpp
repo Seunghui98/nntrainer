@@ -122,6 +122,11 @@ public:
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
+  void nearest_upsample_fp32(const float *src, float *dst,
+                              size_t N, size_t C, size_t Hi, size_t Wi,
+                              unsigned int ksh, unsigned int ksw) override {
+    nntrainer::nearest_upsample_fp32(src, dst, N, C, Hi, Wi, ksh, ksw);
+  }
 
   // FP32 Data conversion / Copy
   void scopy_u8(unsigned int N, const uint8_t *X, unsigned int iX, uint8_t *Y,
@@ -298,6 +303,11 @@ public:
                              unsigned int lds, _FP16 *d,
                              unsigned int ldd) override {
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
+  }
+  void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
+                              size_t N, size_t C, size_t Hi, size_t Wi,
+                              unsigned int ksh, unsigned int ksw) override {
+    nntrainer::nearest_upsample_fp16(src, dst, N, C, Hi, Wi, ksh, ksw);
   }
 
   void scopy_int4_to_float16(unsigned int N, const uint8_t *X, unsigned int iX,

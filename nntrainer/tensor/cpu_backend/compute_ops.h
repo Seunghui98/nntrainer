@@ -128,6 +128,13 @@ public:
                                      const float *src, unsigned int ld_src,
                                      float *dst, unsigned int ld_dst);
 
+  /**
+   * @brief Nearest-neighbor 2D upsample using row-replicate memcpy.
+   */
+  virtual void nearest_upsample_fp32(const float *src, float *dst,
+                                      size_t N, size_t C, size_t Hi, size_t Wi,
+                                      unsigned int ksh, unsigned int ksw);
+
   // ===========================================================================
   // FP32 Data conversion / Copy
   // ===========================================================================
@@ -311,6 +318,10 @@ public:
   virtual void transpose_matrix_fp16(const unsigned int M, const unsigned int N,
                                      const _FP16 *src, unsigned int ld_src,
                                      _FP16 *dst, unsigned int ld_dst);
+
+  virtual void nearest_upsample_fp16(const _FP16 *src, _FP16 *dst,
+                                      size_t N, size_t C, size_t Hi, size_t Wi,
+                                      unsigned int ksh, unsigned int ksw);
 
   // ===========================================================================
   // FP16 Data conversion
