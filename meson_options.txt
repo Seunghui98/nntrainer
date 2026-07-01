@@ -33,6 +33,18 @@ option('enable-npu', type: 'boolean', value: false)
 # Alternatively: export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
 # See docs/backend_guide/QNN_BUILD.md for details.
 option('qnn-sdk-root', type: 'string', value: '')
+# HTP (Hexagon Tensor Processor / HMX) backend via the Qualcomm HexKL
+# CPU Macro API (sdkl.h / libsdkl.so). Proprietary SDK is NOT vendored;
+# pass the extracted hexkl_addon root, e.g.:
+#   meson setup build -Denable-htp=true \
+#     -Dhexkl-sdk-root=/path/to/Hexagon_SDK/.../addons/hexkl_addon
+# ARM/Android only (no x86 libsdkl.so). See docs/superpowers/plans.
+option('enable-htp', type: 'boolean', value: false)
+option('hexkl-sdk-root', type: 'string', value: '')
+# Which prebuilt libsdkl.so to link (lib/<subdir>/libsdkl.so). Keep the CPU-side
+# SDKL helper on armv8: the armv9 prebuilt may use instructions unavailable to
+# the Android app process on current SM8750/V79 devices.
+option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26')
 option('mmap-read', type: 'boolean', value: true)
 option('enable-kernel-caching', type: 'boolean', value: false)
 

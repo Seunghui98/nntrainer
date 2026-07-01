@@ -31,6 +31,7 @@
 #include <common.h>
 #include <cpu_backend.h>
 #include <layer_context.h>
+#include <quantizer.h>
 #include <tensor_dim.h>
 
 namespace ml::train {
@@ -380,16 +381,16 @@ public:
               weight.getDataType() == dtype)
             weight.save(file);
           else {
+            TensorDim dim = weight.getDim();
+            unsigned int K = dim.height();
+            unsigned int N = dim.width();
+
             if (dtype == TensorDim::DataType::Q4_0) {
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)
                 << "Save with quantization only supports for FP32 weight.";
               ///@note The codelines below can be replaced with quantizer's
               /// quantize()
-              TensorDim dim = weight.getDim();
-              unsigned int K = dim.height();
-              unsigned int N = dim.width();
-
               // Skip quantization for bias-like tensors (1D with height == 1)
               // as they are not suitable for Q4_0 block quantization
               if (K == 1) {
@@ -434,6 +435,16 @@ public:
               nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
                                          true);
               file.write((const char *)data, q_size + scale_size);
+            } else if (dtype == TensorDim::DataType::QINT8) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                quantize_qint8_weight(weight, true).save(file);
+              }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
