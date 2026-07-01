@@ -41,6 +41,11 @@ if get_option('enable-htp')
   nntrainer_base_deps += hexkl_dep
 endif
 
+if host_machine.system() == 'android'
+  nntrainer_base_deps += meson.get_compiler('cpp').find_library('log')
+  nntrainer_base_deps += meson.get_compiler('cpp').find_library('android')
+endif
+
 if get_option('platform') == 'tizen'
   nntrainer_base_deps += dependency('dlog')
 endif

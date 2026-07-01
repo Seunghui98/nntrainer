@@ -33,6 +33,8 @@ struct WHEntry {
 // Weight cache with a hard cap on total NPU bytes to avoid DMA exhaustion.
 // When the cap is exceeded, the oldest entry (by insertion order) is evicted.
 static constexpr size_t WH_CACHE_MAX_BYTES = 64 * 1024 * 1024; // 64 MB
+static constexpr size_t PREFILL_WH_CACHE_MAX_BYTES =
+  128 * 1024 * 1024; // 128 MB
 
 struct WHCache {
   std::map<const void *, WHEntry> cache;
@@ -60,14 +62,29 @@ struct WHCache {
   }
 } g_wh_cache;
 
-// Persistent WH weight residency for prefill (M>1). Unlike WHCache, entries
-// are never evicted: populated once (typically at warmup) and reused for the
-// whole process lifetime. RM master weights are untouched so the decode
-// (CPU hsgemv) path keeps working. Memory cost: one WH copy per prefill weight
-// (confirmed to fit the NPU DMA budget for the target model).
+// Persistent WH weight residency for prefill (M>1). Mirrors WHCache with
+// FIFO eviction capped at PREFILL_WH_CACHE_MAX_BYTES to avoid NPU DMA
+// exhaustion (full model weights exceed the hardware limit). Entries populated
+// during warmup and reused for subsequent prefill calls; misses fall back to
+// transient per-call staging.
 struct PrefillWHCache {
   std::map<const void *, WHEntry> cache;
+  std::vector<const void *> order;
+  size_t total_bytes = 0;
   std::mutex mtx;
+
+  void evict_one() {
+    if (order.empty())
+      return;
+    const void *oldest = order.front();
+    order.erase(order.begin());
+    auto it = cache.find(oldest);
+    if (it != cache.end()) {
+      total_bytes -= it->second.bytes;
+      sdkl_npu_free(it->second.npu);
+      cache.erase(it);
+    }
+  }
 
   ~PrefillWHCache() {
     for (auto &e : cache)
@@ -75,33 +92,21 @@ struct PrefillWHCache {
   }
 } g_prefill_wh;
 
-// Return a resident WH pointer for RM weight B, converting+allocating on first
-// request. Returns nullptr on alloc/convert failure so the caller can fall back
-// to a transient conversion (result stays correct, only slower).
-const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
-                                     unsigned int K) {
-  std::lock_guard<std::mutex> lk(g_prefill_wh.mtx);
-  auto it = g_prefill_wh.cache.find(B);
-  if (it != g_prefill_wh.cache.end()) {
-    if (it->second.N == N && it->second.K == K)
-      return static_cast<const _Float16 *>(it->second.npu);
-    // Pointer reused with a different shape: drop stale entry and rebuild.
-    sdkl_npu_free(it->second.npu);
-    g_prefill_wh.cache.erase(it);
-  }
-
-  const size_t w_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
-  void *w_npu = nullptr;
-  if (sdkl_npu_alloc(w_bytes, &w_npu) != 0 || w_npu == nullptr)
-    return nullptr;
-  std::memcpy(w_npu, B, w_bytes);
-  if (sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K, (_Float16 *)w_npu) !=
-      0) {
-    sdkl_npu_free(w_npu);
-    return nullptr;
-  }
-  g_prefill_wh.cache[B] = {w_npu, N, K, w_bytes};
-  return static_cast<const _Float16 *>(w_npu);
+// Return a resident WH pointer for RM weight B, converting and caching on
+// first request. FIFO eviction keeps total NPU bytes under
+// PREFILL_WH_CACHE_MAX_BYTES.
+//
+// DISABLED: On-device testing with Qwen3-0.6B (28 layers × 3 FC = 84 calls,
+// each weight ~4 MB) showed that even with FIFO eviction the accumulation of
+// NPU DMA mappings saturates the DSP mapping pool before evictions can reclaim
+// space — sdkl_npu_free returns Err=1 on valid pointers once the pool is
+// exhausted, leading to a crash. WHCache (decode, 64 MB cap) + transient
+// X_npu + A_npu per call is the confirmed-safe pool usage pattern.
+// Re-enable only after the DSP mapping pool budget is known and the cap is
+// set to (pool_limit − WHCache_max − peak_transient_per_call).
+const _Float16 *getOrCreatePrefillWH(const void * /*B*/, unsigned int /*N*/,
+                                     unsigned int /*K*/) {
+  return nullptr;
 }
 } // namespace
 

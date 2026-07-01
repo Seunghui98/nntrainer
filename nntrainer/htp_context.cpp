@@ -54,7 +54,10 @@ void HtpContext::initialize() noexcept {
     // still runs, transparently, on the CPU.
     if (HtpBackend::global().enabled()) {
       cd->setComputeOps(get_htp_ops());
-      cd->setMemAllocator(std::make_shared<HtpMemAllocator>());
+      // Use the default CPU allocator for model tensors (weights, activations).
+      // shgemm_f32f16_f32 stages data into NPU-accessible buffers per-call via
+      // sdkl_npu_alloc; allocating all model tensors with HtpMemAllocator would
+      // exhaust the NPU DMA pool on a full transformer model.
     } else
       cd->setComputeOps(get_cpu_ops());
   } catch (...) {

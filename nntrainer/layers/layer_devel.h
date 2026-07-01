@@ -445,6 +445,11 @@ public:
               } else {
                 quantize_qint8_weight(weight, true).save(file);
               }
+            } else if (dtype == TensorDim::DataType::FP16) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "FP16 save only supports FP32 source weights.";
+              weight.clone(TensorDim::DataType::FP16).save(file);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
