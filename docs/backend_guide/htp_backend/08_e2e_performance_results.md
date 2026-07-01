@@ -62,3 +62,45 @@ peak memory: 3252140 KB (~3.1 GB)
 | **CPU (ms)** | CPU NEON `shgemm` (KleidiAI 기반 단일 스레드) 실행 시간 |
 | **Speedup** | CPU 시간 / NPU 시간 |
 | **Throughput (GFLOPS)** | FLOPs(2xMxNxK) / (NPU 실행시간 x 10^9) |
+
+---
+
+## 5. FP16 Prefill WH-Residency (Pin-Once + Warmup) — 2026-07-02
+
+**목표:** warmup 이후 prefill에서 WH 레이아웃 변환(rm_to_wh) 비용 부분 제거
+
+**기기:** Galaxy S25 Ultra (R3CY205ZMND, Snapdragon 8 Elite V79 HTP)  
+**모델:** Qwen3-0.6B FP16 HTP (`fsu: false`, `compute_engine: htp`)  
+**빌드:** `armv8_android26/libsdkl.so`, `PREFILL_WH_PIN_MAX_BYTES = 48 MB`
+
+### 5-1. NPU DMA 풀 프로브
+
+| 측정 방식 | 결과 | 비고 |
+| :--- | :--- | :--- |
+| Transient (Task 1: 4 MB chunks, all freed) | 4000 MB | pin-once 산정에 사용 불가 |
+| Raw sustained-pin (Task 4a: 4/6/6 MB cycling, never freed) | 448 MB / 84 weights | 루프 상한 도달, 할당기 미실패 |
+| 커널 실행 중 실효 예산 | **~48 MB (~9 weights)** | sdkl_npu_mm 내부 스크래치 ~400 MB 영구 점유 |
+
+### 5-2. 단계별 transient prefill 시간 (Task 3 측정, M=16)
+
+| Shape | alloc (ms) | memcpy (ms) | rm2wh (ms) | mm (ms) | copyback (ms) | rm2wh 비율 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| q_proj (2048×1024) | 0.345 | 0.263 | 25.938 | 0.175 | 0.004 | 96.8% |
+| gate_up_proj (3072×1024) | 0.388 | 0.306 | 30.034 | 0.211 | 0.006 | 96.7% |
+| down_proj (1024×3072) | 0.372 | 0.315 | 36.062 | 0.214 | 0.002 | 97.8% |
+
+rm_to_wh가 transient prefill 비용의 96-98%를 차지. 9개 가중치 pin-once 시 9×30 ms ≈ 270 ms 절감 예상.
+
+### 5-3. E2E Prefill A/B (warmup off vs on, 48 MB cap)
+
+| 구성 | prefill run1 (ms) | prefill run2 (ms) | 평균 (ms) | 평균 TPS | 개선 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| warmup_prefill: false (cold) | 3922 | 3978 | 3950 | 5.82 | — |
+| warmup_prefill: true (warmed) | 3831 | 4466 | 4149 | 5.58 | -5.0% |
+
+**비고:** warmup-ON run2(4466 ms)는 이상치로 추정됨(thermal throttling). 동일 세션 첫 warmup-ON 측정(sanity check)은 3539 ms로 +10.4% 개선이었으나 A/B 평균은 noise에 잠김. run-to-run 분산(±300-400 ms)이 예측 개선(270 ms)보다 커서 통계적으로 불확실.
+
+**pin 상주 가중치:** ~9/84 (48 MB / ~448 MB 모델 총합) — 레이어 1-3의 FC 3종  
+**A2 필요 여부:** A1의 실효 residency는 B_effective≈48 MB로 한계. 더 큰 개선은 A2 설계 필요.
+
+*주: generation TPS는 decode=CPU NEON 고정이므로 pin-once와 무관.*

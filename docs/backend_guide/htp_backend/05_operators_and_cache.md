@@ -24,22 +24,26 @@ Qualcomm HMX 연산 타일은 가중치 행렬이 WH(Width-Height) 레이아웃�
 
 `shgemm_f32f16_f32` 내부에서 M 크기에 따라 두 경로로 분기합니다.
 
-### 3-1. Prefill (M > 1) — Transient Alloc 경로
+### 3-1. Prefill (M > 1) — PrefillWHCache (pin-once) + Transient Fallback
 
-- `sdkl_npu_alloc(W_npu)` → RM→WH 변환 → 연산 → `sdkl_npu_free(W_npu)` 1회성 처리
-- WHCache를 **완전히 스킵**: LLM prefill에서 동일 가중치가 1번만 참조되므로 캐싱 이득이 없음
-- 최대 NPU DMA 점유: 호출당 `N×K×2 bytes` (FP16)로 제한됨
+`g_prefill_wh` (`PrefillWHCache`)를 통해 WH 레이아웃 변환 비용을 최초 1회만 지불합니다.
 
-### 3-2. Decode (M = 1) — WHCache 경로
+| 상태 | 처리 | W_npu 수명 |
+| :--- | :--- | :--- |
+| 캐시 **히트** (동일 포인터 + N,K) | 즉시 pinned WH 포인터 반환 | 프로세스 수명 내내 유지 |
+| 캐시 **미스** + `total_bytes + new_bytes ≤ 48 MB` | alloc + memcpy + rm_to_wh + pin | 프로세스 수명 내내 유지 |
+| 캐시 **미스** + 캡 초과 또는 alloc 실패 | pin 안 함, `nullptr` 반환 → transient 경로 | 1회 호출 후 즉시 free |
 
-디코드 단계에서는 동일 가중치가 토큰 생성 루프 전체에 걸쳐 반복 참조됩니다.
+**상수:** `PREFILL_WH_PIN_MAX_BYTES = 48 MB` (hexkl_mm.cpp:41)
 
-- **용량 상한**: `WH_CACHE_MAX_BYTES = 64 MB`로 고정 — NPU DMA 자원 고갈 방지
-- **키**: 가중치 포인터 `B`(기존 CPU 버퍼 주소)
-- **캐시 미스**: NPU 버퍼 할당 + RM→WH 변환 + 삽입
-- **캐시 히트**: 이미 WH로 변환된 `W_npu` 재사용 — 할당·변환 비용 0
-- **FIFO 만료(Eviction)**: 삽입 순서(`std::vector<const void*> order`)를 추적하여 용량 초과 시 가장 오래된 엔트리를 `sdkl_npu_free`로 제거
-- **종료 처리**: `WHCache` 소멸자에서 잔여 엔트리 전량 해제
+Qwen3-0.6B 기준 48 MB 내에 pin 가능한 가중치는 레이어 1-3의 FC 3종×3레이어 = **9개(48 MB)**. 나머지 레이어(4-28)는 `nullptr`을 받아 transient 경로를 사용합니다.
+
+### 3-2. Decode (M = 1) — CPU NEON 고정 (g_wh_cache 미사용)
+
+**Decode(M=1)는 NPU shgemm 경로에 진입하지 않습니다.** `float_tensor.cpp::dotFloat32Float16`에서 M==1 조건을 먼저 검사하여 CPU NEON `hsgemv`로 분기하므로 `shgemm_f32f16_f32`가 호출되지 않습니다.
+
+- `g_wh_cache` (FIFO WHCache, 64 MB 캡, `hexkl_mm.cpp`)는 소스에 존재하지만 **실제로 채워지지 않습니다.**
+- decode → CPU 고정 라우팅은 메모리 대역폭 제한 구간에서 CPU NEON이 경쟁력 있고, NPU FastRPC 왕복 오버헤드가 불리하기 때문입니다.
 
 ## 4. QINT8 GEMM 파이프라인 (`shgemm_u8i8_i32`)
 
@@ -64,6 +68,7 @@ C (FP32, M×N)  [C[m,n] = act_scale × wt_scale[n] × (C_i32[m,n] − zp_corr[n]
 
 | 조건 | 실행 경로 | 이유 |
 | :--- | :--- | :--- |
-| M == 1 (decode) | CPU `hsgemv` | 메모리 대역 제한 구간; CPU NEON FP16이 경쟁력 있음 |
-| M > 1 && N%32==0 && `supports_shgemm()` | NPU `shgemm_f32f16_f32` (transient) | HMX 타일 병렬성 유효 |
+| M == 1 (decode) | CPU `hsgemv` | 메모리 대역 제한 구간; CPU NEON FP16이 경쟁력 있음. shgemm 진입 전에 분기 |
+| M > 1 && N%32==0 && `supports_shgemm()` && PrefillWHCache 히트 | NPU `shgemm_f32f16_f32` (pinned WH) | pin-once 경로 — rm_to_wh 비용 없음 |
+| M > 1 && N%32==0 && `supports_shgemm()` && PrefillWHCache 미스 | NPU `shgemm_f32f16_f32` (transient W_npu) | 캡 초과 또는 최초 호출 — pin 공간 부족 시 WH 매 호출 재계산 |
 | M > 1 && (N%32≠0 또는 NPU 미가동) | CPU `shgemm` fallback | N 정렬 위반 시 SDK 예외 방지 |

@@ -9,9 +9,9 @@
 `HtpKernelTest` 스위트: sdkl C API 직접 호출 정확도 및 성능 측정.
 
 ```
-[==========] Running 13 tests from 1 test suite.
+[==========] Running 18 tests from 1 test suite.
 [----------] Global test environment set-up.
-[----------] 13 tests from HtpKernelTest
+[----------] 18 tests from HtpKernelTest
 [ RUN      ] HtpKernelTest.Accuracy_f16f16_f16
 [       OK ] HtpKernelTest.Accuracy_f16f16_f16 ([ms] ms)
 [ RUN      ] HtpKernelTest.Accuracy_f16
@@ -24,10 +24,6 @@
 [       OK ] HtpKernelTest.Accuracy_mm_tensor_f16 ([ms] ms)
 [ RUN      ] HtpKernelTest.Constraint_MisalignedRejected_f16f16
 [       OK ] HtpKernelTest.Constraint_MisalignedRejected_f16f16 ([ms] ms)
-[ RUN      ] HtpKernelTest.Padding_NonMultipleOf32_f32f16_f32
-[       OK ] HtpKernelTest.Padding_NonMultipleOf32_f32f16_f32 ([ms] ms)
-[ RUN      ] HtpKernelTest.Accuracy_f32f16_f32_Prefill
-[       OK ] HtpKernelTest.Accuracy_f32f16_f32_Prefill ([ms] ms)
 [ RUN      ] HtpKernelTest.Perf_f16f16_f16
 [       OK ] HtpKernelTest.Perf_f16f16_f16 ([ms] ms)
 [ RUN      ] HtpKernelTest.Perf_f16
@@ -36,11 +32,25 @@
 [       OK ] HtpKernelTest.Perf_u8i8_i32 ([ms] ms)
 [ RUN      ] HtpKernelTest.Perf_u8i4_i32
 [       OK ] HtpKernelTest.Perf_u8i4_i32 ([ms] ms)
+[ RUN      ] HtpKernelTest.Padding_NonMultipleOf32_f32f16_f32
+[       OK ] HtpKernelTest.Padding_NonMultipleOf32_f32f16_f32 ([ms] ms)
+[ RUN      ] HtpKernelTest.Accuracy_f32f16_f32_Prefill
+[       OK ] HtpKernelTest.Accuracy_f32f16_f32_Prefill ([ms] ms)
+[ RUN      ] HtpKernelTest.PrefillWHResidency_ReusesCacheAcrossCalls
+[       OK ] HtpKernelTest.PrefillWHResidency_ReusesCacheAcrossCalls ([ms] ms)
+[ RUN      ] HtpKernelTest.PrefillWHResidency_PinsMultipleNeverEvicts
+[       OK ] HtpKernelTest.PrefillWHResidency_PinsMultipleNeverEvicts ([ms] ms)
 [ RUN      ] HtpKernelTest.Perf_f32f16_f32_Prefill
 [       OK ] HtpKernelTest.Perf_f32f16_f32_Prefill ([ms] ms)
-[----------] 13 tests from HtpKernelTest ([ms] ms total)
-[==========] 13 tests from 1 test suite ran.
-[  PASSED  ] 13 tests.
+[ RUN      ] HtpKernelTest.PhaseTiming_TransientPrefillBreakdown
+[       OK ] HtpKernelTest.PhaseTiming_TransientPrefillBreakdown ([ms] ms)
+[ RUN      ] HtpKernelTest.PoolProbe_MeasureMaxResidentBytes
+[       OK ] HtpKernelTest.PoolProbe_MeasureMaxResidentBytes ([ms] ms)
+[ RUN      ] HtpKernelTest.PoolProbe_MeasureMaxSustainedPinBytes
+[       OK ] HtpKernelTest.PoolProbe_MeasureMaxSustainedPinBytes ([ms] ms)
+[----------] 18 tests from HtpKernelTest ([ms] ms total)
+[==========] 18 tests from 1 test suite ran.
+[  PASSED  ] 18 tests.
 ```
 
 NPU 없는 환경(ADSP_LIBRARY_PATH 미설정 등)에서는 accuracy/perf 테스트가 `[ SKIPPED ]`로 표시됩니다.
@@ -103,22 +113,27 @@ NPU 없는 환경(ADSP_LIBRARY_PATH 미설정 등)에서는 accuracy/perf 테스
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites tests="26" failures="0" disabled="0" errors="0" time="[TBD]" name="AllTests">
+<testsuites tests="31" failures="0" disabled="0" errors="0" time="[TBD]" name="AllTests">
   <!-- unittest_nntrainer_htp_kernels -->
-  <testsuite name="HtpKernelTest" tests="13" failures="0" disabled="0" errors="0" time="[TBD]">
+  <testsuite name="HtpKernelTest" tests="18" failures="0" disabled="0" errors="0" time="[TBD]">
     <testcase name="Accuracy_f16f16_f16" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Accuracy_f16" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Accuracy_u8i8_i32" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Accuracy_u8i4_i32" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Accuracy_mm_tensor_f16" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Constraint_MisalignedRejected_f16f16" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
-    <testcase name="Padding_NonMultipleOf32_f32f16_f32" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
-    <testcase name="Accuracy_f32f16_f32_Prefill" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Perf_f16f16_f16" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Perf_f16" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Perf_u8i8_i32" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Perf_u8i4_i32" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="Padding_NonMultipleOf32_f32f16_f32" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="Accuracy_f32f16_f32_Prefill" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="PrefillWHResidency_ReusesCacheAcrossCalls" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="PrefillWHResidency_PinsMultipleNeverEvicts" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
     <testcase name="Perf_f32f16_f32_Prefill" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="PhaseTiming_TransientPrefillBreakdown" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="PoolProbe_MeasureMaxResidentBytes" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
+    <testcase name="PoolProbe_MeasureMaxSustainedPinBytes" status="run" result="completed" time="[TBD]" classname="HtpKernelTest" />
   </testsuite>
   <!-- unittest_nntrainer_htp_backend -->
   <testsuite name="HtpShgemmTest" tests="6" failures="0" disabled="0" errors="0" time="[TBD]">
