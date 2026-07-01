@@ -586,6 +586,14 @@ public:
   }
 
   /**
+   * @brief     return zero-point correction pointer of Tensor
+   * @retval    template T pointer
+   */
+  template <typename T = int32_t> T *getZpCorr() const {
+    return (T *)itensor_->getZpCorr();
+  }
+
+  /**
    * @brief     return zero point pointer of Tensor
    * @retval    unsigned int pointer
    */

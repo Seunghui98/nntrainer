@@ -956,8 +956,15 @@ void NeuralNetwork::load(const std::string &file_path,
       if (!visited_weights.insert(&weight->getVariableRef()).second) {
         continue;
       }
-      size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
+      size_t size = 0;
+      if (tensor_data_type == TensorDim::DataType::QINT8) {
+        size =
+          weight->getVariable().bytes() + weight->getVariable().scale_size() *
+                                            (sizeof(float) + sizeof(int32_t));
+      } else {
+        size = weight->getVariable().getMemoryBytes();
+      }
       weight->getVariableRef().setFileOffset(start_from);
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for

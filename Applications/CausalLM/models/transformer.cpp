@@ -140,6 +140,13 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   FSU_LOOKAHEAD = nntr_cfg.contains("fsu_lookahead")
                     ? nntr_cfg["fsu_lookahead"].get<unsigned int>()
                     : 1;
+  COMPUTE_ENGINE = nntr_cfg.contains("compute_engine")
+                     ? nntr_cfg["compute_engine"].get<std::string>()
+                     : std::string("cpu");
+  if (COMPUTE_ENGINE == "htp" && MEMORY_SWAP)
+    throw std::invalid_argument(
+      "compute_engine=htp is not supported with fsu=true in this phase "
+      "(in-place WH weight conversion requires resident weights)");
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
@@ -527,14 +534,16 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", COMPUTE_ENGINE)}));
   Tensor up = ffn_up(input);
 
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", COMPUTE_ENGINE)}));
   Tensor gate = ffn_gate(input);
 
   /// @note nntrainer binary stores mlp weights in up, gate order.
@@ -551,7 +560,8 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", COMPUTE_ENGINE)}));
   return ffn_down(act);
 }
 
