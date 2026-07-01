@@ -59,6 +59,50 @@ struct WHCache {
       sdkl_npu_free(e.second.npu);
   }
 } g_wh_cache;
+
+// Persistent WH weight residency for prefill (M>1). Unlike WHCache, entries
+// are never evicted: populated once (typically at warmup) and reused for the
+// whole process lifetime. RM master weights are untouched so the decode
+// (CPU hsgemv) path keeps working. Memory cost: one WH copy per prefill weight
+// (confirmed to fit the NPU DMA budget for the target model).
+struct PrefillWHCache {
+  std::map<const void *, WHEntry> cache;
+  std::mutex mtx;
+
+  ~PrefillWHCache() {
+    for (auto &e : cache)
+      sdkl_npu_free(e.second.npu);
+  }
+} g_prefill_wh;
+
+// Return a resident WH pointer for RM weight B, converting+allocating on first
+// request. Returns nullptr on alloc/convert failure so the caller can fall back
+// to a transient conversion (result stays correct, only slower).
+const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
+                                     unsigned int K) {
+  std::lock_guard<std::mutex> lk(g_prefill_wh.mtx);
+  auto it = g_prefill_wh.cache.find(B);
+  if (it != g_prefill_wh.cache.end()) {
+    if (it->second.N == N && it->second.K == K)
+      return static_cast<const _Float16 *>(it->second.npu);
+    // Pointer reused with a different shape: drop stale entry and rebuild.
+    sdkl_npu_free(it->second.npu);
+    g_prefill_wh.cache.erase(it);
+  }
+
+  const size_t w_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
+  void *w_npu = nullptr;
+  if (sdkl_npu_alloc(w_bytes, &w_npu) != 0 || w_npu == nullptr)
+    return nullptr;
+  std::memcpy(w_npu, B, w_bytes);
+  if (sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K, (_Float16 *)w_npu) !=
+      0) {
+    sdkl_npu_free(w_npu);
+    return nullptr;
+  }
+  g_prefill_wh.cache[B] = {w_npu, N, K, w_bytes};
+  return static_cast<const _Float16 *>(w_npu);
+}
 } // namespace
 
 namespace nntrainer {
@@ -138,44 +182,55 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   std::memset(X_npu, 0, Mp * K * sizeof(float));
   std::memcpy(X_npu, A, M * K * sizeof(float));
 
-  // M>1 (prefill): bypass WHCache — weight accessed once per forward pass.
-  // Alloc W_npu transiently to keep peak NPU DMA below the ~64 MB budget.
-  // WHCache below is kept for potential future decode-NPU scenarios.
+  // M>1 (prefill): use the persistent WH residency cache (populated at
+  // warmup). Heavy weight staging (alloc + memcpy + RM->WH) is done once and
+  // reused; the real prefill call becomes lookup + matmul + copy-back.
+  // On cache miss/alloc failure, fall back to a transient conversion so the
+  // result is always correct (only slower). WHCache below is retained for
+  // potential future decode-NPU scenarios.
   if (M > 1) {
-    const size_t w_bytes = N * K * sizeof(_FP16);
-    void *W_npu = nullptr;
-    err = sdkl_npu_alloc(w_bytes, &W_npu);
-    if (err != 0 || W_npu == nullptr) {
-      cleanup();
-      throw std::runtime_error(
-        "shgemm_f32f16_f32: prefill weight NPU alloc failed (err=" +
-        std::to_string(err) + ")");
-    }
-    std::memcpy(W_npu, B, w_bytes);
-    int werr =
-      sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K, (_Float16 *)W_npu);
-    if (werr != 0) {
-      sdkl_npu_free(W_npu);
-      cleanup();
-      throw std::runtime_error("rm_to_wh_f16_inplace failed (prefill): " +
-                               std::to_string(werr));
-    }
     if (beta != 0.0f) {
-      sdkl_npu_free(W_npu);
       cleanup();
       throw std::runtime_error(
         "shgemm_f32f16_f32: beta != 0 not supported (Phase 1)");
     }
     std::memset(A_npu, 0, Mp * N * sizeof(float));
-    err = sdkl_npu_mm_f32f16_f32(
-      domain, (int)Mp, (int)N, (int)K, static_cast<float *>(A_npu),
-      static_cast<const float *>(X_npu), static_cast<const _Float16 *>(W_npu));
-    sdkl_npu_free(W_npu);
+
+    const _Float16 *W_wh = getOrCreatePrefillWH(B, N, K);
+    void *W_transient = nullptr;
+    if (W_wh == nullptr) {
+      // Fallback: transient alloc + convert for this call only (not cached).
+      const size_t w_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
+      err = sdkl_npu_alloc(w_bytes, &W_transient);
+      if (err != 0 || W_transient == nullptr) {
+        cleanup();
+        throw std::runtime_error(
+          "shgemm_f32f16_f32: prefill weight NPU alloc failed (err=" +
+          std::to_string(err) + ")");
+      }
+      std::memcpy(W_transient, B, w_bytes);
+      int werr = sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
+                                               (_Float16 *)W_transient);
+      if (werr != 0) {
+        sdkl_npu_free(W_transient);
+        cleanup();
+        throw std::runtime_error("rm_to_wh_f16_inplace failed (prefill): " +
+                                 std::to_string(werr));
+      }
+      W_wh = static_cast<const _Float16 *>(W_transient);
+    }
+
+    err = sdkl_npu_mm_f32f16_f32(domain, (int)Mp, (int)N, (int)K,
+                                 static_cast<float *>(A_npu),
+                                 static_cast<const float *>(X_npu), W_wh);
+    if (W_transient)
+      sdkl_npu_free(W_transient);
     if (err != 0) {
       cleanup();
       throw std::runtime_error("sdkl_npu_mm_f32f16_f32 failed (prefill): " +
                                std::to_string(err));
     }
+
     const float *A_npu_f32 = static_cast<const float *>(A_npu);
     if (alpha == 1.0f) {
       std::memcpy(C, A_npu_f32, M * N * sizeof(float));
@@ -278,6 +333,18 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   }
 
   cleanup();
+}
+
+size_t prefillWHCacheSize() {
+  std::lock_guard<std::mutex> lk(g_prefill_wh.mtx);
+  return g_prefill_wh.cache.size();
+}
+
+void prefillWHCacheClear() {
+  std::lock_guard<std::mutex> lk(g_prefill_wh.mtx);
+  for (auto &e : g_prefill_wh.cache)
+    sdkl_npu_free(e.second.npu);
+  g_prefill_wh.cache.clear();
 }
 
 } // namespace hmx

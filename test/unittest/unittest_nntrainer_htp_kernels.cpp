@@ -46,6 +46,8 @@ void shgemm_f32f16_f32(unsigned int TStorageOrder, bool TransA, bool TransB,
                        float alpha, const float *A, unsigned int lda,
                        const __fp16 *B, unsigned int ldb, float beta, float *C,
                        unsigned int ldc);
+size_t prefillWHCacheSize();
+void prefillWHCacheClear();
 } // namespace hmx
 } // namespace nntrainer
 
@@ -837,6 +839,40 @@ TEST_F(HtpKernelTest, Accuracy_f32f16_f32_Prefill) {
     EXPECT_LT(e, 1e-2f) << s.name << " M=" << s.M << " N=" << s.N
                         << " K=" << s.K << " relError=" << e;
   }
+}
+
+TEST_F(HtpKernelTest, PrefillWHResidency_ReusesCacheAcrossCalls) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  nntrainer::hmx::prefillWHCacheClear();
+  ASSERT_EQ(nntrainer::hmx::prefillWHCacheSize(), 0u);
+
+  const int M = 16, N = 1024, K = 1024;
+  std::vector<float> A = makeRandF32(M * K);
+  std::vector<_FP16> W = makeRandF16(N * K);
+  std::vector<float> C(M * N, 0.f), ref(M * N, 0.f);
+  cpuGemmF32F16(M, N, K, A.data(), W.data(), ref.data());
+
+  auto call = [&]() {
+    nntrainer::hmx::shgemm_f32f16_f32(
+      0, false, true, M, N, K, 1.0f, A.data(), K,
+      reinterpret_cast<const __fp16 *>(W.data()), K, 0.0f, C.data(), N);
+  };
+
+  // First call: populates one resident WH entry, result correct.
+  call();
+  EXPECT_EQ(nntrainer::hmx::prefillWHCacheSize(), 1u);
+  EXPECT_LT(relErrorF32(C.data(), ref.data(), M * N), 1e-2f);
+
+  // Second call, SAME weight pointer: cache hit, no new entry, still correct.
+  std::fill(C.begin(), C.end(), 0.f);
+  call();
+  EXPECT_EQ(nntrainer::hmx::prefillWHCacheSize(), 1u);
+  EXPECT_LT(relErrorF32(C.data(), ref.data(), M * N), 1e-2f);
+
+  nntrainer::hmx::prefillWHCacheClear();
+  EXPECT_EQ(nntrainer::hmx::prefillWHCacheSize(), 0u);
 }
 
 TEST_F(HtpKernelTest, Perf_f32f16_f32_Prefill) {

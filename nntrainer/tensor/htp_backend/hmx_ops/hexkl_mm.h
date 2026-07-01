@@ -43,6 +43,18 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
                        const unsigned int ldb, const float beta, float *C,
                        const unsigned int ldc);
 
+/**
+ * @brief Number of resident WH prefill-weight entries currently cached.
+ * @note Introspection/test hook for the persistent prefill WH residency cache.
+ */
+size_t prefillWHCacheSize();
+
+/**
+ * @brief Free and drop all resident WH prefill-weight entries.
+ * @note Test-isolation hook; also called implicitly at process exit.
+ */
+void prefillWHCacheClear();
+
 } // namespace hmx
 } // namespace nntrainer
 

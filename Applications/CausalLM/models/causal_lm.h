@@ -200,6 +200,8 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   bool SKIP_PREFILL;
+  bool WARMUP_PREFILL; /**< Run one throwaway prefill forward before the first
+                            real prefill to populate HTP WH residency cache. */
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */
@@ -213,7 +215,8 @@ protected:
    *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
    */
   KVCacheManager kv_cache;
-  bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
+  bool kv_cache_bound = false;      /**< True once KV cache tensors are bound */
+  bool htp_prefill_warmed_ = false; /**< True once the one-shot warmup ran. */
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers via
