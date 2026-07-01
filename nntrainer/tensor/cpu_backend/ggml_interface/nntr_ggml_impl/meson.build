@@ -18,8 +18,8 @@ message('arm_arch_opt : ' + arm_arch_opt)
 
 # arm_arch_opt != 'none' case for cross-compilation scenario
 if arch == 'aarch64' or arm_arch_opt != 'none'
-  if arm_arch_opt == 'armv9.2-a'
-    # SVE/SVE2 implementation for armv9.2-a
+  if arm_arch_opt == 'armv9.2-a' and not get_option('arm-march').contains('nosve')
+    # SVE/SVE2 implementation for armv9.2-a (only when SVE is actually enabled)
     ggml_impl_interface_sources += 'nntr_ggml_impl_sve.cpp'
   else
     # NEON implementation (armv8.2-a, armv7l, or auto)

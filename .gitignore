@@ -88,3 +88,5 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+# superpowers docs (local reference - not for commit)
+docs/superpowers/
