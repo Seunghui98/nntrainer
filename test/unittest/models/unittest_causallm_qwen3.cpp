@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -35,15 +36,42 @@ namespace {
 /**
  * @brief Tiny Qwen3 CausalLM adapter (inference shared by CausalLMTestAdapter)
  */
-using TinyQwen3CausalLM =
-  causallm_test::CausalLMTestAdapter<causallm::Qwen3CausalLM>;
+class TinyQwen3CausalLM final : public causallm::Qwen3CausalLM,
+                                public causallm_test::TinyCausalLMRunner {
+public:
+  struct QuantizedWeightInfo {
+    ml::train::TensorDim::DataType dtype;
+    nntrainer::QScheme qscheme;
+    size_t scale_size;
+    std::vector<float> scales;
+    std::vector<int32_t> zp_corr;
+  };
 
-/**
- * @brief Populate deterministic tiny Qwen3 weights for golden token tests
- */
-void setupQwen3DeterministicWeights(TinyQwen3CausalLM &model) {
-  model.forEachLayer(
-    [](ml::train::Layer &layer, nntrainer::RunLayerContext &context, void *) {
+  /**
+   * @brief Construct a tiny Qwen3 CausalLM test adapter
+   */
+  TinyQwen3CausalLM(causallm::json &cfg, causallm::json &generation_cfg,
+                    causallm::json &nntr_cfg) :
+    causallm::Transformer(cfg, generation_cfg, nntr_cfg,
+                          causallm::ModelType::CAUSALLM),
+    causallm::Qwen3CausalLM(cfg, generation_cfg, nntr_cfg) {}
+
+  void initializeModel() override { initialize(); }
+
+  void saveWeight(const std::string &path) override { save_weight(path); }
+
+  void saveWeightWithDtype(
+    const std::string &path,
+    const std::map<std::string, ml::train::TensorDim::DataType>
+      &layer_dtype_map) override {
+    save_weight(path, ml::train::TensorDim::DataType::NONE, layer_dtype_map);
+  }
+
+  void loadWeight(const std::string &path) override { load_weight(path); }
+
+  void setDeterministicWeights() override {
+    auto set_weights = [](ml::train::Layer &layer,
+                          nntrainer::RunLayerContext &context, void *) {
       if (layer.getName() == "output_of_causallm")
         return;
 
@@ -62,7 +90,155 @@ void setupQwen3DeterministicWeights(TinyQwen3CausalLM &model) {
           weight.setValue(0, 0, 4, 0, 2.0f);
         }
       }
-    });
+    };
+
+    model->forEachLayer(set_weights, nullptr);
+  }
+
+  void setQuantizedRoundTripWeights() {
+    auto set_weights = [](ml::train::Layer &layer,
+                          nntrainer::RunLayerContext &context, void *) {
+      for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
+        auto &weight = context.getWeight(i);
+        if (weight.getDataType() != ml::train::TensorDim::DataType::FP32)
+          continue;
+
+        if (layer.getType() == "rms_norm" ||
+            layer.getType() == "reshaped_rms_norm") {
+          weight.setValue(1.0f);
+          continue;
+        }
+
+        float *data = weight.getData<float>();
+        for (unsigned int idx = 0; idx < weight.size(); ++idx) {
+          const int pattern = static_cast<int>(idx % 13) - 6;
+          data[idx] = static_cast<float>(pattern) / 8.0f;
+        }
+      }
+    };
+
+    model->forEachLayer(set_weights, nullptr);
+  }
+
+  void runPrompt(const std::string &prompt) override {
+    run(prompt, false, "", "", false);
+  }
+
+  std::vector<float> prefillLogits(const std::string &prompt) override {
+    allocateAndBindKVCache();
+
+    auto encoded = tokenizer->Encode(prompt);
+    if (encoded.empty())
+      throw std::invalid_argument("tiny Qwen3 prompt encoded to no tokens");
+
+    const unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+    const unsigned int init_len = static_cast<unsigned int>(
+      std::min<size_t>(encoded.size(), num_allow_str));
+    std::vector<float> input_sample(
+      static_cast<size_t>(BATCH_SIZE) * MAX_SEQ_LEN, 0.0f);
+
+    for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+      for (unsigned int i = 0; i < init_len; ++i) {
+        const auto token_id = static_cast<unsigned int>(encoded[i]);
+        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
+          static_cast<float>(token_id);
+        ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = token_id;
+      }
+    }
+
+    std::vector<std::pair<std::string, float *>> cache_inputs;
+    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      cache_inputs.emplace_back(
+        "cache_k_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+      cache_inputs.emplace_back(
+        "cache_v_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+    }
+
+    std::sort(
+      cache_inputs.begin(), cache_inputs.end(),
+      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+
+    std::vector<float *> input;
+    input.reserve(1 + cache_inputs.size());
+    input.push_back(input_sample.data());
+    for (const auto &cache_input : cache_inputs)
+      input.push_back(cache_input.second);
+
+    std::vector<float *> label;
+    setKVCachePosition(0);
+    auto output = model->incremental_inference(BATCH_SIZE, input, label,
+                                               init_len, 0, init_len, false);
+    std::vector<float> logits(output[0], output[0] + NUM_VOCAB);
+    for (auto &out : output)
+      delete[] out;
+
+    return logits;
+  }
+
+  std::string getOutputText(int batch_idx = 0) const override {
+    return getOutput(batch_idx);
+  }
+
+  bool hasRun() const override { return causallm::CausalLM::hasRun(); }
+
+  unsigned int tokenAt(size_t idx) const override { return ids_history[idx]; }
+
+  std::vector<unsigned int>
+  generateFromLogits(float *logits, bool do_sample, float repetition_penalty,
+                     unsigned int *input_ids,
+                     unsigned int num_input_ids) override {
+    return generate(logits, do_sample, repetition_penalty, input_ids,
+                    num_input_ids);
+  }
+
+  QuantizedWeightInfo inspectWeight(const std::string &layer_name) {
+    struct InspectState {
+      const std::string *target_name;
+      QuantizedWeightInfo info{ml::train::TensorDim::DataType::NONE,
+                               nntrainer::QScheme::PER_TENSOR_AFFINE,
+                               0,
+                               {},
+                               {}};
+      bool found = false;
+    } state{&layer_name};
+
+    auto inspect = [](ml::train::Layer &layer, nntrainer::RunLayerContext &ctx,
+                      void *user_data) {
+      auto *state = static_cast<InspectState *>(user_data);
+      if (state->found || layer.getName() != *state->target_name ||
+          ctx.getNumWeights() == 0)
+        return;
+
+      auto &weight = ctx.getWeight(0);
+      state->info.dtype = weight.getDataType();
+      state->info.qscheme = weight.q_scheme();
+      state->info.scale_size = weight.scale_size();
+      if (weight.getDataType() == ml::train::TensorDim::DataType::QINT8) {
+        const size_t count = weight.getDim().width();
+        state->info.scales.assign(weight.getScale<float>(),
+                                  weight.getScale<float>() + count);
+        state->info.zp_corr.assign(weight.getZpCorr<int32_t>(),
+                                   weight.getZpCorr<int32_t>() + count);
+      }
+      state->found = true;
+    };
+
+    model->forEachLayer(inspect, &state);
+    if (!state.found)
+      throw std::invalid_argument("unknown layer: " + layer_name);
+
+    return state.info;
+  }
+};
+
+/**
+ * @brief Populate deterministic tiny Qwen3 weights for golden token tests
+ */
+void setupQwen3DeterministicWeights(TinyQwen3CausalLM &model) {
+  model.setDeterministicWeights();
 }
 
 /**
@@ -440,6 +616,60 @@ INSTANTIATE_TEST_SUITE_P(
   [](const ::testing::TestParamInfo<causallm_test::TinyCausalLMCase> &info) {
     return info.param.name;
   });
+
+TEST(Qwen3Qint8WeightRoundTripTest, SaveLoadRestoresQuantMetadata) {
+  const auto files = causallm_test::makeTinyCausalLMFiles(
+    "Qwen3Qint8WeightRoundTripTest", "SaveLoadRestoresQuantMetadata",
+    "Qwen3_QINT8_FP32");
+  const auto fp32_data_type = causallm_test::makeTinyFp32DataType();
+  const auto qint8_data_type = causallm_test::makeTinyQint8Fp32DataType();
+
+  auto source_model_cfg = makeTinyQwen3Config();
+  auto source_generation_cfg = causallm_test::makeTinyGenerationConfig();
+  auto source_nntr_cfg = causallm_test::makeTinyNntrainerConfig(
+    files.tokenizer_path, fp32_data_type);
+  TinyQwen3CausalLM source(source_model_cfg, source_generation_cfg,
+                           source_nntr_cfg);
+  source.initializeModel();
+  source.setQuantizedRoundTripWeights();
+
+  ASSERT_NO_THROW(source.saveWeightWithDtype(
+    files.weight_path.string(), makeQwen3LayerDtypeMap(qint8_data_type)));
+
+  auto loaded_model_cfg = makeTinyQwen3Config();
+  auto loaded_generation_cfg = causallm_test::makeTinyGenerationConfig();
+  auto loaded_nntr_cfg = causallm_test::makeTinyNntrainerConfig(
+    files.tokenizer_path, qint8_data_type);
+  TinyQwen3CausalLM loaded(loaded_model_cfg, loaded_generation_cfg,
+                           loaded_nntr_cfg);
+  loaded.initializeModel();
+  ASSERT_NO_THROW(loaded.loadWeight(files.weight_path.string()));
+
+  const auto embedding = loaded.inspectWeight("embedding0");
+  EXPECT_EQ(embedding.dtype, ml::train::TensorDim::DataType::QINT8);
+  EXPECT_EQ(embedding.qscheme, nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  EXPECT_EQ(embedding.scale_size, embedding.scales.size());
+  ASSERT_FALSE(embedding.scales.empty());
+  ASSERT_FALSE(embedding.zp_corr.empty());
+  EXPECT_TRUE(
+    std::any_of(embedding.scales.begin(), embedding.scales.end(),
+                [](float v) { return std::isfinite(v) && v > 0.0f; }));
+  EXPECT_NE(std::accumulate(embedding.zp_corr.begin(), embedding.zp_corr.end(),
+                            int64_t{0}),
+            int64_t{0});
+
+  const auto wq = loaded.inspectWeight("layer0_wq");
+  EXPECT_EQ(wq.dtype, ml::train::TensorDim::DataType::QINT8);
+  EXPECT_EQ(wq.qscheme, nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  EXPECT_EQ(wq.scale_size, wq.scales.size());
+  ASSERT_FALSE(wq.scales.empty());
+  ASSERT_FALSE(wq.zp_corr.empty());
+  EXPECT_TRUE(std::any_of(wq.scales.begin(), wq.scales.end(), [](float v) {
+    return std::isfinite(v) && v > 0.0f;
+  }));
+  EXPECT_NE(std::accumulate(wq.zp_corr.begin(), wq.zp_corr.end(), int64_t{0}),
+            int64_t{0});
+}
 
 /**
  * @brief Test that a tiny Qwen3 embedding model can save/load and encode

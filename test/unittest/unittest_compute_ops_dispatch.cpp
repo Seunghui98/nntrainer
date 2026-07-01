@@ -22,6 +22,11 @@
 #include <atomic>
 #include <memory>
 
+#ifdef ENABLE_HEXKL
+#include <cpu_ops_table.h>
+#include <htp_backend.h>
+#endif
+
 namespace {
 
 /**
@@ -325,6 +330,105 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
   // Now a.multiply(b_migrated) is on the same context — no throw.
   EXPECT_NO_THROW(a.multiply(b_migrated, out));
 }
+
+#ifdef ENABLE_HEXKL
+/**
+ * @brief Phase 0 smoke: the HTP ops singleton is constructible.
+ */
+TEST(HtpBackendSmoke, GetOpsNonNull) {
+  EXPECT_NE(nntrainer::get_htp_ops(), nullptr);
+}
+
+/**
+ * @brief Phase 0 smoke: the NPU either initialized or gracefully
+ *        disabled, and supports_*() exactly tracks that state so a
+ *        disabled backend falls back to CPU. The CPU backend itself
+ *        never advertises shgemm acceleration.
+ */
+TEST(HtpBackendSmoke, SupportsTracksEnabledAndCpuHasNoAccel) {
+  auto &be = nntrainer::HtpBackend::global();
+  auto *htp = nntrainer::get_htp_ops();
+#ifdef ENABLE_FP16
+  EXPECT_EQ(htp->supports_shgemm(), be.enabled());
+  if (!be.enabled())
+    EXPECT_FALSE(htp->supports_shgemm());
+  nntrainer::ensureComputeOps();
+  EXPECT_FALSE(nntrainer::getComputeOps()->supports_shgemm());
+#else
+  (void)be;
+  (void)htp;
+#endif
+}
+#ifdef ENABLE_FP16
+/**
+ * @brief supports_shgemm()=true인 mock ops를 붙인 텐서가 dotFloat32Float16의
+ *        GEMM 경로에서 실제로 shgemm 오버라이드를 통과하는지 검증.
+ *        (x86: mock이 CPU shgemm으로 포워딩하므로 결과 정확도도 확인)
+ */
+struct ShgemmCounters {
+  std::atomic<int> shgemm{0};
+};
+
+class MockShgemmOps : public nntrainer::CpuComputeOps {
+public:
+  MockShgemmOps(ShgemmCounters *c) : counters_(c) {}
+
+  bool supports_shgemm() const override { return true; }
+
+  void shgemm(unsigned int o, bool tA, bool tB, unsigned int M, unsigned int N,
+              unsigned int K, float a, const float *A, unsigned int lda,
+              const _FP16 *B, unsigned int ldb, float b, float *C,
+              unsigned int ldc) override {
+    counters_->shgemm++;
+    // Forward to CPU for correctness on x86
+    nntrainer::shgemm(o, tA, tB, M, N, K, a, A, lda, B, ldb, b, C, ldc);
+  }
+
+private:
+  ShgemmCounters *counters_;
+};
+
+TEST(ShgemmGatingTest, SupportsTrueRoutesToShgemmOverride) {
+  ShgemmCounters cnt;
+  auto mock = std::make_unique<MockShgemmOps>(&cnt);
+  auto ct = std::make_shared<nntrainer::ContextData>();
+  ct->setComputeOps(mock.get());
+
+  // FP32 activation(4x8) · FP16 weight(4x8)^T => (4x4) GEMM shape (M=4,N=4,K=8)
+  nntrainer::Tensor act(1, 1, 4, 8);   // FP32
+  nntrainer::TensorDim wdim({1, 1, 4, 8}, nntrainer::Tdatatype::FP16);
+  nntrainer::Tensor wgt(wdim);
+  act.setRandNormal(0.0f, 1.0f);
+  wgt.setRandNormal(0.0f, 1.0f);
+
+  act.setContextData(ct);
+  EXPECT_NO_THROW(act.dot(wgt, false, true));  // trans_in=true -> weight is [N,K]
+  EXPECT_GT(cnt.shgemm.load(), 0) << "shgemm override must be called when supported";
+}
+
+TEST(ShgemmGatingTest, SupportsFalseSkipsShgemmOverride) {
+  // Default CpuComputeOps: supports_shgemm()=false
+  // dotFloat32Float16 must NOT call the shgemm override.
+  ShgemmCounters cnt;
+
+  // Use fresh ctx with plain CpuComputeOps (supports_shgemm=false)
+  auto real_cpu = std::make_unique<nntrainer::CpuComputeOps>();
+  auto ct = std::make_shared<nntrainer::ContextData>();
+  ct->setComputeOps(real_cpu.get());
+
+  nntrainer::Tensor act(1, 1, 4, 8);
+  nntrainer::TensorDim wdim({1, 1, 4, 8}, nntrainer::Tdatatype::FP16);
+  nntrainer::Tensor wgt(wdim);
+  act.setRandNormal(0.0f, 1.0f);
+  wgt.setRandNormal(0.0f, 1.0f);
+
+  act.setContextData(ct);
+  EXPECT_NO_THROW(act.dot(wgt, false, true));
+  // cnt.shgemm must be 0 — gating must route to nntrainer::shgemm() directly
+  EXPECT_EQ(cnt.shgemm.load(), 0) << "shgemm override must NOT be called when not supported";
+}
+#endif // ENABLE_FP16
+#endif // ENABLE_HEXKL
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

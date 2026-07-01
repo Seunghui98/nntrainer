@@ -38,7 +38,7 @@
  *     --output_bin <name> Output weight filename (auto-generated if omitted)
  *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
  *
- *   Supported data types: FP32, FP16, Q4_0, Q4_K, Q6_K
+ *   Supported data types: FP32, FP16, QINT8, Q4_0, Q4_K, Q6_K
  *
  *   Example:
  *     # Quantize Qwen3-4B to Q4_0 FC layers (embedding stays FP32):
@@ -99,10 +99,11 @@ namespace {
  * @brief Map of string data type names to DataType enum values
  */
 const std::map<std::string, DataType> dtype_str_map = {
-  {"FP32", DataType::FP32}, {"FP16", DataType::FP16},
-  {"Q4_0", DataType::Q4_0}, {"Q6_K", DataType::Q6_K},
-  {"Q4_K", DataType::Q4_K}, {"QS4CX", DataType::QS4CX},
-  {"NONE", DataType::NONE}};
+  {"FP32", DataType::FP32},   {"FP16", DataType::FP16},
+  {"QINT8", DataType::QINT8}, {"Q4_0", DataType::Q4_0},
+  {"Q6_K", DataType::Q6_K},   {"Q4_K", DataType::Q4_K},
+  {"QS4CX", DataType::QS4CX}, {"NONE", DataType::NONE},
+};
 
 /**
  * @brief Map of string ISA names to ISA enum values
@@ -149,7 +150,8 @@ DataType strToDataType(const std::string &s) {
   auto it = dtype_str_map.find(upper);
   if (it == dtype_str_map.end()) {
     throw std::invalid_argument("Unsupported data type: " + s +
-                                ". Supported: FP32, FP16, Q4_0, Q6_K, Q4_K");
+                                ". Supported: FP32, FP16, QINT8, Q4_0, Q6_K, "
+                                "Q4_K");
   }
   return it->second;
 }
@@ -171,6 +173,11 @@ std::string dataTypeToStr(DataType dt) {
  */
 std::string buildModelTensorType(const std::string &fc_dtype) {
   return fc_dtype + "-FP32";
+}
+
+bool usesQint8(DataType fc_dtype, DataType embd_dtype, DataType lmhead_dtype) {
+  return fc_dtype == DataType::QINT8 || embd_dtype == DataType::QINT8 ||
+         lmhead_dtype == DataType::QINT8;
 }
 
 /**
@@ -406,7 +413,7 @@ void printUsage(const char *prog) {
     << "                        from this config will be used.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
-    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K\n"
+    << "Supported data types: FP32, FP16, QINT8, Q4_0, Q6_K, Q4_K\n"
     << "Supported ISA options: DEFAULT (current platform), X86, ARM\n"
     << "\n"
     << "Examples:\n"
@@ -812,6 +819,8 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
+    if (usesQint8(fc_dtype, embd_dtype, lmhead_dtype))
+      new_nntr_cfg["compute_engine"] = "htp";
 
     std::string output_config_path = output_dir + "/nntr_config.json";
 

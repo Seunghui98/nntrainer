@@ -671,6 +671,12 @@ TinyCausalLMDataType makeTinyFp32DataType();
 TinyCausalLMDataType makeTinyQ40Fp32DataType();
 
 /**
+ * @brief Make QINT8 weights with FP32 activations data type variant
+ * @return Tiny QINT8-FP32 data type descriptor
+ */
+TinyCausalLMDataType makeTinyQint8Fp32DataType();
+
+/**
  * @brief Convert a test dtype string to an nntrainer tensor data type
  * @param dtype Test dtype string
  * @return nntrainer tensor data type

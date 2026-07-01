@@ -65,7 +65,8 @@ CharTensor::CharTensor(
     << "invalid scale factor size " << scales.size();
 
   MemoryData *mem_data = new MemoryData(
-    (void *)(new int8_t[dim.getDataLen() + sizeof(float) * scale_size()]()));
+    (void *)(new int8_t[dim.getDataLen() + sizeof(float) * scale_size() +
+                        sizeof(int32_t) * scale_size()]()));
   data = std::shared_ptr<MemoryData>(mem_data, [](MemoryData *mem_data) {
     delete[] mem_data->getAddr<int8_t>();
     delete mem_data;
@@ -129,8 +130,9 @@ void CharTensor::allocate() {
     /// allocate new memory for the tensor data
     MemoryData *mem_data;
 
-    mem_data = new MemoryData(
-      (void *)(new int8_t[dim.getDataLen() + 4 * scale_size()]{}));
+    mem_data =
+      new MemoryData((void *)(new int8_t[dim.getDataLen() + 4 * scale_size() +
+                                         sizeof(int32_t) * scale_size()]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<int8_t>();
       delete mem_data;
@@ -428,6 +430,8 @@ void CharTensor::read(std::ifstream &file, size_t start_offset,
     start_offset = file_offset;
   }
   read_quantization_info(file, start_offset, read_from_offset);
+  deallocate();
+  allocate();
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -442,6 +446,30 @@ void CharTensor::read(std::ifstream &file, size_t start_offset,
   checkedRead(file, (char *)getData(), sz,
               "[CharTensor::read] operation failed", start_offset,
               read_from_offset);
+  putData();
+}
+
+void CharTensor::read(ReadSource src, size_t start_offset,
+                      bool read_from_offset) {
+  if (start_offset == std::numeric_limits<size_t>::max()) {
+    start_offset = file_offset;
+  }
+  read_quantization_info(src, start_offset, read_from_offset);
+  deallocate();
+  allocate();
+
+  std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
+
+  NNTR_THROW_IF(sz < 0, std::invalid_argument)
+    << "read size: " << getMemoryBytes()
+    << " is too big. It cannot be represented by std::streamsize";
+
+  if (read_from_offset) {
+    start_offset += sizeof(uint16_t);
+  }
+
+  checkedRead(src, (char *)getData(), sz, "[CharTensor::read] operation failed",
+              start_offset, read_from_offset);
   putData();
 }
 
@@ -564,7 +592,8 @@ void CharTensor::print(std::ostream &out) const {
 }
 
 size_t CharTensor::getMemoryBytes() const {
-  return bytes() + scale_size() * sizeof(float);
+  return bytes() + scale_size() * sizeof(float) +
+         scale_size() * sizeof(int32_t);
 }
 
 size_t CharTensor::scale_size() const {
@@ -573,7 +602,9 @@ size_t CharTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
-    return width();
+    // QINT8 weights are consumed as [N, K], with one scale / zp_corr entry
+    // per output channel row N rather than per inner dimension K.
+    return height();
     break;
   default:
     break;
@@ -596,6 +627,19 @@ void CharTensor::copy(const void *buf) {
 
   float *scales = (float *)(((int8_t *)buf) + size());
   o->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
+
+  const int32_t *src_zp = reinterpret_cast<const int32_t *>(
+    reinterpret_cast<const float *>(reinterpret_cast<const int8_t *>(buf) +
+                                    size()) +
+    scale_size());
+  memcpy(getZpCorr(), src_zp, scale_size() * sizeof(int32_t));
+}
+
+void *CharTensor::getZpCorr() const {
+  if (!data)
+    return nullptr;
+  data->validate();
+  return ((int32_t *)getScale()) + scale_size();
 }
 
 void CharTensor::save_quantization_info(std::ostream &file) {
@@ -607,6 +651,13 @@ void CharTensor::read_quantization_info(std::ifstream &file,
                                         size_t start_offset,
                                         bool read_from_offset) {
   checkedRead(file, (char *)&qscheme, sizeof(uint16_t),
+              "[CharTensor::read] failed to read quantization information",
+              start_offset, read_from_offset);
+}
+
+void CharTensor::read_quantization_info(ReadSource src, size_t start_offset,
+                                        bool read_from_offset) {
+  checkedRead(src, (char *)&qscheme, sizeof(uint16_t),
               "[CharTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
 }

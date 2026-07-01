@@ -16,6 +16,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <quantizer.h>
 #include <tensor.h>
 #include <tensor_dim.h>
 #include <thread_manager.h>
@@ -473,6 +474,12 @@ void TieWordEmbedding::save(std::ofstream &file,
                                        quant_weight.getData<uint8_t>(), K, N,
                                        nullptr);
               quant_weight.save(file);
+            }
+          } else if (dtype == nntrainer::TensorDim::DataType::QINT8) {
+            if (K == 1) {
+              weight.save(file);
+            } else {
+              nntrainer::quantize_qint8_weight(weight, true).save(file);
             }
           } else if (dtype == nntrainer::TensorDim::DataType::Q6_K) {
             //////////////////////////////////////////////////////////////////

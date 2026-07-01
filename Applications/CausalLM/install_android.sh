@@ -9,6 +9,7 @@ MODEL_DIR="$INSTALL_DIR/models"
 
 # Set SCRIPT_DIR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Color codes
 RED='\033[0;31m'
@@ -48,6 +49,83 @@ log_step() {
 log_header "Install CausalLM to Android Device"
 log_info "INSTALL_DIR: $INSTALL_DIR"
 log_info "SCRIPT_DIR: $SCRIPT_DIR"
+log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
+
+find_build_artifact() {
+    local filename=$1
+    local candidates=(
+        "$SCRIPT_DIR/jni/libs/arm64-v8a/$filename"
+        "$SCRIPT_DIR/jni/obj/local/arm64-v8a/$filename"
+        "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/$filename"
+        "$NNTRAINER_ROOT/builddir/jni/arm64-v8a/$filename"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_meson_build_option() {
+    local option_name=$1
+    local meson_options="$NNTRAINER_ROOT/builddir/meson-info/intro-buildoptions.json"
+    if command -v python3 >/dev/null 2>&1 && [ -f "$meson_options" ]; then
+        python3 - "$meson_options" "$option_name" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    for option in json.load(f):
+        if option.get("name") == sys.argv[2]:
+            print(option.get("value", ""))
+            break
+PY
+    fi
+}
+
+find_hexkl_addon_root() {
+    if [ -n "${HEXKL_ADDON_ROOT:-}" ] && [ -d "$HEXKL_ADDON_ROOT" ]; then
+        echo "$HEXKL_ADDON_ROOT"
+        return 0
+    fi
+
+    local parsed_root
+    parsed_root="$(get_meson_build_option hexkl-sdk-root)"
+    if [ -n "$parsed_root" ] && [ -d "$parsed_root" ]; then
+        echo "$parsed_root"
+        return 0
+    fi
+
+    local default_root="/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon"
+    if [ -d "$default_root" ]; then
+        echo "$default_root"
+        return 0
+    fi
+
+    return 1
+}
+
+find_libsdkl() {
+    local hexkl_root
+    hexkl_root="$(find_hexkl_addon_root || true)"
+    local lib_subdir
+    lib_subdir="$(get_meson_build_option hexkl-lib-subdir)"
+    if [ -z "$lib_subdir" ]; then
+        lib_subdir="armv8_android26"
+    fi
+
+    local sdk_lib="$hexkl_root/lib/$lib_subdir/libsdkl.so"
+    if [ -n "$hexkl_root" ] && [ -f "$sdk_lib" ]; then
+        echo "$sdk_lib"
+        return 0
+    fi
+
+    find_build_artifact libsdkl.so
+}
 
 # Check if device is connected
 log_step "1/3" "Check device connection"
@@ -198,6 +276,23 @@ else
     log_warning "libcausallm_api.so not found (Optional, skipping)"
 fi
 
+LIBSDKL_PATH="$(find_libsdkl || true)"
+if [ -n "$LIBSDKL_PATH" ]; then
+    log_info "  [HTP] libsdkl.so..."
+    adb push "$LIBSDKL_PATH" "$INSTALL_DIR/" 2>&1 | tail -1
+
+    HEXKL_ROOT="$(find_hexkl_addon_root || true)"
+    HEXKL_SKEL_PATH="$HEXKL_ROOT/lib/hexagon_toolv19_v79/libhexkl_skel.so"
+    if [ -n "$HEXKL_ROOT" ] && [ -f "$HEXKL_SKEL_PATH" ]; then
+        log_info "  [HTP] libhexkl_skel.so (V79)..."
+        adb push "$HEXKL_SKEL_PATH" "$INSTALL_DIR/" 2>&1 | tail -1
+    else
+        log_warning "libsdkl.so was found, but libhexkl_skel.so was not. Set HEXKL_ADDON_ROOT if HTP initialization fails."
+    fi
+else
+    log_info "  [HTP] libsdkl.so not found; skipping HTP runtime libraries"
+fi
+
 log_success "All libraries pushed"
 
 # Create run script on device
@@ -205,6 +300,7 @@ log_info "Creating run script on device..."
 adb shell "cat > $INSTALL_DIR/run_causallm.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 export NNTR_NUM_THREADS=4
 cd $INSTALL_DIR
 ./nntrainer_causallm \$@
@@ -216,6 +312,7 @@ adb shell "chmod 755 $INSTALL_DIR/run_causallm.sh"
 adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 cd $INSTALL_DIR
 ./nntr_quantize \$@
 EOF"
@@ -226,6 +323,7 @@ adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
 adb shell "cat > $INSTALL_DIR/run_safetensors_info.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 cd $INSTALL_DIR
 ./nntr_safetensors_info \$@
 EOF"
@@ -236,6 +334,7 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 export NNTR_NUM_THREADS=4
 cd $INSTALL_DIR
 ./test_api \$@
