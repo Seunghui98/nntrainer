@@ -128,6 +128,51 @@ const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
   g_prefill_wh.total_bytes += new_bytes;
   return static_cast<const _Float16 *>(new_npu);
 }
+
+// Host-resident pre-baked WH weights, keyed by the RM weight pointer. Populated
+// offline-then-loaded (see loader). Holds already-converted WH bytes in normal
+// host RAM (NOT NPU DMA) — cheap to keep the whole model resident, sidestepping
+// the ~48 MB NPU pin budget. shgemm memcpies these into NPU scratch per call.
+struct PrefillWHRegistry {
+  struct Entry {
+    std::vector<_FP16> wh; // WH-layout bytes, N*K elements
+    unsigned int N, K;
+  };
+  std::map<const void *, Entry> reg;
+  std::mutex mtx;
+} g_prefill_wh_reg;
+
+// Reusable NPU scratch buffers for prefill staging. sdkl_npu_alloc/free per
+// call is ~0.35 ms; reusing across the 84 prefill matmuls removes that churn.
+// Grows on demand; never shrinks. Not thread-safe by itself — guarded by the
+// caller's single-threaded prefill loop; a mutex makes reuse safe if that
+// changes.
+struct NpuScratch {
+  void *p = nullptr;
+  size_t cap = 0;
+  std::mutex mtx;
+  void *get(size_t bytes) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (bytes <= cap && p != nullptr)
+      return p;
+    if (p != nullptr) {
+      sdkl_npu_free(p);
+      p = nullptr;
+      cap = 0;
+    }
+    void *np = nullptr;
+    if (sdkl_npu_alloc(bytes, &np) != 0 || np == nullptr)
+      return nullptr;
+    p = np;
+    cap = bytes;
+    return p;
+  }
+  ~NpuScratch() {
+    if (p != nullptr)
+      sdkl_npu_free(p);
+  }
+};
+static NpuScratch g_scratch_X, g_scratch_A, g_scratch_W;
 } // namespace
 
 namespace nntrainer {
@@ -182,24 +227,18 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   void *A_npu = nullptr; // FP32 output (nntrainer's C), Mp*N rows
 
   auto cleanup = [&]() {
-    if (X_npu)
-      sdkl_npu_free(X_npu);
-    if (A_npu)
-      sdkl_npu_free(A_npu);
+    // X_npu / A_npu are borrowed from g_scratch_* and must NOT be freed here.
   };
 
   int err = 0;
 
-  err = sdkl_npu_alloc(Mp * K * sizeof(float), &X_npu);
-  if (err != 0) {
-    cleanup();
-    throw std::runtime_error("sdkl_npu_alloc X failed: " + std::to_string(err));
+  X_npu = g_scratch_X.get((size_t)Mp * K * sizeof(float));
+  if (X_npu == nullptr) {
+    throw std::runtime_error("shgemm_f32f16_f32: X scratch alloc failed");
   }
-
-  err = sdkl_npu_alloc(Mp * N * sizeof(float), &A_npu);
-  if (err != 0) {
-    cleanup();
-    throw std::runtime_error("sdkl_npu_alloc A failed: " + std::to_string(err));
+  A_npu = g_scratch_A.get((size_t)Mp * N * sizeof(float));
+  if (A_npu == nullptr) {
+    throw std::runtime_error("shgemm_f32f16_f32: A scratch alloc failed");
   }
 
   // --- Copy input into NPU memory ---
@@ -221,35 +260,46 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
     }
     std::memset(A_npu, 0, Mp * N * sizeof(float));
 
-    const _Float16 *W_wh = getOrCreatePrefillWH(B, N, K);
+    const size_t w_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
+    const _Float16 *W_wh = nullptr;
     void *W_transient = nullptr;
-    if (W_wh == nullptr) {
-      // Fallback: transient alloc + convert for this call only (not cached).
-      const size_t w_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
-      err = sdkl_npu_alloc(w_bytes, &W_transient);
-      if (err != 0 || W_transient == nullptr) {
+
+    // Fast path: pre-baked WH bytes registered on the host (offline bake).
+    // Stage them into NPU memory with a plain memcpy — no rm_to_wh.
+    const _FP16 *wh_host =
+      lookupPrefillWH(reinterpret_cast<const void *>(B), N, K);
+    if (wh_host != nullptr) {
+      W_transient = g_scratch_W.get(w_bytes);
+      if (W_transient == nullptr) {
         cleanup();
-        throw std::runtime_error(
-          "shgemm_f32f16_f32: prefill weight NPU alloc failed (err=" +
-          std::to_string(err) + ")");
+        throw std::runtime_error("shgemm_f32f16_f32: W scratch alloc failed");
       }
-      std::memcpy(W_transient, B, w_bytes);
-      int werr = sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                               (_Float16 *)W_transient);
-      if (werr != 0) {
-        sdkl_npu_free(W_transient);
-        cleanup();
-        throw std::runtime_error("rm_to_wh_f16_inplace failed (prefill): " +
-                                 std::to_string(werr));
-      }
+      std::memcpy(W_transient, wh_host, w_bytes);
       W_wh = static_cast<const _Float16 *>(W_transient);
+    } else {
+      // No pre-baked WH: fall back to the pin cache, then transient convert.
+      W_wh = getOrCreatePrefillWH(B, N, K);
+      if (W_wh == nullptr) {
+        W_transient = g_scratch_W.get(w_bytes);
+        if (W_transient == nullptr) {
+          cleanup();
+          throw std::runtime_error("shgemm_f32f16_f32: W scratch alloc failed");
+        }
+        std::memcpy(W_transient, B, w_bytes);
+        int werr = sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
+                                                 (_Float16 *)W_transient);
+        if (werr != 0) {
+          cleanup();
+          throw std::runtime_error("rm_to_wh_f16_inplace failed (prefill): " +
+                                   std::to_string(werr));
+        }
+        W_wh = static_cast<const _Float16 *>(W_transient);
+      }
     }
 
     err = sdkl_npu_mm_f32f16_f32(domain, (int)Mp, (int)N, (int)K,
                                  static_cast<float *>(A_npu),
                                  static_cast<const float *>(X_npu), W_wh);
-    if (W_transient)
-      sdkl_npu_free(W_transient);
     if (err != 0) {
       cleanup();
       throw std::runtime_error("sdkl_npu_mm_f32f16_f32 failed (prefill): " +
@@ -358,6 +408,41 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   }
 
   cleanup();
+}
+
+void registerPrefillWH(const void *rm_ptr, unsigned int N, unsigned int K,
+                       const void *wh_src) {
+  if (rm_ptr == nullptr || wh_src == nullptr)
+    return;
+  const size_t n = (size_t)N * (size_t)K;
+  std::lock_guard<std::mutex> lk(g_prefill_wh_reg.mtx);
+  auto &e = g_prefill_wh_reg.reg[rm_ptr];
+  e.wh.assign(reinterpret_cast<const _FP16 *>(wh_src),
+              reinterpret_cast<const _FP16 *>(wh_src) + n);
+  e.N = N;
+  e.K = K;
+}
+
+const _FP16 *lookupPrefillWH(const void *rm_ptr, unsigned int N,
+                             unsigned int K) {
+  if (rm_ptr == nullptr)
+    return nullptr;
+  std::lock_guard<std::mutex> lk(g_prefill_wh_reg.mtx);
+  auto it = g_prefill_wh_reg.reg.find(rm_ptr);
+  if (it == g_prefill_wh_reg.reg.end() || it->second.N != N ||
+      it->second.K != K)
+    return nullptr;
+  return it->second.wh.data();
+}
+
+size_t prefillWHRegistrySize() {
+  std::lock_guard<std::mutex> lk(g_prefill_wh_reg.mtx);
+  return g_prefill_wh_reg.reg.size();
+}
+
+void prefillWHRegistryClear() {
+  std::lock_guard<std::mutex> lk(g_prefill_wh_reg.mtx);
+  g_prefill_wh_reg.reg.clear();
 }
 
 size_t prefillWHCacheSize() {

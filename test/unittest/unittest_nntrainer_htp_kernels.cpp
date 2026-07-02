@@ -48,7 +48,20 @@ void shgemm_f32f16_f32(unsigned int TStorageOrder, bool TransA, bool TransB,
                        unsigned int ldc);
 size_t prefillWHCacheSize();
 void prefillWHCacheClear();
+void registerPrefillWH(const void *rm_ptr, unsigned int N, unsigned int K,
+                       const void *wh_src);
+const __fp16 *lookupPrefillWH(const void *rm_ptr, unsigned int N,
+                              unsigned int K);
+size_t prefillWHRegistrySize();
+void prefillWHRegistryClear();
 } // namespace hmx
+
+// Forward declaration: CPU reference shgemm (nntrainer/tensor/cpu_backend).
+// Same __fp16-vs-_FP16 mangling note as above applies here.
+void shgemm(unsigned int TStorageOrder, bool TransA, bool TransB,
+            unsigned int M, unsigned int N, unsigned int K, float alpha,
+            const float *A, unsigned int lda, const __fp16 *B, unsigned int ldb,
+            float beta, float *C, unsigned int ldc);
 } // namespace nntrainer
 
 namespace {
@@ -1101,6 +1114,81 @@ TEST_F(HtpKernelTest, PoolProbe_MeasureMaxSustainedPinBytes) {
          mb, bufs.size());
   RecordProperty("sustained_pin_max_mb", static_cast<int>(mb));
   SUCCEED();
+}
+
+// A registered pre-baked WH weight must be used by shgemm's prefill path and
+// produce the same result as the transient rm_to_wh path. We build the WH bytes
+// by running rm_to_wh ourselves, register them, and confirm (a) the registry
+// reports the entry and (b) shgemm output matches an unregistered reference
+// run.
+TEST_F(HtpKernelTest, PrefillWHRegistry_UsedByShgemmMatchesTransient) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  nntrainer::hmx::prefillWHRegistryClear();
+  ASSERT_EQ(nntrainer::hmx::prefillWHRegistrySize(), 0u);
+
+  const int M = 16, N = 1024, K = 1024;
+  std::vector<_FP16> W = makeRandF16(N * K, -0.5f, 0.5f, 7);
+  std::vector<float> A = makeRandF32(M * K);
+  std::vector<float> C_ref(M * N, 0.f), C_reg(M * N, 0.f);
+
+  auto run = [&](std::vector<float> &C) {
+    nntrainer::hmx::shgemm_f32f16_f32(
+      0, false, true, M, N, K, 1.0f, A.data(), K,
+      reinterpret_cast<const __fp16 *>(W.data()), K, 0.0f, C.data(), N);
+  };
+
+  // Reference: no registration -> transient rm_to_wh path.
+  run(C_ref);
+
+  // Build WH bytes on host by mirroring the SDK conversion, then register.
+  std::vector<_FP16> WH = W; // copy RM
+  ASSERT_EQ(sdkl_cpu_rm_to_wh_f16_inplace(
+              (size_t)N, (size_t)K, reinterpret_cast<_Float16 *>(WH.data())),
+            0);
+  nntrainer::hmx::registerPrefillWH(reinterpret_cast<const void *>(W.data()), N,
+                                    K, WH.data());
+  EXPECT_EQ(nntrainer::hmx::prefillWHRegistrySize(), 1u);
+
+  // Registered run must hit the pre-baked path and match the reference.
+  run(C_reg);
+  for (int i = 0; i < M * N; ++i)
+    ASSERT_NEAR(C_reg[i], C_ref[i], 1e-2f) << "mismatch at " << i;
+
+  nntrainer::hmx::prefillWHRegistryClear();
+  EXPECT_EQ(nntrainer::hmx::prefillWHRegistrySize(), 0u);
+}
+
+// Scratch reuse must not change results even when call shapes vary between
+// calls (a larger shape then a smaller one must both be correct). We compare
+// each shgemm result against a fresh CPU reference (nntrainer::shgemm).
+TEST_F(HtpKernelTest, ScratchReuse_MixedShapesStayCorrect) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+  nntrainer::hmx::prefillWHRegistryClear();
+  nntrainer::hmx::prefillWHCacheClear();
+
+  struct S {
+    int M, N, K;
+  };
+  const S shapes[] = {{16, 2048, 1024}, {16, 1024, 1024}, {16, 3072, 1024}};
+  for (const auto &s : shapes) {
+    std::vector<_FP16> W = makeRandF16(s.N * s.K, -0.3f, 0.3f, s.N + s.K);
+    std::vector<float> A = makeRandF32(s.M * s.K);
+    std::vector<float> C_npu(s.M * s.N, 0.f), C_cpu(s.M * s.N, 0.f);
+
+    nntrainer::hmx::shgemm_f32f16_f32(
+      0, false, true, s.M, s.N, s.K, 1.0f, A.data(), s.K,
+      reinterpret_cast<const __fp16 *>(W.data()), s.K, 0.0f, C_npu.data(), s.N);
+    nntrainer::shgemm(0, false, true, s.M, s.N, s.K, 1.0f, A.data(), s.K,
+                      reinterpret_cast<const __fp16 *>(W.data()), s.K, 0.0f,
+                      C_cpu.data(), s.N);
+
+    for (int i = 0; i < s.M * s.N; ++i)
+      ASSERT_NEAR(C_npu[i], C_cpu[i], 5e-2f)
+        << "shape " << s.N << "x" << s.K << " idx " << i;
+  }
 }
 
 } // namespace

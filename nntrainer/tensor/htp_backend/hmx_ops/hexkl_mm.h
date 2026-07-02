@@ -55,6 +55,33 @@ size_t prefillWHCacheSize();
  */
 void prefillWHCacheClear();
 
+/**
+ * @brief Register pre-baked (already WH-layout) FP16 weight bytes for prefill.
+ * @param rm_ptr  Host pointer to the RM weight tensor data (the lookup key —
+ *                the same pointer shgemm_f32f16_f32 receives as B).
+ * @param N,K     Weight dims (N=output cols, K=inner). Bytes =
+ * N*K*sizeof(_FP16).
+ * @param wh_src  Host pointer to N*K WH-layout FP16 values; copied internally.
+ * @note Overwrites any existing entry for rm_ptr. Host-side only (no NPU
+ * alloc).
+ */
+void registerPrefillWH(const void *rm_ptr, unsigned int N, unsigned int K,
+                       const void *wh_src);
+
+/**
+ * @brief Look up pre-baked WH bytes for an RM weight pointer.
+ * @return Host WH pointer if registered with matching N,K; else nullptr.
+ * @note Never throws.
+ */
+const _FP16 *lookupPrefillWH(const void *rm_ptr, unsigned int N,
+                             unsigned int K);
+
+/** @brief Number of registered pre-baked WH weights (test hook). */
+size_t prefillWHRegistrySize();
+
+/** @brief Free and drop all registered pre-baked WH weights (test hook). */
+void prefillWHRegistryClear();
+
 } // namespace hmx
 } // namespace nntrainer
 
