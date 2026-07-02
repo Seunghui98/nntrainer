@@ -45,33 +45,31 @@ namespace {
 /**
  * @brief In-place SiLU / swish (x * sigmoid(x)) over a contiguous buffer.
  * @details Fuses what would otherwise be a separate Activation layer (a full
- * extra read+write pass over the conv output) into the conv epilogue. The
- * sigmoid is evaluated in fp32 and cast back to T so an FP16 activation graph
- * does not lose precision (or overflow exp) in the half domain. Called after
- * all conv compute completes, so it is never nested inside another
- * parallel_for.
- *
- * @note ThreadManager::parallel_for invokes its callback through a type-erased
- * std::function PER INDEX, so iterating it at element granularity would pay a
- * non-inlinable call per element (measured ~3x slower than a serial inlined
- * loop). Instead we parallelize over a handful of contiguous chunks (one per
- * compute thread) and run a tight, fully-inlined inner loop inside each — the
- * std::function is then hit only ~nthreads times while the exp stays inlined.
+ * extra read+write pass over the conv output) into the conv epilogue. Calls
+ * the vectorized silu_inplace kernel (fp16: rational-sigmoid NEON, fp32:
+ * exp_ps 16-wide NEON) via cpu_backend.h. Single-threaded below 1M elements to avoid
+ * parallel_for dispatch overhead (~101 calls/inference for YOLOv11m).
  */
 template <typename T>
 static inline void convApplySwishInplace(T *data, size_t n) {
+  // The SiLU epilogue is memory/latency-bound; below this size the thread
+  // dispatch overhead (~101 calls/inference) exceeds the parallel speedup, so
+  // run single-threaded. Threshold tuned on-device (R3CY10WM83Y): 8-thread
+  // was ~94ms vs single-thread ~77ms for YOLOv11m @ 832x832.
+  static constexpr size_t kSiluParallelThreshold = 1u << 20; // 1M elements
   auto &tm = ThreadManager::Global();
   const size_t nthreads = std::max<size_t>(1, tm.getComputeThreadCount());
+  if (n < kSiluParallelThreshold || nthreads <= 1) {
+    silu_inplace(static_cast<unsigned int>(n), data);
+    return;
+  }
   const size_t chunk = (n + nthreads - 1) / nthreads;
   tm.parallel_for(0, nthreads, [&](size_t t) {
     const size_t start = t * chunk;
     if (start >= n)
       return;
-    const size_t end = std::min(start + chunk, n);
-    for (size_t i = start; i < end; ++i) {
-      const float x = static_cast<float>(data[i]);
-      data[i] = static_cast<T>(x / (1.0f + std::exp(-x)));
-    }
+    const size_t len = std::min(start + chunk, n) - start;
+    silu_inplace(static_cast<unsigned int>(len), data + start);
   });
 }
 
