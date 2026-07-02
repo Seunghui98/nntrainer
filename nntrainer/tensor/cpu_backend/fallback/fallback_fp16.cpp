@@ -194,6 +194,10 @@ void swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   __fallback_swiglu(N, X, Y, Z);
 }
 
+void silu_inplace(const unsigned int N, _FP16 *X) {
+  __fallback_silu_inplace_fp16(N, X);
+}
+
 void tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }

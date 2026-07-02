@@ -300,6 +300,10 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   nntrainer::avx2::swiglu(N, X, Y, Z, alpha);
 }
 
+void silu_inplace(const unsigned int N, float *X) {
+  __fallback_silu_inplace(N, X);
+}
+
 void tanh_gelu(const unsigned int N, const float *X, float *Y) {
   // AVX implmenetation will be implemented, now fallback instead
   __fallback_tanh_gelu(N, X, Y);

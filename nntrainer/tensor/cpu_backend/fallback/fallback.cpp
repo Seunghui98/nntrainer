@@ -205,6 +205,10 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   __fallback_swiglu(N, X, Y, Z, alpha);
 }
 
+void silu_inplace(const unsigned int N, float *X) {
+  __fallback_silu_inplace(N, X);
+}
+
 void tanh_gelu(const unsigned int N, const float *X, float *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }
@@ -399,6 +403,10 @@ void depthwise_conv2d_fp32(const float *input, const float *kernel,
 }
 
 #ifdef ENABLE_FP16
+void silu_inplace(const unsigned int N, _FP16 *X) {
+  __fallback_silu_inplace_fp16(N, X);
+}
+
 void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
                            _FP16 *output, unsigned int batch,
                            unsigned int channels, unsigned int in_h,

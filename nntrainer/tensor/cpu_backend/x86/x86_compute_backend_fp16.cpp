@@ -294,6 +294,10 @@ void swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   __fallback_swiglu(N, X, Y, Z);
 }
 
+void silu_inplace(const unsigned int N, _FP16 *X) {
+  __fallback_silu_inplace_fp16(N, X);
+}
+
 _FP16 max_val(const unsigned int N, _FP16 *X) { return __fallback_max(N, X); }
 
 void softmax(const unsigned int N, _FP16 *X, _FP16 *Y) {

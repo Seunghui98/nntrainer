@@ -55,6 +55,10 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   nntrainer::neon::swiglu(N, X, Y, Z, alpha);
 }
 
+void silu_inplace(const unsigned int N, float *X) {
+  nntrainer::neon::silu_inplace(N, X);
+}
+
 void tanh_gelu(const unsigned int N, const float *X, float *Y) {
 #ifdef __ARM_NEON
   nntrainer::neon::tanh_gelu(N, X, Y);
