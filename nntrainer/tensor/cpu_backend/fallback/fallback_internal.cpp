@@ -438,6 +438,11 @@ void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z,
   }
 }
 
+void __fallback_silu_inplace(const unsigned int N, float *X) {
+  for (unsigned int i = 0; i < N; ++i)
+    X[i] = X[i] / (1.0f + std::exp(-X[i]));
+}
+
 void __fallback_tanh_gelu(const unsigned int N, const float *X, float *Y) {
   for (unsigned int i = 0; i < N; ++i) {
     float x = X[i];

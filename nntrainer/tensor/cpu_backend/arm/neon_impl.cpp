@@ -2396,4 +2396,39 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
   }
 }
 #endif
+void silu_inplace(const unsigned int N, float *X) {
+  unsigned int i = 0;
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  const float32x4_t neg_one = vdupq_n_f32(-1.0f);
+
+  for (; N - i >= 16; i += 16) {
+    float32x4_t x0 = vld1q_f32(&X[i]);
+    float32x4_t x1 = vld1q_f32(&X[i + 4]);
+    float32x4_t x2 = vld1q_f32(&X[i + 8]);
+    float32x4_t x3 = vld1q_f32(&X[i + 12]);
+
+    float32x4_t e0 = exp_ps(vmulq_f32(x0, neg_one));
+    float32x4_t e1 = exp_ps(vmulq_f32(x1, neg_one));
+    float32x4_t e2 = exp_ps(vmulq_f32(x2, neg_one));
+    float32x4_t e3 = exp_ps(vmulq_f32(x3, neg_one));
+
+    vst1q_f32(&X[i], vdivq_f32(x0, vaddq_f32(e0, one)));
+    vst1q_f32(&X[i + 4], vdivq_f32(x1, vaddq_f32(e1, one)));
+    vst1q_f32(&X[i + 8], vdivq_f32(x2, vaddq_f32(e2, one)));
+    vst1q_f32(&X[i + 12], vdivq_f32(x3, vaddq_f32(e3, one)));
+  }
+
+  for (; N - i >= 4; i += 4) {
+    float32x4_t x0 = vld1q_f32(&X[i]);
+    float32x4_t e0 = exp_ps(vmulq_f32(x0, neg_one));
+    vst1q_f32(&X[i], vdivq_f32(x0, vaddq_f32(e0, one)));
+  }
+
+  while (i < N) {
+    const float x = X[i];
+    X[i] = x / (1.0f + std::exp(-x));
+    ++i;
+  }
+}
+
 } // namespace nntrainer::neon

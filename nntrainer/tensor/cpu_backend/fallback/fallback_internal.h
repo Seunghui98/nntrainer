@@ -409,6 +409,12 @@ void __fallback_compute_rotary_embedding_value(unsigned int dim,
 void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z);
 
 /**
+ * @brief in-place SiLU/swish scalar fallback: X[i] = X[i] * sigmoid(X[i])
+ * (fp16)
+ */
+void __fallback_silu_inplace_fp16(const unsigned int N, _FP16 *X);
+
+/**
  * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
  *                                  + 0.044715 * X^3)))
  *
@@ -505,6 +511,11 @@ void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z);
  */
 void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z,
                        float alpha);
+
+/**
+ * @brief in-place SiLU/swish scalar fallback: X[i] = X[i] * sigmoid(X[i])
+ */
+void __fallback_silu_inplace(const unsigned int N, float *X);
 
 /**
  * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X

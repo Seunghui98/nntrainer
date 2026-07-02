@@ -221,6 +221,13 @@ void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   }
 }
 
+void __fallback_silu_inplace_fp16(const unsigned int N, _FP16 *X) {
+  for (unsigned int i = 0; i < N; ++i) {
+    const float x = static_cast<float>(X[i]);
+    X[i] = static_cast<_FP16>(x / (1.0f + std::exp(-x)));
+  }
+}
+
 void __fallback_tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
   for (unsigned int i = 0; i < N; ++i) {
     float x = static_cast<float>(X[i]);

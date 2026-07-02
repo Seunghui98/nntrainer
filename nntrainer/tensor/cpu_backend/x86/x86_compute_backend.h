@@ -152,6 +152,12 @@ void compute_rotary_embedding_value(unsigned int dim, unsigned int half_,
 void swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z);
 
 /**
+ * @brief in-place SiLU/swish scalar fallback: X[i] = X[i] * sigmoid(X[i])
+ * (fp16)
+ */
+void silu_inplace(const unsigned int N, _FP16 *X);
+
+/**
  * @brief returns maximum value of the vector X
  *
  * @param N number of elements in X
@@ -523,6 +529,12 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
  * @param alpha float
  */
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
+
+/**
+ * @brief in-place SiLU/swish scalar fallback: X[i] = X[i] * sigmoid(X[i])
+ * (fp32)
+ */
+void silu_inplace(const unsigned int N, float *X);
 
 /**
  * @brief tanh_gelu function
