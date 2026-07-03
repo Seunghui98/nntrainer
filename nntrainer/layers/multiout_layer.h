@@ -99,6 +99,17 @@ public:
    */
   const std::string getType() const override { return MultiOutLayer::type; };
 
+  /**
+   * @note W4A8: MultiOut int8 passthrough (supportInt8ActInput/Output = true)
+   * was tried and REVERTED -- it triggered a SIGSEGV inside
+   * ConcatLayer::forwarding() (memcpy) on-device, most likely from a
+   * TensorPool/Manager shared-memory sizing mismatch when an in-place fan-out
+   * mixes a 1-byte-per-elem (Q8_0_TW) dtype into memory planned for a wider
+   * dtype. Needs a dedicated memory-planner investigation before re-enabling;
+   * see docs/superpowers/plans int8-e2e session notes. Left at the Layer
+   * default (false) intentionally -- do not flip without that investigation.
+   */
+
   void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;

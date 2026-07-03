@@ -168,6 +168,15 @@ static void sliceForwardT(const Tensor &input, Tensor &output,
 }
 
 void SliceLayer::forwarding_operation(const Tensor &input, Tensor &output) {
+  // W4A8 static Q8_0: a Q8_0_TW edge is a flat int8 payload (1 byte/elem, no
+  // block-size constraint -- see q8_0_tw_tensor.h), so the same element-wise
+  // copy logic as FP16/FP32 applies unchanged with T=int8_t. Falling through
+  // to the FP32 branch below would silently reinterpret 1-byte elements as
+  // 4-byte floats (wrong stride, out-of-bounds read/write).
+  if (output.getDataType() == ml::train::TensorDim::DataType::Q8_0_TW) {
+    sliceForwardT<int8_t>(input, output, axis, start);
+    return;
+  }
 #ifdef ENABLE_FP16
   if (output.getDataType() == ml::train::TensorDim::DataType::FP16) {
     sliceForwardT<_FP16>(input, output, axis, start);
