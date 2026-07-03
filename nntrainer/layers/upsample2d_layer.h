@@ -78,6 +78,32 @@ public:
    */
   void setProperty(const std::vector<std::string> &values) override;
 
+  /**
+   * @copydoc Layer::supportInt8ActInput()
+   * @note W4A8: only nearest-neighbor upsample is int8-safe without dequant
+   * -- it copies an existing raw value verbatim, no interpolation math (see
+   * the Q8_0_TW dispatch in forwarding()). Bilinear computes a real weighted
+   * average of multiple values and would need dequant/requant -- not
+   * implemented, so it stays FP16/FP32-only (false here).
+   */
+  bool supportInt8ActInput() const override {
+    const auto &mode = std::get<props::UpsampleMode>(upsample2d_props);
+    return !mode.empty() &&
+           mode.get() == props::UpsampleModeInfo::Interpolation::nearest;
+  }
+
+  /**
+   * @copydoc Layer::supportInt8ActOutput()
+   */
+  bool supportInt8ActOutput() const override { return supportInt8ActInput(); }
+
+  /**
+   * @copydoc Layer::isInt8PassThrough()
+   * @note nearest upsample only ever copies through an existing input value
+   * verbatim -- it never combines values under a different effective scale.
+   */
+  bool isInt8PassThrough() const override { return supportInt8ActInput(); }
+
   static constexpr const char *type = "upsample2d";
 
 private:

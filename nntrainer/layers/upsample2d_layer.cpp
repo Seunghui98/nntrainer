@@ -206,6 +206,15 @@ void Upsample2dLayer::forwarding(nntrainer::RunLayerContext &context,
   const auto &kernel_size =
     std::get<std::array<props::KernelSize, UPSAMPLE2D_DIM>>(upsample2d_props);
 
+  // W4A8 static Q8_0: nearest-neighbor upsample only ever copies an existing
+  // input value verbatim (no interpolation math), so it's exact directly on
+  // raw int8 bytes -- same template as FP32/FP16 above (T=int8_t). Bilinear
+  // mode computes a real weighted average and is NOT dispatched here; it
+  // stays FP16/FP32-only (see Upsample2dLayer::supportInt8ActInput()).
+  if (out.getDataType() == ml::train::TensorDim::DataType::Q8_0_TW) {
+    upsampleForwardT<int8_t>(in, out, upsampling_type, kernel_size);
+    return;
+  }
 #ifdef ENABLE_FP16
   if (out.getDataType() == ml::train::TensorDim::DataType::FP16) {
     upsampleForwardT<_FP16>(in, out, upsampling_type, kernel_size);

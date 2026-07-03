@@ -103,6 +103,33 @@ public:
    */
   void setProperty(const std::vector<std::string> &values) override;
 
+  /**
+   * @copydoc Layer::supportInt8ActInput()
+   * @note W4A8: only max-pooling is int8-safe without dequant -- it selects
+   * one of the existing raw values (max is monotonic under a fixed positive
+   * per-tensor scale: max(dequant(a),dequant(b)) == dequant(max(a,b))), so
+   * the winning int8 byte can be copied through unchanged (see the NHWC
+   * Q8_0_TW dispatch in pooling2d()). Average/global pooling sum multiple
+   * int8 values and would need wider (int32) accumulation before requant --
+   * not implemented, so they stay FP16/FP32-only (false here).
+   */
+  bool supportInt8ActInput() const override {
+    const auto &pt = std::get<props::PoolingType>(pooling2d_props);
+    return !pt.empty() && pt.get() == props::PoolingTypeInfo::Enum::max;
+  }
+
+  /**
+   * @copydoc Layer::supportInt8ActOutput()
+   */
+  bool supportInt8ActOutput() const override { return supportInt8ActInput(); }
+
+  /**
+   * @copydoc Layer::isInt8PassThrough()
+   * @note max-pooling only ever copies through an existing input value
+   * verbatim -- it never combines values under a different effective scale.
+   */
+  bool isInt8PassThrough() const override { return supportInt8ActInput(); }
+
   static constexpr const char *type = "pooling2d";
 
   /**

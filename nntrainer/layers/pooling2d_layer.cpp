@@ -398,6 +398,15 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
         return;
       }
 #endif
+      // W4A8 static Q8_0: max-pooling is monotonic under a fixed positive
+      // per-tensor scale (max(dequant(a), dequant(b)) == dequant(max(a,b))),
+      // so operating directly on the raw int8 values and copying the winning
+      // int8 byte through is exact -- no dequant/requant needed, same
+      // template as FP32/FP16 above (T=int8_t).
+      else if (in.getDataType() == ml::train::TensorDim::DataType::Q8_0_TW) {
+        run_nhwc.template operator()<int8_t>();
+        return;
+      }
     }
   }
 
