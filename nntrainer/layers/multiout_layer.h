@@ -100,15 +100,26 @@ public:
   const std::string getType() const override { return MultiOutLayer::type; };
 
   /**
-   * @note W4A8: MultiOut int8 passthrough (supportInt8ActInput/Output = true)
-   * was tried and REVERTED -- it triggered a SIGSEGV inside
-   * ConcatLayer::forwarding() (memcpy) on-device, most likely from a
-   * TensorPool/Manager shared-memory sizing mismatch when an in-place fan-out
-   * mixes a 1-byte-per-elem (Q8_0_TW) dtype into memory planned for a wider
-   * dtype. Needs a dedicated memory-planner investigation before re-enabling;
-   * see docs/superpowers/plans int8-e2e session notes. Left at the Layer
-   * default (false) intentionally -- do not flip without that investigation.
+   * @copydoc Layer::supportInt8ActInput()
+   * @note W4A8: MultiOut is a pure fan-out -- initializeInPlace() makes every
+   * output alias the input's memory (see forwarding(): the whole body is
+   * skipped when in-place), so whatever dtype flows in (including Q8_0_TW)
+   * flows out byte-identical with zero copy/compute. Safe unconditionally.
    */
+  bool supportInt8ActInput() const override { return true; }
+
+  /**
+   * @copydoc Layer::supportInt8ActOutput()
+   */
+  bool supportInt8ActOutput() const override { return true; }
+
+  /**
+   * @copydoc Layer::isInt8PassThrough()
+   * @note MultiOut does not independently decide its output dtype -- it
+   * aliases whatever arrives. NetworkGraph::propagateActivationDataTypes()
+   * must recurse through it to check the REAL downstream consumers.
+   */
+  bool isInt8PassThrough() const override { return true; }
 
   void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,

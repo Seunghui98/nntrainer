@@ -438,6 +438,15 @@ public:
   }
 
   /**
+   * @brief   Whether the underlying layer forwards int8 (Q8_0_TW) to its own
+   *          consumers byte-identically (W4A8 NHWC path). See
+   *          Layer::isInt8PassThrough() for why this must be recursed
+   *          through when propagating int8 capability.
+   * @return  boolean true if this layer is a transparent int8 passthrough
+   */
+  bool isInt8PassThrough() const { return getLayer()->isInt8PassThrough(); }
+
+  /**
    * @brief   Whether the underlying layer has a registered static activation
    *          scale for its output edge (W4A8 §5.7 condition 3).
    * @return  boolean true if a positive output activation scale is registered

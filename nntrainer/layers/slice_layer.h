@@ -92,6 +92,27 @@ public:
    */
   const std::string getType() const final { return SliceLayer::type; };
 
+  /**
+   * @copydoc Layer::supportInt8ActInput()
+   * @note W4A8: forwarding_operation() has a dtype-correct Q8_0_TW dispatch
+   * (sliceForwardT<int8_t>), so an int8 input is copied byte-identically.
+   */
+  bool supportInt8ActInput() const final { return true; }
+
+  /**
+   * @copydoc Layer::supportInt8ActOutput()
+   */
+  bool supportInt8ActOutput() const final { return true; }
+
+  /**
+   * @copydoc Layer::isInt8PassThrough()
+   * @note Slice only extracts a contiguous sub-range -- it does not
+   * recompute values, so whatever dtype arrives is exactly what its own
+   * consumers receive. NetworkGraph::propagateActivationDataTypes() must
+   * recurse through it to check the REAL downstream consumers.
+   */
+  bool isInt8PassThrough() const final { return true; }
+
   std::tuple<props::Print, props::StartIndex, props::EndIndex, props::Axis>
     slice_props;
 

@@ -362,6 +362,25 @@ public:
   virtual bool supportInt8ActOutput() const { return false; }
 
   /**
+   * @brief  check if this layer forwards an int8 (Q8_0_TW) activation to its
+   * own consumers byte-identically, without independently deciding its own
+   * output dtype (W4A8 NHWC path)
+   * @note   default false. A layer like Conv2D "terminates" an incoming int8
+   * edge -- it consumes int8 and independently decides its OWN output dtype
+   * (FP16 or a freshly-promoted Q8_0_TW), so its consumers' capability does
+   * not need to be re-checked against the ORIGINAL producer. A layer like
+   * MultiOut or Slice does not recompute values -- whatever dtype arrives is
+   * the exact dtype its own consumers receive, so
+   * NetworkGraph::propagateActivationDataTypes() must recurse through it and
+   * verify ITS consumers too, or a downstream consumer with no int8 support
+   * (e.g. Concat) can silently receive a Q8_0_TW tensor it never agreed to
+   * accept, sized for the wrong dtype (heap corruption/SIGSEGV -- see W4A8
+   * session notes on the MultiOut/Concat incident).
+   * @return true if this layer is a transparent int8 passthrough
+   */
+  virtual bool isInt8PassThrough() const { return false; }
+
+  /**
    * @brief  check if this layer has a registered static activation scale for
    * its output edge (spec §5.7 condition 3)
    * @note   default false; a layer overrides this to report that a calibrated

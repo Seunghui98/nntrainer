@@ -46,10 +46,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "graph_node.h"
@@ -113,15 +115,57 @@ void NetworkGraph::propagateActivationDataTypes() {
    * producer→consumer is carried as int8 (Q8_0_TW) only when all three hold:
    *   1. the producer can emit int8 output (Layer::supportInt8ActOutput),
    *   2. every consumer of that output can accept int8 input
-   *      (Layer::supportInt8ActInput), and
+   *      (Layer::supportInt8ActInput), transitively through any consumer
+   *      that is a transparent passthrough (Layer::isInt8PassThrough, e.g.
+   *      MultiOut/Slice) -- a passthrough does not re-decide its own output
+   *      dtype, so whatever the producer emits is exactly what the
+   *      passthrough's OWN consumers receive, and they must be checked too,
+   *      and so on transitively. A non-passthrough consumer (e.g. Conv2D)
+   *      terminates the check: it independently decides its own output
+   *      dtype, so nothing further downstream needs checking against THIS
+   *      producer.
    *   3. the edge's static scale is registered (hasActivationScale).
-   * Otherwise the edge stays FP16. Every layer currently declares no int8
-   * capability, so the selection set is empty and the dataflow is unchanged;
-   * U4e/U5 consume int8_output_nodes_ to wire the boundary quant/dequant and
-   * the conv int8 input path.
+   * Otherwise the edge stays FP16. U4e/U5 consume int8_output_nodes_ to wire
+   * the boundary quant/dequant and the conv int8 input path.
+   *
+   * Skipping the transitive walk (checking only the producer's immediate
+   * consumer) is unsound whenever a passthrough sits in between: the
+   * passthrough's capability alone says nothing about whether ITS consumer
+   * can handle the dtype, so an incapable node downstream (e.g. Concat, which
+   * silently no-ops on Q8_0_TW input while still writing FP16-sized data into
+   * an output allocated for the smaller dtype) can receive int8 it never
+   * agreed to accept -- a heap-sizing mismatch that crashes as a SIGSEGV
+   * inside memcpy, not a clean, catchable error.
    */
   int8_output_nodes_.clear();
   const bool probe = std::getenv("NNTR_INT8_PROBE") != nullptr;
+
+  std::function<bool(const std::string &, std::unordered_set<std::string> &)>
+    canCarryInt8 = [&](const std::string &node_name,
+                       std::unordered_set<std::string> &visited) -> bool {
+    if (node_name.empty())
+      return false;
+    if (!visited.insert(node_name).second)
+      return true; // already verified on this traversal (cycle-safe)
+    auto node = getLayerNode(node_name);
+    if (!node->supportInt8ActInput()) {
+      if (probe)
+        std::cerr << "[INT8_PROBE]     rejected at " << node_name
+                  << " type=" << node->getType()
+                  << " (no supportInt8ActInput)" << std::endl;
+      return false;
+    }
+    if (!node->isInt8PassThrough())
+      return true; // terminates here; this node decides its own output dtype
+    const auto consumers = node->getOutputConnections();
+    if (consumers.empty())
+      return true; // passthrough feeding a graph output; nothing to check
+    for (const auto &c : consumers) {
+      if (!canCarryInt8(c, visited))
+        return false;
+    }
+    return true;
+  };
 
   for (auto iter = cbegin(); iter != cend(); ++iter) {
     const auto &producer = *iter;
@@ -135,11 +179,12 @@ void NetworkGraph::propagateActivationDataTypes() {
     if (consumer_names.empty())
       continue;
 
-    /** condition 2: every consumer must accept int8 input (fan-out>1 requires
-     * all consumers capable) */
+    /** condition 2: every consumer must accept int8 input, transitively
+     * through any passthrough (fan-out>1 requires all consumers capable) */
     bool all_consumers_capable = true;
     for (const auto &cname : consumer_names) {
-      if (cname.empty() || !getLayerNode(cname)->supportInt8ActInput()) {
+      std::unordered_set<std::string> visited;
+      if (cname.empty() || !canCarryInt8(cname, visited)) {
         if (probe)
           std::cerr << "[INT8_PROBE] cond1-pass " << producer->getName()
                     << " blocked by consumer "
