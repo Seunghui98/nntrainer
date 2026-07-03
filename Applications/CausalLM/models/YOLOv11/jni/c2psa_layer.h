@@ -23,8 +23,10 @@
 #define __C2PSA_LAYER_H__
 
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include <common_properties.h>
 #include <layer_devel.h>
 #include <layer_impl.h>
 #include <node_exporter.h>
@@ -48,9 +50,34 @@ public:
                 const ml::train::ExportMethods &method) const override {}
   const std::string getType() const override { return PSAAttentionLayer::type; }
   void setProperty(const std::vector<std::string> &values) override {
-    nntrainer::LayerImpl::setProperty(values);
+    auto remain = nntrainer::loadProperties(values, psa_props);
+    nntrainer::LayerImpl::setProperty(remain);
   }
   bool supportBackwarding() const override { return false; }
+
+  /**
+   * @copydoc Layer::supportInt8ActInput()
+   * @note W4A8: the attention math already stages FP16 through an FP32
+   * buffer at the layer boundary (see forwarding()); a Q8_0_TW input is
+   * dequantized the same way using a registered per-tensor input scale.
+   */
+  bool supportInt8ActInput() const override {
+    const auto &ais = std::get<nntrainer::props::InputActivationScale>(psa_props);
+    return !ais.empty() && ais.get() > 0.0f;
+  }
+
+  /**
+   * @copydoc Layer::supportInt8ActOutput()
+   */
+  bool supportInt8ActOutput() const override {
+    const auto &aos = std::get<nntrainer::props::ActivationScale>(psa_props);
+    return !aos.empty() && aos.get() > 0.0f;
+  }
+
+  /**
+   * @copydoc Layer::hasActivationScale()
+   */
+  bool hasActivationScale() const override { return supportInt8ActOutput(); }
 
   static constexpr const char *type = "psa_attention";
 
@@ -66,6 +93,10 @@ private:
   static constexpr unsigned int NUM_HEADS = 4;
   static constexpr unsigned int KD = 32; ///< key dim per head
   static constexpr unsigned int VD = 64; ///< val dim per head
+
+  std::tuple<nntrainer::props::ActivationScale,
+             nntrainer::props::InputActivationScale>
+    psa_props;
 };
 
 } // namespace yolov11

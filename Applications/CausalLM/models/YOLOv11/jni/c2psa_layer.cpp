@@ -94,14 +94,25 @@ void PSAAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &out_t = context.getOutput(0);
 
   const nntrainer::Tdatatype dtype = in_t.getDataType();
+  const bool int8_in = (dtype == nntrainer::Tdatatype::Q8_0_TW);
 #ifdef ENABLE_FP16
   const bool fp16 = (dtype == nntrainer::Tdatatype::FP16);
 #else
   const bool fp16 = false;
 #endif
-  NNTR_THROW_IF(dtype != nntrainer::Tdatatype::FP32 && !fp16,
+  NNTR_THROW_IF(dtype != nntrainer::Tdatatype::FP32 && !fp16 && !int8_in,
                 std::invalid_argument)
-    << "PSAAttentionLayer only implements the FP32 and FP16 activation paths";
+    << "PSAAttentionLayer only implements the FP32, FP16, and Q8_0_TW "
+       "activation paths";
+
+  float in_scale = -1.0f;
+  if (int8_in) {
+    const auto &ais = std::get<nntrainer::props::InputActivationScale>(psa_props);
+    NNTR_THROW_IF(ais.empty() || ais.get() <= 0.0f, std::invalid_argument)
+      << "PSAAttentionLayer: int8 input edge with no registered "
+         "InputActivationScale";
+    in_scale = ais.get();
+  }
 
   const unsigned int B = in_t.batch();
   const unsigned int H = in_t.height();
@@ -116,8 +127,17 @@ void PSAAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
   std::vector<float> in_f32, out_f32;
   const float *in;
   float *out;
+  if (int8_in) {
+    in_f32.resize(in_t.size());
+    const int8_t *src = in_t.getData<int8_t>();
+    for (size_t i = 0; i < in_f32.size(); ++i)
+      in_f32[i] = static_cast<float>(src[i]) * in_scale;
+    out_f32.resize(out_t.size());
+    in = in_f32.data();
+    out = out_f32.data();
+  }
 #ifdef ENABLE_FP16
-  if (fp16) {
+  else if (fp16) {
     in_f32.resize(in_t.size());
     const _FP16 *src = in_t.getData<_FP16>();
     for (size_t i = 0; i < in_f32.size(); ++i)
@@ -125,9 +145,9 @@ void PSAAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
     out_f32.resize(out_t.size());
     in = in_f32.data();
     out = out_f32.data();
-  } else
+  }
 #endif
-  {
+  else {
     in = in_t.getData<float>();
     out = out_t.getData<float>();
   }
@@ -198,8 +218,21 @@ void PSAAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
                        VD, N);
   }
 
+  const bool int8_out = (out_t.getDataType() == nntrainer::Tdatatype::Q8_0_TW);
+  if (int8_out) {
+    const auto &aos = std::get<nntrainer::props::ActivationScale>(psa_props);
+    NNTR_THROW_IF(aos.empty() || aos.get() <= 0.0f, std::invalid_argument)
+      << "PSAAttentionLayer: int8 output edge with no registered "
+         "ActivationScale";
+    const float out_scale = aos.get();
+    const float inv_scale = 1.0f / out_scale;
+    int8_t *dst = out_t.getData<int8_t>();
+    for (size_t i = 0; i < out_f32.size(); ++i)
+      dst[i] = static_cast<int8_t>(
+        std::clamp(std::roundf(out_f32[i] * inv_scale), -127.0f, 127.0f));
+  }
 #ifdef ENABLE_FP16
-  if (fp16) {
+  else if (fp16) {
     _FP16 *dst = out_t.getData<_FP16>();
     for (size_t i = 0; i < out_f32.size(); ++i)
       dst[i] = static_cast<_FP16>(out_f32[i]);
