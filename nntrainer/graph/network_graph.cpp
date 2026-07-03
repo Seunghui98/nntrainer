@@ -121,6 +121,7 @@ void NetworkGraph::propagateActivationDataTypes() {
    * the conv int8 input path.
    */
   int8_output_nodes_.clear();
+  const bool probe = std::getenv("NNTR_INT8_PROBE") != nullptr;
 
   for (auto iter = cbegin(); iter != cend(); ++iter) {
     const auto &producer = *iter;
@@ -139,6 +140,13 @@ void NetworkGraph::propagateActivationDataTypes() {
     bool all_consumers_capable = true;
     for (const auto &cname : consumer_names) {
       if (cname.empty() || !getLayerNode(cname)->supportInt8ActInput()) {
+        if (probe)
+          std::cerr << "[INT8_PROBE] cond1-pass " << producer->getName()
+                    << " blocked by consumer "
+                    << (cname.empty() ? "(empty)" : cname)
+                    << " type="
+                    << (cname.empty() ? "?" : getLayerNode(cname)->getType())
+                    << std::endl;
         all_consumers_capable = false;
         break;
       }
@@ -147,8 +155,12 @@ void NetworkGraph::propagateActivationDataTypes() {
       continue;
 
     /** condition 3: a registered static scale must exist for this edge */
-    if (!hasActivationScale(producer->getName()))
+    if (!hasActivationScale(producer->getName())) {
+      if (probe)
+        std::cerr << "[INT8_PROBE] cond1+2-pass " << producer->getName()
+                  << " blocked: no activation scale" << std::endl;
       continue;
+    }
 
     int8_output_nodes_.insert(producer->getName());
   }

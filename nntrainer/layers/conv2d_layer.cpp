@@ -1115,9 +1115,42 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   // reaches the 1x1 stride-1 quantized NHWC path, so `input_` can bind straight
   // to the raw int8 tensor here. When the edge stays FP16/FP32, input_is_int8
   // is false and every path below is unchanged.
-  const bool input_is_int8 =
+  const bool input_is_int8_raw =
     (input_raw.getDataType() == nntrainer::Tdatatype::Q8_0_TW);
-  Tensor &input_ = input_raw;
+  const bool is_1x1_s1_for_dequant =
+    kernel_size[0].get() == 1 && kernel_size[1].get() == 1 &&
+    stride[0].get() == 1 && stride[1].get() == 1;
+  // W4A8 "beyond 1x1" boundary dequant: a conv whose supportInt8ActInput() is
+  // true but which is NOT the 1x1 int8-native fast-path (e.g. a 3x3 groups==1
+  // consumer, see Conv2DLayer::supportInt8ActInput) receives its Q8_0_TW input
+  // dequantized here into a plain FP16 buffer, then runs the existing,
+  // already-validated FP16 im2col/GEMM path below completely unchanged. This
+  // trusts the graph-level capability gate to only route int8 edges to conv
+  // configurations this generic dequant can safely feed.
+  Tensor input_dequant_fp16;
+  bool did_dequant_input = false;
+#ifdef ENABLE_FP16
+  if (input_is_int8_raw && !is_1x1_s1_for_dequant) {
+    float in_scale = -1.0f;
+    auto &ais = std::get<props::InputActivationScale>(conv_props);
+    if (!ais.empty() && ais.get() > 0.0f)
+      in_scale = ais.get();
+    NNTR_THROW_IF(in_scale <= 0.0f, std::invalid_argument)
+      << "[Conv2D] " << context.getName()
+      << ": int8 input edge with no registered InputActivationScale";
+    TensorDim fp16_in_dim = input_raw.getDim();
+    fp16_in_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+    input_dequant_fp16 = Tensor(fp16_in_dim);
+    const int8_t *src = input_raw.getData<int8_t>();
+    _FP16 *dst = input_dequant_fp16.getData<_FP16>();
+    const size_t n_in = input_raw.size();
+    for (size_t i = 0; i < n_in; ++i)
+      dst[i] = static_cast<_FP16>(static_cast<float>(src[i]) * in_scale);
+    did_dequant_input = true;
+  }
+#endif
+  Tensor &input_ = did_dequant_input ? input_dequant_fp16 : input_raw;
+  const bool input_is_int8 = input_is_int8_raw && !did_dequant_input;
 
   Tensor &filter_kernel = context.getWeight(wt_idx[ConvParams::weight]);
 
@@ -1719,12 +1752,10 @@ bool Conv2DLayer::hasActivationScale() const {
 }
 
 bool Conv2DLayer::supportInt8ActInput() const {
-  // W4A8 "1x1 first" scope: only the 1x1 stride-1 quantized GEMM path consumes
-  // an int8 (Q8_0_TW) activation directly (repack flat int8 -> block_q8_0x4,
-  // no FP16 round trip). 3x3 / depthwise convs have no int8-native kernel yet,
-  // so they decline int8 input and their incoming edge stays FP16. Props are
-  // set at construction (before compile()/propagateActivationDataTypes()), so
-  // kernel/stride are known here.
+  // W4A8 "1x1 first" scope: the 1x1 stride-1 quantized GEMM path consumes an
+  // int8 (Q8_0_TW) activation directly (repack flat int8 -> block_q8_0x4, no
+  // FP16 round trip). Props are set at construction (before compile()/
+  // propagateActivationDataTypes()), so kernel/stride are known here.
   //
   // The int8-native path only runs when THIS conv's own filter is Q4_0
   // (quant_matmul_filter): otherwise forwarding falls back to the FP im2col
@@ -1739,8 +1770,23 @@ bool Conv2DLayer::supportInt8ActInput() const {
     std::get<std::array<props::KernelSize, CONV2D_DIM>>(conv_props);
   const auto &stride = std::get<std::array<props::Stride, CONV2D_DIM>>(conv_props);
   const unsigned int filter_size = std::get<props::FilterSize>(conv_props);
-  return kernel_size[0].get() == 1 && kernel_size[1].get() == 1 &&
-         stride[0].get() == 1 && stride[1].get() == 1 && (filter_size % 32 == 0);
+  const bool is_1x1_s1 = kernel_size[0].get() == 1 && kernel_size[1].get() == 1 &&
+                        stride[0].get() == 1 && stride[1].get() == 1;
+  if (is_1x1_s1)
+    return filter_size % 32 == 0;
+
+  // W4A8 "beyond 1x1" extension: a standard (non-grouped) 3x3 stride-1 conv
+  // has no int8-native GEMM of its own, but Conv2DLayer::forwarding()
+  // dequantizes a Q8_0_TW input to FP16 at the boundary and runs the existing,
+  // already-validated FP16 im2col/GEMM path unchanged -- so this conv has no
+  // %32/quant-filter constraint of its own (dequant is filter-format-agnostic).
+  // Grouped/depthwise convs (own NHWC NEON kernel, see is_true_depthwise in
+  // forwarding()) are excluded until that path gets its own dequant boundary.
+  const bool is_3x3_s1 = kernel_size[0].get() == 3 && kernel_size[1].get() == 3 &&
+                        stride[0].get() == 1 && stride[1].get() == 1;
+  const auto &groups_prop = std::get<props::ConvGroups>(conv_props);
+  const unsigned int groups = groups_prop.empty() ? 1 : groups_prop.get();
+  return is_3x3_s1 && groups == 1;
 }
 
 bool Conv2DLayer::supportInt8ActOutput() const {
