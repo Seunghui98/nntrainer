@@ -149,6 +149,21 @@ void ConcatLayer::forwarding(RunLayerContext &context, bool training) {
 
   const TensorDim out_dim = output.getDim();
 
+  if (std::getenv("NNTR_INT8_PROBE")) {
+    std::cerr << "[CONCAT_PROBE] " << context.getName()
+              << " out dtype=" << (int)out_dim.getDataType()
+              << " out size=" << output.size()
+              << " out bytes=" << output.getMemoryBytes()
+              << " numInputs=" << context.getNumInputs() << std::endl;
+    for (unsigned int idx = 0; idx < context.getNumInputs(); idx++) {
+      Tensor &in = context.getInput(idx);
+      std::cerr << "[CONCAT_PROBE]   in[" << idx << "] name=" << in.getName()
+                << " dtype=" << (int)in.getDataType()
+                << " C=" << in.channel() << " size=" << in.size()
+                << " bytes=" << in.getMemoryBytes() << std::endl;
+    }
+  }
+
   // NHWC path: channel is physical-innermost, so a channel-axis concat (the
   // only concat YOLOv11 uses) interleaves per-pixel channel runs. The NCHW
   // reshape-helper path below assumes channel-major planes and would copy
