@@ -11,6 +11,10 @@
  *
  */
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include <addition_layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -32,14 +36,94 @@ void AdditionLayer::finalize(InitLayerContext &context) {
 void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
-  /** @todo check possibility for in-place of addition layer */
+  const bool int8_out =
+    (hidden_.getDataType() == nntrainer::Tdatatype::Q8_0_TW);
+  bool any_int8_in = false;
   for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
-    const Tensor &input_ = context.getInput(idx);
-    if (!idx) {
-      hidden_.copy(input_);
-    } else {
-      hidden_.add_i(input_);
+    if (context.getInput(idx).getDataType() == nntrainer::Tdatatype::Q8_0_TW) {
+      any_int8_in = true;
+      break;
     }
+  }
+
+  if (!any_int8_in && !int8_out) {
+    /** @todo check possibility for in-place of addition layer */
+    for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
+      const Tensor &input_ = context.getInput(idx);
+      if (!idx) {
+        hidden_.copy(input_);
+      } else {
+        hidden_.add_i(input_);
+      }
+    }
+    return;
+  }
+
+  // W4A8 static Q8_0: at least one input (or the output) is a persistent
+  // int8 (Q8_0_TW) edge. Dequantize every input to FP32 using ITS OWN
+  // registered per-tensor scale (Conv2DLayer::supportInt8ActInput() and
+  // NetworkGraph::propagateActivationDataTypes() guarantee any promoted
+  // input edge here has a registered scale -- see
+  // AdditionLayer::supportInt8ActInput()), sum in FP32, then requantize
+  // once into the output using this layer's own registered output scale.
+  NNTR_THROW_IF(context.getNumInputs() != 2, std::invalid_argument)
+    << "[AdditionLayer] int8 activation path only supports exactly 2 "
+       "inputs, got "
+    << context.getNumInputs();
+
+  const auto &in_scales =
+    std::get<std::array<props::InputActivationScale, 2>>(add_props);
+  const size_t n = hidden_.size();
+  std::vector<float> acc(n, 0.0f);
+
+  for (unsigned int idx = 0; idx < 2; ++idx) {
+    const Tensor &input_ = context.getInput(idx);
+    if (input_.getDataType() == nntrainer::Tdatatype::Q8_0_TW) {
+      NNTR_THROW_IF(in_scales[idx].empty() || in_scales[idx].get() <= 0.0f,
+                    std::invalid_argument)
+        << "[AdditionLayer] int8 input " << idx
+        << " has no registered InputActivationScale";
+      const float scale = in_scales[idx].get();
+      const int8_t *src = input_.getData<int8_t>();
+      for (size_t i = 0; i < n; ++i)
+        acc[i] += static_cast<float>(src[i]) * scale;
+    }
+#ifdef ENABLE_FP16
+    else if (input_.getDataType() == nntrainer::Tdatatype::FP16) {
+      const _FP16 *src = input_.getData<_FP16>();
+      for (size_t i = 0; i < n; ++i)
+        acc[i] += static_cast<float>(src[i]);
+    }
+#endif
+    else {
+      const float *src = input_.getData<float>();
+      for (size_t i = 0; i < n; ++i)
+        acc[i] += src[i];
+    }
+  }
+
+  if (int8_out) {
+    const auto &aos = std::get<props::ActivationScale>(add_props);
+    NNTR_THROW_IF(aos.empty() || aos.get() <= 0.0f, std::invalid_argument)
+      << "[AdditionLayer] int8 output edge with no registered "
+         "ActivationScale";
+    const float inv_scale = 1.0f / aos.get();
+    int8_t *dst = hidden_.getData<int8_t>();
+    for (size_t i = 0; i < n; ++i)
+      dst[i] = static_cast<int8_t>(
+        std::clamp(std::roundf(acc[i] * inv_scale), -127.0f, 127.0f));
+  }
+#ifdef ENABLE_FP16
+  else if (hidden_.getDataType() == nntrainer::Tdatatype::FP16) {
+    _FP16 *dst = hidden_.getData<_FP16>();
+    for (size_t i = 0; i < n; ++i)
+      dst[i] = static_cast<_FP16>(acc[i]);
+  }
+#endif
+  else {
+    float *dst = hidden_.getData<float>();
+    for (size_t i = 0; i < n; ++i)
+      dst[i] = acc[i];
   }
 }
 

@@ -15,6 +15,8 @@
 #define __ADDITION_LAYER_H__
 #ifdef __cplusplus
 
+#include <array>
+
 #include <common_properties.h>
 #include <layer_devel.h>
 
@@ -29,7 +31,10 @@ public:
   /**
    * @brief     Constructor of Addition Layer
    */
-  AdditionLayer() : Layer(), add_props(props::Print(), props::SkipPrefill()) {}
+  AdditionLayer() :
+    Layer(),
+    add_props(props::Print(), props::SkipPrefill(), props::ActivationScale(),
+              std::array<props::InputActivationScale, 2>()) {}
 
   /**
    * @brief     Destructor of Addition Layer
@@ -96,7 +101,38 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
-  std::tuple<props::Print, props::SkipPrefill>
+  /**
+   * @copydoc Layer::supportInt8ActInput()
+   * @note W4A8: Addition always has exactly 2 inputs in this model
+   * (residual connections). Each input is dequantized using ITS OWN
+   * registered scale (they need not match -- e.g. m10/add_pe combines
+   * m10/attn and m10/pe/dw, which happen to share a scale via the
+   * calibration tool's union-find grouping, but this code does not assume
+   * that), summed in float, then requantized with this layer's own output
+   * scale. Requires BOTH per-input scales to be registered.
+   */
+  bool supportInt8ActInput() const override {
+    const auto &in_scales =
+      std::get<std::array<props::InputActivationScale, 2>>(add_props);
+    return !in_scales[0].empty() && in_scales[0].get() > 0.0f &&
+           !in_scales[1].empty() && in_scales[1].get() > 0.0f;
+  }
+
+  /**
+   * @copydoc Layer::supportInt8ActOutput()
+   */
+  bool supportInt8ActOutput() const override {
+    const auto &aos = std::get<props::ActivationScale>(add_props);
+    return !aos.empty() && aos.get() > 0.0f;
+  }
+
+  /**
+   * @copydoc Layer::hasActivationScale()
+   */
+  bool hasActivationScale() const override { return supportInt8ActOutput(); }
+
+  std::tuple<props::Print, props::SkipPrefill, props::ActivationScale,
+             std::array<props::InputActivationScale, 2>>
     add_props; /**< fc layer properties : unit - number of output neurons */
   bool skip_prefill = false;
 
