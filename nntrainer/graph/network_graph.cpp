@@ -155,6 +155,12 @@ void NetworkGraph::propagateActivationDataTypes() {
 
   ml_logd("[W4A8] int8 activation edges selected: %zu",
           int8_output_nodes_.size());
+  if (std::getenv("NNTR_INT8_PROBE")) {
+    std::cerr << "[INT8_PROBE] edges selected: " << int8_output_nodes_.size()
+              << std::endl;
+    for (const auto &n : int8_output_nodes_)
+      std::cerr << "[INT8_PROBE]   " << n << std::endl;
+  }
 }
 
 bool NetworkGraph::hasActivationScale(const std::string &node_name) const {
