@@ -36,6 +36,15 @@ void PSAAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
 
   nntrainer::TensorDim out_dim = in_dim;
   out_dim.channel(NUM_HEADS * VD); // 256
+  // W4A8: an int8 (Q8_0_TW) input edge must not leak into this layer's own
+  // nominal output dim -- PSAAttentionLayer is not a passthrough (it
+  // computes real attention values), so its own output dtype is decided
+  // independently by NetworkGraph::propagateActivationDataTypes() based on
+  // ITS consumers, not inherited from its input (mirrors
+  // Conv2DLayer::finalize()'s and AdditionLayer::finalize()'s identical
+  // correction).
+  if (out_dim.getDataType() == ml::train::TensorDim::DataType::Q8_0_TW)
+    out_dim.setDataType(context.getActivationDataType());
   context.setOutputDimensions({out_dim});
 }
 

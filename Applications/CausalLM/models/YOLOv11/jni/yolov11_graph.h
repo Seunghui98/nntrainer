@@ -356,9 +356,48 @@ inline Tensor sliceCh(const std::string &name, int start0, int end0,
   return s(in);
 }
 
-/** @brief Elementwise addition of two tensors. */
-inline Tensor addT(const std::string &name, Tensor a, Tensor b) {
-  LayerHandle l(createLayer("Addition", {nntrainer::withKey("name", name)}));
+/**
+ * @brief Look up producer_name's own registered output scale (its "<name>"
+ * key in the calibration table) for use as ANOTHER layer's per-input scale.
+ * Returns 0.0f (uncalibrated -- caller should skip injecting the property)
+ * if no entry exists or the entry is non-positive.
+ */
+inline float producerOutputScale(const std::string &producer_name) {
+  const auto &tbl = actScaleTable();
+  auto it = tbl.find(producer_name);
+  return (it != tbl.end() && it->second > 0.0f) ? it->second : 0.0f;
+}
+
+/**
+ * @brief Elementwise addition of two tensors.
+ * @param a_producer, b_producer  Layer names whose OWN registered output
+ *                                scale should be used to dequantize `a`/`b`
+ *                                respectively, if the calibration table has
+ *                                an entry for them. Pass "" to skip (no
+ *                                scale injected for that input -- this
+ *                                Addition instance will then never be
+ *                                promoted, staying FP16, matching today's
+ *                                behavior).
+ */
+inline Tensor addT(const std::string &name, Tensor a, Tensor b,
+                    const std::string &a_producer = "",
+                    const std::string &b_producer = "") {
+  std::vector<std::string> props = {nntrainer::withKey("name", name)};
+  const float sa = a_producer.empty() ? 0.0f : producerOutputScale(a_producer);
+  const float sb = b_producer.empty() ? 0.0f : producerOutputScale(b_producer);
+  if (sa > 0.0f && sb > 0.0f) {
+    props.push_back(
+      nntrainer::withKey("input_activation_scale", {sa, sb}));
+  }
+  // Addition's OWN output scale only (its "<name>" key). Deliberately NOT
+  // appendActScales(props, name): that helper's "<name>:in" convention
+  // assumes a single-input conv and would inject a SCALAR
+  // input_activation_scale, colliding with the 2-element array pushed
+  // above ("size must match with array size" parse error).
+  const float s_out = producerOutputScale(name);
+  if (s_out > 0.0f)
+    props.push_back(nntrainer::withKey("activation_scale", s_out));
+  LayerHandle l(createLayer("Addition", props));
   return l({a, b});
 }
 
@@ -402,18 +441,19 @@ inline Tensor buildC2PSA(const std::string &n, Tensor x,
   auto v = vcat(v_parts);
   auto pe = yolov11::dwConvBnOnly(n + "/pe", 256, v);
 
-  LayerHandle att(
-    createLayer("psa_attention", {nntrainer::withKey("name", n + "/attn")}));
+  std::vector<std::string> attn_props = {nntrainer::withKey("name", n + "/attn")};
+  appendActScales(attn_props, n + "/attn");
+  LayerHandle att(createLayer("psa_attention", attn_props));
   auto attn = att(qkv);
-  auto attn_pe = addT(n + "/add_pe", attn, pe);
+  auto attn_pe = addT(n + "/add_pe", attn, pe, n + "/attn", n + "/pe/dw");
   auto proj =
     yolov11::convBnOnly(n + "/proj", 256, 256, 1, 1, 0, attn_pe, conv_q40);
-  auto b1 = addT(n + "/res1", b, proj);
+  auto b1 = addT(n + "/res1", b, proj, n + "/slice_b", n + "/proj/conv");
 
   auto ffn0 = yolov11::convBnSilu(n + "/ffn0", 256, 512, 1, 1, 0, b1, conv_q40);
   auto ffn1 =
     yolov11::convBnOnly(n + "/ffn1", 512, 256, 1, 1, 0, ffn0, conv_q40);
-  auto b2 = addT(n + "/res2", b1, ffn1);
+  auto b2 = addT(n + "/res2", b1, ffn1, n + "/res1", n + "/ffn1/conv");
 
   LayerHandle cat(createLayer("concat", {nntrainer::withKey("name", n + "/cat"),
                                          nntrainer::withKey("axis", chAxis())}));

@@ -30,7 +30,23 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 void AdditionLayer::finalize(InitLayerContext &context) {
   if (!std::get<props::SkipPrefill>(add_props).empty())
     skip_prefill = std::get<props::SkipPrefill>(add_props).get();
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+
+  TensorDim out_dim = context.getInputDimensions()[0];
+  // W4A8: an int8 (Q8_0_TW) input edge must not leak into this layer's own
+  // NOMINAL output dim. Addition is NOT a passthrough (isInt8PassThrough()
+  // is false -- it does real dequant-add-requant compute), so
+  // NetworkGraph::propagateActivationDataTypes() decides THIS layer's own
+  // output edge independently, based on whether ITS OWN consumer(s) accept
+  // int8; that decision is applied later by finalizeContext() only to the
+  // actual request spec (via isInt8ActivationOutput()), not by inheriting
+  // the input dtype forward. Without this guard, e.g. m10/res2 (both
+  // inputs legitimately int8) would leak Q8_0_TW into its own nominal dim
+  // even though m10/cat (its consumer) does not support int8 input,
+  // feeding a mismatched-dtype tensor into Concat's NHWC forwarding
+  // (mirrors Conv2DLayer::finalize()'s identical correction).
+  if (out_dim.getDataType() == ml::train::TensorDim::DataType::Q8_0_TW)
+    out_dim.setDataType(context.getActivationDataType());
+  context.setOutputDimensions({out_dim});
 }
 
 void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
