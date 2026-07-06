@@ -34,6 +34,16 @@
 #include <quantizer.h>
 #include <tensor_dim.h>
 
+#ifdef ENABLE_HEXKL
+#include <cstring>
+// remote.h defines CDSP_DOMAIN_ID / CDSP1_DOMAIN_ID used by sdkl.h; it must
+// be included first (same order used by every other sdkl.h consumer in this
+// backend, e.g. htp_backend.cpp, hexkl_mm.cpp).
+#include <remote.h>
+#include <sdkl.h>
+#include <wh_trailer.h>
+#endif
+
 namespace ml::train {
 class Layer;
 }
@@ -449,7 +459,29 @@ public:
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)
                 << "FP16 save only supports FP32 source weights.";
-              weight.clone(TensorDim::DataType::FP16).save(file);
+              Tensor fp16w = weight.clone(TensorDim::DataType::FP16);
+              fp16w.save(file);
+#ifdef ENABLE_HEXKL
+              if (nntrainer::hmx::g_wh_collector != nullptr) {
+                unsigned int Kdim = fp16w.getDim().height();
+                unsigned int Ndim = fp16w.getDim().width();
+                if (Ndim % 32 == 0 && Kdim % 32 == 0) {
+                  const size_t bytes = (size_t)Ndim * Kdim * sizeof(_FP16);
+                  nntrainer::hmx::WHTrailerEntry e;
+                  e.name = run_context.getWeight(i).getName();
+                  e.N = Ndim;
+                  e.K = Kdim;
+                  e.wh_bytes.resize(bytes);
+                  std::memcpy(e.wh_bytes.data(), fp16w.getData<_FP16>(), bytes);
+                  int rc = sdkl_cpu_rm_to_wh_f16_inplace(
+                    (size_t)Ndim, (size_t)Kdim,
+                    reinterpret_cast<_Float16 *>(e.wh_bytes.data()));
+                  NNTR_THROW_IF(rc != 0, std::runtime_error)
+                    << "WH bake conversion failed for " << e.name;
+                  nntrainer::hmx::g_wh_collector->push_back(std::move(e));
+                }
+              }
+#endif
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";

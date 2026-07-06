@@ -25,12 +25,14 @@
 
 #include <remote.h>
 #include <sdkl.h>
+#include <wh_trailer.h>
 
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -737,6 +739,53 @@ TEST_F(HtpDispatchTest, RoutesFfnToCpu_WhenFfnFallbackDisabled) {
 }
 
 } // namespace
+
+TEST(WHTrailerCodec, RoundTripsEntries) {
+  using nntrainer::hmx::WHTrailerEntry;
+  std::vector<WHTrailerEntry> in;
+  {
+    WHTrailerEntry e;
+    e.name = "layer0/fc_q";
+    e.N = 32;
+    e.K = 64;
+    e.wh_bytes.resize((size_t)e.N * e.K * 2, 0);
+    for (size_t i = 0; i < e.wh_bytes.size(); ++i)
+      e.wh_bytes[i] = static_cast<char>(i & 0xFF);
+    in.push_back(std::move(e));
+  }
+  {
+    WHTrailerEntry e;
+    e.name = "layer1/fc_o";
+    e.N = 64;
+    e.K = 32;
+    e.wh_bytes.resize((size_t)e.N * e.K * 2, 7);
+    in.push_back(std::move(e));
+  }
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  // Simulate a real bin: some weight data first, THEN the trailer.
+  const char pad[100] = {0};
+  ss.write(pad, sizeof(pad));
+  nntrainer::hmx::writeWHTrailer(ss, in);
+
+  std::vector<WHTrailerEntry> out;
+  ASSERT_TRUE(nntrainer::hmx::readWHTrailer(ss, out));
+  ASSERT_EQ(out.size(), in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    EXPECT_EQ(out[i].name, in[i].name);
+    EXPECT_EQ(out[i].N, in[i].N);
+    EXPECT_EQ(out[i].K, in[i].K);
+    EXPECT_EQ(out[i].wh_bytes, in[i].wh_bytes);
+  }
+}
+
+TEST(WHTrailerCodec, ReturnsFalseOnPlainData) {
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  const char pad[64] = {0};
+  ss.write(pad, sizeof(pad)); // no trailer/magic
+  std::vector<nntrainer::hmx::WHTrailerEntry> out;
+  EXPECT_FALSE(nntrainer::hmx::readWHTrailer(ss, out));
+}
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

@@ -58,6 +58,10 @@
 #include <slice_realizer.h>
 #include <util_func.h>
 
+#ifdef ENABLE_HEXKL
+#include <wh_trailer.h>
+#endif
+
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
 #endif
@@ -727,11 +731,35 @@ void NeuralNetwork::save(
     auto model_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
-    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-      const auto &layer_node = *iter;
-      auto it = layer_dtype_map.find(layer_node->getName());
-      auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
-      layer_node->save(model_file, false, exec_mode, target_dtype, target_isa);
+#ifdef ENABLE_HEXKL
+    // If the target dtype requested WH-baked FP16, append a WH trailer
+    // holding the WH-layout version of every FP16 FC weight (N,K both
+    // 32-aligned). The RM weight section above is written unchanged, so
+    // non-HTP readers ignore this trailer (it sits after the weight data,
+    // where the reader is EOF-tolerant). Requires the NPU (rm_to_wh runs
+    // on device).
+    if (dtype == TensorDim::DataType::FP16 && nntrainer::isWHBakeRequested()) {
+      std::vector<nntrainer::hmx::WHTrailerEntry> wh_entries;
+      nntrainer::hmx::g_wh_collector = &wh_entries;
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        const auto &layer_node = *iter;
+        layer_node->save(model_file, false, exec_mode,
+                         TensorDim::DataType::FP16, target_isa);
+      }
+      nntrainer::hmx::g_wh_collector = nullptr;
+      nntrainer::hmx::writeWHTrailer(model_file, wh_entries);
+    } else
+#endif
+    {
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           iter++) {
+        const auto &layer_node = *iter;
+        auto it = layer_dtype_map.find(layer_node->getName());
+        auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
+        layer_node->save(model_file, false, exec_mode, target_dtype,
+                         target_isa);
+      }
     }
 
     if (opt && istrequal(opt->getType(), "adam")) {
