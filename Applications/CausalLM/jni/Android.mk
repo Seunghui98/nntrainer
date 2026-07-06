@@ -13,6 +13,9 @@ endif
 
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
 
+# HexKL SDK root (used by nntr_quantize for WH-layout bake, ENABLE_HEXKL)
+HEXKL_ADDON_ROOT := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
+
 # Common Includes Definition
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
@@ -41,6 +44,14 @@ include $(PREBUILT_SHARED_LIBRARY)
 include $(CLEAR_VARS)
 LOCAL_MODULE := ccapi-nntrainer
 LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+# Prebuilt sdkl (HexKL NPU) library — armv8, matches S25 Ultra's Oryon CPU.
+# Only used by nntr_quantize (WH-layout bake, ENABLE_HEXKL).
+include $(CLEAR_VARS)
+LOCAL_MODULE := sdkl
+LOCAL_SRC_FILES := $(HEXKL_ADDON_ROOT)/lib/armv8_android26/libsdkl.so
+LOCAL_EXPORT_C_INCLUDES := $(HEXKL_ADDON_ROOT)/include
 include $(PREBUILT_SHARED_LIBRARY)
 
 # Tokenizer library
@@ -199,6 +210,15 @@ LOCAL_ARM_MODE := arm
 LOCAL_MODULE := nntr_quantize
 LOCAL_LDLIBS := -llog -landroid -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
 
+# ENABLE_HEXKL: layer_devel.h's WH-entry-collection code (used by --fc_dtype
+# FP16_WH) transitively pulls in remote.h/sdkl.h under this guard.
+LOCAL_CFLAGS += \
+    -DENABLE_HEXKL=1 \
+    -Drestrict=__restrict \
+    -I/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/incs \
+    -I/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/incs/stddef \
+    -I$(HEXKL_ADDON_ROOT)/include
+
 # Source files
 LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/causal_lm.cpp \
@@ -242,7 +262,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/shared_fully_connected_layer.cpp \
     ../api/streamer.cpp
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer sdkl
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \

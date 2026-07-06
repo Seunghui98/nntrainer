@@ -39,6 +39,8 @@
  *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
  *
  *   Supported data types: FP32, FP16, QINT8, Q4_0, Q4_K, Q6_K
+ *     FP16_WH: FP16 FC layers + offline-baked WH trailer for the HTP
+ *              prefill fast path (see nntrainer::setWHBakeRequested)
  *
  *   Example:
  *     # Quantize Qwen3-4B to Q4_0 FC layers (embedding stays FP32):
@@ -67,6 +69,10 @@
 #include <app_context.h>
 #include <factory.h>
 #include <tensor_dim.h>
+
+#ifdef ENABLE_HEXKL
+#include <wh_trailer.h>
+#endif
 
 #include "causal_lm.h"
 #include "deberta_v2.h"
@@ -414,6 +420,9 @@ void printUsage(const char *prog) {
     << "  --help, -h            Show this help message\n"
     << "\n"
     << "Supported data types: FP32, FP16, QINT8, Q4_0, Q6_K, Q4_K\n"
+    << "  FP16_WH: FP16 FC layers, plus an offline-baked WH trailer for the\n"
+    << "           HTP prefill fast path (HTP backend only; decode still "
+       "uses RM)\n"
     << "Supported ISA options: DEFAULT (current platform), X86, ARM\n"
     << "\n"
     << "Examples:\n"
@@ -667,6 +676,23 @@ int main(int argc, char *argv[]) {
 
     // Parse target ISA
     ml::train::ISA target_isa = strToISA(isa_str);
+
+    // FP16_WH is not a DataType: it requests an FP16 save with an appended
+    // offline-baked WH trailer for the HTP prefill fast path.
+    {
+      std::string up = fc_dtype_str;
+      std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      if (up == "FP16_WH") {
+#ifdef ENABLE_HEXKL
+        nntrainer::setWHBakeRequested(true);
+#else
+        std::cerr << "[WARNING] --fc_dtype FP16_WH requested but this build "
+                     "was compiled without ENABLE_HEXKL; saving plain FP16 "
+                     "without a WH trailer.\n";
+#endif
+        fc_dtype_str = "FP16"; // save path emits FP16 RM + WH trailer
+      }
+    }
 
     // Parse target data types
     DataType fc_dtype = strToDataType(fc_dtype_str);

@@ -72,3 +72,17 @@ C (FP32, M×N)  [C[m,n] = act_scale × wt_scale[n] × (C_i32[m,n] − zp_corr[n]
 | M > 1 && N%32==0 && `supports_shgemm()` && PrefillWHCache 히트 | NPU `shgemm_f32f16_f32` (pinned WH) | pin-once 경로 — rm_to_wh 비용 없음 |
 | M > 1 && N%32==0 && `supports_shgemm()` && PrefillWHCache 미스 | NPU `shgemm_f32f16_f32` (transient W_npu) | 캡 초과 또는 최초 호출 — pin 공간 부족 시 WH 매 호출 재계산 |
 | M > 1 && (N%32≠0 또는 NPU 미가동) | CPU `shgemm` fallback | N 정렬 위반 시 SDK 예외 방지 |
+
+## 6. 오프라인 WH Bake 파이프라인 (Integrated .bin)
+
+3-1의 pin-once 캐시는 프로세스 최초 호출 시점에 48 MB 캡 내에서만 rm_to_wh 비용을 상각합니다. 배포 전에 WH 변환을 오프라인으로 1회 수행해 두면 그 캡을 넘어서는 가중치까지도 첫 prefill 호출부터 rm_to_wh 비용 없이 NPU에 바로 투입할 수 있습니다.
+
+파이프라인 흐름:
+
+1. **Bake (오프라인, `nntr_quantize --fc_dtype FP16_WH`)** — `--fc_dtype FP16_WH`는 `DataType`이 아니라 도구 자체의 지시자입니다. 인자 파싱 단계에서 `nntrainer::setWHBakeRequested(true)`를 호출하고 이후 흐름은 일반 FP16 저장(`fc_dtype_str = "FP16"`)으로 진행됩니다. 저장 과정에서 `g_wh_collector`가 FC 레이어별 RM→WH 변환 결과를 `WHTrailerEntry{name, N, K, wh_bytes}` 형태로 수집합니다.
+2. **Trailer 기록 (writer, save 경로)** — 기존 RM FP16 바이너리 바이트열은 그대로 유지되고, 파일 끝에 `WH_TRAILER_MAGIC = "WHF1"`으로 식별되는 트레일러가 추가로 append됩니다 (`writeWHTrailer`). 트레일러를 모르는 구버전 로더는 동일 RM 바이너리만 읽으므로 파일 포맷은 하위 호환입니다.
+3. **Load-time registration (loader, `neuralnet.cpp`)** — 모델 로드 시 `readWHTrailer`가 트레일러 존재 여부를 먼저 확인하고, 존재하면 각 엔트리를 이름 키로 `registerPrefillWH(ptr, N, K, wh_bytes)`에 등록합니다. 이 등록은 `ExecutionMode::TRAIN`뿐 아니라 실제 CausalLM 앱이 항상 사용하는 `ExecutionMode::INFERENCE` 로드 경로에서도 수행됩니다.
+4. **Prefill fast path (consumer, `shgemm_f32f16_f32`)** — 호출 시 `lookupPrefillWH(ptr, N, K)`로 사전 등록된 WH 포인터를 먼저 조회합니다. 히트하면 rm_to_wh 변환 없이 즉시 NPU에 투입되고, 미스(트레일러 없음/등록 실패)면 3-1의 pin-once/transient 경로로 안전하게 폴백합니다 — 어느 경우에도 throw하지 않습니다.
+5. **Decode는 변경 없음** — decode(M=1)는 여전히 CPU NEON `hsgemv` 고정 경로이며 WH 트레일러/레지스트리와 무관합니다 (2절, 3-2절 참조).
+
+실측(2026-07-06, Qwen3-0.6B, S25 Ultra): 트레일러가 포함된 integrated bin 로드 시 `[HTP] Registered 196/196 pre-baked WH weights` 로그로 전 FC 가중치 등록을 확인했으며, 첫 prefill 호출부터 대부분의 레이어가 즉시 fast path를 탄 결과 prefill 시간이 3178 ms → 96 ms로 감소했습니다 (자세한 A/B 수치는 `08_e2e_performance_results.md` 6절 참조).

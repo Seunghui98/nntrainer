@@ -104,3 +104,45 @@ rm_to_wh가 transient prefill 비용의 96-98%를 차지. 9개 가중치 pin-onc
 **A2 필요 여부:** A1의 실효 residency는 B_effective≈48 MB로 한계. 더 큰 개선은 A2 설계 필요.
 
 *주: generation TPS는 decode=CPU NEON 고정이므로 pin-once와 무관.*
+
+---
+
+## 6. FP16 Prefill Offline WH Bake (2026-07-06 실측)
+
+5절의 pin-once 캐시는 48 MB 캡 안에서만 rm_to_wh 비용을 상각했습니다(~9/84 가중치). 이 절은 05번 문서 6절에서 설명한 오프라인 WH bake 파이프라인(`nntr_quantize --fc_dtype FP16_WH` → `WHF1` 트레일러 → load-time `registerPrefillWH`)을 캡 제한 없이 전체 FC 가중치에 적용한 뒤 실제 CausalLM 앱(`nntrainer_causallm`)으로 측정한 A/B 결과입니다.
+
+**기기/빌드:** Galaxy S25 Ultra (R3CY205ZMND, V79 HTP), `armv8_android26/libsdkl.so`, `libnntrainer.so`는 커밋 `510960db`(load-side INFERENCE 등록 포함 3건의 버그 수정 반영) 기준으로 재빌드.  
+**모델:** Qwen3-0.6B, `compute_engine: htp`, `fsu: false`, `fc_layer_dtype: FP16`, `embedding/lmhead: FP32`, `max_seq_len: 2048`, `warmup_prefill: true`, prompt 23 토큰 / 32 토큰 생성.
+
+### 6-1. 로드 시 WH 등록 확인
+
+```
+07-06 16:49:38.790 ... I nntrainer: [HTP] Registered 196/196 pre-baked WH weights
+```
+
+Integrated bin(`nntr_qwen3_0_6b_hmx_wh_baked.bin`, 트레일러 `WHF1` 확인됨) 로드 시 196개 FC 가중치 전량이 등록됨. RM-only bin(`nntr_qwen3_0_6b_hmx_w16a32_new.bin`) 로드 시에는 이 로그가 출력되지 않음(트레일러 없음 → 정상적으로 pin-once/transient 경로로 폴백).
+
+### 6-2. Prefill A/B (동일 프롬프트, 동일 기기/세션)
+
+| 구성 | .bin | prefill (ms) | prefill TPS | generation (ms) | generation TPS | peak RSS (KB) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| A. RM-only (기존 baseline) | `nntr_qwen3_0_6b_hmx_w16a32_new.bin` (2,125,725,696 B) | **3178** | 7.24 | 11682 | 2.74 | 2,322,652 |
+| B. RM+WH integrated (신규) | `nntr_qwen3_0_6b_hmx_wh_baked.bin` (3,006,537,490 B) | **96** | 239.58 | 11713 | 2.73 | 4,023,708 |
+| **개선** | | **-96.98% (33.1x)** | **33.1x** | ±0% (decode는 CPU 고정, 무관) | ±0% | +1,701,056 KB |
+
+- **Prefill:** 3178 ms → 96 ms, TPS 7.24 → 239.58 (약 **33.1배** 개선). 05번 문서 6절에서 설명한 대로 loader가 로드 시점에 전 FC 가중치를 미리 등록해 두므로, 최초 prefill 호출부터 rm_to_wh 재계산 없이 pinned WH 포인터를 즉시 사용한 결과입니다. 이번 측정에서는 단계별(alloc/memcpy/rm2wh/mm) 세부 breakdown을 별도로 격리하지 않았으나, 5-2절의 transient 측정(레이어당 rm2wh가 전체 시간의 96-98%)에 비춰보면 이번 개선분의 대부분은 rm2wh 제거로 설명됩니다.
+- **Generation(decode):** 변화 없음 (11682 ms → 11713 ms, TPS 2.74 → 2.73) — decode(M=1)는 여전히 CPU NEON `hsgemv` 고정 경로이므로 예상된 결과입니다.
+- **출력 텍스트:** 두 런 모두 반복 토큰 위주의 알려진 품질 이슈(별도 미해결 버그, 본 측정과 무관) — 타이밍/등록 카운트만 유효합니다.
+
+**측정 방식 참고:** 본 절(6절)의 A/B는 구성별 1회 측정(single measured run)입니다 — 5절(5-3)처럼 반복 측정 후 평균/분산을 낸 것이 아닙니다. 다만 관측된 효과 크기(33.1배, prefill 3178ms→96ms, 약 3082 ms 차이)는 5-3절에서 관찰된 run-to-run 분산(±300-400 ms)보다 훨씬 크므로, 이 결과를 측정 noise로 보기는 어렵습니다.
+
+### 6-3. 메모리 비용
+
+| 항목 | RM-only | RM+WH integrated | 델타 |
+| :--- | :---: | :---: | :---: |
+| `.bin` 파일 크기 | 2,125,725,696 B (1.98 GiB) | 3,006,537,490 B (2.80 GiB) | **+880,811,794 B (+839.9 MiB / +880.8 MB)** |
+| 실행 중 peak RSS | 2,322,652 KB (2.22 GiB) | 4,023,708 KB (3.84 GiB) | **+1,701,056 KB (+1.62 GiB)** |
+
+파일 크기 델타(+880.8 MB)는 설계 문서의 예시치("+~336 MB")보다 훨씬 큽니다 — Qwen3-0.6B는 FC 가중치 종류(q/k/v/o/gate/up/down proj 등)와 레이어 수(28)가 많아 196개 전량을 WH로 baking하면 RM 대비 거의 2배 가까운 용량이 추가로 필요합니다. 실행 중 peak RSS 델타(+1.62 GiB)는 파일 크기 델타보다도 커서, RM 원본과 등록된 WH 사본이 동시에 상주하는 데다(loader가 RM은 그대로 유지한 채 WH 트레일러 영역도 별도로 로드/등록) NPU 측 스크래치 할당까지 겹쳐진 결과로 추정됩니다. 메모리가 타이트한 기기에서는 이 트레이드오프(prefill 33배 개선 vs peak RSS +1.6 GiB)를 감안해 integrated bin 적용 여부를 결정해야 합니다.
+
+**결론:** load-side INFERENCE 등록 수정(`510960db`) 이후 오프라인 WH bake 파이프라인이 설계대로 동작함을 실제 CausalLM 앱 A/B로 확인. Prefill은 설계 목표(staging ~2700ms→~40-70ms, 총 prefill ~3950ms→~1300ms 지향)를 상회하는 개선(3178ms→96ms)을 보였으나, 메모리 비용은 설계 문서 추정치보다 상당히 크므로 배포 시 peak RSS 여유를 반드시 확인해야 함.
