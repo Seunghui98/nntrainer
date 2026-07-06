@@ -21,6 +21,11 @@
 #include <gtest/gtest.h>
 #include <hexkl_mm.h>
 #include <htp_backend.h>
+#include <input_layer.h>
+#include <layer.h>
+#include <model.h>
+#include <neuralnet.h>
+#include <optimizer.h>
 #include <tensor.h>
 
 #include <remote.h>
@@ -28,11 +33,16 @@
 #include <wh_trailer.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -785,6 +795,138 @@ TEST(WHTrailerCodec, ReturnsFalseOnPlainData) {
   ss.write(pad, sizeof(pad)); // no trailer/magic
   std::vector<nntrainer::hmx::WHTrailerEntry> out;
   EXPECT_FALSE(nntrainer::hmx::readWHTrailer(ss, out));
+}
+
+TEST(WHTrailerLoad, RegisterThenLookupReturnsBytes) {
+  nntrainer::hmx::prefillWHRegistryClear();
+  const unsigned N = 32, K = 64;
+  std::vector<_FP16> rm((size_t)N * K,
+                        (_FP16)1.0f); // stands in for weight data
+  std::vector<_FP16> wh((size_t)N * K);
+  for (size_t i = 0; i < wh.size(); ++i)
+    wh[i] = (_FP16)((float)(i % 13));
+
+  nntrainer::hmx::registerPrefillWH(rm.data(), N, K, wh.data());
+  const _FP16 *got = nntrainer::hmx::lookupPrefillWH(rm.data(), N, K);
+  ASSERT_NE(got, nullptr);
+  for (size_t i = 0; i < wh.size(); ++i)
+    ASSERT_EQ((float)got[i], (float)wh[i]);
+  // Wrong shape must miss.
+  EXPECT_EQ(nntrainer::hmx::lookupPrefillWH(rm.data(), N + 32, K), nullptr);
+  nntrainer::hmx::prefillWHRegistryClear();
+}
+
+/**
+ * @brief Helper: build a 2-FC-layer NeuralNetwork for WH-bake gate tests.
+ *        dense1 and dense2 both use 32-aligned dims (input_width, units1,
+ *        units2 all 32) so that dims alone can't be what excludes dense2
+ *        from the WH trailer -- only its layer_dtype_map override (FP32)
+ *        should exclude it.
+ */
+static std::unique_ptr<nntrainer::NeuralNetwork>
+createWHBakeGateTestNN(unsigned int input_width, unsigned int units1,
+                       unsigned int units2) {
+  auto nn = std::make_unique<nntrainer::NeuralNetwork>();
+
+  nn->addLayer(ml::train::layer::Input(
+    {"name=input", "input_shape=1:1:" + std::to_string(input_width)}));
+  nn->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense1", "unit=" + std::to_string(units1)}));
+  nn->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense2", "unit=" + std::to_string(units2)}));
+
+  nn->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn->setProperty({"loss=mse", "batch_size=1"});
+
+  // INFERENCE mode: TRAIN mode would append epoch/iter metadata after the
+  // WH trailer, moving it away from EOF and breaking readWHTrailer's
+  // EOF-relative parsing (matches quantize.cpp's inference-only usage).
+  nn->compile(ml::train::ExecutionMode::INFERENCE);
+  nn->initialize(ml::train::ExecutionMode::INFERENCE);
+  return nn;
+}
+
+namespace {
+/**
+ * @brief RAII guard for WHBakeGate tests: guarantees the process-global
+ *        WH-bake flag (nntrainer::setWHBakeRequested) is reset to false and
+ *        the temporary output file is removed on every exit path from the
+ *        test, not just the happy path. gtest's ASSERT_* macros do an early
+ *        `return` from the enclosing test function on failure, which would
+ *        otherwise skip manual cleanup placed after them and leak the flag
+ *        (stuck true) and the file into subsequent tests in the same
+ *        process.
+ */
+struct WHBakeGateTestGuard {
+  std::string file_path;
+  explicit WHBakeGateTestGuard(std::string path) : file_path(std::move(path)) {
+    nntrainer::setWHBakeRequested(true);
+  }
+  ~WHBakeGateTestGuard() {
+    nntrainer::setWHBakeRequested(false);
+    remove(file_path.c_str());
+  }
+
+  WHBakeGateTestGuard(const WHBakeGateTestGuard &) = delete;
+  WHBakeGateTestGuard &operator=(const WHBakeGateTestGuard &) = delete;
+};
+} // namespace
+
+/**
+ * @brief Regression test for the WH-bake gate bug in NeuralNetwork::save
+ *        (MODEL_FORMAT_BIN case): the old code only entered the WH-bake
+ *        branch when the *global* dtype argument passed to save() was
+ *        FP16, and once inside, it hardcoded every layer's save dtype to
+ *        FP16, ignoring layer_dtype_map entirely.
+ *
+ *        Real callers such as Applications/CausalLM/quantize.cpp always
+ *        pass dtype=NONE and rely entirely on layer_dtype_map for
+ *        per-layer dtypes (that's how --embd_dtype/--lmhead_dtype differ
+ *        from --fc_dtype), so with the old code the bake branch never
+ *        fired for them at all (no trailer ever written). Had the branch
+ *        been forced open by other means, it would additionally have
+ *        forced layers the caller wanted to keep at FP32 (e.g. embedding,
+ *        lm_head) to FP16 as well.
+ *
+ *        This test builds dense1 (resolved to FP16 via layer_dtype_map,
+ *        32x32 dims -> WH-eligible) and dense2 (explicitly overridden to
+ *        FP32 via layer_dtype_map, identical 32x32 dims so the "N,K both
+ *        32-aligned" gate can't be what excludes it), with dtype=NONE at
+ *        the call site -- exactly the quantize.cpp calling convention.
+ *        After the fix, exactly one WH trailer entry must exist, and it
+ *        must belong to dense1, not dense2.
+ */
+TEST(WHBakeGate, RespectsLayerDtypeMapOverride) {
+  const std::string file_path = "test_wh_bake_gate.bin";
+  auto nn = createWHBakeGateTestNN(/*input_width=*/32, /*units1=*/32,
+                                   /*units2=*/32);
+
+  std::map<std::string, nntrainer::TensorDim::DataType> dtype_map = {
+    {"dense1", nntrainer::TensorDim::DataType::FP16},
+    {"dense2", nntrainer::TensorDim::DataType::FP32},
+  };
+
+  WHBakeGateTestGuard guard(file_path);
+  ASSERT_NO_THROW(nn->save(file_path, ml::train::ModelFormat::MODEL_FORMAT_BIN,
+                           nntrainer::TensorDim::DataType::NONE, dtype_map));
+
+  std::ifstream file(file_path, std::ios::binary);
+  ASSERT_TRUE(file.is_open());
+  std::vector<nntrainer::hmx::WHTrailerEntry> entries;
+  ASSERT_TRUE(nntrainer::hmx::readWHTrailer(file, entries))
+    << "Expected a WH trailer to be written: WH bake was requested and "
+       "dense1 resolves to FP16 with 32-aligned dims.";
+  file.close();
+
+  ASSERT_EQ(entries.size(), 1u);
+  EXPECT_NE(entries[0].name.find("dense1"), std::string::npos)
+    << "unexpected WH entry name: " << entries[0].name;
+  for (const auto &e : entries) {
+    EXPECT_EQ(e.name.find("dense2"), std::string::npos)
+      << "dense2 was overridden to FP32 in layer_dtype_map and must not be "
+         "WH-baked, but found an entry for it: "
+      << e.name;
+  }
 }
 
 int main(int argc, char **argv) {
