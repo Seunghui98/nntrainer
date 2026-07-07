@@ -1040,6 +1040,15 @@ TEST(WHTrailerLoad, InferenceModeLoadRegistersWH) {
   nntrainer::hmx::prefillWHRegistryClear();
 }
 
+#ifdef ENABLE_HEXKL
+TEST(HtpBackendLifecycle, npuAliveTracksEnabled) {
+  // On a host with no NPU, both are false and must agree; on a device
+  // with an initialized NPU, both are true. They must never disagree
+  // while the process is running.
+  EXPECT_EQ(nntrainer::HtpBackend::global().enabled(), nntrainer::npuAlive());
+}
+#endif
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

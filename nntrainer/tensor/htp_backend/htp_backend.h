@@ -60,6 +60,16 @@ private:
   int domain_ = 0; ///< CDSP_DOMAIN_ID (resolved in the .cpp)
 };
 
+/**
+ * @brief True while the NPU session is initialized and sdkl_npu_free is
+ *        safe to call. Set false by HtpBackend's destructor immediately
+ *        before sdkl_npu_finalize so namespace-scope statics destroyed
+ *        afterwards skip freeing an already-finalized NPU. A plain flag
+ *        (not HtpBackend::enabled()) avoids touching the singleton after
+ *        its own destruction.
+ */
+bool npuAlive();
+
 } // namespace nntrainer
 
 #endif // ENABLE_HEXKL

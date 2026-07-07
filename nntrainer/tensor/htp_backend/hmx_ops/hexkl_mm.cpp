@@ -24,6 +24,15 @@
 #include <vector>
 
 namespace {
+
+// Free NPU memory only while the session is alive. At process teardown the
+// HtpBackend singleton finalizes the NPU before these namespace-scope
+// statics are destroyed; freeing afterwards yields sdkl_npu_free Err=1.
+static void npuFreeIfAlive(void *p) {
+  if (p != nullptr && nntrainer::npuAlive())
+    sdkl_npu_free(p);
+}
+
 struct WHEntry {
   void *npu;
   unsigned int N, K;
@@ -55,14 +64,14 @@ struct WHCache {
     auto it = cache.find(oldest);
     if (it != cache.end()) {
       total_bytes -= it->second.bytes;
-      sdkl_npu_free(it->second.npu);
+      npuFreeIfAlive(it->second.npu);
       cache.erase(it);
     }
   }
 
   ~WHCache() {
     for (auto &e : cache)
-      sdkl_npu_free(e.second.npu);
+      npuFreeIfAlive(e.second.npu);
   }
 } g_wh_cache;
 
@@ -79,7 +88,7 @@ struct PrefillWHCache {
 
   ~PrefillWHCache() {
     for (auto &e : cache)
-      sdkl_npu_free(e.second.npu);
+      npuFreeIfAlive(e.second.npu);
   }
 } g_prefill_wh;
 
@@ -101,7 +110,7 @@ const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
   // Same pointer, different shape (rare pointer reuse): drop the stale entry.
   if (it != g_prefill_wh.cache.end()) {
     g_prefill_wh.total_bytes -= it->second.bytes;
-    sdkl_npu_free(it->second.npu);
+    npuFreeIfAlive(it->second.npu);
     g_prefill_wh.cache.erase(it);
   }
 
@@ -120,7 +129,7 @@ const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
   int werr =
     sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K, (_Float16 *)new_npu);
   if (werr != 0) {
-    sdkl_npu_free(new_npu);
+    npuFreeIfAlive(new_npu);
     return nullptr; // conversion failed: transient fallback recomputes safely
   }
 
@@ -156,7 +165,7 @@ struct NpuScratch {
     if (bytes <= cap && p != nullptr)
       return p;
     if (p != nullptr) {
-      sdkl_npu_free(p);
+      npuFreeIfAlive(p);
       p = nullptr;
       cap = 0;
     }
@@ -169,7 +178,7 @@ struct NpuScratch {
   }
   ~NpuScratch() {
     if (p != nullptr)
-      sdkl_npu_free(p);
+      npuFreeIfAlive(p);
   }
 };
 static NpuScratch g_scratch_X, g_scratch_A, g_scratch_W;
@@ -453,7 +462,7 @@ size_t prefillWHCacheSize() {
 void prefillWHCacheClear() {
   std::lock_guard<std::mutex> lk(g_prefill_wh.mtx);
   for (auto &e : g_prefill_wh.cache)
-    sdkl_npu_free(e.second.npu);
+    npuFreeIfAlive(e.second.npu);
   g_prefill_wh.cache.clear();
   g_prefill_wh.total_bytes = 0;
 }
@@ -574,11 +583,11 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
 
   auto cleanup = [&]() {
     if (X_npu)
-      sdkl_npu_free(X_npu);
+      npuFreeIfAlive(X_npu);
     if (C_npu)
-      sdkl_npu_free(C_npu);
+      npuFreeIfAlive(C_npu);
     if (W_npu)
-      sdkl_npu_free(W_npu);
+      npuFreeIfAlive(W_npu);
   };
 
   int err = 0;

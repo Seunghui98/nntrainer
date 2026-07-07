@@ -22,7 +22,15 @@
 #include <remote.h>
 #include <sdkl.h>
 
+#include <atomic>
+
 namespace nntrainer {
+
+namespace {
+std::atomic<bool> g_npu_alive{false};
+} // namespace
+
+bool npuAlive() { return g_npu_alive.load(std::memory_order_acquire); }
 
 HtpBackend &HtpBackend::global() {
   static HtpBackend instance;
@@ -43,6 +51,7 @@ HtpBackend::HtpBackend() {
   }
 
   enabled_ = true;
+  g_npu_alive.store(true, std::memory_order_release);
 
   char version[SDKL_VERSION_STR_LEN] = {0};
   if (sdkl_npu_get_version(domain_, version) == 0) {
@@ -54,6 +63,7 @@ HtpBackend::HtpBackend() {
 
 HtpBackend::~HtpBackend() {
   if (enabled_) {
+    g_npu_alive.store(false, std::memory_order_release);
     sdkl_npu_finalize(domain_);
     enabled_ = false;
   }
