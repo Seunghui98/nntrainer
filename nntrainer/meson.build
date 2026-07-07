@@ -110,6 +110,11 @@ endif
 
 if get_option('enable-htp')
   nntrainer_headers += meson.current_source_dir() / 'htp_context.h'
+  # layer_devel.h (an installed public header) includes <wh_trailer.h> under
+  # ENABLE_HEXKL, so it must be installed too or consumers building against the
+  # installed headers (e.g. Applications/CausalLM ndk-build) fail with
+  # "wh_trailer.h file not found".
+  nntrainer_headers += meson.current_source_dir() / 'tensor' / 'htp_backend' / 'hmx_ops' / 'wh_trailer.h'
   nntrainer_common_sources += 'htp_context.cpp'
 endif
 

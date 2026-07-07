@@ -8,6 +8,29 @@
  */
 
 #ifdef ENABLE_HEXKL
+
+#include <htp_backend.h>
+
+// sdkl.h references CDSP_DOMAIN_ID / CDSP1_DOMAIN_ID, which come from
+// remote.h; it must be included first regardless of which sections below
+// end up compiled.
+#include <remote.h>
+#include <sdkl.h>
+
+namespace {
+// Free NPU memory only while the session is alive. At process teardown the
+// HtpBackend singleton finalizes the NPU before these namespace-scope
+// statics are destroyed; freeing afterwards yields sdkl_npu_free Err=1.
+//
+// Defined here (before ENABLE_FP16) so that both the FP16-only section
+// below and the always-compiled shgemm_u8i8_i32 section later in this file
+// share a single definition.
+static void npuFreeIfAlive(void *p) {
+  if (p != nullptr && nntrainer::npuAlive())
+    sdkl_npu_free(p);
+}
+} // namespace
+
 #ifdef ENABLE_FP16
 
 #include <hexkl_mm.h>
@@ -24,14 +47,6 @@
 #include <vector>
 
 namespace {
-
-// Free NPU memory only while the session is alive. At process teardown the
-// HtpBackend singleton finalizes the NPU before these namespace-scope
-// statics are destroyed; freeing afterwards yields sdkl_npu_free Err=1.
-static void npuFreeIfAlive(void *p) {
-  if (p != nullptr && nntrainer::npuAlive())
-    sdkl_npu_free(p);
-}
 
 struct WHEntry {
   void *npu;
