@@ -816,6 +816,30 @@ TEST(WHTrailerLoad, RegisterThenLookupReturnsBytes) {
   nntrainer::hmx::prefillWHRegistryClear();
 }
 
+#if defined(ENABLE_HEXKL) && defined(ENABLE_FP16)
+#include <cstdlib>
+TEST(HtpPrefillWH, disableToggleForcesMiss) {
+  // Register a dummy WH entry and confirm the env toggle forces a miss.
+  const unsigned int N = 32, K = 32;
+  std::vector<_FP16> wh(N * K);
+  for (size_t i = 0; i < wh.size(); ++i)
+    wh[i] = static_cast<_FP16>(1.0f);
+  const void *key = reinterpret_cast<const void *>(0xABCD);
+
+  nntrainer::hmx::prefillWHRegistryClear();
+  nntrainer::hmx::registerPrefillWH(key, N, K, wh.data());
+
+  unsetenv("NNTR_HTP_DISABLE_PREBAKED_WH");
+  EXPECT_NE(nntrainer::hmx::lookupPrefillWH(key, N, K), nullptr);
+
+  setenv("NNTR_HTP_DISABLE_PREBAKED_WH", "1", 1);
+  EXPECT_EQ(nntrainer::hmx::lookupPrefillWH(key, N, K), nullptr);
+  unsetenv("NNTR_HTP_DISABLE_PREBAKED_WH");
+
+  nntrainer::hmx::prefillWHRegistryClear();
+}
+#endif
+
 /**
  * @brief Helper: build a 2-FC-layer NeuralNetwork for WH-bake gate tests.
  *        dense1 and dense2 both use 32-aligned dims (input_width, units1,

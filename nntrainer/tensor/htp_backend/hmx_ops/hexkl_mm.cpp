@@ -40,6 +40,8 @@ static void npuFreeIfAlive(void *p) {
 #include <sdkl.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -300,6 +302,35 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
       }
       std::memcpy(W_transient, wh_host, w_bytes);
       W_wh = static_cast<const _Float16 *>(W_transient);
+
+      if (const char *ve = std::getenv("NNTR_HTP_VERIFY_PREBAKED_WH")) {
+        if (ve[0] == '1') {
+          std::vector<_FP16> chk((size_t)N * K);
+          std::memcpy(chk.data(), B, w_bytes);
+          int vrc = sdkl_cpu_rm_to_wh_f16_inplace(
+            (size_t)N, (size_t)K, reinterpret_cast<_Float16 *>(chk.data()));
+          if (vrc != 0) {
+            std::fprintf(stderr,
+                         "[HTP][verify] rm_to_wh failed rc=%d N=%u K=%u\n", vrc,
+                         N, K);
+          } else if (std::memcmp(chk.data(), wh_host, w_bytes) != 0) {
+            size_t nmis = 0, first = (size_t)-1;
+            for (size_t i = 0; i < (size_t)N * K; ++i) {
+              if (std::memcmp(&chk[i], &wh_host[i], sizeof(_FP16)) != 0) {
+                if (first == (size_t)-1)
+                  first = i;
+                ++nmis;
+              }
+            }
+            std::fprintf(stderr,
+                         "[HTP][verify] MISMATCH B=%p N=%u K=%u nmis=%zu "
+                         "first=%zu\n",
+                         B, N, K, nmis, first);
+          } else {
+            std::fprintf(stderr, "[HTP][verify] OK B=%p N=%u K=%u\n", B, N, K);
+          }
+        }
+      }
     } else {
       // No pre-baked WH: fall back to the pin cache, then transient convert.
       W_wh = getOrCreatePrefillWH(B, N, K);
@@ -451,6 +482,11 @@ const _FP16 *lookupPrefillWH(const void *rm_ptr, unsigned int N,
                              unsigned int K) {
   if (rm_ptr == nullptr)
     return nullptr;
+  // Escape hatch / bisection aid: force the transient RM->WH path.
+  if (const char *e = std::getenv("NNTR_HTP_DISABLE_PREBAKED_WH")) {
+    if (e[0] == '1')
+      return nullptr;
+  }
   std::lock_guard<std::mutex> lk(g_prefill_wh_reg.mtx);
   auto it = g_prefill_wh_reg.reg.find(rm_ptr);
   if (it == g_prefill_wh_reg.reg.end() || it->second.N != N ||
