@@ -86,15 +86,16 @@ void RMSReverseNormLayer::incremental_forwarding(
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  unsigned int _from = from;
-  bool is_prefill = !from;
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  } else if (skip_prefill && is_prefill)
+  unsigned int step_size = to - from;
+  bool is_prefill = !from || step_size > 1;
+  if (skip_prefill && is_prefill)
     return;
+
+  if (from) {
+    // Normalize to 0-based while preserving step size for multi-token prefill
+    to = to - from;
+    from = 0;
+  }
 
   in_step_dim.batch(1);
   in_step_dim.height(to - from);
