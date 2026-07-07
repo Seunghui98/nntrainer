@@ -96,7 +96,7 @@ CI (`cpp_linter`) checks only the lines you changed, and only with version 14.
 
 Required trailers on every commit:
 ```
-Signed-off-by: j2z0.lee <j2z0.lee@ax.samsung.com>
+Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 ```
 Use `git commit -s` to add the `Signed-off-by` automatically; append `Co-Authored-By` manually.

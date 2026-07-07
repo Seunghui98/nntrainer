@@ -40,6 +40,7 @@ static void npuFreeIfAlive(void *p) {
 #include <sdkl.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,17 @@ static void npuFreeIfAlive(void *p) {
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+
+// CPU reference GEMM (nntrainer/tensor/cpu_backend) — used only by the
+// NNTR_HTP_VERIFY_PREFILL_MM diagnostic below to diff the NPU result against
+// a known-correct implementation on the exact same real inputs.
+namespace nntrainer {
+void shgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
+            const unsigned int M, const unsigned int N, const unsigned int K,
+            const float alpha, const float *A, const unsigned int lda,
+            const _FP16 *B, const unsigned int ldb, const float beta, float *C,
+            const unsigned int ldc);
+}
 
 namespace {
 
@@ -109,12 +121,34 @@ struct PrefillWHCache {
   }
 } g_prefill_wh;
 
+// sdkl's WH-bake and NPU matmul both expect the weight physically laid out
+// [N, K] row-major (N rows of K-wide vectors). nntrainer's FC-family layers
+// store weights [K, N] row-major (TensorDim(1,1,in_dim.width(),unit)) and
+// call dot(..., trans=false, trans_in=false) — i.e. TransB=false. Relabeling
+// such a buffer as [N,K] (swapping the dims passed to
+// sdkl_cpu_rm_to_wh_f16_inplace without moving any bytes) silently scrambles
+// every element's tile position; an actual transpose is required first.
+// copyForWHBake writes B into `dst` (already sized N*K) in true [N,K]
+// row-major order, ready for sdkl_cpu_rm_to_wh_f16_inplace(N, K, dst).
+void copyForWHBake(const _FP16 *B, unsigned int N, unsigned int K, bool transB,
+                   _FP16 *dst) {
+  if (transB) {
+    // B is already [N, K] row-major (matches the sdkl/hexkl_mm convention).
+    std::memcpy(dst, B, (size_t)N * K * sizeof(_FP16));
+  } else {
+    // B is [K, N] row-major: dst[n,k] = B[k,n].
+    for (unsigned int k = 0; k < K; ++k)
+      for (unsigned int n = 0; n < N; ++n)
+        dst[(size_t)n * K + k] = B[(size_t)k * N + n];
+  }
+}
+
 // Return a pinned WH pointer for RM weight B, converting and pinning on first
 // request. Never evicts. Returns nullptr (caller falls back to transient) when
 // adding this weight would exceed PREFILL_WH_PIN_MAX_BYTES, or on any alloc /
 // conversion failure. Never throws — a throw here would crash inference.
 const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
-                                     unsigned int K) {
+                                     unsigned int K, bool transB) {
   if (B == nullptr)
     return nullptr;
 
@@ -142,7 +176,8 @@ const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
   if (err != 0 || new_npu == nullptr)
     return nullptr; // pool exhausted: transient fallback
 
-  std::memcpy(new_npu, B, new_bytes);
+  copyForWHBake(static_cast<const _FP16 *>(B), N, K, transB,
+                static_cast<_FP16 *>(new_npu));
   int werr =
     sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K, (_Float16 *)new_npu);
   if (werr != 0) {
@@ -306,7 +341,7 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
       if (const char *ve = std::getenv("NNTR_HTP_VERIFY_PREBAKED_WH")) {
         if (ve[0] == '1') {
           std::vector<_FP16> chk((size_t)N * K);
-          std::memcpy(chk.data(), B, w_bytes);
+          copyForWHBake(B, N, K, TransB, chk.data());
           int vrc = sdkl_cpu_rm_to_wh_f16_inplace(
             (size_t)N, (size_t)K, reinterpret_cast<_Float16 *>(chk.data()));
           if (vrc != 0) {
@@ -333,14 +368,14 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
       }
     } else {
       // No pre-baked WH: fall back to the pin cache, then transient convert.
-      W_wh = getOrCreatePrefillWH(B, N, K);
+      W_wh = getOrCreatePrefillWH(B, N, K, TransB);
       if (W_wh == nullptr) {
         W_transient = g_scratch_W.get(w_bytes);
         if (W_transient == nullptr) {
           cleanup();
           throw std::runtime_error("shgemm_f32f16_f32: W scratch alloc failed");
         }
-        std::memcpy(W_transient, B, w_bytes);
+        copyForWHBake(B, N, K, TransB, static_cast<_FP16 *>(W_transient));
         int werr = sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
                                                  (_Float16 *)W_transient);
         if (werr != 0) {
@@ -368,6 +403,34 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
       for (unsigned int i = 0; i < M * N; ++i)
         C[i] = alpha * A_npu_f32[i];
     }
+
+    if (const char *dbg = std::getenv("NNTR_HTP_VERIFY_PREFILL_MM")) {
+      if (dbg[0] == '1') {
+        static int call_idx = 0;
+        std::vector<float> C_ref((size_t)M * N);
+        nntrainer::shgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda,
+                          B, ldb, beta, C_ref.data(), N);
+        float max_ref = 0.f, max_err = 0.f, max_a = 0.f, max_b = 0.f;
+        for (size_t i = 0; i < (size_t)M * K; ++i)
+          max_a = std::max(max_a, std::fabs(A[i]));
+        for (size_t i = 0; i < (size_t)N * K; ++i)
+          max_b = std::max(max_b, std::fabs((float)B[i]));
+        for (size_t i = 0; i < (size_t)M * N; ++i) {
+          max_ref = std::max(max_ref, std::fabs(C_ref[i]));
+          max_err = std::max(max_err, std::fabs(C[i] - C_ref[i]));
+        }
+        float rel = max_err / (max_ref + 1e-6f);
+        std::fprintf(
+          stderr,
+          "[HTP][mm-verify] call=%d TransA=%d TransB=%d M=%u N=%u K=%u "
+          "lda=%u ldb=%u ldc=%u prebaked=%d maxA=%.4f maxB=%.4f maxRef=%.4f "
+          "maxErr=%.4f relErr=%.6f%s\n",
+          call_idx++, (int)TransA, (int)TransB, M, N, K, lda, ldb, ldc,
+          (int)(wh_host != nullptr), max_a, max_b, max_ref, max_err, rel,
+          rel > 0.05f ? " MISMATCH" : "");
+      }
+    }
+
     cleanup();
     return;
   }
@@ -406,7 +469,7 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
           "shgemm_f32f16_f32: weight NPU alloc failed (err=" +
           std::to_string(err) + ")");
       }
-      std::memcpy(new_npu, B, new_bytes);
+      copyForWHBake(B, N, K, TransB, static_cast<_FP16 *>(new_npu));
       int werr = sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
                                                (_Float16 *)new_npu);
       if (werr != 0) {

@@ -69,7 +69,7 @@ public:
 
   void loadWeight(const std::string &path) override { load_weight(path); }
 
-  void setDeterministicWeights() override {
+  void setDeterministicWeights() {
     auto set_weights = [](ml::train::Layer &layer,
                           nntrainer::RunLayerContext &context, void *) {
       if (layer.getName() == "output_of_causallm")

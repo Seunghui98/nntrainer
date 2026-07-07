@@ -854,6 +854,65 @@ TEST_F(HtpKernelTest, Accuracy_f32f16_f32_Prefill) {
   }
 }
 
+// Reproduces the ACTUAL production calling convention used by
+// FullyConnectedLayer / SharedFullyConnectedLayer for wq/wk/wv/wo and the FFN
+// gate/up/down projections: `input_.dot(weight, hidden_, false, false)`, i.e.
+// TransA=false, TransB=false. The FC weight tensor is constructed as
+// TensorDim(1, 1, in_dim.width(), unit) — physically stored ROW-MAJOR AS
+// [K, N] (K rows of N-wide vectors), NOT [N, K] like
+// Accuracy_f32f16_f32_Prefill above (which always passes TransB=true and
+// builds W as [N,K]). Unlike that test, this one matches what real Qwen3
+// prefill actually sends to hexkl_mm.cpp.
+TEST_F(HtpKernelTest, Accuracy_f32f16_f32_Prefill_TransBFalse_KNLayout) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  // The pin cache keys on raw pointer address only (production weight
+  // pointers are stable for a model's lifetime). Clear it so a freed
+  // std::vector from an earlier test can't alias this test's buffers via
+  // heap address reuse and return a stale WH entry baked under a different
+  // TransB convention.
+  nntrainer::hmx::prefillWHCacheClear();
+
+  struct PrefillShape {
+    int M, N, K;
+    const char *name;
+  };
+  // Same Qwen3-0.6B prefill shapes as Accuracy_f32f16_f32_Prefill.
+  const PrefillShape shapes[] = {
+    {16, 2048, 1024, "q_proj"},    {16, 1024, 1024, "kv_proj"},
+    {16, 1024, 2048, "o_proj"},    {16, 3072, 1024, "gate_up_proj"},
+    {16, 1024, 3072, "down_proj"},
+  };
+  for (const auto &s : shapes) {
+    std::vector<float> A = makeRandF32(s.M * s.K);
+    // Weight stored [K, N] row-major — matches the real FC layer layout
+    // (TensorDim height=K, width=N).
+    std::vector<_FP16> W_kn = makeRandF16(s.K * s.N);
+    std::vector<float> C(s.M * s.N, 0.f), ref(s.M * s.N, 0.f);
+
+    // CPU reference: C[m,n] = sum_k A[m,k] * W_kn[k,n] — no transpose,
+    // matching dot(..., trans=false, trans_in=false) semantics exactly.
+    for (int m = 0; m < s.M; ++m)
+      for (int n = 0; n < s.N; ++n) {
+        float acc = 0.f;
+        for (int k = 0; k < s.K; ++k)
+          acc += A[m * s.K + k] * (float)W_kn[k * s.N + n];
+        ref[m * s.N + n] = acc;
+      }
+
+    // Production calling convention: TransB=false, ldb = weight's own last
+    // axis = N (see TensorBase::calculateFlattenDot, !trans && !trans_in
+    // branch: ldb = input_last_axis).
+    nntrainer::hmx::shgemm_f32f16_f32(
+      0, false, false, s.M, s.N, s.K, 1.0f, A.data(), s.K,
+      reinterpret_cast<const __fp16 *>(W_kn.data()), s.N, 0.0f, C.data(), s.N);
+    float e = relErrorF32(C.data(), ref.data(), s.M * s.N);
+    EXPECT_LT(e, 1e-2f) << s.name << " M=" << s.M << " N=" << s.N
+                        << " K=" << s.K << " relError=" << e;
+  }
+}
+
 TEST_F(HtpKernelTest, PrefillWHResidency_ReusesCacheAcrossCalls) {
   if (!npu_enabled)
     GTEST_SKIP() << "NPU not available on this device";

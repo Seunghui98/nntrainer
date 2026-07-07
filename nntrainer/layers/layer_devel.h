@@ -466,13 +466,23 @@ public:
                 unsigned int Kdim = fp16w.getDim().height();
                 unsigned int Ndim = fp16w.getDim().width();
                 if (Ndim % 32 == 0 && Kdim % 32 == 0) {
+                  // fp16w is physically [K, N] row-major (FC-family weight
+                  // convention: height=K=in_dim.width(), width=N=unit; see
+                  // FullyConnectedLayer/SharedFullyConnectedLayer weight_dim
+                  // and their trans=false, trans_in=false dot() calls). The
+                  // sdkl WH-bake and NPU matmul require [N, K] row-major —
+                  // transpose before baking so the pre-baked bytes match what
+                  // hexkl_mm.cpp's runtime conversion produces for the same
+                  // weight (see copyForWHBake in hexkl_mm.cpp).
+                  Tensor fp16w_nk = fp16w.transpose("0:2:1");
                   const size_t bytes = (size_t)Ndim * Kdim * sizeof(_FP16);
                   nntrainer::hmx::WHTrailerEntry e;
                   e.name = run_context.getWeight(i).getName();
                   e.N = Ndim;
                   e.K = Kdim;
                   e.wh_bytes.resize(bytes);
-                  std::memcpy(e.wh_bytes.data(), fp16w.getData<_FP16>(), bytes);
+                  std::memcpy(e.wh_bytes.data(), fp16w_nk.getData<_FP16>(),
+                              bytes);
                   int rc = sdkl_cpu_rm_to_wh_f16_inplace(
                     (size_t)Ndim, (size_t)Kdim,
                     reinterpret_cast<_Float16 *>(e.wh_bytes.data()));
