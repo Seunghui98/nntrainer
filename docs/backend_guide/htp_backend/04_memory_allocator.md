@@ -63,7 +63,7 @@ struct PrefillWHCache {
 | 캐시 미스 + `total_bytes + new_bytes ≤ PREFILL_WH_PIN_MAX_BYTES` | `sdkl_npu_alloc` + memcpy + `sdkl_cpu_rm_to_wh_f16_inplace` + pin | 새 WH 포인터 |
 | 캐시 미스 + 캡 초과 또는 alloc 실패 | 할당 안 함, 에러 무시 | `nullptr` → 호출자가 transient 경로 사용 |
 
-**상수:** `PREFILL_WH_PIN_MAX_BYTES = 48 MB` (`hexkl_mm.cpp:41`)
+**상수:** `PREFILL_WH_PIN_MAX_BYTES = 48 MB` (`hexkl_mm.cpp:79`)
 
 Qwen3-0.6B 기준 48 MB 내에 핀 가능한 가중치: q_proj(4 MB)×3 + gate_up_proj(6 MB)×3 + down_proj(6 MB)×3 = **48 MB (레이어 1-3, 총 9개)**. 레이어 4-28의 가중치는 transient 경로로 처리됩니다.
 

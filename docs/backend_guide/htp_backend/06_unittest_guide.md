@@ -6,10 +6,10 @@
 
 HTP 백엔드 검증을 위해 두 종류의 정밀 레벨 테스트 스위트가 동작합니다.
 
-| 바이너리 | 소스 파일 | 역할 |
-| :--- | :--- | :--- |
-| `unittest_nntrainer_htp_kernels` | `test/unittest/unittest_nntrainer_htp_kernels.cpp` | sdkl C API 직접 호출 — 커널 수치 정확도 및 처리 레이턴시 측정 |
-| `unittest_nntrainer_htp_backend` | `test/unittest/unittest_nntrainer_htp_backend.cpp` | nntrainer ComputeOps API 레벨 통합 테스트 — Fallback 제어 흐름, QINT8 디스패치 검증 |
+| 바이너리 | 소스 파일 | 역할 | 테스트 스위트 |
+| :--- | :--- | :--- | :--- |
+| `unittest_nntrainer_htp_kernels` | `test/unittest/unittest_nntrainer_htp_kernels.cpp` | sdkl C API 직접 호출 — 커널 수치 정확도 및 처리 레이턴시 측정 | `HtpKernelTest` **22개** |
+| `unittest_nntrainer_htp_backend` | `test/unittest/unittest_nntrainer_htp_backend.cpp` | nntrainer ComputeOps API 레벨 통합 테스트 — QINT8 디스패치 검증 | `HtpShgemmTest`(6) + `HtpU8i8Test`(3) + `HtpDispatchTest`(4), 총 **13개, 3스위트** |
 
 NPU 의존 테스트는 `HtpBackend::global().enabled()` == false 일 때 `GTEST_SKIP()`으로 자동 건너뜁니다.
 
@@ -73,4 +73,25 @@ adb -s R3CY205ZMND shell \
   "cd /data/local/tmp && \
    LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
    ./sdkl_rm_to_wh_i8_probe --preset qwen_attn --buf all"
+```
+
+## 5. 진단 env 토글로 실행
+
+WH 캐시 및 prefill matmul 경로를 세밀하게 검증해야 할 때는 아래 `NNTR_HTP_*` 환경변수를 단말 실행 커맨드에 주입합니다.
+
+```bash
+# pre-baked WH를 강제 miss시켜 transient 경로로 실행 (bisection)
+adb -s R3CY205ZMND shell \
+  "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
+   NNTR_HTP_DISABLE_PREBAKED_WH=1 ./unittest_nntrainer_htp_kernels --gtest_color=no"
+
+# pre-baked 바이트를 transient 재계산과 memcmp (가중치별 OK/MISMATCH 로그)
+adb -s R3CY205ZMND shell \
+  "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
+   NNTR_HTP_VERIFY_PREBAKED_WH=1 ./unittest_nntrainer_htp_backend --gtest_color=no"
+
+# live NPU 출력을 CPU 레퍼런스와 diff
+adb -s R3CY205ZMND shell \
+  "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
+   NNTR_HTP_VERIFY_PREFILL_MM=1 ./unittest_nntrainer_htp_kernels --gtest_color=no"
 ```
