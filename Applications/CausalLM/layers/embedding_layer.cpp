@@ -771,6 +771,27 @@ void EmbeddingLayer::save(std::ofstream &file,
                                    quant_weight.getData<uint8_t>(), K, N,
                                    nullptr);
           quant_weight.save(file);
+        } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
+          // Skip quantization for bias-like tensors (1D with height == 1)
+          // as they are not suitable for Q8_0 block quantization
+          if (K == 1) {
+            weight.save(file);
+          } else {
+            NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+              << "Q8_0 embedding quantization requires width to be "
+                 "divisible by 32, but got width="
+              << N;
+            //////////////////////////////////////////////////////////////////
+            ///@note Please note that Embedding layer doesn't need to be
+            /// transposed!
+            //////////////////////////////////////////////////////////////////
+            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                           {nntrainer::Tformat::NCHW, dtype});
+            nntrainer::quantize_q8_0(weight.getData<float>(),
+                                     quant_weight.getData<uint8_t>(), K, N,
+                                     nullptr);
+            quant_weight.save(file);
+          }
         } else {
           NNTR_THROW_IF(true, std::runtime_error)
             << "This dtype is not supported in save with quantization";
