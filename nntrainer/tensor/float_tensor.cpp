@@ -997,16 +997,11 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     K = getDim().width();
     N = input.getDim().width();
     // Q8_0 weight is stored as plain block_q8_0 rows in [N, K] layout (one row
-    // per output channel, K in-features per row), i.e. the transpose of a plain
-    // FP32 [K, N] weight. Dequantize to FP32 [N, K], transpose back to [K, N]
-    // and reuse the standard FP32 GEMM path so the result is bit-comparable to
-    // running the same weight in FP32. Activations stay full-precision FP32
-    // (W8A32), matching the "Q8_0-FP32" model tensor type.
-    Tensor wdeq(1, 1, N, K, {getFormat(), Tdatatype::FP32});
-    dequantize_row_q8_0((const void *)mdata, wdeq.getData<float>(),
-                        (int64_t)N * K);
-    Tensor wT = wdeq.transpose("0:2:1");
-    dotFloat(wT, output, trans, trans_in, beta);
+    // per output channel). The FP32 activation is online-quantized to block_q8_0
+    // and multiplied via the int8 dot-product kernel (NEON on ARM, scalar
+    // elsewhere) - the same W8A8 accumulation strategy the Q4_0 path uses -
+    // instead of dequantizing the weight to FP32 and running an sgemm.
+    o->gemm_q8_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   }
 

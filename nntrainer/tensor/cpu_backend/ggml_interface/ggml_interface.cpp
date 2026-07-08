@@ -17,6 +17,7 @@
 #include <nntr_ggml_impl_utils.h>
 #include <string>
 #include <thread>
+#include <thread_manager.h>
 #include <vector>
 
 namespace nntrainer {
@@ -123,6 +124,36 @@ void __ggml_repack_q4_0_to_q4_0_8(void *dst, void *src, size_t data_size,
 void __ggml_repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
                                   const unsigned int M, const unsigned int N) {
   nntr_repack_q4_K_to_q4_K_8_bl(dst, 8, src, data_size, M, N);
+}
+
+void __ggml_gemm_q8_0_q8_0(const unsigned int M, const unsigned int N,
+                           const unsigned int K, const float *A,
+                           const unsigned int lda, const void *B,
+                           const unsigned int ldb, float *C,
+                           const unsigned int ldc) {
+  (void)lda;
+  (void)ldb;
+  const unsigned int nb = K / QK8_0;
+  const size_t row_bytes = sizeof(block_q8_0) * nb;
+
+  // Online-quantize the FP32 activation [M, K] to plain block_q8_0 [M, nb],
+  // matching the weight's block layout so the int8 dot kernel can consume both.
+  std::vector<char> QA(row_bytes * (size_t)M);
+  nntr_quantize_q8_0(A, QA.data(), (int64_t)M, (int64_t)K, nullptr);
+
+  // Parallelize over output columns (weight rows). parallel_for is synchronous,
+  // so QA (captured by reference) outlives every task.
+  auto &tm = ThreadManager::Global();
+  const unsigned int chunk = 16;
+  const size_t loop = (N + chunk - 1) / chunk;
+  tm.parallel_for(0, loop, [=, &QA](size_t idx) {
+    unsigned int c0 = chunk * static_cast<unsigned int>(idx);
+    unsigned int c1 =
+      std::min<unsigned int>(chunk * (static_cast<unsigned int>(idx) + 1), N);
+    nntr_gemm_q8_0_q8_0(static_cast<int>(K), C + c0, ldc,
+                        (const char *)B + (size_t)c0 * row_bytes, QA.data(),
+                        static_cast<int>(M), static_cast<int>(c1 - c0));
+  });
 }
 
 } // namespace nntrainer
