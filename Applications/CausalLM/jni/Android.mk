@@ -31,6 +31,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
     $(LOCAL_PATH)/../models/lfm2 \
+    $(LOCAL_PATH)/../models/lfm2_moe \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
 
@@ -103,6 +104,12 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
     ../models/lfm2/lfm2_causallm.cpp \
+    ../models/lfm2_moe/lfm2_moe_causallm.cpp \
+    ../models/lfm2_moe/lfm2_slim_moe_causallm.cpp \
+    ../models/lfm2_moe/lfm2_cached_slim_moe_causallm.cpp \
+    ../models/lfm2_moe/lfm2_moe_layer.cpp \
+    ../models/lfm2_moe/lfm2_moe_layer_fsu.cpp \
+    ../models/lfm2_moe/lfm2_moe_layer_cached.cpp \
     ../models/gemma3/function.cpp \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
@@ -220,6 +227,12 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
     ../models/lfm2/lfm2_causallm.cpp \
+    ../models/lfm2_moe/lfm2_moe_causallm.cpp \
+    ../models/lfm2_moe/lfm2_slim_moe_causallm.cpp \
+    ../models/lfm2_moe/lfm2_cached_slim_moe_causallm.cpp \
+    ../models/lfm2_moe/lfm2_moe_layer.cpp \
+    ../models/lfm2_moe/lfm2_moe_layer_fsu.cpp \
+    ../models/lfm2_moe/lfm2_moe_layer_cached.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
@@ -248,6 +261,7 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
     $(LOCAL_PATH)/../models/lfm2 \
+    $(LOCAL_PATH)/../models/lfm2_moe \
 
 include $(BUILD_EXECUTABLE)
 
@@ -315,7 +329,11 @@ LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_tinybert_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2.cpp \
-    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_moe.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_moe_reference.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_slim_moe.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_cached_slim_moe.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := googletest_main
