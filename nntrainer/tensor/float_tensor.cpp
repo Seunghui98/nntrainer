@@ -748,10 +748,11 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::FP16:
     dotFloat32Float16(input, output, trans, trans_in, beta);
     break;
-  /** applying gemm_q4_k / gemm_q6_k / gemm_q4_0 */
+  /** applying gemm_q4_k / gemm_q6_k / gemm_q4_0 / gemm_q8_0 */
   case Tdatatype::Q4_K:
   case Tdatatype::Q6_K:
   case Tdatatype::Q4_0:
+  case Tdatatype::Q8_0:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
   case Tdatatype::QINT16:
@@ -989,6 +990,23 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     } else {
       o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     }
+    break;
+  }
+  case Tdatatype::Q8_0: {
+    M = getDim().height();
+    K = getDim().width();
+    N = input.getDim().width();
+    // Q8_0 weight is stored as plain block_q8_0 rows in [N, K] layout (one row
+    // per output channel, K in-features per row), i.e. the transpose of a plain
+    // FP32 [K, N] weight. Dequantize to FP32 [N, K], transpose back to [K, N]
+    // and reuse the standard FP32 GEMM path so the result is bit-comparable to
+    // running the same weight in FP32. Activations stay full-precision FP32
+    // (W8A32), matching the "Q8_0-FP32" model tensor type.
+    Tensor wdeq(1, 1, N, K, {getFormat(), Tdatatype::FP32});
+    dequantize_row_q8_0((const void *)mdata, wdeq.getData<float>(),
+                        (int64_t)N * K);
+    Tensor wT = wdeq.transpose("0:2:1");
+    dotFloat(wT, output, trans, trans_in, beta);
     break;
   }
 

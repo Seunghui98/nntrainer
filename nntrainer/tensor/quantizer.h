@@ -37,7 +37,8 @@ enum class QScheme : uint16_t {
   Q4_Kx8 = 0x03,
   Q6_K = 0x4,
   Q4_0 = 0x5,
-  QS4CX = 0x6,
+  Q8_0 = 0x6,
+  QS4CX = 0x7,
   /** this is for custom use */
   CUSTOM_QUANTIZER_01 = 0x10,
   CUSTOM_QUANTIZER_02 = 0x11,
@@ -434,6 +435,7 @@ public:
     case QScheme::Q4_Kx8:
     case QScheme::Q6_K:
     case QScheme::Q4_0:
+    case QScheme::Q8_0:
       return std::make_unique<GgmlQuantizer>(qscheme);
       break;
     default:
