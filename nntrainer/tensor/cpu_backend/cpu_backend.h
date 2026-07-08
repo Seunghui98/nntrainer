@@ -1096,6 +1096,27 @@ extern void gemm_q4_0(const unsigned int M, const unsigned int N,
                       const unsigned int ldc);
 
 /**
+ * @brief Q8_0 weight (plain block_q8_0) x FP32 activation GEMM.
+ *        C(M, N) = A(M, K) * W.T(N, K). The activation is online-quantized to
+ *        block_q8_0 and multiplied via the int8 dot-product kernel (W8A8
+ *        accumulate, FP32 in/out).
+ *
+ * @param M rows of A / C
+ * @param N rows of W / cols of C
+ * @param K inner dimension (multiple of 32)
+ * @param A FP32 activation [M, K]
+ * @param lda unused
+ * @param B plain block_q8_0 weight [N, K]
+ * @param ldb unused
+ * @param C FP32 output [M, N]
+ * @param ldc leading dimension of C
+ */
+extern void gemm_q8_0(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const void *B,
+                      const unsigned int ldb, float *C, const unsigned int ldc);
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output

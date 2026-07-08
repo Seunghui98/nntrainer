@@ -1773,3 +1773,42 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
     return;
   }
 }
+
+/**
+ * @brief Portable scalar Q8_0-weight x Q8_0-activation GEMM (plain block_q8_0).
+ *        Numerically identical to the NEON dotprod path; used on architectures
+ *        without the NEON i8 dot kernel. Output C[m,j] = sum_b da*db*<a_b,b_b>.
+ */
+void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  assert(n % qk == 0);
+
+  const block_q8_0 *a_base = (const block_q8_0 *)vy; // activations [nr x nb]
+  const block_q8_0 *b_base = (const block_q8_0 *)vx; // weights     [nc x nb]
+
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0 *a_row = a_base + (size_t)m * nb;
+    for (int j = 0; j < nc; ++j) {
+      const block_q8_0 *b_row = b_base + (size_t)j * nb;
+      float acc = 0.0f;
+      for (int b = 0; b < nb; ++b) {
+        int isum = 0;
+        for (int k = 0; k < qk; ++k)
+          isum += (int)a_row[b].qs[k] * (int)b_row[b].qs[k];
+        acc += nntr_fp16_to_fp32(a_row[b].d) * nntr_fp16_to_fp32(b_row[b].d) *
+               (float)isum;
+      }
+      s[(size_t)m * bs + j] = acc;
+    }
+  }
+}
+
+void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  (void)nr;
+  nntr_gemm_q8_0_q8_0(n, s, bs, vx, vy, 1, nc);
+}

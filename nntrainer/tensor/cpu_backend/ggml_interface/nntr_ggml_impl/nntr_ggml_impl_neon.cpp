@@ -1370,3 +1370,47 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
     }
   }
 }
+
+void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  assert(n % qk == 0);
+
+  const block_q8_0 *a_base = (const block_q8_0 *)vy; // activations [nr x nb]
+  const block_q8_0 *b_base = (const block_q8_0 *)vx; // weights     [nc x nb]
+
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0 *a_row = a_base + (size_t)m * nb;
+    for (int j = 0; j < nc; ++j) {
+      const block_q8_0 *b_row = b_base + (size_t)j * nb;
+      float acc = 0.0f;
+      for (int b = 0; b < nb; ++b) {
+        // Each block holds 32 int8 quants; load as two int8x16 vectors.
+        const int8x16_t a0 = vld1q_s8(a_row[b].qs);
+        const int8x16_t a1 = vld1q_s8(a_row[b].qs + 16);
+        const int8x16_t b0 = vld1q_s8(b_row[b].qs);
+        const int8x16_t b1 = vld1q_s8(b_row[b].qs + 16);
+
+        // SAME helper as the Q4_0 NEON path.
+        int32x4_t sumi = vdupq_n_s32(0);
+        sumi = ggml_vdotq_s32(sumi, a0, b0);
+        sumi = ggml_vdotq_s32(sumi, a1, b1);
+
+        const int32_t isum = vaddvq_s32(sumi);
+        const float da = nntr_fp16_to_fp32(a_row[b].d);
+        const float db = nntr_fp16_to_fp32(b_row[b].d);
+        acc += da * db * (float)isum;
+      }
+      s[(size_t)m * bs + j] = acc;
+    }
+  }
+}
+
+void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  (void)nr;
+  nntr_gemm_q8_0_q8_0(n, s, bs, vx, vy, 1, nc);
+}

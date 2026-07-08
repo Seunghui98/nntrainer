@@ -163,6 +163,29 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldc);
 
 /**
+ * @brief C(M, N) = A(M, K) * W.T(N, K) for a plain block_q8_0 weight W.
+ *
+ * FP32 activation A is online-quantized to plain block_q8_0 and multiplied
+ * with the Q8_0 weight rows via the int8 dot-product kernel
+ * (nntr_gemm_q8_0_q8_0). W8A8 in the accumulation, FP32 in/out.
+ *
+ * @param M rows of A / C
+ * @param N rows of W / cols of C
+ * @param K inner dimension (must be a multiple of 32)
+ * @param A FP32 activation [M, K]
+ * @param lda unused (A is row-major, stride K)
+ * @param B plain block_q8_0 weight [N, K]
+ * @param ldb unused (B rows are contiguous)
+ * @param C FP32 output [M, N]
+ * @param ldc leading dimension of C
+ */
+void __ggml_gemm_q8_0_q8_0(const unsigned int M, const unsigned int N,
+                           const unsigned int K, const float *A,
+                           const unsigned int lda, const void *B,
+                           const unsigned int ldb, float *C,
+                           const unsigned int ldc);
+
+/**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *
  * @param M as descripted above
