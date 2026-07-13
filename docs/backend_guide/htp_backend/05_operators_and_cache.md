@@ -79,6 +79,7 @@ C (FP32, M×N)  [C[m,n] = act_scale × wt_scale[n] × (C_i32[m,n] − zp_corr[n]
 
 파이프라인 흐름:
 
+0. **전제조건 — 소스는 진짜 FP32여야 함.** `nntr_quantize`는 소스 `nntr_config.json`에 선언된 dtype으로 `.bin`을 로드하므로, 입력 config는 `"model_tensor_type": "FP32-FP32"` / `"fc_layer_dtype": "FP32"`로 FP32 bin을 정직하게 기술해야 합니다. `FP16-FP32`처럼 잘못 선언하면 loader가 4바이트 가중치를 2바이트로 읽어 가중치가 깨진 채 재저장되고, WH 수집도 안 돼 **빈 트레일러(`Registered 0/0`) + garbage 출력**이 됩니다. `nntr_quantize`는 소스가 `FP32-FP32`가 아니면 **에러로 중단**합니다(`quantize.cpp`; 이전에는 경고만 하고 진행해 깨진 모델을 생성했음). 증상/진단은 [02 §8-5](02_build_and_env.md) 참조.
 1. **Bake (오프라인, `nntr_quantize --fc_dtype FP16_WH`)** — `--fc_dtype FP16_WH`는 `DataType`이 아니라 도구 자체의 지시자입니다. 인자 파싱 단계에서 `nntrainer::setWHBakeRequested(true)`를 호출하고 이후 흐름은 일반 FP16 저장(`fc_dtype_str = "FP16"`)으로 진행됩니다. 저장 과정에서 `g_wh_collector`가 FC 레이어별 RM→WH 변환 결과를 `WHTrailerEntry{name, N, K, wh_bytes}` 형태로 수집합니다.
    - **Weight-layout 버그**: FC 계열 레이어(`fc_layer.cpp`, `shared_fully_connected_layer.cpp`)는 가중치를 **`[K,N]` row-major**로 저장하고 `dot(..., trans=false, trans_in=false)`(즉 `TransB=false`)로 호출한다. 과거 NPU shgemm 경로와 오프라인 WH-bake는 반대인 `[N,K]`를 가정해 모든 FC/QKV/FFN 가중치의 바이트 레이아웃을 잘못 라벨링했고, 그 결과 **NPU 출력이 전부 garbage**였다(CPU는 `ldb`로 레이아웃을 존중해 항상 정상). pre-baked 경로와 transient 경로가 같은 잘못된 가정에서 바이트를 유도했기에 둘 다 동일한 garbage를 냈다.
    - **수정(`8c1c1fa5`)**: `TransB==false`일 때 WH-bake 전에 실제 transpose를 수행한다. `hexkl_mm.cpp`에 `copyForWHBake()` 헬퍼를 추가해 transient·pin-cache RM→WH 경로에 연결하고, `layer_devel.h`는 오프라인 bake 전에 `Tensor::transpose("0:2:1")`(Q4_0/QS4CX와 동일 패턴)를 적용한다.

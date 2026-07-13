@@ -30,10 +30,10 @@ export ANDROID_NDK=/opt/android-ndk-r26d
 export PATH=$ANDROID_NDK:$PATH
 
 ./tools/package_android.sh \
-  --arm-arch=armv9.2-a \
+  --arm-arch=armv8.2-a \
   -Denable-htp=true \
   -Dhexkl-sdk-root=$HEXKL_SDK_ROOT \
-  -Dhexkl-lib-subdir=armv9_android26 \
+  -Dhexkl-lib-subdir=armv8_android26 \
   -Dmmap-read=false \
   -Dwerror=false
 ```
@@ -64,7 +64,7 @@ Use `--gtest_filter=<Suite>.<Test>` to run a specific test case.
 ```bash
 # Push binary and dependencies
 adb -s R3CY205ZMND push build_android/test/unittest/unittest_nntrainer_htp_kernels /data/local/tmp/
-adb -s R3CY205ZMND push $HEXKL_SDK_ROOT/lib/armv9_android26/libsdkl.so /data/local/tmp/
+adb -s R3CY205ZMND push $HEXKL_SDK_ROOT/lib/armv8_android26/libsdkl.so /data/local/tmp/
 # libhexkl_skel.so must already be in /data/local/tmp (device skeleton)
 
 # Run
@@ -156,7 +156,7 @@ The N%32 constraint comes from `sdkl_npu_mm_f32f16_f32` alignment requirements. 
 |--------|---------|-------|
 | `enable-htp` | false | HexKL/HTP NPU backend |
 | `hexkl-sdk-root` | `''` | Path to `hexkl_addon` directory (required when `enable-htp=true`) |
-| `hexkl-lib-subdir` | `armv9_android26` | Which prebuilt `libsdkl.so` to link (S25 Ultra = `armv9_android26`) |
+| `hexkl-lib-subdir` | `armv8_android26` | Which prebuilt `libsdkl.so` to link (S25 Ultra golden path = `armv8_android26`; `armv9_android26` causes a SIGILL on S25 Ultra, see 02 §8-1) |
 | `enable-npu` | false | QNN (Qualcomm AI Engine Direct) backend |
 | `qnn-sdk-root` | `''` | Path to QNN SDK root |
 | `enable-transformer` | false | CausalLM / transformer layers |
@@ -165,7 +165,7 @@ The N%32 constraint comes from `sdkl_npu_mm_f32f16_f32` alignment requirements. 
 | `enable-fsu` | false | Flash Storage Utilization — stream MoE experts from flash at runtime |
 | `enable-kernel-caching` | false | Cache compiled kernels to disk for faster subsequent runs |
 | `enable-debug` | false | Enable debug-level logging |
-| `arm-arch` | `none` | Target ARM architecture (`armv9.2-a` for S25 Ultra); derives `-march` flags |
+| `arm-arch` | `none` | Target ARM architecture (`armv8.2-a` for S25 Ultra golden path); derives `-march` flags |
 
 ---
 

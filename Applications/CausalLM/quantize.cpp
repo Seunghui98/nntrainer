@@ -678,13 +678,17 @@ int main(int argc, char *argv[]) {
     ml::train::ISA target_isa = strToISA(isa_str);
 
     // FP16_WH is not a DataType: it requests an FP16 save with an appended
-    // offline-baked WH trailer for the HTP prefill fast path.
+    // offline-baked WH trailer for the HTP prefill fast path. True only when a
+    // WH bake is actually active (ENABLE_HEXKL); used below to force the output
+    // config's compute_engine to "htp" since a WH-baked model is HTP-only.
+    bool wh_bake_requested = false;
     {
       std::string up = fc_dtype_str;
       std::transform(up.begin(), up.end(), up.begin(), ::toupper);
       if (up == "FP16_WH") {
 #ifdef ENABLE_HEXKL
         nntrainer::setWHBakeRequested(true);
+        wh_bake_requested = true;
 #else
         std::cerr << "[WARNING] --fc_dtype FP16_WH requested but this build "
                      "was compiled without ENABLE_HEXKL; saving plain FP16 "
@@ -699,14 +703,27 @@ int main(int argc, char *argv[]) {
     DataType embd_dtype = strToDataType(embd_dtype_str);
     DataType lmhead_dtype = strToDataType(lmhead_dtype_str);
 
-    // Validate source model is FP32
+    // Validate source model is FP32. This must be a hard error, not a
+    // warning: nntr_quantize loads the source .bin under the dtype declared
+    // here, so a config that mislabels an FP32 bin as (e.g.) "FP16-FP32"
+    // makes the loader read 2 bytes where each weight is 4, silently
+    // producing garbage-valued weights that then get re-saved. The result is
+    // a structurally valid but numerically corrupt output (and, for FP16_WH,
+    // an empty WH trailer -> "[HTP] Registered 0/0"). Refuse rather than bake
+    // a broken model.
     std::string src_tensor_type =
       nntr_cfg["model_tensor_type"].get<std::string>();
     if (src_tensor_type != "FP32-FP32") {
-      std::cerr << "[WARNING] Source model_tensor_type is '" << src_tensor_type
+      std::cerr << "[ERROR] Source model_tensor_type is '" << src_tensor_type
                 << "', not 'FP32-FP32'.\n"
-                << "  Quantization from non-FP32 models may produce unexpected "
-                   "results.\n";
+                << "  nntr_quantize requires an FP32 source model. The source "
+                   "nntr_config.json must declare\n"
+                << "  \"model_tensor_type\": \"FP32-FP32\" and "
+                   "\"fc_layer_dtype\": \"FP32\" so the FP32 .bin is loaded "
+                   "correctly.\n"
+                << "  Baking from a non-FP32-declared source produces a "
+                   "corrupt model (garbage output).\n";
+      return EXIT_FAILURE;
     }
 
     // Setup output directory
@@ -845,7 +862,10 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
-    if (usesQint8(fc_dtype, embd_dtype, lmhead_dtype))
+    // qint8 and FP16_WH bakes are both HTP-only paths — force the output
+    // config to target HTP so it doesn't inherit a stale/mismatched
+    // compute_engine from the source config (see wh_bake_requested above).
+    if (usesQint8(fc_dtype, embd_dtype, lmhead_dtype) || wh_bake_requested)
       new_nntr_cfg["compute_engine"] = "htp";
 
     std::string output_config_path = output_dir + "/nntr_config.json";
@@ -900,9 +920,10 @@ int main(int argc, char *argv[]) {
     std::cout << "\n";
     std::cout << "To run the quantized model:\n";
     if (output_dir == model_path) {
-      std::cout << "  1. Rename nntr_config_quantized.json to "
-                   "nntr_config.json\n";
-      std::cout << "  2. nntr_causallm " << model_path << "\n";
+      // No rename needed: nntr_causallm auto-prefers nntr_config_quantized.json
+      // over nntr_config.json when both exist in the model dir (see main.cpp).
+      std::cout << "  nntr_causallm " << model_path
+                << "  (auto-loads nntr_config_quantized.json)\n";
     } else {
       std::cout << "  nntr_causallm " << output_dir << "\n\n";
     }

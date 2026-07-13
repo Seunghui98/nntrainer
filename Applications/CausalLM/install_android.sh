@@ -303,7 +303,7 @@ export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
 export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 export NNTR_NUM_THREADS=4
 cd $INSTALL_DIR
-./nntrainer_causallm \$@
+./nntrainer_causallm \"\$@\"
 EOF
 "
 adb shell "chmod 755 $INSTALL_DIR/run_causallm.sh"
@@ -314,7 +314,7 @@ adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
 export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 cd $INSTALL_DIR
-./nntr_quantize \$@
+./nntr_quantize \"\$@\"
 EOF"
 
 adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
@@ -325,7 +325,7 @@ adb shell "cat > $INSTALL_DIR/run_safetensors_info.sh << 'EOF'
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
 export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 cd $INSTALL_DIR
-./nntr_safetensors_info \$@
+./nntr_safetensors_info \"\$@\"
 EOF"
 
 adb shell "chmod 755 $INSTALL_DIR/run_safetensors_info.sh"
@@ -337,7 +337,7 @@ export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
 export ADSP_LIBRARY_PATH=$INSTALL_DIR:\$ADSP_LIBRARY_PATH
 export NNTR_NUM_THREADS=4
 cd $INSTALL_DIR
-./test_api \$@
+./test_api \"\$@\"
 EOF
 "
     adb shell "chmod 755 $INSTALL_DIR/run_test_api.sh"

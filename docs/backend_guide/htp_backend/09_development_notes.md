@@ -17,14 +17,13 @@
 | 오프라인 WH bake (WHF1 트레일러) | ✅ | peak RSS +1.6 GiB 트레이드오프 | 메모리 타이트 기기 배포 판단 |
 | HtpMemAllocator | ⏸️ 비활성 | DMA 풀 고갈로 미등록 | per-call staging 유지 |
 | 진단 토글 (NNTR_HTP_*) | ✅ | — | — |
-| armv9 libsdkl.so | ⚠️ 우회 | SM8750 SIGILL | armv8 배포로 우회 |
+| armv9 libsdkl.so SIGILL | ✅ 해결 | — | — |
 | 최신 성능/정확성 | 🚧 측정중 | — | Phase D에서 07·08 링크로 반영 |
 
 (범례: ✅ 완료 / 🚧 진행중 / 📋 계획 / ⏸️ 비활성 / ⚠️ 우회)
 
 ## 2. 알려진 이슈 / 트레이드오프
 
-- **armv9 SIGILL**: `armv9_android26/libsdkl.so`가 SM8750에서 init 경로 SIGILL → 배포 시 `armv8_android26/libsdkl.so` 사용 (02·06 참조).
 - **WH-baked bin 메모리 비용**: integrated bin은 RM 대비 파일 +~880 MB, 실행 peak RSS +~1.6 GiB. prefill 대폭 개선과의 트레이드오프 (08 참조).
 - **QINT8 출력 품질**: 32토큰 생성은 crash 없이 완료되나 수치 정확도 재검증 예정.
 - **E2E single-run 분산**: run-to-run ±300–400 ms. 효과 크기가 분산보다 클 때만 유의미.

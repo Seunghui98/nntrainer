@@ -331,7 +331,16 @@ int main(int argc, char *argv[]) {
     if (std::filesystem::exists(generation_config_path)) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
-    json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    // Prefer the quantizer's output (nntr_config_quantized.json) when present
+    // so a freshly baked/quantized model runs without a manual rename step:
+    // nntr_quantize writes nntr_config_quantized.json for an in-place bake to
+    // avoid clobbering the FP32 source nntr_config.json. Fall back to
+    // nntr_config.json when no quantized config exists.
+    std::string nntr_config_path = model_path + "/nntr_config_quantized.json";
+    if (!std::filesystem::exists(nntr_config_path))
+      nntr_config_path = model_path + "/nntr_config.json";
+    std::cout << "Using config: " << nntr_config_path << std::endl;
+    json nntr_cfg = causallm::LoadJsonFile(nntr_config_path);
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
