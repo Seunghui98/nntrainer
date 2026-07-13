@@ -30,6 +30,14 @@ Applications/quick_ai/res/deberta_v2/*
 Applications/quick_ai/res/xlm_roberta/*
 !Applications/quick_ai/res/xlm_roberta/weight_converter.py
 !Applications/quick_ai/res/xlm_roberta/nntr_config.json
+!Applications/quick_ai/res/siglip2-encoder/
+Applications/quick_ai/res/siglip2-encoder/*
+!Applications/quick_ai/res/siglip2-encoder/config.json
+!Applications/quick_ai/res/siglip2-encoder/generation_config.json
+!Applications/quick_ai/res/siglip2-encoder/nntr_config.json
+!Applications/quick_ai/res/siglip2-encoder/weight_converter.py
+!Applications/quick_ai/res/siglip2-encoder/verify_encoder.py
+!Applications/quick_ai/res/siglip2-encoder/sample.png
 !Applications/quick_ai/res/gemma4/
 Applications/quick_ai/res/gemma4/*
 !Applications/quick_ai/res/gemma4/weight_converter.py

@@ -93,6 +93,7 @@
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include "siglip2/siglip2_vision_encoder.h"
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include "timm_vit/timm_vit_transformer.h"
 #endif
@@ -383,6 +384,11 @@ void registerAllModels() {
                                         json nntr_cfg) {
     return std::make_unique<quick_ai::DebertaV2>(cfg, generation_cfg, nntr_cfg);
   });
+  factory.registerModel(
+    "Siglip2VisionEncoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<quick_ai::Siglip2VisionEncoder>(
+        cfg, generation_cfg, nntr_cfg);
+    });
 #if !defined(_WIN32) && !defined(__ANDROID__)
   factory.registerModel(
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -406,6 +412,11 @@ void registerAllModels() {
                             cfg, generation_cfg, nntr_cfg);
                         });
 #endif
+  factory.registerModel(
+    "Siglip2VisionEncoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<quick_ai::Siglip2VisionEncoder>(
+        cfg, generation_cfg, nntr_cfg);
+    });
 }
 
 /**
@@ -566,6 +577,53 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
 
   return dtype_map;
 }
+
+/**
+ * @brief Build the layer_dtype_map for the SigLIP2 vision encoder.
+ *
+ * The QWEN-style names produced by buildLayerDtypeMap() (layer{i}_wq,
+ * output_of_causallm, ...) do NOT match the encoder layer names, so nothing
+ * would be quantized. This builds the exact FC names emitted by
+ * siglip2_vision_encoder.cpp.
+ *
+ * Encoder FCs (per layer i in [0, enc_layers)):
+ *   enc_layer{i}_wq, _wk, _wv, _out, _fc1, _fc2
+ * plus the single enc_to_dec_proj FC. All are 2D, so they take fc_dtype (Q4_0).
+ *
+ * For Q8_0 the patch_embed_conv is quantized too (stored [CRS, out_ch] by
+ * Conv2DLayer::save, run via NCHW im2col + the interleaved int8 GEMM); for
+ * Q4_0 it stays FP32 (a Q4_0 tensor must be 2D). pos_embedding and all
+ * LayerNorms stay FP32.
+ */
+std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
+                                                          DataType fc_dtype) {
+  std::map<std::string, DataType> dtype_map;
+
+  const bool quant_fc =
+    fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE;
+
+  if (quant_fc) {
+    for (int i = 0; i < enc_layers; ++i) {
+      const std::string pfx = "enc_layer" + std::to_string(i);
+      dtype_map[pfx + "_wq"] = fc_dtype;
+      dtype_map[pfx + "_wk"] = fc_dtype;
+      dtype_map[pfx + "_wv"] = fc_dtype;
+      dtype_map[pfx + "_out"] = fc_dtype;
+      dtype_map[pfx + "_fc1"] = fc_dtype;
+      dtype_map[pfx + "_fc2"] = fc_dtype;
+    }
+    dtype_map["enc_to_dec_proj"] = fc_dtype;
+    // Q8_0 also covers the 16x16 stride-16 patch conv: with no overlap it is a
+    // pure [196, 768] x [768, 768] matmul, stored [CRS, out_ch] by
+    // Conv2DLayer::save and consumed by the same interleaved int8 GEMM as the
+    // FCs (NCHW im2col + dotQnK). Q4_0 keeps the conv FP32 (unchanged).
+    if (fc_dtype == DataType::Q8_0)
+      dtype_map["patch_embed_conv"] = fc_dtype;
+  }
+
+  return dtype_map;
+}
+
 
 /**
  * @brief Add SentenceTransformer module dtype overrides to the dtype map
@@ -770,14 +828,25 @@ int main(int argc, char *argv[]) {
     std::string src_weight_path = model_path + "/" + original_bin;
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
-    // LLM backbones report num_hidden_layers; vision models (e.g. YOLOv11)
-    // don't, so fall back to 0 — buildLayerDtypeMap's FC loop is a no-op then
-    // and the model's getQuantizableLayerNames() supplies the conv names.
-    int num_layers = cfg.contains("num_hidden_layers")
-                       ? cfg["num_hidden_layers"].get<int>()
-                       : 0;
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
+
+    // The SigLIP2 vision encoder nests its layer count under cfg["encoder"]
+    // when a combined config.json is reused; fall back to the top-level field
+    // for a flat config. LLM backbones report num_hidden_layers; other vision
+    // models (e.g. YOLOv11) don't, so fall back to 0 — buildLayerDtypeMap's FC
+    // loop is a no-op then and getQuantizableLayerNames() supplies the convs.
+    const bool is_encoder = (architecture == "Siglip2VisionEncoder");
+    int num_layers = 0;
+    if (is_encoder) {
+      num_layers = cfg.contains("encoder")
+                     ? cfg.at("encoder").value("num_hidden_layers", 12)
+                     : cfg.value("num_hidden_layers", 12);
+    } else {
+      num_layers = cfg.contains("num_hidden_layers")
+                     ? cfg["num_hidden_layers"].get<int>()
+                     : 0;
+    }
 
     std::cout << "  Architecture: " << architecture << "\n";
     std::cout << "  Num layers:   " << num_layers << "\n";
@@ -848,10 +917,18 @@ int main(int argc, char *argv[]) {
       include_lmhead = false;
     }
 
-    auto layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
-                                              lmhead_dtype, include_lmhead);
-    addSentenceTransformerLayerDtypes(layer_dtype_map, nntr_cfg, model_path,
-                                      fc_dtype);
+    std::map<std::string, DataType> layer_dtype_map;
+    if (is_encoder) {
+      // SigLIP2 vision encoder: only its 2D FCs are quantized (conv/pos/LN stay
+      // FP32). embd_dtype is unused (the encoder has no embedding lookup
+      // table).
+      layer_dtype_map = buildEncoderLayerDtypeMap(num_layers, fc_dtype);
+    } else {
+      layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
+                                           lmhead_dtype, include_lmhead);
+      addSentenceTransformerLayerDtypes(layer_dtype_map, nntr_cfg, model_path,
+                                        fc_dtype);
+    }
 
     // Vision models surface their quantizable conv layer names via the model
     // virtual (the public API has no layer enumeration). When a conv target
@@ -896,6 +973,11 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     if (conv_dtype != DataType::FP32 && conv_dtype != DataType::NONE)
       new_nntr_cfg["conv_dtype"] = dataTypeToStr(conv_dtype);
+    // The encoder's patch conv is quantized alongside the FCs for Q8_0 (the
+    // NCHW conv runs the same interleaved int8 GEMM); record its dtype so the
+    // runtime graph declares the matching weight tensor.
+    if (is_encoder && fc_dtype == DataType::Q8_0)
+      new_nntr_cfg["patch_embed_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
 
