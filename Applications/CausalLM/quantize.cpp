@@ -88,6 +88,7 @@
 #endif
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
+#include "xlm_roberta/xlm_roberta.h"
 #if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
 #endif
@@ -258,7 +259,8 @@ std::string resolve_architecture(std::string model_type,
     // Already-resolved nntrainer class names — pass through
     if (architecture == "Qwen3Embedding" || architecture == "Qwen2Embedding" ||
         architecture == "EmbeddingGemma" ||
-        architecture == "MultilingualTinyBert" || architecture == "DebertaV2")
+        architecture == "MultilingualTinyBert" || architecture == "DebertaV2" ||
+        architecture == "XLMRobertaForMaskedLM")
       return architecture;
 
     if (architecture == "Qwen3ForCausalLM")
@@ -270,6 +272,8 @@ std::string resolve_architecture(std::string model_type,
       return "Qwen2Embedding";
     else if (architecture == "BertForMaskedLM")
       return "MultilingualTinyBert";
+    else if (architecture == "XLMRobertaModel")
+      return "XLMRobertaForMaskedLM";
     else if (architecture == "DebertaV2ForMaskedLM")
       return "DebertaV2";
     else
@@ -383,6 +387,13 @@ void registerAllModels() {
         cfg, generation_cfg, nntr_cfg);
     });
 #endif
+#if !defined(_WIN32)
+  factory.registerModel(
+    "XLMRobertaForMaskedLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::XLMRobertaForMaskedLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+#endif
 }
 
 /**
@@ -473,6 +484,8 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
   // Embedding layer
   if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE) {
     dtype_map["embedding0"] = embd_dtype;
+    dtype_map["position_embedding"] = embd_dtype;
+    dtype_map["token_type_embedding"] = embd_dtype;
   }
 
   // Gemma4 PLE layers - set to Q4_0 first

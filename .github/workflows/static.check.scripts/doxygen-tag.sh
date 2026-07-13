@@ -37,7 +37,7 @@ fi
 echo "::group::Doxygen tag check started"
 
 for file in `cat $files`; do
-  if [[ `file $file | grep "ASCII text" | wc -l` -gt 0 ]]; then
+  if [[ `file $file | grep -E "(ASCII|Unicode) text" | wc -l` -gt 0 ]]; then
       # In case of source code files: *.c|*.h|*.cpp|*.py|*.sh|*.php )
       case $file in
           # In case of C/C++ code

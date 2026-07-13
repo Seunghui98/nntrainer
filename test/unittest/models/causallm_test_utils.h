@@ -531,6 +531,16 @@ struct TinyCausalLMCase {
     create_model;
   std::function<void(TinyCausalLMRunner &)>
     setup_weights; /**< Populate deterministic weights before saving */
+  /**
+   * @brief Optional nntrainer config factory override.
+   *
+   * When non-null, called instead of makeTinyNntrainerConfig() to build the
+   * nntrainer config (e.g. flash-attention cases need init_seq_len=32).
+   * When null, makeTinyNntrainerConfig() is used.
+   */
+  std::function<causallm::json(const std::filesystem::path &,
+                               const TinyCausalLMDataType &)>
+    make_nntrainer_config = nullptr;
 };
 
 /**
@@ -675,6 +685,12 @@ TinyCausalLMDataType makeTinyQ40Fp32DataType();
  * @return Tiny QINT8-FP32 data type descriptor
  */
 TinyCausalLMDataType makeTinyQint8Fp32DataType();
+
+/**
+ * @brief Make Q4_0 weights with FP16 activations data type variant
+ * @return Tiny Q4_0-FP16 data type descriptor
+ */
+TinyCausalLMDataType makeTinyQ40Fp16DataType();
 
 /**
  * @brief Convert a test dtype string to an nntrainer tensor data type

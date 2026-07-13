@@ -426,7 +426,7 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   unsigned int from = _from;
   unsigned int to = _to;
 
-  if (to >= max_timestep) {
+  if (to > max_timestep) {
     // initial forwarding
     if (!_from) {
       throw std::invalid_argument(

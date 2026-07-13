@@ -543,7 +543,9 @@ makeQwen3Case(const causallm_test::TinyCausalLMDataType &data_type) {
     "Qwen3_" + data_type.name,
     data_type,
     {"hello tok4", makeExpectedQwen3Logits(),
-     data_type.name == "FP32" ? 1e-4f : 1e-3f},
+     data_type.name == "FP32"       ? 1e-4f
+     : data_type.name == "Q40_FP16" ? 2e-3f
+                                    : 1e-3f},
     makeTinyQwen3Config,
     makeQwen3LayerDtypeMap,
     [](causallm::json &cfg, causallm::json &generation_cfg,
@@ -670,6 +672,15 @@ TEST(Qwen3Qint8WeightRoundTripTest, SaveLoadRestoresQuantMetadata) {
   EXPECT_NE(std::accumulate(wq.zp_corr.begin(), wq.zp_corr.end(), int64_t{0}),
             int64_t{0});
 }
+
+#ifdef ENABLE_FP16
+INSTANTIATE_TEST_SUITE_P(
+  Qwen3Fp16, CausalLMTinyModelTest,
+  ::testing::Values(makeQwen3Case(causallm_test::makeTinyQ40Fp16DataType())),
+  [](const ::testing::TestParamInfo<causallm_test::TinyCausalLMCase> &info) {
+    return info.param.name;
+  });
+#endif
 
 /**
  * @brief Test that a tiny Qwen3 embedding model can save/load and encode

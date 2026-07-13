@@ -46,6 +46,7 @@
 #endif
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
+#include "xlm_roberta.h"
 #if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
 #endif
@@ -184,6 +185,9 @@ std::string resolve_architecture(std::string model_type,
       return "Qwen2Embedding";
     } else if (architecture == "BertForMaskedLM") {
       return "MultilingualTinyBert";
+    } else if (architecture == "XLMRobertaForMaskedLM" ||
+               architecture == "XLMRobertaModel") {
+      return "XLMRobertaForMaskedLM";
     } else if (architecture == "TimmViT" ||
                architecture == "vit_base_patch16_siglip_224") {
       return "TimmViT";
@@ -298,6 +302,13 @@ int main(int argc, char *argv[]) {
   causallm::Factory::Instance().registerModel(
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::MultilingualTinyBert>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+#endif
+#if !defined(_WIN32)
+  causallm::Factory::Instance().registerModel(
+    "XLMRobertaForMaskedLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::XLMRobertaForMaskedLM>(
         cfg, generation_cfg, nntr_cfg);
     });
 #endif

@@ -17,6 +17,7 @@ subdir('timm_vit')
 subdir('gemma4')
 if get_option('platform') != 'windows'
     subdir('bert')
+    subdir('xlm_roberta')
     subdir('gpt_oss_cached_slim')
     subdir('qwen3_cached_slim_moe')
 endif
