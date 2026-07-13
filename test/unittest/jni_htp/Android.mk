@@ -21,11 +21,25 @@ LOCAL_C_INCLUDES         := \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/layers \
     $(NNTRAINER_ROOT)/nntrainer/models \
+    $(NNTRAINER_ROOT)/nntrainer/compiler \
     $(NNTRAINER_ROOT)/nntrainer/graph \
     $(NNTRAINER_ROOT)/nntrainer/optimizers \
     $(NNTRAINER_ROOT)/api \
     $(NNTRAINER_ROOT)/api/ccapi/include \
     $(HEXKL_ADDON_ROOT)/include
+LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
+include $(PREBUILT_SHARED_LIBRARY)
+
+# ---- prebuilt: libccapi-nntrainer.so (ml::train:: layer/optimizer factory) ----
+# unittest_nntrainer_htp_backend builds NeuralNetwork models via the ml::train
+# API (createLayer/createOptimizer), whose symbols live here, not in
+# libnntrainer.so.
+include $(CLEAR_VARS)
+LOCAL_MODULE             := ccapi-nntrainer
+LOCAL_SRC_FILES          := $(NNTRAINER_LIB_DIR)/libccapi-nntrainer.so
+LOCAL_C_INCLUDES         := \
+    $(NNTRAINER_ROOT)/api \
+    $(NNTRAINER_ROOT)/api/ccapi/include
 LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 include $(PREBUILT_SHARED_LIBRARY)
 
@@ -71,7 +85,7 @@ LOCAL_CFLAGS     := \
 LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := $(NNTRAINER_ROOT)/test/unittest/unittest_nntrainer_htp_backend.cpp
-LOCAL_SHARED_LIBRARIES := nntrainer sdkl
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer sdkl
 LOCAL_STATIC_LIBRARIES := gtest
 include $(BUILD_EXECUTABLE)
 
@@ -124,20 +138,5 @@ LOCAL_CFLAGS     := \
 LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := sdkl_npu_probe.cpp
-LOCAL_SHARED_LIBRARIES := sdkl_armv8
-include $(BUILD_EXECUTABLE)
-
-# ---- executable: sdkl_rm_to_wh_i8_probe (armv8 libsdkl, no libnntrainer) ---
-include $(CLEAR_VARS)
-LOCAL_MODULE     := sdkl_rm_to_wh_i8_probe
-LOCAL_CFLAGS     := \
-    -pthread -fexceptions \
-    -DENABLE_FP16=1 -DUSE__FP16=1 \
-    -Drestrict=__restrict \
-    -I/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/incs \
-    -march=armv8.2-a+fp16+dotprod+i8mm -O2
-LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
-LOCAL_LDLIBS     := -llog
-LOCAL_SRC_FILES  := sdkl_rm_to_wh_i8_probe.cpp
 LOCAL_SHARED_LIBRARIES := sdkl_armv8
 include $(BUILD_EXECUTABLE)

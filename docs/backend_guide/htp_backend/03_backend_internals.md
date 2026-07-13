@@ -50,17 +50,27 @@ So the default CPU allocator (regular virtual memory) holds model tensors, and N
 
 `sdkl_npu_mm_f32f16_f32` permanently reserves ~400 MB of internal scratch on its first call. That leaves an effective pin-once budget of **B_effective ≈ 48 MB**, not the raw 448 MB — raising the cap to 512 MB made kernel scratch allocation fail during testing, which corrupted SDKL's internal state and caused a SIGSEGV (see `task-4b-report.md`).
 
-### 2.3 Active Strategy: Per-Call Staging Buffers
+### 2.3 Active Strategy: Reusable NpuScratch Staging Buffers
 
-`shgemm_f32f16_f32` allocates and frees a staging buffer on every NPU GEMM call.
+The FP16 GEMM path (`shgemm_f32f16_f32`) stages every call through three
+process-persistent, grow-on-demand scratch buffers — `g_scratch_X`,
+`g_scratch_A`, `g_scratch_W` (`NpuScratch` instances in `hexkl_mm.cpp`). Each
+`get(bytes)` returns the existing buffer if it's large enough, otherwise frees
+and re-allocs to the new size. They are **never freed per call** (the `cleanup`
+lambda explicitly leaves them alone), only in their destructors at process exit.
+Reusing them across the prefill matmuls removes the ~0.35 ms `sdkl_npu_alloc`/`free`
+churn per call.
 
-| Buffer | Size | Lifetime |
-| :--- | :--- | :--- |
-| `X_npu` (FP32 input, A) | `Mp × K × 4 bytes` (`Mp` = M rounded up to a multiple of 32) | freed right after the call |
-| `A_npu` (FP32 output, C) | `Mp × N × 4 bytes` | freed right after the call |
-| `W_npu` (FP16 weight, WH, prefill) | `N × K × 2 bytes` | pinned on a PrefillWHCache hit; transient on a miss past the cap |
+| Buffer | Backed by | Size | Lifetime |
+| :--- | :--- | :--- | :--- |
+| `X_npu` (FP32 input, A) | `g_scratch_X` | `Mp × K × 4 bytes` (`Mp` = M rounded up to a multiple of 32) | reused across calls; freed at process exit |
+| `A_npu` (FP32 output, C) | `g_scratch_A` | `Mp × N × 4 bytes` | reused across calls; freed at process exit |
+| `W_npu` (FP16 weight, WH, prefill) | pin cache **or** `g_scratch_W` | `N × K × 2 bytes` | pinned for the process on a PrefillWHCache hit / pre-baked hit; otherwise staged transiently into `g_scratch_W` (reused, not per-call freed) |
 
-`X_npu` and `A_npu` are always per-call transient. Only `W_npu` uses the PrefillWHCache strategy.
+Only the weight has a residency choice: a PrefillWHCache/pre-baked hit returns a
+pinned WH pointer directly, while a miss stages the WH bytes into the reused
+`g_scratch_W` buffer. The QINT8 path (§3.4) is the only kernel that still calls
+`sdkl_npu_alloc`/`sdkl_npu_free` per call.
 
 ### 2.4 PrefillWHCache — Pin-Once Residency
 
@@ -123,9 +133,9 @@ Qualcomm HMX tiles need the weight matrix in WH (Width-Height) layout to run in 
 | :--- | :--- | :--- |
 | Cache **hit** (same pointer + N,K) | return the pinned WH pointer immediately | lives for the process |
 | Cache **miss** + `total_bytes + new_bytes ≤ 48 MB` | alloc + memcpy + rm_to_wh + pin | lives for the process |
-| Cache **miss** + over cap or alloc fails | not pinned, returns `nullptr` → transient path | freed right after the call |
+| Cache **miss** + over cap or alloc fails | not pinned, returns `nullptr` → transient path | staged into the reused `g_scratch_W` buffer (§2.3), not per-call freed |
 
-**Constant:** `PREFILL_WH_PIN_MAX_BYTES = 48 MB` (`hexkl_mm.cpp:41`)
+**Constant:** `PREFILL_WH_PIN_MAX_BYTES = 48 MB` (`hexkl_mm.cpp:79`)
 
 For Qwen3-0.6B, 9 weights (3 FC types × layers 1-3) fit in the 48 MB pin budget; layers 4-28 get `nullptr` and use the transient path.
 

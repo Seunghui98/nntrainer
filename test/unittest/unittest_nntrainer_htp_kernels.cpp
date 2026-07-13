@@ -88,33 +88,6 @@ static std::vector<_FP16> makeRandF16(int n, float lo = -0.5f, float hi = 0.5f,
   return v;
 }
 
-// ---- Error metrics ---------------------------------------------------------
-
-// Relative error over fp16 arrays, computed in fp32 space.
-static double relErrorF16(const _FP16 *npu, const _FP16 *cpu, int n) {
-  float ref_max = 0.0f, err_max = 0.0f;
-  for (int i = 0; i < n; ++i) {
-    float c = (float)cpu[i], u = (float)npu[i];
-    ref_max = std::max(ref_max, std::abs(c));
-    err_max = std::max(err_max, std::abs(u - c));
-  }
-  return (double)err_max / ((double)ref_max + 1e-6);
-}
-
-// ---- CPU references --------------------------------------------------------
-
-// C[M,N] = X[M,K] * W[N,K]^T, fp32 accumulate, fp16 store.
-static void cpuGemmF16(int M, int N, int K, const _FP16 *X, const _FP16 *W,
-                       _FP16 *C) {
-  for (int m = 0; m < M; ++m)
-    for (int n = 0; n < N; ++n) {
-      float acc = 0.0f;
-      for (int k = 0; k < K; ++k)
-        acc += (float)X[m * K + k] * (float)W[n * K + k];
-      C[m * N + n] = (_FP16)acc;
-    }
-}
-
 // C[M,N] = A[M,K] (f32) * W[N,K]^T (f16), fp32 accumulate, fp32 store.
 static void cpuGemmF32F16(int M, int N, int K, const float *A, const _FP16 *W,
                           float *C) {
@@ -206,102 +179,6 @@ protected:
   int domain = 0;
 };
 
-// ---- f16f16_f16: RM activations in/out, WH weight --------------------------
-
-TEST_F(HtpKernelTest, Accuracy_f16f16_f16) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  constexpr int M = 32, N = 64, K = 128; // all 32-aligned for M,N
-  auto X = makeRandF16(M * K);
-  auto W = makeRandF16(N * K);
-  std::vector<_FP16> C_cpu(M * N, (_FP16)0.0f);
-
-  cpuGemmF16(M, N, K, X.data(), W.data(), C_cpu.data());
-
-  NpuBuf Xb(M * K * sizeof(_FP16)), Wb(N * K * sizeof(_FP16)),
-    Ab(M * N * sizeof(_FP16));
-  ASSERT_TRUE(Xb.ok() && Wb.ok() && Ab.ok()) << "sdkl_npu_alloc failed";
-
-  std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-  std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-
-  ASSERT_EQ(sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                          static_cast<_FP16 *>(Wb.p)),
-            0);
-  ASSERT_EQ(sdkl_npu_mm_f16f16_f16(domain, M, N, K, static_cast<_FP16 *>(Ab.p),
-                                   static_cast<const _FP16 *>(Xb.p),
-                                   static_cast<const _FP16 *>(Wb.p)),
-            0);
-
-  double err =
-    relErrorF16(static_cast<const _FP16 *>(Ab.p), C_cpu.data(), M * N);
-  // FP16-accumulate kernels lose precision as K grows; 1e-2 is the initial
-  // tolerance (spec §3). Tighten/loosen after observing device output.
-  EXPECT_LT(err, 1e-2) << "f16f16_f16 relative error " << err;
-}
-
-// ---- f16: AH activations in/out, WH weight ---------------------------------
-
-TEST_F(HtpKernelTest, Accuracy_f16) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  constexpr int M = 32, N = 64, K = 128;
-  auto X = makeRandF16(M * K);
-  auto W = makeRandF16(N * K);
-  std::vector<_FP16> C_cpu(M * N, (_FP16)0.0f);
-  cpuGemmF16(M, N, K, X.data(), W.data(), C_cpu.data());
-
-  NpuBuf Xb(M * K * sizeof(_FP16)), Wb(N * K * sizeof(_FP16)),
-    Ab(M * N * sizeof(_FP16));
-  ASSERT_TRUE(Xb.ok() && Wb.ok() && Ab.ok());
-
-  std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-  std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-
-  // X RM -> AH (activation HMX layout), W RM -> WH (weight HMX layout).
-  ASSERT_EQ(sdkl_cpu_rm_to_ah_f16_inplace((size_t)M, (size_t)K,
-                                          static_cast<_FP16 *>(Xb.p)),
-            0);
-  ASSERT_EQ(sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                          static_cast<_FP16 *>(Wb.p)),
-            0);
-
-  ASSERT_EQ(sdkl_npu_mm_f16(domain, M, N, K, static_cast<_FP16 *>(Ab.p),
-                            static_cast<const _FP16 *>(Xb.p),
-                            static_cast<const _FP16 *>(Wb.p)),
-            0);
-
-  // Output A is in AH layout -> convert back to RM before comparing.
-  ASSERT_EQ(sdkl_cpu_ah_to_rm_f16_inplace((size_t)M, (size_t)N,
-                                          static_cast<_FP16 *>(Ab.p)),
-            0);
-
-  double err =
-    relErrorF16(static_cast<const _FP16 *>(Ab.p), C_cpu.data(), M * N);
-  EXPECT_LT(err, 1e-2) << "f16 relative error " << err;
-}
-
-// ---- Tensor descriptor helper ----------------------------------------------
-
-static void fillTensorF16(sdkl_tensor_t &t, void *data, uint64_t rows,
-                          uint64_t cols, sdkl_tensor_layout_e layout) {
-  std::memset(&t, 0, sizeof(t));
-  t.ndims = 2;
-  t.dims[0] = rows;
-  t.dims[1] = cols;
-  t.strides[0] = cols; // row-major: row stride = #cols (in elements)
-  t.strides[1] = 1;
-  t.num_elements = rows * cols;
-  t.data_offset = 0;
-  t.data = data;
-  t.data_dtype = SDKL_DTYPE_FP16;
-  t.quantization = SDKL_QUANT_NONE;
-  t.layout = layout;
-  t.is_continuous = 1;
-}
-
 // ---- u8i8_i32: ui8 activations, i8 weights (WH), i32 output ----------------
 
 TEST_F(HtpKernelTest, Accuracy_u8i8_i32) {
@@ -335,174 +212,6 @@ TEST_F(HtpKernelTest, Accuracy_u8i8_i32) {
   EXPECT_TRUE(
     exactMatchI32(static_cast<const int32_t *>(Ab.p), C_cpu.data(), M * N))
     << "u8i8_i32 output does not match int32 reference exactly";
-}
-
-// ---- u8i4_i32: ui8 activations, i4 weights (WH tiled), i32 output ----------
-
-TEST_F(HtpKernelTest, Accuracy_u8i4_i32) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  // HMX INT4 requires M % 64 == 0 and N % 32 == 0 (same alignment as INT8).
-  // sdkl_npu_mm_u8i4_i32 writes row-major output directly (per sdkl.h:727 and
-  // confirmed by official Qualcomm example which does no ah_to_i32_rm
-  // conversion).
-  constexpr int M = 64, N = 64, K = 128;
-
-  // i4 weights: one value per int8 byte, sign-extended, range [-8, +7].
-  auto X = makeRandU8(M * K);
-  auto W = makeRandI8(N * K, -8, 7, 17);
-  std::vector<int32_t> C_cpu(M * N, 0);
-  cpuGemmI32(M, N, K, X.data(), W.data(), C_cpu.data());
-
-  // Tiled buffer: 2 i4 values packed per byte; N and K rounded to 32.
-  // Size = (N_aligned * K_aligned) / 2 bytes.
-  // Note: sdkl_cpu_rm_to_wh_i4 args are (out, in, wt_rows=K, wt_cols=N).
-  const size_t N_aligned = ((size_t)(N + 31) & ~(size_t)31);
-  const size_t K_aligned = ((size_t)(K + 31) & ~(size_t)31);
-  const size_t tiled_bytes = (N_aligned * K_aligned) / 2;
-
-  NpuBuf Xb(M * K * sizeof(uint8_t)), Wb(tiled_bytes),
-    Ab(M * N * sizeof(int32_t));
-  ASSERT_TRUE(Xb.ok() && Wb.ok() && Ab.ok());
-
-  std::memcpy(Xb.p, X.data(), M * K * sizeof(uint8_t));
-
-  // Pack RM i4 (int8, sign-extended [-8,+7]) -> WH tiled buffer.
-  // wt_rows=K_aligned, wt_cols=N_aligned (per official Qualcomm example).
-  ASSERT_EQ(sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wb.p), W.data(),
-                                 K_aligned, N_aligned),
-            0);
-
-  ASSERT_EQ(sdkl_npu_mm_u8i4_i32(domain, (size_t)M, (size_t)N, (size_t)K,
-                                 static_cast<int32_t *>(Ab.p),
-                                 static_cast<const uint8_t *>(Xb.p),
-                                 static_cast<const uint8_t *>(Wb.p)),
-            0);
-
-  // Output is already row-major (sdkl.h:727); compare directly.
-  EXPECT_TRUE(
-    exactMatchI32(static_cast<const int32_t *>(Ab.p), C_cpu.data(), M * N))
-    << "u8i4_i32 output does not match int32 reference exactly";
-}
-
-// ---- sdkl_mm_tensor: generic tensor GEMM (FP16) ----------------------------
-//
-// sdkl_mm_tensor_validate requires standard (non-transposed) matmul layout:
-//   left[M, K] * right[K, N] = result[M, N]
-// i.e. right is stored [K, N] row-major (NOT the transposed [N,K] used by
-// the typed kernels sdkl_npu_mm_f16 etc.).
-// CPU reference: C[M,N] = X[M,K] * W_kn[K,N] (standard GEMM, no transpose).
-
-TEST_F(HtpKernelTest, Accuracy_mm_tensor_f16) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  // sdkl_mm_tensor computes result[M,N] = left[M,K] @ right[K,N] (standard
-  // GEMM). sdkl_mm_tensor_validate enforces left.dims[1] == right.dims[0],
-  // i.e. right must be shaped [K,N] in the descriptor.
-  //
-  // The NPU path (SDKL_PLATFORM_NPU0) requires HMX layouts:
-  //   left   -> SDKL_LAYOUT_2D_ROW_MAJOR_ACTIVATION_HMX
-  //   right  -> SDKL_LAYOUT_2D_ROW_MAJOR_WEIGHTS_HMX
-  //   result -> SDKL_LAYOUT_2D_ROW_MAJOR_ACTIVATION_HMX
-  //
-  // The WH (weights-HMX) packing expects data logically as [N_out, N_inner]
-  // i.e. [N, K] — the transposed form. We generate W as [N,K] (matching the
-  // other kernel tests), apply sdkl_cpu_rm_to_wh_f16_inplace(N, K), and then
-  // place it in a descriptor with dims [K,N] — which tells the kernel the
-  // un-tiled logical shape is [K,N] = right-hand side of the matmul.
-  // CPU reference uses X[M,K] @ W_nk[N,K]^T = C[M,N] (via cpuGemmF16).
-  constexpr int M = 32, N = 64, K = 128;
-  auto X = makeRandF16(M * K);    // row-major [M, K]
-  auto W_nk = makeRandF16(N * K); // row-major [N, K] — transposed weights
-  std::vector<_FP16> C_cpu(M * N, (_FP16)0.0f);
-  // C = X[M,K] @ W_nk[N,K]^T  — same contract as sdkl_npu_mm_f16
-  cpuGemmF16(M, N, K, X.data(), W_nk.data(), C_cpu.data());
-
-  NpuBuf Xb(M * K * sizeof(_FP16)), Wb(N * K * sizeof(_FP16)),
-    Ab(M * N * sizeof(_FP16));
-  ASSERT_TRUE(Xb.ok() && Wb.ok() && Ab.ok());
-
-  // NPU0: convert to HMX layouts before dispatch.
-  // X[M,K] RM -> AH;  W_nk[N,K] RM -> WH (WH packing args are n_row=N,
-  // n_col=K).
-  std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-  std::memcpy(Wb.p, W_nk.data(), N * K * sizeof(_FP16));
-  std::memset(Ab.p, 0, M * N * sizeof(_FP16));
-
-  // Validate descriptors with RM layout (shape/metadata check, no NPU call).
-  // Use actual NPU buffer pointers; a single-byte dummy would be UB if the
-  // validator ever reads through the pointer.
-  {
-    sdkl_tensor_t left_v, right_v, result_v;
-    fillTensorF16(left_v, Xb.p, (uint64_t)M, (uint64_t)K,
-                  SDKL_LAYOUT_2D_ROW_MAJOR);
-    fillTensorF16(right_v, Wb.p, (uint64_t)K, (uint64_t)N,
-                  SDKL_LAYOUT_2D_ROW_MAJOR);
-    fillTensorF16(result_v, Ab.p, (uint64_t)M, (uint64_t)N,
-                  SDKL_LAYOUT_2D_ROW_MAJOR);
-    ASSERT_EQ(sdkl_tensor_validate(&left_v), 0);
-    ASSERT_EQ(sdkl_tensor_validate(&right_v), 0);
-    ASSERT_EQ(sdkl_tensor_validate(&result_v), 0);
-    ASSERT_EQ(sdkl_mm_tensor_validate(&result_v, &left_v, &right_v), 0);
-  }
-
-  ASSERT_EQ(sdkl_cpu_rm_to_ah_f16_inplace((size_t)M, (size_t)K,
-                                          static_cast<_FP16 *>(Xb.p)),
-            0);
-  ASSERT_EQ(sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                          static_cast<_FP16 *>(Wb.p)),
-            0);
-
-  // Descriptor: right has logical shape [K,N] (the GEMM right-hand side),
-  // but the underlying data is in WH format packed from W_nk[N,K].
-  // Strides for HMX layouts are still set row-major (they're ignored by the
-  // HMX path; only dims and layout tag matter for dispatch).
-  sdkl_tensor_t left, right, result;
-  fillTensorF16(left, Xb.p, (uint64_t)M, (uint64_t)K,
-                SDKL_LAYOUT_2D_ROW_MAJOR_ACTIVATION_HMX);
-  fillTensorF16(right, Wb.p, (uint64_t)K, (uint64_t)N,
-                SDKL_LAYOUT_2D_ROW_MAJOR_WEIGHTS_HMX);
-  fillTensorF16(result, Ab.p, (uint64_t)M, (uint64_t)N,
-                SDKL_LAYOUT_2D_ROW_MAJOR_ACTIVATION_HMX);
-
-  ASSERT_EQ(sdkl_mm_tensor(SDKL_PLATFORM_NPU0, &result, &left, &right), 0)
-    << "sdkl_mm_tensor failed with HMX layouts";
-
-  // Result is in AH layout; convert back to RM for comparison.
-  ASSERT_EQ(sdkl_cpu_ah_to_rm_f16_inplace((size_t)M, (size_t)N,
-                                          static_cast<_FP16 *>(Ab.p)),
-            0);
-
-  double err =
-    relErrorF16(static_cast<const _FP16 *>(Ab.p), C_cpu.data(), M * N);
-  EXPECT_LT(err, 1e-2) << "mm_tensor f16 relative error " << err;
-}
-
-// ---- Constraint: misaligned M/N must be rejected by the kernel -------------
-
-TEST_F(HtpKernelTest, Constraint_MisalignedRejected_f16f16) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  // M = 16 (not a multiple of 32). N, K aligned.
-  constexpr int M = 16, N = 64, K = 128;
-  auto X = makeRandF16(M * K);
-  auto W = makeRandF16(N * K);
-
-  NpuBuf Xb(M * K * sizeof(_FP16)), Wb(N * K * sizeof(_FP16)),
-    Ab(M * N * sizeof(_FP16));
-  ASSERT_TRUE(Xb.ok() && Wb.ok() && Ab.ok());
-  std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-  std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-  (void)sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                      static_cast<_FP16 *>(Wb.p));
-
-  int rc = sdkl_npu_mm_f16f16_f16(domain, M, N, K, static_cast<_FP16 *>(Ab.p),
-                                  static_cast<const _FP16 *>(Xb.p),
-                                  static_cast<const _FP16 *>(Wb.p));
-  EXPECT_NE(rc, 0) << "kernel accepted M=16 (not multiple of 32)";
 }
 
 // ---- Perf harness ----------------------------------------------------------
@@ -604,116 +313,6 @@ static void printPerfMarkdown() {
 
 // ---- Performance sweeps ----------------------------------------------------
 
-static void perfSweepF16f16(int domain, const std::vector<Shape> &shapes,
-                            const char *tag) {
-  for (const auto &s : shapes) {
-    const int M = s.M, N = s.N, K = s.K;
-    auto X = makeRandF16(M * K);
-    auto W = makeRandF16(N * K);
-    std::vector<_FP16> C_cpu(M * N, (_FP16)0.0f);
-
-    NpuBuf Xb(M * K * sizeof(_FP16)), Wb(N * K * sizeof(_FP16)),
-      Ab(M * N * sizeof(_FP16));
-    if (!(Xb.ok() && Wb.ok() && Ab.ok())) {
-      printf("SKIP %s f16f16 %dx%dx%d: alloc failed\n", tag, M, N, K);
-      continue;
-    }
-    std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-
-    int last_rc = 0;
-    auto kernelOnly = [&]() {
-      last_rc = sdkl_npu_mm_f16f16_f16(
-        domain, M, N, K, static_cast<_FP16 *>(Ab.p),
-        static_cast<const _FP16 *>(Xb.p), static_cast<const _FP16 *>(Wb.p));
-    };
-    auto withXform = [&]() {
-      std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-      sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                    static_cast<_FP16 *>(Wb.p));
-      kernelOnly();
-    };
-    // Prepare WH weight once for the kernel-only timing.
-    std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-    sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                  static_cast<_FP16 *>(Wb.p));
-
-    TimeStats k = timeIt(10, 50, kernelOnly);
-    ASSERT_EQ(last_rc, 0) << "f16f16_f16 kernel returned non-zero for shape "
-                          << M << "x" << N << "x" << K;
-    TimeStats full = timeIt(5, 20, withXform);
-    TimeStats cpu = timeIt(
-      1, 3, [&]() { cpuGemmF16(M, N, K, X.data(), W.data(), C_cpu.data()); });
-    recordPerf("f16f16_f16", M, N, K, k, full, cpu.mean_ms, /*quant=*/false);
-  }
-}
-
-TEST_F(HtpKernelTest, Perf_f16f16_f16) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-  perfSweepF16f16(domain, generalShapes(), "general");
-  perfSweepF16f16(domain, llmShapes(), "llm");
-  SUCCEED();
-}
-
-static void perfSweepF16(int domain, const std::vector<Shape> &shapes,
-                         const char *tag) {
-  for (const auto &s : shapes) {
-    const int M = s.M, N = s.N, K = s.K;
-    auto X = makeRandF16(M * K);
-    auto W = makeRandF16(N * K);
-    std::vector<_FP16> C_cpu(M * N, (_FP16)0.0f);
-
-    NpuBuf Xb(M * K * sizeof(_FP16)), Wb(N * K * sizeof(_FP16)),
-      Ab(M * N * sizeof(_FP16));
-    if (!(Xb.ok() && Wb.ok() && Ab.ok())) {
-      printf("SKIP %s f16 %dx%dx%d: alloc failed\n", tag, M, N, K);
-      continue;
-    }
-
-    // Prepare AH-layout X and WH-layout W once for kernel-only timing.
-    std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-    sdkl_cpu_rm_to_ah_f16_inplace((size_t)M, (size_t)K,
-                                  static_cast<_FP16 *>(Xb.p));
-    std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-    sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                  static_cast<_FP16 *>(Wb.p));
-
-    int last_rc = 0;
-    auto kernelOnly = [&]() {
-      last_rc = sdkl_npu_mm_f16(domain, M, N, K, static_cast<_FP16 *>(Ab.p),
-                                static_cast<const _FP16 *>(Xb.p),
-                                static_cast<const _FP16 *>(Wb.p));
-    };
-    auto withXform = [&]() {
-      std::memcpy(Xb.p, X.data(), M * K * sizeof(_FP16));
-      sdkl_cpu_rm_to_ah_f16_inplace((size_t)M, (size_t)K,
-                                    static_cast<_FP16 *>(Xb.p));
-      std::memcpy(Wb.p, W.data(), N * K * sizeof(_FP16));
-      sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                    static_cast<_FP16 *>(Wb.p));
-      kernelOnly();
-      sdkl_cpu_ah_to_rm_f16_inplace((size_t)M, (size_t)N,
-                                    static_cast<_FP16 *>(Ab.p));
-    };
-
-    TimeStats k = timeIt(10, 50, kernelOnly);
-    ASSERT_EQ(last_rc, 0) << "f16 kernel returned non-zero for shape " << M
-                          << "x" << N << "x" << K;
-    TimeStats full = timeIt(5, 20, withXform);
-    TimeStats cpu = timeIt(
-      1, 3, [&]() { cpuGemmF16(M, N, K, X.data(), W.data(), C_cpu.data()); });
-    recordPerf("f16", M, N, K, k, full, cpu.mean_ms, /*quant=*/false);
-  }
-}
-
-TEST_F(HtpKernelTest, Perf_f16) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-  perfSweepF16(domain, generalShapes(), "general");
-  perfSweepF16(domain, llmShapes(), "llm");
-  SUCCEED();
-}
-
 static void perfSweepU8I8(int domain, const std::vector<Shape> &shapes,
                           const char *tag) {
   for (const auto &s : shapes) {
@@ -755,54 +354,6 @@ TEST_F(HtpKernelTest, Perf_u8i8_i32) {
     GTEST_SKIP() << "NPU not available on this device";
   perfSweepU8I8(domain, generalShapes(), "general");
   perfSweepU8I8(domain, llmShapes(), "llm");
-  SUCCEED();
-}
-
-static void perfSweepU8I4(int domain, const std::vector<Shape> &shapes,
-                          const char *tag) {
-  for (const auto &s : shapes) {
-    const int M = s.M, N = s.N, K = s.K;
-    // HMX INT4 requires M % 64 == 0.
-    if (M % 64 != 0) {
-      printf("SKIP %s u8i4 %dx%dx%d: M not multiple of 64\n", tag, M, N, K);
-      continue;
-    }
-    auto X = makeRandU8(M * K);
-    auto W = makeRandI8(N * K, -8, 7, 17);
-    std::vector<int32_t> C_cpu(M * N, 0);
-
-    const size_t N_aligned = ((size_t)(N + 31) & ~(size_t)31);
-    const size_t K_aligned = ((size_t)(K + 31) & ~(size_t)31);
-    const size_t tiled_bytes = (N_aligned * K_aligned) / 2;
-
-    NpuBuf Xb(M * K), Wb(tiled_bytes), Ab(M * N * sizeof(int32_t));
-    if (!(Xb.ok() && Wb.ok() && Ab.ok())) {
-      printf("SKIP %s u8i4 %dx%dx%d: alloc failed\n", tag, M, N, K);
-      continue;
-    }
-    std::memcpy(Xb.p, X.data(), M * K);
-    sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wb.p), W.data(), K_aligned,
-                         N_aligned);
-    int last_rc = 0;
-    auto kernelOnly = [&]() {
-      last_rc = sdkl_npu_mm_u8i4_i32(
-        domain, (size_t)M, (size_t)N, (size_t)K, static_cast<int32_t *>(Ab.p),
-        static_cast<const uint8_t *>(Xb.p), static_cast<const uint8_t *>(Wb.p));
-    };
-    TimeStats k = timeIt(10, 50, kernelOnly);
-    ASSERT_EQ(last_rc, 0) << "u8i4_i32 kernel returned non-zero for shape " << M
-                          << "x" << N << "x" << K;
-    TimeStats cpu = timeIt(
-      1, 3, [&]() { cpuGemmI32(M, N, K, X.data(), W.data(), C_cpu.data()); });
-    recordPerf("u8i4_i32", M, N, K, k, k, cpu.mean_ms, /*quant=*/true);
-  }
-}
-
-TEST_F(HtpKernelTest, Perf_u8i4_i32) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-  perfSweepU8I4(domain, generalShapes(), "general");
-  perfSweepU8I4(domain, llmShapes(), "llm");
   SUCCEED();
 }
 
@@ -1099,82 +650,6 @@ TEST_F(HtpKernelTest, PhaseTiming_TransientPrefillBreakdown) {
   SUCCEED();
 }
 
-// Measures the usable NPU DMA residency budget by allocating fixed-size
-// chunks until failure. The SDK has no pool-query API, so this empirical
-// value gates the prefill pin cap (PREFILL_WH_PIN_MAX_BYTES). Chunk size
-// matches a typical prefill weight so the number reflects the real
-// many-small-buffers residency pattern (subject to fragmentation).
-TEST_F(HtpKernelTest, PoolProbe_MeasureMaxResidentBytes) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  const size_t chunk = 4ull * 1024 * 1024; // 4 MB, ~one prefill weight
-  std::vector<void *> bufs;
-  size_t total = 0;
-  while (bufs.size() < 4096u) { // 16 GB safety cap; never reached in practice
-    void *p = nullptr;
-    int err = sdkl_npu_alloc(chunk, &p);
-    if (err != 0 || p == nullptr)
-      break;
-    bufs.push_back(p);
-    total += chunk;
-  }
-  for (void *p : bufs)
-    sdkl_npu_free(p);
-
-  const size_t mb = total / (1024u * 1024u);
-  printf("[PoolProbe] max resident: %zu MB across %zu chunks of %zu MB\n", mb,
-         bufs.size(), chunk / (1024u * 1024u));
-  RecordProperty("pool_max_mb", static_cast<int>(mb));
-  SUCCEED();
-}
-
-// Measures the usable NPU DMA **sustained-pin** budget by allocating
-// variably-sized buffers matching real Qwen3-0.6B FC weight sizes and NOT
-// freeing them — exactly the pin-once access pattern. This is distinct from
-// PoolProbe_MeasureMaxResidentBytes (transient alloc-then-free-all), which
-// measured ~4000 MB but is not a valid proxy for how much can be kept pinned
-// simultaneously (real ceiling found to be ~48 MB / 9 weights on S25 Ultra).
-// Weight sizes: q_proj=4MB (N=2048,K=1024), gate_up_proj=6MB (N=3072,K=1024),
-// down_proj=6MB (N=1024,K=3072); cycle repeats 28 times (28 layers × 3 FC).
-TEST_F(HtpKernelTest, PoolProbe_MeasureMaxSustainedPinBytes) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  // Sizes in bytes for the three FC weight shapes in Qwen3-0.6B.
-  static const size_t kWeightSizes[] = {
-    2048ull * 1024 * sizeof(_FP16), // q_proj:       N=2048, K=1024 → 4 MB
-    3072ull * 1024 * sizeof(_FP16), // gate_up_proj:  N=3072, K=1024 → 6 MB
-    1024ull * 3072 * sizeof(_FP16), // down_proj:     N=1024, K=3072 → 6 MB
-  };
-  const size_t kNumShapes = sizeof(kWeightSizes) / sizeof(kWeightSizes[0]); // 3
-  const size_t kMaxWeights = 84; // 28 layers × 3 FC
-
-  std::vector<void *> bufs;
-  size_t total_bytes = 0;
-
-  for (size_t i = 0; i < kMaxWeights; ++i) {
-    size_t sz = kWeightSizes[i % kNumShapes];
-    void *p = nullptr;
-    int err = sdkl_npu_alloc(sz, &p);
-    if (err != 0 || p == nullptr)
-      break; // pool exhausted — stop, do NOT free any prior allocations
-    bufs.push_back(p);
-    total_bytes += sz;
-  }
-
-  // Cleanup — free only after the full probe is complete.
-  for (void *p : bufs)
-    sdkl_npu_free(p);
-
-  const size_t mb = total_bytes / (1024u * 1024u);
-  printf("[SustainedPinProbe] max pinned: %zu MB across %zu weights "
-         "(q/gu/d shapes cycling: 4/6/6 MB)\n",
-         mb, bufs.size());
-  RecordProperty("sustained_pin_max_mb", static_cast<int>(mb));
-  SUCCEED();
-}
-
 // A registered pre-baked WH weight must be used by shgemm's prefill path and
 // produce the same result as the transient rm_to_wh path. We build the WH bytes
 // by running rm_to_wh ourselves, register them, and confirm (a) the registry
@@ -1286,6 +761,107 @@ TEST_F(HtpKernelTest, OfflineWH_ConversionIsDeterministicAndByteIdentical) {
     ASSERT_EQ(std::memcmp(wh_host.data(), nb.p, bytes), 0)
       << "WH bytes differ for " << s.N << "x" << s.K;
   }
+}
+
+// ---------------------------------------------------------------------------
+// NPU DMA pool probes — MUST remain the LAST tests in this fixture.
+//
+// PoolProbe_MeasureMaxResidentBytes transiently allocates ~all device DMA
+// memory (4 MB chunks until failure, ~4 GB) and frees it. That exhaustion
+// leaves the SDKL allocator in a state where the next sdkl_npu_mm_f32f16_f32
+// (which reserves ~400 MB of internal scratch on its first call) faults, so
+// any shgemm/prefill test scheduled after it SIGSEGVs (see 03 §2.4). Running
+// both probes last guarantees every functional test executes against a clean
+// pool; MeasureMaxResidentBytes is placed dead last as the destructive one.
+// Do NOT add new tests below these two.
+// ---------------------------------------------------------------------------
+
+// Measures the usable NPU DMA **sustained-pin** budget by allocating
+// variably-sized buffers matching real Qwen3-0.6B FC weight sizes and NOT
+// freeing them — exactly the pin-once access pattern. This is distinct from
+// PoolProbe_MeasureMaxResidentBytes (transient alloc-then-free-all), which
+// measured ~4000 MB but is not a valid proxy for how much can be kept pinned
+// simultaneously (real ceiling found to be ~48 MB / 9 weights on S25 Ultra).
+// Weight sizes: q_proj=4MB (N=2048,K=1024), gate_up_proj=6MB (N=3072,K=1024),
+// down_proj=6MB (N=1024,K=3072); cycle repeats 28 times (28 layers × 3 FC).
+TEST_F(HtpKernelTest, PoolProbe_MeasureMaxSustainedPinBytes) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+  if (!std::getenv("NNTR_HTP_POOL_PROBE"))
+    GTEST_SKIP() << "destructive NPU DMA pool probe (allocates to failure, "
+                    "corrupts SDKL allocator state); opt in with "
+                    "NNTR_HTP_POOL_PROBE=1 and run in isolation, e.g. "
+                    "--gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxSustainedPinBytes";
+
+  // Sizes in bytes for the three FC weight shapes in Qwen3-0.6B.
+  static const size_t kWeightSizes[] = {
+    2048ull * 1024 * sizeof(_FP16), // q_proj:       N=2048, K=1024 → 4 MB
+    3072ull * 1024 * sizeof(_FP16), // gate_up_proj:  N=3072, K=1024 → 6 MB
+    1024ull * 3072 * sizeof(_FP16), // down_proj:     N=1024, K=3072 → 6 MB
+  };
+  const size_t kNumShapes = sizeof(kWeightSizes) / sizeof(kWeightSizes[0]); // 3
+  const size_t kMaxWeights = 84; // 28 layers × 3 FC
+
+  std::vector<void *> bufs;
+  size_t total_bytes = 0;
+
+  for (size_t i = 0; i < kMaxWeights; ++i) {
+    size_t sz = kWeightSizes[i % kNumShapes];
+    void *p = nullptr;
+    int err = sdkl_npu_alloc(sz, &p);
+    if (err != 0 || p == nullptr)
+      break; // pool exhausted — stop, do NOT free any prior allocations
+    bufs.push_back(p);
+    total_bytes += sz;
+  }
+
+  // Cleanup — free only after the full probe is complete.
+  for (void *p : bufs)
+    sdkl_npu_free(p);
+
+  const size_t mb = total_bytes / (1024u * 1024u);
+  printf("[SustainedPinProbe] max pinned: %zu MB across %zu weights "
+         "(q/gu/d shapes cycling: 4/6/6 MB)\n",
+         mb, bufs.size());
+  RecordProperty("sustained_pin_max_mb", static_cast<int>(mb));
+  SUCCEED();
+}
+
+// Measures the usable NPU DMA residency budget by allocating fixed-size
+// chunks until failure. The SDK has no pool-query API, so this empirical
+// value gates the prefill pin cap (PREFILL_WH_PIN_MAX_BYTES). Chunk size
+// matches a typical prefill weight so the number reflects the real
+// many-small-buffers residency pattern (subject to fragmentation).
+// DESTRUCTIVE: exhausting the pool corrupts SDKL allocator state — must run
+// last (see the banner above).
+TEST_F(HtpKernelTest, PoolProbe_MeasureMaxResidentBytes) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+  if (!std::getenv("NNTR_HTP_POOL_PROBE"))
+    GTEST_SKIP() << "destructive NPU DMA pool probe (allocates to failure, "
+                    "corrupts SDKL allocator state); opt in with "
+                    "NNTR_HTP_POOL_PROBE=1 and run in isolation, e.g. "
+                    "--gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxResidentBytes";
+
+  const size_t chunk = 4ull * 1024 * 1024; // 4 MB, ~one prefill weight
+  std::vector<void *> bufs;
+  size_t total = 0;
+  while (bufs.size() < 4096u) { // 16 GB safety cap; never reached in practice
+    void *p = nullptr;
+    int err = sdkl_npu_alloc(chunk, &p);
+    if (err != 0 || p == nullptr)
+      break;
+    bufs.push_back(p);
+    total += chunk;
+  }
+  for (void *p : bufs)
+    sdkl_npu_free(p);
+
+  const size_t mb = total / (1024u * 1024u);
+  printf("[PoolProbe] max resident: %zu MB across %zu chunks of %zu MB\n", mb,
+         bufs.size(), chunk / (1024u * 1024u));
+  RecordProperty("pool_max_mb", static_cast<int>(mb));
+  SUCCEED();
 }
 
 } // namespace

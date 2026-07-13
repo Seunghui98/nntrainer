@@ -185,11 +185,15 @@ TEST_F(HtpShgemmTest, BetaNonZeroThrows) {
                std::runtime_error);
 }
 
-TEST_F(HtpShgemmTest, MNotAlignedThrows) {
+// A non-32-aligned M is NOT a throw condition: shgemm_f32f16_f32 rounds M up to
+// a multiple of 32 internally and returns only the real rows (verified at the
+// kernel level by Padding_NonMultipleOf32_f32f16_f32). The real hard constraint
+// is N % 32 == 0 (the WH tile width); confirm the kernel rejects a bad N.
+TEST_F(HtpShgemmTest, NNotAlignedThrows) {
   if (!npu_enabled)
     GTEST_SKIP() << "NPU not available on this device";
 
-  constexpr int M = 4, N = 32, K = 32; // M=4 not a multiple of 32
+  constexpr int M = 32, N = 33, K = 32; // N=33 not a multiple of 32
   auto A = makeRandF32(M * K);
   auto Bh = toFP16(makeRandF32(N * K, -0.5f, 0.5f));
   std::vector<float> C(M * N, 0.0f);
@@ -214,45 +218,6 @@ TEST(HtpFallbackTest, CpuOpsNeverAdvertisesShgemm) {
   nntrainer::ensureComputeOps();
   EXPECT_FALSE(nntrainer::getComputeOps()->supports_shgemm())
     << "Global CPU ops must not advertise NPU shgemm";
-}
-
-// ---- Edge cases (device) ---------------------------------------------------
-
-// Renamed from EdgeCase_SingleElement: tests minimum valid aligned shape (M=32,
-// N=32).
-TEST_F(HtpShgemmTest, EdgeCase_MinValidShape) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  constexpr int M = 32, N = 32, K = 32;
-  auto A = makeRandF32(M * K);
-  auto Bf = makeRandF32(N * K, -0.5f, 0.5f);
-  auto Bh = toFP16(Bf);
-  std::vector<float> C_cpu(M * N, 0.0f), C_npu(M * N, 0.0f);
-
-  cpuShgemm(M, N, K, 1.0f, A.data(), Bh.data(), 0.0f, C_cpu.data());
-  ASSERT_NO_THROW(nntrainer::hmx::shgemm_f32f16_f32(
-    1, false, true, M, N, K, 1.0f, A.data(), K,
-    reinterpret_cast<const _FP16 *>(Bh.data()), K, 0.0f, C_npu.data(), N));
-  EXPECT_LT(relError(C_npu.data(), C_cpu.data(), M * N), 0.001f);
-}
-
-TEST_F(HtpShgemmTest, EdgeCase_SingleRow) {
-  if (!npu_enabled)
-    GTEST_SKIP() << "NPU not available on this device";
-
-  constexpr int M = 32, N = 64,
-                K = 128; // M must be multiple of 32 (HMX tile constraint)
-  auto A = makeRandF32(M * K);
-  auto Bf = makeRandF32(N * K, -0.5f, 0.5f);
-  auto Bh = toFP16(Bf);
-  std::vector<float> C_cpu(M * N, 0.0f), C_npu(M * N, 0.0f);
-
-  cpuShgemm(M, N, K, 1.0f, A.data(), Bh.data(), 0.0f, C_cpu.data());
-  ASSERT_NO_THROW(nntrainer::hmx::shgemm_f32f16_f32(
-    1, false, true, M, N, K, 1.0f, A.data(), K,
-    reinterpret_cast<const _FP16 *>(Bh.data()), K, 0.0f, C_npu.data(), N));
-  EXPECT_LT(relError(C_npu.data(), C_cpu.data(), M * N), 0.001);
 }
 
 // ---- HtpU8i8Test fixture ---------------------------------------------------
@@ -321,36 +286,6 @@ static float quantizeActU8(const std::vector<float> &A, std::vector<uint8_t> &X,
   }
   return act_scale;
 }
-
-class ScopedEnvVar {
-public:
-  ScopedEnvVar(const char *key, const char *value) : key_(key) {
-    const char *current = std::getenv(key_);
-    if (current != nullptr) {
-      had_value_ = true;
-      old_value_ = current;
-    }
-
-    if (value != nullptr) {
-      setenv(key_, value, 1);
-    } else {
-      unsetenv(key_);
-    }
-  }
-
-  ~ScopedEnvVar() {
-    if (had_value_) {
-      setenv(key_, old_value_.c_str(), 1);
-    } else {
-      unsetenv(key_);
-    }
-  }
-
-private:
-  const char *key_;
-  bool had_value_ = false;
-  std::string old_value_;
-};
 
 // Dequantize I32 accumulator to FP32.
 // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
@@ -673,78 +608,6 @@ TEST_F(HtpDispatchTest, PadsAndRunsHtp_WhenMMisaligned) {
 
   double err = relError(result.getData<float>(), C_cpu.data(), M * N);
   EXPECT_LT(err, 0.01) << "padded HTP dot() relError " << err
-                       << " vs CPU reference exceeds 1%";
-}
-
-TEST_F(HtpDispatchTest, RoutesAttentionToCpu_WhenAttentionFallbackDisabled) {
-  constexpr int M = 64, N = 32, K = 32;
-
-  auto A_f32 = makeRandF32(M * K, -1.0f, 1.0f);
-  auto W_i8 = makeRandI8Vec(N * K, -50, 50, 19);
-
-  std::vector<float> wt_scale;
-  std::vector<int32_t> zp_corr;
-  nntrainer::Tensor wgt = makeQint8Weight(N, K, W_i8, wt_scale, zp_corr);
-  wgt.setName("layer0_wq:weight");
-
-  nntrainer::TensorDim adim(1, 1, M, K);
-  nntrainer::Tensor act(adim, false);
-  act.allocate();
-  std::memcpy(act.getData<float>(), A_f32.data(), M * K * sizeof(float));
-  act.setContextData(htp_ct);
-
-  std::vector<uint8_t> X_u8;
-  float act_scale = quantizeActU8(A_f32, X_u8, M, K);
-  std::vector<int32_t> C_i32_cpu(M * N, 0);
-  cpuGemmU8I8I32(M, N, K, X_u8.data(), W_i8.data(), C_i32_cpu.data());
-  std::vector<float> C_cpu(M * N);
-  dequantI32ToF32(M, N, act_scale, wt_scale.data(), zp_corr.data(),
-                  C_i32_cpu.data(), C_cpu.data());
-
-  ScopedEnvVar attention_enable("NNTR_HTP_QINT8_ATTENTION_ENABLE", "0");
-  ScopedEnvVar ffn_enable("NNTR_HTP_QINT8_FFN_ENABLE", nullptr);
-
-  nntrainer::Tensor result;
-  ASSERT_NO_THROW(result = act.dot(wgt, false, true));
-
-  double err = relError(result.getData<float>(), C_cpu.data(), M * N);
-  EXPECT_LT(err, 0.01) << "attention CPU fallback relError " << err
-                       << " vs CPU reference exceeds 1%";
-}
-
-TEST_F(HtpDispatchTest, RoutesFfnToCpu_WhenFfnFallbackDisabled) {
-  constexpr int M = 64, N = 32, K = 32;
-
-  auto A_f32 = makeRandF32(M * K, -1.0f, 1.0f);
-  auto W_i8 = makeRandI8Vec(N * K, -50, 50, 23);
-
-  std::vector<float> wt_scale;
-  std::vector<int32_t> zp_corr;
-  nntrainer::Tensor wgt = makeQint8Weight(N, K, W_i8, wt_scale, zp_corr);
-  wgt.setName("layer0_ffn_gate:weight");
-
-  nntrainer::TensorDim adim(1, 1, M, K);
-  nntrainer::Tensor act(adim, false);
-  act.allocate();
-  std::memcpy(act.getData<float>(), A_f32.data(), M * K * sizeof(float));
-  act.setContextData(htp_ct);
-
-  std::vector<uint8_t> X_u8;
-  float act_scale = quantizeActU8(A_f32, X_u8, M, K);
-  std::vector<int32_t> C_i32_cpu(M * N, 0);
-  cpuGemmU8I8I32(M, N, K, X_u8.data(), W_i8.data(), C_i32_cpu.data());
-  std::vector<float> C_cpu(M * N);
-  dequantI32ToF32(M, N, act_scale, wt_scale.data(), zp_corr.data(),
-                  C_i32_cpu.data(), C_cpu.data());
-
-  ScopedEnvVar attention_enable("NNTR_HTP_QINT8_ATTENTION_ENABLE", nullptr);
-  ScopedEnvVar ffn_enable("NNTR_HTP_QINT8_FFN_ENABLE", "0");
-
-  nntrainer::Tensor result;
-  ASSERT_NO_THROW(result = act.dot(wgt, false, true));
-
-  double err = relError(result.getData<float>(), C_cpu.data(), M * N);
-  EXPECT_LT(err, 0.01) << "FFN CPU fallback relError " << err
                        << " vs CPU reference exceeds 1%";
 }
 

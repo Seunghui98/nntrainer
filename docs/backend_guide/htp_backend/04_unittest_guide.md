@@ -4,29 +4,63 @@ Deploying cross-compiled HTP unittest binaries to a target device (e.g. Galaxy S
 
 ## 1. Building and Running Unittests
 
-### Build
-To avoid rebuilding the entire module, compile only the changed test binary:
+### Prerequisites and Build
+
+The HTP unittest binaries are **not** built by meson/ninja: the top-level `meson.build` skips `subdir('test')` on `platform=android` (`test is not supported in android build, test skipped`), so `ninja -C <builddir> test/unittest/...` fails with `unknown target`. They are instead built with **ndk-build** from `test/unittest/jni_htp/Android.mk`, which links against the prebuilt `libnntrainer.so` / `libccapi-nntrainer.so` / `libsdkl.so` produced by the library build.
+
+**1. Set the cross-build environment variables** (see [02 §1](02_build_and_run.md)):
 
 ```bash
-ninja -C build_android test/unittest/unittest_nntrainer_htp_kernels
-ninja -C build_android test/unittest/unittest_nntrainer_htp_backend
+export HEXKL_SDK_ROOT=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
+export ANDROID_NDK=/opt/android-ndk-r26d
+export PATH=$ANDROID_NDK:$PATH
 ```
+
+**2. Build the HTP library** ([02 §2](02_build_and_run.md) golden path). This produces the prebuilt `.so`s under `builddir/jni/arm64-v8a/` that `jni_htp/Android.mk` links against:
+
+```bash
+./tools/package_android.sh \
+  --arm-arch=armv8.2-a \
+  -Denable-htp=true \
+  -Dhexkl-sdk-root=$HEXKL_SDK_ROOT \
+  -Dhexkl-lib-subdir=armv8_android26 \
+  -Dmmap-read=false \
+  -Dwerror=false
+```
+
+**3. Build the test binaries with ndk-build.** `jni_htp/` uses a flat layout (`Android.mk` + `Application.mk` directly in the folder), so point ndk-build at them explicitly:
+
+```bash
+ndk-build -C test/unittest/jni_htp \
+  NDK_PROJECT_PATH=. \
+  APP_BUILD_SCRIPT=Android.mk \
+  NDK_APPLICATION_MK=Application.mk \
+  -j$(nproc)
+```
+
+Output (binaries + all runtime `.so` dependencies) lands in `test/unittest/jni_htp/libs/arm64-v8a/`:
+- `unittest_nntrainer_htp_kernels`, `unittest_nntrainer_htp_backend`
+- `libnntrainer.so`, `libccapi-nntrainer.so`, `libsdkl.so`, `libc++_shared.so`
+
+To build a single binary, append its module name (e.g. `unittest_nntrainer_htp_kernels`) to the command.
 
 ### Deploy via ADB
 Target device: **Galaxy S25 Ultra** (SM-S938N)
 
-Push the cross-compiled binaries and the SDK's runtime libraries directly to `/data/local/tmp` on the device.
+The ndk-build output dir contains the binaries and every runtime `.so` they link against, so push `libs/arm64-v8a/` to `/data/local/tmp`.
 
 ```bash
-# 1. Push the compiled unittest binaries
-adb push build_android/test/unittest/unittest_nntrainer_htp_kernels /data/local/tmp/
-adb push build_android/test/unittest/unittest_nntrainer_htp_backend /data/local/tmp/
+# 1. Push the runtime .so deps (libnntrainer/libccapi-nntrainer/libsdkl/libc++_shared)
+adb push test/unittest/jni_htp/libs/arm64-v8a/. /data/local/tmp/
 
-# 2. Push the HexKL prebuilt shared library
-adb push $HEXKL_SDK_ROOT/lib/armv8_android26/libsdkl.so /data/local/tmp/
+# 2. Push the freshly-linked executables from obj/ (see caveat below)
+adb push test/unittest/jni_htp/obj/local/arm64-v8a/unittest_nntrainer_htp_kernels /data/local/tmp/
+adb push test/unittest/jni_htp/obj/local/arm64-v8a/unittest_nntrainer_htp_backend /data/local/tmp/
 
 # [Note] The CDSP device skeleton for HTP (libhexkl_skel.so, V79) must also already be in /data/local/tmp.
 ```
+
+> **Caveat — push executables from `obj/`, not `libs/`, on incremental rebuilds.** ndk-build links each executable in `obj/local/arm64-v8a/` and installs a *stripped* copy into `libs/arm64-v8a/`, but the strip-install step does **not** reliably refresh on incremental rebuilds — the `libs/` copy can stay stale (old code) while `obj/` has your latest changes. Always push the executable from `obj/local/arm64-v8a/` (unstripped, larger, but current). The `.so` deps in `libs/` are refreshed normally.
 
 ### Run Remotely
 Inject the shared-library path (`LD_LIBRARY_PATH`) and the CDSP skeleton linker path (`ADSP_LIBRARY_PATH`):
@@ -60,75 +94,68 @@ Inject these `NNTR_HTP_*` env vars into the run command to closely verify the WH
 
 ```bash
 # Force lookupPrefillWH to miss, using the known-good transient RM→WH path (bisection)
-adb -s R3CY205ZMND shell \
+adb shell \
   "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
    NNTR_HTP_DISABLE_PREBAKED_WH=1 ./unittest_nntrainer_htp_kernels --gtest_color=no"
 
 # Recompute the transient conversion on every pre-baked hit and memcmp it (per-weight OK/MISMATCH log)
-adb -s R3CY205ZMND shell \
+adb shell \
   "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
    NNTR_HTP_VERIFY_PREBAKED_WH=1 ./unittest_nntrainer_htp_backend --gtest_color=no"
 
 # Diff live NPU output against the CPU reference
-adb -s R3CY205ZMND shell \
+adb shell \
   "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
    NNTR_HTP_VERIFY_PREFILL_MM=1 ./unittest_nntrainer_htp_kernels --gtest_color=no"
+
+# Run a destructive pool probe (opt-in). MUST be isolated to ONE probe per
+# process — never in a full-suite run (it corrupts the SDKL allocator → SIGSEGV).
+adb shell \
+  "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
+   NNTR_HTP_POOL_PROBE=1 ./unittest_nntrainer_htp_kernels \
+   --gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxSustainedPinBytes --gtest_color=no"
 ```
 
 ## 2. Test Source File Composition
 
-Two precision-level test suites verify the HTP backend.
+Two test binaries verify the HTP backend at different levels.
 
 | Binary | Source File | Role | Test Suites |
 | :--- | :--- | :--- | :--- |
-| `unittest_nntrainer_htp_kernels` | `test/unittest/unittest_nntrainer_htp_kernels.cpp` | Calls the sdkl C API directly — measures kernel numerical accuracy and latency | `HtpKernelTest` **18** |
-| `unittest_nntrainer_htp_backend` | `test/unittest/unittest_nntrainer_htp_backend.cpp` | Integration test at the nntrainer ComputeOps API level — verifies QINT8 dispatch | `HtpShgemmTest`(6) + `HtpFallbackTest`(2) + `HtpU8i8Test`(3) + `HtpDispatchTest`(4), **15 tests, 4 suites** |
+| `unittest_nntrainer_htp_kernels` | `test/unittest/unittest_nntrainer_htp_kernels.cpp` | Calls the sdkl C API directly — measures kernel numerical accuracy and latency for the kernels the backend actually uses (`f32f16_f32` prefill, `u8i8_i32`) plus WH cache/registry and pool probes | `HtpKernelTest` **14** |
+| `unittest_nntrainer_htp_backend` | `test/unittest/unittest_nntrainer_htp_backend.cpp` | Integration tests at the nntrainer ComputeOps API level — shgemm/QINT8 dispatch plus the WH trailer codec, prefill-WH registry/loader, offline-bake gate, and backend lifecycle | `HtpShgemmTest`(4) + `HtpFallbackTest`(2) + `HtpU8i8Test`(3) + `HtpDispatchTest`(2) + `WHTrailerCodec`(2) + `WHTrailerLoad`(2) + `HtpPrefillWH`(1) + `WHBakeGate`(1) + `HtpBackendLifecycle`(1), **18 tests, 9 suites** |
 
-NPU-dependent tests auto-skip via `GTEST_SKIP()` when `HtpBackend::global().enabled() == false`. `HtpFallbackTest` and part of `HtpDispatchTest` (the `*FallbackDisabled` tests) verify the fallback path and run even without an NPU.
-
-`test/unittest/jni_htp/sdkl_rm_to_wh_i8_probe.cpp` is a standalone diagnostic binary that isolates `sdkl_cpu_rm_to_wh_i8_inplace()`'s behavior per buffer kind — used for debugging QINT8 weight-layout conversion issues.
-
-```bash
-# Build, push to device, and run (presets: small / qwen_attn / qwen_ffn_up / qwen_ffn_down)
-adb -s R3CY205ZMND shell \
-  "cd /data/local/tmp && \
-   LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
-   ./sdkl_rm_to_wh_i8_probe --preset qwen_attn --buf all"
-```
+NPU-dependent tests auto-skip via `GTEST_SKIP()` when `HtpBackend::global().enabled() == false`. Tests that run even without an NPU: `HtpFallbackTest` and the entire `WHTrailerCodec` / `WHTrailerLoad` / `HtpPrefillWH` / `WHBakeGate` / `HtpBackendLifecycle` group — they exercise host-side WH-trailer/registry/bake/lifecycle logic rather than the NPU.
 
 ## 3. Tests per File
 
-### `unittest_nntrainer_htp_kernels` — `HtpKernelTest` (18)
-- Accuracy_f16f16_f16
-- Accuracy_f16
+### `unittest_nntrainer_htp_kernels` — `HtpKernelTest` (14)
 - Accuracy_u8i8_i32
-- Accuracy_u8i4_i32
-- Accuracy_mm_tensor_f16
-- Constraint_MisalignedRejected_f16f16
-- Perf_f16f16_f16
-- Perf_f16
 - Perf_u8i8_i32
-- Perf_u8i4_i32
 - Padding_NonMultipleOf32_f32f16_f32
 - Accuracy_f32f16_f32_Prefill
+- Accuracy_f32f16_f32_Prefill_TransBFalse_KNLayout
 - PrefillWHResidency_ReusesCacheAcrossCalls
 - PrefillWHResidency_PinsMultipleNeverEvicts
 - Perf_f32f16_f32_Prefill
 - PhaseTiming_TransientPrefillBreakdown
-- PoolProbe_MeasureMaxResidentBytes
-- PoolProbe_MeasureMaxSustainedPinBytes
+- PrefillWHRegistry_UsedByShgemmMatchesTransient
+- ScratchReuse_MixedShapesStayCorrect
+- OfflineWH_ConversionIsDeterministicAndByteIdentical
+- PoolProbe_MeasureMaxSustainedPinBytes — **opt-in, skipped by default** (see note below)
+- PoolProbe_MeasureMaxResidentBytes — **opt-in, skipped by default** (see note below)
 
-### `unittest_nntrainer_htp_backend` — 4 suites (15)
+> **PoolProbe_\* are destructive and skipped by default.** They allocate NPU DMA memory to failure to characterize the pool; that exhaustion corrupts the SDKL allocator's internal state, so a functional test running afterward in the same process SIGSEGVs. They only run when `NNTR_HTP_POOL_PROBE=1` is set, and must be run **in isolation** (one probe per process via `--gtest_filter`), never alongside the functional tests. Kept last in the fixture as defense-in-depth. The measured numbers are recorded in [03 §2.4](03_backend_internals.md).
 
-**HtpShgemmTest** (6)
+### `unittest_nntrainer_htp_backend` — 9 suites (18)
+
+**HtpShgemmTest** (4)
 - AccuracyVsCpu
 - AlphaBetaHandling
 - BetaNonZeroThrows
-- MNotAlignedThrows
-- EdgeCase_MinValidShape
-- EdgeCase_SingleRow
+- NNotAlignedThrows
 
-**HtpFallbackTest** (2)
+**HtpFallbackTest** (2) — runs even without NPU
 - SupportsShgemmTracksBackendState
 - CpuOpsNeverAdvertisesShgemm
 
@@ -137,55 +164,71 @@ adb -s R3CY205ZMND shell \
 - ZpCorrApplied
 - AlignmentGuard_NNot32
 
-**HtpDispatchTest** (4)
+**HtpDispatchTest** (2)
 - RoutesToHtp_WhenMAligned
 - PadsAndRunsHtp_WhenMMisaligned
-- RoutesAttentionToCpu_WhenAttentionFallbackDisabled (runs even without NPU)
-- RoutesFfnToCpu_WhenFfnFallbackDisabled (runs even without NPU)
+
+**WHTrailerCodec** (2) — host-side, runs without NPU
+- RoundTripsEntries
+- ReturnsFalseOnPlainData
+
+**WHTrailerLoad** (2) — host-side, runs without NPU
+- RegisterThenLookupReturnsBytes
+- InferenceModeLoadRegistersWH
+
+**HtpPrefillWH** (1) — host-side, runs without NPU
+- disableToggleForcesMiss
+
+**WHBakeGate** (1) — host-side, runs without NPU
+- RespectsLayerDtypeMapOverride
+
+**HtpBackendLifecycle** (1) — runs everywhere
+- npuAliveTracksEnabled
 
 ## 4. Test Results Record
 
 Record results in the tables below after running the commands in §1. (Legend: ✅ PASS / ❌ FAIL / ⏭️ SKIPPED — accuracy/perf tests are expected to SKIP when the NPU isn't up)
 
-### 4.1 `unittest_nntrainer_htp_kernels` — `HtpKernelTest` (18)
+Last run: **2026-07-13, Galaxy S25 Ultra (ADB `R3CY205ZMND`, V79 skel)**. Kernels: **12 passed, 2 skipped** (default run; pool probes opt-in). Backend: **18 passed**.
+
+### 4.1 `unittest_nntrainer_htp_kernels` — `HtpKernelTest` (14)
 
 | Test | Result | Time (ms) | Notes |
 | :--- | :---: | :---: | :--- |
-| Accuracy_f16f16_f16 | | | |
-| Accuracy_f16 | | | |
-| Accuracy_u8i8_i32 | | | |
-| Accuracy_u8i4_i32 | | | |
-| Accuracy_mm_tensor_f16 | | | |
-| Constraint_MisalignedRejected_f16f16 | | | |
-| Perf_f16f16_f16 | | | |
-| Perf_f16 | | | |
-| Perf_u8i8_i32 | | | |
-| Perf_u8i4_i32 | | | |
-| Padding_NonMultipleOf32_f32f16_f32 | | | |
-| Accuracy_f32f16_f32_Prefill | | | |
-| PrefillWHResidency_ReusesCacheAcrossCalls | | | |
-| PrefillWHResidency_PinsMultipleNeverEvicts | | | |
-| Perf_f32f16_f32_Prefill | | | |
-| PhaseTiming_TransientPrefillBreakdown | | | |
-| PoolProbe_MeasureMaxResidentBytes | | | |
-| PoolProbe_MeasureMaxSustainedPinBytes | | | |
+| Accuracy_u8i8_i32 | ✅ | 58 | |
+| Perf_u8i8_i32 | ✅ | 12981 | all shapes SKIP (M not mult. of 64) — perf sweep no-op, test passes |
+| Padding_NonMultipleOf32_f32f16_f32 | ✅ | 1 | |
+| Accuracy_f32f16_f32_Prefill | ✅ | 325 | |
+| Accuracy_f32f16_f32_Prefill_TransBFalse_KNLayout | ✅ | 466 | |
+| PrefillWHResidency_ReusesCacheAcrossCalls | ✅ | 33 | |
+| PrefillWHResidency_PinsMultipleNeverEvicts | ✅ | 45 | |
+| Perf_f32f16_f32_Prefill | ✅ | 793 | |
+| PhaseTiming_TransientPrefillBreakdown | ✅ | 2225 | rm2wh dominates (q=21/gu=30/down=36 ms) |
+| PrefillWHRegistry_UsedByShgemmMatchesTransient | ✅ | 16 | |
+| ScratchReuse_MixedShapesStayCorrect | ✅ | 115 | |
+| OfflineWH_ConversionIsDeterministicAndByteIdentical | ✅ | 217 | |
+| PoolProbe_MeasureMaxSustainedPinBytes | ⏭️ | — | opt-in; SKIPPED by default. Isolated run: **448 MB / 84 weights** |
+| PoolProbe_MeasureMaxResidentBytes | ⏭️ | — | opt-in; SKIPPED by default. Isolated run: **3972 MB / 993×4 MB** |
 
-### 4.2 `unittest_nntrainer_htp_backend` — 4 suites (15)
+### 4.2 `unittest_nntrainer_htp_backend` — 9 suites (18)
 
 | Suite | Test | Result | Time (ms) | Notes |
 | :--- | :--- | :---: | :---: | :--- |
-| HtpShgemmTest | AccuracyVsCpu | | | |
-| HtpShgemmTest | AlphaBetaHandling | | | |
-| HtpShgemmTest | BetaNonZeroThrows | | | |
-| HtpShgemmTest | MNotAlignedThrows | | | |
-| HtpShgemmTest | EdgeCase_MinValidShape | | | |
-| HtpShgemmTest | EdgeCase_SingleRow | | | |
-| HtpFallbackTest | SupportsShgemmTracksBackendState | | | |
-| HtpFallbackTest | CpuOpsNeverAdvertisesShgemm | | | |
-| HtpU8i8Test | Accuracy_VsCpu | | | |
-| HtpU8i8Test | ZpCorrApplied | | | |
-| HtpU8i8Test | AlignmentGuard_NNot32 | | | |
-| HtpDispatchTest | RoutesToHtp_WhenMAligned | | | |
-| HtpDispatchTest | PadsAndRunsHtp_WhenMMisaligned | | | |
-| HtpDispatchTest | RoutesAttentionToCpu_WhenAttentionFallbackDisabled | | | Runs even without NPU |
-| HtpDispatchTest | RoutesFfnToCpu_WhenFfnFallbackDisabled | | | Runs even without NPU |
+| HtpShgemmTest | AccuracyVsCpu | ✅ | 72 | |
+| HtpShgemmTest | AlphaBetaHandling | ✅ | 0 | |
+| HtpShgemmTest | BetaNonZeroThrows | ✅ | 0 | |
+| HtpShgemmTest | NNotAlignedThrows | ✅ | 0 | |
+| HtpFallbackTest | SupportsShgemmTracksBackendState | ✅ | 0 | Runs even without NPU |
+| HtpFallbackTest | CpuOpsNeverAdvertisesShgemm | ✅ | 0 | Runs even without NPU |
+| HtpU8i8Test | Accuracy_VsCpu | ✅ | 2 | |
+| HtpU8i8Test | ZpCorrApplied | ✅ | 4 | |
+| HtpU8i8Test | AlignmentGuard_NNot32 | ✅ | 0 | |
+| HtpDispatchTest | RoutesToHtp_WhenMAligned | ✅ | 3 | |
+| HtpDispatchTest | PadsAndRunsHtp_WhenMMisaligned | ✅ | 2 | |
+| WHTrailerCodec | RoundTripsEntries | ✅ | 0 | Host-side, runs without NPU |
+| WHTrailerCodec | ReturnsFalseOnPlainData | ✅ | 0 | Host-side, runs without NPU |
+| WHTrailerLoad | RegisterThenLookupReturnsBytes | ✅ | 0 | Host-side, runs without NPU |
+| WHTrailerLoad | InferenceModeLoadRegistersWH | ✅ | 7 | Host-side, runs without NPU |
+| HtpPrefillWH | disableToggleForcesMiss | ✅ | 0 | Host-side, runs without NPU |
+| WHBakeGate | RespectsLayerDtypeMapOverride | ✅ | 1 | Host-side, runs without NPU |
+| HtpBackendLifecycle | npuAliveTracksEnabled | ✅ | 0 | Runs everywhere |
