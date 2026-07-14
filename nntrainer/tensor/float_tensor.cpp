@@ -39,6 +39,8 @@ namespace nntrainer {
 
 namespace {
 
+/** @brief Identifies which projection group (attention vs feed-forward) a
+ * QINT8-quantized weight belongs to */
 enum class QInt8ProjectionGroup { Unknown, Attention, Ffn };
 
 bool envEnabled(const char *key, bool default_value) {

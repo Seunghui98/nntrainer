@@ -91,6 +91,10 @@ static void cpuShgemm(int M, int N, int K, float alpha, const float *A,
 
 // ---- Fixture ---------------------------------------------------------------
 
+/**
+ * @brief Fixture for hmx::shgemm_f32f16_f32 accuracy/edge-case tests; tracks
+ *        whether the NPU backend is available so tests can self-skip.
+ */
 class HtpShgemmTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -101,6 +105,9 @@ protected:
 
 // ---- Accuracy tests --------------------------------------------------------
 
+/**
+ * @brief One (M, N, K) shgemm test shape, with a label for failure messages.
+ */
 struct ShgemmShape {
   int M, N, K;
   const char *label;
@@ -238,6 +245,10 @@ TEST(HtpFallbackTest, CpuOpsNeverAdvertisesShgemm) {
 //                (C_i32[m,n] - zp_corr[n])
 //   where C_i32 = X_u8 * W_i8^T  (integer accumulator)
 
+/**
+ * @brief Fixture for hmx::shgemm_u8i8_i32 tests; tracks whether the NPU
+ *        backend is available so tests can self-skip.
+ */
 class HtpU8i8Test : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -432,12 +443,12 @@ TEST_F(HtpU8i8Test, AlignmentGuard_NNot32) {
                std::runtime_error);
 }
 
-// ---- HtpDispatchTest fixture -----------------------------------------------
-//
-// Exercises the FloatTensor::dotQInteger routing: FP32 activation ×
-// QINT8 weight dispatches through the HTP context ops when available.
-// Uses Tensor::dot() via a ContextData stamped with the HTP ops.
-
+/**
+ * @brief Fixture exercising the FloatTensor::dotQInteger routing: FP32
+ *        activation x QINT8 weight dispatches through the HTP context ops
+ *        when available. Uses Tensor::dot() via a ContextData stamped with
+ *        the HTP ops.
+ */
 class HtpDispatchTest : public ::testing::Test {
 protected:
   void SetUp() override {

@@ -154,6 +154,10 @@ static bool exactMatchI32(const int32_t *a, const int32_t *b, int n) {
 
 // ---- NPU buffer RAII -------------------------------------------------------
 
+/**
+ * @brief RAII wrapper for an NPU-allocated buffer; frees itself via
+ *        sdkl_npu_free when it goes out of scope.
+ */
 struct NpuBuf {
   void *p = nullptr;
   NpuBuf() = default;
@@ -172,6 +176,10 @@ struct NpuBuf {
 
 // ---- Fixture ---------------------------------------------------------------
 
+/**
+ * @brief Fixture for direct sdkl kernel accuracy/perf tests; captures NPU
+ *        availability and the HTP compute domain for use by test bodies.
+ */
 class HtpKernelTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -219,6 +227,9 @@ TEST_F(HtpKernelTest, Accuracy_u8i8_i32) {
 
 // ---- Perf harness ----------------------------------------------------------
 
+/**
+ * @brief Mean/min/standard-deviation timing statistics, in milliseconds.
+ */
 struct TimeStats {
   double mean_ms, min_ms, std_ms;
 };
@@ -246,6 +257,10 @@ template <typename Fn> static TimeStats timeIt(int warmup, int iters, Fn &&fn) {
   return {mean, mn, std::sqrt(var / iters)};
 }
 
+/**
+ * @brief One row of recorded performance results (kernel/full timing,
+ *        throughput, and CPU-vs-NPU speedup) for a single matmul shape.
+ */
 struct PerfRow {
   std::string op;
   int M, N, K;
@@ -266,7 +281,9 @@ static void recordPerf(const std::string &op, int M, int N, int K,
                     speedup, quant ? "TOPS" : "GFLOPS"});
 }
 
-// Shape sets (all M%32==0, N%32==0).
+/**
+ * @brief M/N/K dimensions of a matmul test shape (all M%32==0, N%32==0).
+ */
 struct Shape {
   int M, N, K;
 };

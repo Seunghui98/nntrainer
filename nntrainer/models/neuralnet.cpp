@@ -1027,7 +1027,7 @@ void NeuralNetwork::load(const std::string &file_path,
         const auto &var = weight->getVariable();
         // On-disk qparam count = out-features = width(). The QINT8 save path
         // always transposes the weight to [N,K]
-        // (quantize_qint8_weight(w, /*transpose_input=*/true)), so the
+        // (quantize_qint8_weight(w, transpose_input=true)), so the
         // per-channel scale/zp count equals the runtime tensor's width().
         // scale_size() cannot be used here: the tensor's qscheme is still the
         // PER_TENSOR_AFFINE placeholder (returns 1) until
