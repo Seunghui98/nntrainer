@@ -2,6 +2,9 @@
 /**
  * @file   unittest_nntrainer_htp_backend.cpp
  * @date   19 Jun 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  * @brief  HTP backend accuracy, fallback, and edge-case tests.
  *
  * Compiled only with -Denable-htp=true. NPU-specific tests are
@@ -81,9 +84,9 @@ static double relError(const float *npu, const float *cpu, int n) {
 // Wraps nntrainer::shgemm with StorageOrder=1 (ROW_MAJOR).
 static void cpuShgemm(int M, int N, int K, float alpha, const float *A,
                       const uint16_t *B, float beta, float *C) {
-  nntrainer::shgemm(0 /*ROW_MAJOR*/, false /*TransA*/, true /*TransB*/, M, N, K,
-                    alpha, A, K, reinterpret_cast<const _FP16 *>(B), K, beta, C,
-                    N);
+  // StorageOrder=0 (ROW_MAJOR), TransA=false, TransB=true
+  nntrainer::shgemm(0, false, true, M, N, K, alpha, A, K,
+                    reinterpret_cast<const _FP16 *>(B), K, beta, C, N);
 }
 
 // ---- Fixture ---------------------------------------------------------------
@@ -129,9 +132,9 @@ TEST_F(HtpShgemmTest, AccuracyVsCpu) {
     cpuShgemm(s.M, s.N, s.K, 1.0f, A_f32.data(), B_fp16.data(), 0.0f,
               C_cpu.data());
 
-    // NPU under test
+    // NPU under test: StorageOrder=1 (ROW_MAJOR)
     ASSERT_NO_THROW(nntrainer::hmx::shgemm_f32f16_f32(
-      1 /*ROW_MAJOR*/, false, true, s.M, s.N, s.K, 1.0f, A_f32.data(), s.K,
+      1, false, true, s.M, s.N, s.K, 1.0f, A_f32.data(), s.K,
       reinterpret_cast<const _FP16 *>(B_fp16.data()), s.K, 0.0f, C_npu.data(),
       s.N))
       << "Shape: " << s.label;
@@ -178,10 +181,11 @@ TEST_F(HtpShgemmTest, BetaNonZeroThrows) {
   auto Bh = toFP16(makeRandF32(N * K, -0.5f, 0.5f));
   std::vector<float> C(M * N, 1.0f);
 
+  // beta != 0 is expected to trigger the throw path below.
   EXPECT_THROW(nntrainer::hmx::shgemm_f32f16_f32(
                  1, false, true, M, N, K, 1.0f, A.data(), K,
-                 reinterpret_cast<const _FP16 *>(Bh.data()), K,
-                 0.5f /*beta != 0*/, C.data(), N),
+                 reinterpret_cast<const _FP16 *>(Bh.data()), K, 0.5f, C.data(),
+                 N),
                std::runtime_error);
 }
 
@@ -785,8 +789,8 @@ struct WHBakeGateTestGuard {
  */
 TEST(WHBakeGate, RespectsLayerDtypeMapOverride) {
   const std::string file_path = "test_wh_bake_gate.bin";
-  auto nn = createWHBakeGateTestNN(/*input_width=*/32, /*units1=*/32,
-                                   /*units2=*/32);
+  // input_width=32, units1=32, units2=32
+  auto nn = createWHBakeGateTestNN(32, 32, 32);
 
   std::map<std::string, nntrainer::TensorDim::DataType> dtype_map = {
     {"dense1", nntrainer::TensorDim::DataType::FP16},
@@ -842,8 +846,8 @@ TEST(WHTrailerLoad, InferenceModeLoadRegistersWH) {
   const std::string file_path = "test_wh_trailer_load_inference.bin";
   nntrainer::hmx::prefillWHRegistryClear();
 
-  auto nn1 = createWHBakeGateTestNN(/*input_width=*/32, /*units1=*/32,
-                                    /*units2=*/32);
+  // input_width=32, units1=32, units2=32
+  auto nn1 = createWHBakeGateTestNN(32, 32, 32);
 
   std::map<std::string, nntrainer::TensorDim::DataType> dtype_map = {
     {"dense1", nntrainer::TensorDim::DataType::FP16},

@@ -2,6 +2,9 @@
 /**
  * @file   unittest_nntrainer_htp_kernels.cpp
  * @date   23 Jun 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  * @brief  Direct sdkl kernel accuracy + performance tests (kernel level).
  *
  * Compiled only with -Denable-htp=true. NPU tests are runtime-skipped when
@@ -345,7 +348,7 @@ static void perfSweepU8I8(int domain, const std::vector<Shape> &shapes,
                           << "x" << N << "x" << K;
     TimeStats cpu = timeIt(
       1, 3, [&]() { cpuGemmI32(M, N, K, X.data(), W.data(), C_cpu.data()); });
-    recordPerf("u8i8_i32", M, N, K, k, k, cpu.mean_ms, /*quant=*/true);
+    recordPerf("u8i8_i32", M, N, K, k, k, cpu.mean_ms, true); // quant=true
   }
 }
 
@@ -564,7 +567,7 @@ TEST_F(HtpKernelTest, Perf_f32f16_f32_Prefill) {
       cpuGemmF32F16(s.M, s.N, s.K, A.data(), W.data(), ref.data());
     });
     recordPerf(std::string("f32f16_f32_prefill_") + s.name, s.M, s.N, s.K, full,
-               full, cpu.mean_ms, /*quant=*/false);
+               full, cpu.mean_ms, false); // quant=false
   }
   SUCCEED();
 }
@@ -788,10 +791,11 @@ TEST_F(HtpKernelTest, PoolProbe_MeasureMaxSustainedPinBytes) {
   if (!npu_enabled)
     GTEST_SKIP() << "NPU not available on this device";
   if (!std::getenv("NNTR_HTP_POOL_PROBE"))
-    GTEST_SKIP() << "destructive NPU DMA pool probe (allocates to failure, "
-                    "corrupts SDKL allocator state); opt in with "
-                    "NNTR_HTP_POOL_PROBE=1 and run in isolation, e.g. "
-                    "--gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxSustainedPinBytes";
+    GTEST_SKIP()
+      << "destructive NPU DMA pool probe (allocates to failure, "
+         "corrupts SDKL allocator state); opt in with "
+         "NNTR_HTP_POOL_PROBE=1 and run in isolation, e.g. "
+         "--gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxSustainedPinBytes";
 
   // Sizes in bytes for the three FC weight shapes in Qwen3-0.6B.
   static const size_t kWeightSizes[] = {
@@ -838,10 +842,11 @@ TEST_F(HtpKernelTest, PoolProbe_MeasureMaxResidentBytes) {
   if (!npu_enabled)
     GTEST_SKIP() << "NPU not available on this device";
   if (!std::getenv("NNTR_HTP_POOL_PROBE"))
-    GTEST_SKIP() << "destructive NPU DMA pool probe (allocates to failure, "
-                    "corrupts SDKL allocator state); opt in with "
-                    "NNTR_HTP_POOL_PROBE=1 and run in isolation, e.g. "
-                    "--gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxResidentBytes";
+    GTEST_SKIP()
+      << "destructive NPU DMA pool probe (allocates to failure, "
+         "corrupts SDKL allocator state); opt in with "
+         "NNTR_HTP_POOL_PROBE=1 and run in isolation, e.g. "
+         "--gtest_filter=HtpKernelTest.PoolProbe_MeasureMaxResidentBytes";
 
   const size_t chunk = 4ull * 1024 * 1024; // 4 MB, ~one prefill weight
   std::vector<void *> bufs;
