@@ -217,7 +217,7 @@ public:
       state->info.qscheme = weight.q_scheme();
       state->info.scale_size = weight.scale_size();
       if (weight.getDataType() == ml::train::TensorDim::DataType::QINT8) {
-        const size_t count = weight.getDim().width();
+        const size_t count = weight.scale_size();
         state->info.scales.assign(weight.getScale<float>(),
                                   weight.getScale<float>() + count);
         state->info.zp_corr.assign(weight.getZpCorr<int32_t>(),

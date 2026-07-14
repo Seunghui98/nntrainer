@@ -1024,9 +1024,15 @@ void NeuralNetwork::load(const std::string &file_path,
       auto tensor_data_type = weight->getDim().getDataType();
       size_t size = 0;
       if (tensor_data_type == TensorDim::DataType::QINT8) {
-        size =
-          weight->getVariable().bytes() + weight->getVariable().scale_size() *
-                                            (sizeof(float) + sizeof(int32_t));
+        const auto &var = weight->getVariable();
+        // On-disk qparam count = out-features = width(). The QINT8 save path
+        // always transposes the weight to [N,K]
+        // (quantize_qint8_weight(w, /*transpose_input=*/true)), so the
+        // per-channel scale/zp count equals the runtime tensor's width().
+        // scale_size() cannot be used here: the tensor's qscheme is still the
+        // PER_TENSOR_AFFINE placeholder (returns 1) until
+        // read_quantization_info() runs during the actual read.
+        size = var.bytes() + var.width() * (sizeof(float) + sizeof(int32_t));
       } else {
         size = weight->getVariable().getMemoryBytes();
       }

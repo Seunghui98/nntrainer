@@ -205,8 +205,7 @@ TEST(nntrainer_Tensor, Tensor_04_p) {
     in.push_back(ttv);
   }
 
-  std::vector<float> scales = {1.349f, 3.135f, 6.196f, 2.105f, 6.125f,
-                               4.106f, 0.916f, 7.014f, 9.814f, 5.556f};
+  std::vector<float> scales = {1.349f, 3.135f, 6.196f};
 
   nntrainer::Tensor tensor = nntrainer::Tensor(
     in, scales, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8},

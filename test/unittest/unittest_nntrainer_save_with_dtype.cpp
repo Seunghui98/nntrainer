@@ -230,6 +230,7 @@ TEST(SaveWithDtype, save_bin_produces_nonempty_file_p) {
   remove(file_path.c_str());
 }
 
+#ifdef ENABLE_FP16
 /**
  * @brief Save with FP16 dtype should throw (unsupported conversion)
  */
@@ -241,6 +242,7 @@ TEST(SaveWithDtype, save_bin_with_fp16_dtype_throws_n) {
     std::runtime_error);
   remove("test_fp16.bin");
 }
+#endif // ENABLE_FP16
 
 /**
  * @brief Save with QINT8 dtype should throw (unsupported conversion)

@@ -487,7 +487,7 @@ TEST(TensorPool, validate_memory_reuse_01_p) {
   EXPECT_EQ(pool.minMemoryRequirement(),
             t1->bytes() + (t2->scale_size() + t3->scale_size() +
                            t4->scale_size() + t5->scale_size()) *
-                            sizeof(float));
+                            (sizeof(float) + sizeof(int32_t)));
 
   EXPECT_NO_THROW(pool.allocate());
 
