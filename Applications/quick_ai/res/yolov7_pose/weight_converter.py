@@ -174,9 +174,66 @@ def np32(t):
     return t.detach().cpu().float().numpy().astype(np.float32)
 
 
-def convert(model):
-    """Return {nntrainer_weight_name: np.ndarray(float32)}."""
-    sd = model.state_dict()
+def _fuse_conv_bn_np(cw, cb, bn_w, bn_b, bn_rm, bn_rv, eps=1e-5):
+    """Fold Conv (+optional bias) and BatchNorm into a single biased conv."""
+    import numpy as _np
+
+    std = _np.sqrt(bn_rv + eps)
+    scale = bn_w / std
+    w = cw * scale.reshape(-1, 1, 1, 1)
+    b = (cb if cb is not None else _np.zeros_like(bn_rm)) * scale + (
+        bn_b - bn_w * bn_rm / std
+    )
+    return w.astype(_np.float32), b.astype(_np.float32)
+
+
+def _prepare_state(state):
+    """Return a fused, alias-free {key: np.float32} dict.
+
+    Handles both fused checkpoints (Conv+BN already folded) and unfused ones
+    (folds every ``<mp>.conv`` + ``<mp>.bn`` pair), and drops the aliased
+    ``model.*`` (nn.Sequential) view and ``num_batches_tracked`` buffers.
+    """
+    sd = {}
+    for k, v in state.items():
+        if k.startswith("model.") or k.endswith(".num_batches_tracked"):
+            continue
+        sd[k] = np32(v)
+
+    bn_prefixes = {
+        k[: -len(".bn.weight")] for k in sd if k.endswith(".bn.weight")
+    }
+    if not bn_prefixes:
+        return sd  # already fused
+
+    fused = {}
+    for mp in bn_prefixes:
+        cw = sd.get(mp + ".conv.weight")
+        cb = sd.get(mp + ".conv.bias")
+        fused[mp + ".conv.weight"], fused[mp + ".conv.bias"] = _fuse_conv_bn_np(
+            cw, cb, sd[mp + ".bn.weight"], sd[mp + ".bn.bias"],
+            sd[mp + ".bn.running_mean"], sd[mp + ".bn.running_var"],
+        )
+    out = {}
+    for k, v in sd.items():
+        mp = None
+        for suf in (".conv.weight", ".conv.bias", ".bn.weight", ".bn.bias",
+                    ".bn.running_mean", ".bn.running_var"):
+            if k.endswith(suf):
+                cand = k[: -len(suf)]
+                if cand in bn_prefixes:
+                    mp = cand
+                    break
+        if mp is not None:
+            continue  # replaced by the fused entry
+        out[k] = v
+    out.update(fused)
+    return out
+
+
+def convert(state):
+    """Return {nntrainer_weight_name: np.ndarray(float32)} from a state dict."""
+    sd = _prepare_state(state)
     out = {}
     consumed = set()
 
@@ -197,54 +254,54 @@ def convert(model):
         # ---- fused Conv modules: "<mp>.conv.weight" / "<mp>.conv.bias" -----
         if k.endswith(".conv.weight"):
             mp = k[: -len(".conv.weight")]
-            out[mp + ":filter"] = np32(take(k))  # [out,in,kh,kw] (NCHW)
+            out[mp + ":filter"] = (take(k))  # [out,in,kh,kw] (NCHW)
             bk = mp + ".conv.bias"
             if bk in sd:
-                out[mp + ":bias"] = np32(take(bk))
+                out[mp + ":bias"] = (take(bk))
             continue
 
         # ---- head.final_layer: raw nn.Conv2d (no ".conv" wrapper) ----------
         if k == "head.final_layer.weight":
-            out["head.final_layer:filter"] = np32(take(k))
+            out["head.final_layer:filter"] = (take(k))
             if "head.final_layer.bias" in sd:
-                out["head.final_layer:bias"] = np32(take("head.final_layer.bias"))
+                out["head.final_layer:bias"] = (take("head.final_layer.bias"))
             continue
 
         # ---- ScaleNorm scalar g -> per-channel gamma (broadcast) -----------
         if k == "head.mlp.0.g":
-            g = float(np32(take(k)).reshape(-1)[0])
+            g = float((take(k)).reshape(-1)[0])
             out["head.mlp.0:gamma"] = np.full((FLATTEN,), g, dtype=np.float32)
             continue
 
         # ---- GAU (RTMCCBlock) ----------------------------------------------
         if k == "head.gau.uv.weight":  # [2e+s, D] -> [D, 2e+s]
-            out["head.gau:uv_weight"] = np32(take(k)).T.copy()
+            out["head.gau:uv_weight"] = (take(k)).T.copy()
             continue
         if k == "head.gau.o.weight":  # [D, e] -> [e, D]
-            out["head.gau:o_weight"] = np32(take(k)).T.copy()
+            out["head.gau:o_weight"] = (take(k)).T.copy()
             continue
         if k == "head.gau.gamma":
-            out["head.gau:gamma"] = np32(take(k))
+            out["head.gau:gamma"] = (take(k))
             continue
         if k == "head.gau.beta":
-            out["head.gau:beta"] = np32(take(k))
+            out["head.gau:beta"] = (take(k))
             continue
         if k == "head.gau.ln.g":
-            out["head.gau:ln_g"] = np32(take(k)).reshape(1)
+            out["head.gau:ln_g"] = (take(k)).reshape(1)
             continue
         if k == "head.gau.res_scale.scale":
-            out["head.gau:res_scale"] = np32(take(k))
+            out["head.gau:res_scale"] = (take(k))
             continue
 
         # ---- generic Linear (mlp.1, cls_x, cls_y, head_feat.fc) ------------
         if k.endswith(".weight"):
             mp = k[: -len(".weight")]
-            w = np32(take(k))
+            w = (take(k))
             if w.ndim == 2:  # Linear [out,in] -> [in,out]
                 out[mp + ":weight"] = w.T.copy()
                 bk = mp + ".bias"
                 if bk in sd:
-                    out[mp + ":bias"] = np32(take(bk))
+                    out[mp + ":bias"] = (take(bk))
                 continue
 
         # ---- unmatched .bias handled alongside its weight above ------------
@@ -291,8 +348,10 @@ def main():
         print(f"# total {len(state)} checkpoint entries")
         return
 
-    model = build_model(args.weights, device)
-    tensors = convert(model)
+    state = _load_checkpoint(args.weights, device)
+    if state and all(k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
+    tensors = convert(state)
 
     if args.dump_names:
         for name in sorted(tensors):
