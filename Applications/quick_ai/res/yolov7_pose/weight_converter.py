@@ -39,6 +39,30 @@ FEATMAP = 10
 FLATTEN = FEATMAP * FEATMAP  # 100
 
 
+class _Placeholder(nn.Module):
+    """Permissive nn.Module stand-in for an unavailable training-repo class.
+
+    A full torch.save(model) may pickle instance state that re-binds methods
+    (e.g. a fused Conv does ``self.forward = self.forward_fuse``); restoring
+    such a bound method calls ``getattr(obj, 'forward_fuse')``. Return a no-op
+    callable for any attribute the real class would have provided, so the
+    (real) parameter/buffer/submodule dicts still deserialize and state_dict()
+    recovers the tensors.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)  # _parameters/_buffers/_modules
+        except AttributeError:
+            if name.startswith("__") and name.endswith("__"):
+                raise
+            return lambda *a, **k: None
+
+
+def _placeholder_class(module_name, cls_name):
+    return type(cls_name, (_Placeholder,), {"__module__": module_name})
+
+
 class _ShimLoader(importlib.abc.Loader):
     """Materialize a module whose every attribute is an nn.Module placeholder."""
 
@@ -46,7 +70,7 @@ class _ShimLoader(importlib.abc.Loader):
         m = types.ModuleType(spec.name)
 
         def _getattr(name, _m=m):
-            cls = type(name, (nn.Module,), {"__module__": _m.__name__})
+            cls = _placeholder_class(_m.__name__, name)
             setattr(_m, name, cls)
             return cls
 
@@ -109,25 +133,40 @@ def build_model(checkpoint_path, device):
         nc=1, img_size=320, embed_dim=128, widen_factor=1.5, nkpt=NKPT
     )
     state = _load_checkpoint(checkpoint_path, device)
-    # tolerate a "module." / "model." prefix on externally-saved state dicts
-    if all(k.startswith("module.") for k in state):
+    # tolerate a "module." prefix on externally-saved state dicts
+    if state and all(k.startswith("module.") for k in state):
         state = {k[len("module."):]: v for k, v in state.items()}
+
+    # A checkpoint with no BatchNorm keys was already fused (Conv+BN folded);
+    # fuse the reconstruction first so the key sets line up.
+    already_fused = not any(".bn." in k for k in state)
+    model.eval()
+    if already_fused:
+        model.fuse()
+
     missing, unexpected = model.load_state_dict(state, strict=False)
+    # Ignore the aliased "model.*" (nn.Sequential) view: those tensors are
+    # shared with backbone/head/head_feat and always resolve via the canonical
+    # paths, so their absence from either side is benign.
+    missing = [k for k in missing if not k.startswith("model.")]
+    unexpected = [k for k in unexpected if not k.startswith("model.")]
     if missing or unexpected:
         print(
             f"[converter] load_state_dict: {len(missing)} missing, "
             f"{len(unexpected)} unexpected keys"
         )
         if missing:
-            print("  e.g. missing:", missing[:5])
+            print("  e.g. missing:", missing[:8])
         if unexpected:
-            print("  e.g. unexpected:", unexpected[:5])
+            print("  e.g. unexpected:", unexpected[:8])
         raise SystemExit(
-            "checkpoint keys do not match the reconstructed model; adjust the "
-            "reconstruction in models_pose/ or the mapping to match your model."
+            "checkpoint keys do not match the reconstructed model. Compare with "
+            "`--inspect` and align models_pose/ (and the weight_converter "
+            "mapping) with your model's module hierarchy."
         )
-    model.to(device).float().eval()
-    model.fuse()
+    model.to(device).float()
+    if not already_fused:
+        model.fuse()
     return model
 
 
