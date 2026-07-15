@@ -597,13 +597,22 @@ size_t CharTensor::getMemoryBytes() const {
 }
 
 size_t CharTensor::scale_size() const {
+  // QINT4_HTP weights are stored in the runtime FC weight layout [K, N]
+  // (in, out) with one scale / zp_corr entry per output channel (= N = width).
+  // Key on the dtype rather than qscheme: the loader can leave qscheme
+  // mismatched per weight, but scale_size() must stay correct for buffer
+  // sizing (alloc, getMemoryBytes, dequant bounds) regardless.
+  if (getDataType() == Tdatatype::QINT4_HTP)
+    return width();
+
   switch (qscheme) {
   case QScheme::PER_TENSOR_AFFINE:
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
-    // QINT8 weights are consumed as [N, K], with one scale / zp_corr entry
-    // per output channel row N rather than per inner dimension K.
+  case QScheme::PER_CHANNEL_AFFINE_I4:
+    // QINT8 weights are consumed as [N, K], with one scale / zp_corr
+    // entry per output channel row N rather than per inner dimension K.
     return height();
     break;
   default:

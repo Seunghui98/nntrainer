@@ -171,6 +171,8 @@ unsigned int TensorDim::getDataTypeSize() const {
     return sizeof(int8_t);
   case TensorDim::DataType::QINT4:
     return sizeof(int8_t);
+  case TensorDim::DataType::QINT4_HTP:
+    return sizeof(int8_t);
   case TensorDim::DataType::BCQ:
     return sizeof(uint32_t);
   case TensorDim::DataType::Q6_K:
@@ -410,6 +412,8 @@ std::ostream &operator<<(std::ostream &out, TensorDim const &d) {
     type_ = "QINT8";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::QINT4) {
     type_ = "QINT4";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::QINT4_HTP) {
+    type_ = "QINT4_HTP";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::BCQ) {
     type_ = "BCQ";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::Q4_K) {
