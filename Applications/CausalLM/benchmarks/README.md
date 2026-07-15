@@ -38,7 +38,7 @@ python3 benchmark_android.py \
 - `-n, --n-gen`: Number of generation tokens (default: 0)
 - `-t, --n-threads`: Number of OMP threads (default: 4)
 - `-b, --batch-size`: Batch size (default: 1)
-- `--compute-engine`: compute_engine 값, 콤마 구분 (e.g., `htp,cpu`). 미지정 시 `nntr_config.json` 기존 값 사용
+- `--compute-engine`: compute_engine value(s), comma-separated (e.g., `htp,cpu`). If unset, the existing value in `nntr_config.json` is used
 
 ## Output
 
@@ -104,9 +104,9 @@ python3 benchmark_android.py \
   -t 2,4,8,16
 ```
 
-#### HTP vs CPU prefill 비교
+#### HTP vs CPU prefill comparison
 ```bash
-# M=16,32,64,128,256 에서 HTP vs CPU prefill TPS 비교
+# Compare HTP vs CPU prefill TPS at M=16,32,64,128,256
 python3 benchmark_android.py \
   -m /data/local/tmp/nntrainer/causallm/models/qwen3-0.6b \
   -p 16,32,64,128,256 \
