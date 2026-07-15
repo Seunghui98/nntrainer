@@ -13,8 +13,17 @@ endif
 
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
 
-# HexKL SDK root (used by nntr_quantize for WH-layout bake, ENABLE_HEXKL)
-HEXKL_ADDON_ROOT := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
+# HexKL SDK root (used by nntr_quantize for WH-layout bake, ENABLE_HEXKL).
+# Taken from the HEXKL_SDK_ROOT environment variable (points to
+# .../addons/hexkl_addon), matching the meson -Dhexkl-sdk-root path. Falls
+# back to the legacy hardcoded path only when the variable is unset.
+HEXKL_ADDON_ROOT := $(HEXKL_SDK_ROOT)
+ifeq ($(HEXKL_ADDON_ROOT),)
+  HEXKL_ADDON_ROOT := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
+endif
+# SDK common headers (remote.h, AEEStdDef.h, ...) live at the SDK root's incs/,
+# a sibling of addons/.
+HEXKL_SDK_INCS := $(HEXKL_ADDON_ROOT)/../../incs
 
 # Common Includes Definition
 CAUSALLM_COMMON_INCLUDES := \
@@ -219,8 +228,8 @@ LOCAL_LDLIBS := -llog -landroid -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -
 LOCAL_CFLAGS += \
     -DENABLE_HEXKL=1 \
     -Drestrict=__restrict \
-    -I/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/incs \
-    -I/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/incs/stddef \
+    -I$(HEXKL_SDK_INCS) \
+    -I$(HEXKL_SDK_INCS)/stddef \
     -I$(HEXKL_ADDON_ROOT)/include
 
 # Source files

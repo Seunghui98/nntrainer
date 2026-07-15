@@ -96,6 +96,13 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
                      const float *A, const int8_t *B_wh, const float *wt_scale,
                      const int32_t *zp_corr, float *C);
 
+// U8 activations × I4 weights (WH-layout, packed two-per-byte) → I32
+// accumulator → FP32 output. B_wh holds N*K/2 packed bytes in an int8 buffer.
+// N must be 32-aligned. M is padded internally to the SDKL 64-row tile.
+void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const int8_t *B_wh, const float *wt_scale,
+                     const int32_t *zp_corr, float *C);
+
 } // namespace hmx
 } // namespace nntrainer
 
