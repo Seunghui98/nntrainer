@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -85,19 +86,26 @@ std::vector<Keypoint> decodeSimcc(const float *pose) {
   return kpts;
 }
 
-void printPeakRSS() {
+// Peak resident set size (VmHWM) in KB, or 0 if unavailable.
+long peakRSSKB() {
 #ifdef __linux__
   std::ifstream f("/proc/self/status");
   std::string line;
-  while (std::getline(f, line))
-    if (line.rfind("VmHWM:", 0) == 0)
-      std::cout << "  " << line << std::endl;
+  while (std::getline(f, line)) {
+    if (line.rfind("VmHWM:", 0) == 0) {
+      long kb = 0;
+      std::sscanf(line.c_str(), "VmHWM: %ld kB", &kb);
+      return kb;
+    }
+  }
 #endif
+  return 0;
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
+  auto t_start = std::chrono::steady_clock::now();
   openblas_set_num_threads(4);
 
   std::string res_dir = (argc > 1) ? argv[1] : ".";
@@ -189,15 +197,24 @@ int main(int argc, char **argv) {
     }
     std::cout << "[Pose] ReID head: " << (with_reid ? "on" : "off") << std::endl;
 
+    auto t_compile0 = std::chrono::steady_clock::now();
     if (int ret = model->compile(x, graph_outputs,
                                  ml::train::ExecutionMode::INFERENCE))
       throw std::runtime_error("compile failed: " + std::to_string(ret));
+    double compile_ms =
+      std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_compile0)
+        .count();
 
     std::string weights_path = res_dir + "/" + weights_default;
     if (const char *w = std::getenv("YOLO_WEIGHTS"))
       weights_path = (w[0] == '/') ? std::string(w) : res_dir + "/" + w;
+    auto t_load0 = std::chrono::steady_clock::now();
     model->load(weights_path,
                 ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
+    double load_ms = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t_load0)
+                       .count();
     std::cout << "[Pose] Weights loaded: " << weights_path << std::endl;
 
     auto input = loadBin(input_path);
@@ -227,9 +244,7 @@ int main(int argc, char **argv) {
       auto t1 = std::chrono::steady_clock::now();
       total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
-    std::cout << "[Pose] Inference done, outputs=" << outs.size()
-              << " avg=" << (total_ms / iters) << " ms" << std::endl;
-    printPeakRSS();
+    double infer_ms = total_ms / iters;
 
     // outs[0] = pose [1, 2*NKPT, SIMCC_BINS]; outs[1] = reid [1, EMBED_DIM]
     // (only when the ReID branch is enabled).
@@ -275,6 +290,23 @@ int main(int argc, char **argv) {
       std::cout << "[ReID] embed_dim=" << EMBED_DIM
                 << " l2norm=" << std::sqrt(norm) << std::endl;
     }
+
+    long peak_kb = peakRSSKB();
+    double e2e_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t_start)
+                      .count();
+    std::printf(
+      "\n================[ YOLOv7 Pose with NNTrainer ]================\n");
+    std::printf("compile:   %.1f ms\n", compile_ms);
+    std::printf("load:      %.1f ms\n", load_ms);
+    std::printf("inference: %.3f ms (avg over %d iter%s)\n", infer_ms, iters,
+                iters > 1 ? "s" : "");
+    std::printf("keypoints: %d/%d visible\n", visible, NKPT);
+    std::printf("peak memory: %ld KB\n", peak_kb);
+    std::printf(
+      "=============================================================\n");
+    std::printf("[e2e time]: %.0f ms\n", e2e_ms);
+    std::printf("Max Resident Set Size: %ld KB\n", peak_kb);
 
     return 0;
   } catch (const std::exception &e) {

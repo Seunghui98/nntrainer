@@ -80,15 +80,39 @@ YOLO_TENSOR_TYPE=w32a32 YOLO_WEIGHTS=/path/res/yolov7_pose.safetensors \
 
 # 2b. stage 2 (W8A32) inference  -- ARM/Android only, see note below
 YOLO_TENSOR_TYPE=w8a32 YOLO_WEIGHTS=/path/res/yolov7_pose_q8_0.safetensors \
-  ./yolov7_pose_infer /path/res input_320.bin
+  ./yolov7_pose_infer /path/res /path/res/input_320.bin
+
+# 2c. (x86) check Q8_0-weight ACCURACY without the ARM kernel: store
+#     dequantized-Q8_0 conv weights as FP32 and run w32a32. These numerics are
+#     exactly W8A32's (weights quantized, activations FP32).
+python3 weight_converter.py --weights pose_base_v311.pt --sim-q8-conv \
+        --output /path/res/yolov7_pose_w8sim.safetensors
+YOLO_TENSOR_TYPE=w32a32 YOLO_WEIGHTS=/path/res/yolov7_pose_w8sim.safetensors \
+  ./yolov7_pose_infer /path/res /path/res/input_320.bin
 ```
 
+Every run prints a timing/memory summary:
+
+```
+================[ YOLOv7 Pose with NNTrainer ]================
+compile:   9.3 ms
+load:      49.8 ms
+inference: 12.7 ms (avg over 10 iters)
+keypoints: 87/87 visible
+peak memory: 125196 KB
+=============================================================
+[e2e time]: 6579 ms
+Max Resident Set Size: 125196 KB
+```
+
+(`YOLO_BENCH_ITERS=N` averages the inference time over N runs.)
+
 > **Q8_0 runtime is ARM-only.** The quantized conv uses the NEON indirect-conv
-> kernel (dotprod / i8mm); x86 has no NHWC quantized-conv fallback, so
-> `w8a32` inference runs on the Android target, not on the x86 host. On x86 you
-> can still (a) produce and inspect the Q8_0 safetensors with `nntr_quantize`
-> and (b) verify stage-1 (`w32a32`) numerics. Stage-2 runtime parity is checked
-> on device.
+> kernel (dotprod / i8mm); x86 has no NHWC quantized-conv fallback, so the real
+> `w8a32` inference runs on the Android target. On x86, `--sim-q8-conv` (step
+> 2c) reproduces the **W8A32 accuracy** (identical numerics), and `nntr_quantize`
+> still produces/inspects the on-device Q8_0 safetensors; runtime speed is
+> measured on device.
 
 ### Parity check
 

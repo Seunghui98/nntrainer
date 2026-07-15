@@ -231,6 +231,42 @@ def _prepare_state(state):
     return out
 
 
+def q8_0_roundtrip(w):
+    """Quantize a conv filter [out, in, kh, kw] to Q8_0 and back to FP32.
+
+    Mirrors nntrainer's block_q8_0 (32-element blocks, fp16-ish scale =
+    amax/127 per block, round-to-nearest) applied per output-channel row over
+    CRS = in*kh*kw, matching how the conv filter is block-quantized. Only rows
+    where out and CRS are both multiples of 32 are quantized; others pass
+    through. Running these dequantized weights at FP32 activation reproduces the
+    W8A32 numerics on any host (the real Q8_0 conv kernel is ARM-only).
+    """
+    out = w.shape[0]
+    K = int(np.prod(w.shape[1:]))
+    if out % 32 != 0 or K % 32 != 0:
+        return w
+    flat = w.reshape(out, K // 32, 32).astype(np.float32)
+    amax = np.max(np.abs(flat), axis=2, keepdims=True)
+    # fp16 round-trip of the scale, as stored in block_q8_0.d
+    d = (amax / 127.0).astype(np.float16).astype(np.float32)
+    d = np.where(d == 0.0, 1.0, d)
+    q = np.clip(np.round(flat / d), -128, 127)
+    return (q * d).reshape(w.shape).astype(np.float32)
+
+
+def apply_sim_q8_conv(tensors):
+    """Round-trip every eligible conv filter through Q8_0 (in place)."""
+    n = 0
+    for name in list(tensors):
+        if name.endswith(":filter") and tensors[name].ndim == 4:
+            rt = q8_0_roundtrip(tensors[name])
+            if rt is not tensors[name]:
+                tensors[name] = rt
+                n += 1
+    print(f"[converter] Q8_0-simulated {n} conv filters (weights dequantized)")
+    return tensors
+
+
 def convert(state):
     """Return {nntrainer_weight_name: np.ndarray(float32)} from a state dict."""
     sd = _prepare_state(state)
@@ -335,6 +371,13 @@ def main():
         help="print the raw checkpoint's parameter keys+shapes and exit "
         "(does not require matching the reconstructed model)",
     )
+    ap.add_argument(
+        "--sim-q8-conv",
+        action="store_true",
+        help="dequantized-Q8_0 conv weights (FP32 storage) so W8A32 numerics "
+        "can be checked on x86 with the w32a32 preset (real Q8_0 conv is "
+        "ARM-only)",
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -352,6 +395,8 @@ def main():
     if state and all(k.startswith("module.") for k in state):
         state = {k[len("module."):]: v for k, v in state.items()}
     tensors = convert(state)
+    if args.sim_q8_conv:
+        apply_sim_q8_conv(tensors)
 
     if args.dump_names:
         for name in sorted(tensors):
