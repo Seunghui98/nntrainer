@@ -79,13 +79,10 @@ public:
     auto nodes = yolov7_pose::buildBackbone(x, /*conv_q=*/false);
     auto pose_feat =
       yolov7_pose::buildNeck("backbone.features", nodes, false);
-    auto reid_feat =
-      yolov7_pose::buildNeck("backbone.features_feat", nodes, false);
     auto pose_out = yolov7_pose::buildPoseHead(pose_feat, false);
-    auto reid_out = yolov7_pose::buildReidHead(reid_feat);
     quantizable_convs_ = yolov7_pose::quantizableConvs();
 
-    std::vector<ml::train::Tensor> outs = {pose_out, reid_out};
+    std::vector<ml::train::Tensor> outs = {pose_out};
     if (model->compile(x, outs, ml::train::ExecutionMode::INFERENCE))
       throw std::runtime_error("Yolov7Pose compile failed");
 

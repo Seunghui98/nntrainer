@@ -173,14 +173,22 @@ int main(int argc, char **argv) {
                            ml::train::TensorDim::DataType::FP32),
       "input0");
 
+    // pose_base_v311.pt is pose-only (no ReID head). Enable the ReID branch
+    // (second neck "features_feat" + head_feat) only for a merged checkpoint.
+    bool with_reid = std::getenv("YOLO_WITH_REID") != nullptr;
+
     auto nodes = yolov7_pose::buildBackbone(x, preset_q);
     auto pose_feat = yolov7_pose::buildNeck("backbone.features", nodes, preset_q);
-    auto reid_feat =
-      yolov7_pose::buildNeck("backbone.features_feat", nodes, preset_q);
     auto pose_out = yolov7_pose::buildPoseHead(pose_feat, preset_q);
-    auto reid_out = yolov7_pose::buildReidHead(reid_feat);
 
-    std::vector<Tensor> graph_outputs = {pose_out, reid_out};
+    std::vector<Tensor> graph_outputs = {pose_out};
+    if (with_reid) {
+      auto reid_feat =
+        yolov7_pose::buildNeck("backbone.features_feat", nodes, preset_q);
+      graph_outputs.push_back(yolov7_pose::buildReidHead(reid_feat));
+    }
+    std::cout << "[Pose] ReID head: " << (with_reid ? "on" : "off") << std::endl;
+
     if (int ret = model->compile(x, graph_outputs,
                                  ml::train::ExecutionMode::INFERENCE))
       throw std::runtime_error("compile failed: " + std::to_string(ret));
@@ -223,17 +231,21 @@ int main(int argc, char **argv) {
               << " avg=" << (total_ms / iters) << " ms" << std::endl;
     printPeakRSS();
 
-    // outs[0] = pose [1, 2*NKPT, SIMCC_BINS], outs[1] = reid [1, EMBED_DIM]
+    // outs[0] = pose [1, 2*NKPT, SIMCC_BINS]; outs[1] = reid [1, EMBED_DIM]
+    // (only when the ReID branch is enabled).
+    const bool has_reid = outs.size() > 1;
     if (const char *dump = std::getenv("POSE_DUMP")) {
       std::string base = dump;
       std::ofstream pf(base + "_pose.bin", std::ios::binary);
       pf.write(reinterpret_cast<const char *>(outs[0]),
                sizeof(float) * 2 * NKPT * SIMCC_BINS);
-      std::ofstream rf(base + "_reid.bin", std::ios::binary);
-      rf.write(reinterpret_cast<const char *>(outs[1]),
-               sizeof(float) * EMBED_DIM);
-      std::cout << "[Pose] raw outputs dumped to " << base << "_{pose,reid}.bin"
-                << std::endl;
+      if (has_reid) {
+        std::ofstream rf(base + "_reid.bin", std::ios::binary);
+        rf.write(reinterpret_cast<const char *>(outs[1]),
+                 sizeof(float) * EMBED_DIM);
+      }
+      std::cout << "[Pose] raw outputs dumped to " << base << "_pose.bin"
+                << (has_reid ? " (+_reid.bin)" : "") << std::endl;
     }
 
     auto kpts = decodeSimcc(outs[0]);
@@ -256,12 +268,13 @@ int main(int argc, char **argv) {
     }
     std::cout << "\n]" << std::endl;
 
-    // reid embedding norm (sanity)
-    float norm = 0.0f;
-    for (int i = 0; i < EMBED_DIM; ++i)
-      norm += outs[1][i] * outs[1][i];
-    std::cout << "[ReID] embed_dim=" << EMBED_DIM << " l2norm=" << std::sqrt(norm)
-              << std::endl;
+    if (has_reid) {
+      float norm = 0.0f;
+      for (int i = 0; i < EMBED_DIM; ++i)
+        norm += outs[1][i] * outs[1][i];
+      std::cout << "[ReID] embed_dim=" << EMBED_DIM
+                << " l2norm=" << std::sqrt(norm) << std::endl;
+    }
 
     return 0;
   } catch (const std::exception &e) {

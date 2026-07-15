@@ -4,14 +4,18 @@ Port of the `YOLOv7ReIDtiny` model (RTMPose-style SimCC pose head + ReID
 embedding head on a YOLOv7-tiny CSP backbone with a dual FPN neck) onto
 nntrainer's functional graph API.
 
-- **Backbone**: YOLOv7-tiny CSP, `widen_factor = 1.5` (stem 48 … deepest 768).
-- **Neck**: two independent FPNs — `backbone.features` (pose) and
-  `backbone.features_feat` (ReID) — each SPPCSPCTiny + 2× upsample + 2×
-  downsample, single stride-32 end (768 ch @ 10×10).
+- **Backbone**: YOLOv7-tiny CSP, `widen_factor = 1.5`. block 1 downsamples with
+  a strided conv (`base`); blocks 2-4 downsample with a parameter-free maxpool
+  and the ELAN doubles the channels (nodes 48 / 96 / 192 / 384 / 768).
+- **Neck** (`backbone.features`): SPPCSPCTiny(768→384) + 2× upsample + 2×
+  downsample (each a `base` sample block + ELAN, bottleneck = out/2), single
+  stride-32 end (768 ch @ 10×10).
 - **Pose head** (`head`): 7×7 conv → flatten → ScaleNorm+Linear MLP → GAU
   (`rtmcc_gau` custom layer) → `cls_x` / `cls_y` SimCC classifiers → output
   `[1, 2·87, 640]` (`cls_x` rows stacked over `cls_y` rows).
-- **ReID head** (`head_feat`): global-avg-pool → Linear → `[1, 128]`.
+- **ReID head** (optional, `head_feat`): a second neck `features_feat` +
+  global-avg-pool → Linear → `[1, 128]`. Enable with `YOLO_WITH_REID=1`
+  (a merged pose+ReID checkpoint); `pose_base_v311.pt` is pose-only.
 
 Input `1×3×320×320` (NCHW FP32). Pose decode is RTMPose SimCC: per keypoint,
 `argmax` over 640 bins for x and y, `score = min(max_x, max_y)`, coordinates
@@ -60,14 +64,14 @@ python3 weight_converter.py --weights pose_base_v311.pt --inspect | head
 python3 weight_converter.py --weights pose_base_v311.pt \
         --output /path/res/yolov7_pose.safetensors
 
-# 1b. an input tensor (NCHW FP32, 1x3x320x320). Either export from the
-#     reference inference.py, or (for a smoke test) generate one:
-python3 make_reference.py --weights pose_merged_v311.pt --out /path/res
+# 1b. an input tensor (NCHW FP32, 1x3x320x320) from an image:
+python3 make_input.py --image sample.jpg --out /path/res
+#     (make_reference.py also writes input_320.bin alongside a PyTorch ref)
 
-# 1c. stage 1 (W32A32) inference
+# 1c. stage 1 (W32A32) inference  (pass an ABSOLUTE input path)
 YOLO_TENSOR_TYPE=w32a32 YOLO_WEIGHTS=/path/res/yolov7_pose.safetensors \
   ../../../../build/Applications/quick_ai/models/YOLOv7Pose/jni/yolov7_pose_infer \
-  /path/res input_320.bin
+  /path/res /path/res/input_320.bin
 
 # 2. Q8_0 weights via nntr_quantize (uses nntrainer's own packing)
 ../../../../build/Applications/quick_ai/nntr_quantize /path/res \
@@ -110,12 +114,15 @@ cd Applications/quick_ai/models/YOLOv7Pose
 # then run on device (see script output)
 ```
 
-## Note on the reconstructed reference
+## Notes
 
-The upstream `models_pose/backbone/csp.py`, `head/keypoint.py`,
-`head/reid.py` were not available; `res/yolov7_pose/models_pose/` contains a
-reconstruction consistent with the provided modules and the published output
-shapes. The weight converter maps by structural name, so if the real
-checkpoint's module hierarchy differs, adjust the small mapping in
-`weight_converter.py` (and the matching names in `yolov7_pose_graph.h`); the
-`--dump-names` flag and `verify_parity.py` make mismatches obvious.
+- **Checkpoint formats**: `weight_converter.py` maps keys model-free and
+  accepts a state_dict *or* a full `torch.save(model)` object (fused or
+  unfused). If unpickling needs the training repo's `models` package it is
+  shimmed automatically. Use `--inspect` to print the checkpoint's raw
+  keys+shapes.
+- **Reference model**: `models_pose/pose_ref.py` reproduces the pose-only
+  checkpoint's exact module hierarchy (verified key+shape match) and drives
+  `make_reference.py` for parity. Random-weight parity vs PyTorch: pose logits
+  agree to ~0.1 % of range, SimCC arg-max keypoints match 173–174/174 (the odd
+  near-tie flip is a random-weight artifact; trained weights are unimodal).

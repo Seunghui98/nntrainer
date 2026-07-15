@@ -183,42 +183,49 @@ inline Tensor downRoute(const std::string &name, int c_in, int c_out,
   return concat(name + "/cat", {d, route});
 }
 
-// One BlockS2 = sample block + ELAN.
+// One BlockS2 = sample block ("base") + ELAN. ELAN bottleneck = c_elan_out/2.
 inline Tensor blockUp(const std::string &name, int c_in, int c_sample_out,
                       int c_elan_out, int route_ch, Tensor input, Tensor route,
                       bool conv_q = false) {
-  auto s = upSample(name + ".sample", c_in, c_sample_out, route_ch, input,
-                    route, conv_q);
-  return elan(name + ".elan", c_sample_out, c_elan_out, c_elan_out, 2, s,
+  auto s = upSample(name + ".base", c_in, c_sample_out, route_ch, input, route,
+                    conv_q);
+  return elan(name + ".elan", c_sample_out, c_elan_out, c_elan_out / 2, 2, s,
               conv_q);
 }
 
 inline Tensor blockDown(const std::string &name, int c_in, int c_sample_out,
                         int c_elan_out, int route_ch, Tensor input,
                         Tensor route, bool conv_q = false) {
-  auto s = downRoute(name + ".sample", c_in, c_sample_out, route_ch, input,
-                     route, conv_q);
-  return elan(name + ".elan", c_sample_out, c_elan_out, c_elan_out, 2, s,
+  auto s = downRoute(name + ".base", c_in, c_sample_out, route_ch, input, route,
+                     conv_q);
+  return elan(name + ".elan", c_sample_out, c_elan_out, c_elan_out / 2, 2, s,
               conv_q);
 }
 
 // ---- backbone -------------------------------------------------------------
-// Returns the 5 stage nodes [stem(48), 96, 192, 384, 768].
+// YOLOv7-tiny CSP (widen 1.5). Stage nodes: [stem 48, 96, 192, 384, 768].
+// block 1 downsamples with a strided conv ("base"); blocks 2-4 downsample with
+// a parameter-free maxpool and the ELAN doubles the channels.
 inline std::vector<Tensor> buildBackbone(Tensor xIn, bool conv_q = false) {
   const std::string p = "backbone.backbone.blocks";
   std::vector<Tensor> nodes;
-  // block 0: stem (StemS0, single 3x3 s2)
-  auto b0 = convBnSilu(p + ".0.0", 3, C_STEM, 3, 2, 1, xIn, conv_q);
+
+  // block 0: stem (StemS0, single 3x3 s2)  3 -> 48
+  auto b0 = convBnSilu(p + ".0.0", 3, 48, 3, 2, 1, xIn, conv_q);
   nodes.push_back(b0);
-  int ch = C_STEM;
-  auto prev = b0;
-  // blocks 1..4: DownConv(3x3 s2) + ELAN, channels double each stage.
-  for (int i = 1; i <= 4; ++i) {
+
+  // block 1: base DownConv 48 -> 96 (s2), ELAN 96 -> 96 (bottleneck 48)
+  auto b1_base = convBnSilu(p + ".1.base", 48, 96, 3, 2, 1, b0, conv_q);
+  auto b1 = elan(p + ".1.elan", 96, 96, 48, 2, b1_base, conv_q);
+  nodes.push_back(b1);
+
+  // blocks 2-4: maxpool (s2) + ELAN that doubles the channels.
+  int ch = 96;
+  auto prev = b1;
+  for (int i = 2; i <= 4; ++i) {
     int out = ch * 2;
-    auto d = convBnSilu(p + "." + std::to_string(i) + ".down", ch, ch, 3, 2, 1,
-                        prev, conv_q);
-    // ELAN bottleneck = c_block * 2^(i-1) = out/2.
-    auto e = elan(p + "." + std::to_string(i) + ".elan", ch, out, out / 2, 2, d,
+    auto mp = maxpool(p + "." + std::to_string(i) + "/mp", 2, 2, 0, prev);
+    auto e = elan(p + "." + std::to_string(i) + ".elan", ch, out, ch, 2, mp,
                   conv_q);
     nodes.push_back(e);
     prev = e;
@@ -229,30 +236,30 @@ inline std::vector<Tensor> buildBackbone(Tensor xIn, bool conv_q = false) {
 
 // ---- neck (one FPN) -------------------------------------------------------
 // prefix is "backbone.features" (pose) or "backbone.features_feat" (reid).
+// Node channels: spp 384, up0 192, up1 96, down0 192, down1 384, end 768.
 // Returns the single stride-32 end [768ch, 10x10].
 inline Tensor buildNeck(const std::string &prefix,
                         const std::vector<Tensor> &nodes, bool conv_q = false) {
-  int S = C_STEM;
   auto b2 = nodes[2]; // 192, stride 8
   auto b3 = nodes[3]; // 384, stride 16
   auto b4 = nodes[4]; // 768, stride 32
 
-  auto spp = sppcspc(prefix + ".spp", 16 * S, 8 * S, b4, conv_q); // 384
+  auto spp = sppcspc(prefix + ".spp", 768, 384, b4, conv_q); // 384
 
-  // feature_up.0: upsample(spp) route b3 -> 192 ; elan -> 96
-  auto up0 = blockUp(prefix + ".feature_up.0", 8 * S, 4 * S, 2 * S, 8 * S, spp,
-                     b3, conv_q);
-  // feature_up.1: upsample(up0) route b2 -> 96 ; elan -> 48
-  auto up1 = blockUp(prefix + ".feature_up.1", 2 * S, 2 * S, S, 4 * S, up0, b2,
+  // feature_up.0: up(spp) + route b3(384) -> base 384 ; elan -> 192
+  auto up0 = blockUp(prefix + ".feature_up.0", 384, 384, 192, 384, spp, b3,
                      conv_q);
-  // feature_down.0: down(up1) route up0 -> 192 ; elan -> 96
-  auto down0 = blockDown(prefix + ".feature_down.0", S, 4 * S, 2 * S, 2 * S,
-                         up1, up0, conv_q);
-  // feature_down.1: down(down0) route spp -> 768 ; elan -> 384
-  auto down1 = blockDown(prefix + ".feature_down.1", 2 * S, 16 * S, 8 * S,
-                         8 * S, down0, spp, conv_q);
+  // feature_up.1: up(up0) + route b2(192) -> base 192 ; elan -> 96
+  auto up1 = blockUp(prefix + ".feature_up.1", 192, 192, 96, 192, up0, b2,
+                     conv_q);
+  // feature_down.0: down(up1) + route up0(192) -> base 384 ; elan -> 192
+  auto down0 = blockDown(prefix + ".feature_down.0", 96, 384, 192, 192, up1,
+                         up0, conv_q);
+  // feature_down.1: down(down0) + route spp(384) -> base 768 ; elan -> 384
+  auto down1 = blockDown(prefix + ".feature_down.1", 192, 768, 384, 384, down0,
+                         spp, conv_q);
   // ends.0: 3x3 conv 384 -> 768
-  return convBnSilu(prefix + ".ends.0", 8 * S, 16 * S, 3, 1, 1, down1, conv_q);
+  return convBnSilu(prefix + ".ends.0", 384, 768, 3, 1, 1, down1, conv_q);
 }
 
 // ---- RTMCC SimCC pose head ------------------------------------------------
