@@ -97,6 +97,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::UINT8:
   case TensorDim::DataType::UINT4:
   case TensorDim::DataType::QINT8:
+  case TensorDim::DataType::QINT4_HTP:
   case TensorDim::DataType::QINT4:
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
@@ -1023,7 +1024,8 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       auto tensor_data_type = weight->getDim().getDataType();
       size_t size = 0;
-      if (tensor_data_type == TensorDim::DataType::QINT8) {
+      if (tensor_data_type == TensorDim::DataType::QINT8 ||
+          tensor_data_type == TensorDim::DataType::QINT4_HTP) {
         size =
           weight->getVariable().bytes() + weight->getVariable().scale_size() *
                                             (sizeof(float) + sizeof(int32_t));
