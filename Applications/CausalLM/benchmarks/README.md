@@ -134,6 +134,27 @@ Model: qwen3-0.6b | Size: 2.30 GiB | Type: CausalLM | Dtype: FP32-FP32 | Device:
 +---------+-----------+---------+------+----------------+---------+
 ```
 
+### Results
+
+Measured qwen3-0.6b with u8i4 FC weights (`QINT4_HTP-FP32`) on the HTP, same
+table format:
+
+```
+Model: qwen3-0.6b | Dtype: QINT4_HTP-FP32 | Device: S25U
++---------+-----------+---------+------+----------------+-----------+
+| Engine  | Threads   | Prompt  | Gen  | Prefill TPS    | Gen TPS   |
++=========+===========+=========+======+================+===========+
+| htp     | 4         | 64      | 0    | 115.523        | N/A       |
+| htp     | 4         | 128     | 0    | 132.505        | N/A       |
+| htp     | 4         | 512     | 0    | 295.612        | N/A       |
+| htp     | 4         | 1024    | 0    | 313.246        | N/A       |
++---------+-----------+---------+------+----------------+-----------+
+```
+
+- Generation run: 512 tokens at 1.96321 TPS (decode is memory-bandwidth
+  bound), e2e 264836 ms, peak memory 1451140 KB (~1.38 GiB, vs ~2.53 GiB for
+  f32f16).
+
 ## How It Works
 
 1. **Load Configuration**: Pulls `nntr_config.json` from the device via ADB
