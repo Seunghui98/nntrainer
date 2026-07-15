@@ -19,11 +19,15 @@
 # @author Seungbaek Hong <sb92.hong@samsung.com>
 
 import argparse
+import importlib.abc
+import importlib.machinery
 import os
 import sys
+import types
 
 import numpy as np
 import torch
+import torch.nn as nn
 from safetensors.numpy import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,18 +39,93 @@ FEATMAP = 10
 FLATTEN = FEATMAP * FEATMAP  # 100
 
 
+class _ShimLoader(importlib.abc.Loader):
+    """Materialize a module whose every attribute is an nn.Module placeholder."""
+
+    def create_module(self, spec):
+        m = types.ModuleType(spec.name)
+
+        def _getattr(name, _m=m):
+            cls = type(name, (nn.Module,), {"__module__": _m.__name__})
+            setattr(_m, name, cls)
+            return cls
+
+        m.__getattr__ = _getattr
+        return m
+
+    def exec_module(self, module):
+        pass
+
+
+class _ShimFinder(importlib.abc.MetaPathFinder):
+    """Serve shim modules for training-repo packages absent in this env."""
+
+    def __init__(self, roots):
+        self.roots = set(roots)
+
+    def find_spec(self, name, path, target=None):
+        if name.split(".")[0] in self.roots:
+            return importlib.machinery.ModuleSpec(name, _ShimLoader())
+        return None
+
+
+def _load_checkpoint(checkpoint_path, device):
+    """Load a checkpoint saved either as a state_dict or as a full model object.
+
+    A full ``torch.save(model)`` embeds the training repo's class paths (e.g.
+    ``models.*``); if that package is absent we install a permissive shim so
+    unpickling reconstructs the module tree as nn.Module placeholders, from
+    which the (real) state_dict is recovered. Only the tensors matter here.
+    """
+    installed = []
+    while True:
+        try:
+            obj = torch.load(
+                checkpoint_path, map_location=device, weights_only=False
+            )
+            break
+        except ModuleNotFoundError as e:
+            root = (e.name or "").split(".")[0]
+            if not root or root in installed:
+                raise
+            sys.meta_path.insert(0, _ShimFinder({root}))
+            installed.append(root)
+            print(f"[converter] shimming missing package '{root}' for unpickling")
+
+    if hasattr(obj, "state_dict") and not isinstance(obj, dict):
+        return obj.state_dict()
+    if isinstance(obj, dict):
+        for key in ("model", "state_dict", "ema", "weights"):
+            v = obj.get(key)
+            if hasattr(v, "state_dict") and not isinstance(v, dict):
+                return v.state_dict()
+            if isinstance(v, dict):
+                return v
+    return obj
+
+
 def build_model(checkpoint_path, device):
     model = YOLOv7ReIDtiny(
         nc=1, img_size=320, embed_dim=128, widen_factor=1.5, nkpt=NKPT
     )
-    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model" in state and hasattr(
-        state["model"], "state_dict"
-    ):
-        state = state["model"].state_dict()
-    elif isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    model.load_state_dict(state, strict=True)
+    state = _load_checkpoint(checkpoint_path, device)
+    # tolerate a "module." / "model." prefix on externally-saved state dicts
+    if all(k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(
+            f"[converter] load_state_dict: {len(missing)} missing, "
+            f"{len(unexpected)} unexpected keys"
+        )
+        if missing:
+            print("  e.g. missing:", missing[:5])
+        if unexpected:
+            print("  e.g. unexpected:", unexpected[:5])
+        raise SystemExit(
+            "checkpoint keys do not match the reconstructed model; adjust the "
+            "reconstruction in models_pose/ or the mapping to match your model."
+        )
     model.to(device).float().eval()
     model.fuse()
     return model
@@ -154,9 +233,25 @@ def main():
         action="store_true",
         help="print produced nntrainer weight names and exit",
     )
+    ap.add_argument(
+        "--inspect",
+        action="store_true",
+        help="print the raw checkpoint's parameter keys+shapes and exit "
+        "(does not require matching the reconstructed model)",
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
+
+    if args.inspect:
+        state = _load_checkpoint(args.weights, device)
+        for k in sorted(state):
+            v = state[k]
+            shape = tuple(v.shape) if hasattr(v, "shape") else type(v).__name__
+            print(f"{k}\t{shape}")
+        print(f"# total {len(state)} checkpoint entries")
+        return
+
     model = build_model(args.weights, device)
     tensors = convert(model)
 

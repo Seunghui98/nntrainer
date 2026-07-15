@@ -51,7 +51,13 @@ ninja -C build Applications/quick_ai/models/YOLOv7Pose/jni/yolov7_pose_infer \
 cd Applications/quick_ai/res/yolov7_pose
 
 # 1. FP32 weights: PyTorch .pt -> nntrainer safetensors
-python3 weight_converter.py --weights pose_merged_v311.pt \
+#    Accepts either a state_dict or a full torch.save(model) object; if the
+#    checkpoint pickles the original training repo's classes (e.g. a missing
+#    `models` package), the converter shims them to recover the state_dict.
+#    Use --inspect first to print the checkpoint's raw keys/shapes and confirm
+#    they match the reconstructed model.
+python3 weight_converter.py --weights pose_base_v311.pt --inspect | head
+python3 weight_converter.py --weights pose_base_v311.pt \
         --output /path/res/yolov7_pose.safetensors
 
 # 1b. an input tensor (NCHW FP32, 1x3x320x320). Either export from the
