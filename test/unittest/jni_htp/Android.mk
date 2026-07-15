@@ -1,7 +1,10 @@
 LOCAL_PATH := $(call my-dir)
 
 NNTRAINER_ROOT    := $(LOCAL_PATH)/../../..
-HEXKL_ADDON_ROOT  := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
+HEXKL_ADDON_ROOT  := $(HEXKL_SDK_ROOT)
+ifeq ($(HEXKL_ADDON_ROOT),)
+  HEXKL_ADDON_ROOT := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
+endif
 GTEST_ROOT        := $(NNTRAINER_ROOT)/subprojects/googletest/googletest
 NNTRAINER_LIB_DIR := $(NNTRAINER_ROOT)/builddir/jni/arm64-v8a
 
@@ -133,7 +136,7 @@ LOCAL_CFLAGS     := \
     -pthread -fexceptions \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
     -Drestrict=__restrict \
-    -I/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/incs \
+    -I$(HEXKL_ADDON_ROOT)/../../incs \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
 LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS     := -llog
