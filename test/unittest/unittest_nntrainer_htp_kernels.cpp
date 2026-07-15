@@ -24,9 +24,11 @@
 #include <remote.h>
 #include <sdkl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -223,6 +225,170 @@ TEST_F(HtpKernelTest, Accuracy_u8i8_i32) {
   EXPECT_TRUE(
     exactMatchI32(static_cast<const int32_t *>(Ab.p), C_cpu.data(), M * N))
     << "u8i8_i32 output does not match int32 reference exactly";
+}
+
+// ---- u8i4_i32: ui8 activations, i4 weights (WH), i32 output ----------------
+
+TEST_F(HtpKernelTest, Accuracy_u8i4_i32) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  // HMX INT4 shares the u8i8 tiling: M % 64 == 0 and N % 32 == 0.
+  // sdkl_npu_mm_u8i4_i32 takes the weight as a packed uint8 in WH layout and
+  // writes row-major output (per sdkl.h). Weights are drawn from the valid i4
+  // range [-7, 7], stored one value per int8 byte (sign-extended), which is
+  // the documented input contract for sdkl_cpu_rm_to_wh_i4.
+  constexpr int M = 64, N = 64, K = 128;
+  auto X = makeRandU8(M * K);
+  auto W = makeRandI8(N * K, -7, 7);
+  std::vector<int32_t> C_cpu(M * N, 0);
+  cpuGemmI32(M, N, K, X.data(), W.data(), C_cpu.data());
+
+  // Over-allocate the WH output to the unpacked size so any HMX tile padding
+  // beyond N*K/2 cannot overflow. rm_to_wh_i4 is NOT in-place: it reads the
+  // i4-in-i8 input and writes the packed WH bytes to a separate buffer.
+  const size_t w_unpacked = (size_t)N * (size_t)K * sizeof(int8_t);
+  NpuBuf Xb(M * K * sizeof(uint8_t)), Win(w_unpacked), Wwh(w_unpacked),
+    Ab(M * N * sizeof(int32_t));
+  ASSERT_TRUE(Xb.ok() && Win.ok() && Wwh.ok() && Ab.ok());
+
+  std::memcpy(Xb.p, X.data(), M * K * sizeof(uint8_t));
+  std::memcpy(Win.p, W.data(), w_unpacked);
+
+  // Device-verified: sdkl_cpu_rm_to_wh_i4 expects (wt_rows=K, wt_cols=N) — the
+  // inner dimension first — to produce a WH weight that sdkl_npu_mm_u8i4_i32
+  // consumes as C = X * W^T for a logically [N, K] weight. (Passing (N, K),
+  // the order used by the in-place i8 variant, yields wrong values.)
+  ASSERT_EQ(sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wwh.p),
+                                 static_cast<int8_t *>(Win.p), (size_t)K,
+                                 (size_t)N),
+            0);
+  ASSERT_EQ(sdkl_npu_mm_u8i4_i32(domain, M, N, K, static_cast<int32_t *>(Ab.p),
+                                 static_cast<const uint8_t *>(Xb.p),
+                                 static_cast<const uint8_t *>(Wwh.p)),
+            0);
+
+  // C_cpu = X * W^T (W as [N, K]); output is row-major (per sdkl.h).
+  EXPECT_TRUE(
+    exactMatchI32(static_cast<const int32_t *>(Ab.p), C_cpu.data(), M * N))
+    << "u8i4_i32 output does not match int32 reference exactly";
+}
+
+// ---- Full-pipeline u8i4 accuracy -------------------------------------------
+// Mirrors quantize_qint4_weight (per-output-channel i4 weight in [-7,7] +
+// zp_corr) and shgemm_u8i4_i32 (per-tensor u8 activation with zp=128, M padded
+// to 64, dequant) exactly, at realistic non-square / small-M LLM shapes the
+// square integer-only test cannot exercise. Returns the relative error vs the
+// FP32 reference so a numeric bug (huge error) is distinguishable from INT4
+// quantization loss (small, bounded error). Negative return = setup failure.
+static float u8i4FullPipelineRelErr(int M, int N, int K, int domain,
+                                    uint32_t seed) {
+  const int Mp = ((M + 63) / 64) * 64;
+  auto A = makeRandF32(M * K, -1.0f, 1.0f, seed);
+  auto W = makeRandF32(N * K, -0.5f, 0.5f, seed + 1);
+
+  // FP32 reference: C[m,n] = sum_k A[m,k] * W[n,k].
+  std::vector<float> C_ref((size_t)M * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k)
+        acc += A[(size_t)m * K + k] * W[(size_t)n * K + k];
+      C_ref[(size_t)m * N + n] = acc;
+    }
+
+  // Quantize weight per-output-channel to i4 [-7,7]; compute zp_corr.
+  std::vector<int8_t> Wi4((size_t)N * K, 0);
+  std::vector<float> wt_scale(N, 1.0f);
+  std::vector<int32_t> zp_corr(N, 0);
+  for (int n = 0; n < N; ++n) {
+    float maxabs = 0.0f;
+    for (int k = 0; k < K; ++k)
+      maxabs = std::max(maxabs, std::abs(W[(size_t)n * K + k]));
+    float s = maxabs > 0.0f ? maxabs / 7.0f : 1.0f;
+    wt_scale[n] = s;
+    int32_t rowsum = 0;
+    for (int k = 0; k < K; ++k) {
+      long q = std::lround(W[(size_t)n * K + k] / s);
+      int8_t c = (int8_t)std::max<long>(-7, std::min<long>(7, q));
+      Wi4[(size_t)n * K + k] = c;
+      rowsum += c;
+    }
+    zp_corr[n] = 128 * rowsum;
+  }
+
+  // Pack i4 weight to WH layout (rm_to_wh_i4 takes (wt_rows=K, wt_cols=N)).
+  const size_t w_unpacked = (size_t)N * K;
+  NpuBuf Win(w_unpacked), Wwh(w_unpacked);
+  if (!Win.ok() || !Wwh.ok())
+    return -1.0f;
+  std::memcpy(Win.p, Wi4.data(), w_unpacked);
+  if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wwh.p),
+                           static_cast<int8_t *>(Win.p), (size_t)K,
+                           (size_t)N) != 0)
+    return -2.0f;
+
+  // Quantize activation per-tensor to u8 (zp=128); pad to Mp rows with 128.
+  float amax = 0.0f;
+  for (int i = 0; i < M * K; ++i)
+    amax = std::max(amax, std::abs(A[i]));
+  float act_scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+  std::vector<uint8_t> Xu8((size_t)Mp * K, 128);
+  for (int m = 0; m < M; ++m)
+    for (int k = 0; k < K; ++k) {
+      float q = std::round(A[(size_t)m * K + k] / act_scale) + 128.0f;
+      q = std::max(0.0f, std::min(255.0f, q));
+      Xu8[(size_t)m * K + k] = (uint8_t)q;
+    }
+
+  NpuBuf Xb((size_t)Mp * K * sizeof(uint8_t)),
+    Cb((size_t)Mp * N * sizeof(int32_t));
+  if (!Xb.ok() || !Cb.ok())
+    return -3.0f;
+  std::memcpy(Xb.p, Xu8.data(), (size_t)Mp * K * sizeof(uint8_t));
+  std::memset(Cb.p, 0, (size_t)Mp * N * sizeof(int32_t));
+  if (sdkl_npu_mm_u8i4_i32(domain, Mp, N, K, static_cast<int32_t *>(Cb.p),
+                           static_cast<const uint8_t *>(Xb.p),
+                           static_cast<const uint8_t *>(Wwh.p)) != 0)
+    return -4.0f;
+
+  // Dequant: C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]).
+  const int32_t *Ci = static_cast<const int32_t *>(Cb.p);
+  std::vector<float> C((size_t)M * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n)
+      C[(size_t)m * N + n] = act_scale * wt_scale[n] *
+                             ((float)Ci[(size_t)m * N + n] - (float)zp_corr[n]);
+
+  return relErrorF32(C.data(), C_ref.data(), M * N);
+}
+
+TEST_F(HtpKernelTest, Accuracy_u8i4_full_pipeline) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  struct Case {
+    const char *name;
+    int M, N, K;
+  };
+  // Qwen3-0.6B FC shapes (hidden 1024, intermediate 3072, GQA q=2048/kv=1024).
+  const std::vector<Case> cases = {
+    {"prefill_wq", 5, 2048, 1024},   {"decode_wq", 1, 2048, 1024},
+    {"prefill_wk", 5, 1024, 1024},   {"prefill_ffn_up", 5, 3072, 1024},
+    {"prefill_ffn_down", 5, 1024, 3072}, {"decode_ffn_down", 1, 1024, 3072},
+  };
+  for (const auto &c : cases) {
+    float e = u8i4FullPipelineRelErr(c.M, c.N, c.K, domain,
+                                     100u + (uint32_t)(c.M * 131 + c.N));
+    std::printf("[u8i4 full-pipeline] %-18s M=%4d N=%4d K=%4d  relErr=%.4f\n",
+                c.name, c.M, c.N, c.K, e);
+    std::fflush(stdout);
+    ASSERT_GE(e, 0.0f) << c.name << ": kernel/setup failed (rc=" << e << ")";
+    // INT4 loss over these K is expected but bounded; a layout/scale/padding
+    // bug pushes the error far past quantization noise.
+    EXPECT_LT(e, 0.30f) << c.name << ": relative error too high — likely a bug,"
+                        << " not just INT4 quantization loss";
+  }
 }
 
 // ---- Perf harness ----------------------------------------------------------
