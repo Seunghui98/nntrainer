@@ -48,6 +48,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
+    $(LOCAL_PATH)/../models/lfm2 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
 
@@ -118,6 +119,8 @@ LOCAL_SRC_FILES := \
     ../layers/lm_head.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
+    ../layers/custom_multiply.cpp \
+    ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp \
@@ -129,6 +132,7 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
+    ../models/lfm2/lfm2_causallm.cpp \
     ../models/gemma3/function.cpp \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
@@ -266,6 +270,8 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
+    ../layers/custom_multiply.cpp \
+    ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp\
@@ -278,6 +284,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
+    ../models/lfm2/lfm2_causallm.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
@@ -308,6 +315,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
+    $(LOCAL_PATH)/../models/lfm2 \
 
 include $(BUILD_EXECUTABLE)
 
@@ -387,7 +395,9 @@ LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_qwen2_embedding_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_embedding_gemma_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_tinybert_reference.cpp \
-    $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := googletest_main

@@ -168,7 +168,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
 
   NUM_VOCAB = cfg["vocab_size"];
   DIM = cfg["hidden_size"];
-  INTERMEDIATE_SIZE = cfg["intermediate_size"];
+  INTERMEDIATE_SIZE =
+    cfg.contains("intermediate_size") ? cfg["intermediate_size"].get<int>() : 0;
   NUM_LAYERS = cfg["num_hidden_layers"];
   NUM_HEADS = cfg["num_attention_heads"];
   HEAD_DIM = cfg.contains("head_dim")
@@ -197,8 +198,11 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   } else {
     ROPE_THETA = cfg.value("rope_theta", 10000);
   }
-  TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
-  NORM_EPS = cfg["rms_norm_eps"];
+  TIE_WORD_EMBEDDINGS = cfg.contains("tie_word_embeddings")
+                          ? cfg["tie_word_embeddings"].get<bool>()
+                          : false;
+  NORM_EPS =
+    cfg.contains("rms_norm_eps") ? cfg["rms_norm_eps"].get<float>() : 1e-5;
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
   return;
@@ -440,30 +444,34 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
   const unsigned int kv_width =
     static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
-#ifdef ENABLE_FP16
-  ml::train::TensorDim cache_dim(
-    {BATCH_SIZE, 1, max_timestep, kv_width},
-    {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
-
-  Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
-  Tensor cache_v(cache_dim, "cache_v_l" + std::to_string(layer_id));
-  return {cache_k, cache_v};
-#else
   const std::string cache_shape = std::to_string(BATCH_SIZE) +
                                   ":1:" + std::to_string(max_timestep) + ":" +
                                   std::to_string(kv_width);
 
+  // KV caches MUST be created as "input" layers (not plain Tensors). Plain
+  // Tensors shrink the graph's input-layer set, which changes the tensor-pool
+  // in-place/flatten behavior so that the first transformer layer's input is no
+  // longer a synced dependent of the model input placeholder. On ARM that broke
+  // USE_EMBEDDING prefill: the embedding reached input0's output but never
+  // layer0_conv_norm (all-zero activations → <pad>). The x86 (#else) path
+  // always used input layers and worked; this keeps both paths symmetric,
+  // differing only in the external dtype (FP16 on ARM, UINT16 elsewhere).
+#ifdef ENABLE_FP16
+  const char *cache_dtype = "FP16";
+#else
+  const char *cache_dtype = "UINT16";
+#endif
+
   LayerHandle cache_k_input(createLayer(
-    "input",
-    {withKey("name", "cache_k_l" + std::to_string(layer_id)),
-     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
+    "input", {withKey("name", "cache_k_l" + std::to_string(layer_id)),
+              withKey("input_shape", cache_shape),
+              withKey("input_dtype", cache_dtype)}));
   LayerHandle cache_v_input(createLayer(
-    "input",
-    {withKey("name", "cache_v_l" + std::to_string(layer_id)),
-     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
+    "input", {withKey("name", "cache_v_l" + std::to_string(layer_id)),
+              withKey("input_shape", cache_shape),
+              withKey("input_dtype", cache_dtype)}));
 
   return {cache_k_input(Tensor()), cache_v_input(Tensor())};
-#endif
 }
 
 /**

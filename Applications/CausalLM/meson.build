@@ -35,6 +35,8 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
+    causallm_causal_conv1d_dep,
+    causallm_custom_multiply_dep,
     causallm_deberta_attention_layer_dep,
     causallm_shared_fully_connected_layer_dep,
     causallm_per_layer_slice_dep,
@@ -338,6 +340,8 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_tinybert_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_deberta_v2_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_xlm_roberta_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_reference.cpp',
       ],
       dependencies: [
         nntrainer_dep,

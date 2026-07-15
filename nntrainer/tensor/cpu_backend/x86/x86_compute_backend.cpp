@@ -588,4 +588,21 @@ void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
                                          idx_variant, lower_bound, upper_bound);
 }
 
+// Dispatches to the AVX2 causal depthwise Conv1D prefill kernel.
+void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
+                                const float *bias, float *output,
+                                unsigned int B, unsigned int H,
+                                unsigned int W) {
+  nntrainer::avx2::causal_depthwise_conv1d_k3(input, packed_weight, bias,
+                                              output, B, H, W);
+}
+
+// Dispatches to the AVX2 single-token decode kernel.
+void causal_depthwise_conv1d_k3_decode(const float *x_cur,
+                                       const float *packed_weight, float *state,
+                                       float *y_cur, unsigned int W) {
+  nntrainer::avx2::causal_depthwise_conv1d_k3_decode(x_cur, packed_weight,
+                                                     state, y_cur, W);
+}
+
 } /* namespace nntrainer */
