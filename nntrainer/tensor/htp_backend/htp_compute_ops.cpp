@@ -56,10 +56,10 @@ public:
   }
 
   void shgemm_u8i8(unsigned int order, unsigned int M, unsigned int N,
-                   unsigned int K, const float *A, unsigned int /*lda*/,
+                   unsigned int K, const float *A, unsigned int /** lda */,
                    const int8_t *B, const float *wt_scale,
                    const int32_t *zp_corr, float *C,
-                   unsigned int /*ldc*/) override {
+                   unsigned int /** ldc */) override {
     hmx::shgemm_u8i8_i32(M, N, K, A, B, wt_scale, zp_corr, C);
   }
 };

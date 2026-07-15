@@ -1235,7 +1235,7 @@ static inline __m256 exp256_ps(__m256 x) {
   // __m256 fx = _mm256_add_ps(_mm256_mul_ps(x, c1),c2);
   // return _mm256_castsi256_ps(_mm256_cvtps_epi32(fx));
 
-  /* Low-Precision Version II*/
+  /** Low-Precision Version II */
   /*    const __m256 ln2 = _mm256_set1_ps(0.69314718056f);
     const __m256 inv_ln2 = _mm256_set1_ps(1.44269504089f); // 1 / ln(2)
 
@@ -1629,7 +1629,7 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
   for (int n = head_start; n < actual_head_end; ++n) {
     int rem = head_dim % 8;
 
-    /* Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
+    /** Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
      * _mm256_setzero_ps()); caused warning: ignoring attributes on template
      * argument ‘__m256’ [-Wignored-attributes].
      * So it is implemented that way.

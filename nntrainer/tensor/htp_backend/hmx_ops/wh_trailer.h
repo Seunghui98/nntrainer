@@ -3,6 +3,8 @@
  * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
  *
  * @file   wh_trailer.h
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  * @brief  Self-describing WH-weight trailer appended to FP16 model bins.
  *
  * Layout (appended AFTER all normal weight data):

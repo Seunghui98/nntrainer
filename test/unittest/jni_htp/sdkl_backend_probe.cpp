@@ -62,7 +62,7 @@ int main() {
     cpuGemm(X.data(), W_f32.data(), C_cpu.data());
 
     nntrainer::hmx::shgemm_f32f16_f32(
-      1 /*ROW_MAJOR*/, false /*TransA*/, true /*TransB*/, M, N, K, 1.0f,
+      1 /** ROW_MAJOR */, false /** TransA */, true /** TransB */, M, N, K, 1.0f,
       X.data(), K, reinterpret_cast<const _FP16 *>(W_fp16.data()), K, 0.0f,
       C_npu.data(), N);
 
@@ -152,7 +152,7 @@ int main() {
 
     // CPU HGEMM path (nntrainer::shgemm) — exactly as cpuShgemm in the backend
     // test
-    nntrainer::shgemm(1 /*ROW_MAJOR*/, false /*TransA*/, true /*TransB*/, M, N,
+    nntrainer::shgemm(1 /** ROW_MAJOR */, false /** TransA */, true /** TransB */, M, N,
                       K, 1.0f, X.data(), K,
                       reinterpret_cast<const _FP16 *>(W_fp16.data()), K, 0.0f,
                       C_shgemm.data(), N);

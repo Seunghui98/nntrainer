@@ -19,7 +19,7 @@
 
 namespace nntrainer {
 
-void HtpMemAllocator::alloc(void **ptr, size_t size, size_t /*alignment*/) {
+void HtpMemAllocator::alloc(void **ptr, size_t size, size_t /** alignment */) {
   // sdkl_npu_alloc returns NPU-accessible, DMA-aligned memory; the SDK
   // ignores caller-supplied alignment (its own page alignment applies).
   int err = sdkl_npu_alloc(size, ptr);
