@@ -263,53 +263,22 @@ inline Tensor buildNeck(const std::string &prefix,
 }
 
 // ---- RTMCC SimCC pose head ------------------------------------------------
-// Input: [1, 768, 10, 10]. Output: [1, 2*NKPT, SIMCC_BINS] (cls_x || cls_y).
+// Input: [1, 768, 10, 10]. Output: [1, 1, 2*NKPT, SIMCC_BINS] (cls_x || cls_y).
+// The whole head after the final conv is one layout-independent custom layer,
+// so the graph stays channel-last (NHWC) end-to-end with no transposes.
 inline Tensor buildPoseHead(Tensor feat, bool conv_q = false) {
   const std::string p = "head";
   // final_layer: 7x7 conv 768 -> NKPT, pad 3  => [1, NKPT, 10, 10]
   auto fc = conv(p + ".final_layer", 16 * C_STEM, NKPT, 7, 1, 3, feat,
                  /*act=*/false, conv_q);
-  // flatten spatial to tokens: [1, NKPT, 10, 10] -> [1, 1, NKPT, 100]
-  LayerHandle rs(createLayer(
-    "reshape", {nntrainer::withKey("name", p + "/flatten"),
-                nntrainer::withKey("target_shape",
-                                   "1:" + std::to_string(NKPT) + ":" +
-                                     std::to_string(FEATMAP * FEATMAP))}));
-  auto tok = rs(fc);
-  // mlp.0: ScaleNorm over 100 (rms_norm with gamma = g * ones(100))
-  LayerHandle sn(createLayer(
-    "rms_norm", {nntrainer::withKey("name", p + ".mlp.0"),
-                 nntrainer::withKey("epsilon", "0.00001")}));
-  auto normed = sn(tok);
-  // mlp.1: Linear 100 -> GAU_HIDDEN (no bias)
-  LayerHandle mlp(createLayer(
-    "fully_connected", {nntrainer::withKey("name", p + ".mlp.1"),
-                        nntrainer::withKey("unit", GAU_HIDDEN),
-                        nntrainer::withKey("disable_bias", "true")}));
-  auto h = mlp(normed);
-  // gau: [1,1,NKPT,GAU_HIDDEN] -> same
-  LayerHandle gau(createLayer(
-    "rtmcc_gau", {nntrainer::withKey("name", p + ".gau"),
-                  nntrainer::withKey("gau_expansion", GAU_E),
-                  nntrainer::withKey("gau_key_dim", GAU_S),
-                  nntrainer::withKey("epsilon", "0.00001")}));
-  auto g = gau(h);
-  // cls_x, cls_y: Linear GAU_HIDDEN -> SIMCC_BINS (no bias)
-  LayerHandle clsx(createLayer(
-    "fully_connected", {nntrainer::withKey("name", p + ".cls_x"),
-                        nntrainer::withKey("unit", SIMCC_BINS),
-                        nntrainer::withKey("disable_bias", "true")}));
-  LayerHandle clsy(createLayer(
-    "fully_connected", {nntrainer::withKey("name", p + ".cls_y"),
-                        nntrainer::withKey("unit", SIMCC_BINS),
-                        nntrainer::withKey("disable_bias", "true")}));
-  auto px = clsx(g);
-  auto py = clsy(g);
-  // concat along token axis (height) -> [1, 1, 2*NKPT, SIMCC_BINS]
-  LayerHandle cat(createLayer(
-    "concat", {nntrainer::withKey("name", p + "/pose_out"),
-               nntrainer::withKey("axis", 2)}));
-  return cat({px, py});
+  LayerHandle head(createLayer(
+    "rtmcc_head", {nntrainer::withKey("name", p),
+                   nntrainer::withKey("gau_expansion", GAU_E),
+                   nntrainer::withKey("gau_key_dim", GAU_S),
+                   nntrainer::withKey("gau_hidden", GAU_HIDDEN),
+                   nntrainer::withKey("simcc_bins", SIMCC_BINS),
+                   nntrainer::withKey("epsilon", "0.00001")}));
+  return head(fc);
 }
 
 // ---- ReID embedding head --------------------------------------------------

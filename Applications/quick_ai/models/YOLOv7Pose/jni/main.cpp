@@ -28,8 +28,7 @@
 #include <vector>
 
 #include "yolov7_pose_graph.h"
-#include "rms_norm.h"
-#include "rtmcc_gau.h"
+#include "rtmcc_head.h"
 #include <app_context.h>
 #include <engine.h>
 #include <layer.h>
@@ -130,8 +129,7 @@ int main(int argc, char **argv) {
           std::cerr << "register: " << e.what() << std::endl;
         }
       };
-      tryReg(nntrainer::createLayer<quick_ai::RMSNormLayer>);
-      tryReg(nntrainer::createLayer<quick_ai::RTMCCGauLayer>);
+      tryReg(nntrainer::createLayer<quick_ai::RTMCCHeadLayer>);
     }
 
     ModelHandle model =

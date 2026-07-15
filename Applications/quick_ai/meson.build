@@ -43,6 +43,7 @@ quick_ai_layer_dependencies += [
     causallm_scalar_multiply_dep,
     causallm_logit_softcapping_dep,
     causallm_rtmcc_gau_dep,
+    causallm_rtmcc_head_dep,
 ]
 
 subdir('models')

@@ -303,33 +303,40 @@ def convert(state):
                 out["head.final_layer:bias"] = (take("head.final_layer.bias"))
             continue
 
-        # ---- ScaleNorm scalar g -> per-channel gamma (broadcast) -----------
+        # ---- RTMCC head consolidated into one "rtmcc_head" layer ("head") --
+        # mlp.0 ScaleNorm scalar g, mlp.1 Linear, GAU weights, cls_x/cls_y.
         if k == "head.mlp.0.g":
-            g = float((take(k)).reshape(-1)[0])
-            out["head.mlp.0:gamma"] = np.full((FLATTEN,), g, dtype=np.float32)
+            out["head:mlp_ln_g"] = (take(k)).reshape(1)
             continue
-
-        # ---- GAU (RTMCCBlock) ----------------------------------------------
+        if k == "head.mlp.1.weight":  # [D, F] -> [F, D]
+            out["head:mlp_w"] = (take(k)).T.copy()
+            continue
         if k == "head.gau.uv.weight":  # [2e+s, D] -> [D, 2e+s]
-            out["head.gau:uv_weight"] = (take(k)).T.copy()
+            out["head:gau_uv"] = (take(k)).T.copy()
             continue
         if k == "head.gau.o.weight":  # [D, e] -> [e, D]
-            out["head.gau:o_weight"] = (take(k)).T.copy()
+            out["head:gau_o"] = (take(k)).T.copy()
             continue
         if k == "head.gau.gamma":
-            out["head.gau:gamma"] = (take(k))
+            out["head:gau_gamma"] = (take(k))
             continue
         if k == "head.gau.beta":
-            out["head.gau:beta"] = (take(k))
+            out["head:gau_beta"] = (take(k))
             continue
         if k == "head.gau.ln.g":
-            out["head.gau:ln_g"] = (take(k)).reshape(1)
+            out["head:gau_ln_g"] = (take(k)).reshape(1)
             continue
         if k == "head.gau.res_scale.scale":
-            out["head.gau:res_scale"] = (take(k))
+            out["head:gau_res_scale"] = (take(k))
+            continue
+        if k == "head.cls_x.weight":  # [bins, D] -> [D, bins]
+            out["head:cls_x"] = (take(k)).T.copy()
+            continue
+        if k == "head.cls_y.weight":  # [bins, D] -> [D, bins]
+            out["head:cls_y"] = (take(k)).T.copy()
             continue
 
-        # ---- generic Linear (mlp.1, cls_x, cls_y, head_feat.fc) ------------
+        # ---- generic Linear (head_feat.fc for the optional ReID head) ------
         if k.endswith(".weight"):
             mp = k[: -len(".weight")]
             w = (take(k))

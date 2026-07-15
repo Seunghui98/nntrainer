@@ -26,8 +26,7 @@
 
 #include "jni/yolov7_pose_graph.h"
 #include "model_base.h"
-#include "rms_norm.h"
-#include "rtmcc_gau.h"
+#include "rtmcc_head.h"
 
 namespace quick_ai {
 
@@ -58,8 +57,7 @@ public:
         std::cerr << "failed to register factory: " << e.what() << std::endl;
       }
     };
-    tryRegister(nntrainer::createLayer<quick_ai::RMSNormLayer>);
-    tryRegister(nntrainer::createLayer<quick_ai::RTMCCGauLayer>);
+    tryRegister(nntrainer::createLayer<quick_ai::RTMCCHeadLayer>);
   }
 
   void initialize() override {
