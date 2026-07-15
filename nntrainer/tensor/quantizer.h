@@ -34,6 +34,14 @@ enum class QScheme : uint16_t {
   PER_TENSOR_AFFINE = 0x00,
   PER_CHANNEL_AFFINE = 0x01,
   BINARY_CODE_BASED = 0x02,
+  /**
+   * Per-channel affine INT4 for the HTP u8i4 path. Shares CharTensor (QINT8)
+   * storage with PER_CHANNEL_AFFINE (int4 values held in int8 bytes, one
+   * float scale + int32 zp_corr per output channel) but selects the
+   * sdkl_npu_mm_u8i4_i32 kernel at dispatch. Kept distinct from the existing
+   * Tdatatype::QINT4 (kleidiai qs4cx group path).
+   */
+  PER_CHANNEL_AFFINE_I4 = 0x07,
   Q4_Kx8 = 0x03,
   Q6_K = 0x4,
   Q4_0 = 0x5,
@@ -452,6 +460,24 @@ public:
  * @return Tensor QINT8 tensor with per-channel scales and zp_corr
  */
 Tensor quantize_qint8_weight(const Tensor &input, bool transpose_input);
+
+/**
+ * @brief Quantize an FP32 weight tensor into the INT4 format used by the HTP
+ *        u8i4 path.
+ *
+ * Mirrors quantize_qint8_weight but quantizes to the symmetric INT4 range
+ * [-7, 7] (scale = max_abs / 7) with a per-channel scale and zp_corr. The
+ * result is a CharTensor (Tdatatype::QINT8 storage) tagged with
+ * QScheme::PER_CHANNEL_AFFINE_I4 so dispatch routes it to shgemm_u8i4 rather
+ * than shgemm_u8i8. int4 values are held one-per-byte until the WH-layout
+ * conversion packs them for the NPU.
+ *
+ * @param input Source FP32 tensor
+ * @param transpose_input Quantize the logical [N, K] view obtained from
+ *        input.transpose("0:2:1") when true
+ * @return Tensor QINT8-storage tensor with per-channel scales and zp_corr
+ */
+Tensor quantize_qint4_weight(const Tensor &input, bool transpose_input);
 
 } // namespace nntrainer
 

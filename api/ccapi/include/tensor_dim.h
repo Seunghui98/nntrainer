@@ -68,6 +68,12 @@ public:
     FP16,   /** half precision */
     FP32,   /** single precision */
     NONE,   /** not specified */
+    /**
+     * HTP u8i4: INT4 weight stored one-per-byte in CharTensor (per-channel
+     * affine + zp_corr, WH-packed for HMX). Distinct from QINT4 (kleidiai
+     * qs4cx group path). Kept last so existing enumerator values are unchanged.
+     */
+    QINT4_HTP,
   };
 
   /**

@@ -339,7 +339,9 @@ private:
    * @brief  Get the Data Type String object
    * @return std::string of tensor data type (QINT8)
    */
-  std::string getStringDataType() const override { return "QINT8"; }
+  std::string getStringDataType() const override {
+    return getDataType() == Tdatatype::QINT4_HTP ? "QINT4_HTP" : "QINT8";
+  }
 
   /**
    * @copydoc Tensor::isValid()
