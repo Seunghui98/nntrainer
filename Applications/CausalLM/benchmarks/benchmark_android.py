@@ -78,8 +78,19 @@ def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1, compute_
             self.compute_engine = compute_engine
             self.device_backup = None
             self.temp_config_path = None
-            self.device_config_path = "{}/nntr_config.json".format(model_path)
-            
+            # main.cpp prefers nntr_config_quantized.json over nntr_config.json
+            # when both exist (see Applications/CausalLM/main.cpp). Match that
+            # preference here so we edit the config the binary actually loads.
+            quantized_path = "{}/nntr_config_quantized.json".format(model_path)
+            probe = subprocess.run(
+                ["adb", "shell", "test", "-f", quantized_path],
+                capture_output=True
+            )
+            if probe.returncode == 0:
+                self.device_config_path = quantized_path
+            else:
+                self.device_config_path = "{}/nntr_config.json".format(model_path)
+
         def __enter__(self):
             # Backup device config
             result = subprocess.run(

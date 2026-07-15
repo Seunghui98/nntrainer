@@ -691,6 +691,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       for (size_t i = 0; i < generated_ids.size(); ++i)
         std::cout << (i ? "," : " ") << generated_ids[i];
       std::cout << std::endl;
+      std::cout << "GENERATED_TEXT_BEGIN\n"
+                << output_list[0] << "\nGENERATED_TEXT_END" << std::endl;
     }
   }
 

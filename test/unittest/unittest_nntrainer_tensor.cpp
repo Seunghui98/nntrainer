@@ -15,6 +15,7 @@
 #include "util_func.h"
 #include <cmath>
 #include <cpu_backend.h>
+#include <cstdlib>
 #include <float_tensor.h>
 #include <fp16.h>
 #include <fstream>

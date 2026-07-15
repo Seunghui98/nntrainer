@@ -23,7 +23,7 @@ public:
 - **Version query**: on success, logs the CDSP firmware version via `sdkl_npu_get_version`.
 - **Teardown**: `sdkl_npu_finalize(domain)` runs in the destructor on normal process exit.
   - `HtpBackend` is destroyed *before* the NPU scratch/cache statics, since it's a function-local static. Their destructors used to call `sdkl_npu_free` on an already-finalized NPU, printing `Err=1` three times at shutdown.
-  - Fixed by an atomic flag, `g_npu_alive`: `HtpBackend` sets it `false` right before `sdkl_npu_finalize`, and every teardown free goes through `npuFreeIfAlive()`, which skips the free once the flag is down. This is a safe skip, not a leak — `finalize` already reclaimed that memory (commit `62a11ef3`).
+  - Fixed by an atomic flag, `g_npu_alive`: `HtpBackend` sets it `false` right before `sdkl_npu_finalize`, and every teardown free goes through `npuFreeIfAlive()`, which skips the free once the flag is down. This is a safe skip, not a leak — `finalize` already reclaimed that memory.
 
 ### 1.3 CPU Fallback
 Handles init failure — no HTP hardware on a test PC, or a bad on-device CDSP skeleton path (`/data/local/tmp/libhexkl_skel.so`).
@@ -40,7 +40,7 @@ The Hexagon Tensor Processor DMAs directly with the hardware via physical buffer
 
 So the default CPU allocator (regular virtual memory) holds model tensors, and NPU DMA buffers are only allocated/freed per kernel call.
 
-### 2.2 NPU DMA Pool Budget (measured 2026-07-02)
+### 2.2 NPU DMA Pool Budget
 
 | Method | Result | Note |
 | :--- | :--- | :--- |
@@ -139,12 +139,28 @@ Qualcomm HMX tiles need the weight matrix in WH (Width-Height) layout to run in 
 
 For Qwen3-0.6B, 9 weights (3 FC types × layers 1-3) fit in the 48 MB pin budget; layers 4-28 get `nullptr` and use the transient path.
 
-#### 3.3.2 Decode (M = 1) — Fixed to CPU NEON (no `g_wh_cache`)
+#### 3.3.2 Decode (M = 1) — NPU by default, same routing as prefill
 
-**Decode (M=1) never enters the NPU shgemm path.** `float_tensor.cpp::dotFloat32Float16` checks `M==1` first and branches to CPU NEON `hsgemv`, so `shgemm_f32f16_f32` is never called.
+Decode (M=1) routes through the same `shgemm_f32f16_f32` kernel used by
+prefill (Mp is padded to 32 internally) whenever `supports_shgemm() && N % 32
+== 0` — the same condition prefill uses, with no separate runtime opt-in.
+`float_tensor.cpp::dotFloat32Float16` falls back to CPU NEON `hsgemv` only
+when the NPU is down or `N % 32 != 0`.
 
-- `g_wh_cache` (a FIFO WHCache, 64 MB cap, in `hexkl_mm.cpp`) exists in the source but **is never actually populated.**
-- Decode is fixed to CPU because CPU NEON is competitive in this memory-bandwidth-bound regime, and NPU FastRPC round-trip overhead would hurt.
+The decode path probes `lookupPrefillWH` first and, on a hit, stages the
+pre-baked WH bytes into scratch with a plain `memcpy` (no rm_to_wh), just like
+the prefill fast path; on a registry miss it falls back to the `g_wh_cache`
+path (64 MB FIFO, rm_to_wh per miss), which on models larger than the cap
+thrashes.
+
+This became the default after on-device A/B benchmarking showed
+HTP decode at parity or better than CPU decode, both in throughput and
+generated-text accuracy, once the WH-registry reuse fix landed.
+Even on a registry hit, decode still pays a per-token full-weight staging
+`memcpy` and computes an Mp=32-padded matmul for a single real row; a
+dedicated NPU GEMV kernel (which would remove both costs) remains a possible
+follow-up. See `05_e2e_performance_results.md` for the measurements that
+motivated this default.
 
 ### 3.4 QINT8 GEMM Pipeline (`shgemm_u8i8_i32`)
 
@@ -169,7 +185,8 @@ C (FP32, M×N)  [C[m,n] = act_scale × wt_scale[n] × (C_i32[m,n] − zp_corr[n]
 
 | Condition | Path | Reason |
 | :--- | :--- | :--- |
-| M == 1 (decode) | CPU `hsgemv` | memory-bandwidth-bound; CPU NEON FP16 is competitive. Branches before reaching shgemm |
+| M == 1 (decode) && N%32==0 && `supports_shgemm()` | NPU `shgemm_f32f16_f32` | probes pre-baked WH (memcpy, no rm_to_wh), else g_wh_cache; still pays per-token staging + Mp=32 padding. Default behavior (on-device A/B showed parity-or-better vs CPU) |
+| M == 1 (decode) && (N%32≠0 or NPU down) | CPU `hsgemv` fallback | same alignment/availability guard as prefill |
 | M > 1 && N%32==0 && `supports_shgemm()` && PrefillWHCache hit | NPU `shgemm_f32f16_f32` (pinned WH) | pin-once path — no rm_to_wh cost |
 | M > 1 && N%32==0 && `supports_shgemm()` && PrefillWHCache miss | NPU `shgemm_f32f16_f32` (transient `W_npu`) | over cap or first call — recomputes WH every call when pin space is unavailable |
 | M > 1 && (N%32≠0 or NPU down) | CPU `shgemm` fallback | avoids an SDK exception on N-alignment violation |
@@ -182,13 +199,13 @@ Pipeline:
 
 0. **Precondition: the source must really be FP32.** `nntr_quantize` trusts the dtype declared in the source `nntr_config.json`. If an FP32 file is mislabeled as FP16, the loader reads 4-byte weights as 2-byte values, corrupting them and producing an empty trailer (`Registered 0/0`) plus garbage output. So `nntr_quantize` now aborts if the source isn't declared `"model_tensor_type": "FP32-FP32"` / `"fc_layer_dtype": "FP32"` (`quantize.cpp`; it used to only warn). See [02 §5](02_build_and_run.md).
 1. **Bake** (`nntr_quantize --fc_dtype FP16_WH`) — a tool directive, not a real `DataType`; it triggers `setWHBakeRequested(true)` and otherwise saves as normal FP16. During save, `g_wh_collector` records each FC layer's RM→WH conversion as a `WHTrailerEntry{name, N, K, wh_bytes}`.
-   - **Past bug**: FC layers store weights as `[K,N]` row-major (`TransB=false`), but the NPU shgemm path and WH-bake both assumed the opposite `[N,K]` layout — mislabeling every FC/QKV/FFN weight's bytes and making **all NPU output garbage** (CPU stayed correct since it reads layout via `ldb`). Fixed in `8c1c1fa5` by transposing before WH-bake whenever `TransB==false`.
+   - **Past bug**: FC layers store weights as `[K,N]` row-major (`TransB=false`), but the NPU shgemm path and WH-bake both assumed the opposite `[N,K]` layout — mislabeling every FC/QKV/FFN weight's bytes and making **all NPU output garbage** (CPU stayed correct since it reads layout via `ldb`). Fixed by transposing before WH-bake whenever `TransB==false`.
 2. **Trailer write** — the RM FP16 bytes are untouched; a `WHF1`-tagged trailer is appended to the file end (`writeWHTrailer`). Older loaders that don't know the trailer just read the same RM binary, so the format stays backward-compatible.
 3. **Load-time registration** (`neuralnet.cpp`) — if `readWHTrailer` finds a trailer, each entry is registered via `registerPrefillWH(ptr, N, K, wh_bytes)`. This runs under `ExecutionMode::INFERENCE` too, which is what the CausalLM app always uses.
 4. **Prefill fast path** (`shgemm_f32f16_f32`) — looks up `lookupPrefillWH(ptr, N, K)` first. A hit skips rm_to_wh entirely; a miss falls back to the §3.3.1 pin-once/transient path. Neither case throws.
-5. **Decode is unchanged** — still fixed to CPU NEON `hsgemv`, unrelated to the WH trailer/registry (§1.3, §3.3.2).
+5. **Decode benefits identically** — decode (§3.3.2) probes the same `lookupPrefillWH` registry as prefill, so a trailer-baked model skips rm_to_wh on decode too.
 
-Measured (2026-07-06, Qwen3-0.6B, S25 Ultra): loading an integrated bin with the trailer logged `[HTP] Registered 196/196 pre-baked WH weights`, confirming all FC weights were registered; most layers hit the fast path from the very first prefill call, dropping prefill time from 3178 ms to 96 ms (record new E2E measurements in `05_e2e_performance_results.md`).
+Measured (with Qwen3-0.6B on S25 Ultra): loading an integrated bin with the trailer logged `[HTP] Registered 196/196 pre-baked WH weights`, confirming all FC weights were registered; most layers hit the fast path from the very first prefill call, dropping prefill time from 3178 ms to 96 ms (record new E2E measurements in `05_e2e_performance_results.md`).
 
 ### 3.7 Diagnostic Env Toggles
 

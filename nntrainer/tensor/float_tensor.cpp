@@ -1106,13 +1106,18 @@ Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
     o->shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
               last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
   }
-  /// case3: M==1 decode — CPU always.
-  /// memory-BW bound; CPU NEON FP16 hsgemv is competitive and avoids HMX
-  /// GEMV precision divergence observed in T11 e2e (token #0 mismatch).
+  /// case3: M==1 decode. NPU if supported and N is 32-aligned (reuses the
+  /// pre-baked WH registry via the prefill shgemm kernel), same as prefill.
+  /// Falls back to CPU hsgemv when the NPU is down or N is not 32-aligned.
   else if (M == 1) {
-    o->hsgemv((unsigned int)dim.getStorageOrder(), !trans_in,
-              input_first_three_flat, input_last_axis, alpha, mdata, ldb, data,
-              1, beta, rdata, 1);
+    if (o->supports_shgemm() && N % 32 == 0) {
+      o->shgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K,
+                alpha, data, lda, mdata, ldb, beta, rdata, ldc);
+    } else {
+      o->hsgemv((unsigned int)dim.getStorageOrder(), !trans_in,
+                input_first_three_flat, input_last_axis, alpha, mdata, ldb,
+                data, 1, beta, rdata, 1);
+    }
   }
   /// case others: M>1 prefill — NPU if supported and N is 32-aligned.
   /// N%32==0 guard: hexkl_mm throws on violation; check here for CPU

@@ -42,6 +42,14 @@ cd Applications/CausalLM
 ./build_android.sh --cache
 ```
 
+`build_android.sh` auto-detects HTP from the meson `builddir` (§2): when it was
+configured with `-Denable-htp=true`, the script builds `nntr_quantize` with
+`ENABLE_HEXKL` so the §5 WH bake works. It resolves the HexKL addon root from
+`$HEXKL_ADDON_ROOT`, else the builddir's `hexkl-sdk-root`, else the default SDK
+path — no extra flag needed. If the builddir is HTP but no addon root resolves,
+the build stops with an error rather than silently producing a non-baking
+`nntr_quantize`.
+
 Output: `Applications/CausalLM/jni/libs/arm64-v8a/{nntrainer_causallm, nntr_quantize, libcausallm_core.so}`, deployed to the device in the next step.
 
 ## 4. On-Device Deployment (`install_android.sh`)
@@ -79,6 +87,21 @@ adb shell \
    models/qwen3-0.6b --fc_dtype FP16_WH \
    --output_bin nntr_qwen3_0.6b_fp16_wh.bin"
 ```
+
+Verify the bake actually ran (a `nntr_quantize` built without `ENABLE_HEXKL`
+prints a WARNING and writes no trailer):
+
+```bash
+# The bake output must NOT contain this line:
+#   [WARNING] --fc_dtype FP16_WH requested but this build was compiled without ENABLE_HEXKL
+# Confirm the model carries the WH trailer (last 4 bytes = "WHF1"):
+adb shell "tail -c 4 /data/local/tmp/nntrainer/causallm/models/qwen3-0.6b/nntr_qwen3_0.6b_fp16_wh.bin | od -An -c"
+#   expected: W  H  F  1
+```
+
+On first inference (§6), logcat shows `[HTP] Registered N/N pre-baked WH weights`
+and prefill runs in the ~240-296 TPS range (a trailerless model instead re-bakes
+every run, collapsing prefill to single-digit TPS).
 
 Output: `nntr_qwen3_0.6b_fp16_wh.bin` (WH-baked) + `nntr_config_quantized.json`, which the app auto-loads in place of `nntr_config.json`.
 
