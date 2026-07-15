@@ -929,6 +929,7 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
     break;
   case Tdatatype::QINT16:
   case Tdatatype::QINT8:
+  case Tdatatype::QINT4_HTP:
   case Tdatatype::QINT4:
     dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
     break;
@@ -1225,7 +1226,23 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   float *rdata = output.getData<float>();
 
   auto *o = getOps();
-  if (dtype == Tdatatype::QINT8) {
+  if (dtype == Tdatatype::QINT8 || dtype == Tdatatype::QINT4_HTP) {
+    // Route by dtype, not q_scheme(): the QINT4_HTP dtype uniquely identifies
+    // the u8i4 (INT4 weight) HMX path, and a loaded weight's q_scheme value
+    // does not reliably round-trip.
+    if (dtype == Tdatatype::QINT4_HTP) {
+      if (o->supports_shgemm_u8i4() && N % 32 == 0) {
+        o->shgemm_u8i4((unsigned int)dim.getStorageOrder(), M, N, K, data, lda,
+                       input.getData<int8_t>(), input.getScale<float>(),
+                       input.getZpCorr<int32_t>(), rdata, ldc);
+        traceQInt8Route(input, M, N, K, "htp_u8i4");
+        return output;
+      }
+      // TODO: add a CPU dequant fallback for the u8i4 path (mirroring
+      // qint8CpuFallback) so decode / NPU-down cases do not throw.
+      throw std::runtime_error(
+        "Error: QINT4 Dot requires HTP u8i4 support with N % 32 == 0");
+    }
     if (shouldUseCpuFallbackForQInt8(input)) {
 #ifdef ENABLE_HEXKL
       qint8CpuFallback(M, N, K, data, input.getData<int8_t>(),
