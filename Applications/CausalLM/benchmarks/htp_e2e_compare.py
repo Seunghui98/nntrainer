@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Compare CPU vs HTP greedy token generation for Qwen3-0.6B on device."""
+"""
+@package htp_e2e_compare
+@brief Compare CPU vs HTP greedy token generation for Qwen3-0.6B on device.
+"""
 import json, re, subprocess, sys, tempfile, os
 
 DEVICE = os.environ.get("HTP_E2E_DEVICE", "R3CY205ZMND")

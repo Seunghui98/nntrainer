@@ -29,6 +29,9 @@
 
 namespace nntrainer {
 
+/**
+ * @brief ComputeOps subclass for delegating operations to the HTP NPU backend.
+ */
 class HtpComputeOps : public CpuComputeOps {
 public:
 #ifdef ENABLE_FP16

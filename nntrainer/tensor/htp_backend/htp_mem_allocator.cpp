@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   htp_mem_allocator.cpp
+ * @brief  MemAllocator backed by sdkl_npu_alloc
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs
+ */
 #ifdef ENABLE_HEXKL
 
 #include <htp_mem_allocator.h>

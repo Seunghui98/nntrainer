@@ -94,9 +94,8 @@ if get_option('enable-opencl')
   test_target += [['unittest_attention_kernels_cl', []]]
 endif
 
-test_target += [['unittest_nntrainer_htp_kernels', []]]
-
 if get_option('enable-htp')
+  test_target += [['unittest_nntrainer_htp_kernels', []]]
   test_target += [['unittest_nntrainer_htp_backend', []]]
   # Expose sdkl.h / remote.h include dirs to the htp test binaries. hexkl_dep
   # is declared at root scope (meson.build:281) and visible here via subdir().

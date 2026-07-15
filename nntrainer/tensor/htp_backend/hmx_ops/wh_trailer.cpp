@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
- * @file wh_trailer.cpp
+ *
+ * @file   wh_trailer.cpp
+ * @brief  WH-weight trailer parser implementation
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs
  */
 #ifdef ENABLE_HEXKL
 

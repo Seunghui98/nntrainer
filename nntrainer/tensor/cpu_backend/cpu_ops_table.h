@@ -26,6 +26,9 @@
 
 namespace nntrainer {
 
+/**
+ * @brief Unified CPU backend ComputeOps subclass handling default fallback logic.
+ */
 class CpuComputeOps : public ComputeOps {
 public:
   // FP32 BLAS

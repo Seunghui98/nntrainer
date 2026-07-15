@@ -1,3 +1,7 @@
+"""
+@package test_htp_e2e_compare
+@brief Unit tests for htp_e2e_compare.py's command-building and log parsing.
+"""
 import os
 import sys
 import unittest

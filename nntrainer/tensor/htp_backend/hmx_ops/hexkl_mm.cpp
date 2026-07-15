@@ -4,6 +4,9 @@
  *
  * @file   hexkl_mm.cpp
  * @date   18 Jun 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  * @brief  HMX matrix-multiply operations backed by HexKL (Phase 1).
  */
 
@@ -62,6 +65,10 @@ void shgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
 
 namespace {
 
+/**
+ * @brief One cached WH-layout (converted) weight resident in NPU memory,
+ *        keyed by its original RM host pointer.
+ */
 struct WHEntry {
   void *npu;
   unsigned int N, K;
@@ -78,6 +85,10 @@ static constexpr size_t WH_CACHE_MAX_BYTES = 64 * 1024 * 1024; // 64 MB
 // pool probe confirms a larger budget.
 static constexpr size_t PREFILL_WH_PIN_MAX_BYTES = 48ull * 1024 * 1024; // 48 MB
 
+/**
+ * @brief FIFO-evicting decode (M==1) WH weight cache with a hard cap on
+ *        total resident NPU bytes, to avoid DMA pool exhaustion.
+ */
 struct WHCache {
   std::map<const void *, WHEntry> cache;
   // Insertion-order tracking for FIFO eviction.
@@ -110,6 +121,11 @@ struct WHCache {
 // an evicting cache smaller than the working set thrashes to ~0% hits on a
 // sequential scan. Weights that would exceed PREFILL_WH_PIN_MAX_BYTES are not
 // cached; those calls use the transient path instead (correct, just slower).
+/**
+ * @brief Never-evicting, process-lifetime WH weight residency for prefill
+ *        (M>1). Weights that would exceed PREFILL_WH_PIN_MAX_BYTES are not
+ *        cached and fall back to the transient conversion path instead.
+ */
 struct PrefillWHCache {
   std::map<const void *, WHEntry> cache;
   size_t total_bytes = 0;
@@ -194,7 +210,16 @@ const _Float16 *getOrCreatePrefillWH(const void *B, unsigned int N,
 // offline-then-loaded (see loader). Holds already-converted WH bytes in normal
 // host RAM (NOT NPU DMA) — cheap to keep the whole model resident, sidestepping
 // the ~48 MB NPU pin budget. shgemm memcpies these into NPU scratch per call.
+/**
+ * @brief Host-RAM registry of pre-baked (offline-converted) WH weight
+ *        bytes, keyed by the RM host weight pointer. Populated by the
+ *        loader; cheap to keep the whole model resident since it lives in
+ *        normal host RAM rather than the NPU DMA pool.
+ */
 struct PrefillWHRegistry {
+  /**
+   * @brief One registered pre-baked weight: its WH-layout bytes and shape.
+   */
   struct Entry {
     std::vector<_FP16> wh; // WH-layout bytes, N*K elements
     unsigned int N, K;
@@ -208,6 +233,10 @@ struct PrefillWHRegistry {
 // Grows on demand; never shrinks. Not thread-safe by itself — guarded by the
 // caller's single-threaded prefill loop; a mutex makes reuse safe if that
 // changes.
+/**
+ * @brief Reusable, growable NPU scratch buffer for prefill staging, to
+ *        avoid an sdkl_npu_alloc/free round trip on every matmul call.
+ */
 struct NpuScratch {
   void *p = nullptr;
   size_t cap = 0;
@@ -257,7 +286,7 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   //   Our nntrainer parameters use (A=input, B=weight, C=output).
   //   Internally we call: sdkl_npu_mm_f32f16_f32(domain,
   //     n_row=M, n_col=N, n_inner=K,
-  //     A_npu /*out*/, X_npu /*A input*/, W_npu /*B weight WH*/)
+  //     A_npu [out], X_npu [A input], W_npu [B weight WH])
   //
   // alpha/beta: nntrainer always passes alpha=1.0, beta=0.0 for
   //   dotFloat32Float16. General alpha/beta are supported below.
@@ -525,9 +554,9 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   // --- NPU matrix multiply ---
   // sdkl_npu_mm_f32f16_f32(int domain,
   //                         int n_row, int n_col, int n_inner,
-  //                         float* A   /*output FP32*/,
-  //                         const float* X  /*input FP32*/,
-  //                         const _Float16* W /*weight FP16 WH*/)
+  //                         float* A   [output FP32],
+  //                         const float* X  [input FP32],
+  //                         const _Float16* W [weight FP16 WH])
   // Note: no lda/ldb/ldc — contiguous row-major assumed.
   // Use Mp (padded row count) so the NPU sees a 32-aligned M.
   err = sdkl_npu_mm_f32f16_f32(domain, (int)Mp, (int)N, (int)K,
@@ -780,8 +809,8 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   std::memcpy(W_npu, B_wh, w_bytes);
 
   // --- NPU matrix multiply ---
-  // sdkl_npu_mm_u8i8_i32(domain, n_row, n_col, n_inner, A/*i32 out*/,
-  //                       X/*u8 in*/, W/*i8 WH weight*/)
+  // sdkl_npu_mm_u8i8_i32(domain, n_row, n_col, n_inner, A[i32 out],
+  //                       X[u8 in], W[i8 WH weight])
   std::memset(C_npu, 0, c_bytes);
   err = sdkl_npu_mm_u8i8_i32(
     domain, sdk_M, sdk_N, sdk_K, static_cast<int32_t *>(C_npu),

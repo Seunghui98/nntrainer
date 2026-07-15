@@ -97,6 +97,10 @@ private:
   CallCounters *counters_;
 };
 
+/**
+ * @brief Test fixture wiring a MockComputeOps into a fresh ContextData for
+ *        each test, so dispatch tests can assert on per-call counters.
+ */
 class ComputeOpsDispatchTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -371,6 +375,10 @@ struct ShgemmCounters {
   std::atomic<int> shgemm{0};
 };
 
+/**
+ * @brief CpuComputeOps subclass that advertises shgemm support and forwards
+ *        the call to the real CPU shgemm, incrementing ShgemmCounters.
+ */
 class MockShgemmOps : public nntrainer::CpuComputeOps {
 public:
   MockShgemmOps(ShgemmCounters *c) : counters_(c) {}
@@ -446,6 +454,10 @@ struct DecodeCounters {
   std::atomic<int> hsgemv{0};
 };
 
+/**
+ * @brief CpuComputeOps subclass used to verify decode (M==1) routes to the
+ *        shgemm override rather than hsgemv, incrementing DecodeCounters.
+ */
 class MockDecodeOps : public nntrainer::CpuComputeOps {
 public:
   MockDecodeOps(DecodeCounters *c) : counters_(c) {}

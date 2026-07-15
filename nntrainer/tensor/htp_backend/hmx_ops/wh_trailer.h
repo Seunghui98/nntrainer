@@ -34,6 +34,9 @@ namespace hmx {
 
 static constexpr char WH_TRAILER_MAGIC[4] = {'W', 'H', 'F', '1'};
 
+/**
+ * @brief Entry for a specific weight tensor in the WH trailer
+ */
 struct WHTrailerEntry {
   std::string name;
   unsigned int N = 0;

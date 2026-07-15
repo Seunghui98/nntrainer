@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-nntrainer benchmark for CausalLM models with configuration sweeping.
+@package benchmark_android
+@brief nntrainer benchmark for CausalLM models with configuration sweeping.
 
 Usage:
   python3 benchmark_android.py -m <model_path> [options]

@@ -1,3 +1,7 @@
+"""
+@package test_benchmark_android
+@brief Unit tests for CausalLM Android benchmark utilities.
+"""
 import io
 import json
 import sys
