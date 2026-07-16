@@ -3759,6 +3759,32 @@ void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
   nntr_gemm_q8_0_q8_0(n, s, bs, vx, vy, 1, nc);
 }
 
+// FP32-output plain Q8_0xQ8_0 GEMM (scalar reference). The x86 indirect-conv
+// path is not wired (NNTR_HAS_Q4_0_INDIRECT_CONV=0), so this only needs to link
+// and be correct; the fast SMMLA variant lives in the NEON impl.
+void nntr_gemm_q8_0_q8_0_f32(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0 *a_base = (const block_q8_0 *)vy;
+  const block_q8_0 *b_base = (const block_q8_0 *)vx;
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0 *arow = a_base + (size_t)m * nb;
+    for (int j = 0; j < nc; ++j) {
+      const block_q8_0 *brow = b_base + (size_t)j * nb;
+      float acc = 0.0f;
+      for (int b = 0; b < nb; ++b) {
+        int32_t isum = 0;
+        for (int t = 0; t < QK8_0; ++t)
+          isum += (int32_t)arow[b].qs[t] * (int32_t)brow[b].qs[t];
+        acc += nntr_compute_fp16_to_fp32(arow[b].d) * nntr_compute_fp16_to_fp32(brow[b].d) *
+               (float)isum;
+      }
+      s[(size_t)m * bs + j] = acc;
+    }
+  }
+}
+
 #ifdef ENABLE_FP16
 // ============================================================================
 // Q8_0 x Q8_0 GEMM, FP16 output (register-blocked 4x4 SMMLA). The real kernel

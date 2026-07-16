@@ -109,6 +109,16 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
                          int nr, int nc);
 
 /**
+ * @brief FP32-output Q8_0 x Q8_0 GEMM. Same numerics as nntr_gemm_q8_0_q8_0 but
+ * implemented via the proven SMMLA path on NEON (i8mm) and correct scalar
+ * elsewhere; used by the W8A32 indirect conv. vx=weight[nc x nb],
+ * vy=act[nr x nb], s=FP32 out[nr x bs].
+ */
+void nntr_gemm_q8_0_q8_0_f32(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc);
+
+/**
  * @brief Compute Q8_0 weights by Q8_0 activations GEMV
  */
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
