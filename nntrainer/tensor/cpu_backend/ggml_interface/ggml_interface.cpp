@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <ggml_interface.h>
 #include <mutex>
@@ -168,35 +169,24 @@ void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
 }
 
 /**
- * @brief FP32-activation Q8_0-weight indirect conv GEMM (W8A32).
+ * @brief De-interleave + gather + plain-SMMLA W8A32 fallback (NNTR_Q8A32_PLAIN).
  *
- * The W8A16 (FP16-activation) path stores activations as FP16 between layers,
- * which accumulates rounding error across the deep backbone and collapses pose
- * confidence. This FP32 variant keeps activations in FP32 end-to-end (matching
- * an ONNX-Runtime int8 model's accuracy) while still doing int8 SMMLA compute:
- * the FP32 input is gathered on the fly (no im2col materialization) and
- * quantized per row to plain block_q8_0, the pre-repacked q8_0x4 weight is
- * de-interleaved back to plain block_q8_0, and both feed nntr_gemm_q8_0_q8_0
- * (the same int8 core as the FP32-output GEMM), writing FP32 output. It reuses
- * the identical weight file as the FP16 path (no re-quantize). Portable across
- * ISAs (all primitives have neon/avx/sve/fallback impls).
+ * The original W8A32 pipeline: de-interleaves the pre-repacked q8_0x4 weight
+ * back to plain block_q8_0 (cached per weight pointer), quantizes each gathered
+ * FP32 activation row to plain block_q8_0, and feeds nntr_gemm_q8_0_q8_0_f32.
+ * Kept as a numerical reference / fallback under NNTR_Q8A32_PLAIN. The default
+ * path below is ~2x faster (interleaved 4-row quantize + 4x4 SMMLA, no
+ * de-interleave), so this stays behind the env only.
  */
-void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
-                                         const unsigned int N,
-                                         const unsigned int K, const float *in,
-                                         const ConvGatherParams &geom,
-                                         const void *B, const unsigned int ldb,
-                                         float *C, const unsigned int ldc) {
+static void __q8a32_indirect_plain(const unsigned int M, const unsigned int N,
+                                   const unsigned int K, const float *in,
+                                   const ConvGatherParams &geom, const void *B,
+                                   float *C) {
   auto &tm = ThreadManager::Global();
-  (void)ldb;
-  (void)ldc;
   const unsigned int nb = K / QK8_0;
 
-  // 1) De-interleave weight q8_0x4 -> plain block_q8_0 [N][nb] (inverse of the
-  //    repack_q8_0 done at weight-export time), cached per weight-buffer pointer
-  //    so it runs once instead of every forward. Weights are constant during
-  //    inference, so the cache key (B) is stable; the de-interleaved copy is the
-  //    same byte size as the packed weight (N*nb*sizeof(block_q8_0)).
+  // 1) De-interleave weight q8_0x4 -> plain block_q8_0 [N][nb], cached per
+  //    weight-buffer pointer so it runs once instead of every forward.
   const block_q8_0 *Wp_ptr;
   {
     static std::mutex wcache_mtx;
@@ -240,10 +230,7 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
     });
   }
 
-  // 3) Plain Q8_0 x Q8_0 GEMM -> FP32 C, tiled 16x16 for cache/thread locality.
-  //    nntr_gemm_q8_0_q8_0_f32 uses the proven SMMLA (i8mm) compute on NEON
-  //    (byte-for-byte the working W8A16 fp16 kernel, FP32-store) and a correct
-  //    scalar elsewhere -- unlike the broken nntr_gemm_q8_0_q8_0.
+  // 3) Plain Q8_0 x Q8_0 GEMM -> FP32 C, tiled 16x16.
   const unsigned int row_chunk = 16, col_chunk = 16;
   const size_t row_loop = (M + row_chunk - 1) / row_chunk;
   const size_t col_loop = (N + col_chunk - 1) / col_chunk;
@@ -258,6 +245,126 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
                             (const void *)&Ap_ptr[(size_t)r0 * nb],
                             (int)(r1 - r0), (int)(c1 - c0));
   });
+}
+
+/**
+ * @brief FP32-activation Q8_0-weight indirect conv GEMM (W8A32).
+ *
+ * The W8A16 (FP16-activation) path stores activations as FP16 between layers,
+ * which accumulates rounding error across the deep backbone and collapses pose
+ * confidence. This FP32 variant keeps activations in FP32 end-to-end (matching
+ * an ONNX-Runtime int8 model's accuracy) while still doing int8 SMMLA compute.
+ *
+ * The default path mirrors the fast W8A16 pipeline exactly, only in FP32:
+ * the FP32 input is gathered 4 rows at a time (no im2col materialization) and
+ * quantized straight into the interleaved block_q8_0x4 layout via
+ * nntr_quantize_mat_q8_0_4x8, so the pre-repacked q8_0x4 weight can be consumed
+ * *directly* (no per-forward de-interleave) by the register-blocked 4x4 SMMLA
+ * kernel nntr_gemm_q8_0_q8_0_4x4_f32, writing FP32 output. This removes the two
+ * costs that made the earlier plain path 10-28x slower than W8A16: the 1-row
+ * scalar quantize and the weight de-interleave. It reuses the identical weight
+ * file as the FP16 path (no re-quantize) and is portable across ISAs (all
+ * primitives have neon/avx/sve/fallback impls). Set NNTR_Q8A32_PLAIN to fall
+ * back to the reference de-interleave pipeline.
+ */
+void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
+                                         const unsigned int N,
+                                         const unsigned int K, const float *in,
+                                         const ConvGatherParams &geom,
+                                         const void *B, const unsigned int ldb,
+                                         float *C, const unsigned int ldc) {
+  (void)ldb;
+  (void)ldc;
+
+  static const bool use_plain = (std::getenv("NNTR_Q8A32_PLAIN") != nullptr);
+  if (use_plain) {
+    __q8a32_indirect_plain(M, N, K, in, geom, B, C);
+    return;
+  }
+
+  auto &tm = ThreadManager::Global();
+  const unsigned int nb = K / QK8_0; // blocks per row (K multiple of 32)
+  const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * nb;
+  const unsigned int Mfull = (M / 4) * 4; // 4-row-divisible part
+  const unsigned int rem = M % 4;
+  const unsigned int M4 = M / 4;
+  const unsigned int M4c = (M + 3) / 4; // groups incl. padded tail
+
+  // 1) Fused gather + Q8_0 quantize to interleaved q8_0x4, 4 rows at a time.
+  //    Parallelized over 64-row chunks (16 tiles) to amortize dispatch, with a
+  //    reusable per-thread tile buffer.
+  std::vector<char> QA((size_t)M4c * qa_4_rows_size);
+  char *QA_ptr = QA.data();
+
+  const unsigned int QCHUNK = 64; // multiple of 4
+  if (Mfull > 0) {
+    const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+      std::vector<float> tilebuf((size_t)4 * K);
+      float *tile = tilebuf.data();
+      for (unsigned int r = r0; r < r1; r += 4) {
+        gather_conv_act_rows_fp32(tile, in, geom, (int)r, 4);
+        nntr_quantize_mat_q8_0_4x8(
+          tile, QA_ptr + (size_t)(r / 4) * qa_4_rows_size, K);
+      }
+    });
+  }
+
+  // Handle M-tail (rem 1..3) gather and quantization (zero-padded to 4 rows).
+  if (rem > 0) {
+    std::vector<float> tilebuf((size_t)4 * K, 0.0f);
+    gather_conv_act_rows_fp32(tilebuf.data(), in, geom, (int)Mfull, (int)rem);
+    nntr_quantize_mat_q8_0_4x8(tilebuf.data(),
+                               QA_ptr + (size_t)M4 * qa_4_rows_size, K);
+  }
+
+  // 2) Tiled 4x4 SMMLA GEMM over the 4-row-divisible part, direct to C.
+  //    Weight B is consumed in its native q8_0x4 layout (stride = nb plain
+  //    blocks per 4-column super-block).
+  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
+  const unsigned int row_chunk_size = 16; // multiple of 4
+  const unsigned int col_chunk_size = 16; // multiple of 4
+
+  if (Mfull > 0) {
+    const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
+    const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+      unsigned int r = static_cast<unsigned int>(i / col_loop);
+      unsigned int c = static_cast<unsigned int>(i % col_loop);
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), Mfull);
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+      nntr_gemm_q8_0_q8_0_4x4_f32(
+        (int)K, C + (size_t)r_start * N + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        (const void *)(QA_ptr + (size_t)(r_start / 4) * qa_4_rows_size),
+        (int)(r_end - r_start), (int)(c_end - c_start));
+    });
+  }
+
+  // 3) M-tail (rem 1..3): run the padded last group into a 4xN FP32 scratch,
+  //    then copy only the valid rem rows into C.
+  if (rem > 0) {
+    std::vector<float> scratch((size_t)4 * N);
+    float *scratch_ptr = scratch.data();
+    const char *tail_a = QA_ptr + (size_t)M4 * qa_4_rows_size;
+    const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, col_loop, [=](size_t c) {
+      unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * ((unsigned int)c + 1), N);
+      nntr_gemm_q8_0_q8_0_4x4_f32(
+        (int)K, scratch_ptr + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        (const void *)tail_a, 4, (int)(c_end - c_start));
+    });
+    for (unsigned int rr = 0; rr < rem; ++rr)
+      std::memcpy(C + (size_t)(Mfull + rr) * N, scratch_ptr + (size_t)rr * N,
+                  (size_t)N * sizeof(float));
+  }
 }
 
 } // namespace nntrainer

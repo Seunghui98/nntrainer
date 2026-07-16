@@ -1827,6 +1827,37 @@ void nntr_gemm_q8_0_q8_0_f32(int n, float *__restrict s, size_t bs,
     }
   }
 }
+// Interleaved (q8_0x4) FP32-output GEMM (scalar). Matches the layout of
+// nntr_gemm_q8_0_q8_0_4x4_f32's NEON SMMLA path; correct on x86/SVE/fallback
+// (the indirect conv only runs on NEON, but this keeps it linkable + testable).
+void nntr_gemm_q8_0_q8_0_4x4_f32(int n, float *__restrict s, size_t bs,
+                                 const void *__restrict vx,
+                                 const void *__restrict vy, int nr, int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+  auto dot_one = [&](const block_q8_0x4 *a, int ar, const block_q8_0x4 *b,
+                     int wr) -> float {
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+      int32_t si = 0;
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+      acc += nntr_compute_fp16_to_fp32(a[bi].d[ar]) *
+             nntr_compute_fp16_to_fp32(b[bi].d[wr]) * (float)si;
+    }
+    return acc;
+  };
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        dot_one(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
+  }
+}
 
 #ifdef ENABLE_FP16
 void nntr_gemm_q8_0_q8_0_4x4_fp16(int n, NNTR_GGML_FP16 *__restrict s,

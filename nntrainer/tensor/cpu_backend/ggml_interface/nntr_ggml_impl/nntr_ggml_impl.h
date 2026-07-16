@@ -119,6 +119,17 @@ void nntr_gemm_q8_0_q8_0_f32(int n, float *__restrict s, size_t bs,
                              const void *__restrict vy, int nr, int nc);
 
 /**
+ * @brief Interleaved (q8_0x4) FP32-output 4x4 SMMLA GEMM. Both operands are
+ * pre-packed block_q8_0x4 (weight via repack_q8_0, activation via
+ * nntr_quantize_mat_q8_0_4x8). NEON uses the proven i8mm kernel with FP32
+ * store; other ISAs use a correct scalar. Requires nr % 4 == 0.
+ * vx=weight[nc/4][nb], vy=act[nr/4][nb], s=FP32 out[nr x bs].
+ */
+void nntr_gemm_q8_0_q8_0_4x4_f32(int n, float *__restrict s, size_t bs,
+                                 const void *__restrict vx,
+                                 const void *__restrict vy, int nr, int nc);
+
+/**
  * @brief Compute Q8_0 weights by Q8_0 activations GEMV
  */
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
