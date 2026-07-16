@@ -94,6 +94,10 @@ if get_option('enable-opencl')
   test_target += [['unittest_attention_kernels_cl', []]]
 endif
 
+# Host-runnable numeric tests for the HTP u8i4/u8i8 GEMM pipeline (quant,
+# zp_corr correction, dequant). No Hexagon SDK needed, so build them always.
+test_target += [['unittest_nntrainer_htp_kernel_math', []]]
+
 if get_option('enable-htp')
   test_target += [['unittest_nntrainer_htp_kernels', []]]
   test_target += [['unittest_nntrainer_htp_backend', []]]
