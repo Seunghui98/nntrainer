@@ -62,11 +62,10 @@ LOCAL_CFLAGS += $(POSE_CFLAGS)
 LOCAL_CXXFLAGS += $(POSE_CFLAGS)
 LOCAL_LDFLAGS += -fexceptions
 
-# The custom rtmcc_gau / rms_norm layers are compiled straight into the
-# executable (registered at runtime in main.cpp).
+# The custom rtmcc_head layer is compiled straight into the executable
+# (registered at runtime in main.cpp).
 LOCAL_SRC_FILES := main.cpp \
-	$(QUICK_AI_LAYERS)/rtmcc_gau.cpp \
-	$(QUICK_AI_LAYERS)/rms_norm.cpp
+	$(QUICK_AI_LAYERS)/rtmcc_head.cpp
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(QUICK_AI_LAYERS) \
 	$(LOCAL_PATH)/../../../third_party
