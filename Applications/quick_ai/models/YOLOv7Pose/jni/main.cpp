@@ -138,10 +138,26 @@ int main(int argc, char **argv) {
 
     bool preset_nhwc = false;
     bool preset_q = false;
+    bool fp16_act = false;
     std::string weights_default = "yolov7_pose.safetensors";
     if (const char *tt = std::getenv("YOLO_TENSOR_TYPE")) {
       std::string s = tt;
-      if (s == "w8a32" || s == "W8A32") {
+      if (s == "w8a16" || s == "W8A16") {
+        // Real on-device Q8_0 path: the ARM indirect conv only decodes Q8_0
+        // weights against an FP16 activation, so Q8_0 requires FP16 act.
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
+        preset_nhwc = true;
+        preset_q = true;
+        fp16_act = true;
+        yolov7_pose::quantWeightDtype() = "Q8_0";
+        weights_default = "yolov7_pose_q8_0.safetensors";
+        std::cout << "[Pose] Preset=w8a16 (Q8_0 weights + FP16 act + NHWC)"
+                  << std::endl;
+      } else if (s == "w8a32" || s == "W8A32") {
+        // FP32-activation NHWC. NOTE: with real Q8_0 weights this is only
+        // correct on x86 via --sim-q8-conv (dequantized FP32) weights; the ARM
+        // Q8_0 conv kernel needs FP16 activations (use w8a16 on device).
         model->setProperty(
           {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
         preset_nhwc = true;
@@ -173,10 +189,11 @@ int main(int argc, char **argv) {
       std::cout << "[Pose] tensor_format=NHWC" << std::endl;
     }
 
+    auto input_dtype = fp16_act ? ml::train::TensorDim::DataType::FP16
+                                : ml::train::TensorDim::DataType::FP32;
     auto x = Tensor(
       ml::train::TensorDim(1, 3, INPUT_SIZE, INPUT_SIZE,
-                           ml::train::TensorDim::Format::NCHW,
-                           ml::train::TensorDim::DataType::FP32),
+                           ml::train::TensorDim::Format::NCHW, input_dtype),
       "input0");
 
     // pose_base_v311.pt is pose-only (no ReID head). Enable the ReID branch

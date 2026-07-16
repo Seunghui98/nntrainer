@@ -40,8 +40,12 @@ void RTMCCHeadLayer::finalize(nntrainer::InitLayerContext &context) {
 
   // Output: [B, 1, 2*K, SIMCC] (cls_x rows over cls_y rows). C=1 makes the
   // storage identical in NCHW and NHWC, so main.cpp decodes [2*K, SIMCC].
+  // Always FP32 so the decoder reads float* regardless of the activation dtype
+  // (the FP16-activation W8A16 path still yields an FP32 pose output).
+  auto out_type = nntrainer::TensorDim::TensorType(
+    context.getFormat(), nntrainer::TensorDim::DataType::FP32);
   nntrainer::TensorDim out_dim(in_dim.batch(), 1, 2 * num_token, simcc,
-                               in_dim.getTensorType());
+                               out_type);
   context.setOutputDimensions({out_dim});
 
   // Head weights + all internal token tensors are kept NCHW-typed regardless
@@ -81,8 +85,14 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
 
-  NNTR_THROW_IF(in.getDataType() != DataType::FP32, std::invalid_argument)
-    << "[rtmcc_head] only FP32 activations are supported";
+  const bool in_fp16 = (in.getDataType() == DataType::FP16);
+#ifndef ENABLE_FP16
+  NNTR_THROW_IF(in_fp16, std::invalid_argument)
+    << "[rtmcc_head] FP16 activations require an ENABLE_FP16 build";
+#endif
+  NNTR_THROW_IF(!in_fp16 && in.getDataType() != DataType::FP32,
+                std::invalid_argument)
+    << "[rtmcc_head] only FP32/FP16 activations are supported";
 
   const unsigned int K = num_token;
   const unsigned int F = flatten;
@@ -115,12 +125,25 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const float *rs_p = t_rs.getData<float>();
 
   const nntrainer::TensorDim in_dim = in.getDim();
-  const nntrainer::TensorDim out_dim = out.getDim();
   const unsigned int batch = in_dim.batch();
-  const float *in_all = in.getData<float>();
+  const float *in_all = in_fp16 ? nullptr : in.getData<float>();
+#ifdef ENABLE_FP16
+  const _FP16 *in_all16 = in_fp16 ? in.getData<_FP16>() : nullptr;
+#endif
   float *out_all = out.getData<float>();
   const size_t in_feat = static_cast<size_t>(K) * F;
   const size_t out_feat = static_cast<size_t>(2 * K) * simcc;
+
+  // read conv-output element (keypoint k, spatial s) as float, format-aware.
+  auto read_in = [&](size_t base, unsigned int k, unsigned int s) -> float {
+    size_t idx = is_nchw ? (static_cast<size_t>(k) * F + s)
+                         : (static_cast<size_t>(s) * K + k);
+#ifdef ENABLE_FP16
+    if (in_fp16)
+      return static_cast<float>(in_all16[base + idx]);
+#endif
+    return in_all[base + idx];
+  };
 
   // Internal token tensors are NCHW so Tensor::dot shapes the GEMM correctly.
   const auto nchw = nntrainer::TensorDim::TensorType(
@@ -129,7 +152,7 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::TensorDim kd(1, 1, K, D, nchw);
 
   for (unsigned int b = 0; b < batch; ++b) {
-    const float *inb = in_all + b * in_feat;
+    const size_t base = static_cast<size_t>(b) * in_feat;
     float *outb = out_all + b * out_feat;
 
     // 1. Gather tokens X[K, F] from the conv output (format-aware) and apply
@@ -139,8 +162,7 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     for (unsigned int k = 0; k < K; ++k) {
       float ss = 0.0f;
       for (unsigned int s = 0; s < F; ++s) {
-        // NCHW: [k][s] at k*F + s ; NHWC: [s][k] at s*K + k
-        float v = is_nchw ? inb[k * F + s] : inb[s * K + k];
+        float v = read_in(base, k, s);
         xp[k * F + s] = v;
         ss += v * v;
       }
