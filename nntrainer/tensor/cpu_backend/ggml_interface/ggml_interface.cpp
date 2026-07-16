@@ -229,21 +229,27 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
     });
   }
 
-  // 3) Plain Q8_0 x Q8_0 GEMM -> FP32 C.
-  const unsigned int row_chunk = 16, col_chunk = 16;
-  const size_t row_loop = (M + row_chunk - 1) / row_chunk;
-  const size_t col_loop = (N + col_chunk - 1) / col_chunk;
+  // 3) Plain Q8_0 x Q8_0 GEMM -> FP32 C. Inline scalar int8 dot (correct by
+  //    construction): the shared nntr_gemm_q8_0_q8_0 FP32 primitive is
+  //    under-tested (returns 0 on the x86 AVX build), so we don't rely on it
+  //    here. Parallelized per output row.
   const block_q8_0 *Wp_ptr = Wp.data();
   const block_q8_0 *Ap_ptr = Ap.data();
-  tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
-    unsigned int r = (unsigned int)(i / col_loop);
-    unsigned int c = (unsigned int)(i % col_loop);
-    unsigned int r0 = r * row_chunk, r1 = std::min(r0 + row_chunk, M);
-    unsigned int c0 = c * col_chunk, c1 = std::min(c0 + col_chunk, N);
-    nntr_gemm_q8_0_q8_0((int)K, C + (size_t)r0 * N + c0, N,
-                        (const void *)&Wp_ptr[(size_t)c0 * nb],
-                        (const void *)&Ap_ptr[(size_t)r0 * nb], (int)(r1 - r0),
-                        (int)(c1 - c0));
+  tm.parallel_for(0, M, [=](size_t m) {
+    const block_q8_0 *a = Ap_ptr + (size_t)m * nb;
+    float *crow = C + (size_t)m * N;
+    for (unsigned int j = 0; j < N; ++j) {
+      const block_q8_0 *b = Wp_ptr + (size_t)j * nb;
+      float acc = 0.0f;
+      for (unsigned int bi = 0; bi < nb; ++bi) {
+        int32_t isum = 0;
+        for (int t = 0; t < QK8_0; ++t)
+          isum += (int32_t)a[bi].qs[t] * (int32_t)b[bi].qs[t];
+        acc += nntr_compute_fp16_to_fp32(a[bi].d) *
+               nntr_compute_fp16_to_fp32(b[bi].d) * (float)isum;
+      }
+      crow[j] = acc;
+    }
   });
 }
 
