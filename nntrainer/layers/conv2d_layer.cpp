@@ -124,6 +124,24 @@ static inline void convApplySwishInplace(T *data, size_t n) {
   const size_t nthreads = std::max<size_t>(1, tm.getComputeThreadCount());
   const size_t chunk = (n + nthreads - 1) / nthreads;
 
+  // Per-call SiLU instrumentation under NNTR_LAYER_TIME: which branch ran,
+  // wall ms, and ns/element. Distinguishes compute-bound (high ns/elem,
+  // vectorization helps) from bandwidth/dispatch-bound (low ns/elem or
+  // size-independent cost, fusion is the fix) without guessing.
+  static const bool _silu_lt = std::getenv("NNTR_LAYER_TIME") != nullptr;
+  const auto _silu_t0 = _silu_lt ? std::chrono::high_resolution_clock::now()
+                                 : std::chrono::high_resolution_clock::time_point{};
+  auto _silu_report = [&](const char *path) {
+    if (!_silu_lt)
+      return;
+    const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - _silu_t0)
+                        .count();
+    std::cerr << "[silu] n=" << n << " " << ms << " ms " << path
+              << " t=" << nthreads << " ns/elem=" << (ms * 1e6) / (double)n
+              << "\n";
+  };
+
 #ifdef ENABLE_FP16
   if constexpr (std::is_same_v<T, _FP16>) {
     const _FP16 *lut = get_silu_lut_fp16();
@@ -156,6 +174,7 @@ static inline void convApplySwishInplace(T *data, size_t n) {
         data[i] = lut[u];
       }
     });
+    _silu_report("fp16-lut");
     return;
   }
 #endif
@@ -235,6 +254,13 @@ static inline void convApplySwishInplace(T *data, size_t n) {
       }
     }
   });
+
+#if defined(__ARM_NEON)
+  constexpr bool _neon_f32 = std::is_same_v<T, float>;
+#else
+  constexpr bool _neon_f32 = false;
+#endif
+  _silu_report(use_approx ? "approx" : (_neon_f32 ? "neon-exact" : "scalar-exact"));
 }
 
 static TensorDim calcCol2ImOutputDim(const TensorDim &out,
