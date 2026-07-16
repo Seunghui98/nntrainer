@@ -198,8 +198,8 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                  std::chrono::high_resolution_clock::time_point t0) {
     if (op_time)
       std::cerr << "[head-op] " << tag << " : "
-                << std::chrono::duration<double, std::micro>(clk() - t0).count()
-                << " us\n";
+                << std::chrono::duration<double, std::milli>(clk() - t0).count()
+                << " ms\n";
   };
 
   for (unsigned int b = 0; b < batch; ++b) {

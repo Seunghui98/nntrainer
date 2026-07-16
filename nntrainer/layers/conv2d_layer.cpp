@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -1003,6 +1004,15 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
 
   Tensor &filter_kernel = context.getWeight(wt_idx[ConvParams::weight]);
 
+  // Per-conv phase timing (NNTR_LAYER_TIME): compute (im2col/gather + GEMM +
+  // scatter) vs bias vs activation. Four sequential timestamps at fixed points
+  // cover every branch that reaches the bias/activation epilogue.
+  static const bool _lt = std::getenv("NNTR_LAYER_TIME") != nullptr;
+  auto _ck = []() { return std::chrono::high_resolution_clock::now(); };
+  auto _t_start = _ck();
+  auto _t_comp_end = _t_start;
+  auto _t_bias_end = _t_start;
+
 #if defined(__ARM_NEON) && defined(ENABLE_FP16)
   if (context.getName() == "conv0" &&
       hidden_.getDataType() == nntrainer::Tdatatype::FP16 &&
@@ -1854,6 +1864,8 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
+  _t_comp_end = _ck();
+
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias_kernel = context.getWeight(wt_idx[ConvParams::bias]);
@@ -1929,6 +1941,8 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
+  _t_bias_end = _ck();
+
   // Fused activation epilogue. When the graph sets activation=swish on the
   // conv, apply SiLU in-place on the freshly written output instead of
   // materializing a separate Activation layer (which would read the conv
@@ -1946,6 +1960,23 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     {
       convApplySwishInplace(hidden_.getData<float>(), n);
     }
+  }
+
+  if (_lt) {
+    auto _t_act_end = _ck();
+    auto MS = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const bool wq = filter_kernel.getDataType() == nntrainer::Tdatatype::Q8_0 ||
+                    filter_kernel.getDataType() == nntrainer::Tdatatype::Q4_0;
+    std::cerr << "[conv-op] " << context.getName() << " ic="
+              << input_.channel() << " oc=" << filter_size << " k="
+              << kernel_size[0].get() << " s=" << stride[0].get() << " in="
+              << input_.height() << "x" << input_.width()
+              << (wq ? " q8" : " fp") << " | compute="
+              << MS(_t_start, _t_comp_end) << " bias="
+              << MS(_t_comp_end, _t_bias_end) << " act="
+              << MS(_t_bias_end, _t_act_end) << " ms\n";
   }
 
   // Optional per-conv NaN/inf localization (NNTR_CONV_DEBUG). Scans the conv

@@ -462,8 +462,8 @@ sharedConstTensors NeuralNetwork::forwarding(
         node->forwarding(training);
         auto t1 = std::chrono::high_resolution_clock::now();
         std::cerr << "[layer-time] " << node->getName() << " : "
-                  << std::chrono::duration<double, std::micro>(t1 - t0).count()
-                  << " us\n";
+                  << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                  << " ms\n";
       } else {
         node->forwarding(training);
       }
@@ -559,10 +559,9 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
         auto t0 = std::chrono::high_resolution_clock::now();
         node->incremental_forwarding(from, to, training);
         auto t1 = std::chrono::high_resolution_clock::now();
-        double us =
-          std::chrono::duration<double, std::micro>(t1 - t0).count();
-        std::cerr << "[layer-time] " << node->getName() << " : " << us
-                  << " us\n";
+        std::cerr << "[layer-time] " << node->getName() << " : "
+                  << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                  << " ms\n";
       } else {
         node->incremental_forwarding(from, to, training);
       }
