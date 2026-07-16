@@ -140,6 +140,13 @@ cd Applications/quick_ai/models/YOLOv7Pose
 
 ## Notes
 
+- **Q8_0 conv kernel (W8A16)**: the Q8_0-weight FP16 conv defaults to the
+  **plain** proven kernel (`nntr_gemm_q8_0_q8_0_fp16`), which de-interleaves the
+  saved `q8_0x4` weight on the fly — no re-quantize needed. The faster
+  interleaved SMMLA kernel (`nntr_gemm_q8_0_q8_0_4x4_fp16`) is opt-in via
+  `NNTR_Q8_CONV_INTERLEAVED=1` for A/B testing; it currently produces NaN on
+  device for this model and is pending a fix. Both consume the identical weight
+  file, so switching is a runtime env toggle only.
 - **Checkpoint formats**: `weight_converter.py` maps keys model-free and
   accepts a state_dict *or* a full `torch.save(model)` object (fused or
   unfused). If unpickling needs the training repo's `models` package it is
