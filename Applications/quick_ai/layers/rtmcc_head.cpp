@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <vector>
 
 #include "rtmcc_head.h"
@@ -133,6 +135,42 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   float *out_all = out.getData<float>();
   const size_t in_feat = static_cast<size_t>(K) * F;
   const size_t out_feat = static_cast<size_t>(2 * K) * simcc;
+
+  // Optional NaN/inf localization: when POSE_DEBUG is set, scan the head input
+  // (post-neck / post-final-conv feature map) and every head weight so we can
+  // tell whether a non-finite value arrives from upstream convs or is produced
+  // inside the head. Runs once (batch 0) with negligible cost.
+  if (std::getenv("POSE_DEBUG") != nullptr) {
+    auto scan = [](const char *tag, auto *p, size_t n) {
+      size_t nnan = 0, ninf = 0;
+      double mn = 1e300, mx = -1e300;
+      for (size_t i = 0; i < n; ++i) {
+        float v = static_cast<float>(p[i]);
+        if (std::isnan(v)) { ++nnan; continue; }
+        if (std::isinf(v)) { ++ninf; continue; }
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      std::cerr << "[pose-dbg] " << tag << " n=" << n << " nan=" << nnan
+                << " inf=" << ninf << " min=" << mn << " max=" << mx << "\n";
+    };
+#ifdef ENABLE_FP16
+    if (in_fp16)
+      scan("head.input(fp16)", in_all16, static_cast<size_t>(batch) * in_feat);
+    else
+#endif
+      scan("head.input(fp32)", in_all, static_cast<size_t>(batch) * in_feat);
+    scan("head.mlp_ln_g", w_mlp_g.getData<float>(), w_mlp_g.size());
+    scan("head.mlp_w", w_mlp.getData<float>(), w_mlp.size());
+    scan("head.gau_uv", w_uv.getData<float>(), w_uv.size());
+    scan("head.gau_o", w_o.getData<float>(), w_o.size());
+    scan("head.gau_gamma", t_gamma.getData<float>(), t_gamma.size());
+    scan("head.gau_beta", t_beta.getData<float>(), t_beta.size());
+    scan("head.gau_ln_g", w_gau_g.getData<float>(), w_gau_g.size());
+    scan("head.gau_res_scale", t_rs.getData<float>(), t_rs.size());
+    scan("head.cls_x", w_cx.getData<float>(), w_cx.size());
+    scan("head.cls_y", w_cy.getData<float>(), w_cy.size());
+  }
 
   // read conv-output element (keypoint k, spatial s) as float, format-aware.
   auto read_in = [&](size_t base, unsigned int k, unsigned int s) -> float {
