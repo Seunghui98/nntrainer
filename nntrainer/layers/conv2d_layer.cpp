@@ -1068,6 +1068,22 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   auto _t_comp_end = _t_start;
   auto _t_bias_end = _t_start;
 
+  // One-shot build stamp so a stale deployed libnntrainer.so is immediately
+  // visible in the profile log (this file's compile date/time + which SiLU
+  // path this build carries). Printed only under NNTR_LAYER_TIME.
+  if (_lt) {
+    static std::once_flag _stamp_once;
+    std::call_once(_stamp_once, [] {
+      std::cerr << "[build-stamp] conv2d " << __DATE__ << " " << __TIME__
+#if defined(__ARM_NEON)
+                << " silu_fp32=neon"
+#else
+                << " silu_fp32=scalar"
+#endif
+                << "\n";
+    });
+  }
+
 #if defined(__ARM_NEON) && defined(ENABLE_FP16)
   if (context.getName() == "conv0" &&
       hidden_.getDataType() == nntrainer::Tdatatype::FP16 &&
