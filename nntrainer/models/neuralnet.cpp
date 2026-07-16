@@ -1271,8 +1271,18 @@ void NeuralNetwork::load(const std::string &file_path,
           continue;
         const std::string &name = weight->getName();
         auto it = name_offset_map.find(name);
-        if (it == name_offset_map.end())
+        if (it == name_offset_map.end()) {
+          // The graph expects this weight but the safetensors file has no
+          // tensor of that name, so it silently keeps its uninitialized
+          // contents (garbage) -> the layer then computes NaN/inf downstream.
+          // Warn loudly: this is almost always a name-mismatch between the
+          // weight converter/quantizer output and the graph's weight names.
+          ml_logw("[load] weight '%s' not found in safetensors; it stays "
+                  "UNINITIALIZED (expect NaN). Check the converter/quantizer "
+                  "produced this exact tensor name.",
+                  name.c_str());
           continue;
+        }
         const size_t file_off = data_base + it->second.first;
         weight->getVariableRef().setFileOffset(file_off);
       }
