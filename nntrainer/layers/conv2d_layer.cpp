@@ -44,6 +44,44 @@ namespace nntrainer {
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
+
+// Vectorized expf (Cephes polynomial, ~1e-6 rel error). Used to vectorize the
+// FP32 SiLU epilogue, which otherwise runs a scalar std::exp per element and
+// dominates the W8A32 activation cost (FP16 has a LUT; FP32 had none).
+static inline float32x4_t nntr_vexpq_f32(float32x4_t x) {
+  const float32x4_t hi = vdupq_n_f32(88.3762626647950f);
+  const float32x4_t lo = vdupq_n_f32(-88.3762626647949f);
+  x = vminq_f32(vmaxq_f32(x, lo), hi);
+  const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
+  const float32x4_t c0 = vdupq_n_f32(0.693359375f);
+  const float32x4_t c1 = vdupq_n_f32(-2.12194440e-4f);
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  float32x4_t fx = vmlaq_f32(vdupq_n_f32(0.5f), x, log2e);
+  int32x4_t emm0 = vcvtq_s32_f32(fx);
+  float32x4_t tmp = vcvtq_f32_s32(emm0);
+  uint32x4_t mask = vcgtq_f32(tmp, fx);
+  fx = vsubq_f32(
+    tmp, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(one))));
+  emm0 = vcvtq_s32_f32(fx);
+  x = vmlsq_f32(x, fx, c0);
+  x = vmlsq_f32(x, fx, c1);
+  const float32x4_t p0 = vdupq_n_f32(1.9875691500E-4f);
+  const float32x4_t p1 = vdupq_n_f32(1.3981999507E-3f);
+  const float32x4_t p2 = vdupq_n_f32(8.3334519073E-3f);
+  const float32x4_t p3 = vdupq_n_f32(4.1665795894E-2f);
+  const float32x4_t p4 = vdupq_n_f32(1.6666665459E-1f);
+  const float32x4_t p5 = vdupq_n_f32(5.0000001201E-1f);
+  float32x4_t z = vmulq_f32(x, x);
+  float32x4_t y = vmlaq_f32(p1, p0, x);
+  y = vmlaq_f32(p2, y, x);
+  y = vmlaq_f32(p3, y, x);
+  y = vmlaq_f32(p4, y, x);
+  y = vmlaq_f32(p5, y, x);
+  y = vmlaq_f32(x, y, z);
+  y = vaddq_f32(y, one);
+  int32x4_t pow2n = vshlq_n_s32(vaddq_s32(emm0, vdupq_n_s32(0x7f)), 23);
+  return vmulq_f32(y, vreinterpretq_f32_s32(pow2n));
+}
 #endif
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -173,7 +211,24 @@ static inline void convApplySwishInplace(T *data, size_t n) {
         data[i] = static_cast<T>(x * relu6 / 6.0f);
       }
     } else {
-      // EXACT original bca91663 baseline loop!
+      // EXACT SiLU x/(1+exp(-x)). FP32 gets a NEON-vectorized path (4-wide
+      // expf + reciprocal, ~1e-6 error) so the epilogue is no longer a scalar
+      // std::exp per element -- the FP16 build already uses a LUT; only the
+      // FP32 (W8A32 / W32A32) path was scalar.
+#if defined(__ARM_NEON)
+      if constexpr (std::is_same_v<T, float>) {
+        const float32x4_t one = vdupq_n_f32(1.0f);
+        for (; i + 3 < end; i += 4) {
+          float32x4_t vx = vld1q_f32(&data[i]);
+          float32x4_t e = nntr_vexpq_f32(vnegq_f32(vx));
+          float32x4_t denom = vaddq_f32(one, e);
+          float32x4_t r = vrecpeq_f32(denom);
+          r = vmulq_f32(vrecpsq_f32(denom, r), r);
+          r = vmulq_f32(vrecpsq_f32(denom, r), r);
+          vst1q_f32(&data[i], vmulq_f32(vx, r));
+        }
+      }
+#endif
       for (; i < end; ++i) {
         const float x = static_cast<float>(data[i]);
         data[i] = static_cast<T>(x / (1.0f + std::exp(-x)));
