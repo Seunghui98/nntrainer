@@ -9,6 +9,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -189,12 +190,25 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::TensorDim kf(1, 1, K, F, nchw);
   nntrainer::TensorDim kd(1, 1, K, D, nchw);
 
+  // Op-level timing inside the head, opt-in via NNTR_LAYER_TIME (same env as
+  // the per-layer timer), so the head's internal matmuls can be attributed.
+  const bool op_time = std::getenv("NNTR_LAYER_TIME") != nullptr;
+  auto clk = []() { return std::chrono::high_resolution_clock::now(); };
+  auto rep = [&](const char *tag,
+                 std::chrono::high_resolution_clock::time_point t0) {
+    if (op_time)
+      std::cerr << "[head-op] " << tag << " : "
+                << std::chrono::duration<double, std::micro>(clk() - t0).count()
+                << " us\n";
+  };
+
   for (unsigned int b = 0; b < batch; ++b) {
     const size_t base = static_cast<size_t>(b) * in_feat;
     float *outb = out_all + b * out_feat;
 
     // 1. Gather tokens X[K, F] from the conv output (format-aware) and apply
     //    ScaleNorm (RMS over F, scalar gain mlp_g).
+    auto _t = clk();
     Tensor X(kf, true);
     float *xp = X.getData<float>();
     for (unsigned int k = 0; k < K; ++k) {
@@ -212,11 +226,16 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         xp[k * F + s] *= inv;
     }
 
+    rep("1_gather_scalenorm", _t);
+
     // 2. mlp: H = X @ Wmlp  -> [K, D]
+    _t = clk();
     Tensor H = X.dot(w_mlp);
+    rep("2_mlp_dot", _t);
 
     // 3. GAU on H -> G [K, D].
     // 3a. ScaleNorm over D (scalar gau_g).
+    _t = clk();
     Tensor H_ln(kd, true);
     const float *hp = H.getData<float>();
     float *hlp = H_ln.getData<float>();
@@ -232,11 +251,15 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         hlp[k * D + d] = hp[k * D + d] * inv;
     }
 
+    rep("3a_gau_scalenorm", _t);
+
     // 3b. uv = SiLU(H_ln @ Wuv) ; split u, v, base ; build q, k.
+    _t = clk();
     Tensor uv = H_ln.dot(w_uv);
     float *uvp = uv.getData<float>();
     for (unsigned int i = 0; i < K * UV; ++i)
       uvp[i] = silu(uvp[i]);
+    rep("3b_uv_dot_silu", _t);
 
     nntrainer::TensorDim ke(1, 1, K, E, nchw);
     nntrainer::TensorDim ks(1, 1, K, S, nchw);
@@ -257,6 +280,7 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 
     // 3c. kernel = relu(q k^T / sqrt_s)^2 ; attn = kernel @ v ; gated = u*attn.
+    _t = clk();
     Tensor qk = q.dot(kk, false, true); // [K, K]
     float *qkp = qk.getData<float>();
     for (unsigned int i = 0; i < K * K; ++i) {
@@ -268,8 +292,10 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     float *ap = attn.getData<float>();
     for (unsigned int i = 0; i < K * E; ++i)
       ap[i] *= up[i];
+    rep("3c_attn", _t);
 
     // 3d. out_gau = gated @ Wo ; G = res_scale * H + out_gau.
+    _t = clk();
     Tensor out_gau = attn.dot(w_o); // [K, D]
     const float *ogp = out_gau.getData<float>();
     Tensor G(kd, true);
@@ -277,14 +303,17 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     for (unsigned int k = 0; k < K; ++k)
       for (unsigned int d = 0; d < D; ++d)
         gp[k * D + d] = rs_p[d] * hp[k * D + d] + ogp[k * D + d];
+    rep("3d_o_dot", _t);
 
     // 4. cls_x, cls_y ; write [cls_x rows ; cls_y rows] into the output.
+    _t = clk();
     Tensor px = G.dot(w_cx); // [K, simcc]
     Tensor py = G.dot(w_cy); // [K, simcc]
     const float *pxp = px.getData<float>();
     const float *pyp = py.getData<float>();
     std::copy(pxp, pxp + K * simcc, outb);
     std::copy(pyp, pyp + K * simcc, outb + static_cast<size_t>(K) * simcc);
+    rep("4_cls_xy_dot", _t);
   }
 }
 
