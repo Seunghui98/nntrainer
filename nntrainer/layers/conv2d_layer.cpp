@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -1945,6 +1946,36 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     {
       convApplySwishInplace(hidden_.getData<float>(), n);
     }
+  }
+
+  // Optional per-conv NaN/inf localization (NNTR_CONV_DEBUG). Scans the conv
+  // output so the first conv that emits a non-finite value is named directly;
+  // used to pinpoint where a quantized (Q8_0) conv pipeline goes bad.
+  if (std::getenv("NNTR_CONV_DEBUG") != nullptr) {
+    const size_t n = hidden_.size();
+    size_t nnan = 0, ninf = 0;
+    double mn = 1e300, mx = -1e300;
+    auto acc = [&](float v) {
+      if (std::isnan(v)) { ++nnan; return; }
+      if (std::isinf(v)) { ++ninf; return; }
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    };
+#ifdef ENABLE_FP16
+    if (hidden_.getDataType() == nntrainer::Tdatatype::FP16) {
+      const _FP16 *p = hidden_.getData<_FP16>();
+      for (size_t i = 0; i < n; ++i) acc(static_cast<float>(p[i]));
+    } else
+#endif
+    {
+      const float *p = hidden_.getData<float>();
+      for (size_t i = 0; i < n; ++i) acc(p[i]);
+    }
+    std::cerr << "[conv-dbg] " << context.getName() << " dt="
+              << (hidden_.getDataType() == nntrainer::Tdatatype::FP16 ? "fp16"
+                                                                      : "fp32")
+              << " n=" << n << " nan=" << nnan << " inf=" << ninf
+              << " min=" << mn << " max=" << mx << "\n";
   }
 }
 
