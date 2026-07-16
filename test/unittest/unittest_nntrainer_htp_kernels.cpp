@@ -391,6 +391,121 @@ TEST_F(HtpKernelTest, Accuracy_u8i4_full_pipeline) {
   }
 }
 
+// ---- u8i8 full pipeline: same as u8i4 but 8-bit weights --------------------
+
+// Mirror of u8i4FullPipelineRelErr for the u8i8 path: per-output-channel INT8
+// weight ([-127,127], scale = max_abs/127, zp_corr = 128*sum), WH-packed via
+// the in-place i8 converter, per-tensor u8 activation, kernel, dequant. Same
+// fc_layer shapes so the u8i4 and u8i8 HexKL kernels can be compared directly
+// (this is the HexKL half of the fc_layer mm HexKL-vs-QNN comparison; QNN is
+// fed the identical quantized operands on device). Negative return = setup
+// failure.
+static float u8i8FullPipelineRelErr(int M, int N, int K, int domain,
+                                    uint32_t seed) {
+  const int Mp = ((M + 63) / 64) * 64; // HMX INT8 requires M % 64 == 0
+  auto A = makeRandF32(M * K, -1.0f, 1.0f, seed);
+  auto W = makeRandF32(N * K, -0.5f, 0.5f, seed + 1);
+
+  // FP32 reference: C[m,n] = sum_k A[m,k] * W[n,k].
+  std::vector<float> C_ref((size_t)M * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k)
+        acc += A[(size_t)m * K + k] * W[(size_t)n * K + k];
+      C_ref[(size_t)m * N + n] = acc;
+    }
+
+  // Quantize weight per-output-channel to i8 [-127,127]; compute zp_corr.
+  std::vector<int8_t> Wi8((size_t)N * K, 0);
+  std::vector<float> wt_scale(N, 1.0f);
+  std::vector<int32_t> zp_corr(N, 0);
+  for (int n = 0; n < N; ++n) {
+    float maxabs = 0.0f;
+    for (int k = 0; k < K; ++k)
+      maxabs = std::max(maxabs, std::abs(W[(size_t)n * K + k]));
+    float s = maxabs > 0.0f ? maxabs / 127.0f : 1.0f;
+    wt_scale[n] = s;
+    int32_t rowsum = 0;
+    for (int k = 0; k < K; ++k) {
+      long q = std::lround(W[(size_t)n * K + k] / s);
+      int8_t c = (int8_t)std::max<long>(-127, std::min<long>(127, q));
+      Wi8[(size_t)n * K + k] = c;
+      rowsum += c;
+    }
+    zp_corr[n] = 128 * rowsum;
+  }
+
+  // Pack i8 weight to WH layout in place (rm_to_wh_i8_inplace takes (N, K)).
+  const size_t w_bytes = (size_t)N * K;
+  NpuBuf Wb(w_bytes);
+  if (!Wb.ok())
+    return -1.0f;
+  std::memcpy(Wb.p, Wi8.data(), w_bytes);
+  if (sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
+                                   static_cast<int8_t *>(Wb.p)) != 0)
+    return -2.0f;
+
+  // Quantize activation per-tensor to u8 (zp=128); pad to Mp rows with 128.
+  float amax = 0.0f;
+  for (int i = 0; i < M * K; ++i)
+    amax = std::max(amax, std::abs(A[i]));
+  float act_scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+  std::vector<uint8_t> Xu8((size_t)Mp * K, 128);
+  for (int m = 0; m < M; ++m)
+    for (int k = 0; k < K; ++k) {
+      float q = std::round(A[(size_t)m * K + k] / act_scale) + 128.0f;
+      q = std::max(0.0f, std::min(255.0f, q));
+      Xu8[(size_t)m * K + k] = (uint8_t)q;
+    }
+
+  NpuBuf Xb((size_t)Mp * K * sizeof(uint8_t)),
+    Cb((size_t)Mp * N * sizeof(int32_t));
+  if (!Xb.ok() || !Cb.ok())
+    return -3.0f;
+  std::memcpy(Xb.p, Xu8.data(), (size_t)Mp * K * sizeof(uint8_t));
+  std::memset(Cb.p, 0, (size_t)Mp * N * sizeof(int32_t));
+  if (sdkl_npu_mm_u8i8_i32(domain, Mp, N, K, static_cast<int32_t *>(Cb.p),
+                           static_cast<const uint8_t *>(Xb.p),
+                           static_cast<const int8_t *>(Wb.p)) != 0)
+    return -4.0f;
+
+  // Dequant: C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]).
+  const int32_t *Ci = static_cast<const int32_t *>(Cb.p);
+  std::vector<float> C((size_t)M * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n)
+      C[(size_t)m * N + n] = act_scale * wt_scale[n] *
+                             ((float)Ci[(size_t)m * N + n] - (float)zp_corr[n]);
+
+  return relErrorF32(C.data(), C_ref.data(), M * N);
+}
+
+TEST_F(HtpKernelTest, Accuracy_u8i8_full_pipeline) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  struct Case {
+    const char *name;
+    int M, N, K;
+  };
+  const std::vector<Case> cases = {
+    {"prefill_wq", 5, 2048, 1024},   {"decode_wq", 1, 2048, 1024},
+    {"prefill_wk", 5, 1024, 1024},   {"prefill_ffn_up", 5, 3072, 1024},
+    {"prefill_ffn_down", 5, 1024, 3072}, {"decode_ffn_down", 1, 1024, 3072},
+  };
+  for (const auto &c : cases) {
+    float e = u8i8FullPipelineRelErr(c.M, c.N, c.K, domain,
+                                     200u + (uint32_t)(c.M * 131 + c.N));
+    std::printf("[u8i8 full-pipeline] %-18s M=%4d N=%4d K=%4d  relErr=%.4f\n",
+                c.name, c.M, c.N, c.K, e);
+    std::fflush(stdout);
+    ASSERT_GE(e, 0.0f) << c.name << ": kernel/setup failed (rc=" << e << ")";
+    // INT8 is far tighter than INT4; a few % worst case.
+    EXPECT_LT(e, 0.05f) << c.name << ": relative error too high for INT8";
+  }
+}
+
 // ---- Perf harness ----------------------------------------------------------
 
 /**
@@ -540,6 +655,126 @@ TEST_F(HtpKernelTest, Perf_u8i8_i32) {
     GTEST_SKIP() << "NPU not available on this device";
   perfSweepU8I8(domain, generalShapes(), "general");
   perfSweepU8I8(domain, llmShapes(), "llm");
+  SUCCEED();
+}
+
+// ---- fc_layer mm-level comparison: HexKL u8i4 vs u8i8 ----------------------
+
+// Times the u8i4 and u8i8 HexKL kernels on the same fc_layer mm shapes with
+// identical (matched) quantization, printing kernel latency and relErr vs the
+// FP32 reference side by side. This is the HexKL side of the fc_layer
+// HexKL-vs-QNN comparison; the QNN column is filled in on a device with the
+// QNN SDK by feeding QNN the same quantized operands (see
+// docs/backend_guide/htp_backend/06_fc_mm_hexkl_vs_qnn.md). Kernel-only timing
+// hoists all allocation/quantization/WH packing out of the measured loop so
+// only the sdkl_npu_mm_* call is timed.
+TEST_F(HtpKernelTest, FcMm_Compare_HexKL_u8i4_u8i8) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  struct Case {
+    const char *name;
+    int M, N, K;
+  };
+  const std::vector<Case> cases = {
+    {"prefill_wq", 64, 2048, 1024}, {"prefill_wk", 64, 1024, 1024},
+    {"prefill_ffn_up", 64, 3072, 1024}, {"prefill_ffn_down", 64, 1024, 3072},
+    {"decode_wq", 1, 2048, 1024}, {"decode_ffn_down", 1, 1024, 3072},
+  };
+
+  std::printf("\n| shape | M | N | K | u8i4 ms | u8i4 relErr | u8i8 ms | "
+              "u8i8 relErr |\n");
+  std::printf("|---|---|---|---|---|---|---|---|\n");
+
+  for (const auto &c : cases) {
+    const int M = c.M, N = c.N, K = c.K;
+    const int Mp = ((M + 63) / 64) * 64;
+
+    // Shared operands (identical for both kernels).
+    auto A = makeRandF32(M * K, -1.0f, 1.0f, 900u + (uint32_t)(c.N));
+    auto W = makeRandF32(N * K, -0.5f, 0.5f, 901u + (uint32_t)(c.N));
+
+    // --- u8i4 kernel-only timing ---
+    double u8i4_ms = -1.0;
+    float u8i4_err = u8i4FullPipelineRelErr(M, N, K, domain, 900u + c.N);
+    {
+      std::vector<int8_t> Wi4((size_t)N * K, 0);
+      for (int n = 0; n < N; ++n) {
+        float mx = 0.0f;
+        for (int k = 0; k < K; ++k)
+          mx = std::max(mx, std::abs(W[(size_t)n * K + k]));
+        float s = mx > 0.0f ? mx / 7.0f : 1.0f;
+        for (int k = 0; k < K; ++k) {
+          long q = std::lround(W[(size_t)n * K + k] / s);
+          Wi4[(size_t)n * K + k] = (int8_t)std::max<long>(-7, std::min<long>(7, q));
+        }
+      }
+      NpuBuf Win((size_t)N * K), Wwh((size_t)N * K),
+        Xb((size_t)Mp * K), Cb((size_t)Mp * N * sizeof(int32_t));
+      bool packed = false;
+      if (Win.ok() && Wwh.ok() && Xb.ok() && Cb.ok()) {
+        std::memcpy(Win.p, Wi4.data(), (size_t)N * K);
+        packed = sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wwh.p),
+                                      static_cast<int8_t *>(Win.p), (size_t)K,
+                                      (size_t)N) == 0;
+      }
+      if (packed) {
+        std::memset(Xb.p, 128, (size_t)Mp * K);
+        int rc = 0;
+        auto call = [&]() {
+          rc = sdkl_npu_mm_u8i4_i32(domain, Mp, N, K,
+                                    static_cast<int32_t *>(Cb.p),
+                                    static_cast<const uint8_t *>(Xb.p),
+                                    static_cast<const uint8_t *>(Wwh.p));
+        };
+        TimeStats t = timeIt(5, 30, call);
+        if (rc == 0)
+          u8i4_ms = t.mean_ms;
+      }
+    }
+
+    // --- u8i8 kernel-only timing ---
+    double u8i8_ms = -1.0;
+    float u8i8_err = u8i8FullPipelineRelErr(M, N, K, domain, 902u + c.N);
+    {
+      std::vector<int8_t> Wi8((size_t)N * K, 0);
+      for (int n = 0; n < N; ++n) {
+        float mx = 0.0f;
+        for (int k = 0; k < K; ++k)
+          mx = std::max(mx, std::abs(W[(size_t)n * K + k]));
+        float s = mx > 0.0f ? mx / 127.0f : 1.0f;
+        for (int k = 0; k < K; ++k) {
+          long q = std::lround(W[(size_t)n * K + k] / s);
+          Wi8[(size_t)n * K + k] =
+            (int8_t)std::max<long>(-127, std::min<long>(127, q));
+        }
+      }
+      NpuBuf Wb((size_t)N * K), Xb((size_t)Mp * K),
+        Cb((size_t)Mp * N * sizeof(int32_t));
+      if (Wb.ok() && Xb.ok() && Cb.ok()) {
+        std::memcpy(Wb.p, Wi8.data(), (size_t)N * K);
+        sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
+                                     static_cast<int8_t *>(Wb.p));
+        std::memset(Xb.p, 128, (size_t)Mp * K);
+        int rc = 0;
+        auto call = [&]() {
+          rc = sdkl_npu_mm_u8i8_i32(domain, Mp, N, K,
+                                    static_cast<int32_t *>(Cb.p),
+                                    static_cast<const uint8_t *>(Xb.p),
+                                    static_cast<const int8_t *>(Wb.p));
+        };
+        TimeStats t = timeIt(5, 30, call);
+        if (rc == 0)
+          u8i8_ms = t.mean_ms;
+      }
+    }
+
+    std::printf("| %s | %d | %d | %d | %.4f | %.4f | %.4f | %.4f |\n", c.name, M,
+                N, K, u8i4_ms, u8i4_err, u8i8_ms, u8i8_err);
+    std::fflush(stdout);
+    EXPECT_GE(u8i4_err, 0.0f) << c.name << ": u8i4 setup failed";
+    EXPECT_GE(u8i8_err, 0.0f) << c.name << ": u8i8 setup failed";
+  }
   SUCCEED();
 }
 
