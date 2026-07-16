@@ -154,6 +154,16 @@ int main(int argc, char **argv) {
         weights_default = "yolov7_pose_q8_0.safetensors";
         std::cout << "[Pose] Preset=w8a16 (Q8_0 weights + FP16 act + NHWC)"
                   << std::endl;
+      } else if (s == "w32a16" || s == "W32A16") {
+        // Diagnostic: FP16 activations WITHOUT Q8_0 weights (NHWC). Isolates
+        // FP16-activation overflow from the Q8_0 conv kernel.
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
+        preset_nhwc = true;
+        fp16_act = true;
+        std::cout << "[Pose] Preset=w32a16 (FP32 weights + FP16 act + NHWC, "
+                     "diagnostic)"
+                  << std::endl;
       } else if (s == "w8a32" || s == "W8A32") {
         // FP32-activation NHWC. NOTE: with real Q8_0 weights this is only
         // correct on x86 via --sim-q8-conv (dequantized FP32) weights; the ARM
