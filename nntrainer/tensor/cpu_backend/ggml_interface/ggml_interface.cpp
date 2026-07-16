@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
+#include <thread_manager.h>
 #ifdef Q4_0
 #undef Q4_0
 #endif
@@ -161,6 +163,88 @@ void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
   // follow-up.
   nntr_gemm_q8_0_q8_0(static_cast<int>(K), C, ldc, B, QA.data(),
                       static_cast<int>(M), static_cast<int>(N));
+}
+
+/**
+ * @brief FP32-activation Q8_0-weight indirect conv GEMM (W8A32).
+ *
+ * The W8A16 (FP16-activation) path stores activations as FP16 between layers,
+ * which accumulates rounding error across the deep backbone and collapses pose
+ * confidence. This FP32 variant keeps activations in FP32 end-to-end (matching
+ * an ONNX-Runtime int8 model's accuracy) while still doing int8 SMMLA compute:
+ * the FP32 input is gathered on the fly (no im2col materialization) and
+ * quantized per row to plain block_q8_0, the pre-repacked q8_0x4 weight is
+ * de-interleaved back to plain block_q8_0, and both feed nntr_gemm_q8_0_q8_0
+ * (the same int8 core as the FP32-output GEMM), writing FP32 output. It reuses
+ * the identical weight file as the FP16 path (no re-quantize). Portable across
+ * ISAs (all primitives have neon/avx/sve/fallback impls).
+ */
+void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
+                                         const unsigned int N,
+                                         const unsigned int K, const float *in,
+                                         const ConvGatherParams &geom,
+                                         const void *B, const unsigned int ldb,
+                                         float *C, const unsigned int ldc) {
+  auto &tm = ThreadManager::Global();
+  (void)ldb;
+  (void)ldc;
+  const unsigned int nb = K / QK8_0;
+
+  // 1) De-interleave weight q8_0x4 -> plain block_q8_0 [N][nb] (inverse of the
+  //    repack_q8_0 done at weight-export time). N % 4 == 0 is guaranteed by the
+  //    Q8_0 conv eligibility guard (out_ch % 32 == 0).
+  std::vector<block_q8_0> Wp((size_t)N * nb);
+  {
+    const block_q8_0x4 *bx4 = (const block_q8_0x4 *)B;
+    const unsigned int NB4 = N / 4;
+    block_q8_0 *Wp_ptr = Wp.data();
+    tm.parallel_for(0, NB4, [=](size_t sc) {
+      for (unsigned int j = 0; j < nb; ++j) {
+        const block_q8_0x4 &sb = bx4[(size_t)sc * nb + j];
+        for (unsigned int r = 0; r < 4; ++r) {
+          block_q8_0 &p = Wp_ptr[(size_t)((unsigned)sc * 4 + r) * nb + j];
+          p.d = sb.d[r];
+          for (unsigned int sub = 0; sub < 4; ++sub)
+            std::memcpy(&p.qs[8 * sub], &sb.qs[32 * sub + 8 * r], 8);
+        }
+      }
+    });
+  }
+
+  // 2) Gather FP32 activation rows -> plain block_q8_0 [M][nb].
+  std::vector<block_q8_0> Ap((size_t)M * nb);
+  {
+    block_q8_0 *Ap_ptr = Ap.data();
+    const unsigned int QCHUNK = 64;
+    const size_t qloops = (M + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      std::vector<float> tile((size_t)K);
+      const unsigned int r0 = (unsigned int)q * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, M);
+      for (unsigned int r = r0; r < r1; ++r) {
+        gather_conv_act_rows_fp32(tile.data(), in, geom, (int)r, 1);
+        nntr_quantize_row_q8_0(tile.data(), &Ap_ptr[(size_t)r * nb],
+                               (int64_t)K);
+      }
+    });
+  }
+
+  // 3) Plain Q8_0 x Q8_0 GEMM -> FP32 C.
+  const unsigned int row_chunk = 16, col_chunk = 16;
+  const size_t row_loop = (M + row_chunk - 1) / row_chunk;
+  const size_t col_loop = (N + col_chunk - 1) / col_chunk;
+  const block_q8_0 *Wp_ptr = Wp.data();
+  const block_q8_0 *Ap_ptr = Ap.data();
+  tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+    unsigned int r = (unsigned int)(i / col_loop);
+    unsigned int c = (unsigned int)(i % col_loop);
+    unsigned int r0 = r * row_chunk, r1 = std::min(r0 + row_chunk, M);
+    unsigned int c0 = c * col_chunk, c1 = std::min(c0 + col_chunk, N);
+    nntr_gemm_q8_0_q8_0((int)K, C + (size_t)r0 * N + c0, N,
+                        (const void *)&Wp_ptr[(size_t)c0 * nb],
+                        (const void *)&Ap_ptr[(size_t)r0 * nb], (int)(r1 - r0),
+                        (int)(c1 - c0));
+  });
 }
 
 } // namespace nntrainer

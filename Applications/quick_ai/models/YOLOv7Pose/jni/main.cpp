@@ -165,9 +165,12 @@ int main(int argc, char **argv) {
                      "diagnostic)"
                   << std::endl;
       } else if (s == "w8a32" || s == "W8A32") {
-        // FP32-activation NHWC. NOTE: with real Q8_0 weights this is only
-        // correct on x86 via --sim-q8-conv (dequantized FP32) weights; the ARM
-        // Q8_0 conv kernel needs FP16 activations (use w8a16 on device).
+        // Q8_0 weights + FP32 activations (NHWC). The FP32-activation Q8_0
+        // indirect conv kernel (FloatTensor::convQ4_0Indirect ->
+        // __ggml_q8_0_q8_0_indirect_GEMM_fp32) keeps activations in FP32 between
+        // layers (no FP16 rounding accumulation) with int8 SMMLA compute, so
+        // this recovers ~FP32 pose accuracy at int8 speed. Same weight file as
+        // w8a16 (no re-quantize).
         model->setProperty(
           {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
         preset_nhwc = true;

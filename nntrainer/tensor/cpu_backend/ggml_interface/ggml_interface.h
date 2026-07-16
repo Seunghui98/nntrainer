@@ -264,6 +264,25 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp16(const unsigned int M,
 #endif
 
 /**
+ * @brief FP32-activation Q8_0-weight indirect-conv GEMM (W8A32).
+ *
+ * FP32 analog of __ggml_q8_0_q8_0_indirect_GEMM_fp16: keeps activations FP32
+ * between layers (no FP16 rounding accumulation -> recovers FP32-level pose
+ * accuracy) while still doing int8 SMMLA compute. The FP32 input is gathered on
+ * the fly (gather_conv_act_rows_fp32) and quantized per row to plain
+ * block_q8_0; the pre-repacked q8_0x4 weight B is de-interleaved to plain
+ * block_q8_0; both feed nntr_gemm_q8_0_q8_0 with FP32 output C. Consumes the
+ * same weight file as the FP16 path. Used by FloatTensor::convQ4_0Indirect for
+ * Q8_0 weights.
+ */
+void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
+                                         const unsigned int N,
+                                         const unsigned int K, const float *in,
+                                         const ConvGatherParams &geom,
+                                         const void *B, const unsigned int ldb,
+                                         float *C, const unsigned int ldc);
+
+/**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *
  * @param M as descripted above
