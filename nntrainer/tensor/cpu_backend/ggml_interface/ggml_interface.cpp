@@ -14,9 +14,11 @@
 #include <cmath>
 #include <cstring>
 #include <ggml_interface.h>
+#include <mutex>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 #include <thread_manager.h>
+#include <unordered_map>
 #ifdef Q4_0
 #undef Q4_0
 #endif
@@ -191,24 +193,33 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
   const unsigned int nb = K / QK8_0;
 
   // 1) De-interleave weight q8_0x4 -> plain block_q8_0 [N][nb] (inverse of the
-  //    repack_q8_0 done at weight-export time). N % 4 == 0 is guaranteed by the
-  //    Q8_0 conv eligibility guard (out_ch % 32 == 0).
-  std::vector<block_q8_0> Wp((size_t)N * nb);
+  //    repack_q8_0 done at weight-export time), cached per weight-buffer pointer
+  //    so it runs once instead of every forward. Weights are constant during
+  //    inference, so the cache key (B) is stable; the de-interleaved copy is the
+  //    same byte size as the packed weight (N*nb*sizeof(block_q8_0)).
+  const block_q8_0 *Wp_ptr;
   {
-    const block_q8_0x4 *bx4 = (const block_q8_0x4 *)B;
-    const unsigned int NB4 = N / 4;
-    block_q8_0 *Wp_ptr = Wp.data();
-    tm.parallel_for(0, NB4, [=](size_t sc) {
-      for (unsigned int j = 0; j < nb; ++j) {
-        const block_q8_0x4 &sb = bx4[(size_t)sc * nb + j];
-        for (unsigned int r = 0; r < 4; ++r) {
-          block_q8_0 &p = Wp_ptr[(size_t)((unsigned)sc * 4 + r) * nb + j];
-          p.d = sb.d[r];
-          for (unsigned int sub = 0; sub < 4; ++sub)
-            std::memcpy(&p.qs[8 * sub], &sb.qs[32 * sub + 8 * r], 8);
+    static std::mutex wcache_mtx;
+    static std::unordered_map<const void *, std::vector<block_q8_0>> wcache;
+    std::lock_guard<std::mutex> lk(wcache_mtx);
+    auto it = wcache.find(B);
+    if (it == wcache.end()) {
+      std::vector<block_q8_0> Wp((size_t)N * nb);
+      const block_q8_0x4 *bx4 = (const block_q8_0x4 *)B;
+      const unsigned int NB4 = N / 4;
+      for (unsigned int sc = 0; sc < NB4; ++sc)
+        for (unsigned int j = 0; j < nb; ++j) {
+          const block_q8_0x4 &sb = bx4[(size_t)sc * nb + j];
+          for (unsigned int r = 0; r < 4; ++r) {
+            block_q8_0 &p = Wp[(size_t)(sc * 4 + r) * nb + j];
+            p.d = sb.d[r];
+            for (unsigned int sub = 0; sub < 4; ++sub)
+              std::memcpy(&p.qs[8 * sub], &sb.qs[32 * sub + 8 * r], 8);
+          }
         }
-      }
-    });
+      it = wcache.emplace(B, std::move(Wp)).first;
+    }
+    Wp_ptr = it->second.data();
   }
 
   // 2) Gather FP32 activation rows -> plain block_q8_0 [M][nb].
@@ -236,7 +247,6 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
   const unsigned int row_chunk = 16, col_chunk = 16;
   const size_t row_loop = (M + row_chunk - 1) / row_chunk;
   const size_t col_loop = (N + col_chunk - 1) / col_chunk;
-  const block_q8_0 *Wp_ptr = Wp.data();
   const block_q8_0 *Ap_ptr = Ap.data();
   tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
     unsigned int r = (unsigned int)(i / col_loop);
