@@ -41,31 +41,32 @@ def read_span(path, base, off):
         return f.read(off[1] - off[0])
 
 
-def dequant_q8_0x4(raw, out_ch, crs):
-    """Decode block_q8_0x4 [out_ch/4][crs/32] -> float32 [out_ch, crs]."""
-    nb = crs // 32
-    sb = out_ch // 4
-    sb_bytes = 8 + 128  # 4x fp16 scale + 128 int8
-    expect = sb * nb * sb_bytes
-    if len(raw) != expect:
-        return None, f"byte-size mismatch: have {len(raw)} expect {expect}"
-    buf = np.frombuffer(raw, dtype=np.uint8)
-    out = np.zeros((out_ch, crs), dtype=np.float32)
-    bad_scale = 0
-    pos = 0
-    for s in range(sb):
-        for j in range(nb):
-            d = np.frombuffer(raw[pos : pos + 8], dtype=np.float16).astype(np.float32)
-            qs = np.frombuffer(raw[pos + 8 : pos + 8 + 128], dtype=np.int8)
-            pos += sb_bytes
-            if not np.isfinite(d).all():
-                bad_scale += int((~np.isfinite(d)).sum())
-            for r in range(4):
-                row = s * 4 + r
-                for sub in range(4):
-                    seg = qs[32 * sub + 8 * r : 32 * sub + 8 * r + 8].astype(np.float32)
-                    out[row, j * 32 + sub * 8 : j * 32 + sub * 8 + 8] = seg * d[r]
-    return out, (f"non-finite-scales={bad_scale}" if bad_scale else "")
+def scan_q8_0x4(raw):
+    """Validate a block_q8_0x4 blob straight from its bytes (shape-independent).
+
+    Each 136-byte super-block = 4 fp16 scales + 128 int8. Reports the number of
+    non-finite scales and the dequantized value range across the whole blob.
+    """
+    sb_bytes = 8 + 128
+    if len(raw) % sb_bytes != 0:
+        return None, f"not a multiple of super-block (136B): {len(raw)} bytes"
+    nsb = len(raw) // sb_bytes
+    d = np.frombuffer(raw, dtype=np.uint8).reshape(nsb, sb_bytes)
+    scales = (
+        np.frombuffer(d[:, :8].tobytes(), dtype=np.float16)
+        .astype(np.float32)
+        .reshape(nsb, 4)
+    )
+    qs = d[:, 8:].astype(np.int8).astype(np.float32)  # (nsb, 128)
+    bad = int((~np.isfinite(scales)).sum())
+    # dequant magnitude bound: |val| <= |q| * |scale|; use per-superblock/per-row
+    finite = np.isfinite(scales)
+    smax = float(np.abs(scales[finite]).max()) if finite.any() else float("nan")
+    qmax = float(np.abs(qs).max())
+    approx_max = smax * qmax
+    note = f"scales:bad={bad} |scale|max={smax:.4g} |q|max={qmax:.0f} |val|<={approx_max:.4g}"
+    ok = bad == 0
+    return ok, note
 
 
 def main():
@@ -93,13 +94,12 @@ def main():
         elif dt in ("F16", "FP16"):
             v = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
         elif dt == "Q8_0":
-            # shape is [1,1,CRS,out_ch] (matmul weight); decode to [out_ch,CRS].
-            crs, out_ch = int(shape[-2]), int(shape[-1])
-            v, note = dequant_q8_0x4(raw, out_ch, crs)
-            if v is None:
-                print(f"  !! {name:50s} {dt:6s} {str(shape):20s} {note}")
+            ok, note = scan_q8_0x4(raw)
+            flag = "ok" if ok else "!!"
+            if not ok:
                 n_bad += 1
-                continue
+            print(f"  {flag} {name:50s} {dt:6s} {str(shape):20s} bytes={len(raw)} {note}")
+            continue
         else:
             print(f"  -- {name:50s} {dt:6s} {str(shape):20s} (skipped)")
             continue
