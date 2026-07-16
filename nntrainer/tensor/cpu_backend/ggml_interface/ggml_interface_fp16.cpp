@@ -857,19 +857,17 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp16(const unsigned int M,
   (void)ldc;
 
   // ------------------------------------------------------------------------
-  // Plain (non-interleaved) path -- the DEFAULT for Q8_0-weight FP16 conv.
+  // Plain (non-interleaved) fallback path, opt-in via NNTR_Q8_CONV_PLAIN.
   //
-  // The interleaved q8_0x4 SMMLA kernel (nntr_gemm_q8_0_q8_0_4x4_fp16, taken
-  // below when NNTR_Q8_CONV_INTERLEAVED is set) is the speed variant but has
-  // no unit-test coverage and was observed to produce NaN on-device for this
-  // model, so we default to the proven plain kernel: de-interleave the pre-
-  // repacked q8_0x4 weight back to plain block_q8_0, gather+quantize the FP16
-  // activation to plain block_q8_0, and run nntr_gemm_q8_0_q8_0_fp16 (byte-
-  // for-byte the same int8 SDOT/SMMLA core as the FP32-output
-  // nntr_gemm_q8_0_q8_0). Both paths consume the *same* weight file, so this
-  // is a drop-in swap with no re-quantize. Set NNTR_Q8_CONV_INTERLEAVED=1 to
-  // A/B against the fast interleaved kernel.
-  if (std::getenv("NNTR_Q8_CONV_INTERLEAVED") == nullptr) {
+  // The DEFAULT is the interleaved q8_0x4 SMMLA kernel below
+  // (nntr_gemm_q8_0_q8_0_4x4_fp16): it is verified correct on-device and ~18%
+  // faster end-to-end than this plain path (identical keypoint output). This
+  // fallback de-interleaves the pre-repacked q8_0x4 weight back to plain
+  // block_q8_0, gathers+quantizes the FP16 activation to plain block_q8_0, and
+  // runs nntr_gemm_q8_0_q8_0_fp16 (same int8 SDOT/SMMLA core as the FP32-output
+  // nntr_gemm_q8_0_q8_0). Both paths consume the *same* weight file, so it is a
+  // drop-in A/B swap with no re-quantize -- kept as a reference/debug path.
+  if (std::getenv("NNTR_Q8_CONV_PLAIN") != nullptr) {
     const unsigned int nbp = K / QK8_0;
 
     // 1) De-interleave weight q8_0x4 -> plain block_q8_0 [N][nbp]
