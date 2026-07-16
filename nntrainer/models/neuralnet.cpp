@@ -26,9 +26,11 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -537,17 +539,21 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
-      // auto start_layer =
-      //      std::chrono::high_resolution_clock::now(); // log the
-      //      start_prefill time
       model_graph.flushCacheExcept(f);
-      node->incremental_forwarding(from, to, training);
-      // auto end_layer =
-      //  std::chrono::high_resolution_clock::now(); // log th
-      //   auto duration_ =
-      //   std::chrono::duration_cast<std::chrono::nanoseconds>(end_layer-start_layer);
-      // std::cout << node->getName() <<" : "<< duration_.count()<<"
-      // ns"<<std::endl;
+      // Per-layer wall-clock timing, opt-in via NNTR_LAYER_TIME, to locate the
+      // real forward-pass hotspots (e.g. which convs / the head dominate).
+      static const bool layer_time = std::getenv("NNTR_LAYER_TIME") != nullptr;
+      if (layer_time) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        node->incremental_forwarding(from, to, training);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double us =
+          std::chrono::duration<double, std::micro>(t1 - t0).count();
+        std::cerr << "[layer-time] " << node->getName() << " : " << us
+                  << " us\n";
+      } else {
+        node->incremental_forwarding(from, to, training);
+      }
     } else {
       model_graph.checkLoadComplete(f);
       node->incremental_forwarding(from, to, training);
