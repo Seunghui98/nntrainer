@@ -177,10 +177,28 @@ int main(int argc, char **argv) {
           {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
         preset_nhwc = true;
         preset_q = true;
-        yolov7_pose::quantWeightDtype() = "Q8_0";
-        weights_default = "yolov7_pose_q8_0.safetensors";
-        std::cout << "[Pose] Preset=w8a8 (Q8_0 weights + int8 act + NHWC)"
-                  << std::endl;
+        // NNTR_W8A8_FP32W: keep conv weights FP32 in the file and let the
+        // per-channel path quantize them ONCE, directly from FP32, at load
+        // (getPerChConvWeight's fp32_src path) with an FP32 per-channel scale.
+        // This matches the S0 simulation's per-channel scheme exactly (81/87);
+        // a Q8_0 conv file instead double-quantizes (per-block int8 in the file
+        // -> per-channel requant at load), which costs the borderline keypoint
+        // (80/87). Compute stays int8 (weights are quantized once, cached), so
+        // there is no speed change -- only the on-disk weights are larger.
+        const bool w8a8_fp32w = std::getenv("NNTR_W8A8_FP32W") != nullptr;
+        if (w8a8_fp32w) {
+          yolov7_pose::quantWeightDtype() = "FP32";
+          weights_default = "yolov7_pose.safetensors";
+          std::cout
+            << "[Pose] Preset=w8a8 (FP32 weights, load-time per-channel int8 "
+               "+ int8 act + NHWC)"
+            << std::endl;
+        } else {
+          yolov7_pose::quantWeightDtype() = "Q8_0";
+          weights_default = "yolov7_pose_q8_0.safetensors";
+          std::cout << "[Pose] Preset=w8a8 (Q8_0 weights + int8 act + NHWC)"
+                    << std::endl;
+        }
       } else if (s == "w8a32" || s == "W8A32") {
         // Q8_0 weights + FP32 activations (NHWC). The FP32-activation Q8_0
         // indirect conv kernel (FloatTensor::convQ4_0Indirect ->
