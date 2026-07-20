@@ -111,6 +111,80 @@ struct PerChConvWeight {
   unsigned int Nreal = 0;  ///< real out_ch
 };
 
+static inline float convFp16ToFp32Bits(uint16_t h); // defined below
+
+// fp32 -> fp16 bits (round-to-nearest-even). Inverse of convFp16ToFp32Bits;
+// used by the offline per-channel Q8_0 quantizer so the stored scale d is the
+// exact fp16 value the runtime reads back (convFp16ToFp32Bits). Scales are
+// non-negative (amax/127), so the subnormal/negative paths are not exercised,
+// but sign is preserved for generality.
+static inline uint16_t convFp32ToFp16Bits(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, 4);
+  uint32_t sign = (bits >> 16) & 0x8000;
+  int32_t exp = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
+  uint32_t man = bits & 0x7fffff;
+  if (exp <= 0)
+    return (uint16_t)sign; // underflow -> signed zero
+  if (exp >= 31)
+    return (uint16_t)(sign | 0x7c00); // overflow -> inf
+  uint32_t m = man >> 13;
+  uint32_t rem = man & 0x1fff;
+  if (rem > 0x1000 || (rem == 0x1000 && (m & 1)))
+    ++m;
+  if (m == 0x400) {
+    m = 0;
+    if (++exp >= 31)
+      return (uint16_t)(sign | 0x7c00);
+  }
+  return (uint16_t)(sign | ((uint32_t)exp << 10) | m);
+}
+
+// Offline PER-CHANNEL Q8_0 quantizer for conv weights: writes a plain
+// block_q8_0 stream ([nrow, ncol/32]) where every block of output-channel row
+// n carries the SAME scale d = amax(row_n)/127 (fp16-rounded), and
+// qs = round(x / d). This differs from ggml's per-block quantize_q8_0 (a
+// distinct d per 32-block); it is still a byte-valid Q8_0 tensor.
+//
+// Why this recovers per-channel accuracy without any runtime change: the W8A8
+// per-channel runtime (getPerChConvWeight) dequantizes the loaded Q8_0 and
+// re-quantizes it per output channel (amax over the whole row / 127). When the
+// file is ALREADY per-channel, the dequantized row's amax element is exactly
+// d*127 (the amax element quantizes to +-127), so the re-quant scale comes back
+// to d and every qs is reproduced -- the re-quant is the identity. The prior
+// per-BLOCK file instead forced a lossy dequant(per-block)->requant(per-channel)
+// double rounding (81 -> 80). ncol must be a multiple of 32 (caller guards it).
+static inline void quantize_q8_0_per_channel(const float *src, char *dst,
+                                             unsigned int nrow,
+                                             unsigned int ncol) {
+  struct local_block_q8_0 {
+    uint16_t d;
+    int8_t qs[32];
+  };
+  auto &tm = ThreadManager::Global();
+  const unsigned int nb = ncol / 32;
+  local_block_q8_0 *out = reinterpret_cast<local_block_q8_0 *>(dst);
+  tm.parallel_for(0, nrow, [=](size_t n) {
+    const float *row = src + (size_t)n * ncol;
+    float amax = 0.f;
+    for (unsigned int k = 0; k < ncol; ++k)
+      amax = std::max(amax, std::fabs(row[k]));
+    const float d = amax > 0.f ? amax / 127.f : 1.f;
+    const uint16_t d16 = convFp32ToFp16Bits(d);
+    const float d_used = convFp16ToFp32Bits(d16); // exact value runtime reads
+    const float inv = d_used > 0.f ? 1.f / d_used : 0.f;
+    for (unsigned int j = 0; j < nb; ++j) {
+      local_block_q8_0 &b = out[(size_t)n * nb + j];
+      b.d = d16;
+      for (int c = 0; c < 32; ++c) {
+        const float v = row[j * 32 + c] * inv;
+        b.qs[c] =
+          (int8_t)std::max(-128.f, std::min(127.f, std::round(v)));
+      }
+    }
+  });
+}
+
 static inline float convFp16ToFp32Bits(uint16_t h) {
   uint32_t sign = (uint32_t)(h >> 15) << 31;
   uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff, bits;
@@ -2826,9 +2900,24 @@ void Conv2DLayer::save(std::ofstream &file, RunLayerContext &run_context,
       // The q8_0x4 layout is a logical byte interleave (ISA-independent); the
       // kernel decodes it, so the repacked file is portable across ISAs (unlike
       // Q4_0, whose kernel ISA-specific interleaving is dispatched at save).
-      quantize_q8_0(weight.getData<float>(), tmp.data(),
-                    static_cast<int64_t>(out_ch), static_cast<int64_t>(CRS),
-                    nullptr);
+      //
+      // When quantizing FOR the W8A8 per-channel runtime (env NNTR_W8A8_PERCH,
+      // the same flag that selects the per-channel kernel at run time), use one
+      // scale per output-channel row instead of one per 32-block. This makes the
+      // runtime's dequant->per-channel-requant the identity (see
+      // quantize_q8_0_per_channel), removing the per-block->per-channel double
+      // quantization that costs one keypoint (81 -> 80). The repack and byte
+      // layout are unchanged, so a per-channel file is still a valid Q8_0 tensor
+      // for every other reader.
+      static const bool perch_quant =
+        std::getenv("NNTR_W8A8_PERCH") != nullptr;
+      if (perch_quant)
+        quantize_q8_0_per_channel(weight.getData<float>(), tmp.data(), out_ch,
+                                  CRS);
+      else
+        quantize_q8_0(weight.getData<float>(), tmp.data(),
+                      static_cast<int64_t>(out_ch), static_cast<int64_t>(CRS),
+                      nullptr);
       repack_q8_0(quant_weight.getData<uint8_t>(), tmp.data(), out_ch, CRS);
     }
     quant_weight.save(file);
