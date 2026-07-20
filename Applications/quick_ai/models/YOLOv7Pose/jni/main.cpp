@@ -164,6 +164,22 @@ int main(int argc, char **argv) {
         std::cout << "[Pose] Preset=w32a16 (FP32 weights + FP16 act + NHWC, "
                      "diagnostic)"
                   << std::endl;
+      } else if (s == "w8a8" || s == "W8A8") {
+        // Q8_0 weights + int8-resident activations (W8A8_DESIGN.md). Same
+        // graph and weight file as w8a32; the env flag makes every Q8_0 conv
+        // emit a per-tensor-scale QINT8 activation that the next layers
+        // (Q8_0 convs, concat, max-pool, nearest-upsample) consume directly.
+        // FP32 convs and the head dequantize on entry, so the FP32 islands
+        // (stem/blocks.1/head) behave exactly like w8a32.
+        setenv("NNTR_W8A8", "1", 1);
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
+        preset_nhwc = true;
+        preset_q = true;
+        yolov7_pose::quantWeightDtype() = "Q8_0";
+        weights_default = "yolov7_pose_q8_0.safetensors";
+        std::cout << "[Pose] Preset=w8a8 (Q8_0 weights + int8 act + NHWC)"
+                  << std::endl;
       } else if (s == "w8a32" || s == "W8A32") {
         // Q8_0 weights + FP32 activations (NHWC). The FP32-activation Q8_0
         // indirect conv kernel (FloatTensor::convQ4_0Indirect ->

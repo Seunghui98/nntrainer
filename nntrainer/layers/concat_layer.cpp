@@ -13,6 +13,8 @@
  * @todo merge concat and split layer to a common implementation
  */
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -161,11 +163,45 @@ void ConcatLayer::forwarding(RunLayerContext &context, bool training) {
     const unsigned int H = out_dim.height();
     const unsigned int W = out_dim.width();
     const size_t HW = (size_t)H * W;
+    // W8A8 QINT8 concat: inputs carry per-tensor scales; the output scale is
+    // the max of the input scales and each input is rescaled int8->int8 by
+    // s_i/s_out during its copy (identity memcpy when scales match). Computed
+    // up front since every input copy needs the common output scale.
+    float q8_out_scale = 0.f;
+    if (output.getDataType() == TensorDim::DataType::QINT8) {
+      for (unsigned int idx = 0; idx < context.getNumInputs(); idx++)
+        q8_out_scale = std::max(
+          q8_out_scale, context.getInput(idx).getScale<float>()[0]);
+      if (q8_out_scale <= 0.f)
+        q8_out_scale = 1.f;
+      output.getScale<float>()[0] = q8_out_scale;
+    }
     unsigned int c_offset = 0;
     for (unsigned int idx = 0; idx < context.getNumInputs(); idx++) {
       Tensor &input = context.getInput(idx);
       const unsigned int Ci = input.channel();
-      if (input.getDataType() == TensorDim::DataType::FP32) {
+      if (input.getDataType() == TensorDim::DataType::QINT8) {
+        const int8_t *src = input.getData<int8_t>();
+        int8_t *dst = output.getData<int8_t>();
+        const float mult = input.getScale<float>()[0] / q8_out_scale;
+        const bool identity = std::fabs(mult - 1.f) < 1e-12f;
+        auto &tm = ThreadManager::Global();
+        for (unsigned int b = 0; b < B; ++b) {
+          const size_t base = (size_t)b * HW;
+          tm.parallel_for(0, HW, [&](size_t p) {
+            const int8_t *s = src + (base + p) * Ci;
+            int8_t *d = dst + (base + p) * out_dim.channel() + c_offset;
+            if (identity) {
+              std::memcpy(d, s, (size_t)Ci);
+            } else {
+              for (unsigned int c = 0; c < Ci; ++c) {
+                float q = std::round((float)s[c] * mult);
+                d[c] = (int8_t)std::max(-128.f, std::min(127.f, q));
+              }
+            }
+          });
+        }
+      } else if (input.getDataType() == TensorDim::DataType::FP32) {
         const float *src = input.getData<float>();
         float *dst = output.getData<float>();
         auto &tm = ThreadManager::Global();

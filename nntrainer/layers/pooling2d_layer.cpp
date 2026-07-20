@@ -403,6 +403,12 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
       if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
         run_nhwc.template operator()<float>();
         return;
+      } else if (in.getDataType() == ml::train::TensorDim::DataType::QINT8) {
+        // W8A8: every element shares one per-tensor scale, so raw int8
+        // comparison is the exact max; the output keeps the input's scale.
+        output.getScale<float>()[0] = in.getScale<float>()[0];
+        run_nhwc.template operator()<int8_t>();
+        return;
       }
 #ifdef ENABLE_FP16
       else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
