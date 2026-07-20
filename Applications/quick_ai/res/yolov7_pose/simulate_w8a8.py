@@ -154,6 +154,11 @@ def main():
                     "matching the device epilogue's convRoundScaleFp16. Use to "
                     "isolate whether fp16 activation-scale rounding is what "
                     "costs the device its keypoint (per_channel 81 -> 80).")
+    ap.add_argument("--quant_stem_input", action="store_true",
+                    help="ALSO int8-fake-quant the stem conv's input (the raw "
+                    "image), reproducing the device per-channel path before the "
+                    "stem exclusion fix. The design keeps the image FP32; use "
+                    "this to confirm stem-input quantization costs keypoints.")
     args = ap.parse_args()
     global ACT_SCALE_FP16
     ACT_SCALE_FP16 = args.act_fp16
@@ -198,8 +203,9 @@ def main():
             n_wq += 1
 
             # input edge int8 (except the stem, whose input -- the image --
-            # stays FP32 in the real graph)
-            if not is_stem:
+            # stays FP32 in the real graph; --quant_stem_input overrides to
+            # reproduce the pre-fix device behavior)
+            if not is_stem or args.quant_stem_input:
                 m.register_forward_pre_hook(
                     lambda mod, inp: (fake_quant_act_per_tensor(inp[0]),)
                     + tuple(inp[1:]))

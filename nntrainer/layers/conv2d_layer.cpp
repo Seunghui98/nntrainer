@@ -1330,9 +1330,16 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   // conv (out_ch % 4 != 0, uniquely out_ch=87) whose consumer rtmcc_head is a
   // hard FP32 boundary -> it stays FP32 out. Independent of the per-block
   // eligibility (quant_matmul_filter); the weight is converted in-memory.
+  // The stem (in_ch == 3) is excluded: its input is the network's FP32 image,
+  // and quantizing the raw image to int8 injects error at the very first layer
+  // that the whole net then amplifies. The validated S0 simulation keeps the
+  // stem input FP32 ("the image tensor stays FP32") and holds 81/87; the stem
+  // runs the ordinary FP32 conv (already exercised as the per-block mode's
+  // FP32 island) and its per-channel consumer quantizes its FP32 output.
   const bool perch_mode =
-    w8a8_mode && std::getenv("NNTR_W8A8_PERCH") != nullptr &&
-    groups == 1 && in_dim.getFormat() == ml::train::TensorDim::Format::NHWC;
+    w8a8_mode && std::getenv("NNTR_W8A8_PERCH") != nullptr && groups == 1 &&
+    in_dim.getFormat() == ml::train::TensorDim::Format::NHWC &&
+    in_dim.channel() != 3;
   const bool perch_q8out = perch_mode && (filter_size % 4 == 0);
   const bool w8a8_q8out =
     !perch_mode && w8a8_mode && quant_matmul_filter &&
@@ -1748,10 +1755,14 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
       (weight_dtype == nntrainer::Tdatatype::Q4_0 ||
        weight_dtype == nntrainer::Tdatatype::QINT4 || weight_is_q8);
     const unsigned int owoh = out_dim.width() * out_dim.height();
+    // Mirrors finalize's perch_mode, including the stem exclusion (in_ch == 3):
+    // the stem consumes the FP32 image directly through the ordinary FP32 conv
+    // so the raw input is never quantized (matches the 81/87 S0 simulation).
     const bool perch_mode =
       std::getenv("NNTR_W8A8") != nullptr &&
       std::getenv("NNTR_W8A8_PERCH") != nullptr &&
-      in_dim.getFormat() == ml::train::TensorDim::Format::NHWC;
+      in_dim.getFormat() == ml::train::TensorDim::Format::NHWC &&
+      in_dim.channel() != 3;
 
     TensorDim filter_dim_squeezed{filter_kernel.batch(),
                                   filter_kernel.getDim().getFeatureLen()};
