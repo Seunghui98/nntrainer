@@ -518,6 +518,62 @@ static inline void convApplySwishInplace(T *data, size_t n) {
   _silu_report(use_approx ? "approx" : (_neon_f32 ? "neon-exact" : "scalar-exact"));
 }
 
+// Fused bias + activation over one NHWC output row [C] (channels contiguous,
+// bias[c] per channel), in place; returns max(|result|) so the caller can build
+// a per-tensor quantization scale in the same streaming pass -- no separate
+// bias / SiLU / amax passes over the output (the per-channel W8A8 epilogue was
+// three single-threaded scalar passes; this collapses them into one, and the
+// caller runs it row-parallel). act: 0 none, 1 exact SiLU x*sigmoid(x), 2 the
+// hard/approx SiLU x*relu6(x+3)/6. The NEON path is bit-identical to
+// convApplySwishInplace's vectorized SiLU (same vexpq + two Newton reciprocal
+// refinements), so this reorders work without changing numerics.
+static inline float convBiasActRow(float *row, const float *bias, unsigned int C,
+                                   int act) {
+  float am = 0.f;
+  unsigned int cc = 0;
+#if defined(__ARM_NEON)
+  float32x4_t vam = vdupq_n_f32(0.f);
+  const float32x4_t one = vdupq_n_f32(1.f);
+  const float32x4_t three = vdupq_n_f32(3.f);
+  const float32x4_t six = vdupq_n_f32(6.f);
+  const float32x4_t zero = vdupq_n_f32(0.f);
+  const float32x4_t sixth = vdupq_n_f32(1.f / 6.f);
+  for (; cc + 3 < C; cc += 4) {
+    float32x4_t v = vld1q_f32(row + cc);
+    if (bias)
+      v = vaddq_f32(v, vld1q_f32(bias + cc));
+    if (act == 1) {
+      float32x4_t e = nntr_vexpq_f32(vnegq_f32(v));
+      float32x4_t denom = vaddq_f32(one, e);
+      float32x4_t r = vrecpeq_f32(denom);
+      r = vmulq_f32(vrecpsq_f32(denom, r), r);
+      r = vmulq_f32(vrecpsq_f32(denom, r), r);
+      v = vmulq_f32(v, r);
+    } else if (act == 2) {
+      float32x4_t relu6 = vminq_f32(vmaxq_f32(vaddq_f32(v, three), zero), six);
+      v = vmulq_f32(vmulq_f32(v, relu6), sixth);
+    }
+    vst1q_f32(row + cc, v);
+    vam = vmaxq_f32(vam, vabsq_f32(v));
+  }
+  am = vmaxvq_f32(vam);
+#endif
+  for (; cc < C; ++cc) {
+    float v = row[cc];
+    if (bias)
+      v += bias[cc];
+    if (act == 1)
+      v = v / (1.f + std::exp(-v));
+    else if (act == 2) {
+      float r6 = std::max(0.f, std::min(v + 3.f, 6.f));
+      v = v * r6 / 6.f;
+    }
+    row[cc] = v;
+    am = std::max(am, std::fabs(v));
+  }
+  return am;
+}
+
 static TensorDim calcCol2ImOutputDim(const TensorDim &out,
                                      const TensorDim &kdim) {
 
@@ -1811,33 +1867,53 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
           // bias + SiLU on FP32, then (for an int8 output) requantize.
           {
             nntrainer::LiteScope _e(_pl, "epilogue");
+            auto &tm = ThreadManager::Global();
+            const unsigned int C = filter_size;
+            const size_t nout = (size_t)owoh * filter_size;
             const float *bptr = nullptr;
             if (auto &db = std::get<props::DisableBias>(*layer_impl_props);
                 db.empty() || db.get() == false)
               bptr =
                 context.getWeight(wt_idx[ConvParams::bias]).getData<float>();
-            const size_t nout = (size_t)owoh * filter_size;
-            if (bptr) {
-              const unsigned int C = filter_size;
-              for (unsigned int p = 0; p < owoh; ++p)
-                for (unsigned int cc = 0; cc < C; ++cc)
-                  cptr[(size_t)p * C + cc] += bptr[cc];
-            }
+            static const bool approx_silu =
+              std::getenv("NNTR_APPROX_SILU") != nullptr &&
+              std::string(std::getenv("NNTR_APPROX_SILU")) == "1";
+            int act = 0;
             if (auto &actp = std::get<props::FusedActivation>(conv_props);
                 !actp.empty() && actp.get() == ActivationType::ACT_SWISH)
-              convApplySwishInplace(cptr, nout);
+              act = approx_silu ? 2 : 1;
 
             if (out_qint8) {
+              // One fused row-parallel pass: bias + SiLU + per-row amax; then a
+              // parallel quantize pass. Replaces the former four passes (three
+              // single-threaded) so the epilogue is no longer the conv's cost.
+              std::vector<float> ramax(owoh, 0.f);
+              float *rp = ramax.data();
+              tm.parallel_for(0, owoh, [=](size_t p) {
+                rp[p] = convBiasActRow(cptr + (size_t)p * C, bptr, C, act);
+              });
               float amax = 0.f;
-              for (size_t i = 0; i < nout; ++i)
-                amax = std::max(amax, std::fabs(cptr[i]));
+              for (unsigned int p = 0; p < owoh; ++p)
+                amax = std::max(amax, rp[p]);
               float sc = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
               const float inv = 1.f / sc;
               int8_t *qo = out.getData<int8_t>();
-              for (size_t i = 0; i < nout; ++i)
-                qo[i] = (int8_t)std::max(
-                  -128.f, std::min(127.f, std::round(cptr[i] * inv)));
+              const size_t chunk = 4096;
+              const size_t nchunk = (nout + chunk - 1) / chunk;
+              tm.parallel_for(0, nchunk, [=](size_t ci) {
+                const size_t i0 = ci * chunk;
+                const size_t i1 = std::min(i0 + chunk, nout);
+                for (size_t i = i0; i < i1; ++i)
+                  qo[i] = (int8_t)std::max(
+                    -128.f, std::min(127.f, std::round(cptr[i] * inv)));
+              });
               hidden_.getScale<float>()[0] = sc;
+            } else if (bptr || act) {
+              // FP32 output (head-final conv, out_ch % 4 != 0): fused bias +
+              // SiLU, row-parallel, no requant.
+              tm.parallel_for(0, owoh, [=](size_t p) {
+                convBiasActRow(cptr + (size_t)p * C, bptr, C, act);
+              });
             }
           }
           continue;
