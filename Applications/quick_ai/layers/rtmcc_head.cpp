@@ -85,8 +85,25 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   using nntrainer::Tensor;
   using DataType = ml::train::TensorDim::DataType;
 
-  Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  Tensor &in_raw = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+
+  // W8A8: the feature map may arrive as a per-tensor-scale QINT8 activation
+  // (the producing conv is int8-resident). The head is an FP32 island, so
+  // dequantize once up front and run the FP32 path unchanged.
+  Tensor in = in_raw;
+  std::vector<float> w8a8_deq;
+  if (in_raw.getDataType() == DataType::QINT8) {
+    const int8_t *q = in_raw.getData<int8_t>();
+    const float s = in_raw.getScale<float>()[0];
+    w8a8_deq.resize(in_raw.size());
+    for (size_t i = 0; i < w8a8_deq.size(); ++i)
+      w8a8_deq[i] = s * (float)q[i];
+    nntrainer::TensorDim d = in_raw.getDim();
+    d.setDataType(DataType::FP32);
+    in = nntrainer::Tensor::Map<float>(w8a8_deq.data(),
+                                       w8a8_deq.size() * sizeof(float), d);
+  }
 
   const bool in_fp16 = (in.getDataType() == DataType::FP16);
 #ifndef ENABLE_FP16

@@ -1108,9 +1108,14 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
     // quantized GEMM output [batch, 1, OH*OW, out_ch] (quant path only).
     if (quant_matmul_filter) {
       TensorDim tmp_dim(in_dim.batch(), 1, owoh, filter_size, scratch_type);
-      wt_idx[ConvParams::qgemm_scratch] =
-        context.requestTensor(tmp_dim, "qgemm_out", Initializer::NONE, false,
-                              TensorLifespan::FORWARD_FUNC_LIFESPAN);
+      // W8A8: FUNC-lifespan scratch shares arena memory with activation
+      // tensors; the W8A8 epilogue reads the QINT8 input while writing the
+      // FP32 GEMM result here, so give it an isolated (INFER) allocation --
+      // same reasoning as q8act_scratch below.
+      wt_idx[ConvParams::qgemm_scratch] = context.requestTensor(
+        tmp_dim, "qgemm_out", Initializer::NONE, false,
+        w8a8_mode ? TensorLifespan::FORWARD_INFER_LIFESPAN
+                  : TensorLifespan::FORWARD_FUNC_LIFESPAN);
     }
     // Q8_0 activation scratch for NHWC W4A8 path: pre-allocated once so
     // forwarding never calls malloc. Size = max(owoh, in_h*in_w) * nb blocks,
@@ -1151,7 +1156,7 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
       deq_dim.setDataType(nntrainer::Tdatatype::FP32);
       wt_idx[ConvParams::deq_in_scratch] =
         context.requestTensor(deq_dim, "deq_in", Initializer::NONE, false,
-                              TensorLifespan::FORWARD_FUNC_LIFESPAN);
+                              TensorLifespan::FORWARD_INFER_LIFESPAN);
     }
   }
 }
