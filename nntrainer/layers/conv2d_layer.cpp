@@ -35,6 +35,7 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <profiler.h>
+#include <profiler_lite.h>
 #include <q8_0_tensor.h>
 #include <tensor_dim.h>
 #include <thread>
@@ -1741,6 +1742,10 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
         // GEMM output gets bias + SiLU, then is quantized to int8 (or written
         // FP32 for the head-final conv, whose consumer is FP32).
         if (perch_mode) {
+          // Attribute the intra-layer op scopes below (and the GEMM's internal
+          // pack/matmul split) to this conv, robust to batch>1 workers.
+          const std::string &_pl = context.getName();
+          nntrainer::LiteProf::setCurrent(_pl);
           const unsigned int in_ch = in_dim.channel();
           const unsigned int CRS =
             in_ch * kernel_size[0].get() * kernel_size[1].get();
@@ -1759,6 +1764,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             a_i8 = in_sub.getData<int8_t>();
             a_scale = in_sub.getScale<float>()[0];
           } else {
+            nntrainer::LiteScope _q(_pl, "quantize_in");
             const float *fin = in_sub.getData<float>();
             const size_t n_in = in_sub.size();
             float amax = 0.f;
@@ -1802,34 +1808,37 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
           __ggml_q8ch_indirect_GEMM(owoh, filter_size, W.Kpad, a_i8, a_scale,
                                     geom, W.qs.data(), W.scale.data(), cptr);
 
-          // bias + SiLU on FP32
-          const float *bptr = nullptr;
-          if (auto &db = std::get<props::DisableBias>(*layer_impl_props);
-              db.empty() || db.get() == false)
-            bptr =
-              context.getWeight(wt_idx[ConvParams::bias]).getData<float>();
-          const size_t nout = (size_t)owoh * filter_size;
-          if (bptr) {
-            const unsigned int C = filter_size;
-            for (unsigned int p = 0; p < owoh; ++p)
-              for (unsigned int cc = 0; cc < C; ++cc)
-                cptr[(size_t)p * C + cc] += bptr[cc];
-          }
-          if (auto &actp = std::get<props::FusedActivation>(conv_props);
-              !actp.empty() && actp.get() == ActivationType::ACT_SWISH)
-            convApplySwishInplace(cptr, nout);
+          // bias + SiLU on FP32, then (for an int8 output) requantize.
+          {
+            nntrainer::LiteScope _e(_pl, "epilogue");
+            const float *bptr = nullptr;
+            if (auto &db = std::get<props::DisableBias>(*layer_impl_props);
+                db.empty() || db.get() == false)
+              bptr =
+                context.getWeight(wt_idx[ConvParams::bias]).getData<float>();
+            const size_t nout = (size_t)owoh * filter_size;
+            if (bptr) {
+              const unsigned int C = filter_size;
+              for (unsigned int p = 0; p < owoh; ++p)
+                for (unsigned int cc = 0; cc < C; ++cc)
+                  cptr[(size_t)p * C + cc] += bptr[cc];
+            }
+            if (auto &actp = std::get<props::FusedActivation>(conv_props);
+                !actp.empty() && actp.get() == ActivationType::ACT_SWISH)
+              convApplySwishInplace(cptr, nout);
 
-          if (out_qint8) {
-            float amax = 0.f;
-            for (size_t i = 0; i < nout; ++i)
-              amax = std::max(amax, std::fabs(cptr[i]));
-            float sc = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
-            const float inv = 1.f / sc;
-            int8_t *qo = out.getData<int8_t>();
-            for (size_t i = 0; i < nout; ++i)
-              qo[i] = (int8_t)std::max(-128.f,
-                                       std::min(127.f, std::round(cptr[i] * inv)));
-            hidden_.getScale<float>()[0] = sc;
+            if (out_qint8) {
+              float amax = 0.f;
+              for (size_t i = 0; i < nout; ++i)
+                amax = std::max(amax, std::fabs(cptr[i]));
+              float sc = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
+              const float inv = 1.f / sc;
+              int8_t *qo = out.getData<int8_t>();
+              for (size_t i = 0; i < nout; ++i)
+                qo[i] = (int8_t)std::max(
+                  -128.f, std::min(127.f, std::round(cptr[i] * inv)));
+              hidden_.getScale<float>()[0] = sc;
+            }
           }
           continue;
         }

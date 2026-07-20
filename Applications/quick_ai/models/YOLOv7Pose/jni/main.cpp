@@ -33,6 +33,7 @@
 #include <engine.h>
 #include <layer.h>
 #include <model.h>
+#include <profiler_lite.h>
 #include <tensor_api.h>
 
 extern "C" void openblas_set_num_threads(int);
@@ -287,6 +288,9 @@ int main(int argc, char **argv) {
     // A real deployment warms up at init the same way. Skip with YOLO_NO_WARMUP.
     if (!std::getenv("YOLO_NO_WARMUP"))
       outs = model->inference(1, in_ptr, std::vector<float *>());
+    // Drop any layer-profile samples from the warmup so the report reflects
+    // steady-state only (NNTR_LAYER_PROFILE; no-op when unset).
+    nntrainer::LiteProf::get().reset();
     double total_ms = 0.0;
     for (int it = 0; it < iters; ++it) {
       auto t0 = std::chrono::steady_clock::now();
@@ -295,6 +299,8 @@ int main(int argc, char **argv) {
       total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
     double infer_ms = total_ms / iters;
+    if (nntrainer::LiteProf::get().on())
+      nntrainer::LiteProf::get().report(std::cerr);
 
     // outs[0] = pose [1, 2*NKPT, SIMCC_BINS]; outs[1] = reid [1, EMBED_DIM]
     // (only when the ReID branch is enabled).

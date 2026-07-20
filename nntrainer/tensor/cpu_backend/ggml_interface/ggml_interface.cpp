@@ -18,6 +18,7 @@
 #include <mutex>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
+#include <profiler_lite.h>
 #include <thread_manager.h>
 #include <unordered_map>
 #ifdef Q4_0
@@ -563,34 +564,39 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
   // 1x1 unit-stride convs gather the identity: pack straight from `in`, no tile.
   const bool ident = conv_gather_is_identity(geom, K);
 
-  const unsigned int QCHUNK = 64;
-  if (Mfull > 0) {
-    const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
-    tm.parallel_for(0, qloops, [=](size_t q) {
-      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
-      const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
-      if (ident) {
-        for (unsigned int r = r0; r < r1; r += 4)
-          pack_i8_rows_q8_0x4(in + (size_t)r * K, K, d16,
+  {
+    nntrainer::LiteScope _p(nntrainer::LiteProf::getCurrent(), "gemm.pack");
+    const unsigned int QCHUNK = 64;
+    if (Mfull > 0) {
+      const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
+      tm.parallel_for(0, qloops, [=](size_t q) {
+        const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+        const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+        if (ident) {
+          for (unsigned int r = r0; r < r1; r += 4)
+            pack_i8_rows_q8_0x4(in + (size_t)r * K, K, d16,
+                                QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
+          return;
+        }
+        std::vector<int8_t> tile((size_t)4 * K);
+        for (unsigned int r = r0; r < r1; r += 4) {
+          gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4,
+                                       (int)K);
+          pack_i8_rows_q8_0x4(tile.data(), K, d16,
                               QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
-        return;
-      }
-      std::vector<int8_t> tile((size_t)4 * K);
-      for (unsigned int r = r0; r < r1; r += 4) {
-        gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4, (int)K);
-        pack_i8_rows_q8_0x4(tile.data(), K, d16,
-                            QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
-      }
-    });
-  }
-  if (rem > 0) {
-    std::vector<int8_t> tile((size_t)4 * K, 0);
-    gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)Mfull, (int)rem,
-                                 (int)K);
-    pack_i8_rows_q8_0x4(tile.data(), K, d16,
-                        QA_ptr + (size_t)M4 * qa_4_rows_size);
+        }
+      });
+    }
+    if (rem > 0) {
+      std::vector<int8_t> tile((size_t)4 * K, 0);
+      gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)Mfull, (int)rem,
+                                   (int)K);
+      pack_i8_rows_q8_0x4(tile.data(), K, d16,
+                          QA_ptr + (size_t)M4 * qa_4_rows_size);
+    }
   }
 
+  nntrainer::LiteScope _m(nntrainer::LiteProf::getCurrent(), "gemm.matmul");
   const size_t B_step = (size_t)nb * sizeof(block_q8_0);
   const unsigned int row_chunk_size = 16, col_chunk_size = 16;
 

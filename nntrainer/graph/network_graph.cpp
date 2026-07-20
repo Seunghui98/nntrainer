@@ -33,6 +33,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <profiler.h>
+#include <profiler_lite.h>
 #include <rnn.h>
 #include <rnncell.h>
 #include <split_layer.h>
@@ -403,7 +404,11 @@ sharedConstTensors NetworkGraph::forwarding(
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
-    forwarding_op(*iter, training);
+    LiteProf::setCurrent(ln->getName());
+    {
+      LiteScope _ls(ln->getName(), ln->getType(), true);
+      forwarding_op(*iter, training);
+    }
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
 
@@ -428,7 +433,11 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
-    forwarding_op(*iter, training);
+    LiteProf::setCurrent(ln->getName());
+    {
+      LiteScope _ls(ln->getName(), ln->getType(), true);
+      forwarding_op(*iter, training);
+    }
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
 
