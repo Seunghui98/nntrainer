@@ -1859,6 +1859,37 @@ void nntr_gemm_q8_0_q8_0_4x4_f32(int n, float *__restrict s, size_t bs,
   }
 }
 
+// Per-channel W8A8 GEMM (int32 accumulate; scalar reference). Same numerics as
+// the NEON nntr_gemm_q8ch_4x4_f32: int8 x int8 dot over the whole reduction,
+// then one scale a_scale*w_scale[col]. The per-block fp16 d fields are ignored.
+void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
+                            const void *__restrict vx,
+                            const float *__restrict w_scale,
+                            const void *__restrict vy, float a_scale, int nr,
+                            int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+  auto int_dot = [&](const block_q8_0x4 *a, int ar, const block_q8_0x4 *b,
+                     int wr) -> int32_t {
+    int32_t si = 0;
+    for (int bi = 0; bi < nb; ++bi)
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+    return si;
+  };
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        a_scale * w_scale[j] *
+        (float)int_dot(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
+  }
+}
+
 #ifdef ENABLE_FP16
 void nntr_gemm_q8_0_q8_0_4x4_fp16(int n, NNTR_GGML_FP16 *__restrict s,
                                   size_t bs, const void *__restrict vx,

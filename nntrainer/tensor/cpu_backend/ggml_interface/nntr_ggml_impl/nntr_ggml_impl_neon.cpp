@@ -2343,6 +2343,105 @@ void nntr_gemm_q8_0_q8_0_4x4_f32(int n, float *__restrict s, size_t bs,
 #endif
 }
 
+// Per-CHANNEL W8A8 GEMM (int32 accumulate). Unlike the per-block q8_0 kernels
+// above, the activation carries ONE per-tensor scale (a_scale) and the weight
+// ONE scale per output channel (w_scale[col]), so the whole reduction is a
+// pure int8->int32 accumulation and the scale is applied ONCE at the end --
+// no per-32-block float folding in the hot loop. Both operands are int8 packed
+// in the block_q8_0x4 qs layout (the embedded fp16 d fields are ignored).
+//   n : K (mult of 32)   s : FP32 out [nr x bs]
+//   vx : weight qs [nc/4][nb]   w_scale : FP32 [nc] per output channel
+//   vy : act qs [nr/4][nb]      a_scale : FP32 activation scale
+void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
+                            const void *__restrict vx,
+                            const float *__restrict w_scale,
+                            const void *__restrict vy, float a_scale, int nr,
+                            int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  assert(n % qk == 0);
+  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+
+  auto int_dot = [&](const block_q8_0x4 *a, int ar, const block_q8_0x4 *b,
+                     int wr) -> int32_t {
+    int32_t si = 0;
+    for (int bi = 0; bi < nb; ++bi)
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+    return si;
+  };
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+  const int nc4 = nc & ~3;
+  const int nr4 = nr & ~3;
+  const float32x4_t va = vdupq_n_f32(a_scale);
+  for (int m = 0; m < nr4; m += 4) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    for (int j = 0; j < nc4; j += 4) {
+      const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
+      int32x4_t acc00 = vdupq_n_s32(0), acc01 = vdupq_n_s32(0);
+      int32x4_t acc10 = vdupq_n_s32(0), acc11 = vdupq_n_s32(0);
+      for (int bi = 0; bi < nb; ++bi) {
+        for (int sub = 0; sub < 4; ++sub) {
+          const int8x16_t ar01 = vld1q_s8(a[bi].qs + 32 * sub);
+          const int8x16_t ar23 = vld1q_s8(a[bi].qs + 32 * sub + 16);
+          const int8x16_t bc01 = vld1q_s8(b[bi].qs + 32 * sub);
+          const int8x16_t bc23 = vld1q_s8(b[bi].qs + 32 * sub + 16);
+          acc00 = vmmlaq_s32(acc00, ar01, bc01);
+          acc01 = vmmlaq_s32(acc01, ar01, bc23);
+          acc10 = vmmlaq_s32(acc10, ar23, bc01);
+          acc11 = vmmlaq_s32(acc11, ar23, bc23);
+        }
+      }
+      // reassemble 2x2 SMMLA tiles into per-row [c0 c1 c2 c3]
+      const int32x4_t ri0 =
+        vcombine_s32(vget_low_s32(acc00), vget_low_s32(acc01));
+      const int32x4_t ri1 =
+        vcombine_s32(vget_high_s32(acc00), vget_high_s32(acc01));
+      const int32x4_t ri2 =
+        vcombine_s32(vget_low_s32(acc10), vget_low_s32(acc11));
+      const int32x4_t ri3 =
+        vcombine_s32(vget_high_s32(acc10), vget_high_s32(acc11));
+      const float32x4_t sc = vmulq_f32(va, vld1q_f32(w_scale + j));
+      vst1q_f32(s + (size_t)(m + 0) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(ri0), sc));
+      vst1q_f32(s + (size_t)(m + 1) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(ri1), sc));
+      vst1q_f32(s + (size_t)(m + 2) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(ri2), sc));
+      vst1q_f32(s + (size_t)(m + 3) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(ri3), sc));
+    }
+    for (int j = nc4; j < nc; ++j) {
+      const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
+      const float sc = a_scale * w_scale[j];
+      for (int rr = 0; rr < 4; ++rr)
+        s[(size_t)(m + rr) * bs + j] = sc * (float)int_dot(a, rr, b, j % 4);
+    }
+  }
+  for (int m = nr4; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        a_scale * w_scale[j] *
+        (float)int_dot(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
+  }
+#else
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        a_scale * w_scale[j] *
+        (float)int_dot(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
+  }
+#endif
+}
+
 #ifdef ENABLE_FP16
 // ============================================================================
 // SMMLA (i8mm) FP16-output GEMM for plain block_q8_0 weights x plain block_q8_0
