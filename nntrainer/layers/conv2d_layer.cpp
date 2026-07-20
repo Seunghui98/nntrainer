@@ -2615,11 +2615,16 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   _t_comp_end = _ck();
 
   // Per-channel W8A8 convs applied bias + SiLU + quantize inline per batch, so
-  // skip the generic epilogue entirely (it would double the bias).
+  // skip the generic epilogue entirely (it would double the bias). MUST mirror
+  // the perch_mode condition exactly, including the stem exclusion (in_ch ==
+  // 3): the stem runs the standard FP32 path and still needs this generic
+  // bias + activation epilogue -- skipping it here left the stem linear and
+  // bias-less (catastrophic accuracy loss).
   const bool perch_done =
     std::getenv("NNTR_W8A8") != nullptr &&
     std::getenv("NNTR_W8A8_PERCH") != nullptr &&
     input_.getDim().getFormat() == ml::train::TensorDim::Format::NHWC &&
+    input_.getDim().channel() != 3 &&
     (std::get<props::ConvGroups>(conv_props).empty() ||
      std::get<props::ConvGroups>(conv_props).get() == 1);
 
