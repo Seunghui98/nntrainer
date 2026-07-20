@@ -298,6 +298,19 @@ void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
                                         float *C, const unsigned int ldc);
 
 /**
+ * @brief Per-channel W8A8 indirect conv GEMM: int8 activation (per-tensor
+ * scale) x int8 weight (per-output-channel scale w_scale[N]) -> FP32, via the
+ * int32-accumulate kernel. B is int8 in the q8_0x4 qs layout (d ignored). K may
+ * be CRS-padded to a block multiple; N is the real out_ch (padded columns are
+ * not tiled).
+ */
+void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const int8_t *in,
+                               const float act_scale,
+                               const ConvGatherParams &geom, const void *B,
+                               const float *w_scale, float *C);
+
+/**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *
  * @param M as descripted above

@@ -89,6 +89,131 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 namespace {
 
+// Local mirror of the interleaved Q8_0 x4 super-block (d[4] fp16 + 128 int8),
+// matching repack_q8_0 / the GEMM kernels. Used by the per-channel weight
+// conversion; the fp16 d fields are unused (kept 0) for the per-channel path.
+struct conv_block_q8_0x4 {
+  uint16_t d[4];
+  int8_t qs[128];
+};
+
+// ---- Per-channel W8A8 weight cache (NNTR_W8A8_PERCH) -----------------------
+// A conv's weight (Q8_0 per-block or FP32) is converted ONCE to the per-channel
+// int8 representation the int32-accumulate kernel wants: int8 quants in the
+// q8_0x4 qs layout (CRS zero-padded to a 32 multiple, out_ch to a 4 multiple)
+// plus one FP32 scale per real output channel. Keyed by the weight buffer
+// pointer (constant during inference).
+struct PerChConvWeight {
+  std::vector<char> qs;    ///< block_q8_0x4 stream (qs used; d bytes are 0)
+  std::vector<float> scale; ///< [out_ch] per-output-channel FP32 scale
+  unsigned int Kpad = 0;   ///< CRS padded to a multiple of 32
+  unsigned int Npad = 0;   ///< out_ch padded to a multiple of 4
+  unsigned int Nreal = 0;  ///< real out_ch
+};
+
+static inline float convFp16ToFp32Bits(uint16_t h) {
+  uint32_t sign = (uint32_t)(h >> 15) << 31;
+  uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff, bits;
+  if (exp == 0) {
+    if (man == 0)
+      bits = sign;
+    else {
+      exp = 127 - 15 + 1;
+      while (!(man & 0x400)) {
+        man <<= 1;
+        --exp;
+      }
+      man &= 0x3ff;
+      bits = sign | (exp << 23) | (man << 13);
+    }
+  } else if (exp == 31)
+    bits = sign | 0x7f800000u | (man << 13);
+  else
+    bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+// Build (once, cached) the per-channel int8 weight for a conv whose FP32 filter
+// is logically [out_ch, CRS]. `q8_src` (block_q8_0x4, out_ch x CRS blocked on
+// CRS) is used when non-null; otherwise `fp32_src` (row-major [out_ch, CRS]).
+static const PerChConvWeight &
+getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
+                   const float *fp32_src, unsigned int out_ch,
+                   unsigned int CRS) {
+  static std::mutex mtx;
+  static std::unordered_map<const void *, PerChConvWeight> cache;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto it = cache.find(key);
+  if (it != cache.end())
+    return it->second;
+
+  PerChConvWeight w;
+  w.Nreal = out_ch;
+  w.Kpad = (CRS + QK8_0 - 1) / QK8_0 * QK8_0;
+  w.Npad = (out_ch + 3) / 4 * 4;
+  const unsigned int nb = w.Kpad / QK8_0;
+
+  // 1) FP32 weight [out_ch, CRS].
+  std::vector<float> wf((size_t)out_ch * CRS);
+  if (q8_src) {
+    const unsigned int nbq = CRS / QK8_0; // source is exactly CRS%32==0
+    const unsigned int sc_n = out_ch / 4;
+    for (unsigned int sc = 0; sc < sc_n; ++sc)
+      for (unsigned int j = 0; j < nbq; ++j) {
+        const conv_block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
+        for (unsigned int r = 0; r < 4; ++r) {
+          const float d = convFp16ToFp32Bits(sb.d[r]);
+          const unsigned int n = sc * 4 + r;
+          for (unsigned int sub = 0; sub < 4; ++sub)
+            for (unsigned int c = 0; c < 8; ++c)
+              wf[(size_t)n * CRS + j * QK8_0 + sub * 8 + c] =
+                d * (float)sb.qs[32 * sub + 8 * r + c];
+        }
+      }
+  } else {
+    std::memcpy(wf.data(), fp32_src, (size_t)out_ch * CRS * sizeof(float));
+  }
+
+  // 2) Per-output-channel int8 quantize.
+  w.scale.assign(out_ch, 1.f);
+  std::vector<int8_t> wi((size_t)out_ch * CRS);
+  for (unsigned int n = 0; n < out_ch; ++n) {
+    float amax = 0.f;
+    const float *row = &wf[(size_t)n * CRS];
+    for (unsigned int k = 0; k < CRS; ++k)
+      amax = std::max(amax, std::fabs(row[k]));
+    const float sc = amax > 0.f ? amax / 127.f : 1.f;
+    w.scale[n] = sc;
+    const float inv = 1.f / sc;
+    int8_t *qrow = &wi[(size_t)n * CRS];
+    for (unsigned int k = 0; k < CRS; ++k)
+      qrow[k] = (int8_t)std::max(
+        -128.f, std::min(127.f, std::round(row[k] * inv)));
+  }
+
+  // 3) Pack int8 [Npad, Kpad] -> q8_0x4 qs (d = 0, ignored by the kernel).
+  const unsigned int NB4 = w.Npad / 4;
+  w.qs.assign((size_t)NB4 * nb * sizeof(conv_block_q8_0x4), 0);
+  conv_block_q8_0x4 *dst = (conv_block_q8_0x4 *)w.qs.data();
+  for (unsigned int sc = 0; sc < NB4; ++sc)
+    for (unsigned int j = 0; j < nb; ++j) {
+      conv_block_q8_0x4 &sb = dst[(size_t)sc * nb + j];
+      for (unsigned int r = 0; r < 4; ++r) {
+        const unsigned int n = sc * 4 + r;
+        for (unsigned int sub = 0; sub < 4; ++sub)
+          for (unsigned int c = 0; c < 8; ++c) {
+            const unsigned int k = j * QK8_0 + sub * 8 + c;
+            int8_t v = (n < out_ch && k < CRS) ? wi[(size_t)n * CRS + k] : 0;
+            sb.qs[32 * sub + 8 * r + c] = v;
+          }
+      }
+    }
+  it = cache.emplace(key, std::move(w)).first;
+  return it->second;
+}
+
 #ifdef ENABLE_FP16
 static const _FP16 *get_silu_lut_fp16() {
   static std::vector<_FP16> lut;
@@ -1041,11 +1166,20 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   // the emission is unconditional for quantized convs -- no per-edge graph
   // analysis. Env-gated: all other modes are untouched.
   const bool w8a8_mode = std::getenv("NNTR_W8A8") != nullptr;
+  // Per-channel W8A8 (NNTR_W8A8_PERCH): EVERY NHWC conv runs int8 through the
+  // int32-accumulate kernel and emits a QINT8 activation, except the head-final
+  // conv (out_ch % 4 != 0, uniquely out_ch=87) whose consumer rtmcc_head is a
+  // hard FP32 boundary -> it stays FP32 out. Independent of the per-block
+  // eligibility (quant_matmul_filter); the weight is converted in-memory.
+  const bool perch_mode =
+    w8a8_mode && std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+    groups == 1 && in_dim.getFormat() == ml::train::TensorDim::Format::NHWC;
+  const bool perch_q8out = perch_mode && (filter_size % 4 == 0);
   const bool w8a8_q8out =
-    w8a8_mode && quant_matmul_filter &&
+    !perch_mode && w8a8_mode && quant_matmul_filter &&
     in_t_type.data_type == nntrainer::Tdatatype::Q8_0 &&
     in_dim.getFormat() == ml::train::TensorDim::Format::NHWC;
-  if (w8a8_q8out) {
+  if (w8a8_q8out || perch_q8out) {
     out_dim.setDataType(nntrainer::Tdatatype::QINT8);
   } else if (out_dim.getDataType() == nntrainer::Tdatatype::QINT8) {
     // A conv NEVER passes int8 through: a Q8_0 conv emits int8 via the
@@ -1455,6 +1589,10 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
       (weight_dtype == nntrainer::Tdatatype::Q4_0 ||
        weight_dtype == nntrainer::Tdatatype::QINT4 || weight_is_q8);
     const unsigned int owoh = out_dim.width() * out_dim.height();
+    const bool perch_mode =
+      std::getenv("NNTR_W8A8") != nullptr &&
+      std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+      in_dim.getFormat() == ml::train::TensorDim::Format::NHWC;
 
     TensorDim filter_dim_squeezed{filter_kernel.batch(),
                                   filter_kernel.getDim().getFeatureLen()};
@@ -1510,6 +1648,107 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
       for (unsigned int b = s; b < e; ++b) {
         Tensor out = hidden_.getBatchSlice(b, 1);
         Tensor in_sub = input_.getBatchSlice(b, 1);
+
+        // ---- Per-channel W8A8 path (NNTR_W8A8_PERCH) --------------------
+        // Every NHWC conv runs int8 through the int32-accumulate kernel: the
+        // weight is converted once to per-channel int8 (cached); the input is
+        // int8 (from the previous conv) or quantized here (the stem); the FP32
+        // GEMM output gets bias + SiLU, then is quantized to int8 (or written
+        // FP32 for the head-final conv, whose consumer is FP32).
+        if (perch_mode) {
+          const unsigned int in_ch = in_dim.channel();
+          const unsigned int CRS =
+            in_ch * kernel_size[0].get() * kernel_size[1].get();
+          const PerChConvWeight &W = getPerChConvWeight(
+            filter_kernel.getData(),
+            weight_is_q8 ? (const conv_block_q8_0x4 *)filter_kernel.getData()
+                         : nullptr,
+            weight_is_q8 ? nullptr : filter_kernel.getData<float>(), filter_size,
+            CRS);
+
+          // input int8 + per-tensor scale
+          const int8_t *a_i8 = nullptr;
+          float a_scale = 1.f;
+          std::vector<int8_t> a_buf;
+          if (in_sub.getDataType() == nntrainer::Tdatatype::QINT8) {
+            a_i8 = in_sub.getData<int8_t>();
+            a_scale = in_sub.getScale<float>()[0];
+          } else {
+            const float *fin = in_sub.getData<float>();
+            const size_t n_in = in_sub.size();
+            float amax = 0.f;
+            for (size_t i = 0; i < n_in; ++i)
+              amax = std::max(amax, std::fabs(fin[i]));
+            a_scale = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
+            const float inv = 1.f / a_scale;
+            a_buf.resize(n_in);
+            for (size_t i = 0; i < n_in; ++i)
+              a_buf[i] = (int8_t)std::max(
+                -128.f, std::min(127.f, std::round(fin[i] * inv)));
+            a_i8 = a_buf.data();
+          }
+
+          ConvGatherParams geom;
+          geom.in_ch = (int)in_ch;
+          geom.in_h = in_dim.height();
+          geom.in_w = in_dim.width();
+          geom.k_h = kernel_size[0].get();
+          geom.k_w = kernel_size[1].get();
+          geom.pad_t = padding[0];
+          geom.pad_l = padding[2];
+          geom.stride_h = stride[0].get();
+          geom.stride_w = stride[1].get();
+          geom.dil_h = dilation[0].get();
+          geom.dil_w = dilation[1].get();
+          geom.out_w = out_dim.width();
+          geom.is_nhwc = true;
+
+          const bool out_qint8 =
+            out.getDataType() == nntrainer::Tdatatype::QINT8;
+          std::vector<float> cbuf;
+          float *cptr;
+          if (out_qint8) {
+            cbuf.assign((size_t)owoh * filter_size, 0.f);
+            cptr = cbuf.data();
+          } else {
+            cptr = out.getData<float>(); // NHWC [owoh, out_ch] == GEMM layout
+          }
+
+          __ggml_q8ch_indirect_GEMM(owoh, filter_size, W.Kpad, a_i8, a_scale,
+                                    geom, W.qs.data(), W.scale.data(), cptr);
+
+          // bias + SiLU on FP32
+          const float *bptr = nullptr;
+          if (auto &db = std::get<props::DisableBias>(*layer_impl_props);
+              db.empty() || db.get() == false)
+            bptr =
+              context.getWeight(wt_idx[ConvParams::bias]).getData<float>();
+          const size_t nout = (size_t)owoh * filter_size;
+          if (bptr) {
+            const unsigned int C = filter_size;
+            for (unsigned int p = 0; p < owoh; ++p)
+              for (unsigned int cc = 0; cc < C; ++cc)
+                cptr[(size_t)p * C + cc] += bptr[cc];
+          }
+          if (auto &actp = std::get<props::FusedActivation>(conv_props);
+              !actp.empty() && actp.get() == ActivationType::ACT_SWISH)
+            convApplySwishInplace(cptr, nout);
+
+          if (out_qint8) {
+            float amax = 0.f;
+            for (size_t i = 0; i < nout; ++i)
+              amax = std::max(amax, std::fabs(cptr[i]));
+            float sc = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
+            const float inv = 1.f / sc;
+            int8_t *qo = out.getData<int8_t>();
+            for (size_t i = 0; i < nout; ++i)
+              qo[i] = (int8_t)std::max(-128.f,
+                                       std::min(127.f, std::round(cptr[i] * inv)));
+            hidden_.getScale<float>()[0] = sc;
+          }
+          continue;
+        }
+        // ----------------------------------------------------------------
 
         // W8A8: an FP32-weight conv fed by a QINT8 activation dequantizes it
         // once into a heap-local FP32 buffer and runs the standard path
@@ -2166,6 +2405,16 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
 
   _t_comp_end = _ck();
 
+  // Per-channel W8A8 convs applied bias + SiLU + quantize inline per batch, so
+  // skip the generic epilogue entirely (it would double the bias).
+  const bool perch_done =
+    std::getenv("NNTR_W8A8") != nullptr &&
+    std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+    input_.getDim().getFormat() == ml::train::TensorDim::Format::NHWC &&
+    (std::get<props::ConvGroups>(conv_props).empty() ||
+     std::get<props::ConvGroups>(conv_props).get() == 1);
+
+  if (!perch_done)
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias_kernel = context.getWeight(wt_idx[ConvParams::bias]);

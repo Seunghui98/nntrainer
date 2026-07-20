@@ -504,4 +504,96 @@ void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
   }
 }
 
+/**
+ * @brief Per-CHANNEL W8A8 indirect conv GEMM: int8 activation (per-tensor
+ * scale) x int8 weight (per-output-channel scale) -> FP32.
+ *
+ * Same gather + q8_0x4 int8 packing as __ggml_q8_0_q8_0_indirect_GEMM_i8a, but
+ * the micro-kernel is nntr_gemm_q8ch_4x4_f32 (int32 accumulate over all K, one
+ * scale a_scale*w_scale[col] at the end) -- no per-32-block float folding. The
+ * weight B is int8 in the q8_0x4 qs layout (its fp16 d fields are ignored) and
+ * w_scale is the per-output-channel FP32 scale [N]. K may exceed the geometry's
+ * real CRS (zero-padded via the gather stride), and N is the real (unpadded)
+ * out_ch count so padded weight columns are never tiled.
+ */
+void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const int8_t *in,
+                               const float act_scale,
+                               const ConvGatherParams &geom, const void *B,
+                               const float *w_scale, float *C) {
+  auto &tm = ThreadManager::Global();
+  const unsigned int nb = K / QK8_0;
+  const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * nb;
+  const unsigned int Mfull = (M / 4) * 4;
+  const unsigned int rem = M % 4;
+  const unsigned int M4 = M / 4;
+  const unsigned int M4c = (M + 3) / 4;
+  const uint16_t d16 = 0; // d ignored by the per-channel kernel
+
+  std::vector<char> QA((size_t)M4c * qa_4_rows_size);
+  char *QA_ptr = QA.data();
+
+  const unsigned int QCHUNK = 64;
+  if (Mfull > 0) {
+    const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+      std::vector<int8_t> tile((size_t)4 * K);
+      for (unsigned int r = r0; r < r1; r += 4) {
+        gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4, (int)K);
+        pack_i8_rows_q8_0x4(tile.data(), K, d16,
+                            QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
+      }
+    });
+  }
+  if (rem > 0) {
+    std::vector<int8_t> tile((size_t)4 * K, 0);
+    gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)Mfull, (int)rem,
+                                 (int)K);
+    pack_i8_rows_q8_0x4(tile.data(), K, d16,
+                        QA_ptr + (size_t)M4 * qa_4_rows_size);
+  }
+
+  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
+  const unsigned int row_chunk_size = 16, col_chunk_size = 16;
+
+  if (Mfull > 0) {
+    const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
+    const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+      unsigned int r = static_cast<unsigned int>(i / col_loop);
+      unsigned int c = static_cast<unsigned int>(i % col_loop);
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), Mfull);
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+      nntr_gemm_q8ch_4x4_f32(
+        (int)K, C + (size_t)r_start * N + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        w_scale + c_start,
+        (const void *)(QA_ptr + (size_t)(r_start / 4) * qa_4_rows_size),
+        act_scale, (int)(r_end - r_start), (int)(c_end - c_start));
+    });
+  }
+  if (rem > 0) {
+    std::vector<float> scratch((size_t)4 * N);
+    float *scratch_ptr = scratch.data();
+    const char *tail_a = QA_ptr + (size_t)M4 * qa_4_rows_size;
+    const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, col_loop, [=](size_t c) {
+      unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * ((unsigned int)c + 1), N);
+      nntr_gemm_q8ch_4x4_f32(
+        (int)K, scratch_ptr + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        w_scale + c_start, (const void *)tail_a, act_scale, 4,
+        (int)(c_end - c_start));
+    });
+    for (unsigned int rr = 0; rr < rem; ++rr)
+      std::memcpy(C + (size_t)(Mfull + rr) * N, scratch_ptr + (size_t)rr * N,
+                  (size_t)N * sizeof(float));
+  }
+}
+
 } // namespace nntrainer
