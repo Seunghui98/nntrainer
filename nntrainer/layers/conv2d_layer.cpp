@@ -149,6 +149,11 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
   if (it != cache.end())
     return it->second;
 
+  // Parallelized so the one-time conversion (first forward) is not a big
+  // single-threaded warmup stall. Batch is 1 in the W8A8 path, so this never
+  // nests inside another parallel_for.
+  auto &tm = ThreadManager::Global();
+
   PerChConvWeight w;
   w.Nreal = out_ch;
   w.Kpad = (CRS + QK8_0 - 1) / QK8_0 * QK8_0;
@@ -157,21 +162,23 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
 
   // 1) FP32 weight [out_ch, CRS].
   std::vector<float> wf((size_t)out_ch * CRS);
+  float *wf_ptr = wf.data();
   if (q8_src) {
     const unsigned int nbq = CRS / QK8_0; // source is exactly CRS%32==0
     const unsigned int sc_n = out_ch / 4;
-    for (unsigned int sc = 0; sc < sc_n; ++sc)
+    tm.parallel_for(0, sc_n, [=](size_t sc) {
       for (unsigned int j = 0; j < nbq; ++j) {
         const conv_block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
         for (unsigned int r = 0; r < 4; ++r) {
           const float d = convFp16ToFp32Bits(sb.d[r]);
-          const unsigned int n = sc * 4 + r;
+          const unsigned int n = (unsigned int)sc * 4 + r;
           for (unsigned int sub = 0; sub < 4; ++sub)
             for (unsigned int c = 0; c < 8; ++c)
-              wf[(size_t)n * CRS + j * QK8_0 + sub * 8 + c] =
+              wf_ptr[(size_t)n * CRS + j * QK8_0 + sub * 8 + c] =
                 d * (float)sb.qs[32 * sub + 8 * r + c];
         }
       }
+    });
   } else {
     std::memcpy(wf.data(), fp32_src, (size_t)out_ch * CRS * sizeof(float));
   }
@@ -179,37 +186,41 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
   // 2) Per-output-channel int8 quantize.
   w.scale.assign(out_ch, 1.f);
   std::vector<int8_t> wi((size_t)out_ch * CRS);
-  for (unsigned int n = 0; n < out_ch; ++n) {
+  float *scale_ptr = w.scale.data();
+  int8_t *wi_ptr = wi.data();
+  tm.parallel_for(0, out_ch, [=](size_t n) {
     float amax = 0.f;
-    const float *row = &wf[(size_t)n * CRS];
+    const float *row = &wf_ptr[(size_t)n * CRS];
     for (unsigned int k = 0; k < CRS; ++k)
       amax = std::max(amax, std::fabs(row[k]));
     const float sc = amax > 0.f ? amax / 127.f : 1.f;
-    w.scale[n] = sc;
+    scale_ptr[n] = sc;
     const float inv = 1.f / sc;
-    int8_t *qrow = &wi[(size_t)n * CRS];
+    int8_t *qrow = &wi_ptr[(size_t)n * CRS];
     for (unsigned int k = 0; k < CRS; ++k)
-      qrow[k] = (int8_t)std::max(
-        -128.f, std::min(127.f, std::round(row[k] * inv)));
-  }
+      qrow[k] =
+        (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
+  });
 
   // 3) Pack int8 [Npad, Kpad] -> q8_0x4 qs (d = 0, ignored by the kernel).
   const unsigned int NB4 = w.Npad / 4;
   w.qs.assign((size_t)NB4 * nb * sizeof(conv_block_q8_0x4), 0);
   conv_block_q8_0x4 *dst = (conv_block_q8_0x4 *)w.qs.data();
-  for (unsigned int sc = 0; sc < NB4; ++sc)
+  const int8_t *wi_rd = wi.data();
+  tm.parallel_for(0, NB4, [=](size_t sc) {
     for (unsigned int j = 0; j < nb; ++j) {
       conv_block_q8_0x4 &sb = dst[(size_t)sc * nb + j];
       for (unsigned int r = 0; r < 4; ++r) {
-        const unsigned int n = sc * 4 + r;
+        const unsigned int n = (unsigned int)sc * 4 + r;
         for (unsigned int sub = 0; sub < 4; ++sub)
           for (unsigned int c = 0; c < 8; ++c) {
             const unsigned int k = j * QK8_0 + sub * 8 + c;
-            int8_t v = (n < out_ch && k < CRS) ? wi[(size_t)n * CRS + k] : 0;
+            int8_t v = (n < out_ch && k < CRS) ? wi_rd[(size_t)n * CRS + k] : 0;
             sb.qs[32 * sub + 8 * r + c] = v;
           }
       }
     }
+  });
   it = cache.emplace(key, std::move(w)).first;
   return it->second;
 }
