@@ -2375,12 +2375,80 @@ void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
   };
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+  const int nc8 = nc & ~7;
   const int nc4 = nc & ~3;
   const int nr4 = nr & ~3;
   const float32x4_t va = vdupq_n_f32(a_scale);
   for (int m = 0; m < nr4; m += 4) {
     const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
-    for (int j = 0; j < nc4; j += 4) {
+    int j = 0;
+    // 4x8 tile: one 4-row activation group against TWO 4-col weight groups.
+    // Eight int32 accumulators keep enough independent SMMLA chains in flight
+    // to hide the instruction's ~3-4 cycle latency (the 4x4 tile below issues
+    // only four, stalling the pipe), and the activation super-block is loaded
+    // once per 8 output columns instead of once per 4 -- halving its traffic.
+    for (; j < nc8; j += 8) {
+      const block_q8_0x4 *b0 = b_sbase + (size_t)(j / 4) * nb;     // cols j..j+3
+      const block_q8_0x4 *b1 = b_sbase + (size_t)(j / 4 + 1) * nb; // cols j+4..7
+      int32x4_t p00 = vdupq_n_s32(0), p01 = vdupq_n_s32(0);
+      int32x4_t p10 = vdupq_n_s32(0), p11 = vdupq_n_s32(0);
+      int32x4_t q00 = vdupq_n_s32(0), q01 = vdupq_n_s32(0);
+      int32x4_t q10 = vdupq_n_s32(0), q11 = vdupq_n_s32(0);
+      for (int bi = 0; bi < nb; ++bi) {
+        for (int sub = 0; sub < 4; ++sub) {
+          const int8x16_t ar01 = vld1q_s8(a[bi].qs + 32 * sub);
+          const int8x16_t ar23 = vld1q_s8(a[bi].qs + 32 * sub + 16);
+          const int8x16_t b0c01 = vld1q_s8(b0[bi].qs + 32 * sub);
+          const int8x16_t b0c23 = vld1q_s8(b0[bi].qs + 32 * sub + 16);
+          const int8x16_t b1c01 = vld1q_s8(b1[bi].qs + 32 * sub);
+          const int8x16_t b1c23 = vld1q_s8(b1[bi].qs + 32 * sub + 16);
+          p00 = vmmlaq_s32(p00, ar01, b0c01);
+          p01 = vmmlaq_s32(p01, ar01, b0c23);
+          p10 = vmmlaq_s32(p10, ar23, b0c01);
+          p11 = vmmlaq_s32(p11, ar23, b0c23);
+          q00 = vmmlaq_s32(q00, ar01, b1c01);
+          q01 = vmmlaq_s32(q01, ar01, b1c23);
+          q10 = vmmlaq_s32(q10, ar23, b1c01);
+          q11 = vmmlaq_s32(q11, ar23, b1c23);
+        }
+      }
+      // reassemble 2x2 SMMLA tiles into per-row [c0 c1 c2 c3] for each group
+      const int32x4_t r0lo =
+        vcombine_s32(vget_low_s32(p00), vget_low_s32(p01));
+      const int32x4_t r1lo =
+        vcombine_s32(vget_high_s32(p00), vget_high_s32(p01));
+      const int32x4_t r2lo =
+        vcombine_s32(vget_low_s32(p10), vget_low_s32(p11));
+      const int32x4_t r3lo =
+        vcombine_s32(vget_high_s32(p10), vget_high_s32(p11));
+      const int32x4_t r0hi =
+        vcombine_s32(vget_low_s32(q00), vget_low_s32(q01));
+      const int32x4_t r1hi =
+        vcombine_s32(vget_high_s32(q00), vget_high_s32(q01));
+      const int32x4_t r2hi =
+        vcombine_s32(vget_low_s32(q10), vget_low_s32(q11));
+      const int32x4_t r3hi =
+        vcombine_s32(vget_high_s32(q10), vget_high_s32(q11));
+      const float32x4_t sc0 = vmulq_f32(va, vld1q_f32(w_scale + j));
+      const float32x4_t sc1 = vmulq_f32(va, vld1q_f32(w_scale + j + 4));
+      vst1q_f32(s + (size_t)(m + 0) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(r0lo), sc0));
+      vst1q_f32(s + (size_t)(m + 0) * bs + j + 4,
+                vmulq_f32(vcvtq_f32_s32(r0hi), sc1));
+      vst1q_f32(s + (size_t)(m + 1) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(r1lo), sc0));
+      vst1q_f32(s + (size_t)(m + 1) * bs + j + 4,
+                vmulq_f32(vcvtq_f32_s32(r1hi), sc1));
+      vst1q_f32(s + (size_t)(m + 2) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(r2lo), sc0));
+      vst1q_f32(s + (size_t)(m + 2) * bs + j + 4,
+                vmulq_f32(vcvtq_f32_s32(r2hi), sc1));
+      vst1q_f32(s + (size_t)(m + 3) * bs + j,
+                vmulq_f32(vcvtq_f32_s32(r3lo), sc0));
+      vst1q_f32(s + (size_t)(m + 3) * bs + j + 4,
+                vmulq_f32(vcvtq_f32_s32(r3hi), sc1));
+    }
+    for (; j < nc4; j += 4) {
       const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
       int32x4_t acc00 = vdupq_n_s32(0), acc01 = vdupq_n_s32(0);
       int32x4_t acc10 = vdupq_n_s32(0), acc11 = vdupq_n_s32(0);
@@ -2415,7 +2483,7 @@ void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
       vst1q_f32(s + (size_t)(m + 3) * bs + j,
                 vmulq_f32(vcvtq_f32_s32(ri3), sc));
     }
-    for (int j = nc4; j < nc; ++j) {
+    for (; j < nc; ++j) {
       const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
       const float sc = a_scale * w_scale[j];
       for (int rr = 0; rr < 4; ++rr)

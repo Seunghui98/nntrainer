@@ -405,6 +405,24 @@ static inline void pack_i8_rows_q8_0x4(const int8_t *rows, unsigned int K,
 }
 
 /**
+ * @brief True when a conv's im2col gather is the identity map.
+ *
+ * A 1x1, unit-stride, zero-pad, unit-dilation NHWC conv gathers output pixel m
+ * as exactly the contiguous in_ch vector at input pixel m (out_w == in_w and
+ * (oh,ow)->(oh,ow)), so the K=in_ch activation row is already laid out at
+ * `in + m*K` with stride K -- the exact stride pack_i8_rows_q8_0x4 expects.
+ * The whole gather pass (per-row memset + scatter into a tile) can then be
+ * skipped and the pack reads straight from the input. Requires K == in_ch (no
+ * CRS zero-padding), otherwise the real row stride would be in_ch, not K.
+ */
+static inline bool conv_gather_is_identity(const ConvGatherParams &g,
+                                           unsigned int K) {
+  return g.is_nhwc && g.k_h == 1 && g.k_w == 1 && g.stride_h == 1 &&
+         g.stride_w == 1 && g.pad_t == 0 && g.pad_l == 0 && g.dil_h == 1 &&
+         g.dil_w == 1 && g.out_w == g.in_w && (int)K == g.in_ch;
+}
+
+/**
  * @brief W8A8 indirect conv GEMM: pre-quantized int8 activation (per-tensor
  * scale) x q8_0x4 weight -> FP32 output.
  *
@@ -442,12 +460,21 @@ void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
   std::vector<char> QA((size_t)M4c * qa_4_rows_size);
   char *QA_ptr = QA.data();
 
+  // 1x1 unit-stride convs gather the identity: pack straight from `in`, no tile.
+  const bool ident = conv_gather_is_identity(geom, K);
+
   const unsigned int QCHUNK = 64; // multiple of 4
   if (Mfull > 0) {
     const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
     tm.parallel_for(0, qloops, [=](size_t q) {
       const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
       const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+      if (ident) {
+        for (unsigned int r = r0; r < r1; r += 4)
+          pack_i8_rows_q8_0x4(in + (size_t)r * K, K, d16,
+                              QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
+        return;
+      }
       std::vector<int8_t> tile((size_t)4 * K);
       for (unsigned int r = r0; r < r1; r += 4) {
         gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4, (int)K);
@@ -533,12 +560,21 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
   std::vector<char> QA((size_t)M4c * qa_4_rows_size);
   char *QA_ptr = QA.data();
 
+  // 1x1 unit-stride convs gather the identity: pack straight from `in`, no tile.
+  const bool ident = conv_gather_is_identity(geom, K);
+
   const unsigned int QCHUNK = 64;
   if (Mfull > 0) {
     const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
     tm.parallel_for(0, qloops, [=](size_t q) {
       const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
       const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+      if (ident) {
+        for (unsigned int r = r0; r < r1; r += 4)
+          pack_i8_rows_q8_0x4(in + (size_t)r * K, K, d16,
+                              QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
+        return;
+      }
       std::vector<int8_t> tile((size_t)4 * K);
       for (unsigned int r = r0; r < r1; r += 4) {
         gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4, (int)K);
