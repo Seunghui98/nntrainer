@@ -281,6 +281,12 @@ int main(int argc, char **argv) {
                   ? std::max(1, std::atoi(std::getenv("YOLO_BENCH_ITERS")))
                   : 1;
     std::vector<float *> outs;
+    // One untimed warmup inference. Some presets (e.g. w8a8 per-channel) build
+    // a cached weight representation on the first forward; timing that as
+    // "inference" conflates a one-time setup cost with steady-state latency.
+    // A real deployment warms up at init the same way. Skip with YOLO_NO_WARMUP.
+    if (!std::getenv("YOLO_NO_WARMUP"))
+      outs = model->inference(1, in_ptr, std::vector<float *>());
     double total_ms = 0.0;
     for (int it = 0; it < iters; ++it) {
       auto t0 = std::chrono::steady_clock::now();
