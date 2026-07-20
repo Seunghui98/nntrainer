@@ -266,6 +266,16 @@ static void __q8a32_indirect_plain(const unsigned int M, const unsigned int N,
  * file as the FP16 path (no re-quantize) and is portable across ISAs (all
  * primitives have neon/avx/sve/fallback impls). Set NNTR_Q8A32_PLAIN to fall
  * back to the reference de-interleave pipeline.
+ *
+ * CRS-padding: the caller may pass a K that is LARGER than the geometry's real
+ * CRS = in_ch*k_h*k_w. The gather still produces only the real CRS values per
+ * row and zero-fills the tail up to K (dst_stride = K), and the weight B is
+ * expected to be quantized with the same K-padding; the zero tail contributes 0
+ * to every dot so the result is the un-padded convolution. This lets a conv
+ * whose real CRS is not a multiple of 32 run on the int8 GEMM by rounding K up
+ * to a block multiple. Likewise N may be smaller than the weight's padded
+ * column count -- only the first N columns are ever tiled/written, so padded
+ * out-channels are never computed (free out_ch strip).
  */
 void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
                                          const unsigned int N,
@@ -305,7 +315,7 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
       std::vector<float> tilebuf((size_t)4 * K);
       float *tile = tilebuf.data();
       for (unsigned int r = r0; r < r1; r += 4) {
-        gather_conv_act_rows_fp32(tile, in, geom, (int)r, 4);
+        gather_conv_act_rows_fp32(tile, in, geom, (int)r, 4, (int)K);
         nntr_quantize_mat_q8_0_4x8(
           tile, QA_ptr + (size_t)(r / 4) * qa_4_rows_size, K);
       }
@@ -315,7 +325,8 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
   // Handle M-tail (rem 1..3) gather and quantization (zero-padded to 4 rows).
   if (rem > 0) {
     std::vector<float> tilebuf((size_t)4 * K, 0.0f);
-    gather_conv_act_rows_fp32(tilebuf.data(), in, geom, (int)Mfull, (int)rem);
+    gather_conv_act_rows_fp32(tilebuf.data(), in, geom, (int)Mfull, (int)rem,
+                              (int)K);
     nntr_quantize_mat_q8_0_4x8(tilebuf.data(),
                                QA_ptr + (size_t)M4 * qa_4_rows_size, K);
   }

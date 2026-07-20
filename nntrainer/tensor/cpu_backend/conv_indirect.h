@@ -71,16 +71,22 @@ struct ConvGatherParams {
  * FP16-input Q8_0 quantizer __ggml_quantize_*_q8_0(const _FP16*)). Padding is
  * zero-initialised via memset typed to sizeof(T), so FP16 padding is +0.0 too.
  *
- * @param[out] dst   buffer of nrows*K elements of type T, fully overwritten
+ * @param[out] dst   buffer of nrows*dst_stride elements of type T
  * @param[in]  in    batch-sliced contiguous NCHW input base pointer (type T)
  * @param[in]  p     gather geometry
  * @param[in]  m0    first output-spatial row to gather
  * @param[in]  nrows number of rows to gather
+ * @param[in]  dst_stride  per-row stride in dst (<=0 means use K). When larger
+ *                    than K the tail [K, dst_stride) is zero-filled -- used to
+ *                    zero-pad CRS up to a Q8_0-block multiple so a conv whose
+ *                    CRS is not a multiple of 32 can still feed the int8 GEMM
+ *                    (the zero tail contributes 0 to every dot product).
  */
 template <typename T>
 inline void gather_conv_act_rows(T *dst, const T *in, const ConvGatherParams &p,
-                                 int m0, int nrows) {
+                                 int m0, int nrows, int dst_stride = 0) {
   const int K = p.in_ch * p.k_h * p.k_w;
+  const int st = dst_stride > 0 ? dst_stride : K;
   const long inHW = (long)p.in_h * (long)p.in_w;
   const bool unit_dil = (p.dil_h == 1 && p.dil_w == 1);
   const int khkw = p.k_h * p.k_w;
@@ -89,11 +95,12 @@ inline void gather_conv_act_rows(T *dst, const T *in, const ConvGatherParams &p,
     const int m = m0 + r;
     const int oh = m / p.out_w;
     const int ow = m % p.out_w;
-    T *row = dst + (long)r * K;
+    T *row = dst + (long)r * st;
     /// every K element is written below for unit dilation only along valid
     /// runs, so zero the row up front: padding positions stay 0 (matches
-    /// im2col). sizeof(T) so FP16 padding is +0.0 just like FP32.
-    std::memset(row, 0, (size_t)K * sizeof(T));
+    /// im2col). sizeof(T) so FP16 padding is +0.0 just like FP32. Zeroing the
+    /// full stride also clears the CRS pad tail [K, st) in one pass.
+    std::memset(row, 0, (size_t)st * sizeof(T));
 
     const int h0 = oh * p.stride_h - p.pad_t;
     const int w0 = ow * p.stride_w - p.pad_l;
@@ -213,8 +220,8 @@ inline void gather_conv_act_rows(T *dst, const T *in, const ConvGatherParams &p,
  */
 inline void gather_conv_act_rows_fp32(float *dst, const float *in,
                                       const ConvGatherParams &p, int m0,
-                                      int nrows) {
-  gather_conv_act_rows<float>(dst, in, p, m0, nrows);
+                                      int nrows, int dst_stride = 0) {
+  gather_conv_act_rows<float>(dst, in, p, m0, nrows, dst_stride);
 }
 
 #ifdef ENABLE_FP16
