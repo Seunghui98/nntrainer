@@ -303,12 +303,19 @@ void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
  * int32-accumulate kernel. B is int8 in the q8_0x4 qs layout (d ignored). K may
  * be CRS-padded to a block multiple; N is the real out_ch (padded columns are
  * not tiled).
+ *
+ * @param pad_value int8 value gathered for spatial-padding positions (default
+ * 0 = symmetric quantization). The asymmetric-activation path passes its zero
+ * point (the quantized representation of x = 0) so padded pixels contribute
+ * x ~= 0, not x = -zp*scale; the caller then removes the shared offset via the
+ * per-column colsum correction folded into the bias.
  */
 void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int K, const int8_t *in,
                                const float act_scale,
                                const ConvGatherParams &geom, const void *B,
-                               const float *w_scale, float *C);
+                               const float *w_scale, float *C,
+                               int8_t pad_value = 0);
 
 /**
  * @brief A(M, K) * W.T(N, K) = (M, N)

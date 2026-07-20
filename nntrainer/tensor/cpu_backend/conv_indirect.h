@@ -77,14 +77,21 @@ struct ConvGatherParams {
  * @param[in]  m0    first output-spatial row to gather
  * @param[in]  nrows number of rows to gather
  * @param[in]  dst_stride  per-row stride in dst (<=0 means use K). When larger
- *                    than K the tail [K, dst_stride) is zero-filled -- used to
+ *                    than K the tail [K, dst_stride) is pad-filled -- used to
  *                    zero-pad CRS up to a Q8_0-block multiple so a conv whose
  *                    CRS is not a multiple of 32 can still feed the int8 GEMM
- *                    (the zero tail contributes 0 to every dot product).
+ *                    (the padded weight rows there are 0, so any fill value
+ *                    contributes 0 to every dot product).
+ * @param[in]  pad_byte  byte value written to spatial-padding positions
+ *                    (default 0). The asymmetric-activation int8 path passes
+ *                    the quantized representation of x = 0 (its zero point),
+ *                    which is NOT the byte 0; FP32/FP16 callers keep 0 (the
+ *                    all-zeros bit pattern is +0.0).
  */
 template <typename T>
 inline void gather_conv_act_rows(T *dst, const T *in, const ConvGatherParams &p,
-                                 int m0, int nrows, int dst_stride = 0) {
+                                 int m0, int nrows, int dst_stride = 0,
+                                 int pad_byte = 0) {
   const int K = p.in_ch * p.k_h * p.k_w;
   const int st = dst_stride > 0 ? dst_stride : K;
   const long inHW = (long)p.in_h * (long)p.in_w;
@@ -97,10 +104,11 @@ inline void gather_conv_act_rows(T *dst, const T *in, const ConvGatherParams &p,
     const int ow = m % p.out_w;
     T *row = dst + (long)r * st;
     /// every K element is written below for unit dilation only along valid
-    /// runs, so zero the row up front: padding positions stay 0 (matches
-    /// im2col). sizeof(T) so FP16 padding is +0.0 just like FP32. Zeroing the
-    /// full stride also clears the CRS pad tail [K, st) in one pass.
-    std::memset(row, 0, (size_t)st * sizeof(T));
+    /// runs, so fill the row up front: padding positions keep the pad byte
+    /// (matches im2col zero padding for the default 0; the asym-int8 path
+    /// passes its zero point). Filling the full stride also covers the CRS
+    /// pad tail [K, st) in one pass.
+    std::memset(row, pad_byte, (size_t)st * sizeof(T));
 
     const int h0 = oh * p.stride_h - p.pad_t;
     const int w0 = ow * p.stride_w - p.pad_l;

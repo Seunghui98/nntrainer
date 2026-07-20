@@ -548,7 +548,8 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int K, const int8_t *in,
                                const float act_scale,
                                const ConvGatherParams &geom, const void *B,
-                               const float *w_scale, float *C) {
+                               const float *w_scale, float *C,
+                               int8_t pad_value) {
   auto &tm = ThreadManager::Global();
   const unsigned int nb = K / QK8_0;
   const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * nb;
@@ -581,7 +582,7 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
         std::vector<int8_t> tile((size_t)4 * K);
         for (unsigned int r = r0; r < r1; r += 4) {
           gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4,
-                                       (int)K);
+                                       (int)K, pad_value);
           pack_i8_rows_q8_0x4(tile.data(), K, d16,
                               QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
         }
@@ -590,7 +591,7 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
     if (rem > 0) {
       std::vector<int8_t> tile((size_t)4 * K, 0);
       gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)Mfull, (int)rem,
-                                   (int)K);
+                                   (int)K, pad_value);
       pack_i8_rows_q8_0x4(tile.data(), K, d16,
                           QA_ptr + (size_t)M4 * qa_4_rows_size);
     }

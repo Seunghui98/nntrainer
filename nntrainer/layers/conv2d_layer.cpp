@@ -107,6 +107,9 @@ struct conv_block_q8_0x4 {
 struct PerChConvWeight {
   std::vector<char> qs;    ///< block_q8_0x4 stream (qs used; d bytes are 0)
   std::vector<float> scale; ///< [out_ch] per-output-channel FP32 scale
+  std::vector<int32_t> colsum; ///< [out_ch] sum of the row's int8 quants; used
+                               ///< by the asymmetric-activation path to fold
+                               ///< the shared activation offset into the bias
   unsigned int Kpad = 0;   ///< CRS padded to a multiple of 32
   unsigned int Npad = 0;   ///< out_ch padded to a multiple of 4
   unsigned int Nreal = 0;  ///< real out_ch
@@ -275,10 +278,13 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
     std::memcpy(wf.data(), fp32_src, (size_t)out_ch * CRS * sizeof(float));
   }
 
-  // 2) Per-output-channel int8 quantize.
+  // 2) Per-output-channel int8 quantize (+ per-row quant sum for the
+  // asymmetric-activation bias fold).
   w.scale.assign(out_ch, 1.f);
+  w.colsum.assign(out_ch, 0);
   std::vector<int8_t> wi((size_t)out_ch * CRS);
   float *scale_ptr = w.scale.data();
+  int32_t *colsum_ptr = w.colsum.data();
   int8_t *wi_ptr = wi.data();
   tm.parallel_for(0, out_ch, [=](size_t n) {
     float amax = 0.f;
@@ -289,9 +295,13 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
     scale_ptr[n] = sc;
     const float inv = 1.f / sc;
     int8_t *qrow = &wi_ptr[(size_t)n * CRS];
-    for (unsigned int k = 0; k < CRS; ++k)
+    int32_t qsum = 0;
+    for (unsigned int k = 0; k < CRS; ++k) {
       qrow[k] =
         (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
+      qsum += qrow[k];
+    }
+    colsum_ptr[n] = qsum;
   });
 
   // 3) Pack int8 [Npad, Kpad] -> q8_0x4 qs (d = 0, ignored by the kernel).
@@ -1840,6 +1850,25 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             weight_is_q8 ? nullptr : filter_kernel.getData<float>(), filter_size,
             CRS);
 
+          // Asymmetric (affine) int8 activations with a SHARED fixed offset
+          // (default; NNTR_W8A8_SYM=1 reverts to symmetric): every int8 edge
+          // in this graph carries SiLU-domain values, whose global minimum is
+          // -0.27846 (min of x*sigmoid(x)), so the representation
+          //     x = (q + 128) * s - kActOff
+          // spans [-kActOff, 255*s - kActOff] and uses all 256 levels on the
+          // range that actually occurs -- ~2x the resolution of symmetric
+          // [-amax, amax], which wastes half its levels on negatives that
+          // never happen. This is what keeps ORT's borderline keypoints from
+          // flipping (S0 sim: min margin +0.008 symmetric -> +0.054 affine).
+          // Because the offset is a shared CONSTANT, no zero point needs to be
+          // stored (the tensor scale slot keeps s) and concat/pool/upsample
+          // rescale exactly as before modulo the +128 shift. The GEMM needs no
+          // kernel change: sum_k w*x = s_a*s_w*acc + s_w*(128*s_a -
+          // kActOff)*colsum_w, and the second term folds into the bias.
+          static const bool perch_asym =
+            std::getenv("NNTR_W8A8_SYM") == nullptr;
+          constexpr float kActOff = 0.27846455f;
+
           // input int8 + per-tensor scale
           const int8_t *a_i8 = nullptr;
           float a_scale = 1.f;
@@ -1861,12 +1890,24 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             // simulation (which holds 81/87) is what the fp16 rounding broke on
             // device (per-channel 81 -> 80); ~50 layers of ~5e-4 scale error
             // accumulate across the int8-resident pipeline.
-            a_scale = amax > 0.f ? amax / 127.f : 1.f;
-            const float inv = 1.f / a_scale;
+            // (This input is the stem's SiLU output, so the affine range
+            // [-kActOff, amax] is valid; amax >= max(x) covers the top end.)
             a_buf.resize(n_in);
-            for (size_t i = 0; i < n_in; ++i)
-              a_buf[i] = (int8_t)std::max(
-                -128.f, std::min(127.f, std::round(fin[i] * inv)));
+            if (perch_asym) {
+              a_scale = amax > 0.f ? (amax + kActOff) / 255.f : 1.f;
+              const float inv = 1.f / a_scale;
+              for (size_t i = 0; i < n_in; ++i) {
+                const float q = std::round((fin[i] + kActOff) * inv) - 128.f;
+                a_buf[i] =
+                  (int8_t)std::max(-128.f, std::min(127.f, q));
+              }
+            } else {
+              a_scale = amax > 0.f ? amax / 127.f : 1.f;
+              const float inv = 1.f / a_scale;
+              for (size_t i = 0; i < n_in; ++i)
+                a_buf[i] = (int8_t)std::max(
+                  -128.f, std::min(127.f, std::round(fin[i] * inv)));
+            }
             a_i8 = a_buf.data();
           }
 
@@ -1896,8 +1937,17 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             cptr = out.getData<float>(); // NHWC [owoh, out_ch] == GEMM layout
           }
 
+          // Padded gather positions must represent x = 0, whose affine code is
+          // round(kActOff / s) - 128 (the byte 0 would mean x = 128*s - kActOff).
+          int8_t pad_q = 0;
+          if (perch_asym)
+            pad_q = (int8_t)std::max(
+              -128L,
+              std::min(127L, std::lround(kActOff / a_scale) - 128L));
+
           __ggml_q8ch_indirect_GEMM(owoh, filter_size, W.Kpad, a_i8, a_scale,
-                                    geom, W.qs.data(), W.scale.data(), cptr);
+                                    geom, W.qs.data(), W.scale.data(), cptr,
+                                    pad_q);
 
           // bias + SiLU on FP32, then (for an int8 output) requantize.
           {
@@ -1910,6 +1960,20 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
                 db.empty() || db.get() == false)
               bptr =
                 context.getWeight(wt_idx[ConvParams::bias]).getData<float>();
+            // Affine activations: the GEMM accumulated sum_k q_w * q_a with the
+            // offset still inside q_a; the exact linear term
+            //   s_w[j] * (128*s_a - kActOff) * colsum_w[j]
+            // completes sum_k w*x, and being per-output-channel constant it
+            // folds into the bias (no kernel change, no per-element cost).
+            std::vector<float> ebias;
+            if (perch_asym) {
+              const float koff = 128.f * a_scale - kActOff;
+              ebias.resize(C);
+              for (unsigned int j = 0; j < C; ++j)
+                ebias[j] = (bptr ? bptr[j] : 0.f) +
+                           W.scale[j] * koff * (float)W.colsum[j];
+              bptr = ebias.data();
+            }
             static const bool approx_silu =
               std::getenv("NNTR_APPROX_SILU") != nullptr &&
               std::string(std::getenv("NNTR_APPROX_SILU")) == "1";
@@ -1934,22 +1998,37 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
               // per-channel conv (FP32 act_scale) or an int8 concat/pool/upsample
               // that forwards this scale, never a block_q8_0 fp16 d, so keep the
               // scale in FP32 to match the S0 simulation's 81/87.
-              float sc = amax > 0.f ? amax / 127.f : 1.f;
+              // Affine: the output is a SiLU tensor (>= -kActOff); span
+              // [-kActOff, amax] over 256 levels (amax = max|x| >= max(x)).
+              float sc;
+              if (perch_asym)
+                sc = amax > 0.f ? (amax + kActOff) / 255.f : 1.f;
+              else
+                sc = amax > 0.f ? amax / 127.f : 1.f;
               const float inv = 1.f / sc;
+              const bool asym_q = perch_asym;
               int8_t *qo = out.getData<int8_t>();
               const size_t chunk = 4096;
               const size_t nchunk = (nout + chunk - 1) / chunk;
               tm.parallel_for(0, nchunk, [=](size_t ci) {
                 const size_t i0 = ci * chunk;
                 const size_t i1 = std::min(i0 + chunk, nout);
-                for (size_t i = i0; i < i1; ++i)
-                  qo[i] = (int8_t)std::max(
-                    -128.f, std::min(127.f, std::round(cptr[i] * inv)));
+                if (asym_q) {
+                  for (size_t i = i0; i < i1; ++i) {
+                    const float q =
+                      std::round((cptr[i] + kActOff) * inv) - 128.f;
+                    qo[i] = (int8_t)std::max(-128.f, std::min(127.f, q));
+                  }
+                } else {
+                  for (size_t i = i0; i < i1; ++i)
+                    qo[i] = (int8_t)std::max(
+                      -128.f, std::min(127.f, std::round(cptr[i] * inv)));
+                }
               });
               hidden_.getScale<float>()[0] = sc;
             } else if (bptr || act) {
-              // FP32 output (head-final conv, out_ch % 4 != 0): fused bias +
-              // SiLU, row-parallel, no requant.
+              // FP32 output (head-final conv, out_ch % 4 != 0): fused bias
+              // (incl. the affine correction) + SiLU, row-parallel, no requant.
               tm.parallel_for(0, owoh, [=](size_t p) {
                 convBiasActRow(cptr + (size_t)p * C, bptr, C, act);
               });

@@ -185,6 +185,16 @@ void ConcatLayer::forwarding(RunLayerContext &context, bool training) {
         int8_t *dst = output.getData<int8_t>();
         const float mult = input.getScale<float>()[0] / q8_out_scale;
         const bool identity = std::fabs(mult - 1.f) < 1e-12f;
+        // Per-channel W8A8 (default asymmetric): tensors use the shared-offset
+        // affine code x = (q + 128) * s - C. Because C is COMMON to every
+        // branch it cancels in the rescale --
+        //   q' = round((q + 128) * s_i / s_o) - 128
+        // -- so only the +-128 shift differs from the symmetric formula (and
+        // s_o = max(s_i) still exactly covers the union range). The identity
+        // (mult == 1) memcpy is unchanged in both conventions.
+        static const bool asym =
+          std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+          std::getenv("NNTR_W8A8_SYM") == nullptr;
         auto &tm = ThreadManager::Global();
         for (unsigned int b = 0; b < B; ++b) {
           const size_t base = (size_t)b * HW;
@@ -193,6 +203,11 @@ void ConcatLayer::forwarding(RunLayerContext &context, bool training) {
             int8_t *d = dst + (base + p) * out_dim.channel() + c_offset;
             if (identity) {
               std::memcpy(d, s, (size_t)Ci);
+            } else if (asym) {
+              for (unsigned int c = 0; c < Ci; ++c) {
+                float q = std::round(((float)s[c] + 128.f) * mult) - 128.f;
+                d[c] = (int8_t)std::max(-128.f, std::min(127.f, q));
+              }
             } else {
               for (unsigned int c = 0; c < Ci; ++c) {
                 float q = std::round((float)s[c] * mult);
