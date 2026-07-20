@@ -394,6 +394,39 @@ static inline void pack_i8_rows_q8_0x4(const int8_t *rows, unsigned int K,
                                        uint16_t d_fp16, char *dst) {
   const unsigned int nb = K / QK8_0;
   block_q8_0x4 *out = (block_q8_0x4 *)dst;
+#if defined(__ARM_NEON)
+  // The interleave qs[32*sub + 8*r + lane] is, per 32-block, four 32-byte
+  // groups [r0|r1|r2|r3] of the rows' 8-byte sub-chunks. Loading each row's
+  // 32 bytes once (two q-registers) and storing combined 16-byte halves does
+  // the whole block in 8 loads + 8 stores -- the scalar 8-byte memcpy version
+  // ran well below memory bandwidth and was the largest cost of the 1x1-conv
+  // fast path (head.final gemm.pack).
+  for (unsigned int j = 0; j < nb; ++j) {
+    block_q8_0x4 &sb = out[j];
+    sb.d[0] = sb.d[1] = sb.d[2] = sb.d[3] = d_fp16;
+    const uint8_t *p0 =
+      (const uint8_t *)(rows + (size_t)0 * K + (size_t)j * QK8_0);
+    const uint8_t *p1 =
+      (const uint8_t *)(rows + (size_t)1 * K + (size_t)j * QK8_0);
+    const uint8_t *p2 =
+      (const uint8_t *)(rows + (size_t)2 * K + (size_t)j * QK8_0);
+    const uint8_t *p3 =
+      (const uint8_t *)(rows + (size_t)3 * K + (size_t)j * QK8_0);
+    const uint8x16_t r0lo = vld1q_u8(p0), r0hi = vld1q_u8(p0 + 16);
+    const uint8x16_t r1lo = vld1q_u8(p1), r1hi = vld1q_u8(p1 + 16);
+    const uint8x16_t r2lo = vld1q_u8(p2), r2hi = vld1q_u8(p2 + 16);
+    const uint8x16_t r3lo = vld1q_u8(p3), r3hi = vld1q_u8(p3 + 16);
+    uint8_t *q = (uint8_t *)sb.qs;
+    vst1q_u8(q + 0, vcombine_u8(vget_low_u8(r0lo), vget_low_u8(r1lo)));
+    vst1q_u8(q + 16, vcombine_u8(vget_low_u8(r2lo), vget_low_u8(r3lo)));
+    vst1q_u8(q + 32, vcombine_u8(vget_high_u8(r0lo), vget_high_u8(r1lo)));
+    vst1q_u8(q + 48, vcombine_u8(vget_high_u8(r2lo), vget_high_u8(r3lo)));
+    vst1q_u8(q + 64, vcombine_u8(vget_low_u8(r0hi), vget_low_u8(r1hi)));
+    vst1q_u8(q + 80, vcombine_u8(vget_low_u8(r2hi), vget_low_u8(r3hi)));
+    vst1q_u8(q + 96, vcombine_u8(vget_high_u8(r0hi), vget_high_u8(r1hi)));
+    vst1q_u8(q + 112, vcombine_u8(vget_high_u8(r2hi), vget_high_u8(r3hi)));
+  }
+#else
   for (unsigned int j = 0; j < nb; ++j) {
     block_q8_0x4 &sb = out[j];
     for (int r = 0; r < 4; ++r) {
@@ -403,6 +436,7 @@ static inline void pack_i8_rows_q8_0x4(const int8_t *rows, unsigned int K,
         std::memcpy(&sb.qs[32 * sub + 8 * r], src + 8 * sub, 8);
     }
   }
+#endif
 }
 
 /**
