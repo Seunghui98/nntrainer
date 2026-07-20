@@ -927,8 +927,7 @@ enum ConvParams {
   bias,
   im2col_scratch,
   qgemm_scratch,
-  q8act_scratch,
-  deq_in_scratch
+  q8act_scratch
 };
 
 Conv2DLayer::Conv2DLayer(
@@ -1046,8 +1045,17 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
     w8a8_mode && quant_matmul_filter &&
     in_t_type.data_type == nntrainer::Tdatatype::Q8_0 &&
     in_dim.getFormat() == ml::train::TensorDim::Format::NHWC;
-  if (w8a8_q8out)
+  if (w8a8_q8out) {
     out_dim.setDataType(nntrainer::Tdatatype::QINT8);
+  } else if (out_dim.getDataType() == nntrainer::Tdatatype::QINT8) {
+    // A conv NEVER passes int8 through: a Q8_0 conv emits int8 via the
+    // quantize epilogue (handled above), any other conv dequantizes its
+    // input and produces FP32. Without this, an FP32-weight conv fed a QINT8
+    // activation would inherit QINT8 from its input dtype and write FP32
+    // bytes into an int8-typed tensor -- the next layer then reads a garbage
+    // per-tensor scale.
+    out_dim.setDataType(nntrainer::Tdatatype::FP32);
+  }
 
   context.setOutputDimensions({out_dim});
 
@@ -1073,7 +1081,6 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   wt_idx[ConvParams::im2col_scratch] = std::numeric_limits<unsigned int>::max();
   wt_idx[ConvParams::qgemm_scratch] = std::numeric_limits<unsigned int>::max();
   wt_idx[ConvParams::q8act_scratch] = std::numeric_limits<unsigned int>::max();
-  wt_idx[ConvParams::deq_in_scratch] = std::numeric_limits<unsigned int>::max();
   if (groups == 1) {
     auto scratch_type = in_dim.getTensorType();
     // W8A8: scratch buffers hold FP32 intermediates (im2col columns, the
@@ -1108,15 +1115,13 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
     // quantized GEMM output [batch, 1, OH*OW, out_ch] (quant path only).
     if (quant_matmul_filter) {
       TensorDim tmp_dim(in_dim.batch(), 1, owoh, filter_size, scratch_type);
-      // W8A8: FUNC-lifespan scratch shares arena memory with activation
-      // tensors; the W8A8 epilogue reads the QINT8 input while writing the
-      // FP32 GEMM result here, so give it an isolated (INFER) allocation --
-      // same reasoning as q8act_scratch below.
-      wt_idx[ConvParams::qgemm_scratch] = context.requestTensor(
-        tmp_dim, "qgemm_out", Initializer::NONE, false,
-        w8a8_mode ? TensorLifespan::FORWARD_INFER_LIFESPAN
-                  : TensorLifespan::FORWARD_FUNC_LIFESPAN);
+      wt_idx[ConvParams::qgemm_scratch] =
+        context.requestTensor(tmp_dim, "qgemm_out", Initializer::NONE, false,
+                              TensorLifespan::FORWARD_FUNC_LIFESPAN);
     }
+    // (W8A8 uses forward-local heap buffers for its FP32 GEMM output and input
+    // dequantization -- pool INFER scratch is not materialized for inference
+    // and a FUNC scratch aliases live activation memory; see forwarding().)
     // Q8_0 activation scratch for NHWC W4A8 path: pre-allocated once so
     // forwarding never calls malloc. Size = max(owoh, in_h*in_w) * nb blocks,
     // stored as a plain float buffer and reinterpret-cast to block_q8_0*.
@@ -1146,17 +1151,6 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
           context.requestTensor(q8dim, "q8act", Initializer::NONE, false,
                                 TensorLifespan::FORWARD_INFER_LIFESPAN);
       }
-    }
-    // W8A8: a non-quantized (FP32-weight) conv fed by a QINT8 activation
-    // dequantizes its input once into this FP32 scratch and then runs the
-    // standard FP32 path unchanged (conv is the universal dtype boundary).
-    if (!quant_matmul_filter &&
-        in_dim.getDataType() == nntrainer::Tdatatype::QINT8) {
-      TensorDim deq_dim = in_dim;
-      deq_dim.setDataType(nntrainer::Tdatatype::FP32);
-      wt_idx[ConvParams::deq_in_scratch] =
-        context.requestTensor(deq_dim, "deq_in", Initializer::NONE, false,
-                              TensorLifespan::FORWARD_INFER_LIFESPAN);
     }
   }
 }
@@ -1518,15 +1512,16 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
         Tensor in_sub = input_.getBatchSlice(b, 1);
 
         // W8A8: an FP32-weight conv fed by a QINT8 activation dequantizes it
-        // once into the FP32 scratch and runs the standard path unchanged.
+        // once into a heap-local FP32 buffer and runs the standard path
+        // unchanged (conv is the universal dtype boundary).
+        std::vector<float> deq_in_buf;
         if (!weight_is_quant &&
             in_sub.getDataType() == nntrainer::Tdatatype::QINT8) {
-          Tensor deq = context.getTensor(wt_idx[ConvParams::deq_in_scratch])
-                         .getBatchSlice(b, 1);
           const int8_t *q = in_sub.getData<int8_t>();
           const float sc = in_sub.getScale<float>()[0];
-          float *fp = deq.getData<float>();
           const size_t n_in = in_sub.size();
+          deq_in_buf.resize(n_in);
+          float *fp = deq_in_buf.data();
           auto &tmd = ThreadManager::Global();
           const size_t chunk = 65536;
           tmd.parallel_for(0, (n_in + chunk - 1) / chunk, [=](size_t ci) {
@@ -1534,7 +1529,10 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             for (size_t i = i0; i < i1; ++i)
               fp[i] = sc * (float)q[i];
           });
-          in_sub = deq;
+          TensorDim din = in_sub.getDim();
+          din.setDataType(nntrainer::Tdatatype::FP32);
+          in_sub = Tensor::Map<float>(deq_in_buf.data(),
+                                      deq_in_buf.size() * sizeof(float), din);
         }
 
         if (weight_is_quant) {
@@ -1549,12 +1547,18 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             const bool out_qint8 =
               out.getDataType() == nntrainer::Tdatatype::QINT8;
             Tensor out_flat = out;
+            std::vector<float> w8a8_out_buf;
             if (out_qint8) {
-              out_flat = qgemm_scratch->getBatchSlice(b, 1);
-              out_flat.reshape(TensorDim(
-                1, 1, owoh, filter_size,
-                {ml::train::TensorDim::Format::NCHW,
-                 nntrainer::Tdatatype::FP32}));
+              // Dedicated FP32 GEMM-output buffer (heap-local: pool INFER
+              // scratch is not materialized for inference, and a FUNC scratch
+              // aliases live activation memory). The epilogue reads it back to
+              // quantize into `out`.
+              w8a8_out_buf.assign((size_t)owoh * filter_size, 0.f);
+              out_flat = Tensor::Map<float>(
+                w8a8_out_buf.data(), w8a8_out_buf.size() * sizeof(float),
+                TensorDim(1, 1, owoh, filter_size,
+                          {ml::train::TensorDim::Format::NCHW,
+                           nntrainer::Tdatatype::FP32}));
             } else {
               out_flat.reshape(TensorDim(
                 1, 1, owoh, filter_size,
