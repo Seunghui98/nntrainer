@@ -202,24 +202,45 @@ BD_DIM=256, 4층, 4 head, FFN 1024 (bert_decoder.h:64-77) — 커널 하나하�
   fallback, 직렬 activation 양자화, per-op 오버헤드. GEMM 커널 자체는 이미
   MLAS와 대등하다는 벤치가 커밋 로그(b9bef77)에 있다.
 
-## 5. 권장 조치 (우선순위 순)
+## 5. 성능 개선 백로그 (우선순위 리스트)
 
-1. **gemm_attention 살리기**: `hgemm_f16xf16_f32_fmlal` 구현(또는 기존
-   hgemm/sgemm로 대체 배선)해서 encoder prefill과 cross-attention을 GEMM 경로로.
-   최소한 `compute_kcaches`의 (a) K row 반복 fp16→fp32 변환 제거(층당 1회 사전
-   변환 또는 fmlal 직접 dot), (b) 다중 누적기, (c) `/sqrt(d)` 사전 계산,
-   (d) AV의 fp32 누적 + heap 할당 제거만 해도 상당 부분 회수 가능.
-2. **activation 양자화 병렬화 재시도**: 스레드당 연속 super-row 청크로 분할
-   (row 단위 parallel_for가 아니라)해 revert 원인이던 오버헤드 회피. 또는 GEMM
-   커널 내부로 fold(스레드별로 자기 컬럼 파티션 계산 전에 필요한 act를 협동 양자화).
-3. **BERT: dispatch 감소** — 작은 op들(bias+GELU, residual+LN)의 fused 실행,
-   decode 경로 attention의 head×row 2차원 분할, `parallel_for`의 소규모 일감
-   single-thread cutoff.
-4. **lm_head 전용 최적화**: N=30522 GEMV에 per-channel(또는 per-row Q8) 포맷
-   실험 — 출력층은 per-block 정확도 이득이 작아서 포맷 전환의 리스크가 가장 낮고
-   bytes/fold 이득은 즉시 나온다.
-5. 측정으로 검증: 층별/커널별 시간 분해(simpleperf 또는 performance_metrics.h)로
-   위 표의 기여 추정치를 실측으로 교체.
+예상 회수치는 코드 구조 기반 오더 추정이며 실측으로 검증 필요. 표기:
+효과 = 예상 회수 시간, 난이도 = 구현+검증 비용.
+
+### P0 — 즉시 착수 권장 (격차의 대부분)
+
+| # | 항목 | 대상 | 예상 효과 | 난이도 | 근거 코드 |
+|---|---|---|---|---|---|
+| 1 | **레이어별 실측 프로파일 계측** — 아래 모든 추정치를 실측으로 교체. simpleperf + per-layer timer | 공통 | (전제 작업) | 하 | `performance_metrics.h` |
+| 2 | **attention GEMM화**: 미정의 `hgemm_f16xf16_f32_fmlal` 호출을 기존 `shgemm`/`custom_hgemm` 분기로 대체하고 `NNTR_ENABLE_GEMM_ATTENTION` 활성화. 인코더 prefill(196토큰)과 BERT cross-attn이 대상 | SigLIP2, BERT | 인코더 2~5ms, BERT 0.2~0.5ms | 중 | mha_core.cpp:229, 1058, 1168 |
+| 3 | **activation Q8_0 양자화 병렬화 재시도**: revert(f42d968)된 row 단위 분할 대신 스레드당 연속 super-row 청크(M4/T개)로 분할해 dispatch 오버헤드 회피 | SigLIP2 | 1~3ms | 하 | bs_threadpool.cpp:887-893 |
+| 4 | **`parallel_for` 소규모 일감 cutoff**: 현재 범위≥2면 무조건 futex wake+barrier. 총 일감 추정치가 임계 미만이면 main thread 직행 | BERT(주), 공통 | BERT 0.3~1ms | 하 | thread_manager.h:156-168 |
+| 5 | **lm_head per-channel int8 실험**: N=30522 GEMV는 메모리 바운드라 +6.25% bytes와 per-32 fold가 그대로 시간. 출력층은 per-block 정확도 이득이 작아 포맷 전환 리스크 최소. 포맷 기여분 실측 분리도 겸함 | BERT | 토큰당 0.2~0.5ms | 중 | lm_head.cpp:154, neon_impl.cpp:2953 |
+
+### P1 — 다음 단계
+
+| # | 항목 | 대상 | 예상 효과 | 난이도 | 근거 코드 |
+|---|---|---|---|---|---|
+| 6 | **fallback attention 커널 개선** (P0-2를 안 하거나 보완으로): (a) K row fp16→fp32를 query마다 반복 변환하는 것 제거(층당 1회 사전 변환), (b) 단일 누적기 → 4개 언롤, (c) `/sqrt(d)` 나눗셈을 사전 곱으로, (d) AV fp32 누적 + per-call heap 할당 제거 | SigLIP2, BERT | 인코더 1~3ms | 중 | neon_impl_fp16.cpp:1935-1997, 1853-1932 |
+| 7 | **`nntr_quantize_mat_q8_0_4x8` 패킹 개선**: byte 저장이 `vgetq_lane_s32` 스칼라 추출 — `vqmovn`+`vtbl` 계열 벡터 셔플로 교체 | SigLIP2 | 0.5~1ms | 중 | neon_impl.cpp:1423-1520 |
+| 8 | **BERT decode attention 2차원 분할**: KV head 4개로만 병렬화 → head×row 분할로 풀 활용 | BERT | 0.1~0.3ms | 하 | mha_core.cpp:635-649 |
+| 9 | **elementwise 융합**: bias+GELU, residual+LayerNorm 융합 노드 (ORT의 BiasGelu/SkipLayerNorm 대응). barrier 수와 메모리 pass 동시 감소 | 공통 | 인코더 0.5~1.5ms, BERT 0.2~0.5ms | 상 | layer graph 전반 |
+| 10 | **정적 균등 분할 → 청크+atomic 카운터 동적 스케줄링**: big.LITTLE에서 균등 컬럼 분할은 가장 느린 코어가 barrier를 지배 | 공통 | 가변 | 중 | bs_threadpool.cpp:863-868, thread_manager.cpp |
+
+### P2 — 실험/장기
+
+| # | 항목 | 대상 | 비고 |
+|---|---|---|---|
+| 11 | per-channel(또는 K-chunk scale) 포맷 전면 실험: inner-loop fold 제거로 GEMM ~10-30% 이득 가능하나 정확도 재검증 필수. Q8_0 유지 시에도 블록 128/256 확대 실험 가치 | SigLIP2, BERT | 정확도-속도 트레이드오프 |
+| 12 | `store4` 스칼라 store 제거 (tmp 배열 경유 4회 scalar → `vst1q_f32` 직행) | GEMM 공통 | 소폭 | neon_impl.cpp:2790-2795 |
+| 13 | 커널 내 per-call heap 할당 제거 (`std::vector`/`new float[]`): softmax_row_inplace, compute_kcaches tmp, AV 누적기 | 공통 | 소폭 + jitter 감소 | neon_impl.cpp:1681, neon_impl_fp16.cpp:1876, 1939 |
+| 14 | fmlal 기반 `hgemm_f16xf16_f32` 전용 커널 구현 (P0-2의 상위 호환) | SigLIP2, BERT | P0-2 대비 추가 이득은 실측 후 판단 |
+
+### 정리
+
+- SigLIP2 격차 +2.3ms: P0-2(attention) + P0-3(양자화 병렬화)만으로 역전 가능 전망.
+- BERT 격차 +1.5ms: P0-4(cutoff) + P0-5(lm_head) + P1-8이 주 타깃.
+- 포맷(per-block) 기인분은 P0-5 실험으로 실측 분리 후 P2-11 확대 여부 결정.
 
 ## 부록: 수치 가정
 
