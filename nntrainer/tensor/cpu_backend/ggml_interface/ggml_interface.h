@@ -283,6 +283,21 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
                                          float *C, const unsigned int ldc);
 
 /**
+ * @brief W8A8 indirect conv GEMM: pre-quantized int8 activation with one
+ * per-tensor FP32 scale (produced by the previous layer's fused quantize
+ * epilogue) x q8_0x4 weight -> FP32 output. Same geometry/padding contract as
+ * the fp32 variant; the activation gather is a pure byte shuffle (constant-d
+ * block packing), no per-conv re-quantization.
+ */
+void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
+                                        const unsigned int N,
+                                        const unsigned int K, const int8_t *in,
+                                        const float act_scale,
+                                        const ConvGatherParams &geom,
+                                        const void *B, const unsigned int ldb,
+                                        float *C, const unsigned int ldc);
+
+/**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *
  * @param M as descripted above

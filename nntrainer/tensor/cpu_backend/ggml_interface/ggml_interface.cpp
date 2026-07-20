@@ -378,4 +378,130 @@ void __ggml_q8_0_q8_0_indirect_GEMM_fp32(const unsigned int M,
   }
 }
 
+/**
+ * @brief Pack 4 gathered int8 rows [4][K] into the interleaved block_q8_0x4
+ * stream with one constant scale d for every block.
+ *
+ * A per-tensor-scale int8 activation is numerically identical to a block_q8_0
+ * stream whose blocks all carry d = scale, so the pre-quantized W8A8 activation
+ * feeds the existing q8_0x4 SMMLA kernel with a pure byte shuffle -- no amax
+ * scan, no rounding math (that happened once at the producing layer).
+ * Layout matches nntr_quantize_mat_q8_0_4x8 / repack_q8_0:
+ * qs[32*sub + 8*row + lane], sub = 8-lane chunk 0..3 within the 32-block.
+ */
+static inline void pack_i8_rows_q8_0x4(const int8_t *rows, unsigned int K,
+                                       uint16_t d_fp16, char *dst) {
+  const unsigned int nb = K / QK8_0;
+  block_q8_0x4 *out = (block_q8_0x4 *)dst;
+  for (unsigned int j = 0; j < nb; ++j) {
+    block_q8_0x4 &sb = out[j];
+    for (int r = 0; r < 4; ++r) {
+      sb.d[r] = d_fp16;
+      const int8_t *src = rows + (size_t)r * K + (size_t)j * QK8_0;
+      for (int sub = 0; sub < 4; ++sub)
+        std::memcpy(&sb.qs[32 * sub + 8 * r], src + 8 * sub, 8);
+    }
+  }
+}
+
+/**
+ * @brief W8A8 indirect conv GEMM: pre-quantized int8 activation (per-tensor
+ * scale) x q8_0x4 weight -> FP32 output.
+ *
+ * Identical structure to __ggml_q8_0_q8_0_indirect_GEMM_fp32, but the input is
+ * already int8 with one FP32 scale (the producing layer's fused quantize
+ * epilogue wrote it), so the per-conv activation quantization disappears: the
+ * gather collects int8 bytes and pack_i8_rows_q8_0x4 shuffles them into the
+ * kernel layout with constant d. Same CRS-padding contract: K may exceed the
+ * geometry's real CRS (zero tail via the gather's dst_stride), and only the
+ * first N weight columns are tiled (free out_ch strip).
+ *
+ * @param act_scale the producer's per-tensor scale. It is converted to fp16
+ * once here (block_q8_0.d is fp16); the producer must quantize with the SAME
+ * fp16-rounded value so (q, d) reproduces its FP32 values exactly.
+ */
+void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
+                                        const unsigned int N,
+                                        const unsigned int K, const int8_t *in,
+                                        const float act_scale,
+                                        const ConvGatherParams &geom,
+                                        const void *B, const unsigned int ldb,
+                                        float *C, const unsigned int ldc) {
+  (void)ldb;
+  (void)ldc;
+  auto &tm = ThreadManager::Global();
+  const unsigned int nb = K / QK8_0;
+  const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * nb;
+  const unsigned int Mfull = (M / 4) * 4;
+  const unsigned int rem = M % 4;
+  const unsigned int M4 = M / 4;
+  const unsigned int M4c = (M + 3) / 4;
+  const uint16_t d16 = nntr_compute_fp32_to_fp16(act_scale);
+
+  // 1) Gather int8 rows 4 at a time and byte-pack to q8_0x4 (constant d).
+  std::vector<char> QA((size_t)M4c * qa_4_rows_size);
+  char *QA_ptr = QA.data();
+
+  const unsigned int QCHUNK = 64; // multiple of 4
+  if (Mfull > 0) {
+    const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+      std::vector<int8_t> tile((size_t)4 * K);
+      for (unsigned int r = r0; r < r1; r += 4) {
+        gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4, (int)K);
+        pack_i8_rows_q8_0x4(tile.data(), K, d16,
+                            QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
+      }
+    });
+  }
+  if (rem > 0) {
+    std::vector<int8_t> tile((size_t)4 * K, 0);
+    gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)Mfull, (int)rem,
+                                 (int)K);
+    pack_i8_rows_q8_0x4(tile.data(), K, d16,
+                        QA_ptr + (size_t)M4 * qa_4_rows_size);
+  }
+
+  // 2) Same tiled 4x4 SMMLA GEMM as the FP32-activation path.
+  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
+  const unsigned int row_chunk_size = 16, col_chunk_size = 16;
+
+  if (Mfull > 0) {
+    const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
+    const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+      unsigned int r = static_cast<unsigned int>(i / col_loop);
+      unsigned int c = static_cast<unsigned int>(i % col_loop);
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), Mfull);
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+      nntr_gemm_q8_0_q8_0_4x4_f32(
+        (int)K, C + (size_t)r_start * N + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        (const void *)(QA_ptr + (size_t)(r_start / 4) * qa_4_rows_size),
+        (int)(r_end - r_start), (int)(c_end - c_start));
+    });
+  }
+  if (rem > 0) {
+    std::vector<float> scratch((size_t)4 * N);
+    float *scratch_ptr = scratch.data();
+    const char *tail_a = QA_ptr + (size_t)M4 * qa_4_rows_size;
+    const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, col_loop, [=](size_t c) {
+      unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * ((unsigned int)c + 1), N);
+      nntr_gemm_q8_0_q8_0_4x4_f32(
+        (int)K, scratch_ptr + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        (const void *)tail_a, 4, (int)(c_end - c_start));
+    });
+    for (unsigned int rr = 0; rr < rem; ++rr)
+      std::memcpy(C + (size_t)(Mfull + rr) * N, scratch_ptr + (size_t)rr * N,
+                  (size_t)N * sizeof(float));
+  }
+}
+
 } // namespace nntrainer
