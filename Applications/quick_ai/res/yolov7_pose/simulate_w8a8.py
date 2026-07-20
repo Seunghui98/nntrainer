@@ -62,11 +62,29 @@ SIMCC_BINS = 640  # img_size 320 * simcc_split_ratio 2
 # FP32-scale simulation does not have -- toggle it to test whether the ~50-layer
 # accumulation of fp16 scale error is what drops device per-channel 81 -> 80.
 ACT_SCALE_FP16 = False
+# ORT-style ASYMMETRIC (affine) activation quantization: scale = (max-min)/255
+# with a zero point, so the full 256-level grid spans the actual value range.
+# SiLU outputs live in [~-0.28, max]; symmetric int8 wastes nearly half its
+# levels on negatives that never occur, while affine quantization keeps ~2x the
+# resolution on every activation edge -- the margin that keeps ORT's borderline
+# keypoints (score ~0.5) from flipping.
+ACT_ASYM = False
 
 
 def fake_quant_act_per_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Per-tensor symmetric int8 fake-quant with dynamic scale (FP32, or fp16-
-    rounded when ACT_SCALE_FP16, matching the device epilogue)."""
+    """Per-tensor int8 fake-quant with dynamic scale. Symmetric by default;
+    ACT_ASYM switches to affine (zero-point) quantization like ORT's u8
+    activations. ACT_SCALE_FP16 rounds the scale to fp16 (device per-block)."""
+    if ACT_ASYM:
+        mn, mx = t.min(), t.max()
+        if mx == mn:
+            return t
+        scale = (mx - mn) / 255.0
+        if ACT_SCALE_FP16:
+            scale = scale.half().float()
+        zp = torch.round(-128.0 - mn / scale)
+        q = torch.clamp(torch.round(t / scale) + zp, -128, 127)
+        return (q - zp) * scale
     amax = t.abs().max()
     if amax == 0:
         return t
@@ -159,9 +177,16 @@ def main():
                     "image), reproducing the device per-channel path before the "
                     "stem exclusion fix. The design keeps the image FP32; use "
                     "this to confirm stem-input quantization costs keypoints.")
+    ap.add_argument("--act_asym", action="store_true",
+                    help="ORT-style asymmetric (zero-point) activation "
+                    "fake-quant: scale=(max-min)/255. ~2x activation "
+                    "resolution on SiLU outputs vs symmetric int8; use to "
+                    "check whether affine activations recover the borderline "
+                    "keypoints (device symmetric per-channel reads 79).")
     args = ap.parse_args()
-    global ACT_SCALE_FP16
+    global ACT_SCALE_FP16, ACT_ASYM
     ACT_SCALE_FP16 = args.act_fp16
+    ACT_ASYM = args.act_asym
     wquant = (fake_quant_weight_per_channel if args.wquant == "per_channel"
               else fake_quant_weight_q8_0)
 
@@ -225,8 +250,21 @@ def main():
 
     visible = decode_visible(pose, args.thr)
     print(f"stage={args.stage}  wquant={args.wquant}  "
-          f"weight-quantized convs={n_wq}  act-hooked convs={n_hooked}")
+          f"weight-quantized convs={n_wq}  act-hooked convs={n_hooked}"
+          f"{'  act_asym' if args.act_asym else ''}"
+          f"{'  act_fp16' if args.act_fp16 else ''}")
     print(f"visible keypoints: {visible}/{NKPT} (thr={args.thr})")
+    # Borderline margin report: keypoints whose score sits near the threshold.
+    # These are the ones every small numeric change flips; watching their
+    # margins tells whether a scheme change genuinely adds headroom.
+    border = []
+    for k in range(NKPT):
+        s = min(pose[k].max(), pose[NKPT + k].max())
+        if 0.40 <= s < 0.60:
+            border.append((float(s), k))
+    for s, k in sorted(border):
+        print(f"  borderline kp{k:<3d} score={s:.4f}  "
+              f"({'+' if s >= args.thr else '-'}{abs(s - args.thr):.4f})")
 
 
 if __name__ == "__main__":
