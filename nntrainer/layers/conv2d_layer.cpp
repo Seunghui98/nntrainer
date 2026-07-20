@@ -114,29 +114,46 @@ struct PerChConvWeight {
 
 static inline float convFp16ToFp32Bits(uint16_t h); // defined below
 
-// fp32 -> fp16 bits (round-to-nearest-even). Inverse of convFp16ToFp32Bits;
-// used by the offline per-channel Q8_0 quantizer so the stored scale d is the
-// exact fp16 value the runtime reads back (convFp16ToFp32Bits). Scales are
-// non-negative (amax/127), so the subnormal/negative paths are not exercised,
-// but sign is preserved for generality.
+// fp32 -> fp16 bits (round-to-nearest-even), IEEE-correct including subnormals.
+// Inverse of convFp16ToFp32Bits; used by the offline per-channel Q8_0 quantizer
+// so the stored scale d is the exact fp16 value the runtime reads back. Conv
+// per-channel scales d = amax(row)/127 are frequently in the fp16 subnormal
+// range (amax < ~0.0078 -> d < 2^-14): those MUST be encoded as fp16
+// subnormals, not flushed to zero, or the whole output channel would quantize
+// to all-zero weights (measured as a systematic score drop / lost keypoints).
 static inline uint16_t convFp32ToFp16Bits(float f) {
   uint32_t bits;
   std::memcpy(&bits, &f, 4);
-  uint32_t sign = (bits >> 16) & 0x8000;
-  int32_t exp = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
-  uint32_t man = bits & 0x7fffff;
-  if (exp <= 0)
-    return (uint16_t)sign; // underflow -> signed zero
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const uint32_t e32 = (bits >> 23) & 0xffu;
+  uint32_t man = bits & 0x7fffffu;
+  if (e32 == 0xff) // Inf / NaN
+    return (uint16_t)(sign | 0x7c00u | (man ? 0x200u : 0u));
+  int32_t exp = (int32_t)e32 - 127 + 15;
   if (exp >= 31)
-    return (uint16_t)(sign | 0x7c00); // overflow -> inf
+    return (uint16_t)(sign | 0x7c00u); // overflow -> inf
+  if (exp <= 0) {
+    // subnormal (or zero): shift the significand (with implicit 1) into the
+    // 10-bit fp16 mantissa at the denormal position, round-to-nearest-even.
+    if (exp < -10)
+      return (uint16_t)sign; // magnitude below the smallest fp16 subnormal -> 0
+    man |= 0x800000u;        // restore the implicit leading 1
+    const uint32_t shift = (uint32_t)(14 - exp); // in [14, 24]
+    uint32_t hm = man >> shift;
+    const uint32_t rem = man & ((1u << shift) - 1u);
+    const uint32_t half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (hm & 1u)))
+      ++hm; // ties-to-even; may carry hm up to 0x400 = smallest normal (correct)
+    return (uint16_t)(sign | hm);
+  }
   uint32_t m = man >> 13;
-  uint32_t rem = man & 0x1fff;
-  if (rem > 0x1000 || (rem == 0x1000 && (m & 1)))
+  const uint32_t rem = man & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (m & 1u)))
     ++m;
-  if (m == 0x400) {
+  if (m == 0x400u) {
     m = 0;
     if (++exp >= 31)
-      return (uint16_t)(sign | 0x7c00);
+      return (uint16_t)(sign | 0x7c00u);
   }
   return (uint16_t)(sign | ((uint32_t)exp << 10) | m);
 }
