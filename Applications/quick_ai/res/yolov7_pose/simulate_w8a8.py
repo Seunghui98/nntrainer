@@ -55,12 +55,24 @@ NKPT = 87
 SIMCC_BINS = 640  # img_size 320 * simcc_split_ratio 2
 
 
+# When True, the per-tensor activation scale is rounded to fp16 before use,
+# exactly reproducing the device epilogue's convRoundScaleFp16(amax/127). The
+# per-channel int8 GEMM consumes the activation scale as an FP32 multiplier
+# (block d is ignored), so this rounding is a device-only precision loss the
+# FP32-scale simulation does not have -- toggle it to test whether the ~50-layer
+# accumulation of fp16 scale error is what drops device per-channel 81 -> 80.
+ACT_SCALE_FP16 = False
+
+
 def fake_quant_act_per_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Per-tensor symmetric int8 fake-quant with FP32 dynamic scale."""
+    """Per-tensor symmetric int8 fake-quant with dynamic scale (FP32, or fp16-
+    rounded when ACT_SCALE_FP16, matching the device epilogue)."""
     amax = t.abs().max()
     if amax == 0:
         return t
     scale = amax / 127.0
+    if ACT_SCALE_FP16:
+        scale = scale.half().float()
     return torch.clamp(torch.round(t / scale), -128, 127) * scale
 
 
@@ -137,7 +149,14 @@ def main():
         "the int32-accumulate kernel). Compare s4 accuracy across both to "
         "decide whether all-int8 per-channel holds the 81/87 gate.")
     ap.add_argument("--thr", type=float, default=0.5)
+    ap.add_argument("--act_fp16", action="store_true",
+                    help="round each activation scale to fp16 before use, "
+                    "matching the device epilogue's convRoundScaleFp16. Use to "
+                    "isolate whether fp16 activation-scale rounding is what "
+                    "costs the device its keypoint (per_channel 81 -> 80).")
     args = ap.parse_args()
+    global ACT_SCALE_FP16
+    ACT_SCALE_FP16 = args.act_fp16
     wquant = (fake_quant_weight_per_channel if args.wquant == "per_channel"
               else fake_quant_weight_q8_0)
 

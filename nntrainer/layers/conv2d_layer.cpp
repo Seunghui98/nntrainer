@@ -1843,7 +1843,14 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             float amax = 0.f;
             for (size_t i = 0; i < n_in; ++i)
               amax = std::max(amax, std::fabs(fin[i]));
-            a_scale = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
+            // FP32 activation scale (NOT fp16-rounded): the per-channel kernel
+            // consumes a_scale as an FP32 multiplier and ignores block d, so the
+            // convRoundScaleFp16 used by the per-block path is a needless
+            // per-layer precision loss here. Matching the FP32-scale S0
+            // simulation (which holds 81/87) is what the fp16 rounding broke on
+            // device (per-channel 81 -> 80); ~50 layers of ~5e-4 scale error
+            // accumulate across the int8-resident pipeline.
+            a_scale = amax > 0.f ? amax / 127.f : 1.f;
             const float inv = 1.f / a_scale;
             a_buf.resize(n_in);
             for (size_t i = 0; i < n_in; ++i)
@@ -1912,7 +1919,11 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
               float amax = 0.f;
               for (unsigned int p = 0; p < owoh; ++p)
                 amax = std::max(amax, rp[p]);
-              float sc = amax > 0.f ? convRoundScaleFp16(amax / 127.f) : 1.f;
+              // FP32 output scale (see the input-quant note): the consumer is a
+              // per-channel conv (FP32 act_scale) or an int8 concat/pool/upsample
+              // that forwards this scale, never a block_q8_0 fp16 d, so keep the
+              // scale in FP32 to match the S0 simulation's 81/87.
+              float sc = amax > 0.f ? amax / 127.f : 1.f;
               const float inv = 1.f / sc;
               int8_t *qo = out.getData<int8_t>();
               const size_t chunk = 4096;
