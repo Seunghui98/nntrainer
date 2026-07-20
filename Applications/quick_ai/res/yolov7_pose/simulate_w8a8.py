@@ -90,6 +90,29 @@ def fake_quant_weight_q8_0(w: torch.Tensor) -> torch.Tensor:
     return deq.reshape_as(w)
 
 
+def fake_quant_weight_per_channel(w: torch.Tensor) -> torch.Tensor:
+    """Per-output-channel symmetric int8 fake-quant of a conv weight
+    [out, cin, kh, kw]: ONE FP32 scale per output channel (row of the
+    [out, CRS] matmul). This is the ORT / industry-standard weight scheme --
+    coarser than per-32-block Q8_0 but it lets the int8 GEMM accumulate int32
+    across the whole reduction and apply the scale once (the speed win). No
+    CRS padding is needed (the scale spans the whole row), and scales stay
+    FP32 (no fp16 rounding), unlike block_q8_0.d.
+    """
+    out_ch = w.shape[0]
+    rows = w.reshape(out_ch, -1)
+    amax = rows.abs().amax(dim=1, keepdim=True)  # [out, 1]
+    scale = amax / 127.0
+    q = torch.where(
+        scale > 0,
+        torch.clamp(torch.round(rows / torch.where(scale > 0, scale,
+                                                    torch.ones_like(scale))),
+                    -128, 127) * scale,
+        rows,
+    )
+    return q.reshape_as(w)
+
+
 def decode_visible(pose: np.ndarray, thr: float = 0.5) -> int:
     """Replicates main.cpp decodeSimcc: score = min(max_x, max_y), >= thr."""
     visible = 0
@@ -107,8 +130,16 @@ def main():
     ap.add_argument("--input", default="input_320.bin",
                     help="NCHW FP32 1x3x320x320 input bin (the benchmark one)")
     ap.add_argument("--stage", choices=["fp32", "s3", "s4"], default="s3")
+    ap.add_argument(
+        "--wquant", choices=["per_block", "per_channel"], default="per_block",
+        help="weight fake-quant scheme. per_block = current Q8_0 (scale/32); "
+        "per_channel = ORT-style (one FP32 scale per output channel, enables "
+        "the int32-accumulate kernel). Compare s4 accuracy across both to "
+        "decide whether all-int8 per-channel holds the 81/87 gate.")
     ap.add_argument("--thr", type=float, default=0.5)
     args = ap.parse_args()
+    wquant = (fake_quant_weight_per_channel if args.wquant == "per_channel"
+              else fake_quant_weight_q8_0)
 
     model = YOLOv7Posetiny(nkpt=NKPT, img_size=320)
     state = _load_checkpoint(args.weights, torch.device("cpu"))
@@ -144,7 +175,7 @@ def main():
             is_head_final = out_ch == NKPT
 
             with torch.no_grad():
-                c.weight.copy_(fake_quant_weight_q8_0(c.weight))
+                c.weight.copy_(wquant(c.weight))
             n_wq += 1
 
             # input edge int8 (except the stem, whose input -- the image --
@@ -168,8 +199,8 @@ def main():
     assert pose.shape == (2 * NKPT, SIMCC_BINS), pose.shape
 
     visible = decode_visible(pose, args.thr)
-    print(f"stage={args.stage}  weight-quantized convs={n_wq}  "
-          f"act-hooked convs={n_hooked}")
+    print(f"stage={args.stage}  wquant={args.wquant}  "
+          f"weight-quantized convs={n_wq}  act-hooked convs={n_hooked}")
     print(f"visible keypoints: {visible}/{NKPT} (thr={args.thr})")
 
 
