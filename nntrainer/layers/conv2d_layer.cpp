@@ -1870,9 +1870,12 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
           constexpr float kActOff = 0.27846455f;
 
           // input int8 + per-tensor scale
+          // (thread_local: reused across layers/forwards on this thread --
+          // ParallelBatch workers each get their own -- so the per-forward
+          // malloc/free churn disappears; every byte is overwritten below.)
           const int8_t *a_i8 = nullptr;
           float a_scale = 1.f;
-          std::vector<int8_t> a_buf;
+          static thread_local std::vector<int8_t> a_buf;
           if (in_sub.getDataType() == nntrainer::Tdatatype::QINT8) {
             a_i8 = in_sub.getData<int8_t>();
             a_scale = in_sub.getScale<float>()[0];
@@ -1928,10 +1931,16 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
 
           const bool out_qint8 =
             out.getDataType() == nntrainer::Tdatatype::QINT8;
-          std::vector<float> cbuf;
+          // Reused thread_local GEMM output buffer, NOT zeroed: the GEMM tiles
+          // cover every [M x N] element (bulk rows via the tiled kernel, the
+          // M%4 tail via its scratch memcpy), so the former per-forward
+          // assign(.., 0.f) was a full-tensor memset thrown away immediately.
+          static thread_local std::vector<float> cbuf;
           float *cptr;
           if (out_qint8) {
-            cbuf.assign((size_t)owoh * filter_size, 0.f);
+            const size_t need = (size_t)owoh * filter_size;
+            if (cbuf.size() < need)
+              cbuf.resize(need);
             cptr = cbuf.data();
           } else {
             cptr = out.getData<float>(); // NHWC [owoh, out_ch] == GEMM layout
@@ -1965,10 +1974,11 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             //   s_w[j] * (128*s_a - kActOff) * colsum_w[j]
             // completes sum_k w*x, and being per-output-channel constant it
             // folds into the bias (no kernel change, no per-element cost).
-            std::vector<float> ebias;
+            static thread_local std::vector<float> ebias;
             if (perch_asym) {
               const float koff = 128.f * a_scale - kActOff;
-              ebias.resize(C);
+              if (ebias.size() < C)
+                ebias.resize(C);
               for (unsigned int j = 0; j < C; ++j)
                 ebias[j] = (bptr ? bptr[j] : 0.f) +
                            W.scale[j] * koff * (float)W.colsum[j];
@@ -1986,7 +1996,9 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
               // One fused row-parallel pass: bias + SiLU + per-row amax; then a
               // parallel quantize pass. Replaces the former four passes (three
               // single-threaded) so the epilogue is no longer the conv's cost.
-              std::vector<float> ramax(owoh, 0.f);
+              static thread_local std::vector<float> ramax;
+              if (ramax.size() < owoh)
+                ramax.resize(owoh);
               float *rp = ramax.data();
               tm.parallel_for(0, owoh, [=](size_t p) {
                 rp[p] = convBiasActRow(cptr + (size_t)p * C, bptr, C, act);

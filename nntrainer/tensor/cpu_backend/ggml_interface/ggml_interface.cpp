@@ -559,7 +559,13 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
   const unsigned int M4c = (M + 3) / 4;
   const uint16_t d16 = 0; // d ignored by the per-channel kernel
 
-  std::vector<char> QA((size_t)M4c * qa_4_rows_size);
+  // Reused thread_local packing buffer (per-forward malloc + page-fault churn
+  // showed up as unattributed per-conv time). Every super-block [0, M4c) is
+  // rewritten below, so no clearing is needed on reuse.
+  static thread_local std::vector<char> QA;
+  const size_t qa_bytes = (size_t)M4c * qa_4_rows_size;
+  if (QA.size() < qa_bytes)
+    QA.resize(qa_bytes);
   char *QA_ptr = QA.data();
 
   // 1x1 unit-stride convs gather the identity: pack straight from `in`, no tile.
