@@ -62,16 +62,18 @@ inline std::vector<std::string> &quantizableConvs() {
   return names;
 }
 
-// True when a conv weight can feed the Q8_0 indirect GEMM without padding.
-// CRS = in_ch*k*k must be a multiple of 32 (the Q8_0 block size): the indirect
-// GEMM derives nb = CRS/32 and would silently drop the tail otherwise. out_ch
-// only needs to be a multiple of 4 -- the q8_0x4 weight repack interleaves 4
-// columns per super-block and the 4x4 SMMLA kernel handles the nc%4 edge, so
-// widths like 48 (= 96/2, the ELAN bottleneck) are fine. This relaxation from
-// the earlier out_ch%32 rule makes the 1x1 out_ch=48 convs (elan conv1/conv2,
-// feature_up bottlenecks) int8 instead of FP32, without any re-padding.
+// True when a conv weight forms a real matmul matrix divisible by the block
+// size (Q8_0 block = 32). BOTH out_ch and CRS = in_ch*k*k must be multiples of
+// 32, and both constraints are real:
+//   - the quantized filter is stored as TensorDim(1,1,CRS,out_ch) and Q8_0_Tensor
+//     block-quantizes along width == out_ch, so out_ch % 32 is enforced by the
+//     container (a width=48 tensor throws at construction);
+//   - the indirect GEMM derives nb = CRS/32 and drops any tail, so CRS % 32.
+// (An earlier attempt to relax out_ch to %4 crashed on out_ch=48 for exactly the
+// first reason -- widths like the ELAN bottleneck 48 need out_ch padding, which
+// the plain eligibility guard cannot express.)
 inline bool convQuantEligible(int in_ch, int out_ch, int k) {
-  return out_ch % 4 == 0 && (in_ch * k * k) % 32 == 0;
+  return out_ch % 32 == 0 && (in_ch * k * k) % 32 == 0;
 }
 
 // Conv2D (biased) + optional swish (SiLU) fused activation.
