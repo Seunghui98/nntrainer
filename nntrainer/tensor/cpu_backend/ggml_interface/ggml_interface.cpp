@@ -739,6 +739,37 @@ __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
     dst = (block_q8_0x4 *)w.qs.data();
   }
 
+  // Fast path detection for PER-CHANNEL Q8_0 sources (the "pch" file the
+  // offline __ggml_quantize_q8_0_per_channel writes): every block of an
+  // output-channel row carries the SAME fp16 scale d. For such a row the
+  // generic dequant -> amax -> requant round trip is the identity on the int8
+  // quants (that is the pch file's design point), so the FP32 intermediate can
+  // be skipped entirely: copy the int8 quants, and reproduce the generic
+  // path's scale bit-exactly by replaying its float ops on the row maximum
+  // (amax == fl(d * max|q|) because x -> fl(d*x) is monotone and |fl(d*q)| ==
+  // fl(d*|q|); qrow == q because |(d*q)*fl(1/scv) - q| << 0.5 so the round
+  // returns the same integer). This roughly halves the one-time conversion
+  // cost. NNTR_W8A8_NOFASTCONV=1 reverts to the generic path; per-block Q8_0
+  // sources (non-uniform d) are detected and take the generic path anyway.
+  static const bool no_fastconv =
+    std::getenv("NNTR_W8A8_NOFASTCONV") != nullptr;
+  bool fast_pch = false;
+  if (!no_fastconv && q8_src != nullptr && nbq > 0) {
+    fast_pch = true;
+    const unsigned int full_groups = out_ch / 4;
+    for (unsigned int sc = 0; sc < full_groups && fast_pch; ++sc) {
+      const block_q8_0x4 *row = &q8_src[(size_t)sc * nbq];
+      for (unsigned int r = 0; r < 4 && fast_pch; ++r) {
+        const uint16_t d0 = row[0].d[r];
+        for (unsigned int j = 1; j < nbq; ++j)
+          if (row[j].d[r] != d0) {
+            fast_pch = false;
+            break;
+          }
+      }
+    }
+  }
+
   // Streamed per 4-row group: dequant -> per-channel quantize -> pack with a
   // 4 x CRS scratch, instead of materializing the whole FP32 weight plus a
   // whole int8 copy. The monolithic buffers spiked warmup peak RSS by ~5x the
@@ -748,65 +779,103 @@ __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
   // feeds full 4-row groups (out_ch / 4); a partial tail group
   // (out_ch % 4 != 0) dequantizes to zeros.
   tm.parallel_for(0, NB4, [=](size_t sc) {
-    std::vector<float> wf((size_t)4 * CRS);
     std::vector<int8_t> wi((size_t)4 * CRS);
-    float *wf_ptr = wf.data();
     int8_t *wi_ptr = wi.data();
 
-    // 1) This group's 4 rows as FP32 (rows past out_ch / q8 tail -> 0).
-    if (q8_src) {
+    if (q8_src && fast_pch) {
+      // Per-channel source: int8 straight through (no FP32 round trip). The
+      // whole group's int8 -> wi_ptr, scale/colsum reproduced bit-exactly.
       if ((unsigned int)(sc + 1) * 4 <= out_ch) {
-        for (unsigned int j = 0; j < nbq; ++j) {
-          const block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
-          for (unsigned int r = 0; r < 4; ++r) {
-            const float d = perch_fp16_to_fp32_bits(sb.d[r]);
+        for (unsigned int r = 0; r < 4; ++r) {
+          const unsigned int n = (unsigned int)sc * 4 + r;
+          const float d =
+            perch_fp16_to_fp32_bits(q8_src[(size_t)sc * nbq].d[r]);
+          int8_t *qrow = &wi_ptr[(size_t)r * CRS];
+          int maxq = 0;
+          int32_t qsum = 0;
+          for (unsigned int j = 0; j < nbq; ++j) {
+            const block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
             for (unsigned int sub = 0; sub < 4; ++sub)
-              for (unsigned int c = 0; c < 8; ++c)
-                wf_ptr[(size_t)r * CRS + j * QK8_0 + sub * 8 + c] =
-                  d * (float)sb.qs[32 * sub + 8 * r + c];
+              for (unsigned int c = 0; c < 8; ++c) {
+                const int8_t v = sb.qs[32 * sub + 8 * r + c];
+                qrow[j * QK8_0 + sub * 8 + c] = v;
+                const int a = v < 0 ? -(int)v : (int)v;
+                if (a > maxq)
+                  maxq = a;
+                qsum += v;
+              }
           }
+          const float amax = d * (float)maxq; // == generic path's row amax
+          scale_ptr[n] = amax > 0.f ? amax / 127.f : 1.f;
+          colsum_ptr[n] = qsum;
         }
       } else {
-        std::memset(wf_ptr, 0, (size_t)4 * CRS * sizeof(float));
+        // q8 tail group (out_ch % 4 != 0): zeros, scale 1, colsum 0 --
+        // exactly what the generic path produces for it.
+        std::memset(wi_ptr, 0, (size_t)4 * CRS);
       }
     } else {
+      // Generic path: dequant -> per-channel quantize with a 4 x CRS FP32
+      // scratch. Used for FP32 sources and per-BLOCK Q8_0 (non-uniform d).
+      std::vector<float> wf((size_t)4 * CRS);
+      float *wf_ptr = wf.data();
+
+      // 1) This group's 4 rows as FP32 (rows past out_ch / q8 tail -> 0).
+      if (q8_src) {
+        if ((unsigned int)(sc + 1) * 4 <= out_ch) {
+          for (unsigned int j = 0; j < nbq; ++j) {
+            const block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
+            for (unsigned int r = 0; r < 4; ++r) {
+              const float d = perch_fp16_to_fp32_bits(sb.d[r]);
+              for (unsigned int sub = 0; sub < 4; ++sub)
+                for (unsigned int c = 0; c < 8; ++c)
+                  wf_ptr[(size_t)r * CRS + j * QK8_0 + sub * 8 + c] =
+                    d * (float)sb.qs[32 * sub + 8 * r + c];
+            }
+          }
+        } else {
+          std::memset(wf_ptr, 0, (size_t)4 * CRS * sizeof(float));
+        }
+      } else {
+        for (unsigned int r = 0; r < 4; ++r) {
+          const unsigned int n = (unsigned int)sc * 4 + r;
+          if (n < out_ch)
+            std::memcpy(&wf_ptr[(size_t)r * CRS], &fp32_src[(size_t)n * CRS],
+                        (size_t)CRS * sizeof(float));
+          else
+            std::memset(&wf_ptr[(size_t)r * CRS], 0,
+                        (size_t)CRS * sizeof(float));
+        }
+      }
+
+      // 2) Per-output-channel int8 quantize (+ per-row quant sum for the
+      // asymmetric-activation bias fold).
       for (unsigned int r = 0; r < 4; ++r) {
         const unsigned int n = (unsigned int)sc * 4 + r;
-        if (n < out_ch)
-          std::memcpy(&wf_ptr[(size_t)r * CRS], &fp32_src[(size_t)n * CRS],
-                      (size_t)CRS * sizeof(float));
-        else
-          std::memset(&wf_ptr[(size_t)r * CRS], 0, (size_t)CRS * sizeof(float));
+        if (n >= out_ch) {
+          std::memset(&wi_ptr[(size_t)r * CRS], 0, CRS);
+          continue;
+        }
+        float amax = 0.f;
+        const float *row = &wf_ptr[(size_t)r * CRS];
+        for (unsigned int k = 0; k < CRS; ++k)
+          amax = std::max(amax, std::fabs(row[k]));
+        const float scv = amax > 0.f ? amax / 127.f : 1.f;
+        scale_ptr[n] = scv;
+        const float inv = 1.f / scv;
+        int8_t *qrow = &wi_ptr[(size_t)r * CRS];
+        int32_t qsum = 0;
+        for (unsigned int k = 0; k < CRS; ++k) {
+          qrow[k] =
+            (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
+          qsum += qrow[k];
+        }
+        colsum_ptr[n] = qsum;
       }
-    }
-
-    // 2) Per-output-channel int8 quantize (+ per-row quant sum for the
-    // asymmetric-activation bias fold).
-    for (unsigned int r = 0; r < 4; ++r) {
-      const unsigned int n = (unsigned int)sc * 4 + r;
-      if (n >= out_ch) {
-        std::memset(&wi_ptr[(size_t)r * CRS], 0, CRS);
-        continue;
-      }
-      float amax = 0.f;
-      const float *row = &wf_ptr[(size_t)r * CRS];
-      for (unsigned int k = 0; k < CRS; ++k)
-        amax = std::max(amax, std::fabs(row[k]));
-      const float scv = amax > 0.f ? amax / 127.f : 1.f;
-      scale_ptr[n] = scv;
-      const float inv = 1.f / scv;
-      int8_t *qrow = &wi_ptr[(size_t)r * CRS];
-      int32_t qsum = 0;
-      for (unsigned int k = 0; k < CRS; ++k) {
-        qrow[k] =
-          (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
-        qsum += qrow[k];
-      }
-      colsum_ptr[n] = qsum;
     }
 
     // 3) Pack the group's int8 rows -> q8_0x4 qs (d ignored by the kernel),
-    // applying the taps-last K permutation when enabled.
+    // applying the taps-last K permutation when enabled. Shared by both paths.
     for (unsigned int j = 0; j < nb; ++j) {
       block_q8_0x4 &sb = dst[(size_t)sc * nb + j];
       for (unsigned int r = 0; r < 4; ++r) {
