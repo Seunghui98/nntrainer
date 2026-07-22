@@ -30,7 +30,12 @@ if [ "$USE_CACHE" -eq 1 ] && [ -f "$LIB_OUT" ]; then
 else
   cd "$NNTRAINER_ROOT"
   rm -rf builddir
-  ./tools/package_android.sh
+  # OptimizedV3Planner packs the activation tensor pool far tighter than the
+  # default V1 (measured: 39 MB -> near the 16 MB theoretical minimum on this
+  # W8A8 pose graph). It only changes tensor memory placement, not values, so
+  # the pose output is unchanged; remove this flag if a planner regression is
+  # ever suspected (falls back to the validated V1).
+  ./tools/package_android.sh -Dmemory-planner=v3
 fi
 [ -f "$LIB_OUT" ] || { echo "[ERROR] nntrainer android build failed"; exit 1; }
 
