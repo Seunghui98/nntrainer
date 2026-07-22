@@ -18,6 +18,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <concat_layer.h>
 #include <layer_context.h>
 #include <nntr_threads.h>
@@ -204,7 +208,36 @@ void ConcatLayer::forwarding(RunLayerContext &context, bool training) {
             if (identity) {
               std::memcpy(d, s, (size_t)Ci);
             } else if (asym) {
-              for (unsigned int c = 0; c < Ci; ++c) {
+              unsigned int c = 0;
+#if defined(__ARM_NEON)
+              // q' = round((q + 128) * mult) - 128, saturating to int8. FRINTA
+              // (vrndaq) rounds ties away from zero, matching std::round; the
+              // rounded value is an exact integer float so vcvtq truncates it
+              // losslessly, and the saturating narrows reproduce the clamp.
+              const float32x4_t vmult = vdupq_n_f32(mult);
+              const float32x4_t v128 = vdupq_n_f32(128.f);
+              auto proc = [&](int32x4_t a) {
+                float32x4_t f = vcvtq_f32_s32(a);
+                f = vaddq_f32(f, v128);
+                f = vmulq_f32(f, vmult);
+                f = vrndaq_f32(f);
+                f = vsubq_f32(f, v128);
+                return vcvtq_s32_f32(f);
+              };
+              for (; c + 16 <= Ci; c += 16) {
+                int8x16_t q8 = vld1q_s8(s + c);
+                int16x8_t lo = vmovl_s8(vget_low_s8(q8));
+                int16x8_t hi = vmovl_s8(vget_high_s8(q8));
+                int32x4_t r0 = proc(vmovl_s16(vget_low_s16(lo)));
+                int32x4_t r1 = proc(vmovl_s16(vget_high_s16(lo)));
+                int32x4_t r2 = proc(vmovl_s16(vget_low_s16(hi)));
+                int32x4_t r3 = proc(vmovl_s16(vget_high_s16(hi)));
+                int16x8_t n0 = vcombine_s16(vqmovn_s32(r0), vqmovn_s32(r1));
+                int16x8_t n1 = vcombine_s16(vqmovn_s32(r2), vqmovn_s32(r3));
+                vst1q_s8(d + c, vcombine_s8(vqmovn_s16(n0), vqmovn_s16(n1)));
+              }
+#endif
+              for (; c < Ci; ++c) {
                 float q = std::round(((float)s[c] + 128.f) * mult) - 128.f;
                 d[c] = (int8_t)std::max(-128.f, std::min(127.f, q));
               }
