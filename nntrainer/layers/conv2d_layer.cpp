@@ -13,6 +13,7 @@
  */
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -89,6 +90,26 @@ static inline float32x4_t nntr_vexpq_f32(float32x4_t x) {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 namespace {
+
+// Opt-in (NNTR_MEM_REPORT) high-water tracking for the per-channel conv path's
+// persistent thread_local scratch, printed at teardown so the W8A8 memory
+// footprint can be attributed without a device profiler.
+struct ConvMemReport {
+  std::atomic<size_t> cbuf_elems{0}; // FP32 GEMM output (4 bytes each)
+  std::atomic<size_t> abuf_elems{0}; // int8 quantized input (1 byte each)
+  void bump(std::atomic<size_t> &slot, size_t v) {
+    size_t cur = slot.load(std::memory_order_relaxed);
+    while (v > cur && !slot.compare_exchange_weak(cur, v)) {
+    }
+  }
+  ~ConvMemReport() {
+    if (std::getenv("NNTR_MEM_REPORT"))
+      std::cerr << "[mem] conv thread_local: cbuf=" << (cbuf_elems * 4 >> 10)
+                << " KB (fp32 gemm-out)  a_buf=" << (abuf_elems >> 10)
+                << " KB (int8 input)\n";
+  }
+};
+static ConvMemReport g_conv_mem;
 
 // Local mirror of the interleaved Q8_0 x4 super-block (d[4] fp16 + 128 int8),
 // matching repack_q8_0 / the GEMM kernels. Used by the per-channel weight
@@ -2063,6 +2084,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             // (This input is the stem's SiLU output, so the affine range
             // [-kActOff, amax] is valid; amax >= max(x) covers the top end.)
             a_buf.resize(n_in);
+            g_conv_mem.bump(g_conv_mem.abuf_elems, a_buf.size());
             int8_t *ab = a_buf.data();
             if (perch_asym) {
               a_scale = amax > 0.f ? (amax + kActOff) / 255.f : 1.f;
@@ -2111,6 +2133,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             const size_t need = (size_t)owoh * filter_size;
             if (cbuf.size() < need)
               cbuf.resize(need);
+            g_conv_mem.bump(g_conv_mem.cbuf_elems, cbuf.size());
             cptr = cbuf.data();
           } else {
             cptr = out.getData<float>(); // NHWC [owoh, out_ch] == GEMM layout

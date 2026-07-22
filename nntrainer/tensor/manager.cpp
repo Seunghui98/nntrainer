@@ -32,6 +32,9 @@
 #include <unistd.h>
 #endif
 
+#include <cstdlib>
+#include <iostream>
+
 #include <activation_layer.h>
 #include <basic_planner.h>
 #include <bn_layer.h>
@@ -155,6 +158,9 @@ void Manager::allocateWeights(unsigned int max_exec_order_, bool init) {
   if (!weight_pool.isAllocated()) {
     finalizeTensorPool(weight_pool, 0, max_exec_order_);
     weight_pool.allocate(init);
+    if (std::getenv("NNTR_MEM_REPORT"))
+      std::cerr << "[mem] weight_pool = " << (weight_pool.size() >> 10)
+                << " KB\n";
   }
 }
 
@@ -263,6 +269,10 @@ void Manager::allocateTensors(unsigned int max_exec_order_) {
   if (!tensor_pool.isAllocated()) {
     finalizeTensorPool(tensor_pool, 0, max_exec_order_);
     tensor_pool.allocate();
+    if (std::getenv("NNTR_MEM_REPORT"))
+      std::cerr << "[mem] tensor_pool (activations) = " << (tensor_pool.size() >> 10)
+                << " KB (theoretical min "
+                << (tensor_pool.minMemoryRequirement() >> 10) << " KB)\n";
   }
 }
 
