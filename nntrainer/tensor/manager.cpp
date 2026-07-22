@@ -34,6 +34,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <string>
 
 #include <activation_layer.h>
 #include <basic_planner.h>
@@ -918,6 +919,33 @@ void Manager::flushCacheExcept(unsigned int order) {
 
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
+  // Runtime planner override (NNTR_MEMORY_PLANNER=v3|v2|v1|basic). The planner
+  // is otherwise fixed at compile time, but every planner .cpp is always linked
+  // into the library, so it can be chosen at runtime. Planning only relocates
+  // tensors (values are unchanged), so this cannot alter results; V3 packs the
+  // activation pool far tighter than the default V1. This exists because the
+  // compile-time meson flag does not always reach app build scripts.
+  if (const char *mp = std::getenv("NNTR_MEMORY_PLANNER")) {
+    const std::string s(mp);
+    const bool report = std::getenv("NNTR_MEM_REPORT") != nullptr;
+    if (s == "v3") {
+      if (report) std::cerr << "[mem] planner = V3 (runtime override)\n";
+      pool.finalize(OptimizedV3Planner(), start, end);
+      return;
+    } else if (s == "v2") {
+      if (report) std::cerr << "[mem] planner = V2 (runtime override)\n";
+      pool.finalize(OptimizedV2Planner(), start, end);
+      return;
+    } else if (s == "v1") {
+      if (report) std::cerr << "[mem] planner = V1 (runtime override)\n";
+      pool.finalize(OptimizedV1Planner(), start, end);
+      return;
+    } else if (s == "basic") {
+      if (report) std::cerr << "[mem] planner = Basic (runtime override)\n";
+      pool.finalize(BasicPlanner(), start, end);
+      return;
+    }
+  }
   if (enable_optimizations) {
 #if defined(ENABLE_MEMORY_PLANNER_V3)
     /**
