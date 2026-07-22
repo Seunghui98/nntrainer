@@ -260,66 +260,24 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
   w.Kpad = (CRS + QK8_0 - 1) / QK8_0 * QK8_0;
   w.Npad = (out_ch + 3) / 4 * 4;
   const unsigned int nb = w.Kpad / QK8_0;
+  const unsigned int NB4 = w.Npad / 4;
+  const unsigned int nbq = CRS / QK8_0; // q8 source blocks (CRS % 32 == 0)
 
-  // 1) FP32 weight [out_ch, CRS].
-  std::vector<float> wf((size_t)out_ch * CRS);
-  float *wf_ptr = wf.data();
-  if (q8_src) {
-    const unsigned int nbq = CRS / QK8_0; // source is exactly CRS%32==0
-    const unsigned int sc_n = out_ch / 4;
-    tm.parallel_for(0, sc_n, [=](size_t sc) {
-      for (unsigned int j = 0; j < nbq; ++j) {
-        const conv_block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
-        for (unsigned int r = 0; r < 4; ++r) {
-          const float d = convFp16ToFp32Bits(sb.d[r]);
-          const unsigned int n = (unsigned int)sc * 4 + r;
-          for (unsigned int sub = 0; sub < 4; ++sub)
-            for (unsigned int c = 0; c < 8; ++c)
-              wf_ptr[(size_t)n * CRS + j * QK8_0 + sub * 8 + c] =
-                d * (float)sb.qs[32 * sub + 8 * r + c];
-        }
-      }
-    });
-  } else {
-    std::memcpy(wf.data(), fp32_src, (size_t)out_ch * CRS * sizeof(float));
-  }
-
-  // 2) Per-output-channel int8 quantize (+ per-row quant sum for the
-  // asymmetric-activation bias fold).
   w.scale.assign(out_ch, 1.f);
   w.colsum.assign(out_ch, 0);
-  std::vector<int8_t> wi((size_t)out_ch * CRS);
   float *scale_ptr = w.scale.data();
   int32_t *colsum_ptr = w.colsum.data();
-  int8_t *wi_ptr = wi.data();
-  tm.parallel_for(0, out_ch, [=](size_t n) {
-    float amax = 0.f;
-    const float *row = &wf_ptr[(size_t)n * CRS];
-    for (unsigned int k = 0; k < CRS; ++k)
-      amax = std::max(amax, std::fabs(row[k]));
-    const float sc = amax > 0.f ? amax / 127.f : 1.f;
-    scale_ptr[n] = sc;
-    const float inv = 1.f / sc;
-    int8_t *qrow = &wi_ptr[(size_t)n * CRS];
-    int32_t qsum = 0;
-    for (unsigned int k = 0; k < CRS; ++k) {
-      qrow[k] =
-        (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
-      qsum += qrow[k];
-    }
-    colsum_ptr[n] = qsum;
-  });
 
-  // 3) Pack int8 [Npad, Kpad] -> q8_0x4 qs (d = 0, ignored by the kernel).
-  const unsigned int NB4 = w.Npad / 4;
   // Memory optimization (opt-in via NNTR_W8A8_PERCH_INPLACE): the repacked int8
   // stream is byte-for-byte the same layout and size as the source Q8_0x4
   // weight when out_ch % 4 == 0 and CRS % 32 == 0 (the pack writes every qs
   // byte, and the kernel ignores the d field). Rather than allocate a second
   // ~equal-sized buffer, requantize in place into the source and share it
-  // zero-copy, eliminating the persistent per-conv weight duplicate. The
-  // dequantize pass (1) has already fully consumed the source, so overwriting
-  // it in pass (3) is safe. Numerically identical to the owned-buffer path.
+  // zero-copy, eliminating the persistent per-conv weight duplicate. Each
+  // 4-row group's source blocks are fully dequantized before that group's
+  // pack overwrites them, and groups touch disjoint block ranges, so the
+  // in-place path stays parallel-safe. Numerically identical to the
+  // owned-buffer path.
   static const bool perch_inplace =
     std::getenv("NNTR_W8A8_PERCH_INPLACE") != nullptr;
   const bool use_inplace =
@@ -332,17 +290,83 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
     w.qs.assign((size_t)NB4 * nb * sizeof(conv_block_q8_0x4), 0);
     dst = (conv_block_q8_0x4 *)w.qs.data();
   }
-  const int8_t *wi_rd = wi.data();
+
+  // Streamed per 4-row group: dequant -> per-channel quantize -> pack with a
+  // 4 x CRS scratch, instead of materializing the whole FP32 weight plus a
+  // whole int8 copy. The monolithic buffers spiked warmup peak RSS by ~5x the
+  // weight's int8 size on the largest conv (head-final: ~16 MB) and set the
+  // process peak; streaming keeps the transient in the hundreds of KB. The
+  // per-row math and ordering are unchanged, so scale/colsum/qs stay
+  // bit-identical. Matching the prior pass structure, a q8 source only feeds
+  // full 4-row groups (out_ch / 4); a partial tail group (out_ch % 4 != 0)
+  // dequantizes to zeros, exactly as before.
   tm.parallel_for(0, NB4, [=](size_t sc) {
+    std::vector<float> wf((size_t)4 * CRS);
+    std::vector<int8_t> wi((size_t)4 * CRS);
+    float *wf_ptr = wf.data();
+    int8_t *wi_ptr = wi.data();
+
+    // 1) This group's 4 rows as FP32 (rows past out_ch / q8 tail -> 0).
+    if (q8_src) {
+      if ((unsigned int)(sc + 1) * 4 <= out_ch) {
+        for (unsigned int j = 0; j < nbq; ++j) {
+          const conv_block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
+          for (unsigned int r = 0; r < 4; ++r) {
+            const float d = convFp16ToFp32Bits(sb.d[r]);
+            for (unsigned int sub = 0; sub < 4; ++sub)
+              for (unsigned int c = 0; c < 8; ++c)
+                wf_ptr[(size_t)r * CRS + j * QK8_0 + sub * 8 + c] =
+                  d * (float)sb.qs[32 * sub + 8 * r + c];
+          }
+        }
+      } else {
+        std::memset(wf_ptr, 0, (size_t)4 * CRS * sizeof(float));
+      }
+    } else {
+      for (unsigned int r = 0; r < 4; ++r) {
+        const unsigned int n = (unsigned int)sc * 4 + r;
+        if (n < out_ch)
+          std::memcpy(&wf_ptr[(size_t)r * CRS], &fp32_src[(size_t)n * CRS],
+                      (size_t)CRS * sizeof(float));
+        else
+          std::memset(&wf_ptr[(size_t)r * CRS], 0, (size_t)CRS * sizeof(float));
+      }
+    }
+
+    // 2) Per-output-channel int8 quantize (+ per-row quant sum for the
+    // asymmetric-activation bias fold).
+    for (unsigned int r = 0; r < 4; ++r) {
+      const unsigned int n = (unsigned int)sc * 4 + r;
+      if (n >= out_ch) {
+        std::memset(&wi_ptr[(size_t)r * CRS], 0, CRS);
+        continue;
+      }
+      float amax = 0.f;
+      const float *row = &wf_ptr[(size_t)r * CRS];
+      for (unsigned int k = 0; k < CRS; ++k)
+        amax = std::max(amax, std::fabs(row[k]));
+      const float scv = amax > 0.f ? amax / 127.f : 1.f;
+      scale_ptr[n] = scv;
+      const float inv = 1.f / scv;
+      int8_t *qrow = &wi_ptr[(size_t)r * CRS];
+      int32_t qsum = 0;
+      for (unsigned int k = 0; k < CRS; ++k) {
+        qrow[k] =
+          (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
+        qsum += qrow[k];
+      }
+      colsum_ptr[n] = qsum;
+    }
+
+    // 3) Pack the group's int8 rows -> q8_0x4 qs (d ignored by the kernel).
     for (unsigned int j = 0; j < nb; ++j) {
       conv_block_q8_0x4 &sb = dst[(size_t)sc * nb + j];
       for (unsigned int r = 0; r < 4; ++r) {
-        const unsigned int n = (unsigned int)sc * 4 + r;
         for (unsigned int sub = 0; sub < 4; ++sub)
           for (unsigned int c = 0; c < 8; ++c) {
             const unsigned int k = j * QK8_0 + sub * 8 + c;
-            int8_t v = (n < out_ch && k < CRS) ? wi_rd[(size_t)n * CRS + k] : 0;
-            sb.qs[32 * sub + 8 * r + c] = v;
+            sb.qs[32 * sub + 8 * r + c] =
+              (k < CRS) ? wi_ptr[(size_t)r * CRS + k] : 0;
           }
       }
     }
