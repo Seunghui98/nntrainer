@@ -261,6 +261,12 @@ int main(int argc, char **argv) {
     std::cout << "[Pose] ReID head: " << (with_reid ? "on" : "off") << std::endl;
 
     auto t_compile0 = std::chrono::steady_clock::now();
+    // Everything from process start to here: binary/library startup, arg
+    // parsing, graph construction (buildBackbone/Neck/Head), property setup.
+    // Timed so the e2e figure decomposes fully (ORT's session-create load
+    // covers the equivalent work on its side).
+    double setup_ms =
+      std::chrono::duration<double, std::milli>(t_compile0 - t_start).count();
     if (int ret = model->compile(x, graph_outputs,
                                  ml::train::ExecutionMode::INFERENCE))
       throw std::runtime_error("compile failed: " + std::to_string(ret));
@@ -300,12 +306,21 @@ int main(int argc, char **argv) {
                   ? std::max(1, std::atoi(std::getenv("YOLO_BENCH_ITERS")))
                   : 1;
     std::vector<float *> outs;
-    // One untimed warmup inference. Some presets (e.g. w8a8 per-channel) build
-    // a cached weight representation on the first forward; timing that as
-    // "inference" conflates a one-time setup cost with steady-state latency.
-    // A real deployment warms up at init the same way. Skip with YOLO_NO_WARMUP.
-    if (!std::getenv("YOLO_NO_WARMUP"))
+    // One warmup inference. Some presets (e.g. w8a8 per-channel) build a cached
+    // weight representation on the first forward, and the first inference also
+    // triggers the activation-pool allocation + first-touch; timing that as
+    // "inference" conflates one-time setup with steady-state latency. A real
+    // deployment warms up at init the same way. This one-time cost is reported
+    // separately (init) so the e2e figure decomposes fully instead of leaving a
+    // large untimed gap. Skip with YOLO_NO_WARMUP.
+    double warmup_ms = 0.0;
+    if (!std::getenv("YOLO_NO_WARMUP")) {
+      auto t_warm0 = std::chrono::steady_clock::now();
       outs = model->inference(1, in_ptr, std::vector<float *>());
+      warmup_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_warm0)
+                    .count();
+    }
     // Drop any layer-profile samples from the warmup so the report reflects
     // steady-state only (NNTR_LAYER_PROFILE; no-op when unset).
     nntrainer::LiteProf::get().reset();
@@ -369,17 +384,25 @@ int main(int argc, char **argv) {
     double e2e_ms = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t_start)
                       .count();
+    // init = one-time model setup that a real deployment pays once at startup:
+    // graph build (setup) + compile + weight load + warmup (which builds the
+    // per-channel weight cache and allocates/first-touches the activation
+    // pool). ORT folds the equivalent into its "load" (session create), so
+    // report init alongside it for an apples-to-apples e2e decomposition.
+    double init_ms = setup_ms + compile_ms + load_ms + warmup_ms;
     std::printf(
       "\n================[ YOLOv7 Pose with NNTrainer ]================\n");
-    std::printf("compile:   %.1f ms\n", compile_ms);
-    std::printf("load:      %.1f ms\n", load_ms);
-    std::printf("inference: %.3f ms (avg over %d iter%s)\n", infer_ms, iters,
-                iters > 1 ? "s" : "");
+    std::printf("init:      %.1f ms (setup %.1f + compile %.1f + load %.1f + "
+                "warmup %.1f)\n",
+                init_ms, setup_ms, compile_ms, load_ms, warmup_ms);
+    std::printf("inference: %.3f ms (avg over %d iter%s, steady-state)\n",
+                infer_ms, iters, iters > 1 ? "s" : "");
     std::printf("keypoints: %d/%d visible\n", visible, NKPT);
     std::printf("peak memory: %ld KB\n", peak_kb);
     std::printf(
       "=============================================================\n");
-    std::printf("[e2e time]: %.0f ms\n", e2e_ms);
+    std::printf("[e2e time]: %.0f ms  (init %.0f + %d x infer %.1f)\n", e2e_ms,
+                init_ms, iters, infer_ms);
     std::printf("Max Resident Set Size: %ld KB\n", peak_kb);
 
     return 0;
