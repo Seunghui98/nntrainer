@@ -145,3 +145,19 @@ near zero.
 - Estimate: ~76 ms → 55–60 ms at S3, → ~45 ms at S4, converging on the
   ORT band (~42 ms measured same-device). Estimates are secondary to the
   accuracy gate at every step.
+
+## 7. Memory optimizations (opt-in)
+
+- `NNTR_W8A8_PERCH_INPLACE=1` — by default the per-channel path
+  (`getPerChConvWeight`) keeps a second, ~equal-sized copy of every conv's
+  int8 weight in the kernel's `block_q8_0x4` layout, coexisting with the
+  source Q8_0 weight in the pool (~25 MB duplicate for this model). When the
+  source is already `block_q8_0x4` with `out_ch % 4 == 0` and `CRS % 32 == 0`,
+  the repacked stream is byte-for-byte the same layout and size, so this flag
+  requantizes **in place** into the source buffer and shares it zero-copy
+  instead of allocating the duplicate. The dequantize pass has fully consumed
+  the source before the in-place write, and the packed int8/scale/colsum are
+  **numerically identical** to the owned-buffer path (validated byte-exact on
+  x86 for both per-channel and per-block Q8_0). No weight-file change; the
+  default path is untouched. Convs that don't meet the layout constraint
+  (e.g. the `out_ch = 87` head-final) fall back to the owned buffer.

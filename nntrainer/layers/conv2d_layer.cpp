@@ -106,6 +106,9 @@ struct conv_block_q8_0x4 {
 // pointer (constant during inference).
 struct PerChConvWeight {
   std::vector<char> qs;    ///< block_q8_0x4 stream (qs used; d bytes are 0)
+  const void *qs_ext = nullptr; ///< when set, the int8 payload is shared
+                                ///< zero-copy with the source weight buffer and
+                                ///< `qs` stays empty (no duplicate allocation)
   std::vector<float> scale; ///< [out_ch] per-output-channel FP32 scale
   std::vector<int32_t> colsum; ///< [out_ch] sum of the row's int8 quants; used
                                ///< by the asymmetric-activation path to fold
@@ -113,6 +116,9 @@ struct PerChConvWeight {
   unsigned int Kpad = 0;   ///< CRS padded to a multiple of 32
   unsigned int Npad = 0;   ///< out_ch padded to a multiple of 4
   unsigned int Nreal = 0;  ///< real out_ch
+  /// Pointer to the block_q8_0x4 int8 stream the GEMM kernel reads (shared
+  /// with the source weight when zero-copy, else the owned `qs` buffer).
+  const void *qs_data() const { return qs_ext ? qs_ext : (const void *)qs.data(); }
 };
 
 static inline float convFp16ToFp32Bits(uint16_t h); // defined below
@@ -306,8 +312,26 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
 
   // 3) Pack int8 [Npad, Kpad] -> q8_0x4 qs (d = 0, ignored by the kernel).
   const unsigned int NB4 = w.Npad / 4;
-  w.qs.assign((size_t)NB4 * nb * sizeof(conv_block_q8_0x4), 0);
-  conv_block_q8_0x4 *dst = (conv_block_q8_0x4 *)w.qs.data();
+  // Memory optimization (opt-in via NNTR_W8A8_PERCH_INPLACE): the repacked int8
+  // stream is byte-for-byte the same layout and size as the source Q8_0x4
+  // weight when out_ch % 4 == 0 and CRS % 32 == 0 (the pack writes every qs
+  // byte, and the kernel ignores the d field). Rather than allocate a second
+  // ~equal-sized buffer, requantize in place into the source and share it
+  // zero-copy, eliminating the persistent per-conv weight duplicate. The
+  // dequantize pass (1) has already fully consumed the source, so overwriting
+  // it in pass (3) is safe. Numerically identical to the owned-buffer path.
+  static const bool perch_inplace =
+    std::getenv("NNTR_W8A8_PERCH_INPLACE") != nullptr;
+  const bool use_inplace =
+    perch_inplace && q8_src != nullptr && w.Npad == out_ch && w.Kpad == CRS;
+  conv_block_q8_0x4 *dst;
+  if (use_inplace) {
+    dst = const_cast<conv_block_q8_0x4 *>(q8_src);
+    w.qs_ext = dst;
+  } else {
+    w.qs.assign((size_t)NB4 * nb * sizeof(conv_block_q8_0x4), 0);
+    dst = (conv_block_q8_0x4 *)w.qs.data();
+  }
   const int8_t *wi_rd = wi.data();
   tm.parallel_for(0, NB4, [=](size_t sc) {
     for (unsigned int j = 0; j < nb; ++j) {
@@ -2049,7 +2073,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
               std::min(127L, std::lround(kActOff / a_scale) - 128L));
 
           __ggml_q8ch_indirect_GEMM(owoh, filter_size, W.Kpad, a_i8, a_scale,
-                                    geom, W.qs.data(), W.scale.data(), cptr,
+                                    geom, W.qs_data(), W.scale.data(), cptr,
                                     pad_q);
 
           // bias + SiLU on FP32, then (for an int8 output) requantize.
