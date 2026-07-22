@@ -11,10 +11,13 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <ggml_interface.h>
+#include <iostream>
 #include <mutex>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
@@ -663,6 +666,23 @@ void __ggml_quantize_q8_0_per_channel(const float *src, void *dst,
   });
 }
 
+// Opt-in (NNTR_MEM_REPORT) accumulator for the total time spent converting
+// conv weights to the per-channel runtime form (all convs, once, on the first
+// forward). Printed at teardown so the warmup cost can be split: this vs the
+// activation-pool allocation / first-touch that the same warmup also pays.
+namespace {
+struct ConvPrepTimer {
+  std::atomic<double> ms{0.0};
+  std::atomic<unsigned> convs{0};
+  ~ConvPrepTimer() {
+    if (std::getenv("NNTR_MEM_REPORT"))
+      std::cerr << "[mem] weight conversion total: " << ms.load() << " ms over "
+                << convs.load() << " convs\n";
+  }
+};
+static ConvPrepTimer g_conv_prep;
+} // namespace
+
 const PerChConvWeight &
 __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
                                 const float *fp32_src, unsigned int out_ch,
@@ -674,6 +694,9 @@ __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
   auto it = cache.find(key);
   if (it != cache.end())
     return it->second;
+  static const bool time_prep = std::getenv("NNTR_MEM_REPORT") != nullptr;
+  const auto t_prep0 = time_prep ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
 
   const block_q8_0x4 *q8_src = (const block_q8_0x4 *)q8_src_x4;
 
@@ -820,6 +843,15 @@ __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
       }
     }
   });
+  if (time_prep) {
+    const double dt = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_prep0)
+                        .count();
+    double cur = g_conv_prep.ms.load(std::memory_order_relaxed);
+    while (!g_conv_prep.ms.compare_exchange_weak(cur, cur + dt)) {
+    }
+    g_conv_prep.convs.fetch_add(1, std::memory_order_relaxed);
+  }
   it = cache.emplace(key, std::move(w)).first;
   return it->second;
 }
