@@ -21,6 +21,68 @@ namespace quick_ai {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+
+namespace {
+// Vectorized expf (Cephes polynomial, ~1e-6 rel error) — identical to the
+// conv layer's nntr_vexpq_f32. Used to vectorize the GAU SiLU epilogue, which
+// otherwise runs a scalar (double-promoted) std::exp per element over
+// K*(2E+S) ~= 100k values and dominates the head's non-GEMM cost.
+static inline float32x4_t rtmcc_vexpq_f32(float32x4_t x) {
+  const float32x4_t hi = vdupq_n_f32(88.3762626647950f);
+  const float32x4_t lo = vdupq_n_f32(-88.3762626647949f);
+  x = vminq_f32(vmaxq_f32(x, lo), hi);
+  const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
+  const float32x4_t c0 = vdupq_n_f32(0.693359375f);
+  const float32x4_t c1 = vdupq_n_f32(-2.12194440e-4f);
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  float32x4_t fx = vmlaq_f32(vdupq_n_f32(0.5f), x, log2e);
+  int32x4_t emm0 = vcvtq_s32_f32(fx);
+  float32x4_t tmp = vcvtq_f32_s32(emm0);
+  uint32x4_t mask = vcgtq_f32(tmp, fx);
+  fx = vsubq_f32(
+    tmp, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(one))));
+  emm0 = vcvtq_s32_f32(fx);
+  x = vmlsq_f32(x, fx, c0);
+  x = vmlsq_f32(x, fx, c1);
+  const float32x4_t p0 = vdupq_n_f32(1.9875691500E-4f);
+  const float32x4_t p1 = vdupq_n_f32(1.3981999507E-3f);
+  const float32x4_t p2 = vdupq_n_f32(8.3334519073E-3f);
+  const float32x4_t p3 = vdupq_n_f32(4.1665795894E-2f);
+  const float32x4_t p4 = vdupq_n_f32(1.6666665459E-1f);
+  const float32x4_t p5 = vdupq_n_f32(5.0000001201E-1f);
+  float32x4_t z = vmulq_f32(x, x);
+  float32x4_t y = vmlaq_f32(p1, p0, x);
+  y = vmlaq_f32(p2, y, x);
+  y = vmlaq_f32(p3, y, x);
+  y = vmlaq_f32(p4, y, x);
+  y = vmlaq_f32(p5, y, x);
+  y = vmlaq_f32(x, y, z);
+  y = vaddq_f32(y, one);
+  int32x4_t pow2n = vshlq_n_s32(vaddq_s32(emm0, vdupq_n_s32(0x7f)), 23);
+  return vmulq_f32(y, vreinterpretq_f32_s32(pow2n));
+}
+
+// SiLU(x) = x / (1 + exp(-x)), in place. NEON path with two Newton-Raphson
+// reciprocal refinements (matches the conv layer's exact-NEON SiLU precision).
+static inline void rtmcc_silu_inplace(float *p, unsigned int n) {
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  unsigned int i = 0;
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t v = vld1q_f32(p + i);
+    float32x4_t d = vaddq_f32(one, rtmcc_vexpq_f32(vnegq_f32(v)));
+    float32x4_t r = vrecpeq_f32(d);
+    r = vmulq_f32(r, vrecpsq_f32(d, r));
+    r = vmulq_f32(r, vrecpsq_f32(d, r));
+    vst1q_f32(p + i, vmulq_f32(v, r));
+  }
+  for (; i < n; ++i)
+    p[i] = p[i] / (1.0f + std::exp(-p[i]));
+}
+} // namespace
+#endif
+
 void RTMCCHeadLayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, head_props);
   NNTR_THROW_IF(!remain_props.empty(), std::invalid_argument)
@@ -126,6 +188,7 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const float sqrt_s = std::sqrt(static_cast<float>(S));
 
   auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
+  (void)silu; // ARM builds vectorize SiLU below; keep for the scalar fallback
 
   Tensor &w_mlp_g = context.getWeight(wt_idx[mlp_ln_g]);
   Tensor &w_mlp = context.getWeight(wt_idx[mlp_w]);
@@ -274,8 +337,12 @@ void RTMCCHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     _t = clk();
     Tensor uv = H_ln.dot(w_uv);
     float *uvp = uv.getData<float>();
+#ifdef __ARM_NEON
+    rtmcc_silu_inplace(uvp, K * UV);
+#else
     for (unsigned int i = 0; i < K * UV; ++i)
       uvp[i] = silu(uvp[i]);
+#endif
     rep("3b_uv_dot_silu", _t);
 
     nntrainer::TensorDim ke(1, 1, K, E, nchw);
