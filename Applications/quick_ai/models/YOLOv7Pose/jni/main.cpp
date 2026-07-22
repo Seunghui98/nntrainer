@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -26,7 +25,6 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "yolov7_pose_graph.h"
@@ -104,62 +102,11 @@ long peakRSSKB() {
   return 0;
 }
 
-// CPU pre-warm: on this device the WALT governor keeps idle cores parked and
-// at their lowest frequency, so the FIRST forward (warmup) pays the full
-// core-wake + frequency-ramp latency -- and that cost scales with the number of
-// worker cores the compute pool wakes (measured: warmup ~95 ms at 4 threads vs
-// ~210 ms at 8). ONNX Runtime hides the same ramp inside its ~200 ms eager
-// session-create, so its first timed inference is already hot; nntrainer's load
-// is a light mmap+copy and does not ramp the cores. Spin a background worker on
-// each compute core during setup/compile/load so the governor ramps early and
-// the warmup forward runs on already-hot cores. The threads do real arithmetic
-// (governors gate on actual utilization, not just runnable threads) and are
-// stopped right before warmup so they never contend with it. Opt out with
-// YOLO_NO_PREWARM=1.
-struct CpuPrewarm {
-  std::atomic<bool> stop{false};
-  std::vector<std::thread> workers;
-  void start(unsigned n) {
-    if (std::getenv("YOLO_NO_PREWARM"))
-      return;
-    for (unsigned i = 0; i < n; ++i)
-      workers.emplace_back([this]() {
-        volatile double acc = 0.0; // volatile: keep the loop from being elided
-        double x = 1.0000001;
-        while (!stop.load(std::memory_order_relaxed))
-          for (int k = 0; k < 4096; ++k)
-            acc = acc + x * x, x += 1e-9;
-      });
-  }
-  void finish() {
-    stop.store(true, std::memory_order_relaxed);
-    for (auto &t : workers)
-      if (t.joinable())
-        t.join();
-    workers.clear();
-  }
-  ~CpuPrewarm() { finish(); } // RAII: never leave spinners running on throw
-};
-
 } // namespace
 
 int main(int argc, char **argv) {
   auto t_start = std::chrono::steady_clock::now();
   openblas_set_num_threads(4);
-
-  // Ramp the CPU while setup/compile/load run so warmup meets hot cores. Match
-  // the compute pool's worker count (NNTR_NUM_THREADS, default 8 here) so every
-  // core the first forward will use gets woken.
-  CpuPrewarm prewarm;
-  {
-    unsigned nthr = 8;
-    if (const char *e = std::getenv("NNTR_NUM_THREADS")) {
-      int v = std::atoi(e);
-      if (v > 0)
-        nthr = (unsigned)v;
-    }
-    prewarm.start(nthr);
-  }
 
   std::string res_dir = (argc > 1) ? argv[1] : ".";
   std::string input_path =
@@ -359,9 +306,6 @@ int main(int argc, char **argv) {
                   ? std::max(1, std::atoi(std::getenv("YOLO_BENCH_ITERS")))
                   : 1;
     std::vector<float *> outs;
-    // Stop the CPU pre-warm now: the cores are ramped and the warmup forward is
-    // about to run, so the spinners must yield the cores instead of contending.
-    prewarm.finish();
     // One warmup inference. Some presets (e.g. w8a8 per-channel) build a cached
     // weight representation on the first forward, and the first inference also
     // triggers the activation-pool allocation + first-touch; timing that as
