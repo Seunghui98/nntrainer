@@ -179,7 +179,7 @@ int main(int argc, char **argv) {
         preset_q = true;
         // NNTR_W8A8_FP32W: keep conv weights FP32 in the file and let the
         // per-channel path quantize them ONCE, directly from FP32, at load
-        // (getPerChConvWeight's fp32_src path) with an FP32 per-channel scale.
+        // (__ggml_q8ch_prepare_conv_weight's fp32_src path) with an FP32 per-channel scale.
         // This matches the S0 simulation's per-channel scheme exactly (81/87);
         // a Q8_0 conv file instead double-quantizes (per-block int8 in the file
         // -> per-channel requant at load), which costs the borderline keypoint

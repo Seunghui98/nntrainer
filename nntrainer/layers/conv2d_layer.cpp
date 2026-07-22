@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include <act_simd.h> // shared NEON expf/SiLU + affine int8 quantize helpers
 #include <conv2d_layer.h>
 #include <conv_indirect.h> // repack_q8_0 (q8_0x4 weight interleave for the indirect conv kernel)
 #include <cpu_backend.h>
@@ -44,362 +45,11 @@ namespace nntrainer {
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
-
-// Vectorized expf (Cephes polynomial, ~1e-6 rel error). Used to vectorize the
-// FP32 SiLU epilogue, which otherwise runs a scalar std::exp per element and
-// dominates the W8A32 activation cost (FP16 has a LUT; FP32 had none).
-static inline float32x4_t nntr_vexpq_f32(float32x4_t x) {
-  const float32x4_t hi = vdupq_n_f32(88.3762626647950f);
-  const float32x4_t lo = vdupq_n_f32(-88.3762626647949f);
-  x = vminq_f32(vmaxq_f32(x, lo), hi);
-  const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
-  const float32x4_t c0 = vdupq_n_f32(0.693359375f);
-  const float32x4_t c1 = vdupq_n_f32(-2.12194440e-4f);
-  const float32x4_t one = vdupq_n_f32(1.0f);
-  float32x4_t fx = vmlaq_f32(vdupq_n_f32(0.5f), x, log2e);
-  int32x4_t emm0 = vcvtq_s32_f32(fx);
-  float32x4_t tmp = vcvtq_f32_s32(emm0);
-  uint32x4_t mask = vcgtq_f32(tmp, fx);
-  fx = vsubq_f32(
-    tmp, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(one))));
-  emm0 = vcvtq_s32_f32(fx);
-  x = vmlsq_f32(x, fx, c0);
-  x = vmlsq_f32(x, fx, c1);
-  const float32x4_t p0 = vdupq_n_f32(1.9875691500E-4f);
-  const float32x4_t p1 = vdupq_n_f32(1.3981999507E-3f);
-  const float32x4_t p2 = vdupq_n_f32(8.3334519073E-3f);
-  const float32x4_t p3 = vdupq_n_f32(4.1665795894E-2f);
-  const float32x4_t p4 = vdupq_n_f32(1.6666665459E-1f);
-  const float32x4_t p5 = vdupq_n_f32(5.0000001201E-1f);
-  float32x4_t z = vmulq_f32(x, x);
-  float32x4_t y = vmlaq_f32(p1, p0, x);
-  y = vmlaq_f32(p2, y, x);
-  y = vmlaq_f32(p3, y, x);
-  y = vmlaq_f32(p4, y, x);
-  y = vmlaq_f32(p5, y, x);
-  y = vmlaq_f32(x, y, z);
-  y = vaddq_f32(y, one);
-  int32x4_t pow2n = vshlq_n_s32(vaddq_s32(emm0, vdupq_n_s32(0x7f)), 23);
-  return vmulq_f32(y, vreinterpretq_f32_s32(pow2n));
-}
 #endif
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 namespace {
-
-// Local mirror of the interleaved Q8_0 x4 super-block (d[4] fp16 + 128 int8),
-// matching repack_q8_0 / the GEMM kernels. Used by the per-channel weight
-// conversion; the fp16 d fields are unused (kept 0) for the per-channel path.
-struct conv_block_q8_0x4 {
-  uint16_t d[4];
-  int8_t qs[128];
-};
-
-// ---- Per-channel W8A8 weight cache (NNTR_W8A8_PERCH) -----------------------
-// A conv's weight (Q8_0 per-block or FP32) is converted ONCE to the per-channel
-// int8 representation the int32-accumulate kernel wants: int8 quants in the
-// q8_0x4 qs layout (CRS zero-padded to a 32 multiple, out_ch to a 4 multiple)
-// plus one FP32 scale per real output channel. Keyed by the weight buffer
-// pointer (constant during inference).
-struct PerChConvWeight {
-  std::vector<char> qs;    ///< block_q8_0x4 stream (qs used; d bytes are 0)
-  const void *qs_ext = nullptr; ///< when set, the int8 payload is shared
-                                ///< zero-copy with the source weight buffer and
-                                ///< `qs` stays empty (no duplicate allocation)
-  std::vector<float> scale; ///< [out_ch] per-output-channel FP32 scale
-  std::vector<int32_t> colsum; ///< [out_ch] sum of the row's int8 quants; used
-                               ///< by the asymmetric-activation path to fold
-                               ///< the shared activation offset into the bias
-  unsigned int Kpad = 0;   ///< CRS padded to a multiple of 32
-  unsigned int Npad = 0;   ///< out_ch padded to a multiple of 4
-  unsigned int Nreal = 0;  ///< real out_ch
-  bool taps_last = false;  ///< K permuted to [k_h][k_w][in_ch]; the GEMM must
-                           ///< gather activations in the same taps-last order
-                           ///< (pack-free path). Integer accumulation is
-                           ///< order-exact, so results are bit-identical.
-  /// Pointer to the block_q8_0x4 int8 stream the GEMM kernel reads (shared
-  /// with the source weight when zero-copy, else the owned `qs` buffer).
-  const void *qs_data() const { return qs_ext ? qs_ext : (const void *)qs.data(); }
-};
-
-static inline float convFp16ToFp32Bits(uint16_t h); // defined below
-
-// fp32 -> fp16 bits (round-to-nearest-even), IEEE-correct including subnormals.
-// Inverse of convFp16ToFp32Bits; used by the offline per-channel Q8_0 quantizer
-// so the stored scale d is the exact fp16 value the runtime reads back. Conv
-// per-channel scales d = amax(row)/127 are frequently in the fp16 subnormal
-// range (amax < ~0.0078 -> d < 2^-14): those MUST be encoded as fp16
-// subnormals, not flushed to zero, or the whole output channel would quantize
-// to all-zero weights (measured as a systematic score drop / lost keypoints).
-static inline uint16_t convFp32ToFp16Bits(float f) {
-  uint32_t bits;
-  std::memcpy(&bits, &f, 4);
-  const uint32_t sign = (bits >> 16) & 0x8000u;
-  const uint32_t e32 = (bits >> 23) & 0xffu;
-  uint32_t man = bits & 0x7fffffu;
-  if (e32 == 0xff) // Inf / NaN
-    return (uint16_t)(sign | 0x7c00u | (man ? 0x200u : 0u));
-  int32_t exp = (int32_t)e32 - 127 + 15;
-  if (exp >= 31)
-    return (uint16_t)(sign | 0x7c00u); // overflow -> inf
-  if (exp <= 0) {
-    // subnormal (or zero): shift the significand (with implicit 1) into the
-    // 10-bit fp16 mantissa at the denormal position, round-to-nearest-even.
-    if (exp < -10)
-      return (uint16_t)sign; // magnitude below the smallest fp16 subnormal -> 0
-    man |= 0x800000u;        // restore the implicit leading 1
-    const uint32_t shift = (uint32_t)(14 - exp); // in [14, 24]
-    uint32_t hm = man >> shift;
-    const uint32_t rem = man & ((1u << shift) - 1u);
-    const uint32_t half = 1u << (shift - 1);
-    if (rem > half || (rem == half && (hm & 1u)))
-      ++hm; // ties-to-even; may carry hm up to 0x400 = smallest normal (correct)
-    return (uint16_t)(sign | hm);
-  }
-  uint32_t m = man >> 13;
-  const uint32_t rem = man & 0x1fffu;
-  if (rem > 0x1000u || (rem == 0x1000u && (m & 1u)))
-    ++m;
-  if (m == 0x400u) {
-    m = 0;
-    if (++exp >= 31)
-      return (uint16_t)(sign | 0x7c00u);
-  }
-  return (uint16_t)(sign | ((uint32_t)exp << 10) | m);
-}
-
-// Offline PER-CHANNEL Q8_0 quantizer for conv weights: writes a plain
-// block_q8_0 stream ([nrow, ncol/32]) where every block of output-channel row
-// n carries the SAME scale d = amax(row_n)/127 (fp16-rounded), and
-// qs = round(x / d). This differs from ggml's per-block quantize_q8_0 (a
-// distinct d per 32-block); it is still a byte-valid Q8_0 tensor.
-//
-// Why this recovers per-channel accuracy without any runtime change: the W8A8
-// per-channel runtime (getPerChConvWeight) dequantizes the loaded Q8_0 and
-// re-quantizes it per output channel (amax over the whole row / 127). When the
-// file is ALREADY per-channel, the dequantized row's amax element is exactly
-// d*127 (the amax element quantizes to +-127), so the re-quant scale comes back
-// to d and every qs is reproduced -- the re-quant is the identity. The prior
-// per-BLOCK file instead forced a lossy dequant(per-block)->requant(per-channel)
-// double rounding (81 -> 80). ncol must be a multiple of 32 (caller guards it).
-static inline void quantize_q8_0_per_channel(const float *src, char *dst,
-                                             unsigned int nrow,
-                                             unsigned int ncol) {
-  struct local_block_q8_0 {
-    uint16_t d;
-    int8_t qs[32];
-  };
-  auto &tm = ThreadManager::Global();
-  const unsigned int nb = ncol / 32;
-  local_block_q8_0 *out = reinterpret_cast<local_block_q8_0 *>(dst);
-  tm.parallel_for(0, nrow, [=](size_t n) {
-    const float *row = src + (size_t)n * ncol;
-    float amax = 0.f;
-    for (unsigned int k = 0; k < ncol; ++k)
-      amax = std::max(amax, std::fabs(row[k]));
-    const float d = amax > 0.f ? amax / 127.f : 1.f;
-    const uint16_t d16 = convFp32ToFp16Bits(d);
-    const float d_used = convFp16ToFp32Bits(d16); // exact value runtime reads
-    const float inv = d_used > 0.f ? 1.f / d_used : 0.f;
-    for (unsigned int j = 0; j < nb; ++j) {
-      local_block_q8_0 &b = out[(size_t)n * nb + j];
-      b.d = d16;
-      for (int c = 0; c < 32; ++c) {
-        const float v = row[j * 32 + c] * inv;
-        b.qs[c] =
-          (int8_t)std::max(-128.f, std::min(127.f, std::round(v)));
-      }
-    }
-  });
-}
-
-static inline float convFp16ToFp32Bits(uint16_t h) {
-  uint32_t sign = (uint32_t)(h >> 15) << 31;
-  uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff, bits;
-  if (exp == 0) {
-    if (man == 0)
-      bits = sign;
-    else {
-      exp = 127 - 15 + 1;
-      while (!(man & 0x400)) {
-        man <<= 1;
-        --exp;
-      }
-      man &= 0x3ff;
-      bits = sign | (exp << 23) | (man << 13);
-    }
-  } else if (exp == 31)
-    bits = sign | 0x7f800000u | (man << 13);
-  else
-    bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
-
-// Build (once, cached) the per-channel int8 weight for a conv whose FP32 filter
-// is logically [out_ch, CRS]. `q8_src` (block_q8_0x4, out_ch x CRS blocked on
-// CRS) is used when non-null; otherwise `fp32_src` (row-major [out_ch, CRS]).
-static const PerChConvWeight &
-getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
-                   const float *fp32_src, unsigned int out_ch,
-                   unsigned int CRS, unsigned int khkw = 1,
-                   unsigned int in_ch = 0) {
-  static std::mutex mtx;
-  static std::unordered_map<const void *, PerChConvWeight> cache;
-  std::lock_guard<std::mutex> lk(mtx);
-  auto it = cache.find(key);
-  if (it != cache.end())
-    return it->second;
-
-  // Parallelized so the one-time conversion (first forward) is not a big
-  // single-threaded warmup stall. Batch is 1 in the W8A8 path, so this never
-  // nests inside another parallel_for.
-  auto &tm = ThreadManager::Global();
-
-  PerChConvWeight w;
-  w.Nreal = out_ch;
-  w.Kpad = (CRS + QK8_0 - 1) / QK8_0 * QK8_0;
-  w.Npad = (out_ch + 3) / 4 * 4;
-  const unsigned int nb = w.Kpad / QK8_0;
-  const unsigned int NB4 = w.Npad / 4;
-  const unsigned int nbq = CRS / QK8_0; // q8 source blocks (CRS % 32 == 0)
-
-  w.scale.assign(out_ch, 1.f);
-  w.colsum.assign(out_ch, 0);
-  float *scale_ptr = w.scale.data();
-  int32_t *colsum_ptr = w.colsum.data();
-
-  // Taps-last K permutation (kernels > 1x1, NNTR_W8A8_PACKA=1 reverts): the
-  // filter's K order [in_ch][k_h][k_w] forces the NHWC activation gather into
-  // a byte-wise transposing scatter plus a q8_0x4 interleave (gemm.pack).
-  // Permuting the weight's K to [k_h][k_w][in_ch] lets the gather copy
-  // contiguous NHWC spans and feed the plain-activation kernel directly.
-  // The dot product sums the same K multiset and int32 accumulation is exact,
-  // so outputs are bit-identical; per-row amax/scale/colsum are order-
-  // invariant and unchanged.
-  static const bool packa = std::getenv("NNTR_W8A8_PACKA") != nullptr;
-  const bool taps =
-    !packa && khkw > 1 && in_ch > 0 && (size_t)khkw * in_ch == CRS;
-  w.taps_last = taps;
-  std::vector<unsigned int> perm; // dst (taps-last) k -> src (filter-order) k
-  if (taps) {
-    perm.resize(CRS);
-    for (unsigned int c = 0; c < in_ch; ++c)
-      for (unsigned int t = 0; t < khkw; ++t)
-        perm[(size_t)t * in_ch + c] = c * khkw + t;
-  }
-  const unsigned int *perm_ptr = taps ? perm.data() : nullptr;
-
-  // Memory optimization (opt-in via NNTR_W8A8_PERCH_INPLACE): the repacked int8
-  // stream is byte-for-byte the same layout and size as the source Q8_0x4
-  // weight when out_ch % 4 == 0 and CRS % 32 == 0 (the pack writes every qs
-  // byte, and the kernel ignores the d field). Rather than allocate a second
-  // ~equal-sized buffer, requantize in place into the source and share it
-  // zero-copy, eliminating the persistent per-conv weight duplicate. Each
-  // 4-row group's source blocks are fully dequantized before that group's
-  // pack overwrites them, and groups touch disjoint block ranges, so the
-  // in-place path stays parallel-safe. Numerically identical to the
-  // owned-buffer path.
-  static const bool perch_inplace =
-    std::getenv("NNTR_W8A8_PERCH_INPLACE") != nullptr;
-  const bool use_inplace =
-    perch_inplace && q8_src != nullptr && w.Npad == out_ch && w.Kpad == CRS;
-  conv_block_q8_0x4 *dst;
-  if (use_inplace) {
-    dst = const_cast<conv_block_q8_0x4 *>(q8_src);
-    w.qs_ext = dst;
-  } else {
-    w.qs.assign((size_t)NB4 * nb * sizeof(conv_block_q8_0x4), 0);
-    dst = (conv_block_q8_0x4 *)w.qs.data();
-  }
-
-  // Streamed per 4-row group: dequant -> per-channel quantize -> pack with a
-  // 4 x CRS scratch, instead of materializing the whole FP32 weight plus a
-  // whole int8 copy. The monolithic buffers spiked warmup peak RSS by ~5x the
-  // weight's int8 size on the largest conv (head-final: ~16 MB) and set the
-  // process peak; streaming keeps the transient in the hundreds of KB. The
-  // per-row math and ordering are unchanged, so scale/colsum/qs stay
-  // bit-identical. Matching the prior pass structure, a q8 source only feeds
-  // full 4-row groups (out_ch / 4); a partial tail group (out_ch % 4 != 0)
-  // dequantizes to zeros, exactly as before.
-  tm.parallel_for(0, NB4, [=](size_t sc) {
-    std::vector<float> wf((size_t)4 * CRS);
-    std::vector<int8_t> wi((size_t)4 * CRS);
-    float *wf_ptr = wf.data();
-    int8_t *wi_ptr = wi.data();
-
-    // 1) This group's 4 rows as FP32 (rows past out_ch / q8 tail -> 0).
-    if (q8_src) {
-      if ((unsigned int)(sc + 1) * 4 <= out_ch) {
-        for (unsigned int j = 0; j < nbq; ++j) {
-          const conv_block_q8_0x4 &sb = q8_src[(size_t)sc * nbq + j];
-          for (unsigned int r = 0; r < 4; ++r) {
-            const float d = convFp16ToFp32Bits(sb.d[r]);
-            for (unsigned int sub = 0; sub < 4; ++sub)
-              for (unsigned int c = 0; c < 8; ++c)
-                wf_ptr[(size_t)r * CRS + j * QK8_0 + sub * 8 + c] =
-                  d * (float)sb.qs[32 * sub + 8 * r + c];
-          }
-        }
-      } else {
-        std::memset(wf_ptr, 0, (size_t)4 * CRS * sizeof(float));
-      }
-    } else {
-      for (unsigned int r = 0; r < 4; ++r) {
-        const unsigned int n = (unsigned int)sc * 4 + r;
-        if (n < out_ch)
-          std::memcpy(&wf_ptr[(size_t)r * CRS], &fp32_src[(size_t)n * CRS],
-                      (size_t)CRS * sizeof(float));
-        else
-          std::memset(&wf_ptr[(size_t)r * CRS], 0, (size_t)CRS * sizeof(float));
-      }
-    }
-
-    // 2) Per-output-channel int8 quantize (+ per-row quant sum for the
-    // asymmetric-activation bias fold).
-    for (unsigned int r = 0; r < 4; ++r) {
-      const unsigned int n = (unsigned int)sc * 4 + r;
-      if (n >= out_ch) {
-        std::memset(&wi_ptr[(size_t)r * CRS], 0, CRS);
-        continue;
-      }
-      float amax = 0.f;
-      const float *row = &wf_ptr[(size_t)r * CRS];
-      for (unsigned int k = 0; k < CRS; ++k)
-        amax = std::max(amax, std::fabs(row[k]));
-      const float scv = amax > 0.f ? amax / 127.f : 1.f;
-      scale_ptr[n] = scv;
-      const float inv = 1.f / scv;
-      int8_t *qrow = &wi_ptr[(size_t)r * CRS];
-      int32_t qsum = 0;
-      for (unsigned int k = 0; k < CRS; ++k) {
-        qrow[k] =
-          (int8_t)std::max(-128.f, std::min(127.f, std::round(row[k] * inv)));
-        qsum += qrow[k];
-      }
-      colsum_ptr[n] = qsum;
-    }
-
-    // 3) Pack the group's int8 rows -> q8_0x4 qs (d ignored by the kernel),
-    // applying the taps-last K permutation when enabled.
-    for (unsigned int j = 0; j < nb; ++j) {
-      conv_block_q8_0x4 &sb = dst[(size_t)sc * nb + j];
-      for (unsigned int r = 0; r < 4; ++r) {
-        for (unsigned int sub = 0; sub < 4; ++sub)
-          for (unsigned int c = 0; c < 8; ++c) {
-            const unsigned int k = j * QK8_0 + sub * 8 + c;
-            const unsigned int ks = (k < CRS && perm_ptr) ? perm_ptr[k] : k;
-            sb.qs[32 * sub + 8 * r + c] =
-              (k < CRS) ? wi_ptr[(size_t)r * CRS + ks] : 0;
-          }
-      }
-    }
-  });
-  it = cache.emplace(key, std::move(w)).first;
-  return it->second;
-}
 
 // ---- Stem direct-conv weight cache ----------------------------------------
 // The stem (in_ch == 3) runs a dedicated direct FP32 conv (no im2col, no
@@ -672,57 +322,6 @@ static inline float convBiasActRow(float *row, const float *bias, unsigned int C
     row[cc] = v;
     am = std::max(am, std::fabs(v));
   }
-  return am;
-}
-
-// Affine int8 quantize of a contiguous FP32 run: q = round((x+off)*inv) - 128,
-// saturated to [-128,127]. The NEON path uses FCVTAS (round-to-nearest, ties
-// away from zero -- exactly std::round) and saturating narrows, so it is
-// bit-identical to the scalar tail. Callers parallelize by chunking.
-static inline void convQuantAffine(const float *src, int8_t *dst, size_t n,
-                                   float inv, float off) {
-  size_t i = 0;
-#if defined(__ARM_NEON)
-  const float32x4_t vinv = vdupq_n_f32(inv);
-  const float32x4_t voff = vdupq_n_f32(off);
-  const int32x4_t vm128 = vdupq_n_s32(-128);
-  for (; i + 15 < n; i += 16) {
-    const int32x4_t q0 = vaddq_s32(
-      vcvtaq_s32_f32(vmulq_f32(vaddq_f32(vld1q_f32(src + i + 0), voff), vinv)),
-      vm128);
-    const int32x4_t q1 = vaddq_s32(
-      vcvtaq_s32_f32(vmulq_f32(vaddq_f32(vld1q_f32(src + i + 4), voff), vinv)),
-      vm128);
-    const int32x4_t q2 = vaddq_s32(
-      vcvtaq_s32_f32(vmulq_f32(vaddq_f32(vld1q_f32(src + i + 8), voff), vinv)),
-      vm128);
-    const int32x4_t q3 = vaddq_s32(
-      vcvtaq_s32_f32(
-        vmulq_f32(vaddq_f32(vld1q_f32(src + i + 12), voff), vinv)),
-      vm128);
-    const int16x8_t p0 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
-    const int16x8_t p1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
-    vst1q_s8(dst + i, vcombine_s8(vqmovn_s16(p0), vqmovn_s16(p1)));
-  }
-#endif
-  for (; i < n; ++i) {
-    const float q = std::round((src[i] + off) * inv) - 128.f;
-    dst[i] = (int8_t)std::max(-128.f, std::min(127.f, q));
-  }
-}
-
-// |x| max over a contiguous FP32 run (NEON + tail); callers chunk-parallelize.
-static inline float convAbsMaxF32(const float *src, size_t n) {
-  float am = 0.f;
-  size_t i = 0;
-#if defined(__ARM_NEON)
-  float32x4_t vm = vdupq_n_f32(0.f);
-  for (; i + 3 < n; i += 4)
-    vm = vmaxq_f32(vm, vabsq_f32(vld1q_f32(src + i)));
-  am = vmaxvq_f32(vm);
-#endif
-  for (; i < n; ++i)
-    am = std::max(am, std::fabs(src[i]));
   return am;
 }
 
@@ -1943,10 +1542,9 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
           const unsigned int in_ch = in_dim.channel();
           const unsigned int CRS =
             in_ch * kernel_size[0].get() * kernel_size[1].get();
-          const PerChConvWeight &W = getPerChConvWeight(
+          const PerChConvWeight &W = __ggml_q8ch_prepare_conv_weight(
             filter_kernel.getData(),
-            weight_is_q8 ? (const conv_block_q8_0x4 *)filter_kernel.getData()
-                         : nullptr,
+            weight_is_q8 ? filter_kernel.getData() : nullptr,
             weight_is_q8 ? nullptr : filter_kernel.getData<float>(), filter_size,
             CRS, kernel_size[0].get() * kernel_size[1].get(), in_ch);
 
@@ -1995,7 +1593,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             float *cam = chunk_amax.data();
             tmq.parallel_for(0, nqc, [=](size_t ci) {
               const size_t i0 = ci * qch, i1 = std::min(i0 + qch, n_in);
-              cam[ci] = convAbsMaxF32(fin + i0, i1 - i0);
+              cam[ci] = nntr_absmax_f32(fin + i0, i1 - i0);
             });
             float amax = 0.f;
             for (size_t ci = 0; ci < nqc; ++ci)
@@ -2016,7 +1614,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
               const float inv = 1.f / a_scale;
               tmq.parallel_for(0, nqc, [=](size_t ci) {
                 const size_t i0 = ci * qch, i1 = std::min(i0 + qch, n_in);
-                convQuantAffine(fin + i0, ab + i0, i1 - i0, inv, kActOff);
+                nntr_quantize_affine_i8(fin + i0, ab + i0, i1 - i0, inv, kActOff);
               });
             } else {
               a_scale = amax > 0.f ? amax / 127.f : 1.f;
@@ -2144,7 +1742,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
                 const size_t i1 = std::min(i0 + chunk, nout);
                 if (asym_q) {
                   // NEON affine quantize (bit-identical to the scalar form).
-                  convQuantAffine(cptr + i0, qo + i0, i1 - i0, inv, kActOff);
+                  nntr_quantize_affine_i8(cptr + i0, qo + i0, i1 - i0, inv, kActOff);
                 } else {
                   for (size_t i = i0; i < i1; ++i)
                     qo[i] = (int8_t)std::max(
@@ -3314,15 +2912,15 @@ void Conv2DLayer::save(std::ofstream &file, RunLayerContext &run_context,
       // the same flag that selects the per-channel kernel at run time), use one
       // scale per output-channel row instead of one per 32-block. This makes the
       // runtime's dequant->per-channel-requant the identity (see
-      // quantize_q8_0_per_channel), removing the per-block->per-channel double
-      // quantization that costs one keypoint (81 -> 80). The repack and byte
-      // layout are unchanged, so a per-channel file is still a valid Q8_0 tensor
-      // for every other reader.
+      // __ggml_quantize_q8_0_per_channel), removing the per-block->per-channel
+      // double quantization that costs one keypoint (81 -> 80). The repack and
+      // byte layout are unchanged, so a per-channel file is still a valid Q8_0
+      // tensor for every other reader.
       static const bool perch_quant =
         std::getenv("NNTR_W8A8_PERCH") != nullptr;
       if (perch_quant)
-        quantize_q8_0_per_channel(weight.getData<float>(), tmp.data(), out_ch,
-                                  CRS);
+        __ggml_quantize_q8_0_per_channel(weight.getData<float>(), tmp.data(),
+                                         out_ch, CRS);
       else
         quantize_q8_0(weight.getData<float>(), tmp.data(),
                       static_cast<int64_t>(out_ch), static_cast<int64_t>(CRS),
