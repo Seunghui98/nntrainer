@@ -116,6 +116,10 @@ struct PerChConvWeight {
   unsigned int Kpad = 0;   ///< CRS padded to a multiple of 32
   unsigned int Npad = 0;   ///< out_ch padded to a multiple of 4
   unsigned int Nreal = 0;  ///< real out_ch
+  bool taps_last = false;  ///< K permuted to [k_h][k_w][in_ch]; the GEMM must
+                           ///< gather activations in the same taps-last order
+                           ///< (pack-free path). Integer accumulation is
+                           ///< order-exact, so results are bit-identical.
   /// Pointer to the block_q8_0x4 int8 stream the GEMM kernel reads (shared
   /// with the source weight when zero-copy, else the owned `qs` buffer).
   const void *qs_data() const { return qs_ext ? qs_ext : (const void *)qs.data(); }
@@ -242,7 +246,8 @@ static inline float convFp16ToFp32Bits(uint16_t h) {
 static const PerChConvWeight &
 getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
                    const float *fp32_src, unsigned int out_ch,
-                   unsigned int CRS) {
+                   unsigned int CRS, unsigned int khkw = 1,
+                   unsigned int in_ch = 0) {
   static std::mutex mtx;
   static std::unordered_map<const void *, PerChConvWeight> cache;
   std::lock_guard<std::mutex> lk(mtx);
@@ -267,6 +272,27 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
   w.colsum.assign(out_ch, 0);
   float *scale_ptr = w.scale.data();
   int32_t *colsum_ptr = w.colsum.data();
+
+  // Taps-last K permutation (kernels > 1x1, NNTR_W8A8_PACKA=1 reverts): the
+  // filter's K order [in_ch][k_h][k_w] forces the NHWC activation gather into
+  // a byte-wise transposing scatter plus a q8_0x4 interleave (gemm.pack).
+  // Permuting the weight's K to [k_h][k_w][in_ch] lets the gather copy
+  // contiguous NHWC spans and feed the plain-activation kernel directly.
+  // The dot product sums the same K multiset and int32 accumulation is exact,
+  // so outputs are bit-identical; per-row amax/scale/colsum are order-
+  // invariant and unchanged.
+  static const bool packa = std::getenv("NNTR_W8A8_PACKA") != nullptr;
+  const bool taps =
+    !packa && khkw > 1 && in_ch > 0 && (size_t)khkw * in_ch == CRS;
+  w.taps_last = taps;
+  std::vector<unsigned int> perm; // dst (taps-last) k -> src (filter-order) k
+  if (taps) {
+    perm.resize(CRS);
+    for (unsigned int c = 0; c < in_ch; ++c)
+      for (unsigned int t = 0; t < khkw; ++t)
+        perm[(size_t)t * in_ch + c] = c * khkw + t;
+  }
+  const unsigned int *perm_ptr = taps ? perm.data() : nullptr;
 
   // Memory optimization (opt-in via NNTR_W8A8_PERCH_INPLACE): the repacked int8
   // stream is byte-for-byte the same layout and size as the source Q8_0x4
@@ -358,15 +384,17 @@ getPerChConvWeight(const void *key, const conv_block_q8_0x4 *q8_src,
       colsum_ptr[n] = qsum;
     }
 
-    // 3) Pack the group's int8 rows -> q8_0x4 qs (d ignored by the kernel).
+    // 3) Pack the group's int8 rows -> q8_0x4 qs (d ignored by the kernel),
+    // applying the taps-last K permutation when enabled.
     for (unsigned int j = 0; j < nb; ++j) {
       conv_block_q8_0x4 &sb = dst[(size_t)sc * nb + j];
       for (unsigned int r = 0; r < 4; ++r) {
         for (unsigned int sub = 0; sub < 4; ++sub)
           for (unsigned int c = 0; c < 8; ++c) {
             const unsigned int k = j * QK8_0 + sub * 8 + c;
+            const unsigned int ks = (k < CRS && perm_ptr) ? perm_ptr[k] : k;
             sb.qs[32 * sub + 8 * r + c] =
-              (k < CRS) ? wi_ptr[(size_t)r * CRS + k] : 0;
+              (k < CRS) ? wi_ptr[(size_t)r * CRS + ks] : 0;
           }
       }
     }
@@ -1973,7 +2001,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             weight_is_q8 ? (const conv_block_q8_0x4 *)filter_kernel.getData()
                          : nullptr,
             weight_is_q8 ? nullptr : filter_kernel.getData<float>(), filter_size,
-            CRS);
+            CRS, kernel_size[0].get() * kernel_size[1].get(), in_ch);
 
           // Asymmetric (affine) int8 activations with a SHARED fixed offset
           // (default; NNTR_W8A8_SYM=1 reverts to symmetric): every int8 edge
@@ -2098,7 +2126,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
 
           __ggml_q8ch_indirect_GEMM(owoh, filter_size, W.Kpad, a_i8, a_scale,
                                     geom, W.qs_data(), W.scale.data(), cptr,
-                                    pad_q);
+                                    pad_q, W.taps_last);
 
           // bias + SiLU on FP32, then (for an int8 output) requantize.
           {

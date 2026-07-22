@@ -309,13 +309,18 @@ void __ggml_q8_0_q8_0_indirect_GEMM_i8a(const unsigned int M,
  * point (the quantized representation of x = 0) so padded pixels contribute
  * x ~= 0, not x = -zp*scale; the caller then removes the shared offset via the
  * per-column colsum correction folded into the bias.
+ * @param taps_last B's K dimension is permuted to [k_h][k_w][in_ch]
+ * (PerChConvWeight::taps_last): activations are gathered taps-last as plain
+ * int8 rows (contiguous NHWC copies) and fed to the plain-activation kernel
+ * directly -- no q8_0x4 interleave pass. Bit-identical to the packed path
+ * (integer accumulation over a permuted K is exact).
  */
 void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int K, const int8_t *in,
                                const float act_scale,
                                const ConvGatherParams &geom, const void *B,
                                const float *w_scale, float *C,
-                               int8_t pad_value = 0);
+                               int8_t pad_value = 0, bool taps_last = false);
 
 /**
  * @brief A(M, K) * W.T(N, K) = (M, N)

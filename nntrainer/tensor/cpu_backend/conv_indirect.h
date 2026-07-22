@@ -220,6 +220,73 @@ inline void gather_conv_act_rows(T *dst, const T *in, const ConvGatherParams &p,
 }
 
 /**
+ * @brief NHWC taps-last gather: im2col rows in [k_h][k_w][in_ch] order.
+ *
+ * gather_conv_act_rows produces rows in the filter-tensor order
+ * [in_ch][k_h][k_w], which for an NHWC input is a byte-granular transposing
+ * scatter (each tap's in_ch contiguous bytes fan out with stride k_h*k_w).
+ * When the weight's K dimension is permuted to the same [k_h][k_w][in_ch]
+ * order (see the per-channel weight conversion), every tap instead maps a
+ * contiguous in_ch-span of the NHWC input to a contiguous span of the row --
+ * and with unit width-dilation a whole in-bounds k_w run collapses into ONE
+ * memcpy of run*in_ch elements. The dot product is a sum over the same K
+ * multiset, and integer accumulation is exact, so a GEMM pairing this gather
+ * with the correspondingly permuted weight is bit-identical to the
+ * source-order pairing.
+ *
+ * Same contract as gather_conv_act_rows otherwise: rows [m0, m0+nrows),
+ * dst fully written, spatial padding and the [K, dst_stride) tail filled
+ * with pad_byte. NHWC inputs only.
+ */
+template <typename T>
+inline void gather_conv_act_rows_tapslast(T *dst, const T *in,
+                                          const ConvGatherParams &p, int m0,
+                                          int nrows, int dst_stride = 0,
+                                          int pad_byte = 0) {
+  const int K = p.in_ch * p.k_h * p.k_w;
+  const int st = dst_stride > 0 ? dst_stride : K;
+  const int row_c = p.k_w * p.in_ch; // one kernel row's span in the dst row
+
+  for (int r = 0; r < nrows; ++r) {
+    const int m = m0 + r;
+    const int oh = m / p.out_w;
+    const int ow = m % p.out_w;
+    T *row = dst + (long)r * st;
+    std::memset(row, pad_byte, (size_t)st * sizeof(T));
+
+    const int h0 = oh * p.stride_h - p.pad_t;
+    const int w0 = ow * p.stride_w - p.pad_l;
+
+    for (int kh = 0; kh < p.k_h; ++kh) {
+      const int h = h0 + kh * p.dil_h;
+      if (h < 0 || h >= p.in_h)
+        continue;
+      const T *in_row = in + (long)h * p.in_w * p.in_ch;
+      T *dst_row = row + (long)kh * row_c;
+      if (p.dil_w == 1) {
+        // in-bounds k_w run -> single contiguous copy of run*in_ch elements
+        int wlo = w0 < 0 ? 0 : w0;
+        int whi = w0 + p.k_w;
+        if (whi > p.in_w)
+          whi = p.in_w;
+        if (whi > wlo)
+          std::memcpy(dst_row + (long)(wlo - w0) * p.in_ch,
+                      in_row + (long)wlo * p.in_ch,
+                      (size_t)(whi - wlo) * p.in_ch * sizeof(T));
+      } else {
+        for (int kw = 0; kw < p.k_w; ++kw) {
+          const int w = w0 + kw * p.dil_w;
+          if (w >= 0 && w < p.in_w)
+            std::memcpy(dst_row + (long)kw * p.in_ch,
+                        in_row + (long)w * p.in_ch,
+                        (size_t)p.in_ch * sizeof(T));
+        }
+      }
+    }
+  }
+}
+
+/**
  * @brief FP32 gather (legacy named entry; alias of the template instantiation).
  *
  * Kept as a concrete non-template function so existing FP32-indirect-conv

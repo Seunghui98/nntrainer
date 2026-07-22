@@ -583,7 +583,7 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
                                const float act_scale,
                                const ConvGatherParams &geom, const void *B,
                                const float *w_scale, float *C,
-                               int8_t pad_value) {
+                               int8_t pad_value, bool taps_last) {
   auto &tm = ThreadManager::Global();
   const unsigned int nb = K / QK8_0;
   const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * nb;
@@ -630,6 +630,74 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
       std::vector<float> scratch((size_t)4 * N);
       float *scratch_ptr = scratch.data();
       const int8_t *tail_a = tail.data();
+      const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+      tm.parallel_for(0, col_loop, [=](size_t c) {
+        unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
+        unsigned int c_end =
+          std::min(col_chunk_size * ((unsigned int)c + 1), N);
+        nntr_gemm_q8ch_plainA_f32(
+          (int)K, scratch_ptr + c_start, N,
+          (const void *)((const char *)B + (size_t)c_start * B_step),
+          w_scale + c_start, tail_a, K, act_scale, 4,
+          (int)(c_end - c_start));
+      });
+      for (unsigned int rr = 0; rr < rem; ++rr)
+        std::memcpy(C + (size_t)(Mfull + rr) * N, scratch_ptr + (size_t)rr * N,
+                    (size_t)N * sizeof(float));
+    }
+    return;
+  }
+
+  // Pack-free gathered path (weight K permuted taps-last): gather plain
+  // [M, K] int8 rows -- for NHWC each tap is a contiguous in_ch copy, unit
+  // width-dilation collapses a whole k_w run into one memcpy -- and feed the
+  // plain-activation kernel directly. The q8_0x4 interleave pass (gemm.pack)
+  // and its transposing byte scatter disappear; results are bit-identical to
+  // the packed path (int32 accumulation over a permuted K is exact).
+  if (taps_last) {
+    static thread_local std::vector<int8_t> QAp;
+    const size_t qa_p_bytes = (size_t)M4c * 4 * K;
+    if (QAp.size() < qa_p_bytes)
+      QAp.resize(qa_p_bytes);
+    int8_t *QAp_ptr = QAp.data();
+
+    {
+      nntrainer::LiteScope _g(nntrainer::LiteProf::getCurrent(), "gemm.gather");
+      const unsigned int QCHUNK = 64;
+      const size_t qloops = (M + QCHUNK - 1) / QCHUNK;
+      tm.parallel_for(0, qloops, [=](size_t q) {
+        const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+        const unsigned int r1 = std::min(r0 + QCHUNK, M);
+        gather_conv_act_rows_tapslast<int8_t>(QAp_ptr + (size_t)r0 * K, in,
+                                              geom, (int)r0, (int)(r1 - r0),
+                                              (int)K, pad_value);
+      });
+      if (rem > 0) // zero the tail group's rows past M (kernel reads 4 rows)
+        std::memset(QAp_ptr + (size_t)M * K, 0, (size_t)(4 - rem) * K);
+    }
+
+    nntrainer::LiteScope _m(nntrainer::LiteProf::getCurrent(), "gemm.matmul");
+    if (Mfull > 0) {
+      const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
+      const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+      tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+        unsigned int r = static_cast<unsigned int>(i / col_loop);
+        unsigned int c = static_cast<unsigned int>(i % col_loop);
+        unsigned int r_start = r * row_chunk_size;
+        unsigned int r_end = std::min(row_chunk_size * (r + 1), Mfull);
+        unsigned int c_start = c * col_chunk_size;
+        unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+        nntr_gemm_q8ch_plainA_f32(
+          (int)K, C + (size_t)r_start * N + c_start, N,
+          (const void *)((const char *)B + (size_t)c_start * B_step),
+          w_scale + c_start, QAp_ptr + (size_t)r_start * K, K, act_scale,
+          (int)(r_end - r_start), (int)(c_end - c_start));
+      });
+    }
+    if (rem > 0) {
+      std::vector<float> scratch((size_t)4 * N);
+      float *scratch_ptr = scratch.data();
+      const int8_t *tail_a = QAp_ptr + (size_t)Mfull * K;
       const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
       tm.parallel_for(0, col_loop, [=](size_t c) {
         unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
