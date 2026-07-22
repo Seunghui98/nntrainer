@@ -593,6 +593,61 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
   const unsigned int M4c = (M + 3) / 4;
   const uint16_t d16 = 0; // d ignored by the per-channel kernel
 
+  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
+  const unsigned int row_chunk_size = 16, col_chunk_size = 16;
+
+  // 1x1 unit-stride convs gather the identity: `in` already IS the plain
+  // [M, K] int8 activation matrix, so the plain-activation kernel reads it
+  // directly and the whole packing pass (+ its QA buffer) disappears.
+  const bool ident = conv_gather_is_identity(geom, K);
+  if (ident) {
+    nntrainer::LiteScope _m(nntrainer::LiteProf::getCurrent(), "gemm.matmul");
+    if (Mfull > 0) {
+      const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
+      const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+      tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+        unsigned int r = static_cast<unsigned int>(i / col_loop);
+        unsigned int c = static_cast<unsigned int>(i % col_loop);
+        unsigned int r_start = r * row_chunk_size;
+        unsigned int r_end = std::min(row_chunk_size * (r + 1), Mfull);
+        unsigned int c_start = c * col_chunk_size;
+        unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+        nntr_gemm_q8ch_plainA_f32(
+          (int)K, C + (size_t)r_start * N + c_start, N,
+          (const void *)((const char *)B + (size_t)c_start * B_step),
+          w_scale + c_start, in + (size_t)r_start * K, K, act_scale,
+          (int)(r_end - r_start), (int)(c_end - c_start));
+      });
+    }
+    if (rem > 0) {
+      // The M%4 tail's 4-row group must not read past row M, so copy the rem
+      // rows into a zero-padded 4xK plain buffer.
+      static thread_local std::vector<int8_t> tail;
+      if (tail.size() < (size_t)4 * K)
+        tail.resize((size_t)4 * K);
+      std::memset(tail.data(), 0, (size_t)4 * K);
+      std::memcpy(tail.data(), in + (size_t)Mfull * K, (size_t)rem * K);
+      std::vector<float> scratch((size_t)4 * N);
+      float *scratch_ptr = scratch.data();
+      const int8_t *tail_a = tail.data();
+      const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+      tm.parallel_for(0, col_loop, [=](size_t c) {
+        unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
+        unsigned int c_end =
+          std::min(col_chunk_size * ((unsigned int)c + 1), N);
+        nntr_gemm_q8ch_plainA_f32(
+          (int)K, scratch_ptr + c_start, N,
+          (const void *)((const char *)B + (size_t)c_start * B_step),
+          w_scale + c_start, tail_a, K, act_scale, 4,
+          (int)(c_end - c_start));
+      });
+      for (unsigned int rr = 0; rr < rem; ++rr)
+        std::memcpy(C + (size_t)(Mfull + rr) * N, scratch_ptr + (size_t)rr * N,
+                    (size_t)N * sizeof(float));
+    }
+    return;
+  }
+
   // Reused thread_local packing buffer (per-forward malloc + page-fault churn
   // showed up as unattributed per-conv time). Every super-block [0, M4c) is
   // rewritten below, so no clearing is needed on reuse.
@@ -602,9 +657,6 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
     QA.resize(qa_bytes);
   char *QA_ptr = QA.data();
 
-  // 1x1 unit-stride convs gather the identity: pack straight from `in`, no tile.
-  const bool ident = conv_gather_is_identity(geom, K);
-
   {
     nntrainer::LiteScope _p(nntrainer::LiteProf::getCurrent(), "gemm.pack");
     const unsigned int QCHUNK = 64;
@@ -613,12 +665,6 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
       tm.parallel_for(0, qloops, [=](size_t q) {
         const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
         const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
-        if (ident) {
-          for (unsigned int r = r0; r < r1; r += 4)
-            pack_i8_rows_q8_0x4(in + (size_t)r * K, K, d16,
-                                QA_ptr + (size_t)(r / 4) * qa_4_rows_size);
-          return;
-        }
         std::vector<int8_t> tile((size_t)4 * K);
         for (unsigned int r = r0; r < r1; r += 4) {
           gather_conv_act_rows<int8_t>(tile.data(), in, geom, (int)r, 4,
@@ -638,9 +684,6 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
   }
 
   nntrainer::LiteScope _m(nntrainer::LiteProf::getCurrent(), "gemm.matmul");
-  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
-  const unsigned int row_chunk_size = 16, col_chunk_size = 16;
-
   if (Mfull > 0) {
     const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
     const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;

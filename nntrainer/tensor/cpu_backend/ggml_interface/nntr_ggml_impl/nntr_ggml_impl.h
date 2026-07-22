@@ -146,6 +146,25 @@ void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
                             int nc);
 
 /**
+ * @brief Per-channel W8A8 GEMM with a PLAIN row-major int8 activation.
+ *
+ * Identical math and output to nntr_gemm_q8ch_4x4_f32, but the activation is
+ * read from a plain [nr x n] int8 matrix `A` (row stride lda) instead of the
+ * pre-interleaved block_q8_0x4 stream. This removes the activation packing pass
+ * entirely for the 1x1 unit-stride convs whose gather is the identity (the
+ * input already IS the [M, in_ch] int8 matrix). The weight `vx` stays in the
+ * q8_0x4 qs layout (its fp16 d ignored); w_scale is per-output-channel FP32.
+ * The NEON SMMLA path assembles the 2x8 row tiles on the fly from two 8-byte
+ * plain loads + vcombine. n % 32 == 0; nr,nc arbitrary (tails handled); every
+ * activation row [0, nr) must be in-bounds (the caller zero-pads the M%4 tail).
+ */
+void nntr_gemm_q8ch_plainA_f32(int n, float *__restrict s, size_t bs,
+                               const void *__restrict vx,
+                               const float *__restrict w_scale,
+                               const int8_t *__restrict A, size_t lda,
+                               float a_scale, int nr, int nc);
+
+/**
  * @brief Compute Q8_0 weights by Q8_0 activations GEMV
  */
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,

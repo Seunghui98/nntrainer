@@ -1889,6 +1889,30 @@ void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
         (float)int_dot(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
   }
 }
+// PLAIN row-major int8 activation variant of nntr_gemm_q8ch_4x4_f32 (scalar).
+void nntr_gemm_q8ch_plainA_f32(int n, float *__restrict s, size_t bs,
+                               const void *__restrict vx,
+                               const float *__restrict w_scale,
+                               const int8_t *__restrict A, size_t lda,
+                               float a_scale, int nr, int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+  auto int_dot = [&](int ar, const block_q8_0x4 *b, int wr) -> int32_t {
+    const int8_t *a = A + (size_t)ar * lda;
+    int32_t si = 0;
+    for (int bi = 0; bi < nb; ++bi)
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi * 32 + sub * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+    return si;
+  };
+  for (int m = 0; m < nr; ++m)
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        a_scale * w_scale[j] *
+        (float)int_dot(m, b_sbase + (size_t)(j / 4) * nb, j % 4);
+}
 
 #ifdef ENABLE_FP16
 void nntr_gemm_q8_0_q8_0_4x4_fp16(int n, NNTR_GGML_FP16 *__restrict s,
