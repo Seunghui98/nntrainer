@@ -33,7 +33,6 @@
 #endif
 
 #include <cstdlib>
-#include <iostream>
 #include <string>
 
 #include <activation_layer.h>
@@ -159,9 +158,6 @@ void Manager::allocateWeights(unsigned int max_exec_order_, bool init) {
   if (!weight_pool.isAllocated()) {
     finalizeTensorPool(weight_pool, 0, max_exec_order_);
     weight_pool.allocate(init);
-    if (std::getenv("NNTR_MEM_REPORT"))
-      std::cerr << "[mem] weight_pool = " << (weight_pool.size() >> 10)
-                << " KB\n";
   }
 }
 
@@ -270,10 +266,6 @@ void Manager::allocateTensors(unsigned int max_exec_order_) {
   if (!tensor_pool.isAllocated()) {
     finalizeTensorPool(tensor_pool, 0, max_exec_order_);
     tensor_pool.allocate();
-    if (std::getenv("NNTR_MEM_REPORT"))
-      std::cerr << "[mem] tensor_pool (activations) = " << (tensor_pool.size() >> 10)
-                << " KB (theoretical min "
-                << (tensor_pool.minMemoryRequirement() >> 10) << " KB)\n";
   }
 }
 
@@ -923,25 +915,22 @@ void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
   // is otherwise fixed at compile time, but every planner .cpp is always linked
   // into the library, so it can be chosen at runtime. Planning only relocates
   // tensors (values are unchanged), so this cannot alter results; V3 packs the
-  // activation pool far tighter than the default V1. This exists because the
-  // compile-time meson flag does not always reach app build scripts.
+  // activation pool far tighter than the default V1 (e.g. the W8A8 YOLOv7Pose
+  // activation pool drops 39 MB -> 18 MB, near its theoretical minimum). This
+  // exists because the compile-time meson flag does not always reach app
+  // build scripts.
   if (const char *mp = std::getenv("NNTR_MEMORY_PLANNER")) {
     const std::string s(mp);
-    const bool report = std::getenv("NNTR_MEM_REPORT") != nullptr;
     if (s == "v3") {
-      if (report) std::cerr << "[mem] planner = V3 (runtime override)\n";
       pool.finalize(OptimizedV3Planner(), start, end);
       return;
     } else if (s == "v2") {
-      if (report) std::cerr << "[mem] planner = V2 (runtime override)\n";
       pool.finalize(OptimizedV2Planner(), start, end);
       return;
     } else if (s == "v1") {
-      if (report) std::cerr << "[mem] planner = V1 (runtime override)\n";
       pool.finalize(OptimizedV1Planner(), start, end);
       return;
     } else if (s == "basic") {
-      if (report) std::cerr << "[mem] planner = Basic (runtime override)\n";
       pool.finalize(BasicPlanner(), start, end);
       return;
     }

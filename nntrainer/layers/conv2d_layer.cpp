@@ -13,13 +13,10 @@
  */
 #include <algorithm>
 #include <cmath>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <chrono>
 #include <fstream>
-#include <iostream>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -90,26 +87,6 @@ static inline float32x4_t nntr_vexpq_f32(float32x4_t x) {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 namespace {
-
-// Opt-in (NNTR_MEM_REPORT) high-water tracking for the per-channel conv path's
-// persistent thread_local scratch, printed at teardown so the W8A8 memory
-// footprint can be attributed without a device profiler.
-struct ConvMemReport {
-  std::atomic<size_t> cbuf_elems{0}; // FP32 GEMM output (4 bytes each)
-  std::atomic<size_t> abuf_elems{0}; // int8 quantized input (1 byte each)
-  void bump(std::atomic<size_t> &slot, size_t v) {
-    size_t cur = slot.load(std::memory_order_relaxed);
-    while (v > cur && !slot.compare_exchange_weak(cur, v)) {
-    }
-  }
-  ~ConvMemReport() {
-    if (std::getenv("NNTR_MEM_REPORT"))
-      std::cerr << "[mem] conv thread_local: cbuf=" << (cbuf_elems * 4 >> 10)
-                << " KB (fp32 gemm-out)  a_buf=" << (abuf_elems >> 10)
-                << " KB (int8 input)\n";
-  }
-};
-static ConvMemReport g_conv_mem;
 
 // Local mirror of the interleaved Q8_0 x4 super-block (d[4] fp16 + 128 int8),
 // matching repack_q8_0 / the GEMM kernels. Used by the per-channel weight
@@ -529,24 +506,6 @@ static inline void convApplySwishInplace(T *data, size_t n) {
   const size_t nthreads = std::max<size_t>(1, tm.getComputeThreadCount());
   const size_t chunk = (n + nthreads - 1) / nthreads;
 
-  // Per-call SiLU instrumentation under NNTR_LAYER_TIME: which branch ran,
-  // wall ms, and ns/element. Distinguishes compute-bound (high ns/elem,
-  // vectorization helps) from bandwidth/dispatch-bound (low ns/elem or
-  // size-independent cost, fusion is the fix) without guessing.
-  static const bool _silu_lt = std::getenv("NNTR_LAYER_TIME") != nullptr;
-  const auto _silu_t0 = _silu_lt ? std::chrono::high_resolution_clock::now()
-                                 : std::chrono::high_resolution_clock::time_point{};
-  auto _silu_report = [&](const char *path) {
-    if (!_silu_lt)
-      return;
-    const double ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::high_resolution_clock::now() - _silu_t0)
-                        .count();
-    std::cerr << "[silu] n=" << n << " " << ms << " ms " << path
-              << " t=" << nthreads << " ns/elem=" << (ms * 1e6) / (double)n
-              << "\n";
-  };
-
 #ifdef ENABLE_FP16
   if constexpr (std::is_same_v<T, _FP16>) {
     const _FP16 *lut = get_silu_lut_fp16();
@@ -579,7 +538,6 @@ static inline void convApplySwishInplace(T *data, size_t n) {
         data[i] = lut[u];
       }
     });
-    _silu_report("fp16-lut");
     return;
   }
 #endif
@@ -659,13 +617,6 @@ static inline void convApplySwishInplace(T *data, size_t n) {
       }
     }
   });
-
-#if defined(__ARM_NEON)
-  constexpr bool _neon_f32 = std::is_same_v<T, float>;
-#else
-  constexpr bool _neon_f32 = false;
-#endif
-  _silu_report(use_approx ? "approx" : (_neon_f32 ? "neon-exact" : "scalar-exact"));
 }
 
 // Fused bias + activation over one NHWC output row [C] (channels contiguous,
@@ -1654,31 +1605,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
 
   Tensor &filter_kernel = context.getWeight(wt_idx[ConvParams::weight]);
 
-  // Per-conv phase timing (NNTR_LAYER_TIME): compute (im2col/gather + GEMM +
-  // scatter) vs bias vs activation. Four sequential timestamps at fixed points
-  // cover every branch that reaches the bias/activation epilogue.
-  static const bool _lt = std::getenv("NNTR_LAYER_TIME") != nullptr;
-  auto _ck = []() { return std::chrono::high_resolution_clock::now(); };
-  auto _t_start = _ck();
-  auto _t_comp_end = _t_start;
-  auto _t_bias_end = _t_start;
-
-  // One-shot build stamp so a stale deployed libnntrainer.so is immediately
-  // visible in the profile log (this file's compile date/time + which SiLU
-  // path this build carries). Printed only under NNTR_LAYER_TIME.
-  if (_lt) {
-    static std::once_flag _stamp_once;
-    std::call_once(_stamp_once, [] {
-      std::cerr << "[build-stamp] conv2d " << __DATE__ << " " << __TIME__
-#if defined(__ARM_NEON)
-                << " silu_fp32=neon"
-#else
-                << " silu_fp32=scalar"
-#endif
-                << "\n";
-    });
-  }
-
 #if defined(__ARM_NEON) && defined(ENABLE_FP16)
   if (context.getName() == "conv0" &&
       hidden_.getDataType() == nntrainer::Tdatatype::FP16 &&
@@ -2084,7 +2010,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             // (This input is the stem's SiLU output, so the affine range
             // [-kActOff, amax] is valid; amax >= max(x) covers the top end.)
             a_buf.resize(n_in);
-            g_conv_mem.bump(g_conv_mem.abuf_elems, a_buf.size());
             int8_t *ab = a_buf.data();
             if (perch_asym) {
               a_scale = amax > 0.f ? (amax + kActOff) / 255.f : 1.f;
@@ -2133,7 +2058,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             const size_t need = (size_t)owoh * filter_size;
             if (cbuf.size() < need)
               cbuf.resize(need);
-            g_conv_mem.bump(g_conv_mem.cbuf_elems, cbuf.size());
             cptr = cbuf.data();
           } else {
             cptr = out.getData<float>(); // NHWC [owoh, out_ch] == GEMM layout
@@ -3002,8 +2926,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  _t_comp_end = _ck();
-
   // Per-channel W8A8 convs applied bias + SiLU + quantize inline per batch, so
   // skip the generic epilogue entirely (it would double the bias). MUST mirror
   // the forward branches exactly: the per-channel branch covers every NHWC
@@ -3109,8 +3031,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  _t_bias_end = _ck();
-
   // Fused activation epilogue. When the graph sets activation=swish on the
   // conv, apply SiLU in-place on the freshly written output instead of
   // materializing a separate Activation layer (which would read the conv
@@ -3134,53 +3054,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  if (_lt) {
-    auto _t_act_end = _ck();
-    auto MS = [](auto a, auto b) {
-      return std::chrono::duration<double, std::milli>(b - a).count();
-    };
-    const bool wq = filter_kernel.getDataType() == nntrainer::Tdatatype::Q8_0 ||
-                    filter_kernel.getDataType() == nntrainer::Tdatatype::Q4_0;
-    std::cerr << "[conv-op] " << context.getName() << " ic="
-              << input_.channel() << " oc=" << filter_size << " k="
-              << kernel_size[0].get() << " s=" << stride[0].get() << " in="
-              << input_.height() << "x" << input_.width()
-              << (wq ? " q8" : " fp") << " | compute="
-              << MS(_t_start, _t_comp_end) << " bias="
-              << MS(_t_comp_end, _t_bias_end) << " act="
-              << MS(_t_bias_end, _t_act_end) << " ms\n";
-  }
-
-  // Optional per-conv NaN/inf localization (NNTR_CONV_DEBUG). Scans the conv
-  // output so the first conv that emits a non-finite value is named directly;
-  // used to pinpoint where a quantized (Q8_0) conv pipeline goes bad.
-  if (std::getenv("NNTR_CONV_DEBUG") != nullptr &&
-      hidden_.getDataType() != nntrainer::Tdatatype::QINT8) {
-    const size_t n = hidden_.size();
-    size_t nnan = 0, ninf = 0;
-    double mn = 1e300, mx = -1e300;
-    auto acc = [&](float v) {
-      if (std::isnan(v)) { ++nnan; return; }
-      if (std::isinf(v)) { ++ninf; return; }
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
-    };
-#ifdef ENABLE_FP16
-    if (hidden_.getDataType() == nntrainer::Tdatatype::FP16) {
-      const _FP16 *p = hidden_.getData<_FP16>();
-      for (size_t i = 0; i < n; ++i) acc(static_cast<float>(p[i]));
-    } else
-#endif
-    {
-      const float *p = hidden_.getData<float>();
-      for (size_t i = 0; i < n; ++i) acc(p[i]);
-    }
-    std::cerr << "[conv-dbg] " << context.getName() << " dt="
-              << (hidden_.getDataType() == nntrainer::Tdatatype::FP16 ? "fp16"
-                                                                      : "fp32")
-              << " n=" << n << " nan=" << nnan << " inf=" << ninf
-              << " min=" << mn << " max=" << mx << "\n";
-  }
 }
 
 void Conv2DLayer::calcDerivative(RunLayerContext &context) {

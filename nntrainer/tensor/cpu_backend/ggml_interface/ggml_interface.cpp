@@ -11,12 +11,10 @@
  */
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <ggml_interface.h>
-#include <iostream>
 #include <mutex>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
@@ -35,27 +33,6 @@
 #include <vector>
 
 namespace nntrainer {
-
-// Opt-in (NNTR_MEM_REPORT) high-water tracking for the per-channel GEMM's
-// persistent thread_local activation scratch (worst-case conv sized).
-namespace {
-struct GemmMemReport {
-  std::atomic<size_t> qa{0};  // q8_0x4 packed activation (bytes)
-  std::atomic<size_t> qap{0}; // taps-last plain int8 activation (bytes)
-  void bump(std::atomic<size_t> &slot, size_t v) {
-    size_t cur = slot.load(std::memory_order_relaxed);
-    while (v > cur && !slot.compare_exchange_weak(cur, v)) {
-    }
-  }
-  ~GemmMemReport() {
-    if (std::getenv("NNTR_MEM_REPORT"))
-      std::cerr << "[mem] gemm thread_local: QA=" << (qa >> 10)
-                << " KB (packed act)  QAp=" << (qap >> 10)
-                << " KB (plain act)\n";
-  }
-};
-static GemmMemReport g_gemm_mem;
-} // namespace
 
 void __ggml_init() { nntr_ggml_init(); }
 
@@ -682,7 +659,6 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
     const size_t qa_p_bytes = (size_t)M4c * 4 * K;
     if (QAp.size() < qa_p_bytes)
       QAp.resize(qa_p_bytes);
-    g_gemm_mem.bump(g_gemm_mem.qap, QAp.size());
     int8_t *QAp_ptr = QAp.data();
 
     {
@@ -747,7 +723,6 @@ void __ggml_q8ch_indirect_GEMM(const unsigned int M, const unsigned int N,
   const size_t qa_bytes = (size_t)M4c * qa_4_rows_size;
   if (QA.size() < qa_bytes)
     QA.resize(qa_bytes);
-  g_gemm_mem.bump(g_gemm_mem.qa, QA.size());
   char *QA_ptr = QA.data();
 
   {

@@ -454,19 +454,7 @@ sharedConstTensors NeuralNetwork::forwarding(
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
       model_graph.flushCacheExcept(f);
-      // Per-layer wall-clock timing, opt-in via NNTR_LAYER_TIME, to locate the
-      // real forward-pass hotspots (which convs / the head dominate).
-      static const bool layer_time = std::getenv("NNTR_LAYER_TIME") != nullptr;
-      if (layer_time) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        node->forwarding(training);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::cerr << "[layer-time] " << node->getName() << " : "
-                  << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                  << " ms\n";
-      } else {
-        node->forwarding(training);
-      }
+      node->forwarding(training);
     } else {
       /**
          currently, it supports FSU asynch mode for inference. The prcedure of
@@ -552,19 +540,7 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
       model_graph.flushCacheExcept(f);
-      // Per-layer wall-clock timing, opt-in via NNTR_LAYER_TIME, to locate the
-      // real forward-pass hotspots (e.g. which convs / the head dominate).
-      static const bool layer_time = std::getenv("NNTR_LAYER_TIME") != nullptr;
-      if (layer_time) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        node->incremental_forwarding(from, to, training);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::cerr << "[layer-time] " << node->getName() << " : "
-                  << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                  << " ms\n";
-      } else {
-        node->incremental_forwarding(from, to, training);
-      }
+      node->incremental_forwarding(from, to, training);
     } else {
       model_graph.checkLoadComplete(f);
       node->incremental_forwarding(from, to, training);
