@@ -81,17 +81,19 @@ adb push Applications/HexKLFcCompare/jni/libs/arm64-v8a/. /data/local/tmp/
 adb push Applications/HexKLFcCompare/jni/obj/local/arm64-v8a/hexkl_fc_compare /data/local/tmp/
 #   the CDSP skeleton (libhexkl_skel.so, V79) must already be in /data/local/tmp
 
-# 4. run (inject library + skeleton paths). Keep /vendor/lib64 (and the
-#    existing $LD_LIBRARY_PATH) on the path: libsdkl.so pulls rpcmem_alloc2
-#    from /vendor/lib64/libcdsprpc.so (FastRPC). Replacing LD_LIBRARY_PATH with
-#    only /data/local/tmp drops it and the loader fails with
-#    "cannot locate symbol rpcmem_alloc2 referenced by libsdkl.so".
+# 4. run (inject library + skeleton paths). Add /vendor/lib64 (and keep the
+#    existing $LD_LIBRARY_PATH): libsdkl.so pulls rpcmem_alloc2 from
+#    /vendor/lib64/libcdsprpc.so (FastRPC). Two failure modes to avoid:
+#    - LD_LIBRARY_PATH=/data/local/tmp alone drops /vendor/lib64 -> loader
+#      fails with "cannot locate symbol rpcmem_alloc2 referenced by libsdkl.so".
+#    - Do NOT add /system/lib64: it drags in Android system libs (e.g.
+#      libinput.so) built against a different libfmt and fails to link.
 adb shell "cd /data/local/tmp && \
-  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64:/system/lib64:\$LD_LIBRARY_PATH \
+  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64:\$LD_LIBRARY_PATH \
   ADSP_LIBRARY_PATH=/data/local/tmp:\$ADSP_LIBRARY_PATH \
   ./hexkl_fc_compare --proj q_proj"
 adb shell "cd /data/local/tmp && \
-  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64:/system/lib64:\$LD_LIBRARY_PATH \
+  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64:\$LD_LIBRARY_PATH \
   ADSP_LIBRARY_PATH=/data/local/tmp:\$ADSP_LIBRARY_PATH \
   ./hexkl_fc_compare --proj ffn_down --M 64"
 ```
