@@ -211,7 +211,7 @@ static std::vector<float> dequant(const int32_t *c_i32, int M, int N,
 
 struct QResult {
   std::vector<float> C;
-  double ms = 0.0;
+  double us = 0.0;  // per-call latency (microseconds)
   bool on_npu = false;
 };
 
@@ -233,7 +233,7 @@ struct NpuBuf {
 // Returns false if a kernel/alloc call fails.
 static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
                    const WQuant &wq, int warmup, int iters, int domain,
-                   double &ms, std::vector<int32_t> &c_i32) {
+                   double &us, std::vector<int32_t> &c_i32) {
   const int Mp = ((M + 63) / 64) * 64;
 
   // WH-pack the weight (out of the timed loop).
@@ -267,9 +267,9 @@ static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
       auto t0 = std::chrono::steady_clock::now();
       call();
       auto t1 = std::chrono::steady_clock::now();
-      sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
     }
-    ms = iters > 0 ? sum / iters : 0.0;
+    us = iters > 0 ? sum / iters : 0.0;
     ok = (rc == 0);
   } else {
     NpuBuf Wb(nk);
@@ -291,9 +291,9 @@ static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
       auto t0 = std::chrono::steady_clock::now();
       call();
       auto t1 = std::chrono::steady_clock::now();
-      sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
     }
-    ms = iters > 0 ? sum / iters : 0.0;
+    us = iters > 0 ? sum / iters : 0.0;
     ok = (rc == 0);
   }
   if (!ok)
@@ -330,7 +330,7 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
   std::vector<int32_t> c_i32;
 
 #ifdef ENABLE_HEXKL
-  if (npu_ok && runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.ms,
+  if (npu_ok && runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.us,
                        c_i32)) {
     r.on_npu = true;
     r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
@@ -349,9 +349,9 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
     auto t0 = std::chrono::steady_clock::now();
     cpuIntGemm(M, N, K, x.data(), wq.w_q.data(), c_i32.data());
     auto t1 = std::chrono::steady_clock::now();
-    sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
   }
-  r.ms = sum / it;
+  r.us = sum / it;
   r.on_npu = false;
   r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
   return r;
@@ -408,11 +408,11 @@ int main(int argc, char **argv) {
   float e8 = relErr(r8.C, C_ref);
   float e4 = relErr(r4.C, C_ref);
 
-  std::printf("\n| method | relErr vs FP32 | latency (ms) | engine |\n");
+  std::printf("\n| method | relErr vs FP32 | latency (us) | engine |\n");
   std::printf("|---|---|---|---|\n");
-  std::printf("| u8i8 (INT8 weight) | %.5f | %.4f | %s |\n", e8, r8.ms,
+  std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %s |\n", e8, r8.us,
               r8.on_npu ? "NPU/HMX" : "CPU-emulated");
-  std::printf("| u8i4 (INT4 weight) | %.5f | %.4f | %s |\n", e4, r4.ms,
+  std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %s |\n", e4, r4.us,
               r4.on_npu ? "NPU/HMX" : "CPU-emulated");
 
   std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "

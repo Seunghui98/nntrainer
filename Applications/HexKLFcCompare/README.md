@@ -53,7 +53,7 @@ ninja -C build Applications/HexKLFcCompare/jni/hexkl_fc_compare
 Example output:
 
 ```
-| method | relErr vs FP32 | latency (ms) | engine |
+| method | relErr vs FP32 | latency (us) | engine |
 |---|---|---|---|
 | u8i8 (INT8 weight) | 0.00547 | ... | CPU-emulated |
 | u8i4 (INT4 weight) | 0.07207 | ... | CPU-emulated |
