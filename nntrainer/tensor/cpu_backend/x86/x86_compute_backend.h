@@ -1265,6 +1265,26 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, float *inout, void *output,
                               const float *cos_, const float *sin_,
                               bool only_convert_to_fp16);
+
+#ifdef ENABLE_FP16
+// x86 stubs: the pure-FP16 attention kernels (KV-cache dot / transposed vcache
+// / rotary) are ARM/NEON only; on x86 the transformer runs FP32, so these are
+// NYI throw-stubs that let the layers compile but never execute here.
+void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
+                                   const _FP16 *vcache, _FP16 *output,
+                                   int num_cache_head, int gqa_size,
+                                   int head_dim,
+                                   size_t local_window_size = UINT_MAX,
+                                   int head_start = 0, int head_end = -1);
+void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
+                     int num_rows, int num_cache_head, int head_dim,
+                     int gqa_size, int tile_size,
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
+void compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                              unsigned int half_, _FP16 *inout, _FP16 *output,
+                              const _FP16 *cos_, const _FP16 *sin_);
+#endif
 /**
  * @brief rms normalization computation w.r.t. width in H*W matrix input
  *

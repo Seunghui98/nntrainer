@@ -551,6 +551,87 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                                             cos_, sin_, only_convert_to_fp16);
 }
 
+#ifdef ENABLE_FP16
+// FP16 attention kernels are ARM/NEON only; x86 runs the transformer in FP32,
+// so these throw if ever reached (they exist only to let the layers compile).
+void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
+                                   const _FP16 *vcache, _FP16 *output,
+                                   int num_cache_head, int gqa_size, int head_dim,
+                                   size_t local_window_size, int head_start,
+                                   int head_end) {
+  (void)row_num;
+  (void)in;
+  (void)vcache;
+  (void)output;
+  (void)num_cache_head;
+  (void)gqa_size;
+  (void)head_dim;
+  (void)local_window_size;
+  (void)head_start;
+  (void)head_end;
+  throw std::runtime_error(
+    "Error: NYI compute_fp16vcache_transposed (FP16 attention) on x86 - "
+    "ARM/NEON only");
+}
+
+void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
+                     int num_rows, int num_cache_head, int head_dim,
+                     int gqa_size, int tile_size, size_t local_window_size,
+                     int head_start, int head_end) {
+  (void)in;
+  (void)kcache;
+  (void)output;
+  (void)num_rows;
+  (void)num_cache_head;
+  (void)head_dim;
+  (void)gqa_size;
+  (void)tile_size;
+  (void)local_window_size;
+  (void)head_start;
+  (void)head_end;
+  throw std::runtime_error(
+    "Error: NYI compute_kcaches (FP16 attention) on x86 - ARM/NEON only");
+}
+
+void compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                              unsigned int half_, _FP16 *inout, _FP16 *output,
+                              const _FP16 *cos_, const _FP16 *sin_) {
+  (void)width;
+  (void)dim;
+  (void)half_;
+  (void)inout;
+  (void)output;
+  (void)cos_;
+  (void)sin_;
+  throw std::runtime_error(
+    "Error: NYI compute_rotary_emb_value (FP16) on x86 - ARM/NEON only");
+}
+
+template <>
+void softmax_row_inplace<_FP16>(_FP16 *qk_out, size_t start_row, size_t end_row,
+                                size_t num_heads, _FP16 *sink) {
+  (void)qk_out;
+  (void)start_row;
+  (void)end_row;
+  (void)num_heads;
+  (void)sink;
+  throw std::runtime_error(
+    "Error: NYI softmax_row_inplace<FP16> on x86 - ARM/NEON only");
+}
+
+template <>
+void softmax_row<_FP16>(_FP16 *qk_out, size_t start_row, size_t end_row,
+                        size_t num_heads, _FP16 *sink) {
+  (void)qk_out;
+  (void)start_row;
+  (void)end_row;
+  (void)num_heads;
+  (void)sink;
+  throw std::runtime_error(
+    "Error: NYI softmax_row<FP16> on x86 - ARM/NEON only");
+}
+#endif
+
 void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon) {
