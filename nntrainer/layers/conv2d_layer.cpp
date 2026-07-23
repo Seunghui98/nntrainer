@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <iostream>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -61,14 +62,26 @@ namespace {
 //   [u32 name_len][name][u32 out_ch][float32 * out_ch]
 void w8a8_prebake_write_scale(const char *path, const std::string &name,
                               const float *scales, unsigned int out_ch) {
-  std::ofstream f(path, std::ios::binary | std::ios::app);
-  if (!f)
+  // Truncate on the first write of this process so re-running the quantizer
+  // never appends stale records from a previous run onto the sidecar.
+  static std::mutex mtx;
+  static bool truncated = false;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto mode = std::ios::binary | (truncated ? std::ios::app : std::ios::trunc);
+  truncated = true;
+  std::ofstream f(path, mode);
+  if (!f) {
+    std::cerr << "[W8A8-prebake] ERROR: cannot write sidecar '" << path << "'"
+              << std::endl;
     return;
+  }
   uint32_t nl = (uint32_t)name.size(), oc = out_ch;
   f.write(reinterpret_cast<const char *>(&nl), sizeof(nl));
   f.write(name.data(), nl);
   f.write(reinterpret_cast<const char *>(&oc), sizeof(oc));
   f.write(reinterpret_cast<const char *>(scales), (std::streamsize)oc * 4);
+  std::cerr << "[W8A8-prebake] wrote FP32 scale for conv '" << name << "' ("
+            << oc << " ch)" << std::endl;
 }
 
 const std::vector<float> *w8a8_prebake_lookup(const std::string &name) {
@@ -93,9 +106,19 @@ const std::vector<float> *w8a8_prebake_lookup(const std::string &name) {
         if (f)
           table.emplace(std::move(nm), std::move(s));
       }
+      // Loud diagnostics: a silent miss here degrades accuracy invisibly
+      // (falls back to the fp16-scale path), so always report what loaded.
+      std::cerr << "[W8A8-prebake] scales sidecar '" << path << "': "
+                << table.size() << " conv record(s) loaded" << std::endl;
+      if (table.empty())
+        std::cerr << "[W8A8-prebake] WARNING: no records -- file missing/empty?"
+                  << " All convs fall back to fp16 scales." << std::endl;
     }
   }
   auto it = table.find(name);
+  if (it == table.end() && !table.empty())
+    std::cerr << "[W8A8-prebake] MISS: no scale for conv '" << name
+              << "' (name mismatch?) -- fp16 fallback" << std::endl;
   return it == table.end() ? nullptr : &it->second;
 }
 
