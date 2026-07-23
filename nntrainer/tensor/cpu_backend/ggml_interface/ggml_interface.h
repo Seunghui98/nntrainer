@@ -360,6 +360,21 @@ void __ggml_quantize_q8_0_per_channel(const float *src, void *dst,
                                       unsigned int nrow, unsigned int ncol);
 
 /**
+ * @brief Pre-baked PER-CHANNEL Q8_0 quantizer (ORT-style int8 + FP32 scale).
+ * Like __ggml_quantize_q8_0_per_channel but the int8 quants are fit to the
+ * FULL-PRECISION FP32 per-channel scale scv = amax/127 (qs = round(x / scv)),
+ * and that FP32 scale is written to scales_out[nrow]. The block still stores
+ * d = fp16(scv) so the stream is byte-valid Q8_0, but the runtime ignores it
+ * and uses scales_out (passed as perch_scale) instead -- matching the FP32W
+ * load-time path exactly (81/87) while the on-disk weight stays int8. ncol %
+ * 32 == 0.
+ */
+void __ggml_quantize_q8_0_per_channel_prebake(const float *src, void *dst,
+                                              float *scales_out,
+                                              unsigned int nrow,
+                                              unsigned int ncol);
+
+/**
  * @brief Per-channel W8A8 indirect conv GEMM: int8 activation (per-tensor
  * scale) x int8 weight (per-output-channel scale w_scale[N]) -> FP32, via the
  * int32-accumulate kernel. B is int8 in the q8_0x4 qs layout (d ignored). K may
