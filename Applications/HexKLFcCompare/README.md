@@ -51,13 +51,19 @@ ninja -C build Applications/HexKLFcCompare/jni/hexkl_fc_compare
 ./build/Applications/HexKLFcCompare/jni/hexkl_fc_compare --M 1      # decode
 ```
 
-Example output:
+Example output (on device the `movement` columns are non-zero and `compute` is
+the pure `sdkl_npu_mm` kernel time; `compute` = kernel only, `movement` = NPU
+alloc + host↔NPU copies + WH layout pack):
 
 ```
-| method | relErr vs FP32 | latency (us) | engine |
-|---|---|---|---|
-| u8i8 (INT8 weight) | 0.00547 | ... | CPU-emulated |
-| u8i4 (INT4 weight) | 0.07207 | ... | CPU-emulated |
+| method | relErr vs FP32 | compute us | movement us | engine |
+|---|---|---|---|---|
+| u8i8 (INT8 weight) | 0.00547 |   1650.0 |    320.0 | NPU/HMX |
+| u8i4 (INT4 weight) | 0.07207 |    246.0 |    210.0 | NPU/HMX |
+
+movement breakdown (us) — alloc / H2D copy / WH pack / D2H copy:
+  u8i8: alloc=..  h2d=..  whpack=..  d2h=..
+  u8i4: alloc=..  h2d=..  whpack=..  d2h=..
 ```
 
 ## Build & run — Android device (real NPU latency)

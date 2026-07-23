@@ -209,18 +209,38 @@ static std::vector<float> dequant(const int32_t *c_i32, int M, int N,
   return c;
 }
 
+// Per-phase timing (microseconds). "movement" = everything that loads/moves
+// data (NPU alloc + host->NPU copies + WH layout pack + NPU->host copy);
+// "compute" = the sdkl_npu_mm kernel only.
+struct Timing {
+  double alloc_us = 0.0;  // sdkl_npu_alloc of X / C / weight buffers
+  double h2d_us = 0.0;    // host -> NPU copies (activation + weight)
+  double whpack_us = 0.0; // RM -> WH weight layout conversion
+  double kernel_us = 0.0; // sdkl_npu_mm_u8i{4,8}_i32 (mean per call) = compute
+  double d2h_us = 0.0;    // NPU -> host copy of the int32 accumulator
+  double movement_us() const {
+    return alloc_us + h2d_us + whpack_us + d2h_us;
+  }
+};
+
 struct QResult {
   std::vector<float> C;
-  double us = 0.0;  // per-call latency (microseconds)
+  Timing t;
   bool on_npu = false;
 };
+
+static inline double usSince(std::chrono::steady_clock::time_point s) {
+  return std::chrono::duration<double, std::micro>(
+           std::chrono::steady_clock::now() - s)
+    .count();
+}
 
 #ifdef ENABLE_HEXKL
 // RAII NPU buffer.
 struct NpuBuf {
   void *p = nullptr;
   explicit NpuBuf(size_t bytes) {
-    if (sdkl_npu_alloc(bytes, &p) != 0)
+    if (bytes != 0 && sdkl_npu_alloc(bytes, &p) != 0)
       p = nullptr;
   }
   ~NpuBuf() { if (p) sdkl_npu_free(p); }
@@ -229,78 +249,77 @@ struct NpuBuf {
   bool ok() const { return p != nullptr; }
 };
 
-// Drive the real NPU kernel directly through sdkl. bits = 4 or 8.
-// Returns false if a kernel/alloc call fails.
+// Drive the real NPU kernel directly through sdkl, timing each phase so data
+// movement is separated from pure compute. bits = 4 or 8. Returns false on a
+// kernel/alloc failure.
 static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
                    const WQuant &wq, int warmup, int iters, int domain,
-                   double &us, std::vector<int32_t> &c_i32) {
+                   Timing &tm, std::vector<int32_t> &c_i32) {
+  using clk = std::chrono::steady_clock;
   const int Mp = ((M + 63) / 64) * 64;
-
-  // WH-pack the weight (out of the timed loop).
   const size_t nk = (size_t)N * K;
+
+  // --- alloc: X, C, and weight buffers (i4 needs an rm source + packed dst;
+  // i8 packs in place in a single buffer) ---
+  auto ta = clk::now();
   NpuBuf Xb((size_t)Mp * K), Cb((size_t)Mp * N * sizeof(int32_t));
-  if (!Xb.ok() || !Cb.ok())
+  NpuBuf Wi4src(bits == 4 ? nk : 0); // i4 only: RM int4 source
+  NpuBuf Wbuf(nk);                   // WH weight (packed dst for i4, in-place i8)
+  if (!Xb.ok() || !Cb.ok() || !Wbuf.ok() || (bits == 4 && !Wi4src.ok()))
     return false;
-  // Activation: real M rows, pad the rest to zp=128.
+  tm.alloc_us = usSince(ta);
+
+  // --- H2D: activation (pad rows to zp=128) + weight into NPU buffers ---
+  auto th = clk::now();
   std::memset(Xb.p, 128, (size_t)Mp * K);
   std::memcpy(Xb.p, x.data(), (size_t)M * K);
+  std::memcpy(bits == 4 ? Wi4src.p : Wbuf.p, wq.w_q.data(), nk);
+  tm.h2d_us = usSince(th);
 
-  bool ok = false;
+  // --- WH pack: RM -> WH weight layout ---
+  auto tp = clk::now();
   if (bits == 4) {
-    NpuBuf Win(nk), Wwh(nk);
-    if (!Win.ok() || !Wwh.ok())
-      return false;
-    std::memcpy(Win.p, wq.w_q.data(), nk);
-    if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wwh.p),
-                             static_cast<int8_t *>(Win.p), (size_t)K,
+    if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wbuf.p),
+                             static_cast<int8_t *>(Wi4src.p), (size_t)K,
                              (size_t)N) != 0)
       return false;
-    int rc = 0;
-    auto call = [&]() {
-      rc = sdkl_npu_mm_u8i4_i32(domain, Mp, N, K, static_cast<int32_t *>(Cb.p),
-                                static_cast<const uint8_t *>(Xb.p),
-                                static_cast<const uint8_t *>(Wwh.p));
-    };
-    for (int i = 0; i < warmup; ++i) call();
-    double sum = 0.0;
-    for (int i = 0; i < iters; ++i) {
-      auto t0 = std::chrono::steady_clock::now();
-      call();
-      auto t1 = std::chrono::steady_clock::now();
-      sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
-    }
-    us = iters > 0 ? sum / iters : 0.0;
-    ok = (rc == 0);
   } else {
-    NpuBuf Wb(nk);
-    if (!Wb.ok())
-      return false;
-    std::memcpy(Wb.p, wq.w_q.data(), nk);
     if (sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
-                                     static_cast<int8_t *>(Wb.p)) != 0)
+                                     static_cast<int8_t *>(Wbuf.p)) != 0)
       return false;
-    int rc = 0;
-    auto call = [&]() {
-      rc = sdkl_npu_mm_u8i8_i32(domain, Mp, N, K, static_cast<int32_t *>(Cb.p),
-                                static_cast<const uint8_t *>(Xb.p),
-                                static_cast<const int8_t *>(Wb.p));
-    };
-    for (int i = 0; i < warmup; ++i) call();
-    double sum = 0.0;
-    for (int i = 0; i < iters; ++i) {
-      auto t0 = std::chrono::steady_clock::now();
-      call();
-      auto t1 = std::chrono::steady_clock::now();
-      sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
-    }
-    us = iters > 0 ? sum / iters : 0.0;
-    ok = (rc == 0);
   }
-  if (!ok)
+  tm.whpack_us = usSince(tp);
+
+  // --- compute: the sdkl matmul kernel only ---
+  int rc = 0;
+  auto call = [&]() {
+    rc = (bits == 4)
+           ? sdkl_npu_mm_u8i4_i32(domain, Mp, N, K,
+                                  static_cast<int32_t *>(Cb.p),
+                                  static_cast<const uint8_t *>(Xb.p),
+                                  static_cast<const uint8_t *>(Wbuf.p))
+           : sdkl_npu_mm_u8i8_i32(domain, Mp, N, K,
+                                  static_cast<int32_t *>(Cb.p),
+                                  static_cast<const uint8_t *>(Xb.p),
+                                  static_cast<const int8_t *>(Wbuf.p));
+  };
+  for (int i = 0; i < warmup; ++i)
+    call();
+  double sum = 0.0;
+  for (int i = 0; i < iters; ++i) {
+    auto t0 = clk::now();
+    call();
+    sum += usSince(t0);
+  }
+  tm.kernel_us = iters > 0 ? sum / iters : 0.0;
+  if (rc != 0)
     return false;
-  // Copy back only the real M rows of the int32 accumulator.
+
+  // --- D2H: copy back the real M rows of the int32 accumulator ---
+  auto td = clk::now();
   c_i32.assign((size_t)M * N, 0);
   std::memcpy(c_i32.data(), Cb.p, (size_t)M * N * sizeof(int32_t));
+  tm.d2h_us = usSince(td);
   return true;
 }
 #endif
@@ -330,7 +349,7 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
   std::vector<int32_t> c_i32;
 
 #ifdef ENABLE_HEXKL
-  if (npu_ok && runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.us,
+  if (npu_ok && runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.t,
                        c_i32)) {
     r.on_npu = true;
     r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
@@ -340,7 +359,8 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
   (void)npu_ok;
   (void)domain;
 #endif
-  // Host / NPU-unavailable: emulate the integer GEMM on the CPU.
+  // Host / NPU-unavailable: emulate the integer GEMM on the CPU. No data
+  // movement, so only the compute (kernel) phase is timed.
   (void)warmup;
   c_i32.assign((size_t)M * N, 0);
   int it = std::max(1, iters);
@@ -348,10 +368,9 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
   for (int i = 0; i < it; ++i) {
     auto t0 = std::chrono::steady_clock::now();
     cpuIntGemm(M, N, K, x.data(), wq.w_q.data(), c_i32.data());
-    auto t1 = std::chrono::steady_clock::now();
-    sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
+    sum += usSince(t0);
   }
-  r.us = sum / it;
+  r.t.kernel_us = sum / it;
   r.on_npu = false;
   r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
   return r;
@@ -408,16 +427,29 @@ int main(int argc, char **argv) {
   float e8 = relErr(r8.C, C_ref);
   float e4 = relErr(r4.C, C_ref);
 
-  std::printf("\n| method | relErr vs FP32 | latency (us) | engine |\n");
-  std::printf("|---|---|---|---|\n");
-  std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %s |\n", e8, r8.us,
+  // Compute (kernel only) vs data movement (alloc + H2D + WH pack + D2H).
+  std::printf("\n| method | relErr vs FP32 | compute us | movement us | engine "
+              "|\n");
+  std::printf("|---|---|---|---|---|\n");
+  std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %8.1f | %s |\n", e8,
+              r8.t.kernel_us, r8.t.movement_us(),
               r8.on_npu ? "NPU/HMX" : "CPU-emulated");
-  std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %s |\n", e4, r4.us,
+  std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %8.1f | %s |\n", e4,
+              r4.t.kernel_us, r4.t.movement_us(),
               r4.on_npu ? "NPU/HMX" : "CPU-emulated");
 
+  // Full movement breakdown (µs): where the non-compute time goes.
+  std::printf("\nmovement breakdown (us) — alloc / H2D copy / WH pack / D2H "
+              "copy:\n");
+  std::printf("  u8i8: alloc=%.1f  h2d=%.1f  whpack=%.1f  d2h=%.1f\n",
+              r8.t.alloc_us, r8.t.h2d_us, r8.t.whpack_us, r8.t.d2h_us);
+  std::printf("  u8i4: alloc=%.1f  h2d=%.1f  whpack=%.1f  d2h=%.1f\n",
+              r4.t.alloc_us, r4.t.h2d_us, r4.t.whpack_us, r4.t.d2h_us);
+
   std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "
-              "%.2fx error)\n",
-              e8, e4, e8 > 0.0f ? e4 / e8 : 0.0f);
+              "%.2fx error);  compute u8i4=%.1fus u8i8=%.1fus\n",
+              e8, e4, e8 > 0.0f ? e4 / e8 : 0.0f, r4.t.kernel_us,
+              r8.t.kernel_us);
 
 #ifdef ENABLE_HEXKL
   if (npu_ok)
