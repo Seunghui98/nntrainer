@@ -40,7 +40,8 @@ adb shell "chmod +x $DEVICE_DIR/yolov7_pose_infer"
 
 if [ -n "$RES_DIR" ] && [ -d "$RES_DIR" ]; then
   echo "[push] resources from $RES_DIR"
-  for f in yolov7_pose.safetensors yolov7_pose_q8_0.safetensors input_320.bin; do
+  for f in yolov7_pose.safetensors yolov7_pose_q8_0.safetensors \
+           yolov7_pose_wscale.bin input_320.bin; do
     [ -f "$RES_DIR/$f" ] && adb push "$RES_DIR/$f" "$DEVICE_DIR/" >/dev/null
   done
 fi
