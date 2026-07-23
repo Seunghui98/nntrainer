@@ -1,11 +1,9 @@
-fc_compare_sources = ['hexkl_fc_compare.cpp']
-
-fc_compare_deps = [nntrainer_dep, nntrainer_ccapi_dep]
-
+# Standalone, self-contained example: no nntrainer symbols are used on the host
+# build (the sdkl NPU path is compiled only under ENABLE_HEXKL on Android via
+# the flat Android.mk). So the host target needs no nntrainer dependency.
 e = executable('hexkl_fc_compare',
-  fc_compare_sources,
+  ['hexkl_fc_compare.cpp'],
   include_directories: include_directories('.'),
-  dependencies: fc_compare_deps,
   install: get_option('install-app'),
   install_dir: application_install_dir
 )

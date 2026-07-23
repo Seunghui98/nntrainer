@@ -7,16 +7,21 @@ A standalone example that runs **one fully-connected matmul**
 fc_layer's matmul in isolation, so the quantized GEMM is compared directly with
 FP32.
 
-Weight quantization is the production `quantize_qint{4,8}_weight`
-(per-output-channel symmetric INT8/INT4 + `zp_corr`); activation is per-tensor
-UINT8 (zp=128). The integer accumulator `C_i32 = Σ_k X_u8·W_q` is what the NPU
-computes:
+Weight quantization (per-output-channel symmetric INT8/INT4 + `zp_corr`) and
+activation quantization (per-tensor UINT8, zp=128) are done inline, matching
+`quantize_qint{4,8}_weight` / `shgemm_u8i{4,8}_i32`. The integer accumulator
+`C_i32 = Σ_k X_u8·W_q` is what the NPU computes:
 
-- **On a Hexagon device (`ENABLE_HEXKL`)** the real `sdkl_npu_mm_u8i{4,8}_i32`
-  kernels run → latency is true NPU latency.
+- **On a Hexagon device (`ENABLE_HEXKL`)** the example brings up the CDSP
+  session itself (`sdkl_npu_initialize`) and calls the real
+  `sdkl_npu_mm_u8i{4,8}_i32` kernels → latency is true NPU latency.
 - **On any host** the same integer GEMM runs on the CPU. The integer product is
   exact either way, so the **relErr equals the on-device relErr**; only latency
   differs (host latency is CPU-emulated and labelled).
+
+The example is **self-contained**: it links only `libsdkl.so` (the sdkl C API)
+and uses no `libnntrainer` C++ symbol, so it is unaffected by which symbols the
+Android `libnntrainer.so` exports.
 
 ## Shape
 
@@ -56,27 +61,23 @@ Example output:
 
 ## Build & run — Android device (real NPU latency)
 
-Uses a flat ndk-build project (like `test/unittest/jni_htp`). Build the HTP
-`libnntrainer.so` first (see
-[docs/backend_guide/htp_backend/02_build_and_run.md](../../docs/backend_guide/htp_backend/02_build_and_run.md) §1–2), then:
+Uses a flat ndk-build project (like `test/unittest/jni_htp`). The example links
+only `libsdkl.so`, so it does **not** need the HTP `libnntrainer.so` — just the
+Hexagon SDK (`HEXKL_SDK_ROOT`) and the NDK:
 
 ```bash
 export HEXKL_SDK_ROOT=<Hexagon_SDK>/addons/hexkl_addon
 export ANDROID_NDK=/opt/android-ndk-r26d ; export PATH=$ANDROID_NDK:$PATH
 
-# 1. HTP library (produces builddir/jni/arm64-v8a/libnntrainer.so)
-./tools/package_android.sh --arm-arch=armv8.2-a \
-  -Denable-htp=true -Dhexkl-sdk-root=$HEXKL_SDK_ROOT \
-  -Dhexkl-lib-subdir=armv8_android26 -Dmmap-read=false -Dwerror=false
-
-# 2. the example binary
+# 1. build the example (self-contained; only libsdkl.so is linked)
 ndk-build -C Applications/HexKLFcCompare/jni \
   NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk \
   NDK_APPLICATION_MK=Application.mk -j$(nproc)
 
-# 3. push binary + runtime .so deps (libnntrainer/libsdkl/libc++_shared).
+# 2. push binary + libsdkl.so + libc++_shared.so.
 #    ndk-build with -C <jni> NDK_PROJECT_PATH=. writes libs/ and obj/ UNDER the
-#    jni dir, so the paths include jni/.
+#    jni dir, so the paths include jni/. Push libs/ first, then the (unstripped)
+#    obj/ binary last so it is not overwritten by the stripped libs/ copy.
 adb push Applications/HexKLFcCompare/jni/libs/arm64-v8a/. /data/local/tmp/
 adb push Applications/HexKLFcCompare/jni/obj/local/arm64-v8a/hexkl_fc_compare /data/local/tmp/
 #   the CDSP skeleton (libhexkl_skel.so, V79) must already be in /data/local/tmp

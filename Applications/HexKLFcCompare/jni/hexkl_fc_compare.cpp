@@ -11,18 +11,20 @@
  * HTP u8i8 and u8i4 quantized paths and reports accuracy (relErr vs an FP32
  * reference) and latency. This is deliberately NOT the qwen3-0.6b model: it is
  * one fc_layer's matmul in isolation, so the quantized GEMM can be compared
- * apples-to-apples with FP32 (and, on a QNN build, with a matched QNN matmul).
+ * apples-to-apples with FP32.
  *
- * The weight quantization is the production quantize_qint{4,8}_weight
- * (per-output-channel symmetric INT8/INT4 + zp_corr); the activation is
- * per-tensor UINT8 (zp=128). The integer accumulator C_i32 = sum_k X_u8 * W_q
- * is what the NPU op computes:
- *   - with ENABLE_HEXKL (on a Hexagon device): the real
- *     sdkl_npu_mm_u8i{4,8}_i32 kernels run, so latency is the true NPU latency.
- *   - without it (any host): the same integer GEMM is evaluated on the CPU.
- *     Because the integer product is exact either way, the relErr printed on
- *     the host equals the on-device relErr; only the latency differs (host
- *     latency is CPU-emulated and marked as such).
+ * Self-contained on purpose: the quantization (per-output-channel symmetric
+ * INT8/INT4 weight + zp_corr, per-tensor UINT8 activation) is done inline, and
+ * the NPU is driven through the sdkl C API directly (sdkl_npu_initialize +
+ * sdkl_cpu_rm_to_wh_* + sdkl_npu_mm_u8i{4,8}_i32 + sdkl_npu_finalize). It links
+ * only libsdkl.so (no libnntrainer C++ symbols), which the Android shared
+ * library does not reliably export.
+ *
+ *   - with ENABLE_HEXKL (Hexagon device): the real sdkl kernels run, so
+ *     latency is the true NPU latency.
+ *   - without it (any host): the integer GEMM the NPU performs is emulated on
+ *     the CPU. The integer product is exact, so the relErr equals the
+ *     on-device relErr; only latency differs (CPU-emulated, and labelled).
  *
  * Default shape = qwen3-0.6b q_proj (M=64 prefill tile, N=2048, K=1024);
  * override with --M/--N/--K or pick a projection with --proj.
@@ -39,11 +41,9 @@
 #include <string>
 #include <vector>
 
-#include <quantizer.h>
-#include <tensor.h>
-
 #ifdef ENABLE_HEXKL
-#include <hexkl_mm.h> // nntrainer::hmx::shgemm_u8i{4,8}_i32
+#include <remote.h> // CDSP_DOMAIN_ID
+#include <sdkl.h>   // sdkl_npu_* / sdkl_cpu_rm_to_wh_*
 #endif
 
 namespace {
@@ -96,7 +96,6 @@ static Args parseArgs(int argc, char **argv) {
       std::exit(0);
     }
   }
-  // --N/--K win over --proj; otherwise expand the preset.
   if (proj_set && !(n_set && k_set)) {
     int pn = a.N, pk = a.K;
     if (applyProj(a.proj, pn, pk)) {
@@ -121,20 +120,43 @@ static std::vector<float> randVec(int n, float lo, float hi, uint32_t seed) {
   return v;
 }
 
-// Build a [1,1,N,K] FP32 tensor (logical [N,K]) from a row-major buffer.
-static nntrainer::Tensor makeWeightNK(const std::vector<float> &W, int N,
-                                      int K) {
-  nntrainer::Tensor t(
-    1, 1, N, K, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
-  for (int n = 0; n < N; ++n)
+// Per-output-channel symmetric weight quant (mirrors quantize_qint{4,8}_weight):
+// scale[n] = max_abs(W[n,:]) / q_max, w_q[n,k] = clamp(round(W/scale), ±q_max),
+// zp_corr[n] = 128 * sum_k w_q[n,k]. w_q is logical [N,K] (w_q[n*K+k]).
+struct WQuant {
+  std::vector<int8_t> w_q;
+  std::vector<float> scale;
+  std::vector<int32_t> zp_corr;
+};
+static WQuant quantWeight(const std::vector<float> &W, int N, int K,
+                          int q_max) {
+  WQuant o;
+  o.w_q.resize((size_t)N * K);
+  o.scale.resize(N);
+  o.zp_corr.resize(N);
+  for (int n = 0; n < N; ++n) {
+    float mx = 0.0f;
     for (int k = 0; k < K; ++k)
-      t.setValue(0, 0, n, k, W[(size_t)n * K + k]);
-  return t;
+      mx = std::max(mx, std::fabs(W[(size_t)n * K + k]));
+    float s = mx > 0.0f ? mx / (float)q_max : 1.0f;
+    if (!std::isfinite(s) || s <= 0.0f)
+      s = 1.0f;
+    o.scale[n] = s;
+    int32_t rowsum = 0;
+    for (int k = 0; k < K; ++k) {
+      long q = std::lround(W[(size_t)n * K + k] / s);
+      int8_t c = (int8_t)std::max<long>(-q_max, std::min<long>(q_max, q));
+      o.w_q[(size_t)n * K + k] = c;
+      rowsum += c;
+    }
+    o.zp_corr[n] = 128 * rowsum;
+  }
+  return o;
 }
 
 // Per-tensor u8 activation quant (zp=128), mirrors shgemm_u8i{4,8}_i32.
-static std::vector<uint8_t> quantizeActU8(const std::vector<float> &A, int M,
-                                          int K, float &act_scale) {
+static std::vector<uint8_t> quantAct(const std::vector<float> &A, int M, int K,
+                                     float &act_scale) {
   float mx = 0.0f;
   for (int i = 0; i < M * K; ++i)
     if (std::isfinite(A[i]))
@@ -175,12 +197,113 @@ static float relErr(const std::vector<float> &got,
   return err_max / (ref_max + 1e-6f);
 }
 
-// One quantized result: dequantized output + how it was produced.
+// Dequant: C[m,n] = act_scale * scale[n] * (C_i32[m,n] - zp_corr[n]).
+static std::vector<float> dequant(const int32_t *c_i32, int M, int N,
+                                  float act_scale, const std::vector<float> &sc,
+                                  const std::vector<int32_t> &zp) {
+  std::vector<float> c((size_t)M * N);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n)
+      c[(size_t)m * N + n] = act_scale * sc[n] *
+                             ((float)c_i32[(size_t)m * N + n] - (float)zp[n]);
+  return c;
+}
+
 struct QResult {
   std::vector<float> C;
-  double ms = 0.0;   // per-call latency (mean)
+  double ms = 0.0;
   bool on_npu = false;
 };
+
+#ifdef ENABLE_HEXKL
+// RAII NPU buffer.
+struct NpuBuf {
+  void *p = nullptr;
+  explicit NpuBuf(size_t bytes) {
+    if (sdkl_npu_alloc(bytes, &p) != 0)
+      p = nullptr;
+  }
+  ~NpuBuf() { if (p) sdkl_npu_free(p); }
+  NpuBuf(const NpuBuf &) = delete;
+  NpuBuf &operator=(const NpuBuf &) = delete;
+  bool ok() const { return p != nullptr; }
+};
+
+// Drive the real NPU kernel directly through sdkl. bits = 4 or 8.
+// Returns false if a kernel/alloc call fails.
+static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
+                   const WQuant &wq, int warmup, int iters, int domain,
+                   double &ms, std::vector<int32_t> &c_i32) {
+  const int Mp = ((M + 63) / 64) * 64;
+
+  // WH-pack the weight (out of the timed loop).
+  const size_t nk = (size_t)N * K;
+  NpuBuf Xb((size_t)Mp * K), Cb((size_t)Mp * N * sizeof(int32_t));
+  if (!Xb.ok() || !Cb.ok())
+    return false;
+  // Activation: real M rows, pad the rest to zp=128.
+  std::memset(Xb.p, 128, (size_t)Mp * K);
+  std::memcpy(Xb.p, x.data(), (size_t)M * K);
+
+  bool ok = false;
+  if (bits == 4) {
+    NpuBuf Win(nk), Wwh(nk);
+    if (!Win.ok() || !Wwh.ok())
+      return false;
+    std::memcpy(Win.p, wq.w_q.data(), nk);
+    if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wwh.p),
+                             static_cast<int8_t *>(Win.p), (size_t)K,
+                             (size_t)N) != 0)
+      return false;
+    int rc = 0;
+    auto call = [&]() {
+      rc = sdkl_npu_mm_u8i4_i32(domain, Mp, N, K, static_cast<int32_t *>(Cb.p),
+                                static_cast<const uint8_t *>(Xb.p),
+                                static_cast<const uint8_t *>(Wwh.p));
+    };
+    for (int i = 0; i < warmup; ++i) call();
+    double sum = 0.0;
+    for (int i = 0; i < iters; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      call();
+      auto t1 = std::chrono::steady_clock::now();
+      sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    ms = iters > 0 ? sum / iters : 0.0;
+    ok = (rc == 0);
+  } else {
+    NpuBuf Wb(nk);
+    if (!Wb.ok())
+      return false;
+    std::memcpy(Wb.p, wq.w_q.data(), nk);
+    if (sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
+                                     static_cast<int8_t *>(Wb.p)) != 0)
+      return false;
+    int rc = 0;
+    auto call = [&]() {
+      rc = sdkl_npu_mm_u8i8_i32(domain, Mp, N, K, static_cast<int32_t *>(Cb.p),
+                                static_cast<const uint8_t *>(Xb.p),
+                                static_cast<const int8_t *>(Wb.p));
+    };
+    for (int i = 0; i < warmup; ++i) call();
+    double sum = 0.0;
+    for (int i = 0; i < iters; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      call();
+      auto t1 = std::chrono::steady_clock::now();
+      sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    ms = iters > 0 ? sum / iters : 0.0;
+    ok = (rc == 0);
+  }
+  if (!ok)
+    return false;
+  // Copy back only the real M rows of the int32 accumulator.
+  c_i32.assign((size_t)M * N, 0);
+  std::memcpy(c_i32.data(), Cb.p, (size_t)M * N * sizeof(int32_t));
+  return true;
+}
+#endif
 
 // CPU-exact integer GEMM: C_i32[m,n] = sum_k X_u8[m,k] * W_q[n,k].
 static void cpuIntGemm(int M, int N, int K, const uint8_t *X, const int8_t *W,
@@ -194,79 +317,50 @@ static void cpuIntGemm(int M, int N, int K, const uint8_t *X, const int8_t *W,
     }
 }
 
-// Run the u8i{bits} path: production weight quant + activation quant + integer
-// GEMM (real NPU kernel on device, CPU emulation on host) + dequant.
+// Full u8i{bits} path: quant (inline) + integer GEMM (NPU on device, CPU
+// emulation on host) + dequant.
 static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
                         const std::vector<float> &W, int bits, int warmup,
-                        int iters) {
+                        int iters, bool npu_ok, int domain) {
   QResult r;
-  nntrainer::Tensor wt = makeWeightNK(W, N, K);
-  nntrainer::Tensor q = (bits == 4)
-                          ? nntrainer::quantize_qint4_weight(wt, false)
-                          : nntrainer::quantize_qint8_weight(wt, false);
-  const int8_t *w_q = q.getData<int8_t>();      // WH-packed (device) / [N,K] (host)
-  const float *scale = q.getScale<float>();     // [N]
-  const int32_t *zp_corr = q.getZpCorr<int32_t>(); // [N]
+  const int q_max = (bits == 4) ? 7 : 127;
+  WQuant wq = quantWeight(W, N, K, q_max);
+  float act_scale = 1.0f;
+  auto x = quantAct(A, M, K, act_scale);
+  std::vector<int32_t> c_i32;
 
 #ifdef ENABLE_HEXKL
-  // Real NPU kernel: dequantizes internally, returns FP32 directly. It also
-  // needs the WH-packed weight; quantize_qint{4,8}_weight already produced the
-  // WH bytes in w_q under ENABLE_HEXKL, so hand them straight to the kernel.
-  std::vector<float> C_out((size_t)M * N, 0.0f);
-  auto call = [&]() {
-    if (bits == 4)
-      nntrainer::hmx::shgemm_u8i4_i32((unsigned)M, (unsigned)N, (unsigned)K,
-                                      A.data(), w_q, scale, zp_corr,
-                                      C_out.data());
-    else
-      nntrainer::hmx::shgemm_u8i8_i32((unsigned)M, (unsigned)N, (unsigned)K,
-                                      A.data(), w_q, scale, zp_corr,
-                                      C_out.data());
-  };
-  for (int i = 0; i < warmup; ++i)
-    call();
-  double sum = 0.0;
-  for (int i = 0; i < iters; ++i) {
-    auto t0 = std::chrono::steady_clock::now();
-    call();
-    auto t1 = std::chrono::steady_clock::now();
-    sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+  if (npu_ok && runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.ms,
+                       c_i32)) {
+    r.on_npu = true;
+    r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
+    return r;
   }
-  r.ms = iters > 0 ? sum / iters : 0.0;
-  r.on_npu = true;
-  r.C = std::move(C_out);
 #else
-  // Host: emulate the NPU integer GEMM on the CPU, then dequant with the exact
-  // production formula. relErr is identical to on-device; latency is CPU-only.
+  (void)npu_ok;
+  (void)domain;
+#endif
+  // Host / NPU-unavailable: emulate the integer GEMM on the CPU.
   (void)warmup;
-  float act_scale = 1.0f;
-  auto x_u8 = quantizeActU8(A, M, K, act_scale);
-  std::vector<int32_t> c_i32((size_t)M * N, 0);
-  double sum = 0.0;
+  c_i32.assign((size_t)M * N, 0);
   int it = std::max(1, iters);
+  double sum = 0.0;
   for (int i = 0; i < it; ++i) {
     auto t0 = std::chrono::steady_clock::now();
-    cpuIntGemm(M, N, K, x_u8.data(), w_q, c_i32.data());
+    cpuIntGemm(M, N, K, x.data(), wq.w_q.data(), c_i32.data());
     auto t1 = std::chrono::steady_clock::now();
     sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
   }
   r.ms = sum / it;
   r.on_npu = false;
-  r.C.assign((size_t)M * N, 0.0f);
-  for (int m = 0; m < M; ++m)
-    for (int n = 0; n < N; ++n)
-      r.C[(size_t)m * N + n] =
-        act_scale * scale[n] *
-        ((float)c_i32[(size_t)m * N + n] - (float)zp_corr[n]);
-#endif
+  r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
   return r;
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
-  // Unbuffered stdout so partial output survives a crash in the NPU path
-  // (otherwise a fault in the kernel call loses the buffered header).
+  // Unbuffered stdout so partial output survives a crash in the NPU path.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Args a = parseArgs(argc, argv);
 
@@ -279,15 +373,26 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  bool npu_ok = false;
+  int domain = 0;
+#ifdef ENABLE_HEXKL
+  // Same NPU bring-up as HtpBackend: initialize the CDSP session directly so
+  // the example depends only on libsdkl.so.
+  domain = CDSP_DOMAIN_ID;
+  int init_err = sdkl_npu_initialize(domain, nullptr, nullptr);
+  npu_ok = (init_err == 0);
+  if (!npu_ok)
+    std::fprintf(stderr, "[warn] sdkl_npu_initialize failed (err=%d); "
+                         "falling back to CPU emulation\n",
+                 init_err);
+#endif
+
   std::printf("fc_layer mm comparison (HexKL u8i8 / u8i4 vs FP32)\n");
   std::printf("  proj=%s  M=%d  N=%d  K=%d  (%s)\n", a.proj.c_str(), a.M, a.N,
               a.K,
-#ifdef ENABLE_HEXKL
-              "NPU kernels — real device latency"
-#else
-              "host: CPU-emulated integer GEMM — relErr real, latency reference"
-#endif
-  );
+              npu_ok
+                ? "NPU kernels — real device latency"
+                : "CPU-emulated integer GEMM — relErr real, latency reference");
 
   auto A = randVec(a.M * a.K, -1.0f, 1.0f, 42);
   auto W = randVec(a.N * a.K, -0.5f, 0.5f, 1337);
@@ -295,9 +400,9 @@ int main(int argc, char **argv) {
   auto C_ref = gemmF32(a.M, a.N, a.K, A, W);
 
   std::fprintf(stderr, "[run] u8i8 ...\n");
-  QResult r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters);
+  QResult r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters, npu_ok, domain);
   std::fprintf(stderr, "[run] u8i8 done; u8i4 ...\n");
-  QResult r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters);
+  QResult r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters, npu_ok, domain);
   std::fprintf(stderr, "[run] u8i4 done\n");
 
   float e8 = relErr(r8.C, C_ref);
@@ -313,5 +418,10 @@ int main(int argc, char **argv) {
   std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "
               "%.2fx error)\n",
               e8, e4, e8 > 0.0f ? e4 / e8 : 0.0f);
+
+#ifdef ENABLE_HEXKL
+  if (npu_ok)
+    sdkl_npu_finalize(domain);
+#endif
   return 0;
 }
