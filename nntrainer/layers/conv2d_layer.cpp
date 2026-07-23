@@ -19,6 +19,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,54 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 namespace {
+
+// ---- Pre-baked per-channel W8A8 scale sidecar -----------------------------
+// The ORT-style pre-bake stores conv weights as int8 (Q8_0, ~125MB) plus a
+// standalone FP32 per-channel scale. Rather than thread an extra weight tensor
+// through the graph/safetensors, the FP32 scales ride in a small sidecar file
+// keyed by layer name: nntr_quantize appends one record per per-channel conv
+// (NNTR_W8A8_PREBAKE=<path>), and the runtime loads it once (NNTR_W8A8_PREBAKED
+// =<path>) and hands each conv its FP32 scale as perch_scale. Record format:
+//   [u32 name_len][name][u32 out_ch][float32 * out_ch]
+void w8a8_prebake_write_scale(const char *path, const std::string &name,
+                              const float *scales, unsigned int out_ch) {
+  std::ofstream f(path, std::ios::binary | std::ios::app);
+  if (!f)
+    return;
+  uint32_t nl = (uint32_t)name.size(), oc = out_ch;
+  f.write(reinterpret_cast<const char *>(&nl), sizeof(nl));
+  f.write(name.data(), nl);
+  f.write(reinterpret_cast<const char *>(&oc), sizeof(oc));
+  f.write(reinterpret_cast<const char *>(scales), (std::streamsize)oc * 4);
+}
+
+const std::vector<float> *w8a8_prebake_lookup(const std::string &name) {
+  static std::mutex mtx;
+  static bool loaded = false;
+  static std::unordered_map<std::string, std::vector<float>> table;
+  std::lock_guard<std::mutex> lk(mtx);
+  if (!loaded) {
+    loaded = true;
+    if (const char *path = std::getenv("NNTR_W8A8_PREBAKED")) {
+      std::ifstream f(path, std::ios::binary);
+      while (f) {
+        uint32_t nl = 0;
+        if (!f.read(reinterpret_cast<char *>(&nl), sizeof(nl)))
+          break;
+        std::string nm(nl, '\0');
+        f.read(&nm[0], nl);
+        uint32_t oc = 0;
+        f.read(reinterpret_cast<char *>(&oc), sizeof(oc));
+        std::vector<float> s(oc);
+        f.read(reinterpret_cast<char *>(s.data()), (std::streamsize)oc * 4);
+        if (f)
+          table.emplace(std::move(nm), std::move(s));
+      }
+    }
+  }
+  auto it = table.find(name);
+  return it == table.end() ? nullptr : &it->second;
+}
 
 // ---- Stem direct-conv weight cache ----------------------------------------
 // The stem (in_ch == 3) runs a dedicated direct FP32 conv (no im2col, no
@@ -1540,11 +1589,19 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
           const unsigned int in_ch = in_dim.channel();
           const unsigned int CRS =
             in_ch * kernel_size[0].get() * kernel_size[1].get();
+          // Pre-baked (NNTR_W8A8_PREBAKED): use the FP32 per-channel scale from
+          // the sidecar so an int8 Q8_0 weight reaches FP32W accuracy (81/87).
+          static const bool prebaked =
+            std::getenv("NNTR_W8A8_PREBAKED") != nullptr;
+          const std::vector<float> *pbscale =
+            (prebaked && weight_is_q8) ? w8a8_prebake_lookup(context.getName())
+                                       : nullptr;
           const PerChConvWeight &W = __ggml_q8ch_prepare_conv_weight(
             filter_kernel.getData(),
             weight_is_q8 ? filter_kernel.getData() : nullptr,
             weight_is_q8 ? nullptr : filter_kernel.getData<float>(), filter_size,
-            CRS, kernel_size[0].get() * kernel_size[1].get(), in_ch);
+            CRS, kernel_size[0].get() * kernel_size[1].get(), in_ch,
+            pbscale ? pbscale->data() : nullptr);
 
           // Asymmetric (affine) int8 activations with a SHARED fixed offset
           // (default; NNTR_W8A8_SYM=1 reverts to symmetric): every int8 edge
@@ -2914,7 +2971,20 @@ void Conv2DLayer::save(std::ofstream &file, RunLayerContext &run_context,
       // tensor for every other reader.
       static const bool perch_quant =
         std::getenv("NNTR_W8A8_PERCH") != nullptr;
-      if (perch_quant)
+      // Pre-bake (NNTR_W8A8_PREBAKE=<sidecar path>, per-channel only): fit the
+      // int8 to the FP32 scale (81/87) and append the FP32 per-channel scale to
+      // the sidecar keyed by this layer's name, for the runtime to load as
+      // perch_scale. The on-disk weight stays a byte-valid per-channel Q8_0.
+      const char *prebake_path =
+        perch_quant ? std::getenv("NNTR_W8A8_PREBAKE") : nullptr;
+      if (prebake_path) {
+        std::vector<float> wscales(out_ch);
+        __ggml_quantize_q8_0_per_channel_prebake(weight.getData<float>(),
+                                                 tmp.data(), wscales.data(),
+                                                 out_ch, CRS);
+        w8a8_prebake_write_scale(prebake_path, run_context.getName(),
+                                 wscales.data(), out_ch);
+      } else if (perch_quant)
         __ggml_quantize_q8_0_per_channel(weight.getData<float>(), tmp.data(),
                                          out_ch, CRS);
       else

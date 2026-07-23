@@ -674,6 +674,36 @@ void __ggml_quantize_q8_0_per_channel(const float *src, void *dst,
   });
 }
 
+void __ggml_quantize_q8_0_per_channel_prebake(const float *src, void *dst,
+                                              float *scales_out,
+                                              unsigned int nrow,
+                                              unsigned int ncol) {
+  auto &tm = ThreadManager::Global();
+  const unsigned int nb = ncol / QK8_0;
+  block_q8_0 *out = reinterpret_cast<block_q8_0 *>(dst);
+  tm.parallel_for(0, nrow, [=](size_t n) {
+    const float *row = src + (size_t)n * ncol;
+    float amax = 0.f;
+    for (unsigned int k = 0; k < ncol; ++k)
+      amax = std::max(amax, std::fabs(row[k]));
+    // Full-precision FP32 scale: the int8 quants are fit to scv (NOT the
+    // fp16-rounded d), matching the FP32W load-time path so accuracy is
+    // preserved (81/87). scales_out[n] is what the runtime uses as perch_scale.
+    const float scv = amax > 0.f ? amax / 127.f : 1.f;
+    scales_out[n] = scv;
+    const float inv = scv > 0.f ? 1.f / scv : 0.f;
+    const uint16_t d16 = perch_fp32_to_fp16_bits(scv); // byte-valid Q8_0 only
+    for (unsigned int j = 0; j < nb; ++j) {
+      block_q8_0 &b = out[(size_t)n * nb + j];
+      b.d = d16;
+      for (int c = 0; c < QK8_0; ++c) {
+        const float v = row[j * QK8_0 + c] * inv;
+        b.qs[c] = (int8_t)std::max(-128.f, std::min(127.f, std::round(v)));
+      }
+    }
+  });
+}
+
 const PerChConvWeight &
 __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
                                 const float *fp32_src, unsigned int out_ch,
