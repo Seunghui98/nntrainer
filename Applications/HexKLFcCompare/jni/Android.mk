@@ -23,6 +23,8 @@ LOCAL_C_INCLUDES         := \
     $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend \
     $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hmx_ops \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend \
+    $(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm \
+    $(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm/kai \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/fallback \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/layers \
