@@ -40,7 +40,8 @@ ffn_gate/up N=3072 K=1024; ffn_down N=1024 K=3072.
 
 ## Build & run — host (no NPU, real accuracy numbers)
 
-The example is a normal app target; enable apps and it links `libnntrainer`:
+The example is a normal app target (self-contained; the host build needs no
+HTP/NPU support):
 
 ```bash
 meson setup build -Denable-app=true    # (plus your usual host options)
@@ -90,14 +91,14 @@ adb push Applications/HexKLFcCompare/jni/obj/local/arm64-v8a/hexkl_fc_compare /d
 #    - Do NOT add /system/lib64: it drags in Android system libs (e.g.
 #      libinput.so) built against a different libfmt and fails to link.
 adb shell "cd /data/local/tmp && \
-  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64:\$LD_LIBRARY_PATH \
-  ADSP_LIBRARY_PATH=/data/local/tmp:\$ADSP_LIBRARY_PATH \
+  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64 \
+  ADSP_LIBRARY_PATH=/data/local/tmp \
   ./hexkl_fc_compare --proj q_proj"
 adb shell "cd /data/local/tmp && \
-  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64:\$LD_LIBRARY_PATH \
-  ADSP_LIBRARY_PATH=/data/local/tmp:\$ADSP_LIBRARY_PATH \
+  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64 \
+  ADSP_LIBRARY_PATH=/data/local/tmp \
   ./hexkl_fc_compare --proj ffn_down --M 64"
 ```
 
-On device the `engine` column reads `NPU/HMX` and `latency (ms)` is the real
+On device the `engine` column reads `NPU/HMX` and `latency (us)` is the real
 per-call kernel time.
