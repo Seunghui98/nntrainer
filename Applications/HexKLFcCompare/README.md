@@ -74,9 +74,11 @@ ndk-build -C Applications/HexKLFcCompare/jni \
   NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk \
   NDK_APPLICATION_MK=Application.mk -j$(nproc)
 
-# 3. push binary + runtime .so deps (libnntrainer/libsdkl/libc++_shared)
-adb push Applications/HexKLFcCompare/libs/arm64-v8a/. /data/local/tmp/
-adb push Applications/HexKLFcCompare/obj/local/arm64-v8a/hexkl_fc_compare /data/local/tmp/
+# 3. push binary + runtime .so deps (libnntrainer/libsdkl/libc++_shared).
+#    ndk-build with -C <jni> NDK_PROJECT_PATH=. writes libs/ and obj/ UNDER the
+#    jni dir, so the paths include jni/.
+adb push Applications/HexKLFcCompare/jni/libs/arm64-v8a/. /data/local/tmp/
+adb push Applications/HexKLFcCompare/jni/obj/local/arm64-v8a/hexkl_fc_compare /data/local/tmp/
 #   the CDSP skeleton (libhexkl_skel.so, V79) must already be in /data/local/tmp
 
 # 4. run (inject library + skeleton paths)
