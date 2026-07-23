@@ -678,7 +678,7 @@ const PerChConvWeight &
 __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
                                 const float *fp32_src, unsigned int out_ch,
                                 unsigned int CRS, unsigned int khkw,
-                                unsigned int in_ch) {
+                                unsigned int in_ch, const float *perch_scale) {
   static std::mutex mtx;
   static std::unordered_map<const void *, PerChConvWeight> cache;
   std::lock_guard<std::mutex> lk(mtx);
@@ -816,8 +816,13 @@ __ggml_q8ch_prepare_conv_weight(const void *key, const void *q8_src_x4,
                 qsum += v;
               }
           }
+          // Pre-baked path (ORT-style int8 weight + FP32 scale): use the
+          // supplied FP32 per-channel scale verbatim, skipping the fp16-d
+          // derived amax that costs a borderline quant. Otherwise reproduce the
+          // generic path's row amax from the Q8_0 fp16 d.
           const float amax = d * (float)maxq; // == generic path's row amax
-          scale_ptr[n] = amax > 0.f ? amax / 127.f : 1.f;
+          scale_ptr[n] =
+            perch_scale ? perch_scale[n] : (amax > 0.f ? amax / 127.f : 1.f);
           colsum_ptr[n] = qsum;
         }
       } else {
