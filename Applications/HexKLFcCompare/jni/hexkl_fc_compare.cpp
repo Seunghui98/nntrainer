@@ -72,6 +72,7 @@ static bool applyProj(const std::string &name, int &N, int &K) {
 static Args parseArgs(int argc, char **argv) {
   Args a;
   bool proj_set = false, n_set = false, k_set = false;
+  bool iters_set = false, warmup_set = false;
   for (int i = 1; i < argc; ++i) {
     std::string s = argv[i];
     auto next = [&](int &dst) {
@@ -82,10 +83,8 @@ static Args parseArgs(int argc, char **argv) {
       next(a.M);
     else if (s == "--N") { next(a.N); n_set = true; }
     else if (s == "--K") { next(a.K); k_set = true; }
-    else if (s == "--iters")
-      next(a.iters);
-    else if (s == "--warmup")
-      next(a.warmup);
+    else if (s == "--iters") { next(a.iters); iters_set = true; }
+    else if (s == "--warmup") { next(a.warmup); warmup_set = true; }
     else if (s == "--proj") {
       if (i + 1 < argc) { a.proj = argv[++i]; proj_set = true; }
     } else if (s == "--help" || s == "-h") {
@@ -108,6 +107,19 @@ static Args parseArgs(int argc, char **argv) {
   }
   if (!proj_set && (n_set || k_set))
     a.proj = "custom";
+  // Iteration counts via env var (explicit --iters/--warmup on the CLI win).
+  if (!iters_set)
+    if (const char *e = std::getenv("HEXKL_FC_ITERS")) {
+      int v = std::atoi(e);
+      if (v > 0)
+        a.iters = v;
+    }
+  if (!warmup_set)
+    if (const char *e = std::getenv("HEXKL_FC_WARMUP")) {
+      int v = std::atoi(e);
+      if (v >= 0)
+        a.warmup = v;
+    }
   return a;
 }
 
@@ -216,7 +228,8 @@ struct Timing {
   double alloc_us = 0.0;  // sdkl_npu_alloc of X / C / weight buffers
   double h2d_us = 0.0;    // host -> NPU copies (activation + weight)
   double whpack_us = 0.0; // RM -> WH weight layout conversion
-  double kernel_us = 0.0; // sdkl_npu_mm_u8i{4,8}_i32 (mean per call) = compute
+  double cold_us = 0.0;   // first execute (cold; includes first-call setup)
+  double kernel_us = 0.0; // steady-state sdkl_npu_mm mean = NetRun (compute)
   double d2h_us = 0.0;    // NPU -> host copy of the int32 accumulator
   double movement_us() const {
     return alloc_us + h2d_us + whpack_us + d2h_us;
@@ -303,6 +316,12 @@ static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
                                   static_cast<const uint8_t *>(Xb.p),
                                   static_cast<const int8_t *>(Wbuf.p));
   };
+  // Cold run: the very first execute (mirrors QNN's "Cold run" — carries any
+  // first-call device-side setup).
+  auto tcold = clk::now();
+  call();
+  tm.cold_us = usSince(tcold);
+  // Warmup (discarded), then steady-state NetRun mean.
   for (int i = 0; i < warmup; ++i)
     call();
   double sum = 0.0;
@@ -394,11 +413,14 @@ int main(int argc, char **argv) {
 
   bool npu_ok = false;
   int domain = 0;
+  double init_us = 0.0;
 #ifdef ENABLE_HEXKL
   // Same NPU bring-up as HtpBackend: initialize the CDSP session directly so
-  // the example depends only on libsdkl.so.
+  // the example depends only on libsdkl.so. Timed = QNN "One-time init".
   domain = CDSP_DOMAIN_ID;
+  auto tinit = std::chrono::steady_clock::now();
   int init_err = sdkl_npu_initialize(domain, nullptr, nullptr);
+  init_us = usSince(tinit);
   npu_ok = (init_err == 0);
   if (!npu_ok)
     std::fprintf(stderr, "[warn] sdkl_npu_initialize failed (err=%d); "
@@ -407,8 +429,8 @@ int main(int argc, char **argv) {
 #endif
 
   std::printf("fc_layer mm comparison (HexKL u8i8 / u8i4 vs FP32)\n");
-  std::printf("  proj=%s  M=%d  N=%d  K=%d  (%s)\n", a.proj.c_str(), a.M, a.N,
-              a.K,
+  std::printf("  proj=%s  M=%d  N=%d  K=%d  iters=%d warmup=%d  (%s)\n",
+              a.proj.c_str(), a.M, a.N, a.K, a.iters, a.warmup,
               npu_ok
                 ? "NPU kernels — real device latency"
                 : "CPU-emulated integer GEMM — relErr real, latency reference");
@@ -427,7 +449,37 @@ int main(int argc, char **argv) {
   float e8 = relErr(r8.C, C_ref);
   float e4 = relErr(r4.C, C_ref);
 
-  // Compute (kernel only) vs data movement (alloc + H2D + WH pack + D2H).
+  // ---- QNN-style phase breakdown (microseconds) ----------------------------
+  // Mapping to a qnn-net-run profile:
+  //   One-time init            <- sdkl_npu_initialize (once per process)
+  //   Cold run                 <- first execute (first sdkl_npu_mm call)
+  //   Steady-state NetRun      <- mean sdkl_npu_mm (host-observed execute:
+  //                               RPC round-trip + device compute + return)
+  //   data movement            <- host-side alloc + H2D + WH pack + D2H
+  // sdkl does not expose the intra-execute device timeline (convert / FC /
+  // reshape / writeback), so those sub-phases cannot be split here.
+  std::printf("\nPhase                                    Time (us)\n");
+  std::printf("One-time init (sdkl_npu_initialize)      %10.1f\n", init_us);
+  auto dumpMethod = [&](const char *tag, float err, const QResult &r) {
+    std::printf("[%s]  relErr=%.5f  engine=%s\n", tag, err,
+                r.on_npu ? "NPU/HMX" : "CPU-emulated");
+    std::printf("  Cold run (first execute)               %10.1f\n",
+                r.t.cold_us);
+    std::printf("  Steady-state NetRun (mean execute)     %10.1f   <- compute\n",
+                r.t.kernel_us);
+    std::printf("  Data movement (host-side)              %10.1f\n",
+                r.t.movement_us());
+    std::printf("    alloc                                %10.1f\n",
+                r.t.alloc_us);
+    std::printf("    H2D copy (act + weight)              %10.1f\n", r.t.h2d_us);
+    std::printf("    WH pack (RM->WH weight)              %10.1f\n",
+                r.t.whpack_us);
+    std::printf("    D2H copy (int32 accumulator)         %10.1f\n", r.t.d2h_us);
+  };
+  dumpMethod("u8i8", e8, r8);
+  dumpMethod("u8i4", e4, r4);
+
+  // Compact comparison table.
   std::printf("\n| method | relErr vs FP32 | compute us | movement us | engine "
               "|\n");
   std::printf("|---|---|---|---|---|\n");
@@ -437,14 +489,6 @@ int main(int argc, char **argv) {
   std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %8.1f | %s |\n", e4,
               r4.t.kernel_us, r4.t.movement_us(),
               r4.on_npu ? "NPU/HMX" : "CPU-emulated");
-
-  // Full movement breakdown (µs): where the non-compute time goes.
-  std::printf("\nmovement breakdown (us) — alloc / H2D copy / WH pack / D2H "
-              "copy:\n");
-  std::printf("  u8i8: alloc=%.1f  h2d=%.1f  whpack=%.1f  d2h=%.1f\n",
-              r8.t.alloc_us, r8.t.h2d_us, r8.t.whpack_us, r8.t.d2h_us);
-  std::printf("  u8i4: alloc=%.1f  h2d=%.1f  whpack=%.1f  d2h=%.1f\n",
-              r4.t.alloc_us, r4.t.h2d_us, r4.t.whpack_us, r4.t.d2h_us);
 
   std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "
               "%.2fx error);  compute u8i4=%.1fus u8i8=%.1fus\n",

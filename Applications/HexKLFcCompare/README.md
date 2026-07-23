@@ -32,8 +32,27 @@ Default = qwen3-0.6b `q_proj` (`M=64` prefill tile, `N=2048`, `K=1024`).
 --M <m>   rows / tokens (prefill tile e.g. 64; decode = 1)
 --N <n>   out features (multiple of 32)
 --K <k>   in  features (even, for INT4 packing)
---iters <n> --warmup <n>
+--iters <n> --warmup <n>      steady-state iterations / warmup calls
 ```
+
+Iteration counts can also come from env vars (a CLI flag wins if both are set):
+`HEXKL_FC_ITERS`, `HEXKL_FC_WARMUP`.
+
+## Timing breakdown (QNN-style phases)
+
+The report mirrors a `qnn-net-run` profile so the two can be compared:
+
+| phase | HexKL source | QNN analog |
+| :--- | :--- | :--- |
+| One-time init | `sdkl_npu_initialize` (once) | One-time init |
+| Cold run | first `sdkl_npu_mm` execute | Cold run |
+| Steady-state NetRun (**compute**) | mean `sdkl_npu_mm` (host-observed execute = RPC round-trip + device compute + return) | Steady-state NetRun |
+| Data movement | host-side `sdkl_npu_alloc` + H2D copies + RM→WH pack + D2H copy | (device Convert/Writeback, host-side here) |
+
+sdkl does **not** expose the intra-execute device timeline (Convert / FC /
+Reshape / Writeback), so — unlike QNN's `QnnProfile` — those sub-phases inside
+one `sdkl_npu_mm` call cannot be split. "Steady-state NetRun" is the finest
+pure-compute number sdkl gives.
 `--N`/`--K` override `--proj`. Presets (qwen3-0.6b, hidden 1024, intermediate
 3072, GQA q=2048/kv=1024): q_proj N=2048 K=1024; k/v/o_proj N=1024 K=1024;
 ffn_gate/up N=3072 K=1024; ffn_down N=1024 K=3072.
