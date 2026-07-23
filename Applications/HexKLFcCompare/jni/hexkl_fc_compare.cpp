@@ -265,6 +265,9 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
 } // namespace
 
 int main(int argc, char **argv) {
+  // Unbuffered stdout so partial output survives a crash in the NPU path
+  // (otherwise a fault in the kernel call loses the buffered header).
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   Args a = parseArgs(argc, argv);
 
   if (a.N % 32 != 0) {
@@ -291,8 +294,11 @@ int main(int argc, char **argv) {
 
   auto C_ref = gemmF32(a.M, a.N, a.K, A, W);
 
+  std::fprintf(stderr, "[run] u8i8 ...\n");
   QResult r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters);
+  std::fprintf(stderr, "[run] u8i8 done; u8i4 ...\n");
   QResult r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters);
+  std::fprintf(stderr, "[run] u8i4 done\n");
 
   float e8 = relErr(r8.C, C_ref);
   float e4 = relErr(r4.C, C_ref);
