@@ -348,21 +348,7 @@ int main(int argc, char **argv) {
                 << (has_reid ? " (+_reid.bin)" : "") << std::endl;
     }
 
-    // Output decode (SimCC argmax -> keypoints), the CPU analog of QNN's
-    // Reshape + Output Writeback. Averaged the same way as the compute so the
-    // steady-state figure decomposes into compute + decode.
-    double decode_ms = 0.0;
-    std::vector<Keypoint> kpts;
-    {
-      const int dit = iters;
-      auto d0 = std::chrono::steady_clock::now();
-      for (int it = 0; it < dit; ++it)
-        kpts = decodeSimcc(outs[0]);
-      decode_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - d0)
-                    .count() /
-                  dit;
-    }
+    auto kpts = decodeSimcc(outs[0]);
 
     float score_thr =
       std::getenv("POSE_THR") ? std::stof(std::getenv("POSE_THR")) : 0.5f;
@@ -399,45 +385,20 @@ int main(int argc, char **argv) {
     // per-channel weight cache and allocates/first-touches the activation
     // pool). ORT folds the equivalent into its "load" (session create), so
     // report init alongside it for an apples-to-apples e2e decomposition.
-    // Phase decomposition mirroring the QNN qnn-net-run breakdown for an
-    // apples-to-apples comparison (all times in microseconds):
-    //   One-time init  = graph setup + compile + weight load   (paid once)
-    //   Cold run       = first inference (builds the per-channel weight cache,
-    //                    allocates + first-touches the activation pool, wakes
-    //                    the thread-pool cores) -- QNN's "Cold run"
-    //   Steady-state   = averaged over YOLO_BENCH_ITERS iterations, split into
-    //                    model compute (QNN Convert+FC+Reshape device timeline)
-    //                    and output decode (QNN Output Writeback).
-    const double one_time_init_us = (setup_ms + compile_ms + load_ms) * 1e3;
-    const double cold_run_us = warmup_ms * 1e3;
-    const double compute_us = infer_ms * 1e3;
-    const double decode_us = decode_ms * 1e3;
-    const double steady_us = compute_us + decode_us;
     double init_ms = setup_ms + compile_ms + load_ms + warmup_ms;
-    (void)init_ms;
     std::printf(
-      "\n==============[ YOLOv7 Pose  (nntrainer, CPU) ]==============\n");
-    std::printf("Phase                        Time (us)   Explanation\n");
-    std::printf("------------------------------------------------------------\n");
-    std::printf("One-time init              %10.1f   setup %.0f + compile %.0f "
-                "+ load %.0f (1x)\n",
-                one_time_init_us, setup_ms * 1e3, compile_ms * 1e3,
-                load_ms * 1e3);
-    std::printf("Cold run                   %10.1f   first inference\n",
-                cold_run_us);
-    std::printf("Steady-state inference     %10.1f   avg over %d iter%s\n",
-                steady_us, iters, iters > 1 ? "s" : "");
-    std::printf("  Model compute (fwd)      %10.1f   conv/gemm/act/pool/head\n",
-                compute_us);
-    std::printf("  Output decode (SimCC)    %10.1f   argmax -> keypoints\n",
-                decode_us);
-    std::printf("------------------------------------------------------------\n");
-    std::printf("keypoints: %d/%d visible   peak memory: %ld KB\n", visible,
-                NKPT, peak_kb);
-    std::printf("e2e: %.1f us  (init %.1f + cold %.1f + %d x steady %.1f)\n",
-                e2e_ms * 1e3, one_time_init_us, cold_run_us, iters, steady_us);
+      "\n================[ YOLOv7 Pose with NNTrainer ]================\n");
+    std::printf("init:      %.1f ms (setup %.1f + compile %.1f + load %.1f + "
+                "warmup %.1f)\n",
+                init_ms, setup_ms, compile_ms, load_ms, warmup_ms);
+    std::printf("inference: %.3f ms (avg over %d iter%s, steady-state)\n",
+                infer_ms, iters, iters > 1 ? "s" : "");
+    std::printf("keypoints: %d/%d visible\n", visible, NKPT);
+    std::printf("peak memory: %ld KB\n", peak_kb);
     std::printf(
-      "============================================================\n");
+      "=============================================================\n");
+    std::printf("[e2e time]: %.0f ms  (init %.0f + %d x infer %.1f)\n", e2e_ms,
+                init_ms, iters, infer_ms);
     std::printf("Max Resident Set Size: %ld KB\n", peak_kb);
 
     return 0;
