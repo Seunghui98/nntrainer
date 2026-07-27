@@ -318,10 +318,14 @@ static int run_shape(uint8_t *vtcm_base, uint32_t vtcm_size, const shape_t *s) {
   vtcm_plan p = plan_vtcm(M, K, N, vtcm_size);
 
   const uint32_t need = p.result_offset + ACC_TILE_BYTES;
+  // Every uint32_t is cast: on Hexagon uint32_t is unsigned long, so a bare %u
+  // against one is a -Wformat error, and the example builds with -Werror.
   printf("[%s] M=%u N=%u K=%u | tiles k=%u n=%u | VTCM need=%u (act=%u wt=%u) "
          "avail=%u%s\n",
-         s->name, M, N, K, p.k_tiles, p.n_tiles, need, p.act_bytes, p.wt_bytes,
-         p.config_offset, p.fits ? "" : "  <-- DOES NOT FIT, skipping");
+         s->name, (unsigned)M, (unsigned)N, (unsigned)K, (unsigned)p.k_tiles,
+         (unsigned)p.n_tiles, (unsigned)need, (unsigned)p.act_bytes,
+         (unsigned)p.wt_bytes, (unsigned)p.config_offset,
+         p.fits ? "" : "  <-- DOES NOT FIT, skipping");
   if (!p.fits)
     return AEE_SUCCESS;
 
