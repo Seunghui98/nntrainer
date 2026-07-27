@@ -182,7 +182,17 @@ static nntrainer::Tensor makeWeightNK(const std::vector<float> &W, int N,
 }
 
 // End-to-end u8i{bits} pipeline relative error against an FP32 reference,
-// using the *production* quantize_qint{4,8}_weight for the weights.
+// using the *production* scale / zp_corr from quantize_qint{4,8}_weight.
+//
+// The codes fed to the emulated integer GEMM come from refWeightQuant, not
+// from q.getData(): cpuIntGemm indexes row-major [N, K], and with ENABLE_HEXKL
+// the production payload has been reordered into the HMX-tiled WH layout (and
+// nibble-packed, for int4) by sdkl_cpu_rm_to_wh_i{4,8}. The two agree
+// value-for-value before that conversion -- QInt{4,8}Weight_ScaleZpCorr_
+// MatchReference asserts exactly that on host builds -- so this substitution
+// changes nothing numerically while keeping the helper layout-independent.
+// What is under test here is the production scale / zp_corr and the dequant
+// formula, both of which stay real on every build.
 static float pipelineRelErr(int M, int N, int K, int bits, uint32_t seed) {
   const int q_max = (bits == 4) ? 7 : 127;
   auto A = randVec(M * K, -1.0f, 1.0f, seed);
@@ -192,16 +202,16 @@ static float pipelineRelErr(int M, int N, int K, int bits, uint32_t seed) {
   nntrainer::Tensor q = (bits == 4)
                           ? nntrainer::quantize_qint4_weight(wt, false)
                           : nntrainer::quantize_qint8_weight(wt, false);
-  const int8_t *w_q = q.getData<int8_t>();     // [N*K] logical [N,K] on host
   const float *scale = q.getScale<float>();    // [N]
   const int32_t *zp_corr = q.getZpCorr<int32_t>(); // [N]
 
+  WeightQuant ref = refWeightQuant(W.data(), N, K, q_max);
+
   float act_scale = 1.0f;
   auto x_u8 = quantizeActU8(A.data(), M, K, act_scale);
-  auto c_i32 = cpuIntGemm(M, N, K, x_u8.data(), w_q);
+  auto c_i32 = cpuIntGemm(M, N, K, x_u8.data(), ref.w_q.data());
   auto c_deq = dequant(c_i32.data(), M, N, act_scale, scale, zp_corr);
   auto c_ref = cpuGemmF32(M, N, K, A.data(), W.data());
-  (void)q_max;
   return relErr(c_deq, c_ref);
 }
 
