@@ -292,6 +292,14 @@ struct Timing {
   double whpack_us = 0.0;     // RM -> WH pack (offline at bake time)
   // --- informational ---
   double cold_us = 0.0; // first execute
+  // A mean alone hides how unstable a run was. Once host threads are involved
+  // the worker wake-up (futex, across big.LITTLE under DVFS) can dominate a
+  // single iteration, and the same configuration has been seen to swing 5x
+  // run to run. min is the cleanest read of what the path can do; the spread
+  // between min and max says how much of a difference is scheduling noise.
+  double kernel_min_us = 0.0;
+  double kernel_med_us = 0.0;
+  double kernel_max_us = 0.0;
 
   double perCallUs() const { return h2d_act_us + kernel_us + d2h_us; }
   double oneTimeUs() const { return alloc_us + h2d_weight_us + whpack_us; }
@@ -304,6 +312,20 @@ struct QResult {
   Timing t;
   bool on_npu = false;
 };
+
+/** @brief Fold per-iteration samples into mean/min/median/max. */
+static void summarize(std::vector<double> &samples, Timing &tm) {
+  if (samples.empty())
+    return;
+  std::sort(samples.begin(), samples.end());
+  double sum = 0.0;
+  for (double v : samples)
+    sum += v;
+  tm.kernel_us = sum / samples.size();
+  tm.kernel_min_us = samples.front();
+  tm.kernel_med_us = samples[samples.size() / 2];
+  tm.kernel_max_us = samples.back();
+}
 
 static inline double usSince(std::chrono::steady_clock::time_point s) {
   return std::chrono::duration<double, std::micro>(
@@ -391,13 +413,14 @@ static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
   // Warmup (discarded), then steady-state NetRun mean.
   for (int i = 0; i < warmup; ++i)
     call();
-  double sum = 0.0;
+  std::vector<double> samples;
+  samples.reserve(iters > 0 ? iters : 0);
   for (int i = 0; i < iters; ++i) {
     auto t0 = clk::now();
     call();
-    sum += usSince(t0);
+    samples.push_back(usSince(t0));
   }
-  tm.kernel_us = iters > 0 ? sum / iters : 0.0;
+  summarize(samples, tm);
   if (rc != 0)
     return false;
 
@@ -487,13 +510,14 @@ static bool runViaNntrainer(int M, int N, int K, int bits,
 
     for (int i = 0; i < warmup; ++i)
       call();
-    double sum = 0.0;
+    std::vector<double> samples;
+    samples.reserve(iters > 0 ? iters : 0);
     for (int i = 0; i < iters; ++i) {
       auto t0 = std::chrono::steady_clock::now();
       call();
-      sum += usSince(t0);
+      samples.push_back(usSince(t0));
     }
-    tm.kernel_us = iters > 0 ? sum / iters : 0.0;
+    summarize(samples, tm);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "[warn] nntrainer kernel failed: %s\n", e.what());
     return false;
@@ -549,13 +573,14 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
   (void)warmup;
   c_i32.assign((size_t)M * N, 0);
   int it = std::max(1, iters);
-  double sum = 0.0;
+  std::vector<double> samples;
+  samples.reserve(it);
   for (int i = 0; i < it; ++i) {
     auto t0 = std::chrono::steady_clock::now();
     cpuIntGemm(M, N, K, x.data(), wq.w_q.data(), c_i32.data());
-    sum += usSince(t0);
+    samples.push_back(usSince(t0));
   }
-  r.t.kernel_us = sum / it;
+  summarize(samples, r.t);
   r.on_npu = false;
   r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
   return r;
@@ -775,8 +800,11 @@ int main(int argc, char **argv) {
       std::printf("  Cold run (first call, uploads weight)  %10.1f\n",
                   r.t.cold_us);
       std::printf("  Steady state (weight resident)         %10.1f   <- "
-                  "per-call cost\n",
+                  "per-call cost (mean)\n",
                   r.t.kernel_us);
+      std::printf("    min / median / max                   %10.1f /%8.1f /"
+                  "%8.1f\n",
+                  r.t.kernel_min_us, r.t.kernel_med_us, r.t.kernel_max_us);
       return;
     }
     std::printf("  Cold run (first execute)               %10.1f\n",
@@ -787,6 +815,9 @@ int main(int argc, char **argv) {
                 r.t.h2d_act_us);
     std::printf("    Steady NetRun (mean execute)         %10.1f   <- compute\n",
                 r.t.kernel_us);
+    std::printf("      min / median / max                 %10.1f /%8.1f /"
+                "%8.1f\n",
+                r.t.kernel_min_us, r.t.kernel_med_us, r.t.kernel_max_us);
     std::printf("    D2H int32 accumulator                %10.1f\n", r.t.d2h_us);
     std::printf("  ONE-TIME in production                 %10.1f\n",
                 r.t.oneTimeUs());
