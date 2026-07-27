@@ -655,6 +655,7 @@ void prefillWHCacheClear() {
 #include <mutex>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace nntrainer {
 namespace hmx {
@@ -754,38 +755,60 @@ void *residentIntWeight(const void *host_wh, size_t bytes) {
   return npu;
 }
 
+// Cap on total NPU bytes held by each scratch pool.
+static constexpr size_t SCRATCH_MAX_BYTES = 32ull * 1024 * 1024; // 32 MB
+
 /**
- * @brief Grow-only NPU scratch buffer reused across calls.
+ * @brief NPU scratch buffers keyed by exact byte size.
  *
- * Shapes vary (prefill vs decode), so the buffer is reallocated only when a
- * call needs more bytes than the current one holds; smaller calls reuse it
- * as-is.
+ * Handing sdkl an oversized buffer left over from a larger shape does not
+ * work: reusing one buffer across differing (M, N, K) produced wrong results
+ * on device (caught by
+ * HtpU8i4Test.ScratchPool_HandlesGrowingAndShrinkingShapes), so each distinct
+ * size gets its own buffer. That still removes the per-call allocation for the
+ * case that matters -- a given FC layer keeps its shape, and M is constant
+ * within a prefill pass and 1 while decoding -- so the map stays small (a
+ * handful of entries per model). SCRATCH_MAX_BYTES caps the total anyway,
+ * evicting in insertion order.
  */
 struct NpuScratch {
-  void *buf = nullptr;
-  size_t bytes = 0;
+  std::map<size_t, void *> bufs;
+  std::vector<size_t> order; // insertion order, for eviction
+  size_t total_bytes = 0;
   std::mutex mtx;
 
-  /** @brief Return a buffer of at least `need` bytes, or nullptr on failure. */
+  /** @brief Return a buffer of exactly `need` bytes, or nullptr on failure. */
   void *get(size_t need) {
     std::lock_guard<std::mutex> lock(mtx);
-    if (buf != nullptr && bytes >= need)
-      return buf;
+    auto it = bufs.find(need);
+    if (it != bufs.end())
+      return it->second;
 
     void *fresh = nullptr;
     if (sdkl_npu_alloc(need, &fresh) != 0 || fresh == nullptr)
       return nullptr;
 
-    if (buf != nullptr)
-      npuFreeIfAlive(buf);
-    buf = fresh;
-    bytes = need;
-    return buf;
+    // Evict oldest entries until the new one fits under the cap.
+    while (!order.empty() && total_bytes + need > SCRATCH_MAX_BYTES) {
+      const size_t oldest = order.front();
+      order.erase(order.begin());
+      auto old = bufs.find(oldest);
+      if (old != bufs.end()) {
+        npuFreeIfAlive(old->second);
+        total_bytes -= oldest;
+        bufs.erase(old);
+      }
+    }
+
+    bufs.emplace(need, fresh);
+    order.push_back(need);
+    total_bytes += need;
+    return fresh;
   }
 
   ~NpuScratch() {
-    if (buf != nullptr)
-      npuFreeIfAlive(buf);
+    for (auto &b : bufs)
+      npuFreeIfAlive(b.second);
   }
 };
 
