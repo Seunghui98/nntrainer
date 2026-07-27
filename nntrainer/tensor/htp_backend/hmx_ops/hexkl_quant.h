@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -246,13 +247,32 @@ inline void dequantizeToF32Neon(const int32_t *C_i32, float *C, size_t M,
 // NEON where the target has it, the scalar reference everywhere else. Both are
 // kept compiled so the tests can assert they agree.
 
+/**
+ * @brief Runtime override: NNTR_HTP_NO_SIMD=1 forces the scalar path.
+ *
+ * Exists so the NEON gain can be measured as an A/B on one binary, in one
+ * session, on one device. Comparing against a number from an earlier build is
+ * how a mismatched executable/library pair got mistaken for a 264 us result;
+ * a switch removes every variable except the one under test.
+ *
+ * Read once into a function-local static -- thread-safe since C++11, and a
+ * plain load after the first call, so the hot path pays nothing measurable.
+ */
+inline bool simdDisabledByEnv() {
+  static const bool off = [] {
+    const char *e = std::getenv("NNTR_HTP_NO_SIMD");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return off;
+}
+
 /** @brief Largest |A[i]| over n, skipping non-finite values. */
 inline float activationMaxAbs(const float *A, size_t n) {
 #if defined(HEXKL_QUANT_NEON)
-  return activationMaxAbsNeon(A, n);
-#else
-  return activationMaxAbsScalar(A, n);
+  if (!simdDisabledByEnv())
+    return activationMaxAbsNeon(A, n);
 #endif
+  return activationMaxAbsScalar(A, n);
 }
 
 /** @brief Quantize FP32 activations to U8, padding rows [M, Mp) with the zp. */
@@ -260,10 +280,12 @@ inline void quantizeActivationU8(const float *A, uint8_t *X, size_t M,
                                  size_t Mp, size_t K, float inv_act_scale,
                                  float zero_point) {
 #if defined(HEXKL_QUANT_NEON)
-  quantizeActivationU8Neon(A, X, M, Mp, K, inv_act_scale, zero_point);
-#else
-  quantizeActivationU8Scalar(A, X, M, Mp, K, inv_act_scale, zero_point);
+  if (!simdDisabledByEnv()) {
+    quantizeActivationU8Neon(A, X, M, Mp, K, inv_act_scale, zero_point);
+    return;
+  }
 #endif
+  quantizeActivationU8Scalar(A, X, M, Mp, K, inv_act_scale, zero_point);
 }
 
 /** @brief C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]). */
@@ -271,16 +293,23 @@ inline void dequantizeToF32(const int32_t *C_i32, float *C, size_t M, size_t N,
                             float act_scale, const float *wt_scale,
                             const int32_t *zp_corr) {
 #if defined(HEXKL_QUANT_NEON)
-  dequantizeToF32Neon(C_i32, C, M, N, act_scale, wt_scale, zp_corr);
-#else
-  dequantizeToF32Scalar(C_i32, C, M, N, act_scale, wt_scale, zp_corr);
+  if (!simdDisabledByEnv()) {
+    dequantizeToF32Neon(C_i32, C, M, N, act_scale, wt_scale, zp_corr);
+    return;
+  }
 #endif
+  dequantizeToF32Scalar(C_i32, C, M, N, act_scale, wt_scale, zp_corr);
 }
 
-/** @brief True when the dispatched routines above use the NEON path. */
+/**
+ * @brief True when the dispatched routines above really take the NEON path.
+ *
+ * Reflects the runtime override too, so a profile that says "NEON" was not
+ * merely compiled with it available.
+ */
 inline bool neonEnabled() {
 #if defined(HEXKL_QUANT_NEON)
-  return true;
+  return !simdDisabledByEnv();
 #else
   return false;
 #endif
