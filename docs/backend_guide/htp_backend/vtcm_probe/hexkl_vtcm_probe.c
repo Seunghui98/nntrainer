@@ -40,8 +40,25 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "HAP_perf.h"
 #include "hexkl_micro.h"
+
+/*
+ * Cycle counter. The addon example builds standalone for the Hexagon
+ * simulator, where the FastRPC-oriented HAP_perf may not link, so the
+ * simulator timer is the default. Only the ratio between the two kernels is
+ * read, so any monotonic cycle count will do -- if neither builds, substitute
+ * whatever counter the toolchain offers.
+ *
+ *   default            hexagon_sim_timer.h  (simulator)
+ *   -DUSE_HAP_PERF     HAP_perf.h           (on-target, FastRPC present)
+ */
+#if defined(USE_HAP_PERF)
+#include "HAP_perf.h"
+#define READ_PCYCLES() HAP_perf_get_pcycles()
+#else
+#include "hexagon_sim_timer.h"
+#define READ_PCYCLES() hexagon_sim_read_pcycles()
+#endif
 
 // Bytes per packed int4 weight tile: 32x32 values, two per byte.
 #define WT_TILE_BYTES (512U)
@@ -262,17 +279,35 @@ static int matmul_resident(uint8_t *vtcm_base, const vtcm_plan *p,
 typedef struct {
   const char *name;
   uint32_t M, N, K;
+  bool verify; // run the scalar reference and compare
 } shape_t;
 
-// q_proj is the shape the host-side numbers were taken at; the smaller ones
-// come first so a memory or VTCM limit shows up before the largest allocation.
+/*
+ * q_proj is the shape the host-side numbers were taken at; the smaller ones
+ * come first so a memory or VTCM limit shows up before the largest allocation,
+ * and so that a run stopped early still leaves usable output.
+ *
+ * verify is off for the large shapes on purpose. The reference is scalar C --
+ * q_proj alone is 64*2048*1024 = 134M multiply-accumulates, which on a
+ * cycle-accurate simulator costs far more than everything being measured. The
+ * kernels do not branch on the shape, so proving them on the small shapes
+ * proves them; -DPROBE_VERIFY_ALL forces the rest on if you disagree.
+ *
+ * -DPROBE_SHAPES=N runs only the first N.
+ */
 static const shape_t SHAPES[] = {
-  {"sample     ", 64, 128, 128},
-  {"small      ", 64, 256, 256},
-  {"medium     ", 64, 1024, 1024},
-  {"q_proj     ", 64, 2048, 1024},
-  {"ffn_up     ", 64, 3072, 1024},
+  {"sample     ", 64, 128, 128, true},
+  {"small      ", 64, 256, 256, true},
+  {"medium     ", 64, 1024, 1024, false},
+  {"q_proj     ", 64, 2048, 1024, false},
+  {"ffn_up     ", 64, 3072, 1024, false},
 };
+
+#define SHAPE_COUNT (sizeof(SHAPES) / sizeof(SHAPES[0]))
+
+#if !defined(PROBE_SHAPES)
+#define PROBE_SHAPES SHAPE_COUNT
+#endif
 
 static int run_shape(uint8_t *vtcm_base, uint32_t vtcm_size, const shape_t *s) {
   const uint32_t M = s->M, N = s->N, K = s->K;
@@ -290,14 +325,23 @@ static int run_shape(uint8_t *vtcm_base, uint32_t vtcm_size, const shape_t *s) {
   if (!p.fits)
     return AEE_SUCCESS;
 
+#if defined(PROBE_VERIFY_ALL)
+  const bool verify = true;
+#else
+  const bool verify = s->verify;
+#endif
+
   uint8_t *act = (uint8_t *)malloc(act_n);
-  int8_t *wt_rm = (int8_t *)malloc(wt_n);          // one int4 per byte
-  uint8_t *wt_packed = (uint8_t *)malloc(wt_n / 2); // reference input
-  int32_t *out_ref = (int32_t *)malloc(out_n * sizeof(int32_t));
+  int8_t *wt_rm = (int8_t *)malloc(wt_n); // one int4 per byte
   int32_t *out_base = (int32_t *)malloc(out_n * sizeof(int32_t));
   int32_t *out_res = (int32_t *)malloc(out_n * sizeof(int32_t));
+  // Reference input and output, allocated only when the check runs.
+  uint8_t *wt_packed = verify ? (uint8_t *)malloc(wt_n / 2) : NULL;
+  int32_t *out_ref =
+    verify ? (int32_t *)malloc(out_n * sizeof(int32_t)) : NULL;
 
-  if (!act || !wt_rm || !wt_packed || !out_ref || !out_base || !out_res) {
+  if (!act || !wt_rm || !out_base || !out_res ||
+      (verify && (!wt_packed || !out_ref))) {
     printf("  [SKIP] out of memory on the DSP heap for this shape\n");
     free(act); free(wt_rm); free(wt_packed);
     free(out_ref); free(out_base); free(out_res);
@@ -312,18 +356,19 @@ static int run_shape(uint8_t *vtcm_base, uint32_t vtcm_size, const shape_t *s) {
       v |= (int8_t)0xF0; // sign-extend into [-8, 7]
     wt_rm[i] = v;
   }
-  for (size_t i = 0; i < wt_n / 2; i++)
-    wt_packed[i] = pack_i4(wt_rm[2 * i], wt_rm[2 * i + 1]);
-
-  matmul_u8i4_ref(M, K, N, out_ref, act, wt_packed);
+  if (verify) {
+    for (size_t i = 0; i < wt_n / 2; i++)
+      wt_packed[i] = pack_i4(wt_rm[2 * i], wt_rm[2 * i + 1]);
+    matmul_u8i4_ref(M, K, N, out_ref, act, wt_packed);
+  }
 
   int rc;
   uint64_t c0, c_base, c_load, c_first, c_second;
 
   memset(out_base, 0, out_n * sizeof(int32_t));
-  c0 = HAP_perf_get_pcycles();
+  c0 = READ_PCYCLES();
   rc = matmul_baseline(vtcm_base, &p, M, K, N, out_base, act, wt_rm);
-  c_base = HAP_perf_get_pcycles() - c0;
+  c_base = READ_PCYCLES() - c0;
   if (rc != AEE_SUCCESS) {
     printf("  [FAIL] baseline rc=%d\n", rc);
     goto done;
@@ -331,16 +376,16 @@ static int run_shape(uint8_t *vtcm_base, uint32_t vtcm_size, const shape_t *s) {
 
   // First resident call: conversion up front, then the matmul.
   memset(out_res, 0, out_n * sizeof(int32_t));
-  c0 = HAP_perf_get_pcycles();
+  c0 = READ_PCYCLES();
   rc = load_weight_resident(vtcm_base, &p, N, wt_rm);
-  c_load = HAP_perf_get_pcycles() - c0;
+  c_load = READ_PCYCLES() - c0;
   if (rc != AEE_SUCCESS) {
     printf("  [FAIL] weight load rc=%d\n", rc);
     goto done;
   }
-  c0 = HAP_perf_get_pcycles();
+  c0 = READ_PCYCLES();
   rc = matmul_resident(vtcm_base, &p, M, K, N, out_res, act);
-  c_first = HAP_perf_get_pcycles() - c0;
+  c_first = READ_PCYCLES() - c0;
   if (rc != AEE_SUCCESS) {
     printf("  [FAIL] resident matmul rc=%d\n", rc);
     goto done;
@@ -349,25 +394,36 @@ static int run_shape(uint8_t *vtcm_base, uint32_t vtcm_size, const shape_t *s) {
   // Second call on the same weight: the tiles are still in VTCM, so this is
   // what every call after the first costs.
   memset(out_res, 0, out_n * sizeof(int32_t));
-  c0 = HAP_perf_get_pcycles();
+  c0 = READ_PCYCLES();
   rc = matmul_resident(vtcm_base, &p, M, K, N, out_res, act);
-  c_second = HAP_perf_get_pcycles() - c0;
+  c_second = READ_PCYCLES() - c0;
   if (rc != AEE_SUCCESS) {
     printf("  [FAIL] resident matmul (repeat) rc=%d\n", rc);
     goto done;
   }
 
   {
-    const long d_base = diff_index_i32(out_n, out_ref, out_base);
-    const long d_res = diff_index_i32(out_n, out_ref, out_res);
-    if (d_base >= 0)
-      printf("  [FAIL] baseline differs from reference at %ld (%ld vs %ld)\n",
-             d_base, (long)out_ref[d_base], (long)out_base[d_base]);
-    if (d_res >= 0)
-      printf("  [FAIL] resident differs from reference at %ld (%ld vs %ld)\n",
-             d_res, (long)out_ref[d_res], (long)out_res[d_res]);
-    if (d_base < 0 && d_res < 0)
-      printf("  [OK] both match the reference exactly\n");
+    if (verify) {
+      const long d_base = diff_index_i32(out_n, out_ref, out_base);
+      const long d_res = diff_index_i32(out_n, out_ref, out_res);
+      if (d_base >= 0)
+        printf("  [FAIL] baseline differs from reference at %ld (%ld vs %ld)\n",
+               d_base, (long)out_ref[d_base], (long)out_base[d_base]);
+      if (d_res >= 0)
+        printf("  [FAIL] resident differs from reference at %ld (%ld vs %ld)\n",
+               d_res, (long)out_ref[d_res], (long)out_res[d_res]);
+      if (d_base < 0 && d_res < 0)
+        printf("  [OK] both match the reference exactly\n");
+    } else {
+      // Not a correctness statement -- only that the two kernels agree. The
+      // reference ran on the small shapes; see the comment on SHAPES.
+      const long d_pair = diff_index_i32(out_n, out_base, out_res);
+      if (d_pair >= 0)
+        printf("  [FAIL] baseline and resident disagree at %ld (%ld vs %ld)\n",
+               d_pair, (long)out_base[d_pair], (long)out_res[d_pair]);
+      else
+        printf("  [OK] baseline and resident agree (reference skipped)\n");
+    }
 
     printf("  pcycles  baseline=%llu  load=%llu  resident_1st=%llu  "
            "resident_2nd=%llu\n",
@@ -412,8 +468,14 @@ int main(void) {
     return res;
   }
 
-  for (size_t i = 0; i < sizeof(SHAPES) / sizeof(SHAPES[0]); i++)
-    run_shape(vtcm_base, vtcm_size, &SHAPES[i]);
+  {
+    const size_t n = (PROBE_SHAPES) < SHAPE_COUNT ? (PROBE_SHAPES) : SHAPE_COUNT;
+    for (size_t i = 0; i < n; i++)
+      run_shape(vtcm_base, vtcm_size, &SHAPES[i]);
+    if (n < SHAPE_COUNT)
+      printf("[VTCM PROBE] %u of %u shapes run (PROBE_SHAPES)\n", (unsigned)n,
+             (unsigned)SHAPE_COUNT);
+  }
 
   res2 = hexkl_micro_hmx_unlock();
   if (res2 != AEE_SUCCESS)

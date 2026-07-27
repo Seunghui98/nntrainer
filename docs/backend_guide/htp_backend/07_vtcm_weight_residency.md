@@ -68,12 +68,16 @@ Each stage answers a question before the next one costs anything.
 
 ### 3.1 Does the toolchain work, and how big is VTCM?
 
-Build and run the SDK's micro sample unmodified.
+Build and run the SDK's micro sample unmodified. It targets the Hexagon
+simulator, so this needs no device.
 
 ```bash
-export HEXAGON_SDK_ROOT=<Hexagon_SDK>/6.4.0.2
+source $HEXAGON_SDK_ROOT/setup_sdk_env.source
 export HEXKL_SDK_ROOT=$HEXAGON_SDK_ROOT/addons/hexkl_addon
-# build per the addon's own example instructions (hexagon-clang, V79 target)
+
+cd $HEXKL_SDK_ROOT/examples/hexkl_micro_hmx_mm_u8i4_i32
+./build.sh --hex-arch v79
+./run_simulator.sh --hex-arch v79
 ```
 
 Its `main()` already prints what is needed:
@@ -87,9 +91,15 @@ does not pass, stop here — nothing below is reachable until it does.
 
 ### 3.2 Does hoisting the conversion actually help?
 
-Modify the sample's kernel as in §5, and time both versions **on the DSP**
-(`HAP_perf_get_pcycles()` around the matmul; the sample has no timing of its
-own). Keep it standalone — no FastRPC, no nntrainer.
+`vtcm_probe/hexkl_vtcm_probe.c` is that experiment, written as a drop-in
+replacement for the sample above: same includes, same `main()` shape, so it
+builds with the same two scripts. It runs the sample's per-tile structure and
+the §5 structure over identical data, times both in pcycles, and checks both
+against a scalar reference. See [vtcm_probe/README.md](vtcm_probe/README.md).
+
+Being a simulator, it is deterministic — none of the jitter that made the
+host-side threading numbers unreadable — but its absolute cycle counts are not
+device times. Read the ratio, not the magnitude.
 
 This measures the hypothesis directly:
 
