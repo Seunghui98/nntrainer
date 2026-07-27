@@ -283,25 +283,51 @@ buildFcModel(int M, int N, int K, const std::string &weight_dtype) {
   return nn;
 }
 
-/** @brief The dense layer's weight and bias tensors, by name. */
+/**
+ * @brief The dense layer's weight and bias tensors.
+ *
+ * Located by walking the graph for a node that owns weights, rather than by
+ * matching the layer name against the tensor name: nntrainer decorates weight
+ * names, and a substring match on "dense" silently found nothing. fc_layer
+ * requests "weight" first and "bias" second, so index order is the reliable
+ * key, with the recorded names used only to confirm it.
+ *
+ * getRunContext() throws on a node that has none, so each is guarded.
+ */
 bool findWeights(nntrainer::NeuralNetwork *nn, nntrainer::Tensor **weight,
-                 nntrainer::Tensor **bias) {
+                 nntrainer::Tensor **bias, bool verbose) {
   *weight = nullptr;
   *bias = nullptr;
   for (auto &node : nn->getFlatGraph()) {
-    auto &rc = node->getRunContext();
-    for (unsigned int w = 0; w < rc.getNumWeights(); ++w) {
-      auto &t = rc.getWeight(w);
-      const std::string nm = t.getName();
-      if (nm.find("dense") == std::string::npos)
-        continue;
-      if (nm.find("bias") != std::string::npos)
-        *bias = &t;
-      else
-        *weight = &t;
+    unsigned int nw = 0;
+    try {
+      nw = node->getRunContext().getNumWeights();
+    } catch (...) {
+      continue; // no run context: input layers and the like
     }
+    if (nw == 0)
+      continue;
+
+    auto &rc = node->getRunContext();
+    if (verbose) {
+      std::printf("  [graph] node '%s' (%s) has %u weight(s):", 
+                  node->getName().c_str(), node->getType().c_str(), nw);
+      for (unsigned int w = 0; w < nw; ++w)
+        std::printf(" %s", rc.getWeightName(w).c_str());
+      std::printf("\n");
+    }
+
+    for (unsigned int w = 0; w < nw; ++w) {
+      const std::string nm = rc.getWeightName(w);
+      if (nm.find("bias") != std::string::npos)
+        *bias = &rc.getWeight(w);
+      else if (*weight == nullptr)
+        *weight = &rc.getWeight(w);
+    }
+    if (*weight != nullptr)
+      return true;
   }
-  return *weight != nullptr;
+  return false;
 }
 
 void printHead(const char *tag, const std::vector<float> &v, int n) {
@@ -352,7 +378,7 @@ int main(int argc, char **argv) {
   try {
     auto nn = buildFcModel(a.M, a.N, a.K, "");
     nntrainer::Tensor *w = nullptr, *b = nullptr;
-    if (!findWeights(nn.get(), &w, &b)) {
+    if (!findWeights(nn.get(), &w, &b, true)) {
       std::printf("error: could not locate the dense weight\n");
       return 1;
     }
@@ -377,7 +403,7 @@ int main(int argc, char **argv) {
     try {
       auto nn = buildFcModel(a.M, a.N, a.K, "QINT4_HTP");
       nntrainer::Tensor *w = nullptr, *b = nullptr;
-      if (!findWeights(nn.get(), &w, &b)) {
+      if (!findWeights(nn.get(), &w, &b, true)) {
         std::printf("error: could not locate the dense QINT4_HTP weight\n");
         return 1;
       }
