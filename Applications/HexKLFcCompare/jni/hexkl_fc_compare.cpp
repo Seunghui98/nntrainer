@@ -230,16 +230,30 @@ static std::vector<float> dequant(const int32_t *c_i32, int M, int N,
 // Per-phase timing (microseconds). "movement" = everything that loads/moves
 // data (NPU alloc + host->NPU copies + WH layout pack + NPU->host copy);
 // "compute" = the sdkl_npu_mm kernel only.
+// Timing split by what a real inference actually pays per call.
+//
+// In production the weight is quantized and WH-packed OFFLINE (nntr_quantize)
+// and would be uploaded to the NPU once and kept resident, exactly like QNN
+// keeps weights in its context binary. Only the activation upload, the kernel
+// and the result download are truly per-call. The current kernel does not have
+// a resident-weight cache for u8i8/u8i4, so it re-pays the weight cost on every
+// call -- reported separately so the gap is visible.
 struct Timing {
-  double alloc_us = 0.0;  // sdkl_npu_alloc of X / C / weight buffers
-  double h2d_us = 0.0;    // host -> NPU copies (activation + weight)
-  double whpack_us = 0.0; // RM -> WH weight layout conversion
-  double cold_us = 0.0;   // first execute (cold; includes first-call setup)
-  double kernel_us = 0.0; // steady-state sdkl_npu_mm mean = NetRun (compute)
-  double d2h_us = 0.0;    // NPU -> host copy of the int32 accumulator
-  double movement_us() const {
-    return alloc_us + h2d_us + whpack_us + d2h_us;
-  }
+  // --- per call (unavoidable) ---
+  double h2d_act_us = 0.0; // host -> NPU activation upload
+  double kernel_us = 0.0;  // steady-state sdkl_npu_mm mean (execute)
+  double d2h_us = 0.0;     // NPU -> host int32 accumulator download
+  // --- one-time in production (per call in the current implementation) ---
+  double alloc_us = 0.0;      // sdkl_npu_alloc of X / C / weight buffers
+  double h2d_weight_us = 0.0; // host -> NPU weight upload
+  double whpack_us = 0.0;     // RM -> WH pack (offline at bake time)
+  // --- informational ---
+  double cold_us = 0.0; // first execute
+
+  double perCallUs() const { return h2d_act_us + kernel_us + d2h_us; }
+  double oneTimeUs() const { return alloc_us + h2d_weight_us + whpack_us; }
+  // What the current implementation actually costs on every call.
+  double currentPerCallUs() const { return perCallUs() + oneTimeUs(); }
 };
 
 struct QResult {
@@ -288,12 +302,16 @@ static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
     return false;
   tm.alloc_us = usSince(ta);
 
-  // --- H2D: activation (pad rows to zp=128) + weight into NPU buffers ---
-  auto th = clk::now();
+  // --- H2D activation (per call): pad rows to zp=128, then upload ---
+  auto tha = clk::now();
   std::memset(Xb.p, 128, (size_t)Mp * K);
   std::memcpy(Xb.p, x.data(), (size_t)M * K);
+  tm.h2d_act_us = usSince(tha);
+
+  // --- H2D weight (one-time in production; per call today) ---
+  auto thw = clk::now();
   std::memcpy(bits == 4 ? Wi4src.p : Wbuf.p, wq.w_q.data(), nk);
-  tm.h2d_us = usSince(th);
+  tm.h2d_weight_us = usSince(thw);
 
   // --- WH pack: RM -> WH weight layout ---
   auto tp = clk::now();
@@ -517,29 +535,39 @@ int main(int argc, char **argv) {
                 r.on_npu ? "NPU/HMX" : "CPU-emulated");
     std::printf("  Cold run (first execute)               %10.1f\n",
                 r.t.cold_us);
-    std::printf("  Steady-state NetRun (mean execute)     %10.1f   <- compute\n",
+    std::printf("  PER CALL (unavoidable)                 %10.1f\n",
+                r.t.perCallUs());
+    std::printf("    H2D activation upload                %10.1f\n",
+                r.t.h2d_act_us);
+    std::printf("    Steady NetRun (mean execute)         %10.1f   <- compute\n",
                 r.t.kernel_us);
-    std::printf("  Data movement (host-side)              %10.1f\n",
-                r.t.movement_us());
-    std::printf("    alloc                                %10.1f\n",
+    std::printf("    D2H int32 accumulator                %10.1f\n", r.t.d2h_us);
+    std::printf("  ONE-TIME in production                 %10.1f\n",
+                r.t.oneTimeUs());
+    std::printf("    alloc (X/C/W buffers)                %10.1f\n",
                 r.t.alloc_us);
-    std::printf("    H2D copy (act + weight)              %10.1f\n", r.t.h2d_us);
-    std::printf("    WH pack (RM->WH weight)              %10.1f\n",
+    std::printf("    H2D weight upload                    %10.1f\n",
+                r.t.h2d_weight_us);
+    std::printf("    WH pack (offline at bake time)       %10.1f\n",
                 r.t.whpack_us);
-    std::printf("    D2H copy (int32 accumulator)         %10.1f\n", r.t.d2h_us);
+    std::printf("  => today's per-call cost               %10.1f  (no resident"
+                "-weight cache yet)\n",
+                r.t.currentPerCallUs());
   };
   dumpMethod("u8i8", e8, r8);
   dumpMethod("u8i4", e4, r4);
 
-  // Compact comparison table.
-  std::printf("\n| method | relErr vs FP32 | compute us | movement us | engine "
-              "|\n");
-  std::printf("|---|---|---|---|---|\n");
-  std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %8.1f | %s |\n", e8,
-              r8.t.kernel_us, r8.t.movement_us(),
+  // Compact comparison table. "per-call (ideal)" is what the kernel would cost
+  // once the weight is uploaded once and kept resident (what QNN does via its
+  // context binary); "today" is what the current implementation pays per call.
+  std::printf("\n| method | relErr vs FP32 | compute us | per-call ideal us | "
+              "today us | engine |\n");
+  std::printf("|---|---|---|---|---|---|\n");
+  std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %8.1f | %8.1f | %s |\n",
+              e8, r8.t.kernel_us, r8.t.perCallUs(), r8.t.currentPerCallUs(),
               r8.on_npu ? "NPU/HMX" : "CPU-emulated");
-  std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %8.1f | %s |\n", e4,
-              r4.t.kernel_us, r4.t.movement_us(),
+  std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %8.1f | %8.1f | %s |\n",
+              e4, r4.t.kernel_us, r4.t.perCallUs(), r4.t.currentPerCallUs(),
               r4.on_npu ? "NPU/HMX" : "CPU-emulated");
 
   std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "
