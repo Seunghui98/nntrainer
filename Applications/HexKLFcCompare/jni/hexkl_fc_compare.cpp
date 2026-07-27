@@ -454,8 +454,30 @@ static bool runViaNntrainer(int M, int N, int K, int bits,
                                       wq.zp_corr.data(), C_out.data());
   };
 
+  // libnntrainer brings the CDSP session up lazily, inside the first kernel
+  // call. Absorb that here on a throwaway weight so the cold-run figure below
+  // measures the weight upload rather than a one-off backend init.
+  {
+    const int dN = 32, dK = 32, dM = 64;
+    NpuBuf dsrc((size_t)dN * dK), dwh((size_t)dN * dK);
+    if (dsrc.ok() && dwh.ok()) {
+      std::vector<int8_t> dw((size_t)dN * dK, 1);
+      std::memcpy(dsrc.p, dw.data(), dw.size());
+      std::vector<float> dA((size_t)dM * dK, 0.5f), dC((size_t)dM * dN, 0.0f);
+      std::vector<float> dscale(dN, 1.0f / 7.0f);
+      std::vector<int32_t> dzp(dN, 128 * dK);
+      if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(dwh.p),
+                               static_cast<int8_t *>(dsrc.p), (size_t)dK,
+                               (size_t)dN) == 0) {
+        nntrainer::hmx::shgemm_u8i4_i32(dM, dN, dK, dA.data(),
+                                        static_cast<const int8_t *>(dwh.p),
+                                        dscale.data(), dzp.data(), dC.data());
+      }
+    }
+  }
+
   auto tc = std::chrono::steady_clock::now();
-  call(); // first call: uploads the weight
+  call(); // first call on the real weight: uploads it into NPU memory
   tm.cold_us = usSince(tc);
 
   for (int i = 0; i < warmup; ++i)
@@ -546,28 +568,37 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  bool npu_ok = false;
-  int domain = 0;
-  double init_us = 0.0;
-#ifdef ENABLE_HEXKL
-  // Same NPU bring-up as HtpBackend: initialize the CDSP session directly so
-  // the example depends only on libsdkl.so. Timed = QNN "One-time init".
-  domain = CDSP_DOMAIN_ID;
-  auto tinit = std::chrono::steady_clock::now();
-  int init_err = sdkl_npu_initialize(domain, nullptr, nullptr);
-  init_us = usSince(tinit);
-  npu_ok = (init_err == 0);
-  if (!npu_ok)
-    std::fprintf(stderr, "[warn] sdkl_npu_initialize failed (err=%d); "
-                         "falling back to CPU emulation\n",
-                 init_err);
-#endif
-
   if (a.engine != "nntr" && a.engine != "sdkl") {
     std::printf("unknown --engine '%s' (using sdkl)\n", a.engine.c_str());
     a.engine = "sdkl";
   }
   const bool via_nntr = (a.engine == "nntr");
+
+  bool npu_ok = false;
+  int domain = 0;
+  double init_us = 0.0;
+#ifdef ENABLE_HEXKL
+  domain = CDSP_DOMAIN_ID;
+  if (via_nntr) {
+    // libnntrainer's HtpBackend owns the CDSP session and brings it up lazily
+    // on the first kernel call. Initializing here too makes that second
+    // sdkl_npu_initialize fail (Err=1), which leaves HtpBackend marked
+    // disabled -- so its teardown then skips freeing the NPU buffers it holds.
+    // Leave the session to it; the throwaway call in runViaNntrainer absorbs
+    // the init so it does not land in the cold-run figure.
+    npu_ok = true;
+  } else {
+    // Same bring-up HtpBackend performs. Timed = QNN "One-time init".
+    auto tinit = std::chrono::steady_clock::now();
+    int init_err = sdkl_npu_initialize(domain, nullptr, nullptr);
+    init_us = usSince(tinit);
+    npu_ok = (init_err == 0);
+    if (!npu_ok)
+      std::fprintf(stderr, "[warn] sdkl_npu_initialize failed (err=%d); "
+                           "falling back to CPU emulation\n",
+                   init_err);
+  }
+#endif
 
   std::printf("fc_layer mm comparison (HexKL u8i8 / u8i4 vs FP32)\n");
   std::printf("  proj=%s  M=%d  N=%d  K=%d  iters=%d warmup=%d  engine=%s\n",
@@ -615,7 +646,7 @@ int main(int argc, char **argv) {
                 "  the weight resident on-chip is what QNN's conv path buys.\n"
                 "if us/MMAC stays flat -> compute-bound: M does not help.\n");
 #ifdef ENABLE_HEXKL
-    if (npu_ok)
+    if (npu_ok && !via_nntr)
       sdkl_npu_finalize(domain);
 #endif
     return 0;
@@ -682,7 +713,7 @@ int main(int argc, char **argv) {
     std::printf("\n  (compare against the QNN device-timeline 'FC (weight load "
                 "+ compute)' number)\n");
 #ifdef ENABLE_HEXKL
-    if (npu_ok)
+    if (npu_ok && !via_nntr)
       sdkl_npu_finalize(domain);
 #endif
     return 0;
@@ -787,7 +818,7 @@ int main(int argc, char **argv) {
                 r8.t.kernel_us);
 
 #ifdef ENABLE_HEXKL
-  if (npu_ok)
+  if (npu_ok && !via_nntr)
     sdkl_npu_finalize(domain);
 #endif
   return 0;
