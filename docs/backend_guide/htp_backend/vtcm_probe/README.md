@@ -8,9 +8,9 @@ It is a drop-in replacement for the HexKL addon's own micro-API sample, so it
 builds and runs with that sample's scripts and needs nothing else — no
 FastRPC, no nntrainer, no device.
 
-> **Never built or run.** The nntrainer tree carries no Hexagon toolchain, so
-> this has only been syntax-checked against stub headers. Expect to fix build
-> details on first contact.
+> **Run, on the V79 simulator. Results and verdict below.** Short version:
+> 15.3x at q_proj, and it does not help us — nntrainer bakes WH offline, so it
+> never pays the cost this removes. The useful finding is the cost breakdown.
 
 ## What it measures
 
@@ -121,27 +121,66 @@ compile line):
   `-DPROBE_SHAPES=3`. Output is flushed per shape, so stopping early still
   leaves usable results.
 
-## Reading the output
+## What it actually returned
 
 ```
-[VTCM PROBE] VTCM base = 0x...  size = 8388608 bytes (8.00 MiB)
-[q_proj     ] M=64 N=2048 K=1024 | tiles k=32 n=64 | VTCM need=1638400 (act=65536 wt=1048576) avail=...
+[VTCM PROBE] VTCM base = d9000000  size = 8388608 bytes (8.00 MiB)
+[VTCM PROBE] hmx config = 16384 bytes | tile: act=2048 wt=512 acc=8192
+[q_proj     ] M=64 N=2048 K=1024 | tiles k=32 n=64 | VTCM need=1122304 (act=65536 wt=1048576) avail=8372224
   [OK] baseline and resident agree (reference skipped)
-  pcycles  baseline=...  load=...  resident_1st=...  resident_2nd=...
-  baseline / resident_2nd = ...x
+  pcycles  baseline=27504216  load=25740000  resident_1st=1781076  resident_2nd=1797104
+  baseline / resident_2nd = 15.30x
 ```
 
-| observation | meaning | next step |
-| :--- | :--- | :--- |
-| `resident_2nd` ≪ `baseline` | the per-tile conversion was the cost | build the skel — §3.3 of [07](../07_vtcm_weight_residency.md) |
-| `resident_2nd` ≈ `baseline` | the shipped `sdkl_npu_mm_u8i4_i32` already avoids this; the 217 µs is elsewhere | stop, and re-open with the `--sweep` data |
-| `DOES NOT FIT` on q_proj | VTCM is smaller than the budget assumed | re-plan around the printed size before anything else |
-| a `[FAIL]` line | the kernel is wrong, times are meaningless | fix before reading any timing |
 
-The two numbers worth reporting back are the **VTCM size** and the
-**`baseline / resident_2nd` ratio at q_proj**. On device the host sees ~298 µs
-per `sdkl_npu_mm_u8i4_i32` against QNN's 69.9 µs, so there is roughly a 4x gap
-to close — a ratio well under that means residency alone will not close it.
+V79 simulator, pcycles. VTCM = 8388608 bytes (8 MiB).
+
+| shape | baseline | load | resident_1st | resident_2nd | ratio |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| sample 64×128×128 | 344,784 | 201,264 | 143,140 | 143,280 | 2.41x |
+| small 64×256×256 | 1,089,432 | 804,608 | 285,556 | 286,064 | 3.81x |
+| medium 64×1024×1024 | 14,028,504 | 12,870,368 | 1,166,932 | 1,175,024 | 11.94x |
+| **q_proj 64×2048×1024** | 27,504,216 | 25,740,000 | 1,781,076 | **1,797,104** | **15.30x** |
+| ffn_up 64×3072×1024 | 40,979,928 | 38,609,632 | 2,395,220 | 2,419,184 | 16.94x |
+
+Both kernels matched the reference exactly at the two verified shapes and
+agreed with each other at the rest. `load + resident_1st` reproduces `baseline`
+to within 0.06% everywhere, and the conversion is a flat 12,568 pcycles per
+512-byte tile — so the split between conversion and matmul is real.
+
+**The 15.3x does not transfer to nntrainer.** The sample converts row-major
+weights on the DSP; `sdkl_npu_mm_u8i4_i32` is handed a weight already in WH
+layout, baked once by `quantize_qint4_weight` and passed through untouched by
+`shgemm_u8i4_i32`. Our per-call conversion count is zero. The probe measured a
+large saving on a cost we do not pay.
+
+### The finding that is worth something
+
+The five shapes fit `A + B·(mm ops) + C·(output tiles) + D·(activation tiles)`
+exactly, with `ffn_up` held out of the fit and predicted to the cycle:
+
+| term | cycles | what it is |
+| :--- | ---: | :--- |
+| `B` | 48 | one `hexkl_micro_hmx_mm_u8i4` |
+| `C` | 17,904 | `acc_read_int32` + `copy_32b_to_submatrix`, per 8 KiB output tile |
+| `D` | 17,216 | `copy_submatrix_to_8b_activation`, per 2 KiB activation tile |
+| `A` | 2,032 | setup |
+
+At q_proj: HMX 98,304 (**5.5%**), output copies 1,145,856 (64%), activation
+copies 550,912 (31%). With every weight already resident, the kernel still
+spends 95% of its time shuffling bytes — which is what `hexkl_micro.h` warns
+about when it says the copy helpers are "primarily intended for testing and
+debugging purposes. In operational mode, DMA is typically used."
+
+So the lever is DMA for staging, not where the weight lives. See §7 of
+[07_vtcm_weight_residency.md](../07_vtcm_weight_residency.md).
+
+## Reading the output on a re-run
+
+| observation | meaning |
+| :--- | :--- |
+| `DOES NOT FIT` on q_proj | VTCM is smaller than 8 MiB on this target; re-plan around the printed size |
+| a `[FAIL]` line | the kernel is wrong and the times mean nothing; fix before reading any timing |
 
 ## If it does not fit
 

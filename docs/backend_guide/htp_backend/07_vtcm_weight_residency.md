@@ -3,12 +3,13 @@
 How to cut the NPU-side cost of an fc_layer matmul by keeping the WH-packed
 weight resident in VTCM instead of re-deriving it per tile.
 
-> **Status: §3.1 done, §3.2 in progress, §3.3 unbuilt.** The SDK's micro
-> sample builds and passes on the V79 simulator, and VTCM is 8 MiB. The kernel
-> change in §5 is measured by `vtcm_probe/`, not yet by anything shipping.
-> Nothing here has run on a device: there is no IDL, no skel build, and
-> `libhexkl_skel.so` comes prebuilt from the SDK. Treat §5 as a starting point
-> to compile and verify, in the staged order in §3, not as working code.
+> **Status: measured, and the answer is no. See §7.**
+> §3.1 and §3.2 are done on the V79 simulator. Hoisting the RM→WH conversion is
+> worth 15.3x *for the SDK sample*, but nntrainer bakes WH offline and so pays
+> that cost zero times per call — the win does not transfer. §3.3 is therefore
+> not being built. The document is kept because §3.2's cost breakdown is the
+> useful result: in the micro-API kernel the HMX matmul is 5% of the time and
+> the scalar staging copies are 95%.
 
 ## 1. Where the time goes
 
@@ -114,15 +115,68 @@ Being a simulator, it is deterministic — none of the jitter that made the
 host-side threading numbers unreadable — but its absolute cycle counts are not
 device times. Read the ratio, not the magnitude.
 
-This measures the hypothesis directly:
+#### Result: yes for the sample, but the sample is not our path
 
-- **Large win** (approaching QNN's 69.9 μs): the conversion was the cost, and a
-  custom skel is worth building.
-- **Little or no win**: the shipped `sdkl_npu_mm_u8i4_i32` already does
-  something smarter than the sample, and the 217 μs is elsewhere. Stop, and
-  re-open the question with the sweep data.
+V79 simulator, pcycles:
 
-### 3.3 Only if 3.2 pays: wrap it for the host
+| shape | baseline | load (rm→wh) | resident_1st | resident_2nd | ratio |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| sample 64×128×128 | 344,784 | 201,264 | 143,140 | 143,280 | 2.41x |
+| small 64×256×256 | 1,089,432 | 804,608 | 285,556 | 286,064 | 3.81x |
+| medium 64×1024×1024 | 14,028,504 | 12,870,368 | 1,166,932 | 1,175,024 | 11.94x |
+| **q_proj 64×2048×1024** | 27,504,216 | 25,740,000 | 1,781,076 | **1,797,104** | **15.30x** |
+| ffn_up 64×3072×1024 | 40,979,928 | 38,609,632 | 2,395,220 | 2,419,184 | 16.94x |
+
+Both kernels matched the reference exactly, and `load + resident_1st` reproduces
+`baseline` to within 0.06% at every shape — the decomposition is real, not an
+artifact of where the timers sit.
+
+The conversion costs a flat **12,568 pcycles per 512-byte tile** across all five
+shapes, and at q_proj it is 94% of the baseline. So for the sample's structure
+the hypothesis in §2 is confirmed, emphatically.
+
+**It does not transfer to nntrainer.** The sample takes a row-major weight and
+converts it on the DSP; `sdkl_npu_mm_u8i4_i32` takes a weight that is *already*
+in WH layout, because `quantize_qint4_weight` bakes it with
+`sdkl_cpu_rm_to_wh_i4` at quantization time (`nntrainer/tensor/quantizer.cpp`)
+and `shgemm_u8i4_i32` hands those bytes straight through
+(`hexkl_mm.cpp`). Our path performs **zero** RM→WH conversions per call. The
+15.3x is a win over a cost we do not pay.
+
+#### What the numbers do say
+
+Fitting the five shapes to `A + B·(mm ops) + C·(output tiles) + D·(activation
+tiles)` gives an exact fit at all five, with `ffn_up` held out of the fit and
+predicted to the cycle:
+
+| term | cycles | what it is |
+| :--- | ---: | :--- |
+| `B` | 48 | one `hexkl_micro_hmx_mm_u8i4` |
+| `C` | 17,904 | `acc_read_int32` + `copy_32b_to_submatrix`, per 8 KiB output tile |
+| `D` | 17,216 | `copy_submatrix_to_8b_activation`, per 2 KiB activation tile |
+| `A` | 2,032 | setup |
+
+At q_proj that is HMX 98,304 (**5.5%**), output copies 1,145,856 (64%),
+activation copies 550,912 (31%). Even with every weight resident in VTCM, the
+micro-API kernel spends 95% of its time in the byte-shuffling helpers — 2.2
+cycles/byte on the output copy, 8.4 on the activation copy. `hexkl_micro.h`
+says as much about `copy_psubmatrix`: *"primarily intended for testing and
+debugging purposes. In operational mode, DMA is typically used."*
+
+So the lever is **DMA for activation staging and result writeback**, not where
+the weight lives. Weight residency addresses 0% of our per-call cost.
+
+One inference worth recording, with its assumption stated: 98,304 pcycles of
+HMX at a ~1.0–1.4 GHz DSP clock is 70–98 μs, which brackets QNN's measured
+69.9 μs. If that clock estimate is right, QNN is running at roughly the HMX
+floor for this shape, and the shipped kernel's 298 μs is ~3–4x above it in
+overhead. That would mean the 4x gap is reachable — but by fixing staging, not
+residency. The clock is unverified and the simulator's HMX timing model may not
+match silicon, so this is a hypothesis, not a measurement.
+
+### 3.3 Superseded — see §7
+
+The plan below assumed §3.2 would justify a residency skel. It did not.
 
 Wrapping the kernel so nntrainer can call it means, from scratch:
 
@@ -239,7 +293,8 @@ Two further wins available once the kernel is ours:
 
 - `hexkl_micro_hmx_lock()` can wrap a whole forward pass rather than one matmul.
 - The accumulator can stay in VTCM across output tiles and be copied out once,
-  instead of per tile.
+  instead of per tile. **§3.2 promoted this from a nice-to-have to the main
+  event**: the per-output-tile copy is 64% of the resident kernel's time.
 
 ## 6. What has to hold
 
@@ -249,12 +304,36 @@ Two further wins available once the kernel is ours:
   it as an argument and `hexkl_micro_hmx_mm_u8i4` requires only 128-byte
   alignment, so laying tiles out contiguously is allowed. This is what makes
   the hoist possible at all.
-- **The shipped `sdkl_npu_mm_u8i4_i32` really does re-convert per tile.**
-  Unverified — §3.2 exists to test it.
+- ~~**The shipped `sdkl_npu_mm_u8i4_i32` really does re-convert per tile.**~~
+  **Refuted, and it was always the load-bearing assumption.** It cannot
+  re-convert, because it is handed a weight that is already in WH layout —
+  `quantize_qint4_weight` bakes it once with `sdkl_cpu_rm_to_wh_i4` and
+  `shgemm_u8i4_i32` passes those bytes through untouched. The sample converts
+  because the sample starts from row-major; we do not.
 
 `hexkl_micro_hmx_copy_psubmatrix_to_8b_weight` looks like it would skip the
 conversion entirely, but it is int8-only (no int4 variant in the header) and
 its own docs call it "primarily intended for testing and debugging purposes. In
-operational mode, DMA is typically used." So the route for int4 is either the
-per-tile convert above, or a DMA of pre-baked WH bytes — and nntrainer already
-bakes those offline in `quantize_qint4_weight`.
+operational mode, DMA is typically used." That sentence turned out to describe
+the whole `copy_*submatrix*` family — §3.2 measured them at 95% of the resident
+kernel — and is the strongest hint in the header about where a real kernel
+should spend its effort.
+
+## 7. Verdict, and what to do instead
+
+**Do not build the residency skel.** §3.3 was conditional on §3.2 paying, and
+it does not pay for our path: nntrainer performs zero RM→WH conversions per
+call, so hoisting them saves zero. §5 remains as the record of what was tested.
+
+What §3.2 found instead is that in the micro-API kernel the HMX matmul is 5% of
+the time and the scalar staging copies are 95%. Any future custom kernel should
+be judged on whether it DMAs activations in and results out, and should keep
+the accumulator in VTCM across output tiles rather than copying per tile.
+
+Before any of that is worth building, one cheaper question comes first: **what
+is the shipped `sdkl_npu_mm_u8i4_i32`'s 298 μs actually made of?** Nothing
+measured so far can say. It is a compiled library function, the probe cannot
+call it (macro API, needs FastRPC), and the simulator's cycle counts do not
+convert to device microseconds. Until that is answered, "write our own kernel"
+is a bet that we can beat Qualcomm's staging code, with no evidence either way
+— and the host-side wins (§1: 1214 μs → 545 μs) came far more cheaply.
