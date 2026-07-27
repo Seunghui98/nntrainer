@@ -36,6 +36,7 @@
 #include <wh_trailer.h>
 
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -601,6 +602,98 @@ TEST_F(HtpU8i4Test, ResidentWeightCache_NoAliasingAcrossWeights) {
                        "(stale or aliased cache entry)";
   EXPECT_EQ(b1, b2) << "repeat call on weight B did not reproduce its result "
                        "(stale or aliased cache entry)";
+}
+
+// Measures one fc_layer matmul through the production kernel (not the sdkl C
+// API directly), at real qwen3-0.6b projection shapes.
+//
+// The first call uploads the weight; every later call with the same weight
+// hits the resident cache. Reporting both separates "what an inference
+// actually pays" from the one-off upload, and the steady-state figure is the
+// one to compare against a QNN NetRun.
+//
+// Reports only -- no timing assertion, since numbers move with device thermal
+// state. Iteration count via HEXKL_FC_ITERS (default 20).
+TEST_F(HtpU8i4Test, FcLayerMm_Perf_ResidentWeight) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "HTP not available";
+
+  int iters = 20;
+  if (const char *e = std::getenv("HEXKL_FC_ITERS")) {
+    const int v = std::atoi(e);
+    if (v > 0)
+      iters = v;
+  }
+
+  struct Case {
+    const char *name;
+    int M, N, K;
+  };
+  // qwen3-0.6b: hidden 1024, intermediate 3072, GQA q=2048/kv=1024.
+  // M=64 is one prefill tile; M=1 is a decode step.
+  const std::vector<Case> cases = {
+    {"q_proj   prefill", 64, 2048, 1024}, {"o_proj   prefill", 64, 1024, 1024},
+    {"ffn_up   prefill", 64, 3072, 1024}, {"ffn_down prefill", 64, 1024, 3072},
+    {"q_proj   decode", 1, 2048, 1024},   {"ffn_down decode", 1, 1024, 3072},
+  };
+
+  std::printf("\nfc_layer mm through hmx::shgemm_u8i4_i32 (iters=%d)\n", iters);
+  std::printf("| shape | M | N | K | first call us | steady us | relErr |\n");
+  std::printf("|---|---|---|---|---|---|---|\n");
+
+  for (const auto &c : cases) {
+    auto A_f32 = makeRandF32(c.M * c.K, -1.0f, 1.0f);
+    auto W_i4 = makeRandI4Vec(c.N * c.K, 77);
+    std::vector<float> wt_scale(c.N, 1.0f / 7.0f);
+    auto zp_corr = makeZpCorr(W_i4, c.N, c.K);
+
+    void *W_wh = packI4WeightToNpu(W_i4, c.N, c.K);
+    ASSERT_NE(W_wh, nullptr) << c.name;
+
+    std::vector<float> C(c.M * c.N, 0.0f);
+    auto call = [&]() {
+      nntrainer::hmx::shgemm_u8i4_i32(
+        c.M, c.N, c.K, A_f32.data(), static_cast<int8_t *>(W_wh),
+        wt_scale.data(), zp_corr.data(), C.data());
+    };
+
+    // First call: uploads the weight into NPU memory.
+    auto t0 = std::chrono::steady_clock::now();
+    ASSERT_NO_THROW(call()) << c.name;
+    const double first_us =
+      std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0)
+        .count();
+
+    // Steady state: weight is resident, scratch is reused.
+    double sum_us = 0.0;
+    for (int i = 0; i < iters; ++i) {
+      auto s = std::chrono::steady_clock::now();
+      call();
+      sum_us += std::chrono::duration<double, std::micro>(
+                  std::chrono::steady_clock::now() - s)
+                  .count();
+    }
+    const double steady_us = sum_us / iters;
+
+    // Confirm the cached path still computes the right answer.
+    std::vector<uint8_t> X_u8;
+    float act_scale = quantizeActU8(A_f32, X_u8, c.M, c.K);
+    std::vector<int32_t> C_i32(c.M * c.N, 0);
+    cpuGemmU8I8I32(c.M, c.N, c.K, X_u8.data(), W_i4.data(), C_i32.data());
+    std::vector<float> C_cpu(c.M * c.N);
+    dequantI32ToF32(c.M, c.N, act_scale, wt_scale.data(), zp_corr.data(),
+                    C_i32.data(), C_cpu.data());
+    const double err = relError(C.data(), C_cpu.data(), c.M * c.N);
+
+    sdkl_npu_free(W_wh);
+
+    std::printf("| %s | %d | %d | %d | %9.1f | %9.1f | %.5f |\n", c.name, c.M,
+                c.N, c.K, first_us, steady_us, err);
+    std::fflush(stdout);
+    EXPECT_LT(err, 0.01) << c.name << ": cached path lost accuracy";
+  }
+  SUCCEED();
 }
 
 // Shapes vary between prefill and decode, so the scratch pools must grow and
