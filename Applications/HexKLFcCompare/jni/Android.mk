@@ -1,16 +1,26 @@
 LOCAL_PATH := $(call my-dir)
 
 # Standalone HexKL fc_layer mm comparison (u8i8 vs u8i4 vs FP32).
-# Flat ndk-build project (Android.mk + Application.mk in this folder). The
-# example is self-contained: it links ONLY libsdkl.so (the sdkl C API) and
-# does not use any libnntrainer C++ symbol, so it is unaffected by which
-# symbols the Android libnntrainer.so exports. ENABLE_HEXKL turns on the real
-# sdkl_npu_* path; without it the tool CPU-emulates the integer GEMM.
+# Flat ndk-build project (Android.mk + Application.mk in this folder).
+#
+# Two engines: the default drives the sdkl C API directly, and --engine nntr
+# calls nntrainer's hmx::shgemm_u8i{4,8}_i32 -- the path a real fc_layer takes,
+# including its resident weight cache. The latter needs libnntrainer.so, which
+# is only declared (not included) in the source, so the sdkl path stays free of
+# the nntrainer include tree.
 
+NNTRAINER_ROOT    := $(LOCAL_PATH)/../../..
 HEXKL_ADDON_ROOT  := $(HEXKL_SDK_ROOT)
 ifeq ($(HEXKL_ADDON_ROOT),)
   HEXKL_ADDON_ROOT := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
 endif
+NNTRAINER_LIB_DIR := $(NNTRAINER_ROOT)/builddir/jni/arm64-v8a
+
+# ---- prebuilt: libnntrainer.so (provides hmx::shgemm_u8i{4,8}_i32) ----
+include $(CLEAR_VARS)
+LOCAL_MODULE             := nntrainer
+LOCAL_SRC_FILES          := $(NNTRAINER_LIB_DIR)/libnntrainer.so
+include $(PREBUILT_SHARED_LIBRARY)
 
 # ---- prebuilt: libsdkl.so (armv8, matches the u8i{4,8} kernel path) ----
 include $(CLEAR_VARS)
@@ -34,5 +44,5 @@ LOCAL_CFLAGS     := \
 LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := hexkl_fc_compare.cpp
-LOCAL_SHARED_LIBRARIES := sdkl_armv8
+LOCAL_SHARED_LIBRARIES := sdkl_armv8 nntrainer
 include $(BUILD_EXECUTABLE)

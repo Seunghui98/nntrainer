@@ -44,6 +44,20 @@
 #ifdef ENABLE_HEXKL
 #include <remote.h> // CDSP_DOMAIN_ID
 #include <sdkl.h>   // sdkl_npu_* / sdkl_cpu_rm_to_wh_*
+
+// The production kernels, declared here rather than via <hexkl_mm.h> so this
+// stays free of the nntrainer include tree; only libnntrainer.so is needed at
+// link time. Used by --engine nntr.
+namespace nntrainer {
+namespace hmx {
+void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const int8_t *B_wh, const float *wt_scale,
+                     const int32_t *zp_corr, float *C);
+void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const int8_t *B_wh, const float *wt_scale,
+                     const int32_t *zp_corr, float *C);
+} // namespace hmx
+} // namespace nntrainer
 #endif
 
 namespace {
@@ -60,6 +74,12 @@ struct Args {
   // Which weight width(s) to run: 4, 8, or 0 = both. --sweep defaults to 4
   // (the QNN-comparable config); the normal compare mode defaults to both.
   int bits = -1;
+  // "sdkl": drive sdkl_npu_mm_* directly, with the full phase breakdown.
+  // "nntr": call nntrainer's hmx::shgemm_u8i{4,8}_i32, which is what an
+  //         fc_layer actually goes through -- including its resident weight
+  //         cache and scratch pools. Only cold vs steady are visible there,
+  //         since quantization, upload and dequantize happen inside one call.
+  std::string engine = "sdkl";
 };
 
 // qwen3-0.6b projection presets (hidden 1024, intermediate 3072, GQA
@@ -94,7 +114,10 @@ static Args parseArgs(int argc, char **argv) {
       a.sweep = true;
     else if (s == "--msweep")
       a.msweep = true;
-    else if (s == "--bits") {
+    else if (s == "--engine") {
+      if (i + 1 < argc)
+        a.engine = argv[++i];
+    } else if (s == "--bits") {
       if (i + 1 < argc) {
         std::string v = argv[++i];
         a.bits = (v == "both") ? 0 : std::atoi(v.c_str());
@@ -105,10 +128,17 @@ static Args parseArgs(int argc, char **argv) {
     } else if (s == "--help" || s == "-h") {
       std::printf(
         "usage: hexkl_fc_compare [--proj q_proj|k_proj|o_proj|ffn_up|ffn_down]"
-        " [--M m] [--N n] [--K k] [--iters n] [--warmup n] [--sweep]\n"
+        " [--M m] [--N n] [--K k] [--iters n] [--warmup n]\n"
+        "                        [--bits 4|8|both] [--engine sdkl|nntr]"
+        " [--sweep] [--msweep]\n"
         "  default: qwen3-0.6b q_proj  M=64 N=2048 K=1024\n"
-        "  --sweep: shrink the MAC count while keeping the call structure, to\n"
-        "           split fixed per-call overhead (RPC+setup) from compute\n"
+        "  --engine sdkl: drive sdkl_npu_mm_* directly (full phase breakdown)\n"
+        "  --engine nntr: call nntrainer hmx::shgemm_u8i{4,8}_i32, the path a\n"
+        "                 real fc_layer takes; reports cold vs steady, where\n"
+        "                 the gap is the weight upload its cache removes\n"
+        "  --sweep:  shrink the MAC count at a fixed call structure, to split\n"
+        "            fixed per-call overhead (RPC+setup) from compute\n"
+        "  --msweep: vary M at fixed N,K to test whether it is weight-bound\n"
         "  env: HEXKL_FC_ITERS, HEXKL_FC_WARMUP\n");
       std::exit(0);
     }
@@ -379,6 +409,68 @@ static bool runNpu(int M, int N, int K, int bits, const std::vector<uint8_t> &x,
 }
 #endif
 
+#ifdef ENABLE_HEXKL
+// Drive the production kernel instead of sdkl directly. It takes FP32
+// activations and the WH-packed weight and does quantization, buffer
+// management and dequantize internally, so the only visible split is the first
+// call (which uploads the weight into NPU memory) versus the steady state
+// (weight resident, scratch reused). Returns false if the WH pack fails.
+//
+// The WH buffer must stay alive for the whole loop: the resident cache is
+// keyed by that host pointer, so freeing it between calls would defeat it.
+static bool runViaNntrainer(int M, int N, int K, int bits,
+                            const std::vector<float> &A, const WQuant &wq,
+                            int warmup, int iters, Timing &tm,
+                            std::vector<float> &C_out) {
+  const size_t nk = static_cast<size_t>(N) * K;
+  NpuBuf Wsrc(nk), Wwh(nk);
+  if (!Wsrc.ok() || !Wwh.ok())
+    return false;
+  std::memcpy(Wsrc.p, wq.w_q.data(), nk);
+
+  const int8_t *B_wh = nullptr;
+  if (bits == 4) {
+    if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(Wwh.p),
+                             static_cast<int8_t *>(Wsrc.p), (size_t)K,
+                             (size_t)N) != 0)
+      return false;
+    B_wh = static_cast<const int8_t *>(Wwh.p);
+  } else {
+    if (sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
+                                     static_cast<int8_t *>(Wsrc.p)) != 0)
+      return false;
+    B_wh = static_cast<const int8_t *>(Wsrc.p);
+  }
+
+  C_out.assign(static_cast<size_t>(M) * N, 0.0f);
+  auto call = [&]() {
+    if (bits == 4)
+      nntrainer::hmx::shgemm_u8i4_i32((unsigned)M, (unsigned)N, (unsigned)K,
+                                      A.data(), B_wh, wq.scale.data(),
+                                      wq.zp_corr.data(), C_out.data());
+    else
+      nntrainer::hmx::shgemm_u8i8_i32((unsigned)M, (unsigned)N, (unsigned)K,
+                                      A.data(), B_wh, wq.scale.data(),
+                                      wq.zp_corr.data(), C_out.data());
+  };
+
+  auto tc = std::chrono::steady_clock::now();
+  call(); // first call: uploads the weight
+  tm.cold_us = usSince(tc);
+
+  for (int i = 0; i < warmup; ++i)
+    call();
+  double sum = 0.0;
+  for (int i = 0; i < iters; ++i) {
+    auto t0 = std::chrono::steady_clock::now();
+    call();
+    sum += usSince(t0);
+  }
+  tm.kernel_us = iters > 0 ? sum / iters : 0.0;
+  return true;
+}
+#endif
+
 // CPU-exact integer GEMM: C_i32[m,n] = sum_k X_u8[m,k] * W_q[n,k].
 static void cpuIntGemm(int M, int N, int K, const uint8_t *X, const int8_t *W,
                        int32_t *C) {
@@ -395,7 +487,8 @@ static void cpuIntGemm(int M, int N, int K, const uint8_t *X, const int8_t *W,
 // emulation on host) + dequant.
 static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
                         const std::vector<float> &W, int bits, int warmup,
-                        int iters, bool npu_ok, int domain) {
+                        int iters, bool npu_ok, int domain,
+                        bool via_nntr = false) {
   QResult r;
   const int q_max = (bits == 4) ? 7 : 127;
   WQuant wq = quantWeight(W, N, K, q_max);
@@ -404,8 +497,13 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
   std::vector<int32_t> c_i32;
 
 #ifdef ENABLE_HEXKL
-  if (npu_ok && runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.t,
-                       c_i32)) {
+  if (npu_ok && via_nntr &&
+      runViaNntrainer(M, N, K, bits, A, wq, warmup, iters, r.t, r.C)) {
+    r.on_npu = true;
+    return r; // the kernel already returned dequantized FP32
+  }
+  if (npu_ok && !via_nntr &&
+      runNpu(M, N, K, bits, x, wq, warmup, iters, domain, r.t, c_i32)) {
     r.on_npu = true;
     r.C = dequant(c_i32.data(), M, N, act_scale, wq.scale, wq.zp_corr);
     return r;
@@ -413,6 +511,7 @@ static QResult runQuant(int M, int N, int K, const std::vector<float> &A,
 #else
   (void)npu_ok;
   (void)domain;
+  (void)via_nntr;
 #endif
   // Host / NPU-unavailable: emulate the integer GEMM on the CPU. No data
   // movement, so only the compute (kernel) phase is timed.
@@ -464,9 +563,18 @@ int main(int argc, char **argv) {
                  init_err);
 #endif
 
+  if (a.engine != "nntr" && a.engine != "sdkl") {
+    std::printf("unknown --engine '%s' (using sdkl)\n", a.engine.c_str());
+    a.engine = "sdkl";
+  }
+  const bool via_nntr = (a.engine == "nntr");
+
   std::printf("fc_layer mm comparison (HexKL u8i8 / u8i4 vs FP32)\n");
-  std::printf("  proj=%s  M=%d  N=%d  K=%d  iters=%d warmup=%d  (%s)\n",
+  std::printf("  proj=%s  M=%d  N=%d  K=%d  iters=%d warmup=%d  engine=%s\n",
               a.proj.c_str(), a.M, a.N, a.K, a.iters, a.warmup,
+              via_nntr ? "nntr (hmx::shgemm_*, production path)"
+                       : "sdkl (direct sdkl_npu_mm_*)");
+  std::printf("  %s\n",
               npu_ok
                 ? "NPU kernels — real device latency"
                 : "CPU-emulated integer GEMM — relErr real, latency reference");
@@ -495,7 +603,7 @@ int main(int argc, char **argv) {
     for (int m : Ms) {
       auto Am = randVec(m * a.K, -1.0f, 1.0f, 42);
       QResult q = runQuant(m, a.N, a.K, Am, Wm, sweep_bits, a.warmup, a.iters,
-                           npu_ok, domain);
+                           npu_ok, domain, via_nntr);
       double macs = (double)m * a.N * a.K / 1e6;
       double gbs = (double)wbytes / (q.t.kernel_us * 1e-6) / 1e9;
       std::printf("| %4d | %9.1f | %7.1f | %7.3f | %11.2f |\n", m, macs,
@@ -548,14 +656,16 @@ int main(int argc, char **argv) {
       std::printf("| %5d | %4d | %9.1f |", s.N, s.K, macs);
       if (do8) {
         QResult q8 =
-          runQuant(s.M, s.N, s.K, As, Ws, 8, a.warmup, a.iters, npu_ok, domain);
+          runQuant(s.M, s.N, s.K, As, Ws, 8, a.warmup, a.iters, npu_ok,
+                   domain, via_nntr);
         std::printf(" %12.1f |", q8.t.kernel_us);
         if (base8 < 0.0) base8 = q8.t.kernel_us;
         full8 = q8.t.kernel_us;
       }
       if (do4) {
         QResult q4 =
-          runQuant(s.M, s.N, s.K, As, Ws, 4, a.warmup, a.iters, npu_ok, domain);
+          runQuant(s.M, s.N, s.K, As, Ws, 4, a.warmup, a.iters, npu_ok,
+                   domain, via_nntr);
         std::printf(" %12.1f |", q4.t.kernel_us);
         if (base4 < 0.0) base4 = q4.t.kernel_us;
         full4 = q4.t.kernel_us;
@@ -589,12 +699,14 @@ int main(int argc, char **argv) {
   QResult r8, r4;
   if (run8) {
     std::fprintf(stderr, "[run] u8i8 ...\n");
-    r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters, npu_ok, domain);
+    r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters, npu_ok, domain,
+                  via_nntr);
     std::fprintf(stderr, "[run] u8i8 done\n");
   }
   if (run4) {
     std::fprintf(stderr, "[run] u8i4 ...\n");
-    r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters, npu_ok, domain);
+    r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters, npu_ok, domain,
+                  via_nntr);
     std::fprintf(stderr, "[run] u8i4 done\n");
   }
 
@@ -615,6 +727,18 @@ int main(int argc, char **argv) {
   auto dumpMethod = [&](const char *tag, float err, const QResult &r) {
     std::printf("[%s]  relErr=%.5f  engine=%s\n", tag, err,
                 r.on_npu ? "NPU/HMX" : "CPU-emulated");
+    if (via_nntr) {
+      // The production kernel does quantization, buffer management and
+      // dequantize inside one call, so the phases below are not observable
+      // from here. Cold vs steady is the whole story: the gap is the weight
+      // upload that the resident cache removes from every later call.
+      std::printf("  Cold run (first call, uploads weight)  %10.1f\n",
+                  r.t.cold_us);
+      std::printf("  Steady state (weight resident)         %10.1f   <- "
+                  "per-call cost\n",
+                  r.t.kernel_us);
+      return;
+    }
     std::printf("  Cold run (first execute)               %10.1f\n",
                 r.t.cold_us);
     std::printf("  PER CALL (unavoidable)                 %10.1f\n",

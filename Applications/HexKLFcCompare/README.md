@@ -19,9 +19,17 @@ activation quantization (per-tensor UINT8, zp=128) are done inline, matching
   exact either way, so the **relErr equals the on-device relErr**; only latency
   differs (host latency is CPU-emulated and labelled).
 
-The example is **self-contained**: it links only `libsdkl.so` (the sdkl C API)
-and uses no `libnntrainer` C++ symbol, so it is unaffected by which symbols the
-Android `libnntrainer.so` exports.
+## Two engines
+
+`--engine sdkl` (default) drives the sdkl C API directly and reports the full
+phase breakdown. `--engine nntr` calls nntrainer's `hmx::shgemm_u8i{4,8}_i32`
+instead -- the path a real fc_layer goes through, including its NPU-resident
+weight cache and scratch pools. There only cold vs steady is visible, since
+quantization, buffer management and dequantize all happen inside one call; the
+gap between them is the weight upload the cache removes from every later call.
+
+Use `sdkl` to see where time goes inside one matmul, and `nntr` to measure what
+an fc_layer actually pays per call.
 
 ## Shape
 
@@ -87,43 +95,46 @@ movement breakdown (us) — alloc / H2D copy / WH pack / D2H copy:
 
 ## Build & run — Android device (real NPU latency)
 
-Uses a flat ndk-build project (like `test/unittest/jni_htp`). The example links
-only `libsdkl.so`, so it does **not** need the HTP `libnntrainer.so` — just the
-Hexagon SDK (`HEXKL_SDK_ROOT`) and the NDK:
+Uses a flat ndk-build project (like `test/unittest/jni_htp`). It links
+`libsdkl.so` and the HTP `libnntrainer.so` (the latter supplies
+`hmx::shgemm_u8i{4,8}_i32` for `--engine nntr`), so build the library first —
+see [02_build_and_run.md](../../docs/backend_guide/htp_backend/02_build_and_run.md) §1–2.
 
 ```bash
 export HEXKL_SDK_ROOT=<Hexagon_SDK>/addons/hexkl_addon
 export ANDROID_NDK=/opt/android-ndk-r26d ; export PATH=$ANDROID_NDK:$PATH
 
-# 1. build the example (self-contained; only libsdkl.so is linked)
+# 1. HTP libnntrainer.so -> builddir/jni/arm64-v8a/
+./tools/package_android.sh --arm-arch=armv8.2-a \
+  -Denable-htp=true -Dhexkl-sdk-root=$HEXKL_SDK_ROOT \
+  -Dhexkl-lib-subdir=armv8_android26 -Dmmap-read=false -Dwerror=false
+
+# 2. the example
 ndk-build -C Applications/HexKLFcCompare/jni \
   NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk \
   NDK_APPLICATION_MK=Application.mk -j$(nproc)
 
-# 2. push binary + libsdkl.so + libc++_shared.so.
-#    ndk-build with -C <jni> NDK_PROJECT_PATH=. writes libs/ and obj/ UNDER the
-#    jni dir, so the paths include jni/. Push libs/ first, then the (unstripped)
-#    obj/ binary last so it is not overwritten by the stripped libs/ copy.
+# 3. push. ndk-build with -C <jni> NDK_PROJECT_PATH=. writes libs/ and obj/
+#    UNDER the jni dir, so the paths include jni/. Push libs/ first, then the
+#    (unstripped) obj/ binary, so it is not overwritten by the stripped copy.
 adb push Applications/HexKLFcCompare/jni/libs/arm64-v8a/. /data/local/tmp/
 adb push Applications/HexKLFcCompare/jni/obj/local/arm64-v8a/hexkl_fc_compare /data/local/tmp/
+adb push builddir/jni/arm64-v8a/libnntrainer.so /data/local/tmp/
 #   the CDSP skeleton (libhexkl_skel.so, V79) must already be in /data/local/tmp
 
-# 4. run (inject library + skeleton paths). Add /vendor/lib64 (and keep the
-#    existing $LD_LIBRARY_PATH): libsdkl.so pulls rpcmem_alloc2 from
-#    /vendor/lib64/libcdsprpc.so (FastRPC). Two failure modes to avoid:
-#    - LD_LIBRARY_PATH=/data/local/tmp alone drops /vendor/lib64 -> loader
-#      fails with "cannot locate symbol rpcmem_alloc2 referenced by libsdkl.so".
-#    - Do NOT add /system/lib64: it drags in Android system libs (e.g.
-#      libinput.so) built against a different libfmt and fails to link.
+# 4. run. Keep LD_LIBRARY_PATH to /data/local/tmp only: adding /vendor/lib64
+#    or /system/lib64 perturbs the linker namespace and libnntrainer's
+#    dependency chain then fails on a libfmt mismatch inside libinput.so.
 adb shell "cd /data/local/tmp && \
-  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64 \
-  ADSP_LIBRARY_PATH=/data/local/tmp \
-  ./hexkl_fc_compare --proj q_proj"
-adb shell "cd /data/local/tmp && \
-  LD_LIBRARY_PATH=/data/local/tmp:/vendor/lib64 \
-  ADSP_LIBRARY_PATH=/data/local/tmp \
-  ./hexkl_fc_compare --proj ffn_down --M 64"
+  LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
+  ./hexkl_fc_compare --proj q_proj --bits 4"
+
+# what an fc_layer actually pays per call (resident weight cache in effect)
+adb shell "cd /data/local/tmp && HEXKL_FC_ITERS=20 \
+  LD_LIBRARY_PATH=/data/local/tmp ADSP_LIBRARY_PATH=/data/local/tmp \
+  ./hexkl_fc_compare --proj q_proj --bits 4 --engine nntr"
 ```
 
-On device the `engine` column reads `NPU/HMX` and `latency (us)` is the real
-per-call kernel time.
+On device the `engine` column reads `NPU/HMX` and the times are real per-call
+kernel latency. With `--engine nntr`, the cold-to-steady gap is the weight
+upload that the resident cache removes from every later call.
