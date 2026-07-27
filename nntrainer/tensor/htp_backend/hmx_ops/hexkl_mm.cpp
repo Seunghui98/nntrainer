@@ -647,6 +647,8 @@ void prefillWHCacheClear() {
 
 #include <sdkl.h>
 
+#include <thread_manager.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -859,6 +861,86 @@ struct NpuScratch {
 NpuScratch g_x_scratch; // uint8 activation, padded to the 64-row tile
 NpuScratch g_c_scratch; // int32 accumulator
 
+// ---- Host-side pre/post processing around the NPU matmul -------------------
+//
+// The activation scan, the FP32->U8 quantization and the dequantize are
+// element-wise over M*K and M*N. On a Galaxy S25 Ultra they account for about
+// 197 us of the 495 us an fc_layer call takes (q_proj, M=64, u8i4) -- on the
+// order of the matmul itself. Unlike the matmul, which HMX serializes behind
+// sdkl_npu_lock_hmx, they parallelize directly over rows.
+//
+// parallel_for runs serially when there is one row or no workers, so decode
+// (M=1) is unaffected.
+
+/** @brief Largest |A[i]| over M*K, skipping non-finite values. */
+float activationMaxAbs(const float *A, size_t M, size_t K) {
+  if (M == 0 || K == 0)
+    return 0.0f;
+
+  // One partial per row, reduced serially afterwards: M is small (a prefill
+  // tile), so the reduction is negligible next to the scan.
+  std::vector<float> row_max(M, 0.0f);
+  ThreadManager::Global().parallel_for(0, M, [&](size_t m) {
+    const float *row = A + m * K;
+    float mx = 0.0f;
+    for (size_t k = 0; k < K; ++k) {
+      if (!std::isfinite(row[k]))
+        continue;
+      const float v = std::fabs(row[k]);
+      if (v > mx)
+        mx = v;
+    }
+    row_max[m] = mx;
+  });
+
+  float max_abs = 0.0f;
+  for (float v : row_max)
+    max_abs = std::max(max_abs, v);
+  return max_abs;
+}
+
+/**
+ * @brief Quantize FP32 activations to U8 with the given zero point.
+ * @param Mp Row count padded to the SDKL 64-row tile; rows at or past M are
+ *           filled with the zero point so the padding contributes nothing.
+ */
+void quantizeActivationU8(const float *A, uint8_t *X, size_t M, size_t Mp,
+                          size_t K, float inv_act_scale, float zero_point) {
+  ThreadManager::Global().parallel_for(0, Mp, [&](size_t m) {
+    const size_t off = m * K;
+    if (m >= M) {
+      std::memset(X + off, static_cast<int>(zero_point), K);
+      return;
+    }
+    for (size_t k = 0; k < K; ++k) {
+      const float a = A[off + k];
+      if (!std::isfinite(a)) {
+        X[off + k] = static_cast<uint8_t>(zero_point);
+        continue;
+      }
+      float q = std::round(a * inv_act_scale) + zero_point;
+      if (q < 0.0f)
+        q = 0.0f;
+      if (q > 255.0f)
+        q = 255.0f;
+      X[off + k] = static_cast<uint8_t>(q);
+    }
+  });
+}
+
+/** @brief C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]). */
+void dequantizeToF32(const int32_t *C_i32, float *C, size_t M, size_t N,
+                     float act_scale, const float *wt_scale,
+                     const int32_t *zp_corr) {
+  ThreadManager::Global().parallel_for(0, M, [&](size_t m) {
+    const size_t off = m * N;
+    for (size_t n = 0; n < N; ++n)
+      C[off + n] = act_scale * wt_scale[n] *
+                   (static_cast<float>(C_i32[off + n]) -
+                    static_cast<float>(zp_corr[n]));
+  });
+}
+
 } // namespace
 
 // U8 activations × I8 weights (WH-layout) → I32 accumulator → FP32 output.
@@ -884,7 +966,6 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   const size_t Mp_sz = ((M_sz + 63U) / 64U) * 64U;
   const size_t N_sz = N;
   const size_t K_sz = K;
-  const size_t mk_elems = checkedMulSizeT(M_sz, K_sz, "M*K elements");
   const size_t mpk_elems = checkedMulSizeT(Mp_sz, K_sz, "Mp*K elements");
   const size_t mpn_elems = checkedMulSizeT(Mp_sz, N_sz, "Mp*N elements");
   const size_t nk_elems = checkedMulSizeT(N_sz, K_sz, "N*K elements");
@@ -900,15 +981,7 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   int domain = HtpBackend::global().domain();
 
   // --- Compute per-tensor activation scale ---
-  float max_abs = 0.0f;
-  for (size_t i = 0; i < mk_elems; ++i) {
-    if (!std::isfinite(A[i]))
-      continue;
-
-    float v = std::fabs(A[i]);
-    if (v > max_abs)
-      max_abs = v;
-  }
+  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
   // Guard against zero, non-finite, and underflowing scale values so the
   // quantization path stays finite and deterministic.
   constexpr float kActQuantMax = 127.0f;
@@ -954,28 +1027,8 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
 
   // --- FP32 → U8 quantization (zp = 128) ---
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
-  for (size_t m = 0; m < Mp_sz; ++m) {
-    const size_t row_offset = m * K_sz;
-    if (m >= M_sz) {
-      std::memset(X_u8 + row_offset, static_cast<int>(kActZeroPoint), K_sz);
-      continue;
-    }
-
-    for (size_t k = 0; k < K_sz; ++k) {
-      const float a = A[row_offset + k];
-      if (!std::isfinite(a)) {
-        X_u8[row_offset + k] = static_cast<uint8_t>(kActZeroPoint);
-        continue;
-      }
-
-      float q = std::round(a * inv_act_scale) + kActZeroPoint;
-      if (q < 0.0f)
-        q = 0.0f;
-      if (q > 255.0f)
-        q = 255.0f;
-      X_u8[row_offset + k] = static_cast<uint8_t>(q);
-    }
-  }
+  quantizeActivationU8(A, X_u8, M_sz, Mp_sz, K_sz, inv_act_scale,
+                       kActZeroPoint);
 
   // The WH-layout weight is already in NPU memory (resident cache, or the
   // transient buffer filled above) — no per-call copy.
@@ -996,14 +1049,7 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   // --- Dequantize: I32 accumulator → FP32 ---
   // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
   const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
-  for (size_t m = 0; m < M_sz; ++m) {
-    const size_t row_offset = m * N_sz;
-    for (size_t n = 0; n < N_sz; ++n) {
-      C[row_offset + n] = act_scale * wt_scale[n] *
-                          (static_cast<float>(C_i32[row_offset + n]) -
-                           static_cast<float>(zp_corr[n]));
-    }
-  }
+  dequantizeToF32(C_i32, C, M_sz, N_sz, act_scale, wt_scale, zp_corr);
 
   cleanup();
 }
@@ -1041,7 +1087,6 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   const size_t Mp_sz = ((M_sz + 63U) / 64U) * 64U;
   const size_t N_sz = N;
   const size_t K_sz = K;
-  const size_t mk_elems = checkedMulSizeT(M_sz, K_sz, "M*K elements");
   const size_t mpk_elems = checkedMulSizeT(Mp_sz, K_sz, "Mp*K elements");
   const size_t mpn_elems = checkedMulSizeT(Mp_sz, N_sz, "Mp*N elements");
   const size_t nk_elems = checkedMulSizeT(N_sz, K_sz, "N*K elements");
@@ -1058,15 +1103,7 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   int domain = HtpBackend::global().domain();
 
   // --- Compute per-tensor activation scale (identical to u8i8) ---
-  float max_abs = 0.0f;
-  for (size_t i = 0; i < mk_elems; ++i) {
-    if (!std::isfinite(A[i]))
-      continue;
-
-    float v = std::fabs(A[i]);
-    if (v > max_abs)
-      max_abs = v;
-  }
+  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
   constexpr float kActQuantMax = 127.0f;
   constexpr float kActZeroPoint = 128.0f;
   const double scale_candidate =
@@ -1111,28 +1148,8 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
 
   // --- FP32 → U8 quantization (zp = 128, identical to u8i8) ---
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
-  for (size_t m = 0; m < Mp_sz; ++m) {
-    const size_t row_offset = m * K_sz;
-    if (m >= M_sz) {
-      std::memset(X_u8 + row_offset, static_cast<int>(kActZeroPoint), K_sz);
-      continue;
-    }
-
-    for (size_t k = 0; k < K_sz; ++k) {
-      const float a = A[row_offset + k];
-      if (!std::isfinite(a)) {
-        X_u8[row_offset + k] = static_cast<uint8_t>(kActZeroPoint);
-        continue;
-      }
-
-      float q = std::round(a * inv_act_scale) + kActZeroPoint;
-      if (q < 0.0f)
-        q = 0.0f;
-      if (q > 255.0f)
-        q = 255.0f;
-      X_u8[row_offset + k] = static_cast<uint8_t>(q);
-    }
-  }
+  quantizeActivationU8(A, X_u8, M_sz, Mp_sz, K_sz, inv_act_scale,
+                       kActZeroPoint);
 
   // The packed INT4 WH weight (first N*K/2 bytes) is already in NPU memory —
   // resident cache, or the transient buffer filled above. No per-call copy.
@@ -1155,14 +1172,7 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   // --- Dequantize: I32 accumulator → FP32 (identical to u8i8) ---
   // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
   const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
-  for (size_t m = 0; m < M_sz; ++m) {
-    const size_t row_offset = m * N_sz;
-    for (size_t n = 0; n < N_sz; ++n) {
-      C[row_offset + n] = act_scale * wt_scale[n] *
-                          (static_cast<float>(C_i32[row_offset + n]) -
-                           static_cast<float>(zp_corr[n]));
-    }
-  }
+  dequantizeToF32(C_i32, C, M_sz, N_sz, act_scale, wt_scale, zp_corr);
 
   cleanup();
 }
