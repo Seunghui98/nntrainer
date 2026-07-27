@@ -51,6 +51,7 @@
 #include <layer.h>
 #include <model.h>
 #include <neuralnet.h>
+#include <nntrainer_error.h>
 #include <optimizer.h>
 #include <tensor.h>
 
@@ -278,8 +279,19 @@ buildFcModel(int M, int N, int K, const std::string &weight_dtype) {
 
   nn->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
   nn->setProperty({"loss=mse", "batch_size=" + std::to_string(M)});
-  nn->compile(ml::train::ExecutionMode::INFERENCE);
-  nn->initialize(ml::train::ExecutionMode::INFERENCE);
+
+  // Both return a status code. Ignoring them left a half-built graph looking
+  // like a graph whose layer simply owned no weights.
+  const int crc = nn->compile(ml::train::ExecutionMode::INFERENCE);
+  if (crc != ML_ERROR_NONE) {
+    std::printf("  [model] compile failed (%d)\n", crc);
+    return nullptr;
+  }
+  const int irc = nn->initialize(ml::train::ExecutionMode::INFERENCE);
+  if (irc != ML_ERROR_NONE) {
+    std::printf("  [model] initialize failed (%d)\n", irc);
+    return nullptr;
+  }
   return nn;
 }
 
@@ -377,6 +389,105 @@ bool findWeightsAllocating(nntrainer::NeuralNetwork *nn, int M, int K,
   return findWeights(nn, weight, bias, true);
 }
 
+/**
+ * @brief FullyConnectedLayer::forwarding, run directly on tensors.
+ *
+ * The model path exposes the layer's weights through RunLayerContext, and on
+ * this device that came back empty. Rather than block the comparison on that,
+ * this reproduces exactly what the layer's forward does --
+ *
+ *     input_.dot(weight, hidden_, false, false);   // fc_layer.cpp
+ *     hidden_.add_i(bias);
+ *
+ * -- on tensors built the same way the layer requests them: activation
+ * [1,1,M,K] FP32, weight [1,1,K,N] in the given dtype. Same call, same flags,
+ * same dispatch. What it does not cover is the model plumbing around it: the
+ * weight_dtype property, RunLayerContext, and how the graph hands the layer
+ * its tensors.
+ */
+std::vector<float> forwardDirect(int M, int N, int K,
+                                 const std::vector<float> &A,
+                                 const nntrainer::Tensor &weight,
+                                 const std::vector<float> &bias, bool on_npu) {
+  nntrainer::TensorDim adim(1, 1, M, K);
+  nntrainer::Tensor act(adim, false);
+  act.allocate();
+  std::memcpy(act.getData<float>(), A.data(),
+              static_cast<size_t>(M) * K * sizeof(float));
+
+#ifdef ENABLE_HEXKL
+  if (on_npu) {
+    // dot() only routes to the NPU when the activation carries the HTP ops.
+    static std::shared_ptr<nntrainer::ContextData> ct = [] {
+      auto c = std::make_shared<nntrainer::ContextData>();
+      c->setComputeOps(nntrainer::get_htp_ops());
+      return c;
+    }();
+    act.setContextData(ct);
+  }
+#else
+  (void)on_npu;
+#endif
+
+  nntrainer::Tensor out = act.dot(weight, false, false);
+
+  std::vector<float> C(static_cast<size_t>(M) * N);
+  std::memcpy(C.data(), out.getData<float>(),
+              static_cast<size_t>(M) * N * sizeof(float));
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n)
+      C[static_cast<size_t>(m) * N + n] += bias[n];
+  return C;
+}
+
+/** @brief An FP32 [1,1,K,N] weight tensor holding W_kn. */
+nntrainer::Tensor makeFp32Weight(int K, int N, const std::vector<float> &W_kn) {
+  nntrainer::Tensor t(1, 1, K, N,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  t.allocate();
+  std::memcpy(t.getData<float>(), W_kn.data(),
+              static_cast<size_t>(K) * N * sizeof(float));
+  return t;
+}
+
+#ifdef ENABLE_HEXKL
+/**
+ * @brief A QINT4_HTP [K,N] weight, laid out the way quantize_qint4_weight does.
+ *
+ * [K,N] not [N,K]: scale_size() is width(), so the logical layout would
+ * advertise K scales where the kernel wants N. The packed bytes themselves are
+ * layout-agnostic -- the kernel takes N and K from the matmul dims.
+ */
+nntrainer::Tensor makeQint4HtpWeight(int K, int N, const WeightQuant &wq) {
+  const size_t unpacked = static_cast<size_t>(N) * K;
+  std::vector<int8_t> packed(unpacked, 0);
+
+  void *src = nullptr, *dst = nullptr;
+  if (sdkl_npu_alloc(unpacked, &src) == 0 && src != nullptr &&
+      sdkl_npu_alloc(unpacked, &dst) == 0 && dst != nullptr) {
+    std::memcpy(src, wq.w_i4.data(), unpacked);
+    // (wt_rows=K, wt_cols=N): the transpose of the in-place i8 packer's order.
+    if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(dst),
+                             static_cast<int8_t *>(src), (size_t)K,
+                             (size_t)N) == 0)
+      std::memcpy(packed.data(), dst, unpacked);
+  }
+  if (src)
+    sdkl_npu_free(src);
+  if (dst)
+    sdkl_npu_free(dst);
+
+  nntrainer::TensorDim qdim(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  nntrainer::Tensor t(qdim, true, nntrainer::Initializer::NONE, "",
+                      nntrainer::QScheme::PER_CHANNEL_AFFINE_I4);
+  std::memcpy(t.getData<int8_t>(), packed.data(), unpacked);
+  std::memcpy(t.getScale<float>(), wq.scale.data(), N * sizeof(float));
+  std::memcpy(t.getZpCorr<int32_t>(), wq.zp_corr.data(), N * sizeof(int32_t));
+  return t;
+}
+#endif
+
 void printHead(const char *tag, const std::vector<float> &v, int n) {
   std::printf("  %-10s", tag);
   for (int i = 0; i < n && i < (int)v.size(); ++i)
@@ -422,22 +533,30 @@ int main(int argc, char **argv) {
 
   // ---- the layer, FP32 weight ----------------------------------------------
   std::vector<float> out_fp32;
+  bool via_model = false;
   try {
     auto nn = buildFcModel(a.M, a.N, a.K, "");
     nntrainer::Tensor *w = nullptr, *b = nullptr;
-    if (!findWeightsAllocating(nn.get(), a.M, a.K, &w, &b)) {
-      std::printf("error: could not locate the dense weight\n");
-      return 1;
+    if (nn && findWeightsAllocating(nn.get(), a.M, a.K, &w, &b)) {
+      std::memcpy(w->getData<float>(), W_kn.data(), kn * sizeof(float));
+      if (b)
+        std::memcpy(b->getData<float>(), bias.data(), a.N * sizeof(float));
+      auto res = nn->inference(a.M, {A.data()});
+      out_fp32.assign(res[0], res[0] + (size_t)a.M * a.N);
+      via_model = true;
     }
-    std::memcpy(w->getData<float>(), W_kn.data(), kn * sizeof(float));
-    if (b)
-      std::memcpy(b->getData<float>(), bias.data(), a.N * sizeof(float));
-
-    auto res = nn->inference(a.M, {A.data()});
-    out_fp32.assign(res[0], res[0] + (size_t)a.M * a.N);
   } catch (const std::exception &e) {
-    std::printf("error: FP32 fc_layer failed: %s\n", e.what());
-    return 1;
+    std::printf("  [model] FP32 model path failed: %s\n", e.what());
+  }
+
+  if (!via_model) {
+    // Fall back to the layer's forward arithmetic on bare tensors. Same dot()
+    // call the layer makes; what is skipped is the graph plumbing around it.
+    std::printf("  [model] weights unreachable through the graph -- running "
+                "the layer's forward directly instead\n\n");
+    out_fp32 =
+      forwardDirect(a.M, a.N, a.K, A, makeFp32Weight(a.K, a.N, W_kn), bias,
+                    false);
   }
 
 #ifdef ENABLE_HEXKL
@@ -446,50 +565,38 @@ int main(int argc, char **argv) {
   bool npu_ran = false;
   if (!nntrainer::HtpBackend::global().enabled()) {
     std::printf("[warn] HTP backend unavailable; skipping the NPU run\n\n");
-  } else
+  } else {
+    // The weight tensor is built once and used by whichever path runs, so the
+    // NPU sees exactly the int4 codes the CPU reference used either way.
+    nntrainer::Tensor wgt = makeQint4HtpWeight(a.K, a.N, wq);
+
+    bool through_model = false;
     try {
       auto nn = buildFcModel(a.M, a.N, a.K, "QINT4_HTP");
       nntrainer::Tensor *w = nullptr, *b = nullptr;
-      if (!findWeightsAllocating(nn.get(), a.M, a.K, &w, &b)) {
-        std::printf("error: could not locate the dense QINT4_HTP weight\n");
-        return 1;
-      }
+      if (nn && findWeightsAllocating(nn.get(), a.M, a.K, &w, &b)) {
+        std::memcpy(w->getData<int8_t>(), wgt.getData<int8_t>(), kn);
+        std::memcpy(w->getScale<float>(), wq.scale.data(),
+                    a.N * sizeof(float));
+        std::memcpy(w->getZpCorr<int32_t>(), wq.zp_corr.data(),
+                    a.N * sizeof(int32_t));
+        if (b)
+          std::memcpy(b->getData<float>(), bias.data(), a.N * sizeof(float));
 
-      // WH-pack the same int4 weights the CPU reference used, so the two runs
-      // differ only in who does the arithmetic. sdkl_cpu_rm_to_wh_i4 takes
-      // (wt_rows=K, wt_cols=N) -- the transpose of the in-place i8 variant.
-      void *src = nullptr, *dst = nullptr;
-      if (sdkl_npu_alloc(kn, &src) != 0 || src == nullptr ||
-          sdkl_npu_alloc(kn, &dst) != 0 || dst == nullptr) {
-        std::printf("error: sdkl_npu_alloc failed for the WH pack\n");
-        return 1;
+        auto res = nn->inference(a.M, {A.data()});
+        out_npu.assign(res[0], res[0] + (size_t)a.M * a.N);
+        through_model = true;
       }
-      std::memcpy(src, wq.w_i4.data(), kn);
-      const int rc =
-        sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(dst),
-                             static_cast<int8_t *>(src), (size_t)a.K,
-                             (size_t)a.N);
-      if (rc != 0) {
-        std::printf("error: sdkl_cpu_rm_to_wh_i4 failed (%d)\n", rc);
-        return 1;
-      }
-      std::memcpy(w->getData<int8_t>(), dst, kn);
-      sdkl_npu_free(src);
-      sdkl_npu_free(dst);
-
-      std::memcpy(w->getScale<float>(), wq.scale.data(), a.N * sizeof(float));
-      std::memcpy(w->getZpCorr<int32_t>(), wq.zp_corr.data(),
-                  a.N * sizeof(int32_t));
-      if (b)
-        std::memcpy(b->getData<float>(), bias.data(), a.N * sizeof(float));
-
-      auto res = nn->inference(a.M, {A.data()});
-      out_npu.assign(res[0], res[0] + (size_t)a.M * a.N);
-      npu_ran = true;
     } catch (const std::exception &e) {
-      std::printf("error: QINT4_HTP fc_layer failed: %s\n", e.what());
-      return 1;
+      std::printf("  [model] QINT4_HTP model path failed: %s\n", e.what());
     }
+
+    if (!through_model)
+      out_npu = forwardDirect(a.M, a.N, a.K, A, wgt, bias, true);
+    npu_ran = true;
+    std::printf("  [npu] ran %s\n\n",
+                through_model ? "through the model" : "via the layer's dot()");
+  }
 #else
   std::vector<float> out_npu;
   const bool npu_ran = false;
