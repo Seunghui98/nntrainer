@@ -223,6 +223,19 @@ static const FcShape kFcShapes[] = {
 
 // ---- Production quantization cross-check ------------------------------------
 
+// On the scale / zp_corr side these tests are unconditional: both are computed
+// from the logical [N, K] weight before any layout conversion, so they are
+// comparable against a row-major reference on every build.
+//
+// The quantized payload is not. With ENABLE_HEXKL, quantize_qint{4,8}_weight
+// ends by handing the buffer to sdkl_cpu_rm_to_wh_i{4,8}, which reorders it
+// into the HMX-tiled WH layout the NPU op expects -- and for int4 also packs
+// two nibbles per byte, halving the meaningful byte count. Comparing that
+// element-wise against a row-major [N, K] reference is meaningless, so the
+// payload loops below only run on host builds. The device-side payload is
+// covered end-to-end by BakedWeight_MatchesCpuPipeline, which routes a real
+// quantize_qint4_weight output through Tensor::dot().
+
 TEST(HtpKernelMath, QInt4Weight_ScaleZpCorr_MatchReference) {
   constexpr int N = 64, K = 128;
   auto W = randVec(N * K, -0.7f, 0.7f, 1);
@@ -235,17 +248,22 @@ TEST(HtpKernelMath, QInt4Weight_ScaleZpCorr_MatchReference) {
   WeightQuant ref = refWeightQuant(W.data(), N, K, /*q_max=*/7);
   const float *scale = q.getScale<float>();
   const int32_t *zp_corr = q.getZpCorr<int32_t>();
-  const int8_t *w_q = q.getData<int8_t>();
 
   for (int n = 0; n < N; ++n) {
     EXPECT_FLOAT_EQ(scale[n], ref.scale[n]) << "n=" << n;
     EXPECT_EQ(zp_corr[n], ref.zp_corr[n]) << "n=" << n;
   }
+
+#ifndef ENABLE_HEXKL
+  // Host build: no WH conversion ran, so the payload is still one sign-extended
+  // int4 per byte in row-major [N, K].
+  const int8_t *w_q = q.getData<int8_t>();
   for (int i = 0; i < N * K; ++i) {
-    ASSERT_GE(w_q[i], -7);
-    ASSERT_LE(w_q[i], 7);
-    EXPECT_EQ(w_q[i], ref.w_q[i]) << "i=" << i;
+    ASSERT_GE(w_q[i], -7) << "i=" << i;
+    ASSERT_LE(w_q[i], 7) << "i=" << i;
+    ASSERT_EQ(w_q[i], ref.w_q[i]) << "i=" << i;
   }
+#endif
 }
 
 TEST(HtpKernelMath, QInt8Weight_ScaleZpCorr_MatchReference) {
@@ -259,14 +277,18 @@ TEST(HtpKernelMath, QInt8Weight_ScaleZpCorr_MatchReference) {
   WeightQuant ref = refWeightQuant(W.data(), N, K, /*q_max=*/127);
   const float *scale = q.getScale<float>();
   const int32_t *zp_corr = q.getZpCorr<int32_t>();
-  const int8_t *w_q = q.getData<int8_t>();
 
   for (int n = 0; n < N; ++n) {
     EXPECT_FLOAT_EQ(scale[n], ref.scale[n]) << "n=" << n;
     EXPECT_EQ(zp_corr[n], ref.zp_corr[n]) << "n=" << n;
   }
+
+#ifndef ENABLE_HEXKL
+  // Host build: no WH conversion ran, so the payload is still row-major [N, K].
+  const int8_t *w_q = q.getData<int8_t>();
   for (int i = 0; i < N * K; ++i)
-    EXPECT_EQ(w_q[i], ref.w_q[i]) << "i=" << i;
+    ASSERT_EQ(w_q[i], ref.w_q[i]) << "i=" << i;
+#endif
 }
 
 // ---- Zero-point correction is algebraically exact ---------------------------
