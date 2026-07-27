@@ -865,37 +865,35 @@ NpuScratch g_c_scratch; // int32 accumulator
 //
 // The activation scan, the FP32->U8 quantization and the dequantize are
 // element-wise over M*K and M*N. On a Galaxy S25 Ultra they account for about
-// 197 us of the 495 us an fc_layer call takes (q_proj, M=64, u8i4) -- on the
-// order of the matmul itself. Unlike the matmul, which HMX serializes behind
-// sdkl_npu_lock_hmx, they parallelize directly over rows.
+// 250 us of the 542 us an fc_layer call takes single-threaded (q_proj, M=64,
+// u8i4) -- on the order of the matmul itself. Unlike the matmul, which HMX
+// serializes behind sdkl_npu_lock_hmx, the quantize and dequantize parallelize
+// over rows with no shared state: each row writes a disjoint output range.
 //
 // parallel_for runs serially when there is one row or no workers, so decode
 // (M=1) is unaffected.
 
-/** @brief Largest |A[i]| over M*K, skipping non-finite values. */
+/**
+ * @brief Largest |A[i]| over M*K, skipping non-finite values.
+ *
+ * Deliberately serial. Being a reduction it needs somewhere to put the
+ * per-thread partials, and at a prefill tile that array is only a few cache
+ * lines wide -- so several threads end up writing the same line and trading it
+ * back and forth, which is exactly what the element-wise routines below avoid
+ * by construction. It would also cost an allocation per call and a third
+ * barrier, to save a scan of M*K that is a fraction of the quantize and
+ * dequantize either side of it.
+ */
 float activationMaxAbs(const float *A, size_t M, size_t K) {
-  if (M == 0 || K == 0)
-    return 0.0f;
-
-  // One partial per row, reduced serially afterwards: M is small (a prefill
-  // tile), so the reduction is negligible next to the scan.
-  std::vector<float> row_max(M, 0.0f);
-  ThreadManager::Global().parallel_for(0, M, [&](size_t m) {
-    const float *row = A + m * K;
-    float mx = 0.0f;
-    for (size_t k = 0; k < K; ++k) {
-      if (!std::isfinite(row[k]))
-        continue;
-      const float v = std::fabs(row[k]);
-      if (v > mx)
-        mx = v;
-    }
-    row_max[m] = mx;
-  });
-
   float max_abs = 0.0f;
-  for (float v : row_max)
-    max_abs = std::max(max_abs, v);
+  const size_t n = M * K;
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(A[i]))
+      continue;
+    const float v = std::fabs(A[i]);
+    if (v > max_abs)
+      max_abs = v;
+  }
   return max_abs;
 }
 
