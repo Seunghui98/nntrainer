@@ -3,13 +3,18 @@
 How to cut the NPU-side cost of an fc_layer matmul by keeping the WH-packed
 weight resident in VTCM instead of re-deriving it per tile.
 
-> **Status: measured, and the answer is no. See §7.**
+> **Status: measured; §2's rationale is refuted. See §7.**
 > §3.1 and §3.2 are done on the V79 simulator. Hoisting the RM→WH conversion is
-> worth 15.3x *for the SDK sample*, but nntrainer bakes WH offline and so pays
-> that cost zero times per call — the win does not transfer. §3.3 is therefore
-> not being built. The document is kept because §3.2's cost breakdown is the
-> useful result: in the micro-API kernel the HMX matmul is 5% of the time and
-> the scalar staging copies are 95%.
+> worth 15.3x *for the SDK sample*, but nntrainer bakes WH offline and pays that
+> cost zero times per call, so the win does not transfer and §3.3 is not being
+> built on it. Two results survive: the staging copies, not HMX, dominate the
+> micro-API kernel (95% vs 5%); and the per-call DDR→VTCM *transfer* of the
+> weight — a different thing from the conversion — remains unmeasured.
+>
+> Nothing in nntrainer touches VTCM directly today. The kernels called are the
+> macro API (`sdkl_npu_mm_*`); `hexkl_micro_*` appears nowhere in the tree. The
+> weight cache in `hexkl_mm.cpp` keeps weights resident in `sdkl_npu_alloc`'d
+> DDR, not in VTCM. Controlling VTCM means the micro API, which means a skel.
 
 ## 1. Where the time goes
 
@@ -163,8 +168,16 @@ cycles/byte on the output copy, 8.4 on the activation copy. `hexkl_micro.h`
 says as much about `copy_psubmatrix`: *"primarily intended for testing and
 debugging purposes. In operational mode, DMA is typically used."*
 
-So the lever is **DMA for activation staging and result writeback**, not where
-the weight lives. Weight residency addresses 0% of our per-call cost.
+So one clear lever is **DMA for activation staging and result writeback**.
+
+What this does *not* settle is whether VTCM weight residency is worth anything
+to us for a different reason than the one §2 proposed. The probe compared
+"convert every tile from DDR" against "already in VTCM". It never measured
+"DMA the pre-baked WH bytes from DDR into VTCM each call" — which is what the
+shipped kernel plausibly does, since HMX cannot read DDR and our weight lives
+in `sdkl_npu_alloc`'d memory. Moving 1 MiB per call is not free, and residency
+would remove it. That saving is unmeasured, not disproven; §3.2 killed the
+*conversion* rationale, not the transfer one.
 
 One inference worth recording, with its assumption stated: 98,304 pcycles of
 HMX at a ~1.0–1.4 GHz DSP clock is 70–98 μs, which brackets QNN's measured
@@ -321,19 +334,38 @@ should spend its effort.
 
 ## 7. Verdict, and what to do instead
 
-**Do not build the residency skel.** §3.3 was conditional on §3.2 paying, and
-it does not pay for our path: nntrainer performs zero RM→WH conversions per
-call, so hoisting them saves zero. §5 remains as the record of what was tested.
+**Do not build the residency skel on the strength of §2's argument.** That
+argument was that the conversion is re-done per call; it is not, for us, so
+hoisting it saves zero. §5 remains as the record of what was tested.
 
-What §3.2 found instead is that in the micro-API kernel the HMX matmul is 5% of
-the time and the scalar staging copies are 95%. Any future custom kernel should
-be judged on whether it DMAs activations in and results out, and should keep
-the accumulator in VTCM across output tiles rather than copying per tile.
+Two things stay open, and both point at the same next experiment rather than at
+a skel:
 
-Before any of that is worth building, one cheaper question comes first: **what
-is the shipped `sdkl_npu_mm_u8i4_i32`'s 298 μs actually made of?** Nothing
-measured so far can say. It is a compiled library function, the probe cannot
-call it (macro API, needs FastRPC), and the simulator's cycle counts do not
-convert to device microseconds. Until that is answered, "write our own kernel"
-is a bet that we can beat Qualcomm's staging code, with no evidence either way
-— and the host-side wins (§1: 1214 μs → 545 μs) came far more cheaply.
+1. **Staging, not compute, dominates the micro-API kernel** — HMX 5%, scalar
+   copies 95%. A custom kernel would live or die on DMA staging and on holding
+   the accumulator across output tiles, not on weight placement.
+2. **The DDR→VTCM transfer of the weight is unmeasured.** HMX cannot read DDR,
+   and our WH bytes sit in `sdkl_npu_alloc`'d memory, so *something* moves 1 MiB
+   into VTCM. If the shipped kernel does that per call, residency would remove
+   it — a real saving, for a different reason than §2 gave.
+
+Both resolve the same way, and more cheaply than building anything: **decompose
+the shipped `sdkl_npu_mm_u8i4_i32`'s 298 μs on device.** Sweep N and K
+independently with `hexkl_fc_compare` and fit
+`A + B·(mm ops) + C·(output bytes) + D·(weight bytes) + E·(activation bytes)`,
+the same way §3.2's five shapes were fitted. A significant `D` is the signature
+of a per-call weight transfer and makes the residency case; a dominant `A` says
+the problem is call overhead, not the kernel; a fit near the HMX floor says
+stop.
+
+The probe cannot answer this — `sdkl_npu_mm_u8i4_i32` is a compiled macro-API
+function needing FastRPC, and simulator cycles do not convert to device
+microseconds. Until it is answered, "write our own kernel" is a bet that we can
+beat Qualcomm's staging code, with no evidence either way — and the host-side
+wins (§1: 1214 μs → 545 μs) came far more cheaply.
+
+Worth keeping in view while deciding: on the like-for-like measure (what the
+host actually pays per fc_layer call) HexKL is at 495 μs against QNN's 513 μs
+NetRun — already ahead. The 4x gap is against QNN's FC *sub-phase*, which is
+20% of its own 347 μs device total. This is an optimization from a winning
+position, not a rescue.
