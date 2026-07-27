@@ -829,6 +829,10 @@ int main(int argc, char **argv) {
   //   data movement            <- host-side alloc + H2D + WH pack + D2H
   // sdkl does not expose the intra-execute device timeline (convert / FC /
   // reshape / writeback), so those sub-phases cannot be split here.
+  // Built-at stamp. Chasing a missing phase block through three rebuilds came
+  // down to "is the binary on the device the one I just built?", which nothing
+  // in the output could answer.
+  std::printf("\n  built: %s %s\n", __DATE__, __TIME__);
   std::printf("\nPhase                                    Time (us)\n");
   std::printf("One-time init (sdkl_npu_initialize)      %10.1f\n", init_us);
   auto dumpMethod = [&](const char *tag, float err, const QResult &r) {
@@ -847,7 +851,12 @@ int main(int argc, char **argv) {
       std::printf("    min / median / max                   %10.1f /%8.1f /"
                   "%8.1f\n",
                   r.t.kernel_min_us, r.t.kernel_med_us, r.t.kernel_max_us);
-      if (r.t.p_valid) {
+      if (!r.t.p_valid) {
+        // Gating this block on p_valid once made a stale binary look like a
+        // working one that simply had nothing to say. Say it out loud instead.
+        std::printf("    [phase split unavailable: kernel profile not "
+                    "recorded]\n");
+      } else {
         // Straight from the kernel's own timers, so this is the real split of
         // the steady-state number above rather than a re-measurement.
         std::printf("    NPU matmul (sdkl_npu_mm)             %10.1f   <- "
