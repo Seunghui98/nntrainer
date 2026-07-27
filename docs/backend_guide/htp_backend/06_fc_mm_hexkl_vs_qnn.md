@@ -44,6 +44,38 @@ This is the recipe `quantize_qint4_weight` / `quantize_qint8_weight` and
   `scale` / `zp_corr`, time its execute, and compare relErr + latency against
   the HexKL rows.
 
+## Measured: q_proj (M=64, N=2048, K=1024), Galaxy S25 Ultra
+
+One fc_layer matmul, u8i4. HexKL numbers from
+`hexkl_fc_compare --proj q_proj --bits 4`; QNN from a `qnn-net-run` profile of
+the same shape.
+
+| | μs | note |
+| :--- | ---: | :--- |
+| **HexKL per call (steady)** | **495** | `--engine nntr`: what an fc_layer pays |
+| HexKL first call | 1214 | uploads the weight; also the pre-residency cost |
+| HexKL matmul alone | 298 | `--engine sdkl`: `sdkl_npu_mm_u8i4_i32` only |
+| **QNN NetRun** | **513** | host-observed execute |
+| QNN device total | 347 | Convert 44.5 + FC 69.9 + format 151.1 + writeback 72.9 |
+| QNN FC alone | 69.9 | device-timeline sub-phase |
+
+Reading these:
+
+- **495 vs 513** is the like-for-like comparison — both are what the host pays
+  per matmul. Keeping the weight resident in NPU memory is what closed it:
+  before that every call re-uploaded, which is the 1214 figure.
+- **298 vs 69.9** is not like-for-like. 298 is a whole host-observed execute
+  (FastRPC round trip, input load, matmul, writeback); 69.9 is one sub-phase of
+  QNN's device timeline. sdkl exposes no intra-execute breakdown, so the
+  matching number cannot be extracted. A `--sweep` on device puts the fixed
+  per-call cost at ~76 μs, leaving ~217 μs of actual compute.
+- **495 − 298 ≈ 197 μs** is host-side activation quantization (M·K = 65 536
+  elements) and dequantize (M·N = 131 072). Unlike the matmul, which HMX
+  serializes behind `sdkl_npu_lock_hmx`, this part is element-wise and
+  parallelizable — the remaining lever on the host side.
+- QNN spends 151.1 μs formatting its output back to uint8. HexKL returns fp32
+  and skips that, so a uint8 output requirement would add cost on our side too.
+
 ## Fc shapes (qwen3-0.6b, hidden 1024, intermediate 3072, GQA q=2048/kv=1024)
 
 | projection | N | K |
