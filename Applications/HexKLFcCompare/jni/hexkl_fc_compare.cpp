@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -422,6 +423,31 @@ static bool runViaNntrainer(int M, int N, int K, int bits,
                             const std::vector<float> &A, const WQuant &wq,
                             int warmup, int iters, Timing &tm,
                             std::vector<float> &C_out) {
+  // libnntrainer owns the CDSP session and opens it lazily inside the first
+  // kernel call, so nothing here may touch sdkl_npu_alloc before that happens.
+  // Prime it with a throwaway matmul fed entirely from host memory: the kernel
+  // resolves HtpBackend::global() (which performs the init) before it allocates
+  // anything, and it copies the weight in from wherever the caller put it. The
+  // weight is not WH-packed, so the result is meaningless -- it is discarded.
+  // Doing this first also keeps the backend bring-up out of the cold-run figure.
+  {
+    const int dM = 64, dN = 32, dK = 32;
+    std::vector<int8_t> dwh(static_cast<size_t>(dN) * dK / 2, 0x11);
+    std::vector<float> dA(static_cast<size_t>(dM) * dK, 0.5f);
+    std::vector<float> dC(static_cast<size_t>(dM) * dN, 0.0f);
+    std::vector<float> dscale(dN, 1.0f / 7.0f);
+    std::vector<int32_t> dzp(dN, 0);
+    try {
+      nntrainer::hmx::shgemm_u8i4_i32(dM, dN, dK, dA.data(), dwh.data(),
+                                      dscale.data(), dzp.data(), dC.data());
+    } catch (const std::exception &e) {
+      std::fprintf(stderr, "[warn] backend priming call failed: %s\n", e.what());
+      return false;
+    }
+  }
+
+  // SDKL is up now, so the WH pack below can use NPU-accessible buffers (the
+  // layout path is documented to fault on host-only memory).
   const size_t nk = static_cast<size_t>(N) * K;
   NpuBuf Wsrc(nk), Wwh(nk);
   if (!Wsrc.ok() || !Wwh.ok())
@@ -454,41 +480,24 @@ static bool runViaNntrainer(int M, int N, int K, int bits,
                                       wq.zp_corr.data(), C_out.data());
   };
 
-  // libnntrainer brings the CDSP session up lazily, inside the first kernel
-  // call. Absorb that here on a throwaway weight so the cold-run figure below
-  // measures the weight upload rather than a one-off backend init.
-  {
-    const int dN = 32, dK = 32, dM = 64;
-    NpuBuf dsrc((size_t)dN * dK), dwh((size_t)dN * dK);
-    if (dsrc.ok() && dwh.ok()) {
-      std::vector<int8_t> dw((size_t)dN * dK, 1);
-      std::memcpy(dsrc.p, dw.data(), dw.size());
-      std::vector<float> dA((size_t)dM * dK, 0.5f), dC((size_t)dM * dN, 0.0f);
-      std::vector<float> dscale(dN, 1.0f / 7.0f);
-      std::vector<int32_t> dzp(dN, 128 * dK);
-      if (sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(dwh.p),
-                               static_cast<int8_t *>(dsrc.p), (size_t)dK,
-                               (size_t)dN) == 0) {
-        nntrainer::hmx::shgemm_u8i4_i32(dM, dN, dK, dA.data(),
-                                        static_cast<const int8_t *>(dwh.p),
-                                        dscale.data(), dzp.data(), dC.data());
-      }
+  try {
+    auto tc = std::chrono::steady_clock::now();
+    call(); // first call on the real weight: uploads it into NPU memory
+    tm.cold_us = usSince(tc);
+
+    for (int i = 0; i < warmup; ++i)
+      call();
+    double sum = 0.0;
+    for (int i = 0; i < iters; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      call();
+      sum += usSince(t0);
     }
+    tm.kernel_us = iters > 0 ? sum / iters : 0.0;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "[warn] nntrainer kernel failed: %s\n", e.what());
+    return false;
   }
-
-  auto tc = std::chrono::steady_clock::now();
-  call(); // first call on the real weight: uploads it into NPU memory
-  tm.cold_us = usSince(tc);
-
-  for (int i = 0; i < warmup; ++i)
-    call();
-  double sum = 0.0;
-  for (int i = 0; i < iters; ++i) {
-    auto t0 = std::chrono::steady_clock::now();
-    call();
-    sum += usSince(t0);
-  }
-  tm.kernel_us = iters > 0 ? sum / iters : 0.0;
   return true;
 }
 #endif
