@@ -1,6 +1,10 @@
 LOCAL_PATH := $(call my-dir)
 
-NNTRAINER_ROOT    := $(LOCAL_PATH)/../../..
+# abspath: ndk-build gives my-dir relative to the invocation directory, so a
+# plain $(LOCAL_PATH)/../../.. resolves outside the repo whenever this is built
+# from anywhere but the directory itself -- and it must be, since the folder is
+# not named "jni".
+NNTRAINER_ROOT    := $(abspath $(LOCAL_PATH)/../../..)
 HEXKL_ADDON_ROOT  := $(HEXKL_SDK_ROOT)
 ifeq ($(HEXKL_ADDON_ROOT),)
   HEXKL_ADDON_ROOT := /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon
