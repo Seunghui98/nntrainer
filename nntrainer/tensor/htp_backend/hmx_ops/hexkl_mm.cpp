@@ -647,6 +647,7 @@ void prefillWHCacheClear() {
 
 #include <sdkl.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -698,11 +699,37 @@ int checkedSdkDim(unsigned int dim, const char *label) {
 // grow-only scratch buffers for the activation and accumulator. Steady state
 // then performs no allocation and no weight upload at all.
 
+// Bytes sampled from each end of a weight to detect a recycled host address.
+static constexpr size_t WEIGHT_FINGERPRINT_BYTES = 64;
+
 /** @brief One WH weight resident in NPU memory, keyed by its host pointer. */
 struct IntWeightEntry {
   void *npu;
   size_t bytes;
+  // A host allocator is free to hand the same address to a different weight
+  // once the first has been released, and (pointer, size) alone cannot tell
+  // the two apart. Sampling both ends catches that: the head alone would miss
+  // weights sharing a prefix.
+  uint8_t head[WEIGHT_FINGERPRINT_BYTES];
+  uint8_t tail[WEIGHT_FINGERPRINT_BYTES];
+  size_t fp_len;
 };
+
+/** @brief Fill an entry's fingerprint from the host weight bytes. */
+void fillFingerprint(IntWeightEntry &e, const void *host_wh, size_t bytes) {
+  const uint8_t *p = static_cast<const uint8_t *>(host_wh);
+  e.fp_len = std::min(bytes, WEIGHT_FINGERPRINT_BYTES);
+  std::memcpy(e.head, p, e.fp_len);
+  std::memcpy(e.tail, p + bytes - e.fp_len, e.fp_len);
+}
+
+/** @brief True when the host bytes still match the entry's fingerprint. */
+bool fingerprintMatches(const IntWeightEntry &e, const void *host_wh,
+                        size_t bytes) {
+  const uint8_t *p = static_cast<const uint8_t *>(host_wh);
+  return std::memcmp(e.head, p, e.fp_len) == 0 &&
+         std::memcmp(e.tail, p + bytes - e.fp_len, e.fp_len) == 0;
+}
 
 /**
  * @brief Process-lifetime residency for WH-layout integer weights.
@@ -735,12 +762,23 @@ static constexpr size_t INT_WEIGHT_MAX_BYTES = 48ull * 1024 * 1024; // 48 MB
  *         transient buffer.
  */
 void *residentIntWeight(const void *host_wh, size_t bytes) {
+  if (host_wh == nullptr || bytes == 0)
+    return nullptr;
+
   const auto key = std::make_pair(host_wh, bytes);
 
   std::lock_guard<std::mutex> lock(g_int_weight.mtx);
   auto it = g_int_weight.cache.find(key);
-  if (it != g_int_weight.cache.end())
-    return it->second.npu;
+  if (it != g_int_weight.cache.end()) {
+    if (fingerprintMatches(it->second, host_wh, bytes))
+      return it->second.npu;
+
+    // Same address and size, different contents: the previous weight was
+    // released and this one landed on its address. Drop the stale upload.
+    npuFreeIfAlive(it->second.npu);
+    g_int_weight.total_bytes -= it->second.bytes;
+    g_int_weight.cache.erase(it);
+  }
 
   if (g_int_weight.total_bytes + bytes > INT_WEIGHT_MAX_BYTES)
     return nullptr;
@@ -750,7 +788,12 @@ void *residentIntWeight(const void *host_wh, size_t bytes) {
     return nullptr;
 
   std::memcpy(npu, host_wh, bytes);
-  g_int_weight.cache.emplace(key, IntWeightEntry{npu, bytes});
+
+  IntWeightEntry entry{};
+  entry.npu = npu;
+  entry.bytes = bytes;
+  fillFingerprint(entry, host_wh, bytes);
+  g_int_weight.cache.emplace(key, entry);
   g_int_weight.total_bytes += bytes;
   return npu;
 }
