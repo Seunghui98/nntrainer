@@ -37,12 +37,14 @@ static void npuFreeIfAlive(void *p) {
 #ifdef ENABLE_FP16
 
 #include <hexkl_mm.h>
+#include <hexkl_quant.h>
 #include <htp_backend.h>
 
 #include <remote.h>
 #include <sdkl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -863,13 +865,15 @@ NpuScratch g_c_scratch; // int32 accumulator
 //
 // The activation scan, the FP32->U8 quantization and the dequantize are
 // element-wise over M*K and M*N, and on a Galaxy S25 Ultra account for roughly
-// 250 us of the 545 us an fc_layer call takes (q_proj, M=64, u8i4) -- on the
-// order of the matmul itself.
+// 197 us of the 495 us an fc_layer call takes (q_proj, M=64, u8i4) -- on the
+// order of the matmul itself. They live in hexkl_quant.h, which carries an
+// AArch64 NEON implementation and the scalar reference it must match bit for
+// bit.
 //
-// They are kept serial. Running them through ThreadManager::parallel_for was
-// measured over 200 iterations per setting and did lower the median (542 ->
-// ~357 us), but the mean -- which is what throughput follows -- only improved
-// at two threads, and regressed past it:
+// They are NOT threaded. ThreadManager::parallel_for was measured over 200
+// iterations per setting and did lower the median (542 -> ~357 us), but the
+// mean -- which is what throughput follows -- only improved at two threads and
+// regressed past it:
 //
 //     threads   1      2         4         8
 //     median    542    384/399   359/358   357/358
@@ -880,77 +884,51 @@ NpuScratch g_c_scratch; // int32 accumulator
 // down: it survived removing a per-call allocation, false sharing on the
 // reduction array, and one of the three barriers. parallel_for also draws on
 // the process-wide pool, so this path cannot cap itself at the two threads
-// that helped -- and 4 or 8 is the ordinary setting. Left serial until the
-// tail is understood; the larger headroom is on the NPU side anyway (the
-// matmul is ~298 us of the 545).
+// that helped -- and 4 or 8 is the ordinary setting. SIMD is the safer axis
+// for the same work: no scheduler involvement, so none of that tail.
 
-/**
- * @brief Largest |A[i]| over M*K, skipping non-finite values.
- *
- * Deliberately serial. Being a reduction it needs somewhere to put the
- * per-thread partials, and at a prefill tile that array is only a few cache
- * lines wide -- so several threads end up writing the same line and trading it
- * back and forth, which is exactly what the element-wise routines below avoid
- * by construction. It would also cost an allocation per call and a third
- * barrier, to save a scan of M*K that is a fraction of the quantize and
- * dequantize either side of it.
- */
-float activationMaxAbs(const float *A, size_t M, size_t K) {
-  float max_abs = 0.0f;
-  const size_t n = M * K;
-  for (size_t i = 0; i < n; ++i) {
-    if (!std::isfinite(A[i]))
-      continue;
-    const float v = std::fabs(A[i]);
-    if (v > max_abs)
-      max_abs = v;
-  }
-  return max_abs;
-}
+using quant::activationMaxAbs;
+using quant::dequantizeToF32;
+using quant::quantizeActivationU8;
 
-/**
- * @brief Quantize FP32 activations to U8 with the given zero point.
- * @param Mp Row count padded to the SDKL 64-row tile; rows at or past M are
- *           filled with the zero point so the padding contributes nothing.
- */
-void quantizeActivationU8(const float *A, uint8_t *X, size_t M, size_t Mp,
-                          size_t K, float inv_act_scale, float zero_point) {
-  for (size_t m = 0; m < Mp; ++m) {
-    const size_t off = m * K;
-    if (m >= M) {
-      std::memset(X + off, static_cast<int>(zero_point), K);
-      continue;
-    }
-    for (size_t k = 0; k < K; ++k) {
-      const float a = A[off + k];
-      if (!std::isfinite(a)) {
-        X[off + k] = static_cast<uint8_t>(zero_point);
-        continue;
-      }
-      float q = std::round(a * inv_act_scale) + zero_point;
-      if (q < 0.0f)
-        q = 0.0f;
-      if (q > 255.0f)
-        q = 255.0f;
-      X[off + k] = static_cast<uint8_t>(q);
-    }
-  }
-}
+// ---- Per-phase timing ------------------------------------------------------
+// Five steady_clock reads per call, ~100 ns against a ~300 us call, so this is
+// always on rather than behind a flag -- a profile that has to be enabled is a
+// profile nobody has.
 
-/** @brief C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]). */
-void dequantizeToF32(const int32_t *C_i32, float *C, size_t M, size_t N,
-                     float act_scale, const float *wt_scale,
-                     const int32_t *zp_corr) {
-  for (size_t m = 0; m < M; ++m) {
-    const size_t off = m * N;
-    for (size_t n = 0; n < N; ++n)
-      C[off + n] = act_scale * wt_scale[n] *
-                   (static_cast<float>(C_i32[off + n]) -
-                    static_cast<float>(zp_corr[n]));
-  }
+MmProfile g_profile{};
+
+/** @brief Monotonic microseconds, for the phase timers only. */
+double nowUs() {
+  return std::chrono::duration<double, std::micro>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
 }
 
 } // namespace
+
+const MmProfile &lastMmProfile() { return g_profile; }
+
+void lastMmProfileValues(double *scan_us, double *quant_us, double *stage_us,
+                         double *npu_us, double *dequant_us, double *total_us,
+                         bool *neon) {
+  if (scan_us)
+    *scan_us = g_profile.scan_us;
+  if (quant_us)
+    *quant_us = g_profile.quant_us;
+  if (stage_us)
+    *stage_us = g_profile.stage_us;
+  if (npu_us)
+    *npu_us = g_profile.npu_us;
+  if (dequant_us)
+    *dequant_us = g_profile.dequant_us;
+  if (total_us)
+    *total_us = g_profile.total_us;
+  if (neon)
+    *neon = g_profile.neon;
+}
+
+void resetMmProfile() { g_profile = MmProfile{}; }
 
 // U8 activations × I8 weights (WH-layout) → I32 accumulator → FP32 output.
 //
@@ -989,8 +967,13 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
 
   int domain = HtpBackend::global().domain();
 
+  MmProfile prof;
+  prof.neon = quant::neonEnabled();
+  const double t_begin = nowUs();
+
   // --- Compute per-tensor activation scale ---
-  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
+  const float max_abs = activationMaxAbs(A, M_sz * K_sz);
+  prof.scan_us = nowUs() - t_begin;
   // Guard against zero, non-finite, and underflowing scale values so the
   // quantization path stays finite and deterministic.
   constexpr float kActQuantMax = 127.0f;
@@ -1007,6 +990,7 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   // --- NPU-accessible buffers: reused scratch + resident weight ---
   // X/C come from grow-only scratch pools and the WH weight stays resident
   // across calls, so the steady state allocates nothing and re-uploads nothing.
+  const double t_stage = nowUs();
   void *X_npu = g_x_scratch.get(x_bytes); // uint8  [Mp * K]
   void *C_npu = g_c_scratch.get(c_bytes); // int32  [Mp * N]
   if (X_npu == nullptr || C_npu == nullptr)
@@ -1033,11 +1017,14 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   };
 
   int err = 0;
+  prof.stage_us = nowUs() - t_stage;
 
   // --- FP32 → U8 quantization (zp = 128) ---
+  const double t_quant = nowUs();
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
   quantizeActivationU8(A, X_u8, M_sz, Mp_sz, K_sz, inv_act_scale,
                        kActZeroPoint);
+  prof.quant_us = nowUs() - t_quant;
 
   // The WH-layout weight is already in NPU memory (resident cache, or the
   // transient buffer filled above) — no per-call copy.
@@ -1046,9 +1033,11 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   // sdkl_npu_mm_u8i8_i32(domain, n_row, n_col, n_inner, A[i32 out],
   //                       X[u8 in], W[i8 WH weight])
   std::memset(C_npu, 0, c_bytes);
+  const double t_npu = nowUs();
   err = sdkl_npu_mm_u8i8_i32(
     domain, sdk_M, sdk_N, sdk_K, static_cast<int32_t *>(C_npu),
     static_cast<const uint8_t *>(X_npu), static_cast<const int8_t *>(W_npu));
+  prof.npu_us = nowUs() - t_npu;
   if (err != 0) {
     cleanup();
     throw std::runtime_error("sdkl_npu_mm_u8i8_i32 failed: " +
@@ -1057,10 +1046,14 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
 
   // --- Dequantize: I32 accumulator → FP32 ---
   // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
+  const double t_deq = nowUs();
   const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
   dequantizeToF32(C_i32, C, M_sz, N_sz, act_scale, wt_scale, zp_corr);
+  prof.dequant_us = nowUs() - t_deq;
 
   cleanup();
+  prof.total_us = nowUs() - t_begin;
+  g_profile = prof;
 }
 
 // U8 activations × I4 weights (WH-layout, packed two-per-byte) → I32
@@ -1111,8 +1104,13 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
 
   int domain = HtpBackend::global().domain();
 
+  MmProfile prof;
+  prof.neon = quant::neonEnabled();
+  const double t_begin = nowUs();
+
   // --- Compute per-tensor activation scale (identical to u8i8) ---
-  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
+  const float max_abs = activationMaxAbs(A, M_sz * K_sz);
+  prof.scan_us = nowUs() - t_begin;
   constexpr float kActQuantMax = 127.0f;
   constexpr float kActZeroPoint = 128.0f;
   const double scale_candidate =
@@ -1128,6 +1126,7 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   // Same policy as shgemm_u8i8_i32: the activation/accumulator come from
   // grow-only scratch pools and the packed WH weight stays resident across
   // calls, so the steady state neither allocates nor re-uploads the weight.
+  const double t_stage = nowUs();
   void *X_npu = g_x_scratch.get(x_bytes); // uint8  [Mp * K]
   void *C_npu = g_c_scratch.get(c_bytes); // int32  [Mp * N]
   if (X_npu == nullptr || C_npu == nullptr)
@@ -1154,11 +1153,14 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   };
 
   int err = 0;
+  prof.stage_us = nowUs() - t_stage;
 
   // --- FP32 → U8 quantization (zp = 128, identical to u8i8) ---
+  const double t_quant = nowUs();
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
   quantizeActivationU8(A, X_u8, M_sz, Mp_sz, K_sz, inv_act_scale,
                        kActZeroPoint);
+  prof.quant_us = nowUs() - t_quant;
 
   // The packed INT4 WH weight (first N*K/2 bytes) is already in NPU memory —
   // resident cache, or the transient buffer filled above. No per-call copy.
@@ -1169,9 +1171,11 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   // (domain, n_row, n_col, n_inner, i32 out, u8 activation, u4 packed WH
   // weight). N % 32 == 0 and M padded to 64, same tiling as u8i8.
   std::memset(C_npu, 0, c_bytes);
+  const double t_npu = nowUs();
   err = sdkl_npu_mm_u8i4_i32(
     domain, sdk_M, sdk_N, sdk_K, static_cast<int32_t *>(C_npu),
     static_cast<const uint8_t *>(X_npu), static_cast<const uint8_t *>(W_npu));
+  prof.npu_us = nowUs() - t_npu;
   if (err != 0) {
     cleanup();
     throw std::runtime_error("sdkl_npu_mm_u8i4_i32 failed: " +
@@ -1180,10 +1184,14 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
 
   // --- Dequantize: I32 accumulator → FP32 (identical to u8i8) ---
   // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
+  const double t_deq = nowUs();
   const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
   dequantizeToF32(C_i32, C, M_sz, N_sz, act_scale, wt_scale, zp_corr);
+  prof.dequant_us = nowUs() - t_deq;
 
   cleanup();
+  prof.total_us = nowUs() - t_begin;
+  g_profile = prof;
 }
 
 } // namespace hmx

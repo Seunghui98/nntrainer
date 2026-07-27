@@ -103,6 +103,43 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
                      const float *A, const int8_t *B_wh, const float *wt_scale,
                      const int32_t *zp_corr, float *C);
 
+/**
+ * @brief Where the last shgemm_u8i{4,8}_i32 call spent its time, in
+ *        microseconds.
+ *
+ * The phases are disjoint and sum to a little under the whole call. Recorded
+ * unconditionally -- the timers are five steady_clock reads against a ~300 us
+ * call -- so a caller can attribute a slow matmul without a rebuild.
+ */
+struct MmProfile {
+  double scan_us = 0.0;    /**< activation max-abs scan, over M*K */
+  double quant_us = 0.0;   /**< FP32 -> U8 activation quantize, over Mp*K */
+  double stage_us = 0.0;   /**< scratch lookup + weight residency/upload */
+  double npu_us = 0.0;     /**< sdkl_npu_mm_u8i{4,8}_i32 alone */
+  double dequant_us = 0.0; /**< I32 -> FP32 output dequantize, over M*N */
+  double total_us = 0.0;   /**< whole call, including what the phases miss */
+  bool neon = false;       /**< quantize/dequantize took the NEON path */
+};
+
+/** @brief Phase timings of the most recent integer matmul on this process. */
+const MmProfile &lastMmProfile();
+
+/**
+ * @brief lastMmProfile() as plain scalars.
+ *
+ * For callers that link libnntrainer.so but declare its entry points by hand
+ * instead of including this header -- Applications/HexKLFcCompare does, to stay
+ * out of the nntrainer include tree. Re-declaring MmProfile on that side would
+ * work right up until one copy gained a field, and then read garbage silently;
+ * six doubles and a bool cannot drift that way. Null pointers are skipped.
+ */
+void lastMmProfileValues(double *scan_us, double *quant_us, double *stage_us,
+                         double *npu_us, double *dequant_us, double *total_us,
+                         bool *neon);
+
+/** @brief Zero the profile, so a following call is measured on its own. */
+void resetMmProfile();
+
 } // namespace hmx
 } // namespace nntrainer
 

@@ -57,6 +57,12 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
 void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
                      const float *A, const int8_t *B_wh, const float *wt_scale,
                      const int32_t *zp_corr, float *C);
+// Where the last call spent its time. Taken as scalars rather than as the
+// MmProfile struct hexkl_mm.h defines: a hand-copied struct would keep linking
+// after a field was added on the other side and quietly read the wrong offsets.
+void lastMmProfileValues(double *scan_us, double *quant_us, double *stage_us,
+                         double *npu_us, double *dequant_us, double *total_us,
+                         bool *neon);
 } // namespace hmx
 } // namespace nntrainer
 #endif
@@ -301,6 +307,20 @@ struct Timing {
   double kernel_med_us = 0.0;
   double kernel_max_us = 0.0;
 
+  // Mean host-side phase split inside one shgemm_u8i{4,8}_i32 call, taken
+  // from nntrainer::hmx::lastMmProfile(). Only filled by --engine nntr; the
+  // sdkl engine drives the NPU op directly and never enters those phases.
+  double p_scan_us = 0.0;
+  double p_quant_us = 0.0;
+  double p_stage_us = 0.0;
+  double p_npu_us = 0.0;
+  double p_dequant_us = 0.0;
+  bool p_valid = false;
+  bool p_neon = false;
+
+  /** @brief Host-side work either side of the NPU call. */
+  double hostComputeUs() const { return p_scan_us + p_quant_us + p_dequant_us; }
+
   double perCallUs() const { return h2d_act_us + kernel_us + d2h_us; }
   double oneTimeUs() const { return alloc_us + h2d_weight_us + whpack_us; }
   // What the current implementation actually costs on every call.
@@ -512,12 +532,34 @@ static bool runViaNntrainer(int M, int N, int K, int bits,
       call();
     std::vector<double> samples;
     samples.reserve(iters > 0 ? iters : 0);
+    // The kernel records where each call spent its time; sum it here and mean
+    // it below, so the phase split covers the same iterations as the total.
+    double s_scan = 0, s_quant = 0, s_stage = 0, s_npu = 0, s_deq = 0;
     for (int i = 0; i < iters; ++i) {
       auto t0 = std::chrono::steady_clock::now();
       call();
       samples.push_back(usSince(t0));
+      double c_scan = 0, c_quant = 0, c_stage = 0, c_npu = 0, c_deq = 0;
+      bool c_neon = false;
+      nntrainer::hmx::lastMmProfileValues(&c_scan, &c_quant, &c_stage, &c_npu,
+                                          &c_deq, nullptr, &c_neon);
+      s_scan += c_scan;
+      s_quant += c_quant;
+      s_stage += c_stage;
+      s_npu += c_npu;
+      s_deq += c_deq;
+      tm.p_neon = c_neon;
     }
     summarize(samples, tm);
+    if (iters > 0) {
+      const double inv = 1.0 / iters;
+      tm.p_scan_us = s_scan * inv;
+      tm.p_quant_us = s_quant * inv;
+      tm.p_stage_us = s_stage * inv;
+      tm.p_npu_us = s_npu * inv;
+      tm.p_dequant_us = s_deq * inv;
+      tm.p_valid = true;
+    }
   } catch (const std::exception &e) {
     std::fprintf(stderr, "[warn] nntrainer kernel failed: %s\n", e.what());
     return false;
@@ -805,6 +847,23 @@ int main(int argc, char **argv) {
       std::printf("    min / median / max                   %10.1f /%8.1f /"
                   "%8.1f\n",
                   r.t.kernel_min_us, r.t.kernel_med_us, r.t.kernel_max_us);
+      if (r.t.p_valid) {
+        // Straight from the kernel's own timers, so this is the real split of
+        // the steady-state number above rather than a re-measurement.
+        std::printf("    NPU matmul (sdkl_npu_mm)             %10.1f   <- "
+                    "device\n",
+                    r.t.p_npu_us);
+        std::printf("    Host compute (%-6s)                 %10.1f   <- ARM\n",
+                    r.t.p_neon ? "NEON" : "scalar", r.t.hostComputeUs());
+        std::printf("      max-abs scan (M*K)                 %10.1f\n",
+                    r.t.p_scan_us);
+        std::printf("      quantize F32->U8 (Mp*K)            %10.1f\n",
+                    r.t.p_quant_us);
+        std::printf("      dequantize I32->F32 (M*N)          %10.1f\n",
+                    r.t.p_dequant_us);
+        std::printf("    Buffer staging (scratch + resident)  %10.1f\n",
+                    r.t.p_stage_us);
+      }
       return;
     }
     std::printf("  Cold run (first execute)               %10.1f\n",
