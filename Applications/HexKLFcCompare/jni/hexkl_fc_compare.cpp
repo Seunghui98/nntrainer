@@ -55,7 +55,8 @@ struct Args {
   int iters = 30;
   int warmup = 5;
   std::string proj = "q_proj";
-  bool sweep = false; // decompose fixed per-call overhead vs compute
+  bool sweep = false;  // decompose fixed per-call overhead vs compute
+  bool msweep = false; // vary M at fixed N,K: is the kernel weight-bound?
   // Which weight width(s) to run: 4, 8, or 0 = both. --sweep defaults to 4
   // (the QNN-comparable config); the normal compare mode defaults to both.
   int bits = -1;
@@ -91,6 +92,8 @@ static Args parseArgs(int argc, char **argv) {
     else if (s == "--warmup") { next(a.warmup); warmup_set = true; }
     else if (s == "--sweep")
       a.sweep = true;
+    else if (s == "--msweep")
+      a.msweep = true;
     else if (s == "--bits") {
       if (i + 1 < argc) {
         std::string v = argv[++i];
@@ -467,6 +470,48 @@ int main(int argc, char **argv) {
               npu_ok
                 ? "NPU kernels — real device latency"
                 : "CPU-emulated integer GEMM — relErr real, latency reference");
+
+  // ---- M sweep: is the kernel weight-bandwidth-bound? ----------------------
+  // At fixed N,K the weight bytes are constant while the MAC count grows
+  // linearly with M. So:
+  //   - weight-bandwidth-bound -> time barely grows with M (weight traffic,
+  //     which is constant, dominates) and us/MMAC collapses.
+  //   - compute-bound          -> time grows ~linearly with M and us/MMAC is
+  //     flat.
+  // This is the matmul equivalent of the weight reuse a conv gets for free by
+  // sweeping a small kernel over many spatial positions, and it says directly
+  // whether raising M (more tokens per call) is the lever.
+  if (a.msweep) {
+    const int Ms[] = {1, 8, 32, 64, 128, 256, 512};
+    const int sweep_bits = (a.bits < 0) ? 4 : a.bits;
+    const size_t wbytes =
+      (size_t)a.N * a.K / (sweep_bits == 4 ? 2 : 1); // packed weight bytes
+    std::printf("\nM sweep (N=%d K=%d, %s, iters=%d): weight=%.2f MiB fixed\n",
+                a.N, a.K, sweep_bits == 4 ? "u8i4" : "u8i8", a.iters,
+                (double)wbytes / (1024.0 * 1024.0));
+    std::printf("|    M |   MACs(M) | exec us | us/MMAC | weight GB/s |\n");
+    std::printf("|---|---|---|---|---|\n");
+    auto Wm = randVec(a.N * a.K, -0.5f, 0.5f, 1337);
+    for (int m : Ms) {
+      auto Am = randVec(m * a.K, -1.0f, 1.0f, 42);
+      QResult q = runQuant(m, a.N, a.K, Am, Wm, sweep_bits, a.warmup, a.iters,
+                           npu_ok, domain);
+      double macs = (double)m * a.N * a.K / 1e6;
+      double gbs = (double)wbytes / (q.t.kernel_us * 1e-6) / 1e9;
+      std::printf("| %4d | %9.1f | %7.1f | %7.3f | %11.2f |\n", m, macs,
+                  q.t.kernel_us, q.t.kernel_us / macs, gbs);
+      std::fflush(stdout);
+    }
+    std::printf("\nif us/MMAC collapses as M grows -> weight-bandwidth-bound:\n"
+                "  raising M (more tokens per call) is the lever, and keeping\n"
+                "  the weight resident on-chip is what QNN's conv path buys.\n"
+                "if us/MMAC stays flat -> compute-bound: M does not help.\n");
+#ifdef ENABLE_HEXKL
+    if (npu_ok)
+      sdkl_npu_finalize(domain);
+#endif
+    return 0;
+  }
 
   // ---- overhead decomposition sweep ---------------------------------------
   // Shrink the MAC count while keeping the call structure identical. The
