@@ -92,6 +92,31 @@ LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer sdkl
 LOCAL_STATIC_LIBRARIES := gtest
 include $(BUILD_EXECUTABLE)
 
+# ---- executable: unittest_nntrainer_htp_kernel_math ----
+# Host-side math around the NPU GEMM: the quantize/zp_corr/dequant reference
+# checks, plus the NEON-vs-scalar equivalence tests in hexkl_quant.h. Those
+# build on any host but only exercise the NEON path on arm64, so this target
+# is the only place they actually run against the code they were written for.
+include $(CLEAR_VARS)
+LOCAL_MODULE     := unittest_nntrainer_htp_kernel_math
+LOCAL_CFLAGS     := \
+    -I$(GTEST_ROOT)/include \
+    -I$(HEXKL_ADDON_ROOT)/../../incs \
+    -I$(HEXKL_ADDON_ROOT)/../../incs/stddef \
+    -pthread -fexceptions \
+    -DMIN_CPP_VERSION=201703L \
+    -DENABLE_FP16=1 -DUSE__FP16=1 \
+    -DENABLE_HEXKL=1 \
+    -Drestrict=__restrict \
+    -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 \
+    -march=armv8.2-a+fp16+dotprod+i8mm -O2
+LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS     := -llog
+LOCAL_SRC_FILES  := $(NNTRAINER_ROOT)/test/unittest/unittest_nntrainer_htp_kernel_math.cpp
+LOCAL_SHARED_LIBRARIES := nntrainer sdkl
+LOCAL_STATIC_LIBRARIES := gtest
+include $(BUILD_EXECUTABLE)
+
 # ---- executable: unittest_nntrainer_htp_kernels (direct sdkl kernel tests, armv8 libsdkl) ----
 include $(CLEAR_VARS)
 LOCAL_MODULE     := unittest_nntrainer_htp_kernels
