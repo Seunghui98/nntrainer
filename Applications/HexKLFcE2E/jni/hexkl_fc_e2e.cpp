@@ -286,37 +286,57 @@ buildFcModel(int M, int N, int K, const std::string &weight_dtype) {
 /**
  * @brief The dense layer's weight and bias tensors.
  *
- * Located by walking the graph for a node that owns weights, rather than by
- * matching the layer name against the tensor name: nntrainer decorates weight
- * names, and a substring match on "dense" silently found nothing. fc_layer
- * requests "weight" first and "bias" second, so index order is the reliable
- * key, with the recorded names used only to confirm it.
+ * Two earlier attempts failed here, so this one reports what it sees rather
+ * than only whether it succeeded. Matching the layer name against the tensor
+ * name found nothing (nntrainer decorates weight names); walking the graph
+ * for a node with weights also found nothing, which says the weights are not
+ * reachable at the point it looked, not that the key was wrong.
  *
- * getRunContext() throws on a node that has none, so each is guarded.
+ * getRunContext() throws on a node that has none, so each is guarded and the
+ * reason is printed.
  */
 bool findWeights(nntrainer::NeuralNetwork *nn, nntrainer::Tensor **weight,
                  nntrainer::Tensor **bias, bool verbose) {
   *weight = nullptr;
   *bias = nullptr;
-  for (auto &node : nn->getFlatGraph()) {
+
+  auto graph = nn->getFlatGraph();
+  if (verbose)
+    std::printf("  [graph] %zu node(s)\n", graph.size());
+
+  for (auto &node : graph) {
+    const std::string name = node->getName();
+    const std::string type = node->getType();
+
     unsigned int nw = 0;
+    bool has_ctx = true;
     try {
       nw = node->getRunContext().getNumWeights();
+    } catch (const std::exception &e) {
+      has_ctx = false;
+      if (verbose)
+        std::printf("  [graph] '%s' (%s): no run context (%s)\n", name.c_str(),
+                    type.c_str(), e.what());
     } catch (...) {
-      continue; // no run context: input layers and the like
+      has_ctx = false;
+      if (verbose)
+        std::printf("  [graph] '%s' (%s): no run context\n", name.c_str(),
+                    type.c_str());
+    }
+    if (!has_ctx)
+      continue;
+
+    if (verbose) {
+      std::printf("  [graph] '%s' (%s): %u weight(s)", name.c_str(),
+                  type.c_str(), nw);
+      for (unsigned int w = 0; w < nw; ++w)
+        std::printf(" [%u]=%s", w, node->getRunContext().getWeightName(w).c_str());
+      std::printf("\n");
     }
     if (nw == 0)
       continue;
 
     auto &rc = node->getRunContext();
-    if (verbose) {
-      std::printf("  [graph] node '%s' (%s) has %u weight(s):", 
-                  node->getName().c_str(), node->getType().c_str(), nw);
-      for (unsigned int w = 0; w < nw; ++w)
-        std::printf(" %s", rc.getWeightName(w).c_str());
-      std::printf("\n");
-    }
-
     for (unsigned int w = 0; w < nw; ++w) {
       const std::string nm = rc.getWeightName(w);
       if (nm.find("bias") != std::string::npos)
@@ -328,6 +348,33 @@ bool findWeights(nntrainer::NeuralNetwork *nn, nntrainer::Tensor **weight,
       return true;
   }
   return false;
+}
+
+/**
+ * @brief Locate the weights, running one throwaway inference first if needed.
+ *
+ * nntrainer may not have the weight tensors reachable until the graph has been
+ * allocated, which happens on the first forward pass rather than in
+ * initialize(). The throwaway run produces garbage -- the weights it uses are
+ * whatever the initializer left -- and is discarded; only the allocation it
+ * forces matters.
+ */
+bool findWeightsAllocating(nntrainer::NeuralNetwork *nn, int M, int K,
+                           nntrainer::Tensor **weight,
+                           nntrainer::Tensor **bias) {
+  if (findWeights(nn, weight, bias, true))
+    return true;
+
+  std::printf("  [graph] no weights reachable yet; forcing allocation with a "
+              "throwaway inference\n");
+  std::vector<float> dummy(static_cast<size_t>(M) * K, 0.0f);
+  try {
+    nn->inference(M, {dummy.data()});
+  } catch (const std::exception &e) {
+    std::printf("  [graph] throwaway inference failed: %s\n", e.what());
+    return false;
+  }
+  return findWeights(nn, weight, bias, true);
 }
 
 void printHead(const char *tag, const std::vector<float> &v, int n) {
@@ -378,7 +425,7 @@ int main(int argc, char **argv) {
   try {
     auto nn = buildFcModel(a.M, a.N, a.K, "");
     nntrainer::Tensor *w = nullptr, *b = nullptr;
-    if (!findWeights(nn.get(), &w, &b, true)) {
+    if (!findWeightsAllocating(nn.get(), a.M, a.K, &w, &b)) {
       std::printf("error: could not locate the dense weight\n");
       return 1;
     }
@@ -403,7 +450,7 @@ int main(int argc, char **argv) {
     try {
       auto nn = buildFcModel(a.M, a.N, a.K, "QINT4_HTP");
       nntrainer::Tensor *w = nullptr, *b = nullptr;
-      if (!findWeights(nn.get(), &w, &b, true)) {
+      if (!findWeightsAllocating(nn.get(), a.M, a.K, &w, &b)) {
         std::printf("error: could not locate the dense QINT4_HTP weight\n");
         return 1;
       }
