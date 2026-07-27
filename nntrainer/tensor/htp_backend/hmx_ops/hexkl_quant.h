@@ -51,6 +51,32 @@ namespace nntrainer {
 namespace hmx {
 namespace quant {
 
+/** @brief Zero point of the U8 activation quantization. */
+constexpr float kActZeroPoint = 128.0f;
+/** @brief Largest magnitude an activation maps to either side of the zp. */
+constexpr float kActQuantMax = 127.0f;
+
+/**
+ * @brief Per-tensor activation scale, max_abs / 127, guarded.
+ *
+ * Lives here rather than in the kernel so a test can reproduce a kernel run
+ * bit-for-bit. The division is done in double and narrowed once: computing it
+ * as `max_abs / 127.0f` instead can land a ULP away, which is enough to shift
+ * a quantized value by one and break an exact comparison for reasons that have
+ * nothing to do with the code under test.
+ *
+ * Falls back to 1 when the result is not finite or would denormalize, so the
+ * reciprocal the quantizer takes stays usable.
+ */
+inline float activationScale(float max_abs) {
+  const double candidate =
+    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
+  return (std::isfinite(candidate) &&
+          candidate >= static_cast<double>(std::numeric_limits<float>::min()))
+           ? static_cast<float>(candidate)
+           : 1.0f;
+}
+
 /** @brief Largest |A[i]| over n, skipping non-finite values. Scalar reference.
  */
 inline float activationMaxAbsScalar(const float *A, size_t n) {

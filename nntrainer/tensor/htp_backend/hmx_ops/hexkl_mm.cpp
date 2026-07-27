@@ -976,15 +976,10 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   prof.scan_us = nowUs() - t_begin;
   // Guard against zero, non-finite, and underflowing scale values so the
   // quantization path stays finite and deterministic.
-  constexpr float kActQuantMax = 127.0f;
-  constexpr float kActZeroPoint = 128.0f;
-  const double scale_candidate =
-    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
-  const float act_scale =
-    (std::isfinite(scale_candidate) &&
-     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
-      ? static_cast<float>(scale_candidate)
-      : 1.0f;
+  // Shared with the tests via hexkl_quant.h so a CPU reference can reproduce
+  // this run exactly rather than approximately.
+  constexpr float kActZeroPoint = quant::kActZeroPoint;
+  const float act_scale = quant::activationScale(max_abs);
   const float inv_act_scale = 1.0f / act_scale;
 
   // --- NPU-accessible buffers: reused scratch + resident weight ---
@@ -1111,15 +1106,10 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   // --- Compute per-tensor activation scale (identical to u8i8) ---
   const float max_abs = activationMaxAbs(A, M_sz * K_sz);
   prof.scan_us = nowUs() - t_begin;
-  constexpr float kActQuantMax = 127.0f;
-  constexpr float kActZeroPoint = 128.0f;
-  const double scale_candidate =
-    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
-  const float act_scale =
-    (std::isfinite(scale_candidate) &&
-     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
-      ? static_cast<float>(scale_candidate)
-      : 1.0f;
+  // Shared with the tests via hexkl_quant.h so a CPU reference can reproduce
+  // this run exactly rather than approximately.
+  constexpr float kActZeroPoint = quant::kActZeroPoint;
+  const float act_scale = quant::activationScale(max_abs);
   const float inv_act_scale = 1.0f / act_scale;
 
   // --- NPU-accessible buffers: reused scratch + resident weight ---
