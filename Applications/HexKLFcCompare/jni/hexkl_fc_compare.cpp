@@ -56,6 +56,9 @@ struct Args {
   int warmup = 5;
   std::string proj = "q_proj";
   bool sweep = false; // decompose fixed per-call overhead vs compute
+  // Which weight width(s) to run: 4, 8, or 0 = both. --sweep defaults to 4
+  // (the QNN-comparable config); the normal compare mode defaults to both.
+  int bits = -1;
 };
 
 // qwen3-0.6b projection presets (hidden 1024, intermediate 3072, GQA
@@ -88,6 +91,12 @@ static Args parseArgs(int argc, char **argv) {
     else if (s == "--warmup") { next(a.warmup); warmup_set = true; }
     else if (s == "--sweep")
       a.sweep = true;
+    else if (s == "--bits") {
+      if (i + 1 < argc) {
+        std::string v = argv[++i];
+        a.bits = (v == "both") ? 0 : std::atoi(v.c_str());
+      }
+    }
     else if (s == "--proj") {
       if (i + 1 < argc) { a.proj = argv[++i]; proj_set = true; }
     } else if (s == "--help" || s == "-h") {
@@ -471,32 +480,51 @@ int main(int argc, char **argv) {
       {a.M, 32, 32},      {a.M, 32, 1024},   {a.M, 256, 1024},
       {a.M, 2048, 128},   {a.M, 2048, 1024}, {a.M, 3072, 1024},
     };
-    std::printf("\nOverhead sweep (M=%d, iters=%d): execute time vs MAC count\n",
-                a.M, a.iters);
-    std::printf("|     N |    K |   MACs(M) | u8i8 exec us | u8i4 exec us |\n");
-    std::printf("|---|---|---|---|---|\n");
+    // --sweep defaults to u8i4 only (the QNN-comparable config); --bits 8 or
+    // --bits both opts into the slower INT8 runs.
+    const int sweep_bits = (a.bits < 0) ? 4 : a.bits;
+    const bool do8 = (sweep_bits == 8 || sweep_bits == 0);
+    const bool do4 = (sweep_bits == 4 || sweep_bits == 0);
+    std::printf("\nOverhead sweep (M=%d, iters=%d, bits=%s): execute vs MACs\n",
+                a.M, a.iters,
+                sweep_bits == 0 ? "both" : (sweep_bits == 4 ? "u8i4" : "u8i8"));
+    std::printf("|     N |    K |   MACs(M) |");
+    if (do8) std::printf(" u8i8 exec us |");
+    if (do4) std::printf(" u8i4 exec us |");
+    std::printf("\n|---|---|---|");
+    if (do8) std::printf("---|");
+    if (do4) std::printf("---|");
+    std::printf("\n");
     double base8 = -1.0, base4 = -1.0, full8 = 0.0, full4 = 0.0;
     for (const auto &s : shapes) {
       auto As = randVec(s.M * s.K, -1.0f, 1.0f, 42);
       auto Ws = randVec(s.N * s.K, -0.5f, 0.5f, 1337);
-      QResult q8 =
-        runQuant(s.M, s.N, s.K, As, Ws, 8, a.warmup, a.iters, npu_ok, domain);
-      QResult q4 =
-        runQuant(s.M, s.N, s.K, As, Ws, 4, a.warmup, a.iters, npu_ok, domain);
       double macs = (double)s.M * s.N * s.K / 1e6;
-      std::printf("| %5d | %4d | %9.1f | %12.1f | %12.1f |\n", s.N, s.K, macs,
-                  q8.t.kernel_us, q4.t.kernel_us);
-      if (base8 < 0.0) { base8 = q8.t.kernel_us; base4 = q4.t.kernel_us; }
-      full8 = q8.t.kernel_us;
-      full4 = q4.t.kernel_us;
+      std::printf("| %5d | %4d | %9.1f |", s.N, s.K, macs);
+      if (do8) {
+        QResult q8 =
+          runQuant(s.M, s.N, s.K, As, Ws, 8, a.warmup, a.iters, npu_ok, domain);
+        std::printf(" %12.1f |", q8.t.kernel_us);
+        if (base8 < 0.0) base8 = q8.t.kernel_us;
+        full8 = q8.t.kernel_us;
+      }
+      if (do4) {
+        QResult q4 =
+          runQuant(s.M, s.N, s.K, As, Ws, 4, a.warmup, a.iters, npu_ok, domain);
+        std::printf(" %12.1f |", q4.t.kernel_us);
+        if (base4 < 0.0) base4 = q4.t.kernel_us;
+        full4 = q4.t.kernel_us;
+      }
+      std::printf("\n");
+      std::fflush(stdout);
     }
-    std::printf("\nfixed per-call overhead (smallest shape) : u8i8=%.1f us  "
-                "u8i4=%.1f us\n",
-                base8, base4);
-    std::printf("compute-only at the largest shape        : u8i8=%.1f us  "
-                "u8i4=%.1f us\n",
-                full8 - base8, full4 - base4);
-    std::printf("  (compare against the QNN device-timeline 'FC (weight load "
+    std::printf("\nfixed per-call overhead (smallest shape):");
+    if (do8) std::printf("  u8i8=%.1f us", base8);
+    if (do4) std::printf("  u8i4=%.1f us", base4);
+    std::printf("\ncompute-only at the largest shape       :");
+    if (do8) std::printf("  u8i8=%.1f us", full8 - base8);
+    if (do4) std::printf("  u8i4=%.1f us", full4 - base4);
+    std::printf("\n  (compare against the QNN device-timeline 'FC (weight load "
                 "+ compute)' number)\n");
 #ifdef ENABLE_HEXKL
     if (npu_ok)
@@ -510,14 +538,23 @@ int main(int argc, char **argv) {
 
   auto C_ref = gemmF32(a.M, a.N, a.K, A, W);
 
-  std::fprintf(stderr, "[run] u8i8 ...\n");
-  QResult r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters, npu_ok, domain);
-  std::fprintf(stderr, "[run] u8i8 done; u8i4 ...\n");
-  QResult r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters, npu_ok, domain);
-  std::fprintf(stderr, "[run] u8i4 done\n");
+  // --bits selects which width(s) to run; default (both) keeps the comparison.
+  const bool run8 = (a.bits < 0 || a.bits == 0 || a.bits == 8);
+  const bool run4 = (a.bits < 0 || a.bits == 0 || a.bits == 4);
+  QResult r8, r4;
+  if (run8) {
+    std::fprintf(stderr, "[run] u8i8 ...\n");
+    r8 = runQuant(a.M, a.N, a.K, A, W, 8, a.warmup, a.iters, npu_ok, domain);
+    std::fprintf(stderr, "[run] u8i8 done\n");
+  }
+  if (run4) {
+    std::fprintf(stderr, "[run] u8i4 ...\n");
+    r4 = runQuant(a.M, a.N, a.K, A, W, 4, a.warmup, a.iters, npu_ok, domain);
+    std::fprintf(stderr, "[run] u8i4 done\n");
+  }
 
-  float e8 = relErr(r8.C, C_ref);
-  float e4 = relErr(r4.C, C_ref);
+  float e8 = run8 ? relErr(r8.C, C_ref) : 0.0f;
+  float e4 = run4 ? relErr(r4.C, C_ref) : 0.0f;
 
   // ---- QNN-style phase breakdown (microseconds) ----------------------------
   // Mapping to a qnn-net-run profile:
@@ -554,8 +591,10 @@ int main(int argc, char **argv) {
                 "-weight cache yet)\n",
                 r.t.currentPerCallUs());
   };
-  dumpMethod("u8i8", e8, r8);
-  dumpMethod("u8i4", e4, r4);
+  if (run8)
+    dumpMethod("u8i8", e8, r8);
+  if (run4)
+    dumpMethod("u8i4", e4, r4);
 
   // Compact comparison table. "per-call (ideal)" is what the kernel would cost
   // once the weight is uploaded once and kept resident (what QNN does via its
@@ -563,17 +602,20 @@ int main(int argc, char **argv) {
   std::printf("\n| method | relErr vs FP32 | compute us | per-call ideal us | "
               "today us | engine |\n");
   std::printf("|---|---|---|---|---|---|\n");
-  std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %8.1f | %8.1f | %s |\n",
-              e8, r8.t.kernel_us, r8.t.perCallUs(), r8.t.currentPerCallUs(),
-              r8.on_npu ? "NPU/HMX" : "CPU-emulated");
-  std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %8.1f | %8.1f | %s |\n",
-              e4, r4.t.kernel_us, r4.t.perCallUs(), r4.t.currentPerCallUs(),
-              r4.on_npu ? "NPU/HMX" : "CPU-emulated");
+  if (run8)
+    std::printf("| u8i8 (INT8 weight) | %.5f | %8.1f | %8.1f | %8.1f | %s |\n",
+                e8, r8.t.kernel_us, r8.t.perCallUs(), r8.t.currentPerCallUs(),
+                r8.on_npu ? "NPU/HMX" : "CPU-emulated");
+  if (run4)
+    std::printf("| u8i4 (INT4 weight) | %.5f | %8.1f | %8.1f | %8.1f | %s |\n",
+                e4, r4.t.kernel_us, r4.t.perCallUs(), r4.t.currentPerCallUs(),
+                r4.on_npu ? "NPU/HMX" : "CPU-emulated");
 
-  std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "
-              "%.2fx error);  compute u8i4=%.1fus u8i8=%.1fus\n",
-              e8, e4, e8 > 0.0f ? e4 / e8 : 0.0f, r4.t.kernel_us,
-              r8.t.kernel_us);
+  if (run8 && run4)
+    std::printf("\nsummary: INT8 relErr=%.4f  INT4 relErr=%.4f  (INT4/INT8 = "
+                "%.2fx error);  compute u8i4=%.1fus u8i8=%.1fus\n",
+                e8, e4, e8 > 0.0f ? e4 / e8 : 0.0f, r4.t.kernel_us,
+                r8.t.kernel_us);
 
 #ifdef ENABLE_HEXKL
   if (npu_ok)
