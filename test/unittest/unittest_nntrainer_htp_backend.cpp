@@ -443,6 +443,206 @@ TEST_F(HtpU8i8Test, AlignmentGuard_NNot32) {
                std::runtime_error);
 }
 
+// ---- u8i4 (INT4 weight) ----------------------------------------------------
+//
+// Same quantization model as u8i8, but the weight is symmetric INT4 ([-7, 7])
+// packed two-per-byte in WH layout. These also cover the NPU-resident weight
+// cache: the kernel keys resident weights by host pointer, so a stale or
+// aliasing entry would silently return another weight's result.
+
+/**
+ * @brief Fixture for hmx::shgemm_u8i4_i32 tests; tracks whether the NPU
+ *        backend is available so tests can self-skip.
+ */
+class HtpU8i4Test : public ::testing::Test {
+protected:
+  void SetUp() override {
+    npu_enabled = nntrainer::HtpBackend::global().enabled();
+  }
+  bool npu_enabled;
+};
+
+// Random INT4 weights held one value per byte, sign-extended, in [-7, 7]
+// (the range quantize_qint4_weight emits).
+static std::vector<int8_t> makeRandI4Vec(int n, uint32_t seed = 21) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> dist(-7, 7);
+  std::vector<int8_t> v(n);
+  for (auto &x : v)
+    x = static_cast<int8_t>(dist(rng));
+  return v;
+}
+
+// Pack an [N, K] INT4 weight into WH layout in NPU memory, mirroring
+// quantize_qint4_weight: sdkl_cpu_rm_to_wh_i4 takes (wt_rows=K, wt_cols=N).
+// Returns the NPU buffer holding N*K/2 packed bytes, or nullptr on failure.
+// The caller owns the buffer and must sdkl_npu_free it.
+static void *packI4WeightToNpu(const std::vector<int8_t> &W_i4, int N, int K) {
+  const size_t unpacked = static_cast<size_t>(N) * K;
+  void *src = nullptr;
+  void *dst = nullptr;
+  if (sdkl_npu_alloc(unpacked, &src) != 0 || src == nullptr)
+    return nullptr;
+  // Over-allocate the destination to the unpacked size so tile padding beyond
+  // N*K/2 cannot overflow (same guard quantize_qint4_weight uses).
+  if (sdkl_npu_alloc(unpacked, &dst) != 0 || dst == nullptr) {
+    sdkl_npu_free(src);
+    return nullptr;
+  }
+  std::memcpy(src, W_i4.data(), unpacked);
+  const int rc =
+    sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(dst), static_cast<int8_t *>(src),
+                         static_cast<size_t>(K), static_cast<size_t>(N));
+  sdkl_npu_free(src);
+  if (rc != 0) {
+    sdkl_npu_free(dst);
+    return nullptr;
+  }
+  return dst;
+}
+
+// zp_corr[n] = 128 * sum_k W[n,k]
+static std::vector<int32_t> makeZpCorr(const std::vector<int8_t> &W, int N,
+                                       int K) {
+  std::vector<int32_t> zp(N, 0);
+  for (int n = 0; n < N; ++n) {
+    int32_t s = 0;
+    for (int k = 0; k < K; ++k)
+      s += static_cast<int32_t>(W[n * K + k]);
+    zp[n] = 128 * s;
+  }
+  return zp;
+}
+
+TEST_F(HtpU8i4Test, Accuracy_VsCpu) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "HTP not available";
+
+  constexpr int M = 64, N = 64, K = 64;
+
+  auto A_f32 = makeRandF32(M * K, -1.0f, 1.0f);
+  auto W_i4 = makeRandI4Vec(N * K);
+  std::vector<float> wt_scale(N);
+  for (int n = 0; n < N; ++n)
+    wt_scale[n] = 1.0f / 7.0f + n * 0.001f;
+  auto zp_corr = makeZpCorr(W_i4, N, K);
+
+  // CPU reference: the integer GEMM is the same as u8i8, the weights merely
+  // happen to lie in the INT4 range.
+  std::vector<uint8_t> X_u8;
+  float act_scale = quantizeActU8(A_f32, X_u8, M, K);
+  std::vector<int32_t> C_i32(M * N, 0);
+  cpuGemmU8I8I32(M, N, K, X_u8.data(), W_i4.data(), C_i32.data());
+  std::vector<float> C_cpu(M * N);
+  dequantI32ToF32(M, N, act_scale, wt_scale.data(), zp_corr.data(),
+                  C_i32.data(), C_cpu.data());
+
+  void *W_wh = packI4WeightToNpu(W_i4, N, K);
+  ASSERT_NE(W_wh, nullptr) << "INT4 WH packing failed";
+
+  std::vector<float> C_npu(M * N, 0.0f);
+  ASSERT_NO_THROW(nntrainer::hmx::shgemm_u8i4_i32(
+    M, N, K, A_f32.data(), static_cast<int8_t *>(W_wh), wt_scale.data(),
+    zp_corr.data(), C_npu.data()));
+  sdkl_npu_free(W_wh);
+
+  double err = relError(C_npu.data(), C_cpu.data(), M * N);
+  EXPECT_LT(err, 0.01) << "Relative error " << err
+                       << " exceeds 1% vs CPU reference";
+}
+
+// The resident-weight cache is keyed by host pointer, so two different weights
+// must not alias and a repeated call on the first weight must still return the
+// first weight's result. Interleaving A, B, A catches both a stale entry and a
+// key collision -- failures the accuracy test alone would miss, since it only
+// ever uses one weight.
+TEST_F(HtpU8i4Test, ResidentWeightCache_NoAliasingAcrossWeights) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "HTP not available";
+
+  constexpr int M = 64, N = 64, K = 64;
+
+  auto A_f32 = makeRandF32(M * K, -1.0f, 1.0f);
+  auto W_a = makeRandI4Vec(N * K, 101);
+  auto W_b = makeRandI4Vec(N * K, 202);
+  std::vector<float> wt_scale(N, 1.0f / 7.0f);
+  auto zp_a = makeZpCorr(W_a, N, K);
+  auto zp_b = makeZpCorr(W_b, N, K);
+
+  void *wh_a = packI4WeightToNpu(W_a, N, K);
+  void *wh_b = packI4WeightToNpu(W_b, N, K);
+  ASSERT_NE(wh_a, nullptr);
+  ASSERT_NE(wh_b, nullptr);
+
+  auto run = [&](void *wh, const std::vector<int32_t> &zp) {
+    std::vector<float> C(M * N, 0.0f);
+    nntrainer::hmx::shgemm_u8i4_i32(M, N, K, A_f32.data(),
+                                    static_cast<int8_t *>(wh), wt_scale.data(),
+                                    zp.data(), C.data());
+    return C;
+  };
+
+  const std::vector<float> a1 = run(wh_a, zp_a); // uploads + caches A
+  const std::vector<float> b1 = run(wh_b, zp_b); // uploads + caches B
+  const std::vector<float> a2 = run(wh_a, zp_a); // must hit A's entry
+  const std::vector<float> b2 = run(wh_b, zp_b); // must hit B's entry
+
+  sdkl_npu_free(wh_a);
+  sdkl_npu_free(wh_b);
+
+  // Distinct weights must give distinct results, otherwise the aliasing check
+  // below would pass trivially.
+  EXPECT_GT(relError(a1.data(), b1.data(), M * N), 1e-3)
+    << "weights A and B produced the same result; test cannot detect aliasing";
+
+  // Cached repeats must reproduce the first result bit-for-bit: the kernel is
+  // deterministic and the only thing that changed is the cache path.
+  EXPECT_EQ(a1, a2) << "repeat call on weight A did not reproduce its result "
+                       "(stale or aliased cache entry)";
+  EXPECT_EQ(b1, b2) << "repeat call on weight B did not reproduce its result "
+                       "(stale or aliased cache entry)";
+}
+
+// Shapes vary between prefill and decode, so the scratch pools must grow and
+// then be reused by smaller calls without corrupting results.
+TEST_F(HtpU8i4Test, ScratchPool_HandlesGrowingAndShrinkingShapes) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "HTP not available";
+
+  struct Case {
+    int M, N, K;
+  };
+  // Grow (M and N up), then shrink back below the high-water mark.
+  const std::vector<Case> cases = {{64, 64, 64}, {128, 128, 64}, {64, 64, 64}};
+
+  for (const auto &c : cases) {
+    auto A_f32 = makeRandF32(c.M * c.K, -1.0f, 1.0f);
+    auto W_i4 = makeRandI4Vec(c.N * c.K, 55);
+    std::vector<float> wt_scale(c.N, 1.0f / 7.0f);
+    auto zp_corr = makeZpCorr(W_i4, c.N, c.K);
+
+    std::vector<uint8_t> X_u8;
+    float act_scale = quantizeActU8(A_f32, X_u8, c.M, c.K);
+    std::vector<int32_t> C_i32(c.M * c.N, 0);
+    cpuGemmU8I8I32(c.M, c.N, c.K, X_u8.data(), W_i4.data(), C_i32.data());
+    std::vector<float> C_cpu(c.M * c.N);
+    dequantI32ToF32(c.M, c.N, act_scale, wt_scale.data(), zp_corr.data(),
+                    C_i32.data(), C_cpu.data());
+
+    void *W_wh = packI4WeightToNpu(W_i4, c.N, c.K);
+    ASSERT_NE(W_wh, nullptr) << "M=" << c.M << " N=" << c.N << " K=" << c.K;
+
+    std::vector<float> C_npu(c.M * c.N, 0.0f);
+    ASSERT_NO_THROW(nntrainer::hmx::shgemm_u8i4_i32(
+      c.M, c.N, c.K, A_f32.data(), static_cast<int8_t *>(W_wh),
+      wt_scale.data(), zp_corr.data(), C_npu.data()));
+    sdkl_npu_free(W_wh);
+
+    EXPECT_LT(relError(C_npu.data(), C_cpu.data(), c.M * c.N), 0.01)
+      << "M=" << c.M << " N=" << c.N << " K=" << c.K;
+  }
+}
+
 /**
  * @brief Fixture exercising the FloatTensor::dotQInteger routing: FP32
  *        activation x QINT8 weight dispatches through the HTP context ops
