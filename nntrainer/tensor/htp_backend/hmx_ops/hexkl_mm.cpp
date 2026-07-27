@@ -647,8 +647,6 @@ void prefillWHCacheClear() {
 
 #include <sdkl.h>
 
-#include <thread_manager.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -864,14 +862,27 @@ NpuScratch g_c_scratch; // int32 accumulator
 // ---- Host-side pre/post processing around the NPU matmul -------------------
 //
 // The activation scan, the FP32->U8 quantization and the dequantize are
-// element-wise over M*K and M*N. On a Galaxy S25 Ultra they account for about
-// 250 us of the 542 us an fc_layer call takes single-threaded (q_proj, M=64,
-// u8i4) -- on the order of the matmul itself. Unlike the matmul, which HMX
-// serializes behind sdkl_npu_lock_hmx, the quantize and dequantize parallelize
-// over rows with no shared state: each row writes a disjoint output range.
+// element-wise over M*K and M*N, and on a Galaxy S25 Ultra account for roughly
+// 250 us of the 545 us an fc_layer call takes (q_proj, M=64, u8i4) -- on the
+// order of the matmul itself.
 //
-// parallel_for runs serially when there is one row or no workers, so decode
-// (M=1) is unaffected.
+// They are kept serial. Running them through ThreadManager::parallel_for was
+// measured over 200 iterations per setting and did lower the median (542 ->
+// ~357 us), but the mean -- which is what throughput follows -- only improved
+// at two threads, and regressed past it:
+//
+//     threads   1      2         4         8
+//     median    542    384/399   359/358   357/358
+//     mean      545    464/511   573/584   608/634
+//     max       745    763/1591  2697/2297 2517/2408
+//
+// Occasional multi-millisecond calls eat the gain. The cause was not pinned
+// down: it survived removing a per-call allocation, false sharing on the
+// reduction array, and one of the three barriers. parallel_for also draws on
+// the process-wide pool, so this path cannot cap itself at the two threads
+// that helped -- and 4 or 8 is the ordinary setting. Left serial until the
+// tail is understood; the larger headroom is on the NPU side anyway (the
+// matmul is ~298 us of the 545).
 
 /**
  * @brief Largest |A[i]| over M*K, skipping non-finite values.
@@ -904,11 +915,11 @@ float activationMaxAbs(const float *A, size_t M, size_t K) {
  */
 void quantizeActivationU8(const float *A, uint8_t *X, size_t M, size_t Mp,
                           size_t K, float inv_act_scale, float zero_point) {
-  ThreadManager::Global().parallel_for(0, Mp, [&](size_t m) {
+  for (size_t m = 0; m < Mp; ++m) {
     const size_t off = m * K;
     if (m >= M) {
       std::memset(X + off, static_cast<int>(zero_point), K);
-      return;
+      continue;
     }
     for (size_t k = 0; k < K; ++k) {
       const float a = A[off + k];
@@ -923,20 +934,20 @@ void quantizeActivationU8(const float *A, uint8_t *X, size_t M, size_t Mp,
         q = 255.0f;
       X[off + k] = static_cast<uint8_t>(q);
     }
-  });
+  }
 }
 
 /** @brief C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]). */
 void dequantizeToF32(const int32_t *C_i32, float *C, size_t M, size_t N,
                      float act_scale, const float *wt_scale,
                      const int32_t *zp_corr) {
-  ThreadManager::Global().parallel_for(0, M, [&](size_t m) {
+  for (size_t m = 0; m < M; ++m) {
     const size_t off = m * N;
     for (size_t n = 0; n < N; ++n)
       C[off + n] = act_scale * wt_scale[n] *
                    (static_cast<float>(C_i32[off + n]) -
                     static_cast<float>(zp_corr[n]));
-  });
+  }
 }
 
 } // namespace
