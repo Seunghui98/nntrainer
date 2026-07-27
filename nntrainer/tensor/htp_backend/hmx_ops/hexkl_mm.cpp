@@ -651,7 +651,10 @@ void prefillWHCacheClear() {
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace nntrainer {
 namespace hmx {
@@ -679,6 +682,116 @@ int checkedSdkDim(unsigned int dim, const char *label) {
 
   return static_cast<int>(dim);
 }
+
+// ---- NPU-resident weights and reusable scratch (u8i8 / u8i4) --------------
+//
+// Both integer kernels used to sdkl_npu_alloc the activation, accumulator and
+// weight buffers on every call, memcpy the (already WH-baked) weight in, and
+// free all three on the way out. Weights do not change between calls, so that
+// re-upload is pure overhead: on a Galaxy S25 Ultra it measured ~791 us of
+// alloc plus ~195 us of weight copy per call, against ~298 us of actual u8i4
+// compute. QNN pays neither because its weights live in the context binary.
+//
+// Keep the WH weight resident in NPU memory keyed by its host pointer (the
+// same trick the FP16 path uses via WHCache/PrefillWHCache), and reuse
+// grow-only scratch buffers for the activation and accumulator. Steady state
+// then performs no allocation and no weight upload at all.
+
+/** @brief One WH weight resident in NPU memory, keyed by its host pointer. */
+struct IntWeightEntry {
+  void *npu;
+  size_t bytes;
+};
+
+/**
+ * @brief Process-lifetime residency for WH-layout integer weights.
+ *
+ * Keyed by (host weight pointer, byte size) so u8i8 and u8i4 views of
+ * different weights never alias. Capped by INT_WEIGHT_MAX_BYTES; once the cap
+ * is reached further weights simply are not cached (the call still runs, using
+ * a transient buffer), which keeps NPU DMA usage bounded without thrashing a
+ * sequential prefill scan the way an evicting cache would.
+ */
+struct IntWeightCache {
+  std::map<std::pair<const void *, size_t>, IntWeightEntry> cache;
+  size_t total_bytes = 0;
+  std::mutex mtx;
+
+  ~IntWeightCache() {
+    for (auto &e : cache)
+      npuFreeIfAlive(e.second.npu);
+  }
+} g_int_weight;
+
+// Cap on total NPU bytes held by resident integer weights.
+static constexpr size_t INT_WEIGHT_MAX_BYTES = 48ull * 1024 * 1024; // 48 MB
+
+/**
+ * @brief Return an NPU buffer holding the WH weight bytes, uploading only on
+ *        the first call for a given host pointer.
+ * @return Resident NPU pointer, or nullptr when the weight cannot be cached
+ *         (cap reached or allocation failed); the caller then falls back to a
+ *         transient buffer.
+ */
+void *residentIntWeight(const void *host_wh, size_t bytes) {
+  const auto key = std::make_pair(host_wh, bytes);
+
+  std::lock_guard<std::mutex> lock(g_int_weight.mtx);
+  auto it = g_int_weight.cache.find(key);
+  if (it != g_int_weight.cache.end())
+    return it->second.npu;
+
+  if (g_int_weight.total_bytes + bytes > INT_WEIGHT_MAX_BYTES)
+    return nullptr;
+
+  void *npu = nullptr;
+  if (sdkl_npu_alloc(bytes, &npu) != 0 || npu == nullptr)
+    return nullptr;
+
+  std::memcpy(npu, host_wh, bytes);
+  g_int_weight.cache.emplace(key, IntWeightEntry{npu, bytes});
+  g_int_weight.total_bytes += bytes;
+  return npu;
+}
+
+/**
+ * @brief Grow-only NPU scratch buffer reused across calls.
+ *
+ * Shapes vary (prefill vs decode), so the buffer is reallocated only when a
+ * call needs more bytes than the current one holds; smaller calls reuse it
+ * as-is.
+ */
+struct NpuScratch {
+  void *buf = nullptr;
+  size_t bytes = 0;
+  std::mutex mtx;
+
+  /** @brief Return a buffer of at least `need` bytes, or nullptr on failure. */
+  void *get(size_t need) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (buf != nullptr && bytes >= need)
+      return buf;
+
+    void *fresh = nullptr;
+    if (sdkl_npu_alloc(need, &fresh) != 0 || fresh == nullptr)
+      return nullptr;
+
+    if (buf != nullptr)
+      npuFreeIfAlive(buf);
+    buf = fresh;
+    bytes = need;
+    return buf;
+  }
+
+  ~NpuScratch() {
+    if (buf != nullptr)
+      npuFreeIfAlive(buf);
+  }
+};
+
+// Separate pools so an activation and an accumulator never share a buffer.
+NpuScratch g_x_scratch; // uint8 activation, padded to the 64-row tile
+NpuScratch g_c_scratch; // int32 accumulator
 
 } // namespace
 
@@ -743,42 +856,35 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
       : 1.0f;
   const float inv_act_scale = 1.0f / act_scale;
 
-  // --- Allocate NPU-accessible staging buffers ---
-  void *X_npu = nullptr; // uint8  [M * K]
-  void *C_npu = nullptr; // int32  [M * N]
-  void *W_npu = nullptr; // int8   [N * K] (WH layout, copied as-is)
+  // --- NPU-accessible buffers: reused scratch + resident weight ---
+  // X/C come from grow-only scratch pools and the WH weight stays resident
+  // across calls, so the steady state allocates nothing and re-uploads nothing.
+  void *X_npu = g_x_scratch.get(x_bytes); // uint8  [Mp * K]
+  void *C_npu = g_c_scratch.get(c_bytes); // int32  [Mp * N]
+  if (X_npu == nullptr || C_npu == nullptr)
+    throw std::runtime_error(
+      "shgemm_u8i8_i32: NPU scratch allocation failed (x_bytes=" +
+      std::to_string(x_bytes) + ", c_bytes=" + std::to_string(c_bytes) + ")");
+
+  // int8   [N * K] (WH layout). Resident when it fits the cache budget;
+  // otherwise fall back to a transient buffer freed at the end of the call.
+  void *W_npu = residentIntWeight(B_wh, w_bytes);
+  void *W_transient = nullptr;
+  if (W_npu == nullptr) {
+    if (sdkl_npu_alloc(w_bytes, &W_transient) != 0 || W_transient == nullptr)
+      throw std::runtime_error(
+        "shgemm_u8i8_i32: sdkl_npu_alloc W_npu failed (w_bytes=" +
+        std::to_string(w_bytes) + ")");
+    std::memcpy(W_transient, B_wh, w_bytes);
+    W_npu = W_transient;
+  }
 
   auto cleanup = [&]() {
-    if (X_npu)
-      npuFreeIfAlive(X_npu);
-    if (C_npu)
-      npuFreeIfAlive(C_npu);
-    if (W_npu)
-      npuFreeIfAlive(W_npu);
+    if (W_transient)
+      npuFreeIfAlive(W_transient);
   };
 
   int err = 0;
-
-  err = sdkl_npu_alloc(x_bytes, &X_npu);
-  if (err != 0 || X_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc X_npu failed: " +
-                             std::to_string(err));
-  }
-
-  err = sdkl_npu_alloc(c_bytes, &C_npu);
-  if (err != 0 || C_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc C_npu failed: " +
-                             std::to_string(err));
-  }
-
-  err = sdkl_npu_alloc(w_bytes, &W_npu);
-  if (err != 0 || W_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc W_npu failed: " +
-                             std::to_string(err));
-  }
 
   // --- FP32 → U8 quantization (zp = 128) ---
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
@@ -805,8 +911,8 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
     }
   }
 
-  // --- Copy WH-layout weight directly (no layout conversion needed) ---
-  std::memcpy(W_npu, B_wh, w_bytes);
+  // The WH-layout weight is already in NPU memory (resident cache, or the
+  // transient buffer filled above) — no per-call copy.
 
   // --- NPU matrix multiply ---
   // sdkl_npu_mm_u8i8_i32(domain, n_row, n_col, n_inner, A[i32 out],
@@ -906,42 +1012,36 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
       : 1.0f;
   const float inv_act_scale = 1.0f / act_scale;
 
-  // --- Allocate NPU-accessible staging buffers ---
-  void *X_npu = nullptr; // uint8  [Mp * K]
-  void *C_npu = nullptr; // int32  [Mp * N]
-  void *W_npu = nullptr; // int4   [N * K] packed → N*K/2 bytes (WH layout)
+  // --- NPU-accessible buffers: reused scratch + resident weight ---
+  // Same policy as shgemm_u8i8_i32: the activation/accumulator come from
+  // grow-only scratch pools and the packed WH weight stays resident across
+  // calls, so the steady state neither allocates nor re-uploads the weight.
+  void *X_npu = g_x_scratch.get(x_bytes); // uint8  [Mp * K]
+  void *C_npu = g_c_scratch.get(c_bytes); // int32  [Mp * N]
+  if (X_npu == nullptr || C_npu == nullptr)
+    throw std::runtime_error(
+      "shgemm_u8i4_i32: NPU scratch allocation failed (x_bytes=" +
+      std::to_string(x_bytes) + ", c_bytes=" + std::to_string(c_bytes) + ")");
+
+  // int4 [N * K] packed → N*K/2 bytes (WH layout). Resident when it fits the
+  // cache budget; otherwise a transient buffer freed at the end of the call.
+  void *W_npu = residentIntWeight(B_wh, w_bytes);
+  void *W_transient = nullptr;
+  if (W_npu == nullptr) {
+    if (sdkl_npu_alloc(w_bytes, &W_transient) != 0 || W_transient == nullptr)
+      throw std::runtime_error(
+        "shgemm_u8i4_i32: sdkl_npu_alloc W_npu failed (w_bytes=" +
+        std::to_string(w_bytes) + ")");
+    std::memcpy(W_transient, B_wh, w_bytes);
+    W_npu = W_transient;
+  }
 
   auto cleanup = [&]() {
-    if (X_npu)
-      npuFreeIfAlive(X_npu);
-    if (C_npu)
-      npuFreeIfAlive(C_npu);
-    if (W_npu)
-      npuFreeIfAlive(W_npu);
+    if (W_transient)
+      npuFreeIfAlive(W_transient);
   };
 
   int err = 0;
-
-  err = sdkl_npu_alloc(x_bytes, &X_npu);
-  if (err != 0 || X_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i4_i32: sdkl_npu_alloc X_npu failed: " +
-                             std::to_string(err));
-  }
-
-  err = sdkl_npu_alloc(c_bytes, &C_npu);
-  if (err != 0 || C_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i4_i32: sdkl_npu_alloc C_npu failed: " +
-                             std::to_string(err));
-  }
-
-  err = sdkl_npu_alloc(w_bytes, &W_npu);
-  if (err != 0 || W_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i4_i32: sdkl_npu_alloc W_npu failed: " +
-                             std::to_string(err));
-  }
 
   // --- FP32 → U8 quantization (zp = 128, identical to u8i8) ---
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
@@ -968,8 +1068,8 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
     }
   }
 
-  // --- Copy packed INT4 WH-layout weight directly (first N*K/2 bytes) ---
-  std::memcpy(W_npu, B_wh, w_bytes);
+  // The packed INT4 WH weight (first N*K/2 bytes) is already in NPU memory —
+  // resident cache, or the transient buffer filled above. No per-call copy.
 
   // --- NPU matrix multiply ---
   // sdkl_npu_mm_u8i4_i32 takes the packed INT4 weight as const uint8_t*
