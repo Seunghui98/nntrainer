@@ -3,11 +3,12 @@
 How to cut the NPU-side cost of an fc_layer matmul by keeping the WH-packed
 weight resident in VTCM instead of re-deriving it per tile.
 
-> **Status: not built or measured yet.** The code below targets the Hexagon
-> DSP and needs the Hexagon SDK toolchain, which the nntrainer tree does not
-> carry — there is no IDL, no skel build, and `libhexkl_skel.so` comes prebuilt
-> from the SDK. Treat every listing here as a starting point to compile and
-> verify on device, in the staged order in §3, not as working code.
+> **Status: §3.1 done, §3.2 in progress, §3.3 unbuilt.** The SDK's micro
+> sample builds and passes on the V79 simulator, and VTCM is 8 MiB. The kernel
+> change in §5 is measured by `vtcm_probe/`, not yet by anything shipping.
+> Nothing here has run on a device: there is no IDL, no skel build, and
+> `libhexkl_skel.so` comes prebuilt from the SDK. Treat §5 as a starting point
+> to compile and verify, in the staged order in §3, not as working code.
 
 ## 1. Where the time goes
 
@@ -80,14 +81,26 @@ cd $HEXKL_SDK_ROOT/examples/hexkl_micro_hmx_mm_u8i4_i32
 ./run_simulator.sh --hex-arch v79
 ```
 
-Its `main()` already prints what is needed:
+Its `main()` already prints what is needed, and on a V79 simulator it gives:
 
 ```
-[HEXKL_MICRO] VTCM base = 0x...  VTCM size = N bytes
+[HEXKL_MICRO] VTCM base = 0xd9000000  VTCM size = 8388608 bytes
+[HEXKL_MICRO] Test Passed
 ```
 
-Record `N`. §4 budgets against it. If the sample does not build or the test
-does not pass, stop here — nothing below is reachable until it does.
+**8 MiB, confirmed** — §4's budget was written against an assumed ~8 MiB and
+that assumption holds. If the sample does not build or the test does not pass,
+stop here; nothing below is reachable until it does.
+
+Two setup problems worth knowing about, both hit on first contact:
+
+- `build.sh` fails with `HEXAGON_SDK_ROOT is not set` unless
+  `setup_sdk_env.source` is sourced. Exporting the variable by hand is not
+  enough — the toolchain paths come from the same script.
+- `hexagon-sim` wants `libncurses.so.5`, which Ubuntu 24.04 no longer ships.
+  Symlinking `libncurses.so.6`/`libtinfo.so.6` to the `.5` names works;
+  `ldconfig` afterwards is the part that is easy to miss, since the links can
+  exist on disk while the loader cache still does not know them.
 
 ### 3.2 Does hoisting the conversion actually help?
 
@@ -158,7 +171,8 @@ Per-layer weight totals for qwen3-0.6b (u8i4, hidden 1024, intermediate 3072):
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1.0 | 0.5 | 0.5 | 0.5 | 1.5 | 1.5 | 1.5 | **7.0 MiB** |
 
-One layer's weights nearly fill a typical 8 MiB VTCM, so plan on holding the
+VTCM measures 8 MiB (§3.1), so q_proj's 1.58 MiB is comfortable.
+One layer's weights nearly fill it, so plan on holding the
 current projection (and prefetching the next) rather than a whole layer. All 28
 layers is 196 MiB — never resident.
 
@@ -229,7 +243,8 @@ Two further wins available once the kernel is ours:
 
 ## 6. What has to hold
 
-- **VTCM is large enough** — §3.1 prints the real size; §4 assumes ~8 MiB.
+- ~~**VTCM is large enough**~~ — settled: §3.1 measured 8 MiB, which is what
+  §4 budgeted against.
 - **`weight_offset` is a free parameter.** `hexkl_micro_hmx_rm_to_wh_i4` takes
   it as an argument and `hexkl_micro_hmx_mm_u8i4` requires only 128-byte
   alignment, so laying tiles out contiguously is allowed. This is what makes

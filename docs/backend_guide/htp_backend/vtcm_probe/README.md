@@ -27,9 +27,9 @@ reuses what is in VTCM. **The second is the number that matters** — an fc_laye
 is called once per token with the same weight, so every call after the first
 looks like that one.
 
-It also prints the VTCM size, which the budget in
-[07_vtcm_weight_residency.md](../07_vtcm_weight_residency.md) assumes is ~8 MiB
-without ever having confirmed it.
+It also prints the VTCM size, which on a V79 simulator comes out at 8 MiB —
+matching what the budget in
+[07_vtcm_weight_residency.md](../07_vtcm_weight_residency.md) assumed.
 
 ## Build and run
 
@@ -58,7 +58,23 @@ cd $HEXKL_SDK_ROOT/examples/hexkl_micro_hmx_mm_u8i4_i32
 ./run_simulator.sh --hex-arch v79
 ```
 
-Expect `Test Passed`. Stop here if you do not get it.
+Expect `Test Passed`, preceded by `VTCM size = 8388608 bytes`. Stop here if you
+do not get it.
+
+Two things bite on a fresh machine:
+
+- `HEXAGON_SDK_ROOT is not set` — `setup_sdk_env.source` has to be sourced;
+  exporting the variable by hand leaves the toolchain paths unset.
+- `hexagon-sim: libncurses.so.5: cannot open shared object file` — Ubuntu 24.04
+  does not ship ncurses 5 and has no `libncurses5` package. Symlink the `.6`
+  libraries to the `.5` names and **run `ldconfig`**; the links can already
+  exist while the loader cache still does not know them.
+
+  ```bash
+  sudo ln -s /lib/x86_64-linux-gnu/libncurses.so.6 /lib/x86_64-linux-gnu/libncurses.so.5
+  sudo ln -s /lib/x86_64-linux-gnu/libtinfo.so.6   /lib/x86_64-linux-gnu/libtinfo.so.5
+  sudo ldconfig
+  ```
 
 ### 2. Swap in the probe
 
