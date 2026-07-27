@@ -55,6 +55,7 @@ struct Args {
   int iters = 30;
   int warmup = 5;
   std::string proj = "q_proj";
+  bool sweep = false; // decompose fixed per-call overhead vs compute
 };
 
 // qwen3-0.6b projection presets (hidden 1024, intermediate 3072, GQA
@@ -85,13 +86,18 @@ static Args parseArgs(int argc, char **argv) {
     else if (s == "--K") { next(a.K); k_set = true; }
     else if (s == "--iters") { next(a.iters); iters_set = true; }
     else if (s == "--warmup") { next(a.warmup); warmup_set = true; }
+    else if (s == "--sweep")
+      a.sweep = true;
     else if (s == "--proj") {
       if (i + 1 < argc) { a.proj = argv[++i]; proj_set = true; }
     } else if (s == "--help" || s == "-h") {
       std::printf(
         "usage: hexkl_fc_compare [--proj q_proj|k_proj|o_proj|ffn_up|ffn_down]"
-        " [--M m] [--N n] [--K k] [--iters n] [--warmup n]\n"
-        "  default: qwen3-0.6b q_proj  M=64 N=2048 K=1024\n");
+        " [--M m] [--N n] [--K k] [--iters n] [--warmup n] [--sweep]\n"
+        "  default: qwen3-0.6b q_proj  M=64 N=2048 K=1024\n"
+        "  --sweep: shrink the MAC count while keeping the call structure, to\n"
+        "           split fixed per-call overhead (RPC+setup) from compute\n"
+        "  env: HEXKL_FC_ITERS, HEXKL_FC_WARMUP\n");
       std::exit(0);
     }
   }
@@ -434,6 +440,52 @@ int main(int argc, char **argv) {
               npu_ok
                 ? "NPU kernels — real device latency"
                 : "CPU-emulated integer GEMM — relErr real, latency reference");
+
+  // ---- overhead decomposition sweep ---------------------------------------
+  // Shrink the MAC count while keeping the call structure identical. The
+  // smallest shape's execute time is essentially the fixed per-call cost
+  // (FastRPC round trip + kernel setup); subtracting it from a full-size shape
+  // yields the actual compute time, which is what QNN's device-timeline "FC
+  // (weight load + compute)" number measures.
+  if (a.sweep) {
+    struct S { int M, N, K; };
+    const S shapes[] = {
+      {a.M, 32, 32},      {a.M, 32, 1024},   {a.M, 256, 1024},
+      {a.M, 2048, 128},   {a.M, 2048, 1024}, {a.M, 3072, 1024},
+    };
+    std::printf("\nOverhead sweep (M=%d, iters=%d): execute time vs MAC count\n",
+                a.M, a.iters);
+    std::printf("|     N |    K |   MACs(M) | u8i8 exec us | u8i4 exec us |\n");
+    std::printf("|---|---|---|---|---|\n");
+    double base8 = -1.0, base4 = -1.0, full8 = 0.0, full4 = 0.0;
+    for (const auto &s : shapes) {
+      auto As = randVec(s.M * s.K, -1.0f, 1.0f, 42);
+      auto Ws = randVec(s.N * s.K, -0.5f, 0.5f, 1337);
+      QResult q8 =
+        runQuant(s.M, s.N, s.K, As, Ws, 8, a.warmup, a.iters, npu_ok, domain);
+      QResult q4 =
+        runQuant(s.M, s.N, s.K, As, Ws, 4, a.warmup, a.iters, npu_ok, domain);
+      double macs = (double)s.M * s.N * s.K / 1e6;
+      std::printf("| %5d | %4d | %9.1f | %12.1f | %12.1f |\n", s.N, s.K, macs,
+                  q8.t.kernel_us, q4.t.kernel_us);
+      if (base8 < 0.0) { base8 = q8.t.kernel_us; base4 = q4.t.kernel_us; }
+      full8 = q8.t.kernel_us;
+      full4 = q4.t.kernel_us;
+    }
+    std::printf("\nfixed per-call overhead (smallest shape) : u8i8=%.1f us  "
+                "u8i4=%.1f us\n",
+                base8, base4);
+    std::printf("compute-only at the largest shape        : u8i8=%.1f us  "
+                "u8i4=%.1f us\n",
+                full8 - base8, full4 - base4);
+    std::printf("  (compare against the QNN device-timeline 'FC (weight load "
+                "+ compute)' number)\n");
+#ifdef ENABLE_HEXKL
+    if (npu_ok)
+      sdkl_npu_finalize(domain);
+#endif
+    return 0;
+  }
 
   auto A = randVec(a.M * a.K, -1.0f, 1.0f, 42);
   auto W = randVec(a.N * a.K, -0.5f, 0.5f, 1337);
