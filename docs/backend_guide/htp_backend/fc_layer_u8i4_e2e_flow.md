@@ -93,27 +93,45 @@ flowchart TD
   L2["[CPU] <b>FloatTensor::dotQInteger</b><br/>float_tensor.cpp<br/>routes on dtype, not q_scheme"]
   L3["[CPU] <b>HtpComputeOps::shgemm_u8i4</b><br/>htp_compute_ops.cpp"]
   L4["[CPU] <b>hmx::shgemm_u8i4_i32</b><br/>hexkl_mm.cpp · 495 µs per call"]
-  L5["[NPU] <b>sdkl_npu_mm_u8i4_i32</b><br/>libsdkl.so · 298 µs round trip"]
-  L6["[NPU] <b>FastRPC → CDSP skeleton</b><br/>libhexkl_skel.so (V79)"]
-  L7["[NPU] <b>HMX tile MAC</b><br/>~217 µs of actual compute"]
   OUT["[CPU] <b>hidden_ FP32 [M, N]</b><br/>next layer"]
   INIT["[OFFLINE] HtpBackend::global()<br/>sdkl_npu_initialize · 125 ms"]
+
+  subgraph CALL["[NPU] sdkl_npu_mm_u8i4_i32 — libsdkl.so · 298.2 µs host-observed"]
+    subgraph SKEL["FastRPC → libhexkl_skel.so on the CDSP (V79) — ~76 µs fixed, shape-independent"]
+      MAC["<b>HMX tile MAC + on-device data traffic</b><br/>~217 µs · scales with shape<br/>(by subtraction, not a device timeline)"]
+    end
+  end
 
   L1 -- "input_.dot(weight, hidden_, false, false)" --> L2
   L2 -- "dtype == QINT4_HTP  and  N % 32 == 0" --> L3
   L3 -- "M, N, K, A, B_wh, wt_scale, zp_corr" --> L4
-  L4 -- "X_u8 · W_u4 · C_i32 in NPU DMA memory" --> L5
-  L5 --> L6 --> L7
-  L7 -- "C_i32 back up the stack, dequantized in L4" --> OUT
+  L4 -- "X_u8 · W_u4 · C_i32 in NPU DMA memory" --> MAC
+  MAC -- "C_i32 returns; dequantized back in shgemm_u8i4_i32" --> OUT
   L4 -. "first call in the process" .-> INIT
 
   classDef off fill:#20223A,stroke:#8A90C4,color:#DCDFF5;
   classDef cpu fill:#2A2116,stroke:#C9913F,color:#F2DCB9;
   classDef npu fill:#132A28,stroke:#3FAE9C,color:#BFEDE4;
   class L1,L2,L3,L4,OUT cpu;
-  class L5,L6,L7 npu;
+  class MAC npu;
   class INIT off;
+  style CALL fill:#0E1F1D,stroke:#3FAE9C,color:#BFEDE4;
+  style SKEL fill:#122724,stroke:#3FAE9C,color:#BFEDE4;
 ```
+
+The three NPU-side boxes are **nested, not sequential**. `libhexkl_skel.so` is not a step
+before the MAC — it is the CDSP-side stub the FastRPC call lands in (hence
+`ADSP_LIBRARY_PATH`; if it cannot be loaded, `HtpBackend` init fails and the backend
+disables itself), and the HMX MAC happens *inside* it. The host only ever observes the
+outermost box.
+
+The 76 / 217 split comes from `--sweep`, which shrinks the MAC count while keeping the
+call structure identical: the smallest shape's execute time is essentially the fixed
+per-call cost, and `298 − 76 ≈ 217` is what is left. sdkl exposes no intra-execute device
+timeline (unlike QNN's `QnnProfile`), so **217 µs is an estimate by subtraction, and it
+covers everything that scales with the shape** — on-device input load, weight fetch,
+the MAC itself, and writeback — not the MAC alone. This is why 298 µs cannot be compared
+against QNN's 69.9 µs "FC" sub-phase; the comparable pair is 495 vs 513.
 
 ### What each frame is responsible for
 
@@ -124,6 +142,7 @@ flowchart TD
 | `HtpComputeOps` | ops-table override; `supports_shgemm_u8i4()` tracks NPU availability | **CPU** |
 | `shgemm_u8i4_i32` | activation scale, NEON quantize, scratch + weight residency, dequantize | **CPU** |
 | `sdkl_npu_mm_u8i4_i32` | marshals the call over FastRPC; M padded to the 64-row tile | boundary |
+| `libhexkl_skel.so` | CDSP-side stub the RPC lands in; unpacks the args and dispatches | **NPU** |
 | HMX | the INT4 MAC itself, serialized behind `sdkl_npu_lock_hmx` | **NPU** |
 
 ---
@@ -155,7 +174,7 @@ sequenceDiagram
   RPC->>HMX: skeleton call · X · Wᵀ INT4 MAC
   HMX-->>RPC: C_i32 [64, 2048]
   RPC-->>KN: rc = 0
-  Note right of HMX: this round trip = 298.2 µs steady<br/>~76 µs fixed + ~217 µs compute
+  Note right of HMX: this round trip = 298.2 µs steady<br/>~76 µs fixed + ~217 µs shape-dependent
   KN->>KN: dequantizeToF32 — NEON, M·N = 131,072
   KN-->>FC: C FP32[64,2048] and an updated MmProfile
 ```
@@ -238,8 +257,8 @@ resident-weight cache absorbs the allocation and upload into the first call.
 | HexKL steady, per call | **495** | one fc_layer matmul, weight resident |
 | HexKL first call | 1,214 | the call that uploads the weight |
 | matmul alone | 298 | **NPU** — `sdkl_npu_mm_u8i4_i32` round trip |
-| └ fixed overhead | ~76 | FastRPC round trip + kernel setup (`--sweep`) |
-| └ compute | ~217 | HMX MAC |
+| └ fixed overhead | ~76 | FastRPC round trip + kernel setup, from `--sweep` |
+| └ shape-dependent | ~217 | HMX MAC **plus** on-device load / weight fetch / writeback; `298 − 76`, not a measured sub-phase |
 | host quantize + dequantize | ~197 | **CPU** — 495 − 298, NEON-vectorized |
 | QNN NetRun, same shape | 513 | 495 vs 513 is the like-for-like number |
 
