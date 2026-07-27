@@ -1043,11 +1043,21 @@ static std::shared_ptr<nntrainer::ContextData> htpContextData() {
 // the same kernel, so anything other than equality is a defect.
 
 /**
- * @brief Build a QINT4_HTP weight tensor the way quantize_qint4_weight does.
+ * @brief Build a QINT4_HTP weight tensor exactly the way
+ *        quantize_qint4_weight does.
  *
- * Logical weight is [N, K] with one int4 per int8. The tensor carries N*K
- * bytes but only the first N*K/2 are meaningful -- WH-packed, two nibbles per
- * byte -- which is the layout shgemm_u8i4_i32 reads.
+ * Two details are not guessable and both were got wrong first time:
+ *
+ *   - the tensor must be constructed from a TensorDim, not from the
+ *     vector<vector<int8_t>> overload, which accepts only QINT4 and QINT8 and
+ *     throws on QINT4_HTP;
+ *   - the dims are [K, N], the runtime FC weight layout, not the logical
+ *     [N, K] of the weight itself. scale_size() is width(), so emitting [N, K]
+ *     would give K scales where the kernel wants N. The WH-packed bytes are
+ *     layout-agnostic -- the kernel takes N and K from the matmul dims -- so
+ *     only the metadata differs.
+ *
+ * The payload is N*K/2 WH-packed bytes at the head of an N*K-byte buffer.
  */
 static nntrainer::Tensor makeQint4HtpWeight(int N, int K,
                                             const std::vector<int8_t> &W_i4_rm,
@@ -1078,15 +1088,12 @@ static nntrainer::Tensor makeQint4HtpWeight(int N, int K,
   if (dst)
     sdkl_npu_free(dst);
 
-  std::vector<std::vector<int8_t>> W2d(N, std::vector<int8_t>(K));
-  for (int n = 0; n < N; ++n)
-    for (int k = 0; k < K; ++k)
-      W2d[n][k] = packed[static_cast<size_t>(n) * K + k];
-
-  ml::train::TensorDim::TensorType t_type = {nntrainer::Tformat::NCHW,
-                                             nntrainer::Tdatatype::QINT4_HTP};
-  nntrainer::Tensor wgt(W2d, out_wt_scale, t_type,
+  nntrainer::TensorDim quant_dim(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  nntrainer::Tensor wgt(quant_dim, true, nntrainer::Initializer::NONE, "",
                         nntrainer::QScheme::PER_CHANNEL_AFFINE_I4);
+  std::memcpy(wgt.getData<int8_t>(), packed.data(), unpacked);
+  std::memcpy(wgt.getScale<float>(), out_wt_scale.data(), N * sizeof(float));
   std::memcpy(wgt.getZpCorr<int32_t>(), out_zp_corr.data(),
               N * sizeof(int32_t));
   return wgt;
