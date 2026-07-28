@@ -503,4 +503,121 @@ Tensor quantize_qint8_weight(const Tensor &input, bool transpose_input) {
   return output;
 }
 
+Tensor quantize_qint4_weight(const Tensor &input, bool transpose_input) {
+  NNTR_THROW_IF(input.getDataType() != Tdatatype::FP32, std::invalid_argument)
+    << "[quantize_qint4_weight] Input tensor must be FP32.";
+
+  Tensor logical_weight =
+    transpose_input ? input.transpose("0:2:1") : input.clone();
+  const unsigned int N = logical_weight.height();
+  const unsigned int K = logical_weight.width();
+
+  NNTR_THROW_IF(N == 0 || K == 0, std::invalid_argument)
+    << "[quantize_qint4_weight] Weight dimensions must be non-zero.";
+  NNTR_THROW_IF(N % 32 != 0, std::runtime_error)
+    << "[quantize_qint4_weight] QINT4 quantization requires N divisible by 32, "
+    << "but got N=" << N;
+  // int4 values are packed two-per-byte for the NPU, so K must be even.
+  NNTR_THROW_IF(K % 2 != 0, std::runtime_error)
+    << "[quantize_qint4_weight] QINT4 quantization requires K to be even, "
+    << "but got K=" << K;
+
+  // QINT4_HTP is CharTensor-backed; PER_CHANNEL_AFFINE_I4 selects the u8i4
+  // kernel and the dtype lets load/dispatch tell u8i4 apart from u8i8. Emit the
+  // output tensor in the runtime FC weight layout [K, N] (in, out) so that
+  // scale_size() (= width() = N output channels) agrees between bake and load;
+  // the WH-packed bytes are layout-agnostic (the kernel takes N, K from the
+  // matmul dims), so only the dim metadata differs from the logical [N, K].
+  TensorDim quant_dim = logical_weight.getDim(); // [N, K]
+  quant_dim.setTensorType({logical_weight.getFormat(), Tdatatype::QINT4_HTP});
+  quant_dim.height(K); // -> [K, N]
+  quant_dim.width(N);
+  Tensor output(quant_dim, true, Initializer::NONE, "",
+                QScheme::PER_CHANNEL_AFFINE_I4);
+
+  const float *src = logical_weight.getData<float>();
+  int8_t *dst = output.getData<int8_t>();
+  float *scales = output.getScale<float>();
+  int32_t *zp_corr = output.getZpCorr<int32_t>();
+
+  // Symmetric INT4: quantize to [-7, 7]. Activation zero-point stays 128
+  // (matching the u8 activation path), so zp_corr[n] = 128 * sum_k(W_i4[n,k]).
+  for (unsigned int n = 0; n < N; ++n) {
+    float max_abs = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      const float value = src[n * K + k];
+      NNTR_THROW_IF(!std::isfinite(value), std::runtime_error)
+        << "[quantize_qint4_weight] Encountered non-finite weight value.";
+      max_abs = std::max(max_abs, std::fabs(value));
+    }
+
+    float scale = max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
+    if (!std::isfinite(scale) || scale <= 0.0f)
+      scale = 1.0f;
+
+    scales[n] = scale;
+
+    int32_t row_sum = 0;
+    for (unsigned int k = 0; k < K; ++k) {
+      const float value = src[n * K + k] / scale;
+      const long q = std::lround(value);
+      const int8_t clamped =
+        static_cast<int8_t>(std::max<long>(-7, std::min<long>(7, q)));
+      dst[n * K + k] = clamped;
+      row_sum += static_cast<int32_t>(clamped);
+    }
+    zp_corr[n] = 128 * row_sum;
+  }
+
+#ifdef ENABLE_HEXKL
+  // sdkl_cpu_rm_to_wh_i4 (sdkl.h) converts a row-major i4 weight — one i4
+  // value per int8 byte, sign-extended, values in [-8, 7] — into packed WH
+  // layout (uint8, two nibbles per byte, HMX-tiled). It is NOT in-place:
+  //   int sdkl_cpu_rm_to_wh_i4(uint8_t *full_wt_tiled, int8_t *wt_old,
+  //                            size_t wt_rows, size_t wt_cols);
+  // `dst` already satisfies the input contract (int4 in [-7, 7]). The packed
+  // result is copied back into `dst`; shgemm_u8i4_i32 reads its first N*K/2
+  // bytes.
+  const size_t unpacked_bytes =
+    static_cast<size_t>(N) * static_cast<size_t>(K) * sizeof(int8_t);
+  const size_t packed_bytes = unpacked_bytes / 2;
+  void *wh_out = nullptr;
+  bool used_npu = false;
+
+  // Prefer an NPU-accessible output buffer; device tests showed host-only
+  // buffers can fault in the SDKL layout path. Over-allocate to the unpacked
+  // size so tile padding beyond N*K/2 cannot overflow.
+  if (nntrainer::HtpBackend::global().enabled() &&
+      sdkl_npu_alloc(unpacked_bytes, &wh_out) == 0 && wh_out != nullptr) {
+    used_npu = true;
+  }
+
+  nntrainer::MemAllocator host_alloc;
+  if (!used_npu)
+    host_alloc.alloc(&wh_out, unpacked_bytes, 64);
+
+  // Device-verified: sdkl_cpu_rm_to_wh_i4 takes (wt_rows=K, wt_cols=N) — the
+  // inner dimension first — to produce a WH weight that sdkl_npu_mm_u8i4_i32
+  // consumes as X * W^T for this [N, K] weight. (The in-place i8 variant uses
+  // (N, K); the i4 packer's convention is the transpose of that.)
+  int rc = sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(wh_out), dst,
+                                static_cast<size_t>(K), static_cast<size_t>(N));
+  if (rc == 0)
+    std::memcpy(dst, wh_out, packed_bytes);
+
+  if (used_npu) {
+    const int free_rc = sdkl_npu_free(wh_out);
+    NNTR_THROW_IF(free_rc != 0, std::runtime_error)
+      << "[quantize_qint4_weight] Failed to free temporary SDKL buffer.";
+  } else {
+    host_alloc.free(wh_out);
+  }
+
+  NNTR_THROW_IF(rc != 0, std::runtime_error)
+    << "[quantize_qint4_weight] Failed to convert QINT4 weight to WH layout.";
+#endif
+
+  return output;
+}
+
 } // namespace nntrainer

@@ -438,6 +438,96 @@ TEST(ShortTensor, print) {
 // Main function
 //==============================================================================
 
+//==============================================================================
+// QINT4_HTP Tests (INT4 weights for the HTP u8i4 kernel)
+//
+// QINT4_HTP is CharTensor-backed like QINT8, but carries PER_CHANNEL_AFFINE_I4
+// so the dispatch can tell the two apart, and holds its payload WH-packed two
+// values per byte. The dtype plumbing below -- element size, name, backing
+// class, qscheme, qparam sizing -- had no coverage of its own; every existing
+// INT4 test went through the kernel, which needs a Hexagon device.
+//==============================================================================
+
+TEST(Qint4Htp, element_size_is_one_byte) {
+  // Two int4 values share a byte, but the tensor allocates one byte per
+  // element and uses the first half. Sizing it at 4 bits would halve every
+  // allocation and truncate the payload.
+  nntrainer::TensorDim d(
+    1, 1, 4, 32, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  EXPECT_EQ(d.getDataTypeSize(), sizeof(int8_t));
+  EXPECT_EQ(d.getDataLen(), 4u * 32u);
+}
+
+TEST(Qint4Htp, dtype_name_round_trips) {
+  nntrainer::TensorDim d(
+    1, 1, 4, 32, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  std::stringstream ss;
+  ss << d;
+  EXPECT_NE(ss.str().find("QINT4_HTP"), std::string::npos);
+}
+
+TEST(Qint4Htp, is_backed_by_char_tensor) {
+  nntrainer::TensorDim d(
+    1, 1, 4, 32, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  nntrainer::Tensor t(d, true);
+  EXPECT_EQ(t.getDataType(), nntrainer::Tdatatype::QINT4_HTP);
+  EXPECT_NE(t.getData<int8_t>(), nullptr);
+}
+
+TEST(Qint4Htp, forces_per_channel_affine_i4_qscheme) {
+  // The dtype selects the scheme; a caller asking for anything else must not
+  // be able to produce a tensor the u8i4 dispatch would then reject or, worse,
+  // accept with the wrong qparam layout.
+  nntrainer::TensorDim d(
+    1, 1, 4, 32, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  nntrainer::Tensor t(d, true, nntrainer::Initializer::NONE, "",
+                      nntrainer::QScheme::PER_TENSOR_AFFINE);
+  EXPECT_EQ(t.q_scheme(), nntrainer::QScheme::PER_CHANNEL_AFFINE_I4);
+}
+
+TEST(Qint4Htp, qparams_are_sized_per_output_channel) {
+  // One scale and one zp_corr per output channel, and the tensor is stored
+  // [K, N] so that is width(). Getting this wrong gives K scales where the
+  // kernel indexes N of them -- an out-of-bounds read the kernel cannot see.
+  constexpr unsigned int K = 4, N = 32;
+  nntrainer::TensorDim d(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  nntrainer::Tensor t(d, true, nntrainer::Initializer::NONE, "",
+                      nntrainer::QScheme::PER_CHANNEL_AFFINE_I4);
+
+  EXPECT_EQ(t.scale_size(), N);
+  ASSERT_NE(t.getScale<float>(), nullptr);
+  ASSERT_NE(t.getZpCorr<int32_t>(), nullptr);
+
+  for (unsigned int n = 0; n < N; ++n) {
+    t.getScale<float>()[n] = 0.5f + n;
+    t.getZpCorr<int32_t>()[n] = -128 * (int32_t)(n + 1);
+  }
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_FLOAT_EQ(t.getScale<float>()[n], 0.5f + n);
+    EXPECT_EQ(t.getZpCorr<int32_t>()[n], -128 * (int32_t)(n + 1));
+  }
+}
+
+TEST(Qint4Htp, packed_payload_survives_a_write_read_round_trip) {
+  // The kernel reads the first N*K/2 bytes as packed nibbles. Nothing in the
+  // tensor interprets them, so this only checks the buffer is byte-addressable
+  // and large enough -- which is what the over-allocation is for.
+  constexpr unsigned int K = 4, N = 32;
+  nntrainer::TensorDim d(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4_HTP});
+  nntrainer::Tensor t(d, true);
+
+  int8_t *p = t.getData<int8_t>();
+  const size_t packed = (size_t)K * N / 2;
+  for (size_t i = 0; i < packed; ++i)
+    p[i] = static_cast<int8_t>((i * 7 + 1) & 0xFF);
+  for (size_t i = 0; i < packed; ++i)
+    EXPECT_EQ(p[i], static_cast<int8_t>((i * 7 + 1) & 0xFF)) << "at " << i;
+}
+
+//==============================================================================
+
 int main(int argc, char **argv) {
   int result = -1;
   try {
