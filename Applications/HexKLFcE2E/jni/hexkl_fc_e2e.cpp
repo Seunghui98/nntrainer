@@ -71,6 +71,7 @@ struct Args {
   int K = 64;    // in features
   int show = 8;  // how many output values to print
   uint32_t seed = 1234;
+  std::string dist = "uniform"; // weight distribution: uniform | normal
 };
 
 Args parseArgs(int argc, char **argv) {
@@ -93,13 +94,18 @@ Args parseArgs(int argc, char **argv) {
       int v = 0;
       next(v);
       a.seed = static_cast<uint32_t>(v);
+    } else if (s == "--dist") {
+      if (i + 1 < argc)
+        a.dist = argv[++i];
     } else if (s == "-h" || s == "--help") {
       std::printf(
         "usage: hexkl_fc_e2e [--M rows] [--N out] [--K in] [--show n]\n"
-        "                    [--seed s]\n"
+        "                    [--seed s] [--dist uniform|normal]\n"
         "  N must be a multiple of 32 (the u8i4 kernel's tile width).\n"
         "  Default 4x64x64 keeps the printed output readable; pass real\n"
-        "  layer dims (e.g. --M 64 --N 2048 --K 1024) to exercise q_proj.\n");
+        "  layer dims (e.g. --M 64 --N 2048 --K 1024) to exercise q_proj.\n"
+        "  --dist changes only the reported quantization loss, never the\n"
+        "  npu-vs-cpu check. normal is the closer model of trained weights.\n");
       std::exit(0);
     }
   }
@@ -109,6 +115,31 @@ Args parseArgs(int argc, char **argv) {
 std::vector<float> randVec(size_t n, float lo, float hi, uint32_t seed) {
   std::mt19937 rng(seed);
   std::uniform_real_distribution<float> d(lo, hi);
+  std::vector<float> v(n);
+  for (auto &x : v)
+    x = d(rng);
+  return v;
+}
+
+/**
+ * @brief Weights drawn from a normal distribution.
+ *
+ * Which distribution the weights come from does not affect the npu-vs-cpu
+ * comparison at all -- both sides quantize the same numbers the same way --
+ * and it does not even affect the reported quantization loss through its
+ * scale, since per-channel symmetric quantization divides by max|W[n,:]|/7 and
+ * a uniform rescaling cancels exactly.
+ *
+ * The *shape* does matter. Under U(-a, a) the per-row maximum sits close to a
+ * typical magnitude, so the 15 INT4 levels are used evenly and the measured
+ * loss is optimistic. Trained weights are roughly normal with a long tail: one
+ * outlier sets the scale for its whole row and everything else is squeezed
+ * into the middle few levels. This is the closer model of the two, and still
+ * an underestimate -- it has no outliers beyond what a Gaussian produces.
+ */
+std::vector<float> randNormal(size_t n, float sigma, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> d(0.0f, sigma);
   std::vector<float> v(n);
   for (auto &x : v)
     x = d(rng);
@@ -541,7 +572,8 @@ int main(int argc, char **argv) {
   }
 
   std::printf("fc_layer end-to-end: CPU FP32 vs CPU u8i4 vs HexKL u8i4\n");
-  std::printf("  M=%d N=%d K=%d seed=%u\n", a.M, a.N, a.K, a.seed);
+  std::printf("  M=%d N=%d K=%d seed=%u weights=%s\n", a.M, a.N, a.K, a.seed,
+              a.dist.c_str());
   std::printf("  built: %s %s\n\n", __DATE__, __TIME__);
 
   const size_t mk = (size_t)a.M * a.K;
@@ -549,7 +581,10 @@ int main(int argc, char **argv) {
 
   // fc_layer stores the weight as [K, N]; the quantizer works in [N, K].
   auto A = randVec(mk, -1.0f, 1.0f, a.seed);
-  auto W_kn = randVec(kn, -0.5f, 0.5f, a.seed + 1);
+  // sigma 0.02 is the usual transformer weight initialization; the uniform
+  // bound is what the existing kernel tests use.
+  auto W_kn = (a.dist == "normal") ? randNormal(kn, 0.02f, a.seed + 1)
+                                   : randVec(kn, -0.5f, 0.5f, a.seed + 1);
   auto bias = randVec(a.N, -0.1f, 0.1f, a.seed + 2);
 
   std::vector<float> W_nk(kn);
