@@ -52,29 +52,60 @@ the same shape.
 
 | | μs | note |
 | :--- | ---: | :--- |
-| **HexKL per call (steady)** | **495** | `--engine nntr`: what an fc_layer pays |
-| HexKL first call | 1214 | uploads the weight; also the pre-residency cost |
-| HexKL matmul alone | 298 | `--engine sdkl`: `sdkl_npu_mm_u8i4_i32` only |
+| **HexKL per call (steady)** | **351** | `--engine nntr`: what an fc_layer pays |
+| ↳ NPU matmul | 270 | `sdkl_npu_mm_u8i4_i32`, from the kernel's own timers |
+| ↳ host quantize + dequantize | 77 | NEON; scan 9.3 + quantize 23 + dequantize 45 |
+| ↳ buffer staging | 0.1 | scratch pool + resident weight, both hits |
+| HexKL first call | 1060 | uploads the weight; also the pre-residency cost |
 | **QNN NetRun** | **513** | host-observed execute |
 | QNN device total | 347 | Convert 44.5 + FC 69.9 + format 151.1 + writeback 72.9 |
 | QNN FC alone | 69.9 | device-timeline sub-phase |
 
+Measured with `HEXKL_FC_ITERS=100` on a build-stamped binary, reproduced across
+four runs (351 / 362 / 351 / 360). Earlier revisions of this file quoted 495 μs
+per call and 197 μs of host time; those predate the NEON quantize/dequantize.
+
 Reading these:
 
-- **495 vs 513** is the like-for-like comparison — both are what the host pays
-  per matmul. Keeping the weight resident in NPU memory is what closed it:
-  before that every call re-uploaded, which is the 1214 figure.
-- **298 vs 69.9** is not like-for-like. 298 is a whole host-observed execute
-  (FastRPC round trip, input load, matmul, writeback); 69.9 is one sub-phase of
-  QNN's device timeline. sdkl exposes no intra-execute breakdown, so the
-  matching number cannot be extracted. A `--sweep` on device puts the fixed
-  per-call cost at ~76 μs, leaving ~217 μs of actual compute.
-- **495 − 298 ≈ 197 μs** is host-side activation quantization (M·K = 65 536
-  elements) and dequantize (M·N = 131 072). Unlike the matmul, which HMX
-  serializes behind `sdkl_npu_lock_hmx`, this part is element-wise and
-  parallelizable — the remaining lever on the host side.
-- QNN spends 151.1 μs formatting its output back to uint8. HexKL returns fp32
-  and skips that, so a uint8 output requirement would add cost on our side too.
+- **351 vs 513** is the closest like-for-like pair — both are what the host
+  pays per matmul — but it flatters us twice over, and neither is the whole
+  story. See the phase-by-phase comparison below.
+- **270 vs 69.9** is the compute gap, and it is real: QNN's FC sub-phase is
+  ~4x cheaper. A `--sweep` puts our fixed per-call cost at ~76 μs, so roughly
+  194 μs of the 270 is shape-dependent work against QNN's 69.9.
+- **77 μs of host time**, down from ~197 before NEON. The three loops are now
+  near memory bandwidth: dequantize moves 1 MB in 45 μs (~23 GB/s), the scan
+  256 KB in 9.3 μs (~27 GB/s). Threading them was tried and reverted (see the
+  table in `hexkl_mm.cpp`); SIMD was the axis that held up.
+
+### Where QNN's 513 μs goes, and why the comparison is not clean
+
+| | μs | what it is |
+| :--- | ---: | :--- |
+| Host / qnn-net-run overhead | 128 | the benchmark tool: arg parsing, reading the input from a file, tensor setup, profiling |
+| Non-accelerate RPC overhead | 39 | FastRPC marshalling, domain switch, cache maintenance |
+| Input slice / load (uint8) | 44.5 | input into the device's layout |
+| **FC (weight load + compute)** | **69.9** | |
+| Output format / layout (uint8) | 151.1 | accumulator → output tensor layout |
+| Output writeback | 72.9 | into memory the host can read |
+| Idle / misc | 5.2 | |
+
+Only 13.6% of QNN's 513 μs is the matmul. Two of those rows do not belong in a
+comparison against an integrated app: the 128 μs is `qnn-net-run`'s own cost,
+which we pay none of, and QNN's graph takes uint8 in and returns uint8 out, so
+its 513 excludes the FP32 conversion our 351 includes. Adjusting for the first
+alone gives 351 vs 385.
+
+**The per-call win does not survive scaling to a model.** QNN's overheads are
+per graph execution; ours are per matmul. A qwen3-0.6b token is 196 fc_layer
+calls (7 projections × 28 layers), so we pay ~76 μs of RPC and ~77 μs of
+conversion 196 times — about 30 ms — where QNN pays its equivalent once. A
+rough projection puts a token at ~14 ms for QNN against ~60-70 ms for us.
+
+Which is to say: we are ahead on an isolated fc_layer and behind on the model,
+and the two levers that would close it (keeping activations u8 between layers,
+batching calls into one RPC) are structural rather than kernel work. See §7 of
+[07_vtcm_weight_residency.md](07_vtcm_weight_residency.md).
 
 ## Fc shapes (qwen3-0.6b, hidden 1024, intermediate 3072, GQA q=2048/kv=1024)
 

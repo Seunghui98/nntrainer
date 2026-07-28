@@ -98,9 +98,3 @@ nntrainer_for_android.tar.gz
 ctre-unicode.hpp
 encoder.hpp
 json.hpp
-
-# superpowers docs (local reference - not for commit)
-docs/superpowers/
-
-# Claude Code project guidance (local reference - not for main)
-/CLAUDE.md

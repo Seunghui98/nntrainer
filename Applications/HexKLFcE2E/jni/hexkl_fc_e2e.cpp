@@ -10,10 +10,26 @@
  * @brief  End-to-end fc_layer check: FP32 on CPU vs u8i4 on the NPU.
  *
  * Everything verified so far calls hmx::shgemm_u8i4_i32 or Tensor::dot()
- * directly. This runs a real nntrainer FullyConnectedLayer -- built through
- * the model API, compiled, initialized and forwarded -- twice over identical
- * weights, once with an FP32 weight and once with QINT4_HTP, and prints both
- * outputs side by side.
+ * directly. This aims one level higher: a real nntrainer FullyConnectedLayer,
+ * built through the model API, run twice over identical weights -- once with
+ * an FP32 weight and once with QINT4_HTP -- with both outputs printed side by
+ * side.
+ *
+ * **The model-graph path does not currently work**, and the app says so at
+ * runtime rather than hiding it. On a Galaxy S25 Ultra the fully_connected
+ * node has a run context but reports zero weights, before and after a forward
+ * pass, so there is nowhere to put the weights being compared; the QINT4_HTP
+ * model additionally fails its first inference with "QINT4 Dot requires HTP
+ * u8i4 support with N %% 32 == 0" at a shape that satisfies it, which points
+ * at the activation not carrying the HTP context data through the graph. Both
+ * are defects in the QINT4_HTP wiring, not in this app, and neither is
+ * understood yet.
+ *
+ * When that happens the app falls back to running the layer's forward
+ * arithmetic directly -- input.dot(weight, false, false) then the bias add,
+ * exactly what FullyConnectedLayer::forwarding does -- and prints which path
+ * it took. The numbers below are therefore trustworthy for the kernel and the
+ * dispatch, and say nothing about the graph plumbing around them.
  *
  * Three results, because two of them answer different questions:
  *

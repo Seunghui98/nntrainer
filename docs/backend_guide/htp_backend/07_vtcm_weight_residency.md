@@ -22,19 +22,23 @@ Measured on a Galaxy S25 Ultra, q_proj (M=64, N=2048, K=1024), u8i4:
 
 | | μs |
 | :--- | ---: |
-| HexKL per fc_layer call | 545 |
-| ↳ host quantize + dequantize | ~250 |
-| ↳ **NPU matmul (`sdkl_npu_mm_u8i4_i32`)** | **298** |
+| HexKL per fc_layer call | 351 |
+| ↳ host quantize + dequantize (NEON) | 77 |
+| ↳ **NPU matmul (`sdkl_npu_mm_u8i4_i32`)** | **270** |
+| ↳ buffer staging | 0.1 |
 | QNN NetRun (host-observed execute) | 513 |
 | ↳ **QNN FC (device-timeline sub-phase)** | **69.9** |
 
-The host side is settled: keeping the weight resident in NPU memory took the
-call from 1214 μs to 545 μs, and threading what is left made throughput worse
-(see the table in `hexkl_mm.cpp`). What remains is the 298 μs on the NPU, where
-QNN's comparable phase costs 69.9 μs.
+The host side is settled. Keeping the weight resident in NPU memory took the
+call from 1214 μs to 545 μs; vectorizing the quantize/dequantize took the
+remaining host work from ~197 μs to 77 μs and the call to 351. Threading was
+tried in between and reverted (see the table in `hexkl_mm.cpp`). Buffer staging
+is 0.1 μs, so the scratch pool and the resident-weight cache are both hitting.
 
-A `--sweep` on device (`hexkl_fc_compare --sweep`) put the fixed per-call cost
-at ~76 μs, so roughly 217 μs of the 298 is work that scales with the shape.
+What remains is the 270 μs on the NPU, where QNN's comparable phase costs
+69.9 μs. A `--sweep` on device (`hexkl_fc_compare --sweep`) put the fixed
+per-call cost at ~76 μs, so roughly 194 μs of the 270 is work that scales with
+the shape.
 
 ## 2. The hypothesis, and why it is only a hypothesis
 
@@ -182,7 +186,7 @@ would remove it. That saving is unmeasured, not disproven; §3.2 killed the
 One inference worth recording, with its assumption stated: 98,304 pcycles of
 HMX at a ~1.0–1.4 GHz DSP clock is 70–98 μs, which brackets QNN's measured
 69.9 μs. If that clock estimate is right, QNN is running at roughly the HMX
-floor for this shape, and the shipped kernel's 298 μs is ~3–4x above it in
+floor for this shape, and the shipped kernel's 270 μs is ~3–4x above it in
 overhead. That would mean the 4x gap is reachable — but by fixing staging, not
 residency. The clock is unverified and the simulator's HMX timing model may not
 match silicon, so this is a hypothesis, not a measurement.
@@ -350,7 +354,7 @@ a skel:
    it — a real saving, for a different reason than §2 gave.
 
 Both resolve the same way, and more cheaply than building anything: **decompose
-the shipped `sdkl_npu_mm_u8i4_i32`'s 298 μs on device.** Sweep N and K
+the shipped `sdkl_npu_mm_u8i4_i32`'s 270 μs on device.** Sweep N and K
 independently with `hexkl_fc_compare` and fit
 `A + B·(mm ops) + C·(output bytes) + D·(weight bytes) + E·(activation bytes)`,
 the same way §3.2's five shapes were fitted. A significant `D` is the signature
@@ -416,15 +420,15 @@ different optimization, and one that does not require replacing the kernel.)
 And the probe suggests the code in between is *better* than a naive micro-API
 composition. `resident_2nd` at q_proj — weights fully resident, about the best
 a straightforward micro-API kernel could do — is 1,797,104 pcycles. Against the
-shipped kernel's device-measured 298 μs:
+shipped kernel's device-measured 270 μs:
 
 | assumed DSP clock | naive micro-API | shipped macro |
 | :--- | ---: | ---: |
-| 1.0 GHz | ~1797 μs | **298 μs** |
-| 1.4 GHz | ~1284 μs | **298 μs** |
-| 2.0 GHz | ~899 μs | **298 μs** |
+| 1.0 GHz | ~1797 μs | **270 μs** |
+| 1.4 GHz | ~1284 μs | **270 μs** |
+| 2.0 GHz | ~899 μs | **270 μs** |
 
-The shipped kernel is 3–6x ahead, and its 298 μs includes the FastRPC round
+The shipped kernel is 3–6x ahead, and its 270 μs includes the FastRPC round
 trip that the simulator figure does not pay. So `libhexkl_skel.so` is evidently
 not assembled from the micro-API copy helpers that §3.2 measured at 95% of the
 time — it is doing the DMA the header recommends.
@@ -433,8 +437,7 @@ The clock is unverified and simulator timing may not match silicon, so this is
 an estimate. But a 3–6x margin survives a 2–3x error in the clock, and the
 direction does not change: replacing the kernel means beating staging code that
 already beats the obvious implementation by several times. Meanwhile the
-host-side wins (§1: 1214 μs → 545 μs) came far more cheaply, and ~197 μs of
-scalar quantize/dequantize on the ARM side is still un-vectorized.
+host-side wins (§1: 1214 μs → 351 μs) came far more cheaply.
 
 Worth keeping in view while deciding: on the like-for-like measure (what the
 host actually pays per fc_layer call) HexKL is at 495 μs against QNN's 513 μs
