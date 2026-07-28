@@ -99,8 +99,9 @@ include $(BUILD_EXECUTABLE)
 
 # ---- executable: unittest_nntrainer_htp_kernel_math ----
 # Host-side math around the NPU GEMM: the quantize/zp_corr/dequant reference
-# checks. These build on any host, but the arm64 target is where they run
-# against the same compiler and float behaviour the device path uses.
+# checks, plus the NEON-vs-scalar equivalence tests in hexkl_quant.h. Those
+# build on any host but only exercise the NEON path on arm64, so this target
+# is the only place they actually run against the code they were written for.
 include $(CLEAR_VARS)
 LOCAL_MODULE     := unittest_nntrainer_htp_kernel_math
 LOCAL_CFLAGS     := \

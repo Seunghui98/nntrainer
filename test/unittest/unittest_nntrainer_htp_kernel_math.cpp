@@ -26,12 +26,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include <hexkl_quant.h>
 #include <quantizer.h>
 #include <tensor.h>
 
@@ -378,6 +380,134 @@ TEST(HtpKernelMath, Int8MoreAccurateThanInt4) {
   float e4 = pipelineRelErr(M, N, K, 4, 31);
   EXPECT_LT(e8, e4);
   EXPECT_LT(e8, 0.05f);
+}
+
+// ---- NEON vs scalar ---------------------------------------------------------
+//
+// hexkl_quant.h promises the NEON routines are bit-identical to the scalar
+// reference, not merely close, so these compare with ==. On a host without
+// NEON the dispatched entry point *is* the scalar one and these pass trivially
+// -- the tests earn their keep when this binary is built for arm64 and run on
+// the device, which is the only place the NEON code executes.
+
+namespace q = nntrainer::hmx::quant;
+
+/** @brief Deterministic activations, including the awkward values. */
+static std::vector<float> makeActs(size_t n, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+  std::vector<float> a(n);
+  for (size_t i = 0; i < n; ++i)
+    a[i] = d(rng);
+  if (n > 8) {
+    // Ties, sign-symmetric ties, saturation either way, and non-finites: the
+    // cases where round-mode, clamp order and the finite mask can diverge.
+    a[0] = 0.5f;
+    a[1] = -0.5f;
+    a[2] = 1.5f;
+    a[3] = 1e30f;
+    a[4] = -1e30f;
+    a[5] = std::numeric_limits<float>::infinity();
+    a[6] = -std::numeric_limits<float>::infinity();
+    a[7] = std::numeric_limits<float>::quiet_NaN();
+  }
+  return a;
+}
+
+TEST(HtpQuantSimd, MaxAbs_MatchesScalarExactly) {
+  // Lengths either side of the 16- and 4-wide blocks, so the tail is covered.
+  for (size_t n : {0u, 1u, 3u, 4u, 15u, 16u, 17u, 63u, 64u, 1024u, 65537u}) {
+    auto a = makeActs(n, 1234u + static_cast<unsigned>(n));
+    EXPECT_EQ(q::activationMaxAbsScalar(a.data(), n),
+              q::activationMaxAbs(a.data(), n))
+      << "n=" << n;
+  }
+}
+
+TEST(HtpQuantSimd, MaxAbs_IgnoresNonFinite) {
+  std::vector<float> a(64, 1.0f);
+  a[10] = std::numeric_limits<float>::infinity();
+  a[20] = -std::numeric_limits<float>::infinity();
+  a[30] = std::numeric_limits<float>::quiet_NaN();
+  a[40] = -2.5f;
+  EXPECT_FLOAT_EQ(2.5f, q::activationMaxAbs(a.data(), a.size()));
+}
+
+TEST(HtpQuantSimd, QuantizeU8_MatchesScalarExactly) {
+  constexpr float kZp = 128.0f;
+  for (size_t K : {1u, 4u, 15u, 16u, 17u, 33u, 1024u}) {
+    const size_t M = 3, Mp = 64; // exercises the zero-point row padding too
+    auto a = makeActs(M * K, 77u + static_cast<unsigned>(K));
+    const float inv = 1.0f / (q::activationMaxAbs(a.data(), M * K) / 127.0f);
+
+    std::vector<uint8_t> ref(Mp * K, 0), got(Mp * K, 0);
+    q::quantizeActivationU8Scalar(a.data(), ref.data(), M, Mp, K, inv, kZp);
+    q::quantizeActivationU8(a.data(), got.data(), M, Mp, K, inv, kZp);
+    EXPECT_EQ(ref, got) << "K=" << K;
+  }
+}
+
+TEST(HtpQuantSimd, QuantizeU8_SaturatesAndPads) {
+  constexpr float kZp = 128.0f;
+  const size_t M = 1, Mp = 2, K = 8;
+  // inv_scale of 1 puts +1000 far past 255 and -1000 far below 0.
+  std::vector<float> a = {1000.0f,
+                          -1000.0f,
+                          0.0f,
+                          127.0f,
+                          -128.0f,
+                          std::numeric_limits<float>::quiet_NaN(),
+                          std::numeric_limits<float>::infinity(),
+                          1.0f};
+  std::vector<uint8_t> got(Mp * K, 7);
+  q::quantizeActivationU8(a.data(), got.data(), M, Mp, K, 1.0f, kZp);
+
+  EXPECT_EQ(255, got[0]);
+  EXPECT_EQ(0, got[1]);
+  EXPECT_EQ(128, got[2]);
+  EXPECT_EQ(255, got[3]);
+  EXPECT_EQ(0, got[4]);
+  EXPECT_EQ(128, got[5]); // NaN -> zero point
+  EXPECT_EQ(128, got[6]); // +inf -> zero point
+  EXPECT_EQ(129, got[7]);
+  for (size_t k = 0; k < K; ++k)
+    EXPECT_EQ(128, got[K + k]) << "padding row k=" << k; // rows [M, Mp)
+}
+
+TEST(HtpQuantSimd, Dequantize_MatchesScalarExactly) {
+  std::mt19937 rng(9182);
+  std::uniform_int_distribution<int32_t> ci(-100000, 100000);
+  std::uniform_real_distribution<float> sc(0.001f, 0.05f);
+
+  for (size_t N : {1u, 7u, 8u, 9u, 32u, 2048u}) {
+    const size_t M = 3;
+    std::vector<int32_t> c_i32(M * N), zp(N);
+    std::vector<float> ws(N), ref(M * N, 0.0f), got(M * N, 0.0f);
+    for (size_t i = 0; i < M * N; ++i)
+      c_i32[i] = ci(rng);
+    for (size_t n = 0; n < N; ++n) {
+      zp[n] = ci(rng);
+      ws[n] = sc(rng);
+    }
+    const float act_scale = 0.0137f;
+
+    q::dequantizeToF32Scalar(c_i32.data(), ref.data(), M, N, act_scale,
+                             ws.data(), zp.data());
+    q::dequantizeToF32(c_i32.data(), got.data(), M, N, act_scale, ws.data(),
+                       zp.data());
+    for (size_t i = 0; i < M * N; ++i)
+      ASSERT_EQ(ref[i], got[i]) << "N=" << N << " i=" << i;
+  }
+}
+
+// Reports which path this binary exercises. Without it a green run on x86 is
+// indistinguishable from a green run that actually tested the NEON code.
+TEST(HtpQuantSimd, ReportsWhichPathIsUnderTest) {
+  std::cout << "[ INFO     ] hexkl_quant dispatch: "
+            << (q::neonEnabled() ? "NEON (AArch64)"
+                                 : "scalar (no NEON on this target)")
+            << std::endl;
+  SUCCEED();
 }
 
 int main(int argc, char **argv) {

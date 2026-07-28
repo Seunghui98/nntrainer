@@ -92,6 +92,13 @@ if get_option('enable-opencl')
   nntrainer_inc_abs += meson.current_source_dir() / 'cl_operations'
 endif
 
+# hexkl_quant.h (host-side quantize/dequantize around the HexKL integer
+# matmuls) is header-only and free of any Hexagon SDK dependency, so its
+# directory goes on the include path even without enable-htp -- the NEON vs
+# scalar tests in unittest_nntrainer_htp_kernel_math build everywhere.
+nntrainer_inc += include_directories('htp_backend/hmx_ops')
+nntrainer_inc_abs += meson.current_source_dir() / 'htp_backend/hmx_ops'
+
 if get_option('enable-htp')
   subdir('htp_backend')
   nntrainer_inc += include_directories('htp_backend')

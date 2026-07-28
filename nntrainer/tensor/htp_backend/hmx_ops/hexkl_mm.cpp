@@ -545,6 +545,7 @@ void prefillWHCacheClear() {
 // shgemm_u8i8_i32 can be compiled even when ENABLE_FP16 is not set.
 // C++ system headers are idempotent; project headers carry their own guards.
 #include <hexkl_mm.h>
+#include <hexkl_quant.h>
 #include <htp_backend.h>
 
 #include <sdkl_compat.h>
@@ -764,77 +765,32 @@ NpuScratch g_c_scratch; // int32 accumulator
 // ---- Host-side pre/post processing around the NPU matmul -------------------
 //
 // The activation scan, the FP32->U8 quantization and the dequantize are
-// element-wise over M*K and M*N. Two details below are load bearing for
-// correctness rather than speed:
+// element-wise over M*K and M*N, and on a Galaxy S25 Ultra account for roughly
+// 197 us of the 545 us an fc_layer call takes (q_proj, M=64, u8i4) -- on the
+// order of the matmul itself, and until now plain scalar loops. They move to
+// hexkl_quant.h, which adds an AArch64 NEON implementation alongside the
+// scalar reference it must match bit for bit.
 //
-//   - the activation scale is divided in double and narrowed once. Computing
-//     it as `max_abs / 127.0f` can land a ULP away, which is enough to shift a
-//     quantized value by one.
-//   - the dequantize keeps its left-to-right grouping,
-//     `(act_scale * wt_scale[n]) * (c - zp)`; regrouping changes the
-//     intermediate rounding.
+// They are NOT threaded. ThreadManager::parallel_for was measured over 200
+// iterations per setting and did lower the median (542 -> ~357 us), but the
+// mean -- which is what throughput follows -- only improved at two threads and
+// regressed past it:
 //
-// Both are what let the tests assert bit equality against a CPU mirror instead
-// of a tolerance -- and a tolerance loose enough to cover INT4 quantization
-// error (~7%) is loose enough to hide a shifted nibble or a wrong tile.
+//     threads   1      2         4         8
+//     median    542    384/399   359/358   357/358
+//     mean      545    464/511   573/584   608/634
+//     max       745    763/1591  2697/2297 2517/2408
+//
+// Occasional multi-millisecond calls eat the gain. The cause was not pinned
+// down: it survived removing a per-call allocation, false sharing on the
+// reduction array, and one of the three barriers. parallel_for also draws on
+// the process-wide pool, so this path cannot cap itself at the two threads
+// that helped -- and 4 or 8 is the ordinary setting. SIMD is the safer axis
+// for the same work: no scheduler involvement, so none of that tail.
 
-/**
- * @brief Largest |A[i]| over M*K, skipping non-finite values.
- */
-float activationMaxAbs(const float *A, size_t M, size_t K) {
-  float max_abs = 0.0f;
-  const size_t n = M * K;
-  for (size_t i = 0; i < n; ++i) {
-    if (!std::isfinite(A[i]))
-      continue;
-    const float v = std::fabs(A[i]);
-    if (v > max_abs)
-      max_abs = v;
-  }
-  return max_abs;
-}
-
-/**
- * @brief Quantize FP32 activations to U8 with the given zero point.
- * @param Mp Row count padded to the SDKL 64-row tile; rows at or past M are
- *           filled with the zero point so the padding contributes nothing.
- */
-void quantizeActivationU8(const float *A, uint8_t *X, size_t M, size_t Mp,
-                          size_t K, float inv_act_scale, float zero_point) {
-  for (size_t m = 0; m < Mp; ++m) {
-    const size_t off = m * K;
-    if (m >= M) {
-      std::memset(X + off, static_cast<int>(zero_point), K);
-      continue;
-    }
-    for (size_t k = 0; k < K; ++k) {
-      const float a = A[off + k];
-      if (!std::isfinite(a)) {
-        X[off + k] = static_cast<uint8_t>(zero_point);
-        continue;
-      }
-      float q = std::round(a * inv_act_scale) + zero_point;
-      if (q < 0.0f)
-        q = 0.0f;
-      if (q > 255.0f)
-        q = 255.0f;
-      X[off + k] = static_cast<uint8_t>(q);
-    }
-  }
-}
-
-/** @brief C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]). */
-void dequantizeToF32(const int32_t *C_i32, float *C, size_t M, size_t N,
-                     float act_scale, const float *wt_scale,
-                     const int32_t *zp_corr) {
-  for (size_t m = 0; m < M; ++m) {
-    const size_t off = m * N;
-    for (size_t n = 0; n < N; ++n)
-      C[off + n] =
-        act_scale * wt_scale[n] *
-        (static_cast<float>(C_i32[off + n]) - static_cast<float>(zp_corr[n]));
-  }
-}
+using quant::activationMaxAbs;
+using quant::dequantizeToF32;
+using quant::quantizeActivationU8;
 
 } // namespace
 
@@ -876,18 +832,11 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   int domain = HtpBackend::global().domain();
 
   // --- Compute per-tensor activation scale ---
-  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
-  // Guard against zero, non-finite, and underflowing scale values so the
-  // quantization path stays finite and deterministic.
-  constexpr float kActQuantMax = 127.0f;
-  constexpr float kActZeroPoint = 128.0f;
-  const double scale_candidate =
-    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
-  const float act_scale =
-    (std::isfinite(scale_candidate) &&
-     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
-      ? static_cast<float>(scale_candidate)
-      : 1.0f;
+  const float max_abs = activationMaxAbs(A, M_sz * K_sz);
+  // activationScale guards against zero, non-finite and underflowing values so
+  // the quantization path stays finite and deterministic.
+  constexpr float kActZeroPoint = quant::kActZeroPoint;
+  const float act_scale = quant::activationScale(max_abs);
   const float inv_act_scale = 1.0f / act_scale;
 
   // --- NPU-accessible buffers: reused scratch + resident weight ---
@@ -998,16 +947,9 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
   int domain = HtpBackend::global().domain();
 
   // --- Compute per-tensor activation scale (identical to u8i8) ---
-  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
-  constexpr float kActQuantMax = 127.0f;
-  constexpr float kActZeroPoint = 128.0f;
-  const double scale_candidate =
-    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
-  const float act_scale =
-    (std::isfinite(scale_candidate) &&
-     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
-      ? static_cast<float>(scale_candidate)
-      : 1.0f;
+  const float max_abs = activationMaxAbs(A, M_sz * K_sz);
+  constexpr float kActZeroPoint = quant::kActZeroPoint;
+  const float act_scale = quant::activationScale(max_abs);
   const float inv_act_scale = 1.0f / act_scale;
 
   // --- NPU-accessible buffers: reused scratch + resident weight ---
