@@ -255,6 +255,21 @@ public:
       "ComputeOps::shgemm_u8i8: not implemented for this backend");
   }
 
+  // ===========================================================================
+  // Integer quantized BLAS (u8i4 path)
+  // ===========================================================================
+  virtual bool supports_shgemm_u8i4() const { return false; }
+
+  // B holds INT4 weights (WH layout, packed two-per-byte) in an int8 buffer;
+  // wt_scale/zp_corr are per-output-channel like the u8i8 path.
+  virtual void shgemm_u8i4(unsigned int order, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, unsigned int lda,
+                           const int8_t *B, const float *wt_scale,
+                           const int32_t *zp_corr, float *C, unsigned int ldc) {
+    throw std::runtime_error(
+      "ComputeOps::shgemm_u8i4: not implemented for this backend");
+  }
+
 #ifdef ENABLE_FP16
   // ===========================================================================
   // FP16 BLAS

@@ -549,11 +549,16 @@ void prefillWHCacheClear() {
 
 #include <sdkl_compat.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace nntrainer {
 namespace hmx {
@@ -582,6 +587,255 @@ int checkedSdkDim(unsigned int dim, const char *label) {
   return static_cast<int>(dim);
 }
 
+// ---- NPU-resident weights and reusable scratch (u8i8 / u8i4) --------------
+//
+// Both integer kernels used to sdkl_npu_alloc the activation, accumulator and
+// weight buffers on every call, memcpy the (already WH-baked) weight in, and
+// free all three on the way out. Weights do not change between calls, so that
+// re-upload is pure overhead: on a Galaxy S25 Ultra it measured ~791 us of
+// alloc plus ~195 us of weight copy per call, against ~298 us of actual u8i4
+// compute. QNN pays neither because its weights live in the context binary.
+//
+// Keep the WH weight resident in NPU memory keyed by its host pointer (the
+// same trick the FP16 path uses via WHCache/PrefillWHCache), and reuse
+// grow-only scratch buffers for the activation and accumulator. Steady state
+// then performs no allocation and no weight upload at all.
+
+// Bytes sampled from each end of a weight to detect a recycled host address.
+static constexpr size_t WEIGHT_FINGERPRINT_BYTES = 64;
+
+/** @brief One WH weight resident in NPU memory, keyed by its host pointer. */
+struct IntWeightEntry {
+  void *npu;
+  size_t bytes;
+  // A host allocator is free to hand the same address to a different weight
+  // once the first has been released, and (pointer, size) alone cannot tell
+  // the two apart. Sampling both ends catches that: the head alone would miss
+  // weights sharing a prefix.
+  uint8_t head[WEIGHT_FINGERPRINT_BYTES];
+  uint8_t tail[WEIGHT_FINGERPRINT_BYTES];
+  size_t fp_len;
+};
+
+/** @brief Fill an entry's fingerprint from the host weight bytes. */
+void fillFingerprint(IntWeightEntry &e, const void *host_wh, size_t bytes) {
+  const uint8_t *p = static_cast<const uint8_t *>(host_wh);
+  e.fp_len = std::min(bytes, WEIGHT_FINGERPRINT_BYTES);
+  std::memcpy(e.head, p, e.fp_len);
+  std::memcpy(e.tail, p + bytes - e.fp_len, e.fp_len);
+}
+
+/** @brief True when the host bytes still match the entry's fingerprint. */
+bool fingerprintMatches(const IntWeightEntry &e, const void *host_wh,
+                        size_t bytes) {
+  const uint8_t *p = static_cast<const uint8_t *>(host_wh);
+  return std::memcmp(e.head, p, e.fp_len) == 0 &&
+         std::memcmp(e.tail, p + bytes - e.fp_len, e.fp_len) == 0;
+}
+
+/**
+ * @brief Process-lifetime residency for WH-layout integer weights.
+ *
+ * Keyed by (host weight pointer, byte size) so u8i8 and u8i4 views of
+ * different weights never alias. Capped by INT_WEIGHT_MAX_BYTES; once the cap
+ * is reached further weights simply are not cached (the call still runs, using
+ * a transient buffer), which keeps NPU DMA usage bounded without thrashing a
+ * sequential prefill scan the way an evicting cache would.
+ */
+struct IntWeightCache {
+  std::map<std::pair<const void *, size_t>, IntWeightEntry> cache;
+  size_t total_bytes = 0;
+  std::mutex mtx;
+
+  ~IntWeightCache() {
+    for (auto &e : cache)
+      npuFreeIfAlive(e.second.npu);
+  }
+} g_int_weight;
+
+// Cap on total NPU bytes held by resident integer weights.
+static constexpr size_t INT_WEIGHT_MAX_BYTES = 48ull * 1024 * 1024; // 48 MB
+
+/**
+ * @brief Return an NPU buffer holding the WH weight bytes, uploading only on
+ *        the first call for a given host pointer.
+ * @return Resident NPU pointer, or nullptr when the weight cannot be cached
+ *         (cap reached or allocation failed); the caller then falls back to a
+ *         transient buffer.
+ */
+void *residentIntWeight(const void *host_wh, size_t bytes) {
+  if (host_wh == nullptr || bytes == 0)
+    return nullptr;
+
+  const auto key = std::make_pair(host_wh, bytes);
+
+  std::lock_guard<std::mutex> lock(g_int_weight.mtx);
+  auto it = g_int_weight.cache.find(key);
+  if (it != g_int_weight.cache.end()) {
+    if (fingerprintMatches(it->second, host_wh, bytes))
+      return it->second.npu;
+
+    // Same address and size, different contents: the previous weight was
+    // released and this one landed on its address. Drop the stale upload.
+    npuFreeIfAlive(it->second.npu);
+    g_int_weight.total_bytes -= it->second.bytes;
+    g_int_weight.cache.erase(it);
+  }
+
+  if (g_int_weight.total_bytes + bytes > INT_WEIGHT_MAX_BYTES)
+    return nullptr;
+
+  void *npu = nullptr;
+  if (sdkl_npu_alloc(bytes, &npu) != 0 || npu == nullptr)
+    return nullptr;
+
+  std::memcpy(npu, host_wh, bytes);
+
+  IntWeightEntry entry{};
+  entry.npu = npu;
+  entry.bytes = bytes;
+  fillFingerprint(entry, host_wh, bytes);
+  g_int_weight.cache.emplace(key, entry);
+  g_int_weight.total_bytes += bytes;
+  return npu;
+}
+
+// Cap on total NPU bytes held by each scratch pool.
+static constexpr size_t SCRATCH_MAX_BYTES = 32ull * 1024 * 1024; // 32 MB
+
+/**
+ * @brief NPU scratch buffers keyed by exact byte size.
+ *
+ * Handing sdkl an oversized buffer left over from a larger shape does not
+ * work: reusing one buffer across differing (M, N, K) produced wrong results
+ * on device (caught by
+ * HtpU8i4Test.ScratchPool_HandlesGrowingAndShrinkingShapes), so each distinct
+ * size gets its own buffer. That still removes the per-call allocation for the
+ * case that matters -- a given FC layer keeps its shape, and M is constant
+ * within a prefill pass and 1 while decoding -- so the map stays small (a
+ * handful of entries per model). SCRATCH_MAX_BYTES caps the total anyway,
+ * evicting in insertion order.
+ */
+struct NpuScratch {
+  std::map<size_t, void *> bufs;
+  std::vector<size_t> order; // insertion order, for eviction
+  size_t total_bytes = 0;
+  std::mutex mtx;
+
+  /** @brief Return a buffer of exactly `need` bytes, or nullptr on failure. */
+  void *get(size_t need) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = bufs.find(need);
+    if (it != bufs.end())
+      return it->second;
+
+    void *fresh = nullptr;
+    if (sdkl_npu_alloc(need, &fresh) != 0 || fresh == nullptr)
+      return nullptr;
+
+    // Evict oldest entries until the new one fits under the cap.
+    while (!order.empty() && total_bytes + need > SCRATCH_MAX_BYTES) {
+      const size_t oldest = order.front();
+      order.erase(order.begin());
+      auto old = bufs.find(oldest);
+      if (old != bufs.end()) {
+        npuFreeIfAlive(old->second);
+        total_bytes -= oldest;
+        bufs.erase(old);
+      }
+    }
+
+    bufs.emplace(need, fresh);
+    order.push_back(need);
+    total_bytes += need;
+    return fresh;
+  }
+
+  ~NpuScratch() {
+    for (auto &b : bufs)
+      npuFreeIfAlive(b.second);
+  }
+};
+
+// Separate pools so an activation and an accumulator never share a buffer.
+NpuScratch g_x_scratch; // uint8 activation, padded to the 64-row tile
+NpuScratch g_c_scratch; // int32 accumulator
+
+// ---- Host-side pre/post processing around the NPU matmul -------------------
+//
+// The activation scan, the FP32->U8 quantization and the dequantize are
+// element-wise over M*K and M*N. Two details below are load bearing for
+// correctness rather than speed:
+//
+//   - the activation scale is divided in double and narrowed once. Computing
+//     it as `max_abs / 127.0f` can land a ULP away, which is enough to shift a
+//     quantized value by one.
+//   - the dequantize keeps its left-to-right grouping,
+//     `(act_scale * wt_scale[n]) * (c - zp)`; regrouping changes the
+//     intermediate rounding.
+//
+// Both are what let the tests assert bit equality against a CPU mirror instead
+// of a tolerance -- and a tolerance loose enough to cover INT4 quantization
+// error (~7%) is loose enough to hide a shifted nibble or a wrong tile.
+
+/**
+ * @brief Largest |A[i]| over M*K, skipping non-finite values.
+ */
+float activationMaxAbs(const float *A, size_t M, size_t K) {
+  float max_abs = 0.0f;
+  const size_t n = M * K;
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(A[i]))
+      continue;
+    const float v = std::fabs(A[i]);
+    if (v > max_abs)
+      max_abs = v;
+  }
+  return max_abs;
+}
+
+/**
+ * @brief Quantize FP32 activations to U8 with the given zero point.
+ * @param Mp Row count padded to the SDKL 64-row tile; rows at or past M are
+ *           filled with the zero point so the padding contributes nothing.
+ */
+void quantizeActivationU8(const float *A, uint8_t *X, size_t M, size_t Mp,
+                          size_t K, float inv_act_scale, float zero_point) {
+  for (size_t m = 0; m < Mp; ++m) {
+    const size_t off = m * K;
+    if (m >= M) {
+      std::memset(X + off, static_cast<int>(zero_point), K);
+      continue;
+    }
+    for (size_t k = 0; k < K; ++k) {
+      const float a = A[off + k];
+      if (!std::isfinite(a)) {
+        X[off + k] = static_cast<uint8_t>(zero_point);
+        continue;
+      }
+      float q = std::round(a * inv_act_scale) + zero_point;
+      if (q < 0.0f)
+        q = 0.0f;
+      if (q > 255.0f)
+        q = 255.0f;
+      X[off + k] = static_cast<uint8_t>(q);
+    }
+  }
+}
+
+/** @brief C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n]). */
+void dequantizeToF32(const int32_t *C_i32, float *C, size_t M, size_t N,
+                     float act_scale, const float *wt_scale,
+                     const int32_t *zp_corr) {
+  for (size_t m = 0; m < M; ++m) {
+    const size_t off = m * N;
+    for (size_t n = 0; n < N; ++n)
+      C[off + n] =
+        act_scale * wt_scale[n] *
+        (static_cast<float>(C_i32[off + n]) - static_cast<float>(zp_corr[n]));
+  }
+}
+
 } // namespace
 
 // U8 activations × I8 weights (WH-layout) → I32 accumulator → FP32 output.
@@ -607,7 +861,6 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   const size_t Mp_sz = ((M_sz + 63U) / 64U) * 64U;
   const size_t N_sz = N;
   const size_t K_sz = K;
-  const size_t mk_elems = checkedMulSizeT(M_sz, K_sz, "M*K elements");
   const size_t mpk_elems = checkedMulSizeT(Mp_sz, K_sz, "Mp*K elements");
   const size_t mpn_elems = checkedMulSizeT(Mp_sz, N_sz, "Mp*N elements");
   const size_t nk_elems = checkedMulSizeT(N_sz, K_sz, "N*K elements");
@@ -623,15 +876,7 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   int domain = HtpBackend::global().domain();
 
   // --- Compute per-tensor activation scale ---
-  float max_abs = 0.0f;
-  for (size_t i = 0; i < mk_elems; ++i) {
-    if (!std::isfinite(A[i]))
-      continue;
-
-    float v = std::fabs(A[i]);
-    if (v > max_abs)
-      max_abs = v;
-  }
+  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
   // Guard against zero, non-finite, and underflowing scale values so the
   // quantization path stays finite and deterministic.
   constexpr float kActQuantMax = 127.0f;
@@ -645,70 +890,43 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
       : 1.0f;
   const float inv_act_scale = 1.0f / act_scale;
 
-  // --- Allocate NPU-accessible staging buffers ---
-  void *X_npu = nullptr; // uint8  [M * K]
-  void *C_npu = nullptr; // int32  [M * N]
-  void *W_npu = nullptr; // int8   [N * K] (WH layout, copied as-is)
+  // --- NPU-accessible buffers: reused scratch + resident weight ---
+  // X/C come from grow-only scratch pools and the WH weight stays resident
+  // across calls, so the steady state allocates nothing and re-uploads nothing.
+  void *X_npu = g_x_scratch.get(x_bytes); // uint8  [Mp * K]
+  void *C_npu = g_c_scratch.get(c_bytes); // int32  [Mp * N]
+  if (X_npu == nullptr || C_npu == nullptr)
+    throw std::runtime_error(
+      "shgemm_u8i8_i32: NPU scratch allocation failed (x_bytes=" +
+      std::to_string(x_bytes) + ", c_bytes=" + std::to_string(c_bytes) + ")");
+
+  // int8   [N * K] (WH layout). Resident when it fits the cache budget;
+  // otherwise fall back to a transient buffer freed at the end of the call.
+  void *W_npu = residentIntWeight(B_wh, w_bytes);
+  void *W_transient = nullptr;
+  if (W_npu == nullptr) {
+    if (sdkl_npu_alloc(w_bytes, &W_transient) != 0 || W_transient == nullptr)
+      throw std::runtime_error(
+        "shgemm_u8i8_i32: sdkl_npu_alloc W_npu failed (w_bytes=" +
+        std::to_string(w_bytes) + ")");
+    std::memcpy(W_transient, B_wh, w_bytes);
+    W_npu = W_transient;
+  }
 
   auto cleanup = [&]() {
-    if (X_npu)
-      npuFreeIfAlive(X_npu);
-    if (C_npu)
-      npuFreeIfAlive(C_npu);
-    if (W_npu)
-      npuFreeIfAlive(W_npu);
+    if (W_transient)
+      npuFreeIfAlive(W_transient);
   };
 
   int err = 0;
 
-  err = sdkl_npu_alloc(x_bytes, &X_npu);
-  if (err != 0 || X_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc X_npu failed: " +
-                             std::to_string(err));
-  }
-
-  err = sdkl_npu_alloc(c_bytes, &C_npu);
-  if (err != 0 || C_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc C_npu failed: " +
-                             std::to_string(err));
-  }
-
-  err = sdkl_npu_alloc(w_bytes, &W_npu);
-  if (err != 0 || W_npu == nullptr) {
-    cleanup();
-    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc W_npu failed: " +
-                             std::to_string(err));
-  }
-
   // --- FP32 → U8 quantization (zp = 128) ---
   uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
-  for (size_t m = 0; m < Mp_sz; ++m) {
-    const size_t row_offset = m * K_sz;
-    if (m >= M_sz) {
-      std::memset(X_u8 + row_offset, static_cast<int>(kActZeroPoint), K_sz);
-      continue;
-    }
+  quantizeActivationU8(A, X_u8, M_sz, Mp_sz, K_sz, inv_act_scale,
+                       kActZeroPoint);
 
-    for (size_t k = 0; k < K_sz; ++k) {
-      const float a = A[row_offset + k];
-      if (!std::isfinite(a)) {
-        X_u8[row_offset + k] = static_cast<uint8_t>(kActZeroPoint);
-        continue;
-      }
-
-      float q = std::round(a * inv_act_scale) + kActZeroPoint;
-      if (q < 0.0f)
-        q = 0.0f;
-      if (q > 255.0f)
-        q = 255.0f;
-      X_u8[row_offset + k] = static_cast<uint8_t>(q);
-    }
-  }
-
-  // --- Copy WH-layout weight directly (no layout conversion needed) ---
-  std::memcpy(W_npu, B_wh, w_bytes);
+  // The WH-layout weight is already in NPU memory (resident cache, or the
+  // transient buffer filled above) — no per-call copy.
 
   // --- NPU matrix multiply ---
   // sdkl_npu_mm_u8i8_i32(domain, n_row, n_col, n_inner, A[i32 out],
@@ -726,14 +944,130 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
   // --- Dequantize: I32 accumulator → FP32 ---
   // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
   const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
-  for (size_t m = 0; m < M_sz; ++m) {
-    const size_t row_offset = m * N_sz;
-    for (size_t n = 0; n < N_sz; ++n) {
-      C[row_offset + n] = act_scale * wt_scale[n] *
-                          (static_cast<float>(C_i32[row_offset + n]) -
-                           static_cast<float>(zp_corr[n]));
-    }
+  dequantizeToF32(C_i32, C, M_sz, N_sz, act_scale, wt_scale, zp_corr);
+
+  cleanup();
+}
+
+// U8 activations × I4 weights (WH-layout, packed two-per-byte) → I32
+// accumulator → FP32 output.
+//
+// Identical to shgemm_u8i8_i32 on the activation and dequantize sides; the
+// only differences are the weight buffer size (N*K/2 bytes, packed) and the
+// SDK kernel entry point.
+//
+// Quantization scheme (per-tensor activation, per-channel weight):
+//   act_scale = max_abs(A) / 127.0f
+//   X_u8[i]  = clamp(round(A[i] / act_scale) + 128, 0, 255)   (zp=128)
+//   sdkl call: C_i32 = X_u8 * B_wh^T   (accumulator, no bias)
+//   C[m,n]   = act_scale * wt_scale[n] * (float(C_i32[m,n]) -
+//   float(zp_corr[n]))
+//
+// B_wh must already be in packed INT4 WH layout (see quantize_qint4_weight).
+// SDKL requires M%64==0, so pad activation/output rows internally and copy
+// only the real M rows back to the caller.
+void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const int8_t *B_wh, const float *wt_scale,
+                     const int32_t *zp_corr, float *C) {
+  if (N % 32 != 0)
+    throw std::runtime_error("shgemm_u8i4_i32: N must be a multiple of 32 (N=" +
+                             std::to_string(N) + ")");
+  // INT4 weights are packed two-per-byte, so N*K must be even.
+  if ((static_cast<size_t>(N) * static_cast<size_t>(K)) % 2 != 0)
+    throw std::runtime_error(
+      "shgemm_u8i4_i32: N*K must be even for INT4 packing (N=" +
+      std::to_string(N) + ", K=" + std::to_string(K) + ")");
+
+  const size_t M_sz = M;
+  const size_t Mp_sz = ((M_sz + 63U) / 64U) * 64U;
+  const size_t N_sz = N;
+  const size_t K_sz = K;
+  const size_t mpk_elems = checkedMulSizeT(Mp_sz, K_sz, "Mp*K elements");
+  const size_t mpn_elems = checkedMulSizeT(Mp_sz, N_sz, "Mp*N elements");
+  const size_t nk_elems = checkedMulSizeT(N_sz, K_sz, "N*K elements");
+  const size_t x_bytes =
+    checkedBytes(mpk_elems, sizeof(uint8_t), "X_npu bytes");
+  const size_t c_bytes =
+    checkedBytes(mpn_elems, sizeof(int32_t), "C_npu bytes");
+  // Packed INT4: two weight values per byte.
+  const size_t w_bytes = nk_elems / 2;
+  const int sdk_M = checkedSdkDim(static_cast<unsigned int>(Mp_sz), "Mp");
+  const int sdk_N = checkedSdkDim(N, "N");
+  const int sdk_K = checkedSdkDim(K, "K");
+
+  int domain = HtpBackend::global().domain();
+
+  // --- Compute per-tensor activation scale (identical to u8i8) ---
+  const float max_abs = activationMaxAbs(A, M_sz, K_sz);
+  constexpr float kActQuantMax = 127.0f;
+  constexpr float kActZeroPoint = 128.0f;
+  const double scale_candidate =
+    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
+  const float act_scale =
+    (std::isfinite(scale_candidate) &&
+     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
+      ? static_cast<float>(scale_candidate)
+      : 1.0f;
+  const float inv_act_scale = 1.0f / act_scale;
+
+  // --- NPU-accessible buffers: reused scratch + resident weight ---
+  // Same policy as shgemm_u8i8_i32: the activation/accumulator come from
+  // grow-only scratch pools and the packed WH weight stays resident across
+  // calls, so the steady state neither allocates nor re-uploads the weight.
+  void *X_npu = g_x_scratch.get(x_bytes); // uint8  [Mp * K]
+  void *C_npu = g_c_scratch.get(c_bytes); // int32  [Mp * N]
+  if (X_npu == nullptr || C_npu == nullptr)
+    throw std::runtime_error(
+      "shgemm_u8i4_i32: NPU scratch allocation failed (x_bytes=" +
+      std::to_string(x_bytes) + ", c_bytes=" + std::to_string(c_bytes) + ")");
+
+  // int4 [N * K] packed → N*K/2 bytes (WH layout). Resident when it fits the
+  // cache budget; otherwise a transient buffer freed at the end of the call.
+  void *W_npu = residentIntWeight(B_wh, w_bytes);
+  void *W_transient = nullptr;
+  if (W_npu == nullptr) {
+    if (sdkl_npu_alloc(w_bytes, &W_transient) != 0 || W_transient == nullptr)
+      throw std::runtime_error(
+        "shgemm_u8i4_i32: sdkl_npu_alloc W_npu failed (w_bytes=" +
+        std::to_string(w_bytes) + ")");
+    std::memcpy(W_transient, B_wh, w_bytes);
+    W_npu = W_transient;
   }
+
+  auto cleanup = [&]() {
+    if (W_transient)
+      npuFreeIfAlive(W_transient);
+  };
+
+  int err = 0;
+
+  // --- FP32 → U8 quantization (zp = 128, identical to u8i8) ---
+  uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
+  quantizeActivationU8(A, X_u8, M_sz, Mp_sz, K_sz, inv_act_scale,
+                       kActZeroPoint);
+
+  // The packed INT4 WH weight (first N*K/2 bytes) is already in NPU memory —
+  // resident cache, or the transient buffer filled above. No per-call copy.
+
+  // --- NPU matrix multiply ---
+  // sdkl_npu_mm_u8i4_i32 takes the packed INT4 weight as const uint8_t*
+  // (unlike the int8_t* u8i8 variant); arg order otherwise matches u8i8
+  // (domain, n_row, n_col, n_inner, i32 out, u8 activation, u4 packed WH
+  // weight). N % 32 == 0 and M padded to 64, same tiling as u8i8.
+  std::memset(C_npu, 0, c_bytes);
+  err = sdkl_npu_mm_u8i4_i32(
+    domain, sdk_M, sdk_N, sdk_K, static_cast<int32_t *>(C_npu),
+    static_cast<const uint8_t *>(X_npu), static_cast<const uint8_t *>(W_npu));
+  if (err != 0) {
+    cleanup();
+    throw std::runtime_error("sdkl_npu_mm_u8i4_i32 failed: " +
+                             std::to_string(err));
+  }
+
+  // --- Dequantize: I32 accumulator → FP32 (identical to u8i8) ---
+  // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
+  const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
+  dequantizeToF32(C_i32, C, M_sz, N_sz, act_scale, wt_scale, zp_corr);
 
   cleanup();
 }
