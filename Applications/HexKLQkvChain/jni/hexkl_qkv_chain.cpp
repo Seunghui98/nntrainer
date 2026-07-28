@@ -122,7 +122,7 @@ double nowUs() {
  * printed alongside so a bad tail is still visible instead of hidden.
  */
 struct Stat {
-  double median = 0.0, mean = 0.0, max = 0.0;
+  double min = 0.0, median = 0.0, mean = 0.0, max = 0.0;
 };
 
 Stat summarize(std::vector<double> v) {
@@ -130,6 +130,7 @@ Stat summarize(std::vector<double> v) {
   if (v.empty())
     return s;
   std::sort(v.begin(), v.end());
+  s.min = v.front();
   s.median = v[v.size() / 2];
   s.max = v.back();
   double sum = 0.0;
@@ -213,9 +214,14 @@ struct Projection {
   const char *name;
   int N;
   nntrainer::Tensor weight; // QINT4_HTP [K, N]
-  Stat stat;
+  double cold_us = 0.0;     // very first call: uploads the weight
+  Stat stat;                // steady state, weight resident
   // Phase breakdown from the last timed call, in microseconds.
   double scan = 0, quant = 0, stage = 0, npu = 0, dequant = 0;
+  bool neon = false;
+  bool p_valid = false; // false = the kernel recorded no profile
+
+  double hostComputeUs() const { return scan + quant + dequant; }
 };
 
 Projection bakeProjection(const char *name, int K, int N, uint32_t seed) {
@@ -240,8 +246,7 @@ Projection bakeProjection(const char *name, int K, int N, uint32_t seed) {
  * they issue back to back, so what is timed here is one iteration of all three
  * in sequence, per-call and totalled.
  */
-void runDirect(const Args &a, std::vector<Projection> &projs,
-               const std::vector<float> &A, Stat &total_stat) {
+nntrainer::Tensor makeActivation(const Args &a, const std::vector<float> &A) {
   nntrainer::TensorDim adim(1, 1, a.M, a.K);
   nntrainer::Tensor act(adim, false);
   act.allocate();
@@ -250,6 +255,50 @@ void runDirect(const Args &a, std::vector<Projection> &projs,
 #ifdef ENABLE_HEXKL
   act.setContextData(htpContextData());
 #endif
+  return act;
+}
+
+/** @brief One dot() call, timed, recording the kernel's phase profile. */
+double callOnce(nntrainer::Tensor &act, Projection &p, bool record) {
+#ifdef ENABLE_HEXKL
+  if (record)
+    nntrainer::hmx::resetMmProfile();
+#endif
+  const double t0 = nowUs();
+  // fc_layer's own call: input_.dot(weight, hidden_, false, false). trans_in
+  // must be false -- the weight is [K, N], so with trans_in=true the N and K
+  // roles swap and any shape with N != K is rejected.
+  nntrainer::Tensor out = act.dot(p.weight, false, false);
+  const double dt = nowUs() - t0;
+#ifdef ENABLE_HEXKL
+  if (record) {
+    const auto &mp = nntrainer::hmx::lastMmProfile();
+    // total_us stays zero if the kernel never ran its timers, which is how a
+    // stale library shows up. Gating on it silently would make that look like
+    // a working run with nothing to report.
+    p.p_valid = mp.total_us > 0.0;
+    p.scan = mp.scan_us;
+    p.quant = mp.quant_us;
+    p.stage = mp.stage_us;
+    p.npu = mp.npu_us;
+    p.dequant = mp.dequant_us;
+    p.neon = mp.neon;
+  }
+#else
+  (void)record;
+#endif
+  return dt;
+}
+
+void runDirect(const Args &a, std::vector<Projection> &projs,
+               const std::vector<float> &A, Projection &total) {
+  nntrainer::Tensor act = makeActivation(a, A);
+
+  // Cold first: the very first call on each weight uploads it to NPU memory,
+  // and every call after that hits the resident cache. Folding it into warmup
+  // would hide the upload cost entirely.
+  for (auto &p : projs)
+    p.cold_us = callOnce(act, p, false);
 
   std::vector<std::vector<double>> per(projs.size());
   std::vector<double> totals;
@@ -258,24 +307,10 @@ void runDirect(const Args &a, std::vector<Projection> &projs,
     const bool timed = i >= a.warmup;
     double round = 0.0;
     for (size_t p = 0; p < projs.size(); ++p) {
-      const double t0 = nowUs();
-      // fc_layer's own call: input_.dot(weight, hidden_, false, false).
-      // trans_in must be false -- the weight is [K, N], so with trans_in=true
-      // the N and K roles swap and any shape with N != K is rejected.
-      nntrainer::Tensor out = act.dot(projs[p].weight, false, false);
-      const double dt = nowUs() - t0;
+      const double dt = callOnce(act, projs[p], timed);
       round += dt;
-      if (timed) {
+      if (timed)
         per[p].push_back(dt);
-#ifdef ENABLE_HEXKL
-        const auto &mp = nntrainer::hmx::lastMmProfile();
-        projs[p].scan = mp.scan_us;
-        projs[p].quant = mp.quant_us;
-        projs[p].stage = mp.stage_us;
-        projs[p].npu = mp.npu_us;
-        projs[p].dequant = mp.dequant_us;
-#endif
-      }
     }
     if (timed)
       totals.push_back(round);
@@ -283,31 +318,42 @@ void runDirect(const Args &a, std::vector<Projection> &projs,
 
   for (size_t p = 0; p < projs.size(); ++p)
     projs[p].stat = summarize(per[p]);
-  total_stat = summarize(totals);
+
+  // The QKV row is a real measurement of the three in sequence, not a sum of
+  // three medians -- summing medians would understate a run where the calls
+  // interfere with each other.
+  total.name = "QKV total";
+  total.N = a.q_N + 2 * a.kv_N;
+  total.stat = summarize(totals);
+  total.p_valid = true;
+  for (const auto &p : projs) {
+    total.cold_us += p.cold_us;
+    total.scan += p.scan;
+    total.quant += p.quant;
+    total.stage += p.stage;
+    total.npu += p.npu;
+    total.dequant += p.dequant;
+    total.neon = p.neon;
+    total.p_valid = total.p_valid && p.p_valid;
+  }
 }
 
 /** @brief One matmul at the combined width, for the fused comparison. */
-Stat runFused(const Args &a, int fused_N, const std::vector<float> &A) {
+Projection runFused(const Args &a, int fused_N, const std::vector<float> &A) {
   Projection f = bakeProjection("qkv_fused", a.K, fused_N, a.seed + 99);
+  nntrainer::Tensor act = makeActivation(a, A);
 
-  nntrainer::TensorDim adim(1, 1, a.M, a.K);
-  nntrainer::Tensor act(adim, false);
-  act.allocate();
-  std::memcpy(act.getData<float>(), A.data(),
-              static_cast<size_t>(a.M) * a.K * sizeof(float));
-#ifdef ENABLE_HEXKL
-  act.setContextData(htpContextData());
-#endif
+  f.cold_us = callOnce(act, f, false);
 
   std::vector<double> v;
   for (int i = 0; i < a.warmup + a.iters; ++i) {
-    const double t0 = nowUs();
-    nntrainer::Tensor out = act.dot(f.weight, false, false);
-    const double dt = nowUs() - t0;
-    if (i >= a.warmup)
+    const bool timed = i >= a.warmup;
+    const double dt = callOnce(act, f, timed);
+    if (timed)
       v.push_back(dt);
   }
-  return summarize(v);
+  f.stat = summarize(v);
+  return f;
 }
 
 // ---- model: a real graph ---------------------------------------------------
@@ -422,9 +468,40 @@ bool runModel(const Args &a, const std::vector<float> &A, Stat &stat) {
 
 // ---- Reporting -------------------------------------------------------------
 
-void printRow(const char *label, int N, const Stat &s) {
-  std::printf("  %-10s %6d  %9.1f %9.1f %9.1f\n", label, N, s.median, s.mean,
-              s.max);
+/**
+ * @brief One projection's phase block, in hexkl_fc_compare's layout.
+ *
+ * Same shape as that tool's output on purpose: these two get read side by
+ * side, and a second format would mean re-learning where to look.
+ */
+void dumpMethod(const Projection &p, bool show_cold) {
+  std::printf("[%s]  N=%d  engine=%s\n", p.name, p.N,
+              p.p_valid ? "NPU/HMX" : "unknown");
+  if (show_cold)
+    std::printf("  Cold run (first call, uploads weight)  %10.1f\n", p.cold_us);
+  std::printf("  Steady state (weight resident)         %10.1f   <- "
+              "per-call cost (mean)\n",
+              p.stat.mean);
+  std::printf("    min / median / max                   %10.1f /%8.1f /%8.1f\n",
+              p.stat.min, p.stat.median, p.stat.max);
+  if (!p.p_valid) {
+    std::printf("    [phase split unavailable: kernel profile not recorded]\n");
+    return;
+  }
+  std::printf("    NPU matmul (sdkl_npu_mm)             %10.1f   <- device\n",
+              p.npu);
+  std::printf("    Host compute (%-6s)                 %10.1f   <- ARM\n",
+              p.neon ? "NEON" : "scalar", p.hostComputeUs());
+  std::printf("      max-abs scan (M*K)                 %10.1f\n", p.scan);
+  std::printf("      quantize F32->U8 (Mp*K)            %10.1f\n", p.quant);
+  std::printf("      dequantize I32->F32 (M*N)          %10.1f\n", p.dequant);
+  std::printf("    Buffer staging (scratch + resident)  %10.1f\n", p.stage);
+}
+
+void tableRow(const Projection &p) {
+  std::printf("| %s | %d | %8.1f | %8.1f | %8.1f | %8.1f | %s |\n", p.name, p.N,
+              p.stat.mean, p.stat.median, p.npu, p.hostComputeUs(),
+              p.p_valid ? "NPU/HMX" : "unknown");
 }
 
 } // namespace
@@ -474,9 +551,15 @@ int main(int argc, char **argv) {
               "0.5]\n",
               a.iters, a.warmup, a.seed);
 
+  double init_us = 0.0;
 #ifdef ENABLE_HEXKL
   nntrainer::Engine::Global();
+  // HtpBackend's first touch is what performs the sdkl_npu_initialize
+  // bring-up, so timing it here is the same "One-time init" phase
+  // hexkl_fc_compare reports.
+  const double t_init = nowUs();
   const bool htp = nntrainer::HtpBackend::global().enabled();
+  init_us = nowUs() - t_init;
   std::printf("  HTP backend: %s\n", htp ? "enabled" : "NOT AVAILABLE");
   if (!htp) {
     // sdkl_npu_initialize failing with Err=1 almost always means FastRPC could
@@ -526,57 +609,69 @@ int main(int argc, char **argv) {
   }
 
   // ---- direct path ----
-  std::printf("\n=== direct path (3 x Tensor::dot, QINT4_HTP) ===\n");
   std::vector<Projection> projs;
   projs.push_back(bakeProjection("q_proj", a.K, a.q_N, a.seed + 1));
   projs.push_back(bakeProjection("k_proj", a.K, a.kv_N, a.seed + 2));
   projs.push_back(bakeProjection("v_proj", a.K, a.kv_N, a.seed + 3));
 
-  Stat total;
+  Projection total;
   runDirect(a, projs, A, total);
 
-  std::printf("\n  %-10s %6s  %9s %9s %9s\n", "proj", "N", "median", "mean",
-              "max");
-  std::printf("  %-10s %6s  %9s %9s %9s\n", "----------", "------", "---------",
-              "---------", "---------");
-  for (const auto &p : projs)
-    printRow(p.name, p.N, p.stat);
-  printRow("QKV total", a.q_N + 2 * a.kv_N, total);
+  const int fused_N = a.q_N + 2 * a.kv_N;
+  Projection fused;
+  if (a.run_fused)
+    fused = runFused(a, fused_N, A);
 
-  std::printf("\n  phase breakdown of the last timed call (us)\n");
-  std::printf("  %-10s %8s %8s %8s %8s %8s\n", "proj", "scan", "quant", "stage",
-              "npu", "dequant");
+  // ---- report, in hexkl_fc_compare's phase layout ----
+  std::printf("\nPhase                                    Time (us)\n");
+  std::printf("One-time init (sdkl_npu_initialize)      %10.1f\n", init_us);
   for (const auto &p : projs)
-    std::printf("  %-10s %8.1f %8.1f %8.1f %8.1f %8.1f\n", p.name, p.scan,
-                p.quant, p.stage, p.npu, p.dequant);
+    dumpMethod(p, true);
+  // No cold row on the total: the three uploads happen once each and summing
+  // them would read like a per-call cost, which it is not.
+  dumpMethod(total, false);
+  if (a.run_fused)
+    dumpMethod(fused, true);
 
-  // ---- fused comparison ----
+  std::printf("\n| method | N | mean us | median us | NPU us | host us | "
+              "engine |\n");
+  std::printf("|---|---|---|---|---|---|---|\n");
+  for (const auto &p : projs)
+    tableRow(p);
+  tableRow(total);
+  if (a.run_fused)
+    tableRow(fused);
+
   if (a.run_fused) {
-    const int fused_N = a.q_N + 2 * a.kv_N;
-    std::printf("\n=== fused comparison (1 x N=%d) ===\n", fused_N);
-    const Stat f = runFused(a, fused_N, A);
-    printRow("qkv_fused", fused_N, f);
-
-    const double saving = total.median - f.median;
-    std::printf("\n  three calls   %8.1f us\n", total.median);
-    std::printf("  one call      %8.1f us\n", f.median);
-    std::printf("  difference    %8.1f us  (%.1f%% of the three-call cost)\n",
-                saving, total.median > 0 ? 100.0 * saving / total.median : 0.0);
+    const double saving = total.stat.median - fused.stat.median;
+    std::printf("\nfused vs three calls (median)\n");
+    std::printf("  three calls   %8.1f us\n", total.stat.median);
+    std::printf("  one call      %8.1f us\n", fused.stat.median);
     std::printf(
-      "\n  Same arithmetic either way -- 2048+1024+1024 = %d columns\n"
-      "  against K=%d. What the difference buys is two fewer\n"
-      "  per-call overheads: activation scan and quantize repeated\n"
-      "  over the same input, plus two extra RPC round trips.\n",
-      fused_N, a.K);
+      "  difference    %8.1f us  (%.1f%% of the three-call cost)\n", saving,
+      total.stat.median > 0 ? 100.0 * saving / total.stat.median : 0.0);
+    if (total.p_valid && fused.p_valid) {
+      // Attribute the difference rather than just stating it: the host part is
+      // the redundant scan+quantize, the rest is per-call NPU overhead.
+      std::printf("    of which host  %8.1f us  (scan + quantize done 3x over "
+                  "the same activation)\n",
+                  total.hostComputeUs() - fused.hostComputeUs());
+      std::printf("    of which NPU   %8.1f us  (two extra per-call "
+                  "overheads)\n",
+                  total.npu - fused.npu);
+    }
+    std::printf("\n  Same arithmetic either way -- %d+%d+%d = %d columns "
+                "against K=%d.\n",
+                a.q_N, a.kv_N, a.kv_N, fused_N, a.K);
   }
 
   if (a.run_model && model_ok) {
-    std::printf("\n=== model vs direct ===\n");
-    std::printf("  model inference   %8.1f us  (median, includes the graph)\n",
+    std::printf("\nmodel vs direct (median)\n");
+    std::printf("  model inference   %8.1f us  (includes the graph)\n",
                 model_stat.median);
-    std::printf("  direct 3 x dot    %8.1f us  (median)\n", total.median);
+    std::printf("  direct 3 x dot    %8.1f us\n", total.stat.median);
     std::printf("  graph overhead    %8.1f us\n",
-                model_stat.median - total.median);
+                model_stat.median - total.stat.median);
   }
 
   return 0;
