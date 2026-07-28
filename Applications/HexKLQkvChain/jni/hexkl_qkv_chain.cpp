@@ -479,9 +479,23 @@ int main(int argc, char **argv) {
   const bool htp = nntrainer::HtpBackend::global().enabled();
   std::printf("  HTP backend: %s\n", htp ? "enabled" : "NOT AVAILABLE");
   if (!htp) {
-    std::printf(
-      "\nThe NPU is not up, so nothing below would measure HexKL.\n"
-      "Check the skel is on the device and libsdkl.so is loadable.\n");
+    // sdkl_npu_initialize failing with Err=1 almost always means FastRPC could
+    // not find the CDSP skeleton, and the reason is almost always a missing
+    // ADSP_LIBRARY_PATH rather than a missing file -- so name it first.
+    const char *adsp = std::getenv("ADSP_LIBRARY_PATH");
+    std::printf("\nThe NPU is not up, so nothing below would measure HexKL.\n");
+    if (adsp == nullptr)
+      std::printf(
+        "\n  ADSP_LIBRARY_PATH is NOT SET. FastRPC needs it to find the CDSP\n"
+        "  skeleton (libhexkl_skel.so); without it sdkl_npu_initialize fails\n"
+        "  with Err = 1. Re-run as:\n"
+        "\n"
+        "    cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp \\\n"
+        "      ADSP_LIBRARY_PATH=/data/local/tmp ./hexkl_qkv_chain\n");
+    else
+      std::printf("\n  ADSP_LIBRARY_PATH=%s\n"
+                  "  Check libhexkl_skel.so (V79) is in that directory.\n",
+                  adsp);
     return 1;
   }
 #else

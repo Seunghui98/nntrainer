@@ -66,9 +66,20 @@ The binary lands in `Applications/HexKLQkvChain/libs/arm64-v8a/hexkl_qkv_chain`.
 
 ## Run
 
+The V79 CDSP skeleton, `libhexkl_skel.so`, must already be on the device, and
+`ADSP_LIBRARY_PATH` must point at the directory holding it — that is how
+FastRPC finds it. Without it `sdkl_npu_initialize` fails with `Err = 1` and the
+app reports `HTP backend: NOT AVAILABLE`.
+
 ```bash
-DEV=/data/local/tmp/hexkl
-adb shell mkdir -p $DEV
+adb shell ls -l /data/local/tmp/libhexkl_skel.so   # must exist
+```
+
+Use `/data/local/tmp` itself rather than a subdirectory, so the app, the shared
+libraries and the skel all sit in one place:
+
+```bash
+DEV=/data/local/tmp
 
 # libraries (once per build)
 adb push builddir/jni/arm64-v8a/libnntrainer.so       $DEV/
@@ -80,8 +91,13 @@ adb push $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarc
 adb push Applications/HexKLQkvChain/libs/arm64-v8a/hexkl_qkv_chain $DEV/
 adb shell chmod +x $DEV/hexkl_qkv_chain
 
-adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ./hexkl_qkv_chain"
+adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ADSP_LIBRARY_PATH=$DEV \
+  ./hexkl_qkv_chain"
 ```
+
+> Keep `LD_LIBRARY_PATH` to `$DEV` only. Adding `/vendor/lib64` or
+> `/system/lib64` perturbs the linker namespace and libnntrainer's dependency
+> chain then fails on a libfmt mismatch inside `libinput.so`.
 
 ### Options
 
@@ -102,13 +118,16 @@ Useful variations:
 
 ```bash
 # decode instead of prefill
-adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ./hexkl_qkv_chain --M 1"
+adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ADSP_LIBRARY_PATH=$DEV \
+  ./hexkl_qkv_chain --M 1"
 
 # kernel + dispatch only, no graph
-adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ./hexkl_qkv_chain --no-model"
+adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ADSP_LIBRARY_PATH=$DEV \
+  ./hexkl_qkv_chain --no-model"
 
 # scalar host compute, to see what NEON is worth here
-adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV NNTR_HTP_NO_SIMD=1 ./hexkl_qkv_chain"
+adb shell "cd $DEV && LD_LIBRARY_PATH=$DEV ADSP_LIBRARY_PATH=$DEV \
+  NNTR_HTP_NO_SIMD=1 ./hexkl_qkv_chain"
 ```
 
 ## Reading the output
