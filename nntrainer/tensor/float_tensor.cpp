@@ -1239,8 +1239,23 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       }
       // TODO: add a CPU dequant fallback for the u8i4 path (mirroring
       // qint8CpuFallback) so decode / NPU-down cases do not throw.
+      //
+      // Name the condition that actually failed. These two have very different
+      // causes -- a bad N is the caller's shape, while missing u8i4 support
+      // usually means this tensor got the CPU compute context (a layer without
+      // `engine=htp`, or a tensor built without setContextData) rather than
+      // anything being wrong with the NPU -- and a message covering both sends
+      // the reader after the wrong one.
+      if (!o->supports_shgemm_u8i4())
+        throw std::runtime_error(
+          "Error: QINT4_HTP Dot needs the HTP compute context, but this "
+          "tensor's ComputeOps does not provide shgemm_u8i4. Check that the "
+          "layer sets `engine=htp` (or the tensor has HTP context data) and "
+          "that the HTP backend came up.");
       throw std::runtime_error(
-        "Error: QINT4 Dot requires HTP u8i4 support with N % 32 == 0");
+        "Error: QINT4_HTP Dot requires N % 32 == 0 (the HMX tile width), but "
+        "got N=" +
+        std::to_string(N));
     }
     if (shouldUseCpuFallbackForQInt8(input)) {
 #ifdef ENABLE_HEXKL

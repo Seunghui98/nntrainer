@@ -1282,11 +1282,18 @@ TEST_F(HtpFcLayerTest, Dot_Qint4Htp_BitExactVsCpu) {
     const char *name;
     int M, N, K;
   };
+  // N != K on most of these on purpose. A QINT4_HTP weight is stored [K, N],
+  // so dot(w, trans=false, trans_in=false) -- what FullyConnectedLayer calls --
+  // reads K from the weight's height and N from its width. Passing trans_in
+  // swaps those two roles, and a square shape cannot tell the two apart: an
+  // earlier version of this test used only N == K and so agreed with either
+  // convention, including the wrong one. q_proj/k_proj are the real qwen3-0.6b
+  // projections, where the roles differ by 2x.
   const Shape shapes[] = {
-    {"tile", 64, 32, 32},
-    {"decode", 1, 32, 32},
-    {"below_tile", 63, 64, 64},
-    {"q_proj_small", 64, 256, 256},
+    {"tile", 64, 32, 32},       {"decode", 1, 32, 32},
+    {"below_tile", 63, 64, 64}, {"wide", 64, 256, 64},
+    {"narrow", 64, 64, 256},    {"q_proj", 64, 2048, 1024},
+    {"k_proj", 64, 1024, 1024},
   };
 
   for (const auto &s : shapes) {
@@ -1317,8 +1324,10 @@ TEST_F(HtpFcLayerTest, Dot_Qint4Htp_BitExactVsCpu) {
     dequantizeLikeKernel(C_i32.data(), C_cpu.data(), s.M, s.N, act_scale,
                          wt_scale.data(), zp_corr.data());
 
+    // trans=false, trans_in=false: exactly FullyConnectedLayer::forwarding's
+    // `input_.dot(weight, hidden_, false, false)`.
     nntrainer::Tensor result;
-    ASSERT_NO_THROW(result = act.dot(wgt, false, true));
+    ASSERT_NO_THROW(result = act.dot(wgt, false, false));
     ASSERT_EQ(result.getDim().height(), (unsigned)s.M);
     ASSERT_EQ(result.getDim().width(), (unsigned)s.N);
 
@@ -1337,7 +1346,10 @@ TEST_F(HtpFcLayerTest, BakedWeight_MatchesCpuPipeline) {
   if (!npu_enabled)
     GTEST_SKIP() << "HTP not available";
 
-  constexpr int M = 64, N = 256, K = 256;
+  // N != K so the [K, N] output layout and the trans_in=false convention are
+  // both load bearing; a square shape would pass either way. These are the
+  // qwen3-0.6b q_proj dims.
+  constexpr int M = 64, N = 2048, K = 1024;
 
   auto A_f32 = makeRandF32(M * K, -1.0f, 1.0f);
   auto W_f32 = makeRandF32(N * K, -0.5f, 0.5f);
@@ -1383,8 +1395,11 @@ TEST_F(HtpFcLayerTest, BakedWeight_MatchesCpuPipeline) {
   dequantizeLikeKernel(C_i32.data(), C_cpu.data(), M, N, act_scale, scale,
                        zp_corr);
 
+  // The layer's own call: trans=false, trans_in=false against a [K, N] weight.
   nntrainer::Tensor result;
-  ASSERT_NO_THROW(result = act.dot(baked, false, true));
+  ASSERT_NO_THROW(result = act.dot(baked, false, false));
+  ASSERT_EQ(result.getDim().height(), (unsigned)M);
+  ASSERT_EQ(result.getDim().width(), (unsigned)N);
 
   const long d = firstDiff(C_cpu.data(), result.getData<float>(),
                            static_cast<size_t>(M) * N);
