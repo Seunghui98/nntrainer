@@ -107,10 +107,11 @@ namespace {
  * @brief Map of string data type names to DataType enum values
  */
 const std::map<std::string, DataType> dtype_str_map = {
-  {"FP32", DataType::FP32},   {"FP16", DataType::FP16},
-  {"QINT8", DataType::QINT8}, {"Q4_0", DataType::Q4_0},
-  {"Q6_K", DataType::Q6_K},   {"Q4_K", DataType::Q4_K},
-  {"QS4CX", DataType::QS4CX}, {"NONE", DataType::NONE},
+  {"FP32", DataType::FP32},           {"FP16", DataType::FP16},
+  {"QINT8", DataType::QINT8},         {"Q4_0", DataType::Q4_0},
+  {"Q6_K", DataType::Q6_K},           {"Q4_K", DataType::Q4_K},
+  {"QS4CX", DataType::QS4CX},         {"NONE", DataType::NONE},
+  {"QINT4_HTP", DataType::QINT4_HTP},
 };
 
 /**
@@ -185,7 +186,9 @@ std::string buildModelTensorType(const std::string &fc_dtype) {
 
 bool usesQint8(DataType fc_dtype, DataType embd_dtype, DataType lmhead_dtype) {
   return fc_dtype == DataType::QINT8 || embd_dtype == DataType::QINT8 ||
-         lmhead_dtype == DataType::QINT8;
+         lmhead_dtype == DataType::QINT8 || fc_dtype == DataType::QINT4_HTP ||
+         embd_dtype == DataType::QINT4_HTP ||
+         lmhead_dtype == DataType::QINT4_HTP;
 }
 
 /**

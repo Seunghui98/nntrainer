@@ -97,6 +97,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::UINT8:
   case TensorDim::DataType::UINT4:
   case TensorDim::DataType::QINT8:
+  case TensorDim::DataType::QINT4_HTP:
   case TensorDim::DataType::QINT4:
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
@@ -1023,14 +1024,15 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       auto tensor_data_type = weight->getDim().getDataType();
       size_t size = 0;
-      if (tensor_data_type == TensorDim::DataType::QINT8) {
+      if (tensor_data_type == TensorDim::DataType::QINT8 ||
+          tensor_data_type == TensorDim::DataType::QINT4_HTP) {
         const auto &var = weight->getVariable();
         // On-disk qparam count = out-features = width(). The QINT8 save path
-        // always transposes the weight to [N,K]
-        // (quantize_qint8_weight(w, transpose_input=true)), so the
-        // per-channel scale/zp count equals the runtime tensor's width().
-        // scale_size() cannot be used here: the tensor's qscheme is still the
-        // PER_TENSOR_AFFINE placeholder (returns 1) until
+        // transposes the weight to [N,K] (quantize_qint8_weight(w,
+        // transpose_input=true)) and the QINT4_HTP path emits [K,N]; both keep
+        // one scale+zp per output channel, so the count equals the runtime
+        // tensor's width(). scale_size() cannot be used for QINT8 here: its
+        // qscheme is still the PER_TENSOR_AFFINE placeholder (returns 1) until
         // read_quantization_info() runs during the actual read.
         size = var.bytes() + var.width() * (sizeof(float) + sizeof(int32_t));
       } else {
