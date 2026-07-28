@@ -7,6 +7,9 @@
 .cache/
 .idea/
 
+# meson subproject scratch, written by `meson setup` next to the wrap files
+/subprojects/.wraplock
+
 # jni build files
 libs/
 obj/
