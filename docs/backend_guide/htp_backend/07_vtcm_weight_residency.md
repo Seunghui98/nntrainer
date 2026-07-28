@@ -362,6 +362,43 @@ The probe cannot answer this — `sdkl_npu_mm_u8i4_i32` is a compiled macro-API
 function needing FastRPC, and simulator cycles do not convert to device
 microseconds.
 
+### The micro API does not expose DMA
+
+Settled by grepping the header: `hexkl_micro.h` contains no DMA entry point at
+all. The only mentions are two comments, on the weight and activation copy
+helpers, saying "in operational mode, DMA is typically used for transferring
+weights / activations". The SDK hands out the HMX primitives and the scalar
+copies and keeps the fast path to itself.
+
+That closes the question §3.2 opened. A custom skel can only stage with those
+scalar helpers, which §3.2 measured at 95% of the kernel's time, so its matmul
+would be the 3-6x-slower one below. At 196 fc_layer calls per token that is
+157-314 ms against the 53 ms the shipped kernel costs -- batching every call
+into one RPC saves ~15 ms of round-trip overhead and loses far more than that
+inside. **Both the residency skel and the call-batching skel die on this**, and
+the earlier note that batching would be worth doing "while we are building one
+anyway" was wrong: there is no cheap skel to build.
+
+Hexagon's own user DMA (V68+ descriptor chains) remains reachable in principle,
+but that is writing from scratch what the SDK declined to expose, and success
+means drawing level with Qualcomm rather than passing them.
+
+What survives needs no skel at all:
+
+| | per token | needs |
+| :--- | ---: | :--- |
+| keep activations u8 between layers | ~15 ms | nntrainer only |
+| drop the max-abs scan (cached scale) | ~1.8 ms | nntrainer only |
+
+The first is the larger opportunity now on the table, and it is the same
+structure QNN already has: its graph takes uint8 in and returns uint8 out, so
+it converts once at the boundary while we convert in and out of FP32 on every
+one of the 196 calls.
+
+Worth one grep before assuming batching is out: the macro API has
+`sdkl_mm_tensor`. If it accepts more than one matmul per call, the round-trip
+saving is available without a skel.
+
 ### Why the bet looks unfavourable
 
 Writing our own kernel does not avoid FastRPC. nntrainer runs on ARM, so
