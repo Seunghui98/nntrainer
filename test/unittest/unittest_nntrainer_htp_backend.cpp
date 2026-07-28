@@ -742,6 +742,70 @@ TEST_F(HtpU8i4Test, QuantizationError_VsFp32Reference) {
                           "suspect the quantizer, not the matmul";
 }
 
+// The kernel's shape precondition. u8i8 has a guard test; u8i4 did not.
+//
+// shgemm_u8i4_i32 throws on two conditions, but only one of them is reachable:
+// after N % 32 == 0 passes, N is even, so N*K is even and the "N*K must be
+// even for INT4 packing" check can never fire. That second guard is dead code
+// -- harmless, but not something a test can cover, and worth knowing before
+// someone writes a case for it.
+TEST_F(HtpU8i4Test, AlignmentGuard_Rejects_NNotMultipleOf32) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "HTP not available";
+
+  constexpr int M = 64, N = 48, K = 64; // N = 48 is not a whole HMX tile
+  auto A = makeRandF32(M * K, -1.0f, 1.0f);
+  auto W_i4 = makeRandI4Vec(N * K);
+  std::vector<float> wt_scale(N, 1.0f / 7.0f);
+  auto zp_corr = makeZpCorr(W_i4, N, K);
+  std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
+
+  EXPECT_THROW(nntrainer::hmx::shgemm_u8i4_i32(M, N, K, A.data(), W_i4.data(),
+                                               wt_scale.data(), zp_corr.data(),
+                                               C.data()),
+               std::runtime_error);
+}
+
+// The per-call phase timings must actually be recorded, and the phases must
+// add up to something close to the call. A profile that silently stays zero
+// would make every attribution drawn from it wrong while looking fine.
+TEST_F(HtpU8i4Test, Profile_RecordsEachPhase) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "HTP not available";
+
+  constexpr int M = 64, N = 256, K = 256;
+  auto A = makeRandF32(M * K, -1.0f, 1.0f);
+  auto W_i4 = makeRandI4Vec(N * K);
+  std::vector<float> wt_scale(N, 1.0f / 7.0f);
+  auto zp_corr = makeZpCorr(W_i4, N, K);
+
+  void *W_wh = packI4WeightToNpu(W_i4, N, K);
+  ASSERT_NE(W_wh, nullptr);
+  std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
+
+  nntrainer::hmx::resetMmProfile();
+  ASSERT_NO_THROW(nntrainer::hmx::shgemm_u8i4_i32(
+    M, N, K, A.data(), static_cast<int8_t *>(W_wh), wt_scale.data(),
+    zp_corr.data(), C.data()));
+  sdkl_npu_free(W_wh);
+
+  const auto &p = nntrainer::hmx::lastMmProfile();
+  EXPECT_GT(p.total_us, 0.0);
+  EXPECT_GT(p.scan_us, 0.0);
+  EXPECT_GT(p.quant_us, 0.0);
+  EXPECT_GT(p.npu_us, 0.0);
+  EXPECT_GT(p.dequant_us, 0.0);
+
+  const double parts =
+    p.scan_us + p.quant_us + p.stage_us + p.npu_us + p.dequant_us;
+  EXPECT_LE(parts, p.total_us) << "phases cannot exceed the whole call";
+  EXPECT_GT(parts, 0.5 * p.total_us)
+    << "phases account for only " << parts << " of " << p.total_us
+    << " us; something substantial is happening outside them";
+
+  EXPECT_EQ(p.neon, nntrainer::hmx::quant::neonEnabled());
+}
+
 // The resident-weight cache is keyed by host pointer, so two different weights
 // must not alias and a repeated call on the first weight must still return the
 // first weight's result. Interleaving A, B, A catches both a stale entry and a

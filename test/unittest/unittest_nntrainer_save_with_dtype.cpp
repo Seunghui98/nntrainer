@@ -822,6 +822,135 @@ TEST(SaveWithDtypeInference, save_partial_q4_load_inference_compare_p) {
 // Main function
 // =============================================================================
 
+// =============================================================================
+// QINT4_HTP save tests
+//
+// The u8i4 weight path is exercised end to end elsewhere, but only ever with
+// a weight the test built itself. Nothing covered the save side: the branch in
+// Layer::save that routes QINT4_HTP through quantize_qint4_weight, the qparams
+// written alongside the payload, or the dimension convention between them.
+//
+// Layout, per FC layer with weight [K, N] (height=input_width, width=units):
+//   payload  K*N bytes   (QINT4_HTP is one byte per element; the packed
+//                         nibbles occupy the first half)
+//   qparams  N*(4+4)     (one FP32 scale and one INT32 zp_corr per output
+//                         channel -- N of them, not K)
+//   bias     N*4         (stays FP32)
+//
+// Without ENABLE_HEXKL the quantizer skips the WH tiling and writes row-major
+// codes; the sizes and the qparams are the same either way, which is what
+// these assert.
+// =============================================================================
+
+/**
+ * @brief QINT4_HTP save succeeds and is smaller than the FP32 it replaces
+ */
+TEST(SaveWithDtypeQint4Htp, save_bin_smaller_than_fp32_p) {
+  const unsigned int H = 32, W = 32;
+  auto nn = createInitializedNN(H, W);
+
+  std::string fp32_path = "test_q4htp_fp32.bin";
+  std::string q4_path = "test_q4htp.bin";
+
+  EXPECT_NO_THROW(
+    nn->save(fp32_path, ModelFormat::MODEL_FORMAT_BIN, DataType::NONE));
+  EXPECT_NO_THROW(
+    nn->save(q4_path, ModelFormat::MODEL_FORMAT_BIN, DataType::QINT4_HTP));
+
+  std::ifstream fp32_file(fp32_path, std::ios::binary | std::ios::ate);
+  std::ifstream q4_file(q4_path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(fp32_file.is_open());
+  ASSERT_TRUE(q4_file.is_open());
+
+  EXPECT_GT(q4_file.tellg(), 0);
+  EXPECT_LT(q4_file.tellg(), fp32_file.tellg());
+
+  fp32_file.close();
+  q4_file.close();
+  remove(fp32_path.c_str());
+  remove(q4_path.c_str());
+}
+
+/**
+ * @brief QINT4_HTP writes one scale and one zp_corr per *output* channel
+ *
+ *        Asserted as a difference between two widths rather than an absolute
+ *        size. The file carries a small fixed constant this test cannot
+ *        account for, and pinning it would freeze whatever produces it as
+ *        expected behaviour; differencing cancels it and still isolates the
+ *        term under test.
+ *
+ *        Doubling the units grows the file by the extra payload (H*W) plus
+ *        12 bytes per new channel: 4 scale + 4 zp_corr + 4 bias. If the
+ *        qparams were counted from K instead of N -- the plausible mistake,
+ *        since the weight is stored [K, N] -- only the bias would scale and
+ *        the growth would be H*W + 4*W.
+ */
+TEST(SaveWithDtypeQint4Htp, qparams_scale_with_output_channels_p) {
+  const unsigned int H = 32, W = 32;
+
+  auto save_size = [&](unsigned int units) -> std::streamsize {
+    auto nn = createInitializedNN(H, units);
+    const std::string path =
+      "test_q4htp_w" + std::to_string(units) + ".bin";
+    EXPECT_NO_THROW(
+      nn->save(path, ModelFormat::MODEL_FORMAT_BIN, DataType::QINT4_HTP));
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    EXPECT_TRUE(f.is_open());
+    const std::streamsize sz = f.tellg();
+    f.close();
+    remove(path.c_str());
+    return sz;
+  };
+
+  const std::streamsize s1 = save_size(W);
+  const std::streamsize s2 = save_size(2 * W);
+
+  const std::streamsize per_channel =
+    sizeof(float) + sizeof(int32_t) + sizeof(float); // scale + zp_corr + bias
+  const std::streamsize expected_growth =
+    (std::streamsize)H * W + per_channel * W;
+
+  EXPECT_EQ(s2 - s1, expected_growth)
+    << "growth from " << W << " to " << 2 * W << " units was " << (s2 - s1)
+    << ", expected " << expected_growth
+    << " (payload " << H * W << " + " << per_channel << " per channel)";
+}
+
+/**
+ * @brief The QINT4_HTP payload is one byte per element, not one nibble
+ *
+ *        The packed nibbles fill only the first half of the buffer, and the
+ *        tensor is deliberately sized to the unpacked length so the WH tiling
+ *        cannot overrun it. A file sized to N*K/2 would mean that headroom was
+ *        dropped somewhere between the quantizer and save.
+ */
+TEST(SaveWithDtypeQint4Htp, payload_is_one_byte_per_element_p) {
+  const unsigned int H = 32, W = 32;
+
+  auto save_size = [&](unsigned int in_width) -> std::streamsize {
+    auto nn = createInitializedNN(in_width, W);
+    const std::string path = "test_q4htp_h" + std::to_string(in_width) + ".bin";
+    EXPECT_NO_THROW(
+      nn->save(path, ModelFormat::MODEL_FORMAT_BIN, DataType::QINT4_HTP));
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    EXPECT_TRUE(f.is_open());
+    const std::streamsize sz = f.tellg();
+    f.close();
+    remove(path.c_str());
+    return sz;
+  };
+
+  // Only the payload depends on the input width; the qparams and bias follow
+  // the units, which are held fixed.
+  const std::streamsize s1 = save_size(H);
+  const std::streamsize s2 = save_size(2 * H);
+
+  EXPECT_EQ(s2 - s1, (std::streamsize)H * W)
+    << "payload grew by " << (s2 - s1) << " for " << H * W
+    << " added elements; one byte each is expected";
+}
+
 int main(int argc, char **argv) {
   int result = -1;
   try {
