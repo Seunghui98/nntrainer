@@ -328,6 +328,15 @@ public:
   // ===========================================================================
   // Mixed precision BLAS
   // ===========================================================================
+  /**
+   * @brief Accelerator predicate for shgemm (F32 x F16 -> F32).
+   *
+   * Defaults to false; accelerator backends (e.g. HTP/HMX) override it
+   * to gate the NPU path with a CPU fallback at the call site. CPU
+   * backends leave it false and always run shgemm() directly.
+   */
+  virtual bool supports_shgemm() const { return false; }
+
   virtual void shgemm(const unsigned int TStorageOrder, bool TransA,
                       bool TransB, const unsigned int M, const unsigned int N,
                       const unsigned int K, const float alpha, const float *A,
