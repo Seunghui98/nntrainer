@@ -523,6 +523,44 @@ TEST_F(HtpKernelTest, ScratchReuse_MixedShapesStayCorrect) {
   }
 }
 
+// The offline bake stores WH bytes produced by sdkl_cpu_rm_to_wh_f16_inplace.
+// For a pre-baked weight to be substitutable at runtime, the conversion must be
+// deterministic: identical RM input -> identical WH output. Verify byte
+// equality across two independent conversions (host buffer and NPU buffer),
+// covering the three prefill FC shapes.
+TEST_F(HtpKernelTest, OfflineWH_ConversionIsDeterministicAndByteIdentical) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  struct S {
+    int N, K;
+  };
+  const S shapes[] = {{2048, 1024}, {3072, 1024}, {1024, 3072}};
+  for (const auto &s : shapes) {
+    const size_t n = (size_t)s.N * (size_t)s.K;
+    const size_t bytes = n * sizeof(_FP16);
+    std::vector<_FP16> rm = makeRandF16(n, -0.5f, 0.5f, s.N ^ s.K);
+
+    // Conversion 1: plain host buffer.
+    std::vector<_FP16> wh_host = rm;
+    ASSERT_EQ(
+      sdkl_cpu_rm_to_wh_f16_inplace(
+        (size_t)s.N, (size_t)s.K, reinterpret_cast<_Float16 *>(wh_host.data())),
+      0);
+
+    // Conversion 2: NPU-accessible buffer (the path quantizer.cpp uses).
+    NpuBuf nb(bytes);
+    ASSERT_TRUE(nb.ok());
+    std::memcpy(nb.p, rm.data(), bytes);
+    ASSERT_EQ(sdkl_cpu_rm_to_wh_f16_inplace((size_t)s.N, (size_t)s.K,
+                                            static_cast<_Float16 *>(nb.p)),
+              0);
+
+    ASSERT_EQ(std::memcmp(wh_host.data(), nb.p, bytes), 0)
+      << "WH bytes differ for " << s.N << "x" << s.K;
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
