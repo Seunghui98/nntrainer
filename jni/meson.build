@@ -85,6 +85,18 @@ else
   and_conf.set('MESON_CL_ROOT', '')
 endif
 
+if get_option('enable-htp')
+  # Wire libsdkl.so into ndk-build as a PREBUILT_SHARED_LIBRARY.
+  # hexkl_lib_dir is set in the top-level meson.build HTP block and is in scope.
+  and_conf.set('MESON_ENABLE_HEXKL', 1)
+  and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', hexkl_root / 'include')
+else
+  and_conf.set('MESON_ENABLE_HEXKL', 0)
+  and_conf.set('MESON_HEXKL_LIB_DIR', '')
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', '')
+endif
+
 if tflite_dep.found()
   and_conf.set('MESON_HAS_TFLITE', 1)
   and_conf.set('MESON_TFLITE_ROOT', tflite_root)
