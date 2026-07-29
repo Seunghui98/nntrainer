@@ -61,6 +61,14 @@
 #include <slice_realizer.h>
 #include <util_func.h>
 
+#ifdef ENABLE_HEXKL
+#include <htp_backend.h>
+#include <wh_trailer.h>
+#ifdef ENABLE_FP16
+#include <hexkl_mm.h>
+#endif
+#endif
+
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
 #endif
@@ -706,6 +714,30 @@ TensorDim::DataType resolveStoredDtype(const Tensor &weight,
   return requested;
 }
 
+#ifdef ENABLE_HEXKL
+/**
+ * @brief RAII guard that points the process-global WH collector
+ *        (nntrainer::hmx::g_wh_collector) at @a entries for the guard's
+ *        lifetime and unconditionally clears it back to nullptr on
+ *        destruction -- including when unwinding due to an exception
+ *        thrown by a layer's save(). This guarantees the dangling-pointer
+ *        hazard (a later save() call checking g_wh_collector against a
+ *        destroyed stack vector) cannot occur even if the collection loop
+ *        throws partway through.
+ */
+class WHCollectorGuard {
+public:
+  explicit WHCollectorGuard(
+    std::vector<nntrainer::hmx::WHTrailerEntry> &entries) {
+    nntrainer::hmx::g_wh_collector = &entries;
+  }
+  ~WHCollectorGuard() { nntrainer::hmx::g_wh_collector = nullptr; }
+
+  WHCollectorGuard(const WHCollectorGuard &) = delete;
+  WHCollectorGuard &operator=(const WHCollectorGuard &) = delete;
+};
+#endif // ENABLE_HEXKL
+
 } // namespace
 
 void NeuralNetwork::save(
@@ -730,12 +762,42 @@ void NeuralNetwork::save(
     auto model_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
-    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-      const auto &layer_node = *iter;
-      auto it = layer_dtype_map.find(layer_node->getName());
-      auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
-      layer_node->save(model_file, false, exec_mode, target_dtype, target_isa);
+#ifdef ENABLE_HEXKL
+    // If WH-baked FP16 was requested, append a WH trailer holding the
+    // WH-layout version of every FP16 FC weight (N,K both 32-aligned). Each
+    // layer's dtype is still resolved from layer_dtype_map (falling back to
+    // the global dtype) exactly as in the non-bake path below, so callers
+    // that only mark specific layers as FP16 (e.g. via layer_dtype_map,
+    // while leaving embedding/lmhead at FP32) still get those overrides
+    // honored; the per-layer WH-entry gate in LayerImpl::save (layer_devel.h)
+    // only fires for layers whose *resolved* dtype is FP16 with aligned
+    // dims, so FP32-overridden layers are correctly skipped. The RM weight
+    // section above is written unchanged, so non-HTP readers ignore this
+    // trailer (it sits after the weight data, where the reader is
+    // EOF-tolerant). Requires the NPU (rm_to_wh runs on device).
+    std::vector<nntrainer::hmx::WHTrailerEntry> wh_entries;
+    bool wh_bake_requested = nntrainer::isWHBakeRequested();
+    {
+      std::optional<WHCollectorGuard> wh_collector_guard;
+      if (wh_bake_requested)
+        wh_collector_guard.emplace(wh_entries);
+#endif
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           iter++) {
+        const auto &layer_node = *iter;
+        auto it = layer_dtype_map.find(layer_node->getName());
+        auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
+        layer_node->save(model_file, false, exec_mode, target_dtype,
+                         target_isa);
+      }
+#ifdef ENABLE_HEXKL
+      // wh_collector_guard goes out of scope here (guard destructor resets
+      // g_wh_collector to nullptr unconditionally), whether the loop above
+      // completed normally or is about to propagate an exception.
     }
+    if (wh_bake_requested)
+      nntrainer::hmx::writeWHTrailer(model_file, wh_entries);
+#endif
 
     if (opt && istrequal(opt->getType(), "adam")) {
       std::string adam = "adam";
@@ -959,8 +1021,21 @@ void NeuralNetwork::load(const std::string &file_path,
       if (!visited_weights.insert(&weight->getVariableRef()).second) {
         continue;
       }
-      size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
+      size_t size = 0;
+      if (tensor_data_type == TensorDim::DataType::QINT8) {
+        const auto &var = weight->getVariable();
+        // On-disk qparam count = out-features = width(). The QINT8 save path
+        // always transposes the weight to [N,K]
+        // (quantize_qint8_weight(w, transpose_input=true)), so the
+        // per-channel scale/zp count equals the runtime tensor's width().
+        // scale_size() cannot be used here: the tensor's qscheme is still the
+        // PER_TENSOR_AFFINE placeholder (returns 1) until
+        // read_quantization_info() runs during the actual read.
+        size = var.bytes() + var.width() * (sizeof(float) + sizeof(int32_t));
+      } else {
+        size = weight->getVariable().getMemoryBytes();
+      }
       weight->getVariableRef().setFileOffset(start_from);
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for
@@ -1137,6 +1212,71 @@ void NeuralNetwork::load(const std::string &file_path,
                      "iteration, proceeding with default\n";
       }
     }
+
+#ifdef ENABLE_HEXKL
+#ifdef ENABLE_FP16
+    // Offline-baked WH weights: if this bin carries a WH trailer and HTP is
+    // active, register each entry's WH bytes against the corresponding loaded
+    // weight's live data pointer so prefill skips rm_to_wh. Best-effort: any
+    // failure or absent trailer leaves the runtime on the transient path.
+    //
+    // Runs unconditionally after the exec_mode if/else (not just in the
+    // non-INFERENCE branch): Applications/CausalLM always loads models with
+    // ExecutionMode::INFERENCE, and the INFERENCE branch above never reads
+    // from the outer `model_file` stream itself (workers use their own local
+    // streams or an mmap), so it is still open and readWHTrailer's
+    // EOF-relative seek works correctly regardless of which branch ran.
+    if (nntrainer::HtpBackend::global().enabled()) {
+      std::vector<nntrainer::hmx::WHTrailerEntry> wh_entries;
+      // readWHTrailer seeks within the stream; save/restore not needed since
+      // no further positional reads depend on it except the EOF-tolerant adam
+      // probe below, which re-reads from wherever the stream is — reset it.
+      if (nntrainer::hmx::readWHTrailer(model_file, wh_entries)) {
+        // Build name -> (data ptr, N, K) from the graph's weights.
+        std::map<std::string, std::tuple<const void *, unsigned, unsigned>>
+          by_name;
+        for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+             ++iter) {
+          auto &rc = (*iter)->getRunContext();
+          for (unsigned int w = 0; w < rc.getNumWeights(); ++w) {
+            auto &wt = rc.getWeight(w);
+            if (wt.getDataType() != TensorDim::DataType::FP16)
+              continue;
+            by_name[wt.getName()] =
+              std::make_tuple((const void *)wt.getData<_FP16>(),
+                              wt.getDim().width(), wt.getDim().height());
+          }
+        }
+        size_t registered = 0;
+        for (auto &e : wh_entries) {
+          auto it = by_name.find(e.name);
+          if (it == by_name.end())
+            continue;
+          const void *ptr = std::get<0>(it->second);
+          unsigned Nn = std::get<1>(it->second);
+          unsigned Kk = std::get<2>(it->second);
+          if (ptr == nullptr || Nn != e.N || Kk != e.K ||
+              e.wh_bytes.size() != (size_t)e.N * e.K * sizeof(_FP16))
+            continue;
+          nntrainer::hmx::registerPrefillWH(ptr, e.N, e.K, e.wh_bytes.data());
+          ++registered;
+          // registerPrefillWH copies the bytes into its own registry
+          // storage; release this entry's copy immediately so at most one
+          // entry's worth of duplicate memory is resident at a time instead
+          // of the whole trailer (~880 MB for Qwen3-0.6B) staying alive
+          // alongside the registry's copies until the loop exits.
+          e.wh_bytes.clear();
+          e.wh_bytes.shrink_to_fit();
+        }
+        ml_logi("[HTP] Registered %zu/%zu pre-baked WH weights", registered,
+                wh_entries.size());
+      }
+      // Reset stream to a clean state for the EOF-tolerant adam probe.
+      model_file.clear();
+      model_file.seekg(0, std::ios::end);
+    }
+#endif
+#endif
 
     ml_logi("read modelfile: %s",
             (v.size() == 2) ? v[1].c_str() : v[0].c_str());
