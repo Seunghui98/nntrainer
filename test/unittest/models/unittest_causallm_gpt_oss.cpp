@@ -179,6 +179,10 @@ makeGptOssCase(const causallm_test::TinyCausalLMDataType &data_type) {
   };
 }
 
+/**
+ * @brief Parameterized fixture running golden-token tests for the tiny
+ *        GptOss CausalLM model across the registered TinyCausalLMCase set.
+ */
 class GptOssTinyModelTest
   : public ::testing::TestWithParam<causallm_test::TinyCausalLMCase> {
 protected:

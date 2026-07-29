@@ -86,6 +86,42 @@ check_artifact() {
     fi
 }
 
+get_meson_build_option() {
+    local option_name=$1
+    local meson_options="$NNTRAINER_ROOT/builddir/meson-info/intro-buildoptions.json"
+    if command -v python3 >/dev/null 2>&1 && [ -f "$meson_options" ]; then
+        python3 - "$meson_options" "$option_name" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    for option in json.load(f):
+        if option.get("name") == sys.argv[2]:
+            print(option.get("value", ""))
+            break
+PY
+    fi
+}
+
+find_hexkl_addon_root() {
+    if [ -n "${HEXKL_ADDON_ROOT:-}" ] && [ -d "$HEXKL_ADDON_ROOT" ]; then
+        echo "$HEXKL_ADDON_ROOT"
+        return 0
+    fi
+    local parsed_root
+    parsed_root="$(get_meson_build_option hexkl-sdk-root)"
+    if [ -n "$parsed_root" ] && [ -d "$parsed_root" ]; then
+        echo "$parsed_root"
+        return 0
+    fi
+    local default_root="/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/addons/hexkl_addon"
+    if [ -d "$default_root" ]; then
+        echo "$default_root"
+        return 0
+    fi
+    return 1
+}
+
 # Check if NDK path is set
 if [ -z "$ANDROID_NDK" ]; then
     log_error "ANDROID_NDK is not set. Please set it to your Android NDK path."
@@ -173,8 +209,29 @@ cd "$SCRIPT_DIR/jni"
 rm -rf libs obj
 
 log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_quantize, nntr_safetensors_info)..."
+
+# HTP auto-detect: if the nntrainer builddir was configured with enable-htp=true,
+# nntr_quantize MUST be built with ENABLE_HEXKL so --fc_dtype FP16_WH actually bakes
+# the WH trailer. Without this, the bake silently no-ops (plain FP16, no trailer) and
+# on-device HTP prefill collapses. Mirror install_android.sh's detection so quantize
+# always matches libnntrainer.so's HTP config.
+HEXKL_NDK_ARGS=""
+htp_opt="$(get_meson_build_option enable-htp)"
+if [ "${htp_opt,,}" = "true" ]; then
+    hexkl_root="$(find_hexkl_addon_root || true)"
+    if [ -z "$hexkl_root" ]; then
+        log_error "builddir was configured with enable-htp=true but no hexkl_addon root was found."
+        log_error "Set HEXKL_ADDON_ROOT to the '.../addons/hexkl_addon' directory and re-run."
+        exit 1
+    fi
+    HEXKL_NDK_ARGS="ENABLE_HEXKL=1 HEXKL_ADDON_ROOT=$hexkl_root"
+    log_info "HEXKL bake: enabled (root=$hexkl_root)"
+else
+    log_info "HEXKL bake: disabled (builddir enable-htp != true)"
+fi
+
 # We explicitly set paths to ensure outputs are predictable
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
+if ndk-build $HEXKL_NDK_ARGS NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
     log_success "Build completed successfully"
 else
     log_error "Build failed"

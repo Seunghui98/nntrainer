@@ -197,6 +197,15 @@ TinyCausalLMDataType makeTinyQ40Fp32DataType() {
 }
 
 /**
+ * @brief Make QINT8 weights with FP32 activations data type variant
+ */
+TinyCausalLMDataType makeTinyQint8Fp32DataType() {
+  return {
+    "QINT8_FP32", "QINT8", "QINT8", "QINT8", "QINT8-FP32",
+  };
+}
+
+/**
  * @brief Make Q4_0 weights with FP16 activations data type variant
  */
 TinyCausalLMDataType makeTinyQ40Fp16DataType() {
@@ -215,6 +224,8 @@ ml::train::TensorDim::DataType toTensorDataType(const std::string &dtype) {
     return ml::train::TensorDim::DataType::FP16;
   if (dtype == "Q4_0")
     return ml::train::TensorDim::DataType::Q4_0;
+  if (dtype == "QINT8")
+    return ml::train::TensorDim::DataType::QINT8;
   if (dtype == "NONE")
     return ml::train::TensorDim::DataType::NONE;
 
