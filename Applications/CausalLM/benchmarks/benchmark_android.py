@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-nntrainer benchmark for CausalLM models with configuration sweeping.
+@package benchmark_android
+@brief nntrainer benchmark for CausalLM models with configuration sweeping.
 
 Usage:
   python3 benchmark_android.py -m <model_path> [options]
@@ -65,20 +66,32 @@ def generate_sample_input(target_tokens, local_tokenizer_path=None):
         return generated_text[:target_chars]
 
 
-def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1):
+def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1, compute_engine=None):
     """
     Backup original nntr_config.json from device and create modified version.
     Returns context manager that restores original config on exit.
     """
     class ConfigModifier:
-        def __init__(self, model_path, n_prompt, n_gen, batch_size):
+        def __init__(self, model_path, n_prompt, n_gen, batch_size, compute_engine):
             self.n_prompt = n_prompt
             self.n_gen = n_gen
             self.batch_size = batch_size
+            self.compute_engine = compute_engine
             self.device_backup = None
             self.temp_config_path = None
-            self.device_config_path = f"{model_path}/nntr_config.json"
-            
+            # main.cpp prefers nntr_config_quantized.json over nntr_config.json
+            # when both exist (see Applications/CausalLM/main.cpp). Match that
+            # preference here so we edit the config the binary actually loads.
+            quantized_path = "{}/nntr_config_quantized.json".format(model_path)
+            probe = subprocess.run(
+                ["adb", "shell", "test", "-f", quantized_path],
+                capture_output=True
+            )
+            if probe.returncode == 0:
+                self.device_config_path = quantized_path
+            else:
+                self.device_config_path = "{}/nntr_config.json".format(model_path)
+
         def __enter__(self):
             # Backup device config
             result = subprocess.run(
@@ -102,7 +115,9 @@ def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1):
             config["init_seq_len"] = self.n_prompt
             config["num_to_generate"] = self.n_gen
             config["batch_size"] = self.batch_size
-            
+            if self.compute_engine is not None:
+                config["compute_engine"] = self.compute_engine
+
             # Generate sample_input matching target token count
             local_tokenizer_path = None
             
@@ -196,7 +211,7 @@ def backup_and_modify_config(model_path, n_prompt, n_gen, batch_size=1):
             
             return False
     
-    return ConfigModifier(model_path, n_prompt, n_gen, batch_size)
+    return ConfigModifier(model_path, n_prompt, n_gen, batch_size, compute_engine)
 
 
 def run_single_trial(model_path, omp_threads=None):
@@ -290,25 +305,27 @@ def validate_model_path(model_path):
 def output_results_table(all_results, model_name, model_size, model_type, dtype, device):
     """Output all benchmark results in a pretty table format."""
     # Prepare table data
-    headers = ["Threads", "Prompt", "Gen", "Prefill TPS", "Gen TPS"]
+    headers = ["Engine", "Threads", "Prompt", "Gen", "Prefill TPS", "Gen TPS"]
     table_data = []
-    
+
     for result in all_results:
-        prefill_str = f"{result['prefill_mean']:.2f} ± {result['prefill_std']:.2f}" if result['prefill_mean'] > 0 else "N/A"
-        gen_str = f"{result['gen_mean']:.2f} ± {result['gen_std']:.2f}" if result['gen_mean'] > 0 else "N/A"
-        
+        prefill_str = "{:.2f} ± {:.2f}".format(result['prefill_mean'], result['prefill_std']) if result['prefill_mean'] > 0 else "N/A"
+        gen_str = "{:.2f} ± {:.2f}".format(result['gen_mean'], result['gen_std']) if result['gen_mean'] > 0 else "N/A"
+
         table_data.append([
+            result['compute_engine'],
             result['n_threads'],
             result['n_prompt'],
             result['n_gen'],
             prefill_str,
-            gen_str
+            gen_str,
         ])
-    
+
     print("\n" + "=" * 90)
     print("BENCHMARK SWEEP RESULTS")
     print("=" * 90)
-    print(f"Model: {model_name} | Size: {model_size} | Type: {model_type} | Dtype: {dtype} | Device: {device}")
+    print("Model: {} | Size: {} | Type: {} | Dtype: {} | Device: {}".format(
+        model_name, model_size, model_type, dtype, device))
     print("=" * 90)
     print(tabulate(table_data, headers=headers, tablefmt="grid"))
     print("=" * 90)
@@ -321,7 +338,12 @@ def parse_list_arg(arg_string):
     return [int(x.strip()) for x in arg_string.split(',')]
 
 
-def main():
+def parse_str_list_arg(arg_string):
+    """Parse comma-separated string list argument."""
+    return [x.strip() for x in arg_string.split(',') if x.strip()]
+
+
+def _build_parser():
     parser = argparse.ArgumentParser(
         description="nntrainer benchmark with configuration sweeping for nntrainer CausalLM models"
     )
@@ -345,33 +367,41 @@ def main():
                         help="Maximum wait time for cooling in seconds (default: 300)")
     parser.add_argument("--skip-cooling", action="store_true",
                         help="Skip cooling between configurations")
-    
-    args = parser.parse_args()
+    parser.add_argument("--compute-engine", type=str, default=None,
+                        help="compute_engine values, comma-separated (e.g., htp,cpu). "
+                             "Default: no change (uses existing nntr_config.json value).")
+    return parser
+
+
+def main():
+    args = _build_parser().parse_args()
     
     # Parse list arguments
     n_prompts = parse_list_arg(args.n_prompt)
     n_gens = parse_list_arg(args.n_gen)
     n_threads_list = parse_list_arg(args.n_threads)
-    
+    engines = parse_str_list_arg(args.compute_engine) if args.compute_engine else [None]
+
     for n_threads in n_threads_list:
         assert n_threads > 0, "Error: Thread counts must be positive integers"
-    
+
     # Generate all configurations
-    configs = list(product(n_prompts, n_gens, n_threads_list))
+    configs = list(product(engines, n_prompts, n_gens, n_threads_list))
     
     # Extract model name from path
     model_path = validate_model_path(args.model)
     model_name = os.path.basename(model_path)
     
-    print(f"=== nntrainer benchmark sweep ===")
-    print(f"Model: {model_name}")
-    print(f"Device path: {model_path}")
-    print(f"n_prompt values: {n_prompts}")
-    print(f"n_gen values: {n_gens}")
-    print(f"n_threads values: {n_threads_list}")
-    print(f"n_trials per config: {args.n_trials}")
-    print(f"batch_size: {args.batch_size}")
-    print(f"Total configurations: {len(configs)}")
+    print("=== nntrainer benchmark sweep ===")
+    print("Model: {}".format(model_name))
+    print("Device path: {}".format(model_path))
+    print("compute_engine values: {}".format([e if e else '(from config)' for e in engines]))
+    print("n_prompt values: {}".format(n_prompts))
+    print("n_gen values: {}".format(n_gens))
+    print("n_threads values: {}".format(n_threads_list))
+    print("n_trials per config: {}".format(args.n_trials))
+    print("batch_size: {}".format(args.batch_size))
+    print("Total configurations: {}".format(len(configs)))
     print("-" * 50)
     
     # Load nntr_config.json from device
@@ -409,8 +439,9 @@ def main():
     # Run benchmarks for all configurations
     all_results = []
     
-    for idx, (n_prompt, n_gen, n_threads) in enumerate(configs, 1):
-        print(f"\n[{idx}/{len(configs)}] Config: n_prompt={n_prompt}, n_gen={n_gen}, n_threads={n_threads}")
+    for idx, (engine, n_prompt, n_gen, n_threads) in enumerate(configs, 1):
+        print("\n[{}/{}] Config: engine={}, n_prompt={}, n_gen={}, n_threads={}".format(
+            idx, len(configs), engine or '(config)', n_prompt, n_gen, n_threads))
         print("-" * 50)
         
         # Wait for cooling before starting next configuration (for fair comparison)
@@ -420,7 +451,9 @@ def main():
             time.sleep(2)  # Brief pause after cooling
         
         # Create config modifier for this specific configuration
-        config_modifier = backup_and_modify_config(model_path, n_prompt, n_gen, args.batch_size)
+        config_modifier = backup_and_modify_config(
+            model_path, n_prompt, n_gen, args.batch_size, compute_engine=engine
+        )
         
         try:
             # Manually enter context to ensure proper cleanup on interrupt
@@ -440,13 +473,14 @@ def main():
             gen_mean, gen_std = calculate_statistics(gens)
             
             all_results.append({
+                'compute_engine': engine if engine is not None else '-',
                 'n_prompt': n_prompt,
                 'n_gen': n_gen,
                 'n_threads': n_threads,
                 'prefill_mean': prefill_mean,
                 'prefill_std': prefill_std,
                 'gen_mean': gen_mean,
-                'gen_std': gen_std
+                'gen_std': gen_std,
             })
             
             print(f"  Prefill: {prefill_mean:.2f} ± {prefill_std:.2f} TPS")
