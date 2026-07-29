@@ -271,6 +271,39 @@ if get_option('opencl-kernel-path') != ''
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
 endif
 
+# HTP (Hexagon/HMX) backend via Qualcomm HexKL CPU Macro API (libsdkl.so).
+# ARM/Android only — there is no x86 libsdkl.so. Default off, so x86/CI
+# builds are unaffected. hexkl_dep is referenced only under this guard
+# (mirrors how clblast_dep is referenced only when enable-opencl).
+if get_option('enable-htp')
+  hexkl_root = get_option('hexkl-sdk-root')
+  if hexkl_root == ''
+    error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
+  endif
+  hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
+  # Derive the Hexagon SDK root from the addon path (two levels up).
+  # remote.h and AEEStdErr.h live under <sdk_root>/incs/ and
+  # <sdk_root>/incs/stddef/ respectively; sdkl.h is in the addon include/.
+  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  hexkl_inc = include_directories(
+    hexkl_root / 'include',
+    hexagon_sdk_root / 'incs',
+    hexagon_sdk_root / 'incs' / 'stddef',
+    is_system: true)
+  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  hexkl_dep = declare_dependency(
+    dependencies: libsdkl,
+    include_directories: hexkl_inc)
+  extra_defines += '-DENABLE_HEXKL=1'
+  # sdkl.h uses the C99 `restrict` keyword in C++ function signatures; the NDK
+  # aarch64 C++ compiler rejects it.  Map restrict → __restrict to preserve the
+  # optimization hint while satisfying the C++ front-end.  This flag is
+  # module-wide under the guard; acceptable because HTP is the only sdkl.h
+  # consumer in nntrainer and the macro only affects an optimization hint.
+  extra_defines += '-Drestrict=__restrict'
+  message('HTP/HexKL backend enabled, linking ' + hexkl_lib_dir / 'libsdkl.so')
+endif
+
 if get_option('enable-biqgemm')
   # In order to enable biqgemm, BiQGEMM lib, which is header-only library, is required.
   # This meson tries to find its installation.
