@@ -374,6 +374,7 @@ protected:
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
+  std::string COMPUTE_ENGINE; ///< "cpu" (default) or "htp", from nntr_config
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
