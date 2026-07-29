@@ -50,6 +50,11 @@ void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
 
 #if defined(_WIN32)
   *ptr = _aligned_malloc(aligned_size, alignment);
+#elif defined(__ANDROID__)
+  // Android API < 28: aligned_alloc is not available; use posix_memalign.
+  int ret = posix_memalign(ptr, alignment, aligned_size);
+  if (ret != 0)
+    *ptr = nullptr;
 #else
   *ptr = std::aligned_alloc(alignment, aligned_size);
 #endif

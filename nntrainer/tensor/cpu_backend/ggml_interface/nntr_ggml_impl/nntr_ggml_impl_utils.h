@@ -957,6 +957,7 @@ inline static uint8x8_t vzip2_u8(uint8x8_t a, uint8x8_t b) {
 // vld1q_s8_x4
 // TODO: double-check these work correctly
 
+/** @brief ggml_int16x8x2_t */
 typedef struct ggml_int16x8x2_t {
   int16x8_t val[2];
 } ggml_int16x8x2_t;
@@ -970,6 +971,7 @@ inline static ggml_int16x8x2_t ggml_vld1q_s16_x2(const int16_t *ptr) {
   return res;
 }
 
+/** @brief ggml_uint8x16x2_t */
 typedef struct ggml_uint8x16x2_t {
   uint8x16_t val[2];
 } ggml_uint8x16x2_t;
@@ -983,6 +985,7 @@ inline static ggml_uint8x16x2_t ggml_vld1q_u8_x2(const uint8_t *ptr) {
   return res;
 }
 
+/** @brief ggml_uint8x16x4_t */
 typedef struct ggml_uint8x16x4_t {
   uint8x16_t val[4];
 } ggml_uint8x16x4_t;
@@ -998,6 +1001,7 @@ inline static ggml_uint8x16x4_t ggml_vld1q_u8_x4(const uint8_t *ptr) {
   return res;
 }
 
+/** @brief ggml_int8x16x2_t */
 typedef struct ggml_int8x16x2_t {
   int8x16_t val[2];
 } ggml_int8x16x2_t;
@@ -1011,6 +1015,7 @@ inline static ggml_int8x16x2_t ggml_vld1q_s8_x2(const int8_t *ptr) {
   return res;
 }
 
+/** @brief ggml_int8x16x4_t */
 typedef struct ggml_int8x16x4_t {
   int8x16_t val[4];
 } ggml_int8x16x4_t;
