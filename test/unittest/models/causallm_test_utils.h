@@ -681,6 +681,12 @@ TinyCausalLMDataType makeTinyFp32DataType();
 TinyCausalLMDataType makeTinyQ40Fp32DataType();
 
 /**
+ * @brief Make QINT8 weights with FP32 activations data type variant
+ * @return Tiny QINT8-FP32 data type descriptor
+ */
+TinyCausalLMDataType makeTinyQint8Fp32DataType();
+
+/**
  * @brief Make Q4_0 weights with FP16 activations data type variant
  * @return Tiny Q4_0-FP16 data type descriptor
  */

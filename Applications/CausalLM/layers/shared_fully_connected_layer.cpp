@@ -32,6 +32,25 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum FCParams { weight, bias };
 
+namespace {
+
+size_t serializedWeightBytes(const nntrainer::Tensor &weight) {
+  switch (weight.getDataType()) {
+  case nntrainer::TensorDim::DataType::QINT8:
+  case nntrainer::TensorDim::DataType::QINT4:
+  case nntrainer::TensorDim::DataType::QINT16:
+  case nntrainer::TensorDim::DataType::UINT4:
+  case nntrainer::TensorDim::DataType::UINT8:
+  case nntrainer::TensorDim::DataType::UINT16:
+  case nntrainer::TensorDim::DataType::UINT32:
+    return sizeof(uint16_t) + weight.getMemoryBytes();
+  default:
+    return weight.getMemoryBytes();
+  }
+}
+
+} // namespace
+
 SharedFullyConnectedLayer::SharedFullyConnectedLayer() :
   nntrainer::LayerImpl() {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
@@ -197,7 +216,30 @@ void SharedFullyConnectedLayer::read(
 
       if (read_from_offset &&
           current_offset != std::numeric_limits<size_t>::max()) {
-        current_offset += w.bytes();
+        current_offset += serializedWeightBytes(w);
+      }
+
+      if (context.isMixedPrecision(i) && !context.getWeightFP32(i).empty()) {
+        context.getWeightFP32(i).copyData(context.getWeight(i));
+      }
+    }
+  }
+}
+
+void SharedFullyConnectedLayer::read(
+  nntrainer::ReadSource src, nntrainer::RunLayerContext &context, bool opt_var,
+  ml::train::ExecutionMode mode, bool trainable,
+  nntrainer::TensorDim::DataType definedWeightDataType, bool fsu,
+  size_t start_offset, bool read_from_offset, int file_fd) {
+  if (!shared_mode_) {
+    size_t current_offset = start_offset;
+    for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
+      auto &w = context.getWeight(i);
+      w.read(src, current_offset, read_from_offset, file_fd);
+
+      if (read_from_offset &&
+          current_offset != std::numeric_limits<size_t>::max()) {
+        current_offset += serializedWeightBytes(w);
       }
 
       if (context.isMixedPrecision(i) && !context.getWeightFP32(i).empty()) {

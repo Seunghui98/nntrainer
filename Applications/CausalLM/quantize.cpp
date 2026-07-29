@@ -38,7 +38,9 @@
  *     --output_bin <name> Output weight filename (auto-generated if omitted)
  *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
  *
- *   Supported data types: FP32, FP16, Q4_0, Q4_K, Q6_K
+ *   Supported data types: FP32, FP16, QINT8, Q4_0, Q4_K, Q6_K
+ *     FP16_WH: FP16 FC layers + offline-baked WH trailer for the HTP
+ *              prefill fast path (see nntrainer::setWHBakeRequested)
  *
  *   Example:
  *     # Quantize Qwen3-4B to Q4_0 FC layers (embedding stays FP32):
@@ -67,6 +69,10 @@
 #include <app_context.h>
 #include <factory.h>
 #include <tensor_dim.h>
+
+#ifdef ENABLE_HEXKL
+#include <wh_trailer.h>
+#endif
 
 #include "causal_lm.h"
 #include "deberta_v2.h"
@@ -101,10 +107,11 @@ namespace {
  * @brief Map of string data type names to DataType enum values
  */
 const std::map<std::string, DataType> dtype_str_map = {
-  {"FP32", DataType::FP32}, {"FP16", DataType::FP16},
-  {"Q4_0", DataType::Q4_0}, {"Q6_K", DataType::Q6_K},
-  {"Q4_K", DataType::Q4_K}, {"QS4CX", DataType::QS4CX},
-  {"NONE", DataType::NONE}};
+  {"FP32", DataType::FP32},   {"FP16", DataType::FP16},
+  {"QINT8", DataType::QINT8}, {"Q4_0", DataType::Q4_0},
+  {"Q6_K", DataType::Q6_K},   {"Q4_K", DataType::Q4_K},
+  {"QS4CX", DataType::QS4CX}, {"NONE", DataType::NONE},
+};
 
 /**
  * @brief Map of string ISA names to ISA enum values
@@ -151,7 +158,8 @@ DataType strToDataType(const std::string &s) {
   auto it = dtype_str_map.find(upper);
   if (it == dtype_str_map.end()) {
     throw std::invalid_argument("Unsupported data type: " + s +
-                                ". Supported: FP32, FP16, Q4_0, Q6_K, Q4_K");
+                                ". Supported: FP32, FP16, QINT8, Q4_0, Q6_K, "
+                                "Q4_K");
   }
   return it->second;
 }
@@ -173,6 +181,11 @@ std::string dataTypeToStr(DataType dt) {
  */
 std::string buildModelTensorType(const std::string &fc_dtype) {
   return fc_dtype + "-FP32";
+}
+
+bool usesQint8(DataType fc_dtype, DataType embd_dtype, DataType lmhead_dtype) {
+  return fc_dtype == DataType::QINT8 || embd_dtype == DataType::QINT8 ||
+         lmhead_dtype == DataType::QINT8;
 }
 
 /**
@@ -423,7 +436,10 @@ void printUsage(const char *prog) {
     << "                        from this config will be used.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
-    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K\n"
+    << "Supported data types: FP32, FP16, QINT8, Q4_0, Q6_K, Q4_K\n"
+    << "  FP16_WH: FP16 FC layers, plus an offline-baked WH trailer for the\n"
+    << "           HTP prefill fast path (HTP backend only; decode still "
+       "uses RM)\n"
     << "Supported ISA options: DEFAULT (current platform), X86, ARM\n"
     << "\n"
     << "Examples:\n"
@@ -685,19 +701,53 @@ int main(int argc, char *argv[]) {
     // Parse target ISA
     ml::train::ISA target_isa = strToISA(isa_str);
 
+    // FP16_WH is not a DataType: it requests an FP16 save with an appended
+    // offline-baked WH trailer for the HTP prefill fast path. True only when a
+    // WH bake is actually active (ENABLE_HEXKL); used below to force the output
+    // config's compute_engine to "htp" since a WH-baked model is HTP-only.
+    bool wh_bake_requested = false;
+    {
+      std::string up = fc_dtype_str;
+      std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      if (up == "FP16_WH") {
+#ifdef ENABLE_HEXKL
+        nntrainer::setWHBakeRequested(true);
+        wh_bake_requested = true;
+#else
+        std::cerr << "[WARNING] --fc_dtype FP16_WH requested but this build "
+                     "was compiled without ENABLE_HEXKL; saving plain FP16 "
+                     "without a WH trailer.\n";
+#endif
+        fc_dtype_str = "FP16"; // save path emits FP16 RM + WH trailer
+      }
+    }
+
     // Parse target data types
     DataType fc_dtype = strToDataType(fc_dtype_str);
     DataType embd_dtype = strToDataType(embd_dtype_str);
     DataType lmhead_dtype = strToDataType(lmhead_dtype_str);
 
-    // Validate source model is FP32
+    // Validate source model is FP32. This must be a hard error, not a
+    // warning: nntr_quantize loads the source .bin under the dtype declared
+    // here, so a config that mislabels an FP32 bin as (e.g.) "FP16-FP32"
+    // makes the loader read 2 bytes where each weight is 4, silently
+    // producing garbage-valued weights that then get re-saved. The result is
+    // a structurally valid but numerically corrupt output (and, for FP16_WH,
+    // an empty WH trailer -> "[HTP] Registered 0/0"). Refuse rather than bake
+    // a broken model.
     std::string src_tensor_type =
       nntr_cfg["model_tensor_type"].get<std::string>();
     if (src_tensor_type != "FP32-FP32") {
-      std::cerr << "[WARNING] Source model_tensor_type is '" << src_tensor_type
+      std::cerr << "[ERROR] Source model_tensor_type is '" << src_tensor_type
                 << "', not 'FP32-FP32'.\n"
-                << "  Quantization from non-FP32 models may produce unexpected "
-                   "results.\n";
+                << "  nntr_quantize requires an FP32 source model. The source "
+                   "nntr_config.json must declare\n"
+                << "  \"model_tensor_type\": \"FP32-FP32\" and "
+                   "\"fc_layer_dtype\": \"FP32\" so the FP32 .bin is loaded "
+                   "correctly.\n"
+                << "  Baking from a non-FP32-declared source produces a "
+                   "corrupt model (garbage output).\n";
+      return EXIT_FAILURE;
     }
 
     // Setup output directory
@@ -836,6 +886,11 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
+    // qint8 and FP16_WH bakes are both HTP-only paths — force the output
+    // config to target HTP so it doesn't inherit a stale/mismatched
+    // compute_engine from the source config (see wh_bake_requested above).
+    if (usesQint8(fc_dtype, embd_dtype, lmhead_dtype) || wh_bake_requested)
+      new_nntr_cfg["compute_engine"] = "htp";
 
     std::string output_config_path = output_dir + "/nntr_config.json";
 
@@ -889,9 +944,10 @@ int main(int argc, char *argv[]) {
     std::cout << "\n";
     std::cout << "To run the quantized model:\n";
     if (output_dir == model_path) {
-      std::cout << "  1. Rename nntr_config_quantized.json to "
-                   "nntr_config.json\n";
-      std::cout << "  2. nntr_causallm " << model_path << "\n";
+      // No rename needed: nntr_causallm auto-prefers nntr_config_quantized.json
+      // over nntr_config.json when both exist in the model dir (see main.cpp).
+      std::cout << "  nntr_causallm " << model_path
+                << "  (auto-loads nntr_config_quantized.json)\n";
     } else {
       std::cout << "  nntr_causallm " << output_dir << "\n\n";
     }

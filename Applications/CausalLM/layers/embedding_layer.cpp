@@ -16,6 +16,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <quantizer.h>
 #include <thread_manager.h>
 #include <util_func.h>
 
@@ -760,20 +761,33 @@ void EmbeddingLayer::save(std::ofstream &file,
         unsigned int N = dim.width();
 
         if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
-          NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
-            << "Q4_0 embedding quantization requires width to be "
-               "divisible by 32, but got width="
-            << N;
-          //////////////////////////////////////////////////////////////////
-          ///@note Please note that Embedding layer doesn't need to be
-          /// transposed!
-          //////////////////////////////////////////////////////////////////
-          nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                         {nntrainer::Tformat::NCHW, dtype});
-          nntrainer::quantize_q4_0(weight.getData<float>(),
-                                   quant_weight.getData<uint8_t>(), K, N,
-                                   nullptr);
-          quant_weight.save(file);
+
+          // Skip quantization for bias-like tensors (1D with height == 1)
+          // as they are not suitable for Q4_0 block quantization
+          if (K == 1) {
+            weight.save(file);
+          } else {
+            NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+              << "Q4_0 embedding quantization requires width to be "
+                 "divisible by 32, but got width="
+              << N;
+            //////////////////////////////////////////////////////////////////
+            ///@note Please note that Embedding layer doesn't need to be
+            /// transposed!
+            //////////////////////////////////////////////////////////////////
+            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                           {nntrainer::Tformat::NCHW, dtype});
+            nntrainer::quantize_q4_0(weight.getData<float>(),
+                                     quant_weight.getData<uint8_t>(), K, N,
+                                     nullptr);
+            quant_weight.save(file);
+          }
+        } else if (dtype == nntrainer::TensorDim::DataType::QINT8) {
+          if (K == 1) {
+            weight.save(file);
+          } else {
+            nntrainer::quantize_qint8_weight(weight, true).save(file);
+          }
         } else if (dtype == nntrainer::TensorDim::DataType::Q6_K) {
           //////////////////////////////////////////////////////////////////
           ///@note Please note that Embedding layer doesn't need to be

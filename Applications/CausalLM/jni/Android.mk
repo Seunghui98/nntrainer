@@ -12,6 +12,25 @@ ifndef NNTRAINER_ROOT
 NNTRAINER_ROOT := $(LOCAL_PATH)/../../..
 endif
 
+NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
+
+# HexKL SDK (used by nntr_quantize for WH-layout bake, ENABLE_HEXKL).
+# Off by default so plain CPU-only builds (incl. CI) never need the Hexagon
+# SDK. To build with WH-bake support, export before invoking ndk-build (or
+# build_android.sh):
+#   ENABLE_HEXKL=1 HEXKL_ADDON_ROOT=<path to .../addons/hexkl_addon>
+# Mirrors -Denable-htp=true/-Dhexkl-sdk-root in the top-level meson build.
+ENABLE_HEXKL ?= 0
+ifeq ($(ENABLE_HEXKL),1)
+ifndef HEXKL_ADDON_ROOT
+$(error ENABLE_HEXKL=1 requires HEXKL_ADDON_ROOT to point at the hexkl_addon directory)
+endif
+# remote.h/AEEStdErr.h live under <hexagon_sdk_root>/incs(/stddef); sdkl.h is
+# in the addon's own include/. hexagon_sdk_root is two levels up from the
+# addon dir (mirrors fs.parent(fs.parent(hexkl_root)) in meson.build).
+HEXAGON_SDK_ROOT := $(HEXKL_ADDON_ROOT)/../..
+endif
+
 # Common Includes Definition
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
@@ -48,6 +67,16 @@ $(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package
 endif
 include $(NNTRAINER_PREBUILT_MK)
 LOCAL_PATH := $(CAUSALLM_JNI_PATH)
+
+ifeq ($(ENABLE_HEXKL),1)
+# Prebuilt sdkl (HexKL NPU) library — armv8, matches S25 Ultra's Oryon CPU.
+# Only used by nntr_quantize (WH-layout bake, ENABLE_HEXKL).
+include $(CLEAR_VARS)
+LOCAL_MODULE := sdkl
+LOCAL_SRC_FILES := $(HEXKL_ADDON_ROOT)/lib/armv8_android26/libsdkl.so
+LOCAL_EXPORT_C_INCLUDES := $(HEXKL_ADDON_ROOT)/include
+include $(PREBUILT_SHARED_LIBRARY)
+endif
 
 # Tokenizer library
 include $(CLEAR_VARS)
@@ -180,6 +209,17 @@ LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
 LOCAL_MODULE := nntr_quantize
 LOCAL_LDLIBS := -llog -landroid
 
+ifeq ($(ENABLE_HEXKL),1)
+# ENABLE_HEXKL: layer_devel.h's WH-entry-collection code (used by --fc_dtype
+# FP16_WH) transitively pulls in remote.h/sdkl.h under this guard.
+LOCAL_CFLAGS += \
+    -DENABLE_HEXKL=1 \
+    -Drestrict=__restrict \
+    -I$(HEXAGON_SDK_ROOT)/incs \
+    -I$(HEXAGON_SDK_ROOT)/incs/stddef \
+    -I$(HEXKL_ADDON_ROOT)/include
+endif
+
 # Source files
 LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/causal_lm.cpp \
@@ -229,6 +269,9 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../api/streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+ifeq ($(ENABLE_HEXKL),1)
+LOCAL_SHARED_LIBRARIES += sdkl
+endif
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += \
