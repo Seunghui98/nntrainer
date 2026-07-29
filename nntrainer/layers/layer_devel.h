@@ -31,7 +31,18 @@
 #include <common.h>
 #include <cpu_backend.h>
 #include <layer_context.h>
+#include <quantizer.h>
 #include <tensor_dim.h>
+
+#ifdef ENABLE_HEXKL
+#include <cstring>
+// remote.h defines CDSP_DOMAIN_ID / CDSP1_DOMAIN_ID used by sdkl.h; it must
+// be included first (same order used by every other sdkl.h consumer in this
+// backend, e.g. htp_backend.cpp, hexkl_mm.cpp).
+#include <remote.h>
+#include <sdkl.h>
+#include <wh_trailer.h>
+#endif
 
 namespace ml::train {
 class Layer;
@@ -380,16 +391,16 @@ public:
               weight.getDataType() == dtype)
             weight.save(file);
           else {
+            TensorDim dim = weight.getDim();
+            unsigned int K = dim.height();
+            unsigned int N = dim.width();
+
             if (dtype == TensorDim::DataType::Q4_0) {
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)
                 << "Save with quantization only supports for FP32 weight.";
               ///@note The codelines below can be replaced with quantizer's
               /// quantize()
-              TensorDim dim = weight.getDim();
-              unsigned int K = dim.height();
-              unsigned int N = dim.width();
-
               // Skip quantization for bias-like tensors (1D with height == 1)
               // as they are not suitable for Q4_0 block quantization
               if (K == 1) {
@@ -434,6 +445,53 @@ public:
               nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
                                          true);
               file.write((const char *)data, q_size + scale_size);
+            } else if (dtype == TensorDim::DataType::QINT8) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                quantize_qint8_weight(weight, true).save(file);
+              }
+            } else if (dtype == TensorDim::DataType::FP16) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "FP16 save only supports FP32 source weights.";
+              Tensor fp16w = weight.clone(TensorDim::DataType::FP16);
+              fp16w.save(file);
+#ifdef ENABLE_HEXKL
+              if (nntrainer::hmx::g_wh_collector != nullptr) {
+                unsigned int Kdim = fp16w.getDim().height();
+                unsigned int Ndim = fp16w.getDim().width();
+                if (Ndim % 32 == 0 && Kdim % 32 == 0) {
+                  // fp16w is physically [K, N] row-major (FC-family weight
+                  // convention: height=K=in_dim.width(), width=N=unit; see
+                  // FullyConnectedLayer/SharedFullyConnectedLayer weight_dim
+                  // and their trans=false, trans_in=false dot() calls). The
+                  // sdkl WH-bake and NPU matmul require [N, K] row-major —
+                  // transpose before baking so the pre-baked bytes match what
+                  // hexkl_mm.cpp's runtime conversion produces for the same
+                  // weight (see copyForWHBake in hexkl_mm.cpp).
+                  Tensor fp16w_nk = fp16w.transpose("0:2:1");
+                  const size_t bytes = (size_t)Ndim * Kdim * sizeof(_FP16);
+                  nntrainer::hmx::WHTrailerEntry e;
+                  e.name = run_context.getWeight(i).getName();
+                  e.N = Ndim;
+                  e.K = Kdim;
+                  e.wh_bytes.resize(bytes);
+                  std::memcpy(e.wh_bytes.data(), fp16w_nk.getData<_FP16>(),
+                              bytes);
+                  int rc = sdkl_cpu_rm_to_wh_f16_inplace(
+                    (size_t)Ndim, (size_t)Kdim,
+                    reinterpret_cast<_Float16 *>(e.wh_bytes.data()));
+                  NNTR_THROW_IF(rc != 0, std::runtime_error)
+                    << "WH bake conversion failed for " << e.name;
+                  nntrainer::hmx::g_wh_collector->push_back(std::move(e));
+                }
+              }
+#endif
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";

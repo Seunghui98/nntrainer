@@ -1,9 +1,11 @@
 hmx_ops_sources = [
   'hexkl_mm.cpp',
+  'wh_trailer.cpp',
 ]
 
 hmx_ops_headers = [
   'hexkl_mm.h',
+  'wh_trailer.h',
 ]
 
 foreach s : hmx_ops_sources
