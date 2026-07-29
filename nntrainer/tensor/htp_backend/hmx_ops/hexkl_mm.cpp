@@ -25,7 +25,8 @@ namespace {
 // HtpBackend singleton finalizes the NPU before these namespace-scope
 // statics are destroyed; freeing afterwards yields sdkl_npu_free Err=1.
 //
-// Defined before the ENABLE_FP16 block so later integer-kernel sections can
+// Defined here (before ENABLE_FP16) so that both the FP16-only section
+// below and the always-compiled shgemm_u8i8_i32 section later in this file
 // share a single definition.
 static void npuFreeIfAlive(void *p) {
   if (p != nullptr && nntrainer::npuAlive())
@@ -547,5 +548,205 @@ void prefillWHCacheClear() {
 } // namespace nntrainer
 
 #endif // ENABLE_FP16
+
+// The includes below are repeated outside ENABLE_FP16 so that
+// shgemm_u8i8_i32 can be compiled even when ENABLE_FP16 is not set.
+// C++ system headers are idempotent; project headers carry their own guards.
+#include <hexkl_mm.h>
+#include <htp_backend.h>
+
+#include <sdkl.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+
+namespace nntrainer {
+namespace hmx {
+
+namespace {
+
+size_t checkedMulSizeT(size_t lhs, size_t rhs, const char *label) {
+  if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+    throw std::runtime_error(
+      std::string("shgemm_u8i8_i32: overflow computing ") + label);
+  }
+
+  return lhs * rhs;
+}
+
+size_t checkedBytes(size_t count, size_t elem_size, const char *label) {
+  return checkedMulSizeT(count, elem_size, label);
+}
+
+int checkedSdkDim(unsigned int dim, const char *label) {
+  if (dim > static_cast<unsigned int>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(std::string("shgemm_u8i8_i32: ") + label +
+                             " exceeds SDK int range");
+  }
+
+  return static_cast<int>(dim);
+}
+
+} // namespace
+
+// U8 activations × I8 weights (WH-layout) → I32 accumulator → FP32 output.
+//
+// Quantization scheme (per-tensor activation, per-channel weight):
+//   act_scale = max_abs(A) / 127.0f
+//   X_u8[i]  = clamp(round(A[i] / act_scale) + 128, 0, 255)   (zp=128)
+//   sdkl call: C_i32 = X_u8 * B_wh^T   (accumulator, no bias)
+//   C[m,n]   = act_scale * wt_scale[n] * (float(C_i32[m,n]) -
+//   float(zp_corr[n]))
+//
+// Low-level NPU entry point. B_wh must already be in WH layout.
+// SDKL requires M%64==0, so pad activation/output rows internally and copy
+// only the real M rows back to the caller.
+void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const int8_t *B_wh, const float *wt_scale,
+                     const int32_t *zp_corr, float *C) {
+  if (N % 32 != 0)
+    throw std::runtime_error("shgemm_u8i8_i32: N must be a multiple of 32 (N=" +
+                             std::to_string(N) + ")");
+
+  const size_t M_sz = M;
+  const size_t Mp_sz = ((M_sz + 63U) / 64U) * 64U;
+  const size_t N_sz = N;
+  const size_t K_sz = K;
+  const size_t mk_elems = checkedMulSizeT(M_sz, K_sz, "M*K elements");
+  const size_t mpk_elems = checkedMulSizeT(Mp_sz, K_sz, "Mp*K elements");
+  const size_t mpn_elems = checkedMulSizeT(Mp_sz, N_sz, "Mp*N elements");
+  const size_t nk_elems = checkedMulSizeT(N_sz, K_sz, "N*K elements");
+  const size_t x_bytes =
+    checkedBytes(mpk_elems, sizeof(uint8_t), "X_npu bytes");
+  const size_t c_bytes =
+    checkedBytes(mpn_elems, sizeof(int32_t), "C_npu bytes");
+  const size_t w_bytes = checkedBytes(nk_elems, sizeof(int8_t), "W_npu bytes");
+  const int sdk_M = checkedSdkDim(static_cast<unsigned int>(Mp_sz), "Mp");
+  const int sdk_N = checkedSdkDim(N, "N");
+  const int sdk_K = checkedSdkDim(K, "K");
+
+  int domain = HtpBackend::global().domain();
+
+  // --- Compute per-tensor activation scale ---
+  float max_abs = 0.0f;
+  for (size_t i = 0; i < mk_elems; ++i) {
+    if (!std::isfinite(A[i]))
+      continue;
+
+    float v = std::fabs(A[i]);
+    if (v > max_abs)
+      max_abs = v;
+  }
+  // Guard against zero, non-finite, and underflowing scale values so the
+  // quantization path stays finite and deterministic.
+  constexpr float kActQuantMax = 127.0f;
+  constexpr float kActZeroPoint = 128.0f;
+  const double scale_candidate =
+    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
+  const float act_scale =
+    (std::isfinite(scale_candidate) &&
+     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
+      ? static_cast<float>(scale_candidate)
+      : 1.0f;
+  const float inv_act_scale = 1.0f / act_scale;
+
+  // --- Allocate NPU-accessible staging buffers ---
+  void *X_npu = nullptr; // uint8  [M * K]
+  void *C_npu = nullptr; // int32  [M * N]
+  void *W_npu = nullptr; // int8   [N * K] (WH layout, copied as-is)
+
+  auto cleanup = [&]() {
+    if (X_npu)
+      npuFreeIfAlive(X_npu);
+    if (C_npu)
+      npuFreeIfAlive(C_npu);
+    if (W_npu)
+      npuFreeIfAlive(W_npu);
+  };
+
+  int err = 0;
+
+  err = sdkl_npu_alloc(x_bytes, &X_npu);
+  if (err != 0 || X_npu == nullptr) {
+    cleanup();
+    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc X_npu failed: " +
+                             std::to_string(err));
+  }
+
+  err = sdkl_npu_alloc(c_bytes, &C_npu);
+  if (err != 0 || C_npu == nullptr) {
+    cleanup();
+    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc C_npu failed: " +
+                             std::to_string(err));
+  }
+
+  err = sdkl_npu_alloc(w_bytes, &W_npu);
+  if (err != 0 || W_npu == nullptr) {
+    cleanup();
+    throw std::runtime_error("shgemm_u8i8_i32: sdkl_npu_alloc W_npu failed: " +
+                             std::to_string(err));
+  }
+
+  // --- FP32 → U8 quantization (zp = 128) ---
+  uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
+  for (size_t m = 0; m < Mp_sz; ++m) {
+    const size_t row_offset = m * K_sz;
+    if (m >= M_sz) {
+      std::memset(X_u8 + row_offset, static_cast<int>(kActZeroPoint), K_sz);
+      continue;
+    }
+
+    for (size_t k = 0; k < K_sz; ++k) {
+      const float a = A[row_offset + k];
+      if (!std::isfinite(a)) {
+        X_u8[row_offset + k] = static_cast<uint8_t>(kActZeroPoint);
+        continue;
+      }
+
+      float q = std::round(a * inv_act_scale) + kActZeroPoint;
+      if (q < 0.0f)
+        q = 0.0f;
+      if (q > 255.0f)
+        q = 255.0f;
+      X_u8[row_offset + k] = static_cast<uint8_t>(q);
+    }
+  }
+
+  // --- Copy WH-layout weight directly (no layout conversion needed) ---
+  std::memcpy(W_npu, B_wh, w_bytes);
+
+  // --- NPU matrix multiply ---
+  // sdkl_npu_mm_u8i8_i32(domain, n_row, n_col, n_inner, A[i32 out],
+  //                       X[u8 in], W[i8 WH weight])
+  std::memset(C_npu, 0, c_bytes);
+  err = sdkl_npu_mm_u8i8_i32(
+    domain, sdk_M, sdk_N, sdk_K, static_cast<int32_t *>(C_npu),
+    static_cast<const uint8_t *>(X_npu), static_cast<const int8_t *>(W_npu));
+  if (err != 0) {
+    cleanup();
+    throw std::runtime_error("sdkl_npu_mm_u8i8_i32 failed: " +
+                             std::to_string(err));
+  }
+
+  // --- Dequantize: I32 accumulator → FP32 ---
+  // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
+  const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
+  for (size_t m = 0; m < M_sz; ++m) {
+    const size_t row_offset = m * N_sz;
+    for (size_t n = 0; n < N_sz; ++n) {
+      C[row_offset + n] = act_scale * wt_scale[n] *
+                          (static_cast<float>(C_i32[row_offset + n]) -
+                           static_cast<float>(zp_corr[n]));
+    }
+  }
+
+  cleanup();
+}
+
+} // namespace hmx
+} // namespace nntrainer
 
 #endif // ENABLE_HEXKL
