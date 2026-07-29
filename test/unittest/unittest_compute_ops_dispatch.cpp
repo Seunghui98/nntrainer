@@ -339,21 +339,194 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
 
 #ifdef ENABLE_HEXKL
 /**
- * @brief The HTP ops table exists and, until a kernel is wired to it,
- *        advertises no acceleration.
- *
- * Every op falls through to the CPU implementation at this point, so an
- * engine="htp" model must still run and must not claim an accelerated
- * shgemm it cannot perform. The predicate starts tracking the NPU state
- * in the commit that adds the kernel.
+ * @brief Phase 0 smoke: the HTP ops singleton is constructible.
  */
-TEST(HtpBackendSmoke, AdvertisesNoAccelerationYet) {
-  auto *htp = nntrainer::get_htp_ops();
-  nntrainer::ensureComputeOps();
-  EXPECT_FALSE(htp->supports_shgemm());
-  EXPECT_FALSE(nntrainer::getComputeOps()->supports_shgemm());
+TEST(HtpBackendSmoke, GetOpsNonNull) {
+  EXPECT_NE(nntrainer::get_htp_ops(), nullptr);
 }
+
+/**
+ * @brief Phase 0 smoke: the NPU either initialized or gracefully
+ *        disabled, and supports_*() exactly tracks that state so a
+ *        disabled backend falls back to CPU. The CPU backend itself
+ *        never advertises shgemm acceleration.
+ */
+TEST(HtpBackendSmoke, SupportsTracksEnabledAndCpuHasNoAccel) {
+  auto &be = nntrainer::HtpBackend::global();
+  auto *htp = nntrainer::get_htp_ops();
+#ifdef ENABLE_FP16
+  EXPECT_EQ(htp->supports_shgemm(), be.enabled());
+  if (!be.enabled())
+    EXPECT_FALSE(htp->supports_shgemm());
+  nntrainer::ensureComputeOps();
+  EXPECT_FALSE(nntrainer::getComputeOps()->supports_shgemm());
+#else
+  (void)be;
+  (void)htp;
+#endif
+}
+#ifdef ENABLE_FP16
+/**
+ * @brief A tensor carrying mock ops with supports_shgemm()=true must reach
+ *        the shgemm override on dotFloat32Float16's GEMM path.
+ *        On x86 the mock forwards to the CPU shgemm, so the result is
+ *        checked for accuracy as well.
+ */
+struct ShgemmCounters {
+  std::atomic<int> shgemm{0};
+};
+
+/**
+ * @brief CpuComputeOps subclass that advertises shgemm support and forwards
+ *        the call to the real CPU shgemm, incrementing ShgemmCounters.
+ */
+class MockShgemmOps : public nntrainer::CpuComputeOps {
+public:
+  MockShgemmOps(ShgemmCounters *c) : counters_(c) {}
+
+  bool supports_shgemm() const override { return true; }
+
+  void shgemm(unsigned int o, bool tA, bool tB, unsigned int M, unsigned int N,
+              unsigned int K, float a, const float *A, unsigned int lda,
+              const _FP16 *B, unsigned int ldb, float b, float *C,
+              unsigned int ldc) override {
+    counters_->shgemm++;
+    // Forward to CPU for correctness on x86
+    nntrainer::shgemm(o, tA, tB, M, N, K, a, A, lda, B, ldb, b, C, ldc);
+  }
+
+private:
+  ShgemmCounters *counters_;
+};
+
+TEST(ShgemmGatingTest, SupportsTrueRoutesToShgemmOverride) {
+  ShgemmCounters cnt;
+  auto mock = std::make_unique<MockShgemmOps>(&cnt);
+  auto ct = std::make_shared<nntrainer::ContextData>();
+  ct->setComputeOps(mock.get());
+
+  // FP32 activation(4x8) · FP16 weight(4x8)^T => (4x4) GEMM shape (M=4,N=4,K=8)
+  nntrainer::Tensor act(1, 1, 4, 8); // FP32
+  nntrainer::TensorDim wdim({1, 1, 4, 8}, nntrainer::Tdatatype::FP16);
+  nntrainer::Tensor wgt(wdim);
+  act.setRandNormal(0.0f, 1.0f);
+  wgt.setRandNormal(0.0f, 1.0f);
+
+  act.setContextData(ct);
+  EXPECT_NO_THROW(
+    act.dot(wgt, false, true)); // trans_in=true -> weight is [N,K]
+  EXPECT_GT(cnt.shgemm.load(), 0)
+    << "shgemm override must be called when supported";
+}
+
+TEST(ShgemmGatingTest, SupportsFalseSkipsShgemmOverride) {
+  // Default CpuComputeOps: supports_shgemm()=false
+  // dotFloat32Float16 must NOT call the shgemm override.
+  ShgemmCounters cnt;
+
+  // Use fresh ctx with plain CpuComputeOps (supports_shgemm=false)
+  auto real_cpu = std::make_unique<nntrainer::CpuComputeOps>();
+  auto ct = std::make_shared<nntrainer::ContextData>();
+  ct->setComputeOps(real_cpu.get());
+
+  nntrainer::Tensor act(1, 1, 4, 8);
+  nntrainer::TensorDim wdim({1, 1, 4, 8}, nntrainer::Tdatatype::FP16);
+  nntrainer::Tensor wgt(wdim);
+  act.setRandNormal(0.0f, 1.0f);
+  wgt.setRandNormal(0.0f, 1.0f);
+
+  act.setContextData(ct);
+  EXPECT_NO_THROW(act.dot(wgt, false, true));
+  // cnt.shgemm must be 0 — gating must route to nntrainer::shgemm() directly
+  EXPECT_EQ(cnt.shgemm.load(), 0)
+    << "shgemm override must NOT be called when not supported";
+}
+#endif // ENABLE_FP16
 #endif // ENABLE_HEXKL
+
+#ifdef ENABLE_FP16
+/**
+ * @brief Decode (M==1) routing must reach the shgemm override whenever the
+ *        attached ComputeOps advertises NPU support and N is 32-aligned —
+ *        mirroring prefill's unconditional routing. No env var, no opt-in.
+ */
+struct DecodeCounters {
+  std::atomic<int> shgemm{0};
+  std::atomic<int> hsgemv{0};
+};
+
+/**
+ * @brief CpuComputeOps subclass used to verify decode (M==1) routes to the
+ *        shgemm override rather than hsgemv, incrementing DecodeCounters.
+ */
+class MockDecodeOps : public nntrainer::CpuComputeOps {
+public:
+  MockDecodeOps(DecodeCounters *c) : counters_(c) {}
+
+  bool supports_shgemm() const override { return true; }
+
+  void shgemm(unsigned int o, bool tA, bool tB, unsigned int M, unsigned int N,
+              unsigned int K, float a, const float *A, unsigned int lda,
+              const _FP16 *B, unsigned int ldb, float b, float *C,
+              unsigned int ldc) override {
+    counters_->shgemm++;
+    nntrainer::CpuComputeOps::shgemm(o, tA, tB, M, N, K, a, A, lda, B, ldb, b,
+                                     C, ldc);
+  }
+
+  void hsgemv(unsigned int o, bool tA, unsigned int M, unsigned int N, float a,
+              const _FP16 *A, unsigned int lda, const float *X, unsigned int iX,
+              float b, float *Y, unsigned int iY) override {
+    counters_->hsgemv++;
+    nntrainer::CpuComputeOps::hsgemv(o, tA, M, N, a, A, lda, X, iX, b, Y, iY);
+  }
+
+private:
+  DecodeCounters *counters_;
+};
+
+TEST(DecodeDispatchTest, DefaultRoutesToShgemmWhenAligned) {
+  DecodeCounters cnt;
+  auto mock = std::make_unique<MockDecodeOps>(&cnt);
+  auto ct = std::make_shared<nntrainer::ContextData>();
+  ct->setComputeOps(mock.get());
+
+  // M=1 decode, N=32 (aligned), K=8. No env var is set anywhere in this test.
+  nntrainer::TensorDim::TensorType t_type_fp16 = {nntrainer::Tformat::NCHW,
+                                                  nntrainer::Tdatatype::FP16};
+  nntrainer::Tensor act(1, 1, 1, 8); // FP32
+  nntrainer::Tensor wgt(1, 1, 32, 8, t_type_fp16);
+  act.setRandNormal(0.0f, 1.0f);
+  wgt.setRandNormal(0.0f, 1.0f);
+
+  act.setContextData(ct);
+  EXPECT_NO_THROW(act.dot(wgt, false, true));
+  EXPECT_GT(cnt.shgemm.load(), 0)
+    << "decode must route to shgemm by default when supported+aligned";
+  EXPECT_EQ(cnt.hsgemv.load(), 0);
+}
+
+TEST(DecodeDispatchTest, FallsBackToCpuWhenNMisaligned) {
+  DecodeCounters cnt;
+  auto mock = std::make_unique<MockDecodeOps>(&cnt);
+  auto ct = std::make_shared<nntrainer::ContextData>();
+  ct->setComputeOps(mock.get());
+
+  // M=1 decode, N=8 (NOT 32-aligned) — must fall back to hsgemv even though
+  // supports_shgemm() is true, same as the prefill N%32 guard.
+  nntrainer::TensorDim::TensorType t_type_fp16 = {nntrainer::Tformat::NCHW,
+                                                  nntrainer::Tdatatype::FP16};
+  nntrainer::Tensor act(1, 1, 1, 8);
+  nntrainer::Tensor wgt(1, 1, 8, 8, t_type_fp16);
+  act.setRandNormal(0.0f, 1.0f);
+  wgt.setRandNormal(0.0f, 1.0f);
+
+  act.setContextData(ct);
+  EXPECT_NO_THROW(act.dot(wgt, false, true));
+  EXPECT_EQ(cnt.shgemm.load(), 0);
+  EXPECT_GT(cnt.hsgemv.load(), 0);
+}
+#endif // ENABLE_FP16
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

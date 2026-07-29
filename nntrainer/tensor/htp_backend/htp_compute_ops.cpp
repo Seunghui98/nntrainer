@@ -15,16 +15,16 @@
  *
  * Compiled only when ENABLE_HEXKL is defined.
  *
- * This commit adds the table itself and its registration. The accelerated
- * overrides land with the kernels they dispatch to; until then every op
- * falls through to the CPU implementation, so an engine="htp" model runs
- * correctly, just without acceleration.
+ * Phase 0: skeleton. supports_shgemm() reports whether the NPU came up;
+ * shgemm() forwards to the (stub) HMX op. Wiring this table into the
+ * active dispatch (g_compute_ops / a Context) is a later phase.
  */
 
 #ifdef ENABLE_HEXKL
 
 #include <compute_ops.h>
 #include <cpu_ops_table.h>
+#include <hexkl_mm.h>
 #include <htp_backend.h>
 
 namespace nntrainer {
@@ -32,7 +32,24 @@ namespace nntrainer {
 /**
  * @brief ComputeOps subclass for delegating operations to the HTP NPU backend.
  */
-class HtpComputeOps : public CpuComputeOps {};
+class HtpComputeOps : public CpuComputeOps {
+public:
+#ifdef ENABLE_FP16
+  // F32 activations x F16 weights -> F32. First targeted kernel (§5.2).
+  bool supports_shgemm() const override {
+    return HtpBackend::global().enabled();
+  }
+
+  void shgemm(unsigned int order, bool tA, bool tB, unsigned int M,
+              unsigned int N, unsigned int K, float alpha, const float *A,
+              unsigned int lda, const _FP16 *B, unsigned int ldb, float beta,
+              float *C, unsigned int ldc) override {
+    hmx::shgemm_f32f16_f32(order, tA, tB, M, N, K, alpha, A, lda, B, ldb, beta,
+                           C, ldc);
+  }
+#endif // ENABLE_FP16
+
+};
 
 ComputeOps *get_htp_ops() {
   static HtpComputeOps instance;
