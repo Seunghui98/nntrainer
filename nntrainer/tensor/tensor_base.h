@@ -230,6 +230,15 @@ public:
   }
 
   /**
+   * @copydoc Tensor::getZpCorr()
+   */
+  virtual void *getZpCorr() const {
+    throw std::invalid_argument(
+      "Tensor::getZpCorr() is not supported in tensor data type " +
+      getStringDataType());
+  }
+
+  /**
    * @copydoc Tensor::getZeroPoint()
    */
   virtual unsigned int *getZeroPoint() const {
