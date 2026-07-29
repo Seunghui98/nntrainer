@@ -38,6 +38,7 @@ python3 benchmark_android.py \
 - `-n, --n-gen`: Number of generation tokens (default: 0)
 - `-t, --n-threads`: Number of OMP threads (default: 4)
 - `-b, --batch-size`: Batch size (default: 1)
+- `--compute-engine`: compute_engine 값, 콤마 구분 (e.g., `htp,cpu`). 미지정 시 `nntr_config.json` 기존 값 사용
 
 ## Output
 
@@ -103,6 +104,18 @@ python3 benchmark_android.py \
   -t 2,4,8,16
 ```
 
+#### HTP vs CPU prefill 비교
+```bash
+# M=16,32,64,128,256 에서 HTP vs CPU prefill TPS 비교
+python3 benchmark_android.py \
+  -m /data/local/tmp/nntrainer/causallm/models/qwen3-0.6b \
+  -p 16,32,64,128,256 \
+  -n 0 \
+  --compute-engine htp,cpu \
+  -r 3 \
+  --skip-cooling
+```
+
 ### Output Format
 
 The sweep script outputs a pretty table:
@@ -111,14 +124,14 @@ The sweep script outputs a pretty table:
 ```
 BENCHMARK SWEEP RESULTS (Not Real Result)
 Model: qwen3-0.6b | Size: 2.30 GiB | Type: CausalLM | Dtype: FP32-FP32 | Device: S25U
-+-----------+---------+------+----------------+-----------------+
-| Threads   | Prompt  | Gen  | Prefill TPS    | Gen TPS         |
-+===========+=========+======+================+=================+
-| 1         | 512     | 128  | 200.50 ± 5.25  | 30.10 ± 2.10    |
-| 2         | 512     | 128  | 350.25 ± 8.40  | 55.30 ± 3.20    |
-| 4         | 512     | 128  | 620.80 ± 12.50 | 95.40 ± 4.80    |
-| 8         | 512     | 128  | 750.30 ± 15.20 | 120.50 ± 5.80   |
-+-----------+---------+------+----------------+-----------------+
++---------+-----------+---------+------+----------------+---------+
+| Engine  | Threads   | Prompt  | Gen  | Prefill TPS    | Gen TPS |
++=========+===========+=========+======+================+=========+
+| htp     | 4         | 32      | 0    | 2.50 ± 0.10    | N/A     |
+| htp     | 4         | 128     | 0    | 8.10 ± 0.20    | N/A     |
+| cpu     | 4         | 32      | 0    | 8.20 ± 0.15    | N/A     |
+| cpu     | 4         | 128     | 0    | 9.10 ± 0.20    | N/A     |
++---------+-----------+---------+------+----------------+---------+
 ```
 
 ## How It Works
