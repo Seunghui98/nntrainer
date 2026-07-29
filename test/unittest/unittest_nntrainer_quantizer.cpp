@@ -495,6 +495,34 @@ TEST(nntrainer_Quantizer, ggml_q4_0_01_p) {
   EXPECT_NEAR(mean_squared_error, 0., eps * K * N);
 }
 
+TEST(nntrainer_Quantizer, qint8_weight_transpose_metadata_01_p) {
+  constexpr unsigned int K = 64;
+  constexpr unsigned int N = 32;
+
+  nntrainer::Tensor weight(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+
+  for (unsigned int k = 0; k < K; ++k) {
+    for (unsigned int n = 0; n < N; ++n) {
+      const float value = static_cast<float>((k % 9) - 4) * 0.125f +
+                          static_cast<float>(n % 7) * 0.03125f;
+      weight.setValue(0, 0, k, n, value);
+    }
+  }
+
+  nntrainer::Tensor quantized = nntrainer::quantize_qint8_weight(weight, true);
+
+  EXPECT_EQ(quantized.getDataType(), nntrainer::Tdatatype::QINT8);
+  EXPECT_EQ(quantized.getDim().height(), N);
+  EXPECT_EQ(quantized.getDim().width(), K);
+  EXPECT_EQ(quantized.scale_size(), N);
+
+  const size_t expected_bytes =
+    static_cast<size_t>(N) * K * sizeof(int8_t) +
+    static_cast<size_t>(N) * (sizeof(float) + sizeof(int32_t));
+  EXPECT_EQ(quantized.getMemoryBytes(), expected_bytes);
+}
+
 int main(int argc, char **argv) {
   int result = -1;
 

@@ -121,6 +121,11 @@ public:
   void *getScale(size_t idx) const override;
 
   /**
+   * @copydoc Tensor::getZpCorr()
+   */
+  void *getZpCorr() const override;
+
+  /**
    * @brief     i data index
    * @retval    address of ith data
    */
@@ -248,6 +253,13 @@ public:
             bool read_from_offset) override;
 
   /**
+   * @brief Read the Tensor from a mapped/read-only source
+   * @param[in] src input source
+   */
+  void read(ReadSource src, size_t start_offset = 0,
+            bool read_from_offset = false) override;
+
+  /**
    * @copydoc Tensor::argmax()
    */
   std::vector<unsigned int> argmax() const override;
@@ -291,6 +303,12 @@ public:
    * @copydoc TensorBase::read_quantization_info()
    */
   void read_quantization_info(std::ifstream &file, size_t start_offset,
+                              bool read_from_offset) override;
+
+  /**
+   * @copydoc TensorBase::read_quantization_info()
+   */
+  void read_quantization_info(ReadSource src, size_t start_offset,
                               bool read_from_offset) override;
 
   /**

@@ -9,9 +9,14 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <vector>
 
 #include <chrono>
 #include <cpu_backend.h>
@@ -25,7 +30,175 @@
 
 #include <compute_ops.h>
 
+#ifdef ENABLE_HEXKL
+#include <remote.h>
+#include <sdkl.h>
+#endif
+
 namespace nntrainer {
+
+namespace {
+
+/** @brief Identifies which projection group (attention vs feed-forward) a
+ * QINT8-quantized weight belongs to */
+enum class QInt8ProjectionGroup { Unknown, Attention, Ffn };
+
+bool envEnabled(const char *key, bool default_value) {
+  const char *value = std::getenv(key);
+  if (value == nullptr || value[0] == '\0')
+    return default_value;
+
+  return !(std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+           std::strcmp(value, "False") == 0 ||
+           std::strcmp(value, "FALSE") == 0);
+}
+
+const char *projectionGroupName(QInt8ProjectionGroup group) {
+  switch (group) {
+  case QInt8ProjectionGroup::Attention:
+    return "attention";
+  case QInt8ProjectionGroup::Ffn:
+    return "ffn";
+  case QInt8ProjectionGroup::Unknown:
+  default:
+    return "unknown";
+  }
+}
+
+QInt8ProjectionGroup classifyQInt8Projection(const Tensor &weight) {
+  const std::string &name = weight.getName();
+
+  if (name.find("_wq:") != std::string::npos ||
+      name.find("_wk:") != std::string::npos ||
+      name.find("_wv:") != std::string::npos ||
+      name.find("_attention_out:") != std::string::npos ||
+      name.find("q_proj") != std::string::npos ||
+      name.find("k_proj") != std::string::npos ||
+      name.find("v_proj") != std::string::npos ||
+      name.find("o_proj") != std::string::npos) {
+    return QInt8ProjectionGroup::Attention;
+  }
+
+  if (name.find("_ffn_gate:") != std::string::npos ||
+      name.find("_ffn_up:") != std::string::npos ||
+      name.find("_ffn_down:") != std::string::npos ||
+      name.find("gate_proj") != std::string::npos ||
+      name.find("up_proj") != std::string::npos ||
+      name.find("down_proj") != std::string::npos ||
+      name.find("expert_gate_") != std::string::npos ||
+      name.find("expert_up_") != std::string::npos ||
+      name.find("expert_down_") != std::string::npos) {
+    return QInt8ProjectionGroup::Ffn;
+  }
+
+  return QInt8ProjectionGroup::Unknown;
+}
+
+bool shouldUseCpuFallbackForQInt8(const Tensor &weight) {
+  switch (classifyQInt8Projection(weight)) {
+  case QInt8ProjectionGroup::Attention:
+    return !envEnabled("NNTR_HTP_QINT8_ATTENTION_ENABLE", true);
+  case QInt8ProjectionGroup::Ffn:
+    return !envEnabled("NNTR_HTP_QINT8_FFN_ENABLE", true);
+  case QInt8ProjectionGroup::Unknown:
+  default:
+    return false;
+  }
+}
+
+#ifdef ENABLE_HEXKL
+void fillTensorI8(sdkl_tensor_t &tensor, void *data, uint64_t rows,
+                  uint64_t cols, sdkl_tensor_layout_e layout,
+                  sdkl_tensor_dtype_e dtype) {
+  std::memset(&tensor, 0, sizeof(tensor));
+  tensor.ndims = 2;
+  tensor.dims[0] = rows;
+  tensor.dims[1] = cols;
+  tensor.strides[0] = cols;
+  tensor.strides[1] = 1;
+  tensor.num_elements = rows * cols;
+  tensor.data_offset = 0;
+  tensor.data = data;
+  tensor.data_dtype = dtype;
+  tensor.quantization = SDKL_QUANT_NONE;
+  tensor.layout = layout;
+  tensor.is_continuous = 1;
+}
+
+float quantizeActU8(const float *src, unsigned int M, unsigned int K,
+                    std::vector<uint8_t> &dst) {
+  float max_abs = 0.0f;
+  const size_t elems = static_cast<size_t>(M) * static_cast<size_t>(K);
+  for (size_t i = 0; i < elems; ++i)
+    max_abs = std::max(max_abs, std::fabs(src[i]));
+
+  float act_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+  float inv_scale = 1.0f / act_scale;
+
+  dst.resize(elems);
+  for (size_t i = 0; i < elems; ++i) {
+    float q = std::round(src[i] * inv_scale) + 128.0f;
+    q = std::min(255.0f, std::max(0.0f, q));
+    dst[i] = static_cast<uint8_t>(q);
+  }
+
+  return act_scale;
+}
+
+void dequantI32ToF32(unsigned int M, unsigned int N, float act_scale,
+                     const float *wt_scale, const int32_t *zp_corr,
+                     const int32_t *src, float *dst) {
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      const size_t index = static_cast<size_t>(m) * N + n;
+      dst[index] =
+        act_scale * wt_scale[n] *
+        (static_cast<float>(src[index]) - static_cast<float>(zp_corr[n]));
+    }
+  }
+}
+
+void qint8CpuFallback(unsigned int M, unsigned int N, unsigned int K,
+                      const float *A, const int8_t *W_wh, const float *wt_scale,
+                      const int32_t *zp_corr, float *C) {
+  std::vector<uint8_t> X_u8;
+  const float act_scale = quantizeActU8(A, M, K, X_u8);
+  std::vector<int32_t> C_i32(static_cast<size_t>(M) * N, 0);
+
+  sdkl_tensor_t left;
+  sdkl_tensor_t right;
+  sdkl_tensor_t result;
+  fillTensorI8(left, X_u8.data(), M, K, SDKL_LAYOUT_2D_ROW_MAJOR,
+               SDKL_DTYPE_U8);
+  fillTensorI8(right, const_cast<int8_t *>(W_wh), K, N,
+               SDKL_LAYOUT_2D_ROW_MAJOR_WEIGHTS_HMX, SDKL_DTYPE_I8);
+  fillTensorI8(result, C_i32.data(), M, N, SDKL_LAYOUT_2D_ROW_MAJOR,
+               SDKL_DTYPE_I32);
+
+  const int rc = sdkl_mm_tensor(SDKL_PLATFORM_CPU, &result, &left, &right);
+  NNTR_THROW_IF(rc != 0, std::runtime_error)
+    << "QINT8 CPU fallback sdkl_mm_tensor failed with rc=" << rc;
+
+  dequantI32ToF32(M, N, act_scale, wt_scale, zp_corr, C_i32.data(), C);
+}
+#endif
+
+void traceQInt8Route(const Tensor &weight, unsigned int M, unsigned int N,
+                     unsigned int K, const char *backend) {
+  if (!envEnabled("NNTR_HTP_QINT8_TRACE", false))
+    return;
+
+  ml_logi("[QINT8 route] weight=%s group=%s backend=%s M=%u N=%u K=%u "
+          "weight_dtype=%d act_dtype=%d scales=%u zp_corr=%s",
+          weight.getName().c_str(),
+          projectionGroupName(classifyQInt8Projection(weight)), backend, M, N,
+          K, static_cast<int>(weight.getDataType()),
+          static_cast<int>(Tdatatype::FP32),
+          static_cast<unsigned int>(weight.scale_size()),
+          weight.getZpCorr<int32_t>() ? "yes" : "no");
+}
+
+} // namespace
 
 FloatTensor::FloatTensor(std::string name_, Tformat fm) :
   TensorBase(name_, fm, Tdatatype::FP32) {}
@@ -1037,15 +1210,45 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
                                  bool trans, bool trans_in, float beta,
                                  Tdatatype dtype) const {
 
+  // Allocate output and derive M/N/K from the actual tensor shapes, matching
+  // the pattern used by dotFloat and dotFloat32Float16.  Without this call the
+  // output TensorDim is all-zeros (default-constructed), so N==0, which
+  // satisfies N%32==0 but causes sdkl_npu_alloc(0) to return AEE_EFAILED.
+  unsigned int first_three_flat, last_axis, input_first_three_flat,
+    input_last_axis, M, N, K, lda, ldb, ldc;
+  calculateFlattenDot(input, output, trans, trans_in, first_three_flat,
+                      last_axis, input_first_three_flat, input_last_axis, M, N,
+                      K, lda, ldb, ldc);
+
   float *data = (float *)getData();
   char *mdata = input.getData<char>();
   float *rdata = output.getData<float>();
 
-  unsigned int M = getDim().height();
-  unsigned int K = getDim().width();
-  unsigned int N = output.getDim().width();
-
   auto *o = getOps();
+  if (dtype == Tdatatype::QINT8) {
+    if (shouldUseCpuFallbackForQInt8(input)) {
+#ifdef ENABLE_HEXKL
+      qint8CpuFallback(M, N, K, data, input.getData<int8_t>(),
+                       input.getScale<float>(), input.getZpCorr<int32_t>(),
+                       rdata);
+      traceQInt8Route(input, M, N, K, "cpu");
+      return output;
+#else
+      throw std::runtime_error(
+        "Error: QINT8 CPU fallback requires ENABLE_HEXKL support");
+#endif
+    }
+
+    if (o->supports_shgemm_u8i8() && N % 32 == 0) {
+      o->shgemm_u8i8((unsigned int)dim.getStorageOrder(), M, N, K, data, lda,
+                     input.getData<int8_t>(), input.getScale<float>(),
+                     input.getZpCorr<int32_t>(), rdata, ldc);
+      traceQInt8Route(input, M, N, K, "htp_u8i8");
+      return output;
+    }
+    throw std::runtime_error(
+      "Error: QINT8 Dot requires HTP u8i8 support with N % 32 == 0");
+  }
   if (o->supports_gemv_int4_accel_fp32() && input.getMemoryData()->isSVM() &&
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {

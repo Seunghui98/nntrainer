@@ -113,10 +113,44 @@ static float relErrorF32(const float *npu, const float *cpu, int n) {
   return err_max / (ref_max + 1e-6f);
 }
 
+static std::vector<uint8_t> makeRandU8(int n, int lo = 0, int hi = 15,
+                                       uint32_t seed = 11) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> dist(lo, hi);
+  std::vector<uint8_t> v(n);
+  for (auto &x : v)
+    x = (uint8_t)dist(rng);
+  return v;
+}
 
+static std::vector<int8_t> makeRandI8(int n, int lo = -8, int hi = 7,
+                                      uint32_t seed = 13) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> dist(lo, hi);
+  std::vector<int8_t> v(n);
+  for (auto &x : v)
+    x = (int8_t)dist(rng);
+  return v;
+}
 
 // C[M,N] = X[M,K] (u8) · W[N,K] (i8)^T, exact int32.
+static void cpuGemmI32(int M, int N, int K, const uint8_t *X, const int8_t *W,
+                       int32_t *C) {
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      int32_t acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += (int32_t)X[m * K + k] * (int32_t)W[n * K + k];
+      C[m * N + n] = acc;
+    }
+}
 
+static bool exactMatchI32(const int32_t *a, const int32_t *b, int n) {
+  for (int i = 0; i < n; ++i)
+    if (a[i] != b[i])
+      return false;
+  return true;
+}
 
 // ---- NPU buffer RAII -------------------------------------------------------
 
@@ -142,6 +176,54 @@ struct NpuBuf {
 
 // ---- Fixture ---------------------------------------------------------------
 
+/**
+ * @brief Fixture for direct sdkl kernel accuracy/perf tests; captures NPU
+ *        availability and the HTP compute domain for use by test bodies.
+ */
+class HtpKernelTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    npu_enabled = nntrainer::HtpBackend::global().enabled();
+    domain = nntrainer::HtpBackend::global().domain();
+  }
+  bool npu_enabled = false;
+  int domain = 0;
+};
+
+// ---- u8i8_i32: ui8 activations, i8 weights (WH), i32 output ----------------
+
+TEST_F(HtpKernelTest, Accuracy_u8i8_i32) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+
+  // HMX INT8 requires M % 64 == 0 and N % 32 == 0 (observed on V79).
+  // sdkl_npu_mm_u8i8_i32 writes row-major output directly (per sdkl.h:696).
+  constexpr int M = 64, N = 64, K = 128;
+  auto X = makeRandU8(M * K);
+  auto W = makeRandI8(N * K);
+  std::vector<int32_t> C_cpu(M * N, 0);
+  cpuGemmI32(M, N, K, X.data(), W.data(), C_cpu.data());
+
+  NpuBuf Xb(M * K * sizeof(uint8_t)), Wb(N * K * sizeof(int8_t)),
+    Ab(M * N * sizeof(int32_t));
+  ASSERT_TRUE(Xb.ok() && Wb.ok() && Ab.ok());
+
+  std::memcpy(Xb.p, X.data(), M * K * sizeof(uint8_t));
+  std::memcpy(Wb.p, W.data(), N * K * sizeof(int8_t));
+
+  ASSERT_EQ(sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
+                                         static_cast<int8_t *>(Wb.p)),
+            0);
+  ASSERT_EQ(sdkl_npu_mm_u8i8_i32(domain, M, N, K, static_cast<int32_t *>(Ab.p),
+                                 static_cast<const uint8_t *>(Xb.p),
+                                 static_cast<const int8_t *>(Wb.p)),
+            0);
+
+  // Output is already row-major (sdkl.h:696); compare directly.
+  EXPECT_TRUE(
+    exactMatchI32(static_cast<const int32_t *>(Ab.p), C_cpu.data(), M * N))
+    << "u8i8_i32 output does not match int32 reference exactly";
+}
 
 // ---- Perf harness ----------------------------------------------------------
 
@@ -251,7 +333,49 @@ static void printPerfMarkdown() {
 
 // ---- Performance sweeps ----------------------------------------------------
 
+static void perfSweepU8I8(int domain, const std::vector<Shape> &shapes,
+                          const char *tag) {
+  for (const auto &s : shapes) {
+    const int M = s.M, N = s.N, K = s.K;
+    // HMX INT8 requires M % 64 == 0.
+    if (M % 64 != 0) {
+      printf("SKIP %s u8i8 %dx%dx%d: M not multiple of 64\n", tag, M, N, K);
+      continue;
+    }
+    auto X = makeRandU8(M * K);
+    auto W = makeRandI8(N * K);
+    std::vector<int32_t> C_cpu(M * N, 0);
+    NpuBuf Xb(M * K), Wb(N * K), Ab(M * N * sizeof(int32_t));
+    if (!(Xb.ok() && Wb.ok() && Ab.ok())) {
+      printf("SKIP %s u8i8 %dx%dx%d: alloc failed\n", tag, M, N, K);
+      continue;
+    }
+    std::memcpy(Xb.p, X.data(), M * K);
+    std::memcpy(Wb.p, W.data(), N * K);
+    sdkl_cpu_rm_to_wh_i8_inplace((size_t)N, (size_t)K,
+                                 static_cast<int8_t *>(Wb.p));
+    int last_rc = 0;
+    auto kernelOnly = [&]() {
+      last_rc = sdkl_npu_mm_u8i8_i32(
+        domain, M, N, K, static_cast<int32_t *>(Ab.p),
+        static_cast<const uint8_t *>(Xb.p), static_cast<const int8_t *>(Wb.p));
+    };
+    TimeStats k = timeIt(10, 50, kernelOnly);
+    ASSERT_EQ(last_rc, 0) << "u8i8_i32 kernel returned non-zero for shape " << M
+                          << "x" << N << "x" << K;
+    TimeStats cpu = timeIt(
+      1, 3, [&]() { cpuGemmI32(M, N, K, X.data(), W.data(), C_cpu.data()); });
+    recordPerf("u8i8_i32", M, N, K, k, k, cpu.mean_ms, true); // quant=true
+  }
+}
 
+TEST_F(HtpKernelTest, Perf_u8i8_i32) {
+  if (!npu_enabled)
+    GTEST_SKIP() << "NPU not available on this device";
+  perfSweepU8I8(domain, generalShapes(), "general");
+  perfSweepU8I8(domain, llmShapes(), "llm");
+  SUCCEED();
+}
 
 // ---- M-padding: arbitrary M (not multiple of 32) must work ------------------
 
