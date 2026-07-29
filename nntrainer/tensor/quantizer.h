@@ -443,6 +443,16 @@ public:
   }
 };
 
+/**
+ * @brief Quantize an FP32 weight tensor into the QINT8 format used by the HTP
+ *        u8i8 path.
+ * @param input Source FP32 tensor
+ * @param transpose_input Quantize the logical [N, K] view obtained from
+ *        input.transpose("0:2:1") when true
+ * @return Tensor QINT8 tensor with per-channel scales and zp_corr
+ */
+Tensor quantize_qint8_weight(const Tensor &input, bool transpose_input);
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */

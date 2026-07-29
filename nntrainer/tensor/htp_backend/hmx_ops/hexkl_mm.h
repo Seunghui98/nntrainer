@@ -87,6 +87,18 @@ void prefillWHRegistryClear();
 
 #endif // ENABLE_FP16
 
+// U8 activations x I8 weights (WH-layout) -> I32 accumulator -> FP32 output.
+// N must be 32-aligned. M is padded internally to the SDKL 64-row tile.
+namespace nntrainer {
+namespace hmx {
+
+void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const int8_t *B_wh, const float *wt_scale,
+                     const int32_t *zp_corr, float *C);
+
+} // namespace hmx
+} // namespace nntrainer
+
 #endif // ENABLE_HEXKL
 #endif // __cplusplus
 #endif // __HEXKL_MM_H__

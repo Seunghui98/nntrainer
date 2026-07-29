@@ -10,8 +10,19 @@
 
 #include <cpu_backend.h>
 #include <math.h>
+#include <mem_allocator.h>
 #include <quantizer.h>
 #include <tensor.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+#ifdef ENABLE_HEXKL
+#include <htp_backend.h>
+#include <sdkl_compat.h>
+#endif
 
 namespace nntrainer {
 
@@ -397,5 +408,99 @@ Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
 }
 
 QScheme GgmlQuantizer::qscheme() const { return scheme_; }
+
+Tensor quantize_qint8_weight(const Tensor &input, bool transpose_input) {
+  NNTR_THROW_IF(input.getDataType() != Tdatatype::FP32, std::invalid_argument)
+    << "[quantize_qint8_weight] Input tensor must be FP32.";
+
+  Tensor logical_weight =
+    transpose_input ? input.transpose("0:2:1") : input.clone();
+  const unsigned int N = logical_weight.height();
+  const unsigned int K = logical_weight.width();
+
+  NNTR_THROW_IF(N == 0 || K == 0, std::invalid_argument)
+    << "[quantize_qint8_weight] Weight dimensions must be non-zero.";
+  NNTR_THROW_IF(N % 32 != 0, std::runtime_error)
+    << "[quantize_qint8_weight] QINT8 quantization requires N divisible by 32, "
+    << "but got N=" << N;
+
+  TensorDim quant_dim = logical_weight.getDim();
+  quant_dim.setTensorType({logical_weight.getFormat(), Tdatatype::QINT8});
+  Tensor output(quant_dim, true, Initializer::NONE, "",
+                QScheme::PER_CHANNEL_AFFINE);
+
+  const float *src = logical_weight.getData<float>();
+  int8_t *dst = output.getData<int8_t>();
+  float *scales = output.getScale<float>();
+  int32_t *zp_corr = output.getZpCorr<int32_t>();
+
+  for (unsigned int n = 0; n < N; ++n) {
+    float max_abs = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      const float value = src[n * K + k];
+      NNTR_THROW_IF(!std::isfinite(value), std::runtime_error)
+        << "[quantize_qint8_weight] Encountered non-finite weight value.";
+      max_abs = std::max(max_abs, std::fabs(value));
+    }
+
+    float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+    if (!std::isfinite(scale) || scale <= 0.0f)
+      scale = 1.0f;
+
+    scales[n] = scale;
+
+    int32_t row_sum = 0;
+    for (unsigned int k = 0; k < K; ++k) {
+      const float value = src[n * K + k] / scale;
+      const long q = std::lround(value);
+      const int8_t clamped =
+        static_cast<int8_t>(std::max<long>(-127, std::min<long>(127, q)));
+      dst[n * K + k] = clamped;
+      row_sum += static_cast<int32_t>(clamped);
+    }
+    zp_corr[n] = 128 * row_sum;
+  }
+
+#ifdef ENABLE_HEXKL
+  const size_t packed_bytes =
+    static_cast<size_t>(N) * static_cast<size_t>(K) * sizeof(int8_t);
+  void *tmp = nullptr;
+  int rc = -1;
+
+  if (nntrainer::HtpBackend::global().enabled()) {
+    rc = sdkl_npu_alloc(packed_bytes, &tmp);
+  }
+
+  if (rc == 0 && tmp != nullptr) {
+    // Route the in-place SDKL layout conversion through an NPU-accessible
+    // buffer. Android device tests showed host-only buffers can fault here.
+    std::memcpy(tmp, dst, packed_bytes);
+    rc = sdkl_cpu_rm_to_wh_i8_inplace(static_cast<size_t>(N),
+                                      static_cast<size_t>(K),
+                                      static_cast<int8_t *>(tmp));
+    if (rc == 0)
+      std::memcpy(dst, tmp, packed_bytes);
+
+    const int free_rc = sdkl_npu_free(tmp);
+    NNTR_THROW_IF(free_rc != 0, std::runtime_error)
+      << "[quantize_qint8_weight] Failed to free temporary SDKL buffer.";
+  } else {
+    nntrainer::MemAllocator host_alloc;
+    host_alloc.alloc(&tmp, packed_bytes, 64);
+    std::memcpy(tmp, dst, packed_bytes);
+    rc = sdkl_cpu_rm_to_wh_i8_inplace(static_cast<size_t>(N),
+                                      static_cast<size_t>(K),
+                                      static_cast<int8_t *>(tmp));
+    if (rc == 0)
+      std::memcpy(dst, tmp, packed_bytes);
+    host_alloc.free(tmp);
+  }
+
+  NNTR_THROW_IF(rc != 0, std::runtime_error)
+    << "[quantize_qint8_weight] Failed to convert QINT8 weight to WH layout.";
+#endif
+
+  return output;
+}
 
 } // namespace nntrainer
