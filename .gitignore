@@ -96,6 +96,3 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
-
-# meson subproject scratch, written by `meson setup` next to the wrap files
-/subprojects/.wraplock

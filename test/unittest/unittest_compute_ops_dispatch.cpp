@@ -22,6 +22,13 @@
 #include <atomic>
 #include <memory>
 
+#if defined(ENABLE_FP16) || defined(ENABLE_HEXKL)
+#include <cpu_ops_table.h>
+#endif
+#ifdef ENABLE_HEXKL
+#include <htp_backend.h>
+#endif
+
 namespace {
 
 /**
@@ -90,6 +97,10 @@ private:
   CallCounters *counters_;
 };
 
+/**
+ * @brief Test fixture wiring a MockComputeOps into a fresh ContextData for
+ *        each test, so dispatch tests can assert on per-call counters.
+ */
 class ComputeOpsDispatchTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -325,6 +336,24 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
   // Now a.multiply(b_migrated) is on the same context — no throw.
   EXPECT_NO_THROW(a.multiply(b_migrated, out));
 }
+
+#ifdef ENABLE_HEXKL
+/**
+ * @brief The HTP ops table exists and, until a kernel is wired to it,
+ *        advertises no acceleration.
+ *
+ * Every op falls through to the CPU implementation at this point, so an
+ * engine="htp" model must still run and must not claim an accelerated
+ * shgemm it cannot perform. The predicate starts tracking the NPU state
+ * in the commit that adds the kernel.
+ */
+TEST(HtpBackendSmoke, AdvertisesNoAccelerationYet) {
+  auto *htp = nntrainer::get_htp_ops();
+  nntrainer::ensureComputeOps();
+  EXPECT_FALSE(htp->supports_shgemm());
+  EXPECT_FALSE(nntrainer::getComputeOps()->supports_shgemm());
+}
+#endif // ENABLE_HEXKL
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

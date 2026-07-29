@@ -13,7 +13,7 @@ if get_option('platform') == 'android'
     # Fallback: derive from arm-arch (for builds without --arm-arch argument)
     arm_arch_opt = get_option('arm-arch')
     if arm_arch_opt == 'armv9.2-a'
-      arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
+      arm_march_flag = '-march=armv9.2-a+fp16+dotprod+i8mm+nosve+nosve2'
     elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
       arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
     endif
@@ -31,6 +31,22 @@ flags = extra_defines + flags
 
 and_conf.set('MESON_CFLAGS', ' '.join(flags))
 and_conf.set('MESON_CXXFLAGS', ' '.join(flags))
+# The host compiler (x86 gcc) fails the has_argument('-march=...+sve..') check in
+# the kai sub-meson.build, so SVE sources are excluded from nntrainer_sources even
+# though the NDK target (armv9.2-a) supports SVE. Add them explicitly here.
+if arm_march_flag.contains('sve') and not arm_march_flag.contains('nosve')
+  _kai_dir = meson.project_source_root() / 'nntrainer/tensor/cpu_backend/arm/kai'
+  _kai_d32p_dir = _kai_dir / 'matmul_clamp_f32_qsi8d32p_qsi4c32p'
+  nntrainer_sources += [
+    _kai_dir / 'kai_common_sve_asm.S',
+    _kai_d32p_dir / 'kai_matmul_clamp_f32_qsi8d32p1x4_qsi4c32p8x4_1x8_sve_dotprod.c',
+    _kai_d32p_dir / 'kai_matmul_clamp_f32_qsi8d32p1x4_qsi4c32p8x4_1x8_sve_dotprod_asm.S',
+    _kai_d32p_dir / 'kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p8x8_1x8_sve_dotprod.c',
+    _kai_d32p_dir / 'kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p8x8_1x8_sve_dotprod_asm.S',
+    _kai_d32p_dir / 'kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p8x8_16x8_sve_i8mm.c',
+    _kai_d32p_dir / 'kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p8x8_16x8_sve_i8mm_asm.S',
+  ]
+endif
 and_conf.set('MESON_NNTRAINER_SRCS', ' '.join(nntrainer_sources))
 and_conf.set('MESON_NNTRAINER_INCS', ' '.join(nntrainer_inc_abs))
 and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
@@ -72,7 +88,7 @@ endif
 
 if get_option('enable-opencl')
   # Set OpenCL block markers to include the OpenCL sections
-  and_conf.set('MESON_ENABLE_OPENCL', 1) 
+  and_conf.set('MESON_ENABLE_OPENCL', 1)
   if clblast_dep.found()
     and_conf.set('MESON_CLBLAST_ROOT', clblast_root)
     and_conf.set('MESON_CL_ROOT', opencl_root)
@@ -83,6 +99,18 @@ else
   # No OpenCL libraries needed
   and_conf.set('MESON_CLBLAST_ROOT', '')
   and_conf.set('MESON_CL_ROOT', '')
+endif
+
+if get_option('enable-htp')
+  # Wire libsdkl.so into ndk-build as a PREBUILT_SHARED_LIBRARY.
+  # hexkl_lib_dir is set in the top-level meson.build HTP block and is in scope.
+  and_conf.set('MESON_ENABLE_HEXKL', 1)
+  and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', hexkl_root / 'include')
+else
+  and_conf.set('MESON_ENABLE_HEXKL', 0)
+  and_conf.set('MESON_HEXKL_LIB_DIR', '')
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', '')
 endif
 
 if tflite_dep.found()
@@ -174,4 +202,3 @@ ndk_result = custom_target('ndk-build',
                            install: true,
                            install_dir: nntrainer_libdir,
                            command: [ndk_build_command])
-

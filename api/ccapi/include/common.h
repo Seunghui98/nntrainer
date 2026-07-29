@@ -50,6 +50,7 @@ enum LayerComputeEngine {
   CPU, /**< CPU as the compute engine */
   GPU, /**< GPU as the compute engine */
   QNN, /**< QNN as the compute engine */
+  HTP, /**< HTP (Hexagon/HMX NPU) as the compute engine */
 };
 
 /**

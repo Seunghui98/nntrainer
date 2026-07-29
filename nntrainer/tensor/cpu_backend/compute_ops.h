@@ -241,6 +241,7 @@ public:
                                      unsigned int M, unsigned int N,
                                      unsigned int K, unsigned int group_size);
 
+
 #ifdef ENABLE_FP16
   // ===========================================================================
   // FP16 BLAS
@@ -328,12 +329,22 @@ public:
   // ===========================================================================
   // Mixed precision BLAS
   // ===========================================================================
+  /**
+   * @brief Accelerator predicate for shgemm (F32 x F16 -> F32).
+   *
+   * Defaults to false; accelerator backends (e.g. HTP/HMX) override it
+   * to gate the NPU path with a CPU fallback at the call site. CPU
+   * backends leave it false and always run shgemm() directly.
+   */
+  virtual bool supports_shgemm() const { return false; }
+
   virtual void shgemm(const unsigned int TStorageOrder, bool TransA,
                       bool TransB, const unsigned int M, const unsigned int N,
                       const unsigned int K, const float alpha, const float *A,
                       const unsigned int lda, const _FP16 *B,
                       const unsigned int ldb, const float beta, float *C,
                       const unsigned int ldc);
+
   virtual void shgemv(const unsigned int TStorageOrder, bool TransA,
                       const unsigned int M, const unsigned int N,
                       const float alpha, const float *A, const unsigned int lda,
@@ -432,6 +443,11 @@ ComputeOps *get_cpu_ops();
 /** @brief OpenCL accelerator ComputeOps singleton. Defined when
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
 ComputeOps *get_cl_ops();
+#endif
+#ifdef ENABLE_HEXKL
+/** @brief HTP (Hexagon/HMX) accelerator ComputeOps singleton. Defined
+ *  when enable-htp is on, in htp_backend/htp_compute_ops.cpp. */
+ComputeOps *get_htp_ops();
 #endif
 
 } // namespace nntrainer
