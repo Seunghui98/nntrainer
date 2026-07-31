@@ -612,6 +612,8 @@ static int mode_one(int domain, unsigned N, unsigned K, unsigned n_row) {
 */
 static int mode_stagecost(int domain, int full, unsigned iters) {
   (void)domain;
+  if (iters == 0)
+    iters = 1; /* never divide by a count the caller fumbled */
   const size_t n = full ? N_WEIGHTS * N_LAYERS : N_WEIGHTS;
   const unsigned scale = full ? 1u : N_LAYERS;
 
@@ -715,8 +717,11 @@ int main(int argc, char **argv) {
     printf("[DECODE PROBE] CDSP version = %s\n", version);
 
   if (strcmp(mode, "stagecost") == 0) {
+    /* argv[2] is the sub-mode here, not a count -- taking `iters` from it
+       gave atoi("full") == 0 and a nan result. */
     const int sfull = (argc > 2) && strcmp(argv[2], "full") == 0;
-    const int sres = mode_stagecost(domain, sfull, iters);
+    const unsigned sit = (argc > 3) ? (unsigned)atoi(argv[3]) : (sfull ? 5u : 20u);
+    const int sres = mode_stagecost(domain, sfull, sit ? sit : 1u);
     sdkl_npu_finalize(domain);
     printf("\n[DECODE PROBE] done\n");
     return sres;
