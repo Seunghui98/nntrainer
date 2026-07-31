@@ -149,3 +149,20 @@ LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := sdkl_npu_probe.cpp
 LOCAL_SHARED_LIBRARIES := sdkl_armv8
 include $(BUILD_EXECUTABLE)
+
+# ---- executable: hexkl_pin_probe (armv8 libsdkl, no gtest, no libnntrainer) ----
+# Answers whether one ~79 MB weight can stay resident in NPU memory while
+# matmuls run, which is the gate for moving lm_head to the u8i4 HMX path.
+# Same shape as sdkl_npu_probe: talks to sdkl.h directly, links nothing else.
+include $(CLEAR_VARS)
+LOCAL_MODULE     := hexkl_pin_probe
+LOCAL_CFLAGS     := \
+    -pthread \
+    -DENABLE_FP16=1 -DUSE__FP16=1 \
+    -Drestrict=__restrict \
+    -I$(HEXKL_ADDON_ROOT)/../../incs \
+    -march=armv8.2-a+fp16+dotprod+i8mm -O2
+LOCAL_LDLIBS     := -llog
+LOCAL_SRC_FILES  := hexkl_pin_probe.c
+LOCAL_SHARED_LIBRARIES := sdkl_armv8
+include $(BUILD_EXECUTABLE)
