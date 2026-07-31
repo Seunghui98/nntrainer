@@ -100,25 +100,23 @@ so overshooting the cap is safe.
 The u8i4 path has the same shape of problem in `INT_WEIGHT_MAX_BYTES = 48 MiB`
 (u8i4 branch), which needs the same treatment when that branch lands.
 
-| approach | NPU held | staging per token | needs |
+| approach | NPU held | staging per token | status |
 | :-- | --: | --: | :-- |
-| today (fp16, 64 MiB cap) | 64 MiB | **39.3 ms** | — |
-| **(a) fp16 resident** | 840 MiB | **0** | raise `WH_CACHE_MAX_BYTES` to ~900 MiB. **No model change.** |
-| (b) u8i4 FC, not resident | 48 MiB | 9.8 ms | `fc_layer_dtype=QINT4_HTP` (220 MB / 22.4 GB/s) |
-| **(c) u8i4 FC resident** | 210 MiB | **0** | (b) plus the cap |
+| before | 64 MiB | **39.3 ms** | — |
+| **(a) fp16 resident** | 840 MiB | **0** | **implemented, unmeasured.** No model change. |
+| (b) u8i4 FC, not resident | 48 MiB | 9.8 ms | needs `fc_layer_dtype=QINT4_HTP` |
+| **(c) u8i4 FC resident** | 210 MiB | **0** | (b) plus the same fix on `INT_WEIGHT_MAX_BYTES` |
 
 Both (a) and (c) fit inside the measured budget with room to spare.
 
-**(a) is a one-constant change** and needs no re-quantised model, which makes it
-the cheapest thing on this page to try. Its cost is memory: the host keeps its
-WH copy *and* the NPU holds one, so 840 MiB + 840 MiB ≈ **1.7 GB live at once**.
-(c) is the same idea at 210 + 210 MiB and is the better end state, but it needs
-the u8i4 FC path and a re-quantised model first.
+(a)'s cost is memory: the host keeps its WH copy *and* the NPU holds one, so
+qwen3-0.6b at fp16 is 840 MiB + 840 MiB ≈ **1.7 GB live at once**. (c) is the
+same idea at 210 + 210 MiB and is the better end state, but it needs the u8i4
+FC path and a re-quantised model first.
 
-An intermediate worth considering if 1.7 GB is too much: raise the cap far
-enough to hold the *hot* weights rather than all of them. The cache already
-evicts FIFO; the pin probe says the ceiling is high enough that the policy, not
-the hardware, is what needs choosing.
+If 1.7 GB is too much on a given device, `NNTR_HTP_WH_CACHE_MB` sets how much
+of the model stays resident; the cache evicts FIFO, so a partial cap holds the
+most recently used weights rather than none of them.
 
 ---
 
@@ -136,17 +134,19 @@ multithreaded CPU int4 kernel over the same bytes.
 
 Suggested order, given what is now measured:
 
-| # | step | why |
-| --: | :-- | :-- |
-| 1 | migrate to beta2 ([08](08_attention_hmx_design.md) §4) | prerequisite for everything below |
-| 2 | raise `WH_CACHE_MAX_BYTES`, measure TPS | 39.3 ms, one constant |
-| 3 | measure per-call overhead at FC shapes | sizes the ~18 ms estimate above |
-| 4 | u8i4 FC weights + cap | same win at a quarter of the memory |
-| 5 | lm_head u8i4 ([09](09_lmhead_u8i4_plan.md)) | 6.88 ms, and the milestone |
+| # | step | why | status |
+| --: | :-- | :-- | :-- |
+| 1 | make the registry fill the resident cache | 39.3 ms | **done, needs a device run** |
+| 2 | measure TPS with and without `NNTR_HTP_WH_CACHE_MB=64` | turns a microbenchmark into an end-to-end delta | next |
+| 3 | migrate to beta2 ([08](08_attention_hmx_design.md) §4) | prerequisite for 4 and 5 | |
+| 4 | measure per-call overhead at FC shapes; consider QKV / gate-up fusion | sizes and attacks the ~18 ms estimate | |
+| 5 | u8i4 FC weights + the same cap fix | same win at a quarter of the memory | |
+| 6 | lm_head u8i4 ([09](09_lmhead_u8i4_plan.md)) | 6.88 ms, and the milestone | |
 
-Step 2 is worth doing even if it is later reverted: it converts the 39.3 ms
-from a microbenchmark into an end-to-end TPS delta, which is the only number
-that settles how much of it was really on the critical path.
+Step 2 is the one that matters most right now. 39.3 ms is a standalone
+`memcpy` benchmark; only the TPS delta says how much of it was on the critical
+path. `NNTR_HTP_WH_CACHE_MB=64` restores the old behaviour, so the A/B needs no
+rebuild.
 
 ---
 
