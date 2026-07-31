@@ -166,10 +166,10 @@ So a 37 MiB `sdkl_npu_alloc`/`free` pair happens **once per generated token**,
 plus re-allocating every FC accumulator. This is a fastrpc mmap round trip, not
 a pool hit.
 
-### The padding is not required. The header says so.
+### beta2 removed the padding requirement. The wrapper is stale, not wrong.
 
-`hexkl_mm.cpp:695` asserts "SDKL requires M%64==0" with no citation. The 1.0.0-beta2
-header contradicts it, in the doc block for this exact function:
+`hexkl_mm.cpp:695` asserts "SDKL requires M%64==0" with no citation. The
+1.0.0-beta2 header contradicts it, in the doc block for this exact function:
 
 > `sdkl_npu_mm_u8i4_i32` — This kernel is optimized for int32 matmul on the
 > Hexagon NPU. **It accepts arbitrary (unaligned) dimensions and handles X
@@ -177,16 +177,24 @@ header contradicts it, in the doc block for this exact function:
 
 Neither `M % 64` nor `N % 32` is a precondition. The kernel pads for itself.
 
-Two details confirm this is deliberate and specific to u8i4:
+**That sentence does not exist in beta1.** beta1's doc block for the same
+function says only the usual "assumes A/X row-major, W in WH" plus a note that
+buffers should come from `sdkl_npu_alloc()` — which is *address* alignment, not
+dimension alignment. So `Mp = 64` was very likely correct against beta1, which
+is what the "verified on V79/V81" comment at `hexkl_mm.cpp:299` is recording.
+The wrapper is not wrong-headed; it is one SDK revision behind.
 
-- **Only u8i4 carries that sentence.** `sdkl_npu_mm_u8i8_i32`'s note says only
-  that buffers should come from `sdkl_npu_alloc()` — which is *address*
-  alignment, not dimension alignment. The `Mp = 64` rounding may still be
-  needed there.
-- **Only u8i4 takes `size_t n_row`**; every other kernel in the header takes
-  `int`. It was reworked after the others.
+Two consequences:
 
-So `shgemm_u8i4_i32` should pass `n_row = M` and size its buffers to `M`:
+- **This fix requires the beta2 migration.** Every SDKL layout call in the tree
+  still uses beta1 spellings; the rename table is in
+  [08](08_attention_hmx_design.md) §4. Signatures are unchanged, so it is
+  mechanical, but it has to happen first.
+- **It does not transfer to u8i8.** `sdkl_npu_mm_u8i8_i32` carries no such
+  sentence in either revision, so `shgemm_u8i8_i32` should keep its `Mp = 64`.
+
+So `shgemm_u8i4_i32`, once on beta2, should pass `n_row = M` and size its
+buffers to `M`:
 
 | | now (`Mp = 64`) | per the header (`M = 1`) |
 | :-- | --: | --: |
@@ -417,13 +425,14 @@ Two baselines, not one:
 | 0 | quantise to `QS4CX-FP16` and measure it — the baseline u8i4 must clear (§2) | — |
 | 1 | run `hexkl_pin_probe sweep` **and** `total` | — |
 | 2 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 1 says FITS, 0 leaves room to win |
-| 3 | pass `M` instead of `Mp` in `shgemm_u8i4_i32`, size X/C to `M`, verify against CPU (§4 fix 1) | 2 |
+| 3 | migrate the tree to beta2 layout-function names ([08](08_attention_hmx_design.md) §4) | 2 |
+| 3a | pass `M` instead of `Mp` in `shgemm_u8i4_i32`, size X/C to `M`, verify against CPU (§4 fix 1) | 3 |
 | 4 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
 | 5 | quantise to `QINT4_HTP` (§5.2) | 2, 4 |
 | 6 | `engine=cpu` → `COMPUTE_ENGINE` (§6) | 2 |
 | 7 | u8i4 CPU fallback (§7) | 2 |
 | 8 | accuracy validation (§8) | 5, 6 |
-| 9 | performance, then enable by default | 3, 7, 8 |
+| 9 | performance, then enable by default | 3a, 7, 8 |
 
 Steps 0, 1 and 4 need nothing merged and can start now. **Step 0 is the one that
 can make steps 2–9 unnecessary**, so it goes first even though it is not part

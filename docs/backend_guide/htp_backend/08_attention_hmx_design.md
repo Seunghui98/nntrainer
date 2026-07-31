@@ -99,11 +99,46 @@ beta1; beta2 needs a signed Product Kit License Agreement). Relevant changes:
 
 | change | why it matters here |
 | :-- | :-- |
+| **`sdkl_npu_mm_u8i8` and `sdkl_npu_mm_u8i4`** (AH-native) | **new in beta2** — beta1 shipped only the `_i32` row-major forms. A fused attention chain needs these; under beta1 it was not expressible at all. |
+| `sdkl_npu_mm_u8i4_i32` now "accepts arbitrary (unaligned) dimensions and handles X layout conversion and output padding internally" | **new sentence in beta2.** beta1's doc block for the same function does not say it, which means `hexkl_mm.cpp`'s `Mp = 64` was likely correct against beta1 and is stale against beta2. See [09](09_lmhead_u8i4_plan.md) §4. |
 | `sdkl_npu_mm_f16f16_f16` | fp16 in, fp16 out. Removes *all* dtype conversion from the attention path, which is fp16 end to end on device. |
-| Layout helpers renamed to `<dtype>_rm_to_<dtype>_<layout>` | e.g. `sdkl_cpu_f16_rm_to_f16_wh_inplace`. beta1 spellings do not compile. |
-| DSP-side layout conversion | conversions no longer have to round-trip to the host. |
+| `sdkl_npu_get_hw_info` / `sdkl_npu_hw_info_t` | new. Reports `vtcm_size`, `num_hvx_units`, `hmx_fp16_rate`. `hexkl_pin_probe.c` calls it, so that probe is beta2-only. |
+| New AH converters: `sdkl_cpu_u8_rm_to_u8_ah(_inplace)`, `sdkl_cpu_f32_rm_to_f16_ah`, `sdkl_cpu_f16_ah_to_f32_rm`, non-inplace `sdkl_cpu_f16_rm_to_f16_ah` | new. Needed to feed the AH-native kernels above. |
+| Header now `#include "remote.h"` itself | the include-order workaround at `hexkl_mm.cpp:17` becomes unnecessary. |
+| Layout helpers renamed to `<dtype>_rm_to_<dtype>_<layout>` | beta1 spellings do not compile — see the migration table below. |
 | Micro API shipped (`hexkl_micro.h`, `libhexkl_micro.a`) | makes the hand-written-DSP-kernel option real rather than theoretical. |
 | `hexkl_micro_hw_init` takes **three** args | `(vtcm_base, vtcm_size, hmx_fp16_rate)`. beta1 probes pass two. |
+
+`sdkl_npu_init_config_t` is **not** new and is not a lever: it is an empty
+struct in both revisions, "reserved for future use".
+
+### Migrating this tree from beta1 to beta2
+
+Every SDKL layout call in the tree still uses the beta1 spelling. The
+signatures are unchanged, so this is a mechanical rename:
+
+| beta1 (what is in the tree) | beta2 | callers |
+| :-- | :-- | :-- |
+| `sdkl_cpu_rm_to_wh_f16_inplace` | `sdkl_cpu_f16_rm_to_f16_wh_inplace` | `hexkl_mm.cpp`, `layer_devel.h`, `sdkl_npu_probe.cpp`, `unittest_nntrainer_htp_kernels.cpp` |
+| `sdkl_cpu_rm_to_wh_i8_inplace` | `sdkl_cpu_i8_rm_to_i8_wh_inplace` | `quantizer.cpp`, both htp unittests |
+| `sdkl_cpu_rm_to_wh_i4` | `sdkl_cpu_i4_rm_to_i4_wh` | `quantizer.cpp` (u8i4 branch) |
+| `sdkl_cpu_rm_to_ah_f16_inplace` | `sdkl_cpu_f16_rm_to_f16_ah_inplace` | — |
+| `sdkl_cpu_ah_to_rm_f16_inplace` | `sdkl_cpu_f16_ah_to_f16_rm_inplace` | — |
+| `sdkl_cpu_ui8i8_ah_to_i32_rm` | `sdkl_cpu_i32_ah_to_i32_rm` (+ `_inplace`) | — |
+| `sdkl_cpu_ui8i4_ah_to_i32_rm` | **removed** | — |
+| `sdkl_cpu_rm_to_wh_i8` | `sdkl_cpu_u8_rm_to_u8_ah` | — |
+
+Two of those rows are more than renames:
+
+- **`sdkl_cpu_rm_to_wh_i8` was misnamed in beta1.** Its parameters are
+  `(n_inner, n_row, X_i8_cpu, Xq)` — an *activation*, not a weight — and beta2
+  renames it to `sdkl_cpu_u8_rm_to_u8_ah`, i.e. it always produced AH, not WH.
+  Nothing in this tree calls it (only the `_inplace` weight variant), so there
+  is no latent bug, but do not reach for it expecting a WH converter.
+- **The u8i4-specific AH→RM converter is gone.** beta1 had
+  `sdkl_cpu_ui8i4_ah_to_i32_rm`; beta2 keeps only `sdkl_cpu_i32_ah_to_i32_rm`,
+  documented as the u8i8 variant. If the AH-native `sdkl_npu_mm_u8i4` is used,
+  whether that one reads its output correctly is an open question.
 
 ### The naming is about layout, not output dtype
 
@@ -128,10 +163,9 @@ the suffixed ones round-trip through row-major on every call. It is also why
 probe (5) in `hexkl_layout_probe.c` — is the accumulator's AH the same AH that
 `rm_to_ah` produces — decides whether that fusion is reachable at all.
 
-`sdkl_npu_mm_u8i4_i32` additionally documents that it "accepts arbitrary
-(unaligned) dimensions and handles X layout conversion and output padding
-internally". No other kernel in the header says this, and it is the only one
-taking `size_t` dimensions rather than `int`. See
+`sdkl_npu_mm_u8i4_i32` is also the only kernel taking `size_t` dimensions
+rather than `int` — true in beta1 as well, so it has been the odd one out for a
+while. What is new in beta2 is the unaligned-dimension guarantee. See
 [09](09_lmhead_u8i4_plan.md) §4 for what that changes.
 
 ---
