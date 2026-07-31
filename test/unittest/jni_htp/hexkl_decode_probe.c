@@ -17,7 +17,8 @@
  * 102 ms per token -- and 840 MiB at a plausible memcpy rate lands in the same
  * range, which is the hypothesis this probe exists to confirm or kill.
  *
- * It reproduces both sides with the real shapes and M=1:
+ * It reproduces both sides with the real shapes at decode's M=1 (rounded up to
+ * the fp16 kernel's 32-row tile, exactly as shgemm_f32f16_f32 does):
  *
  *   staged    a host-resident WH weight, memcpy'd into NPU scratch before each
  *             matmul. What the code does today.
@@ -53,6 +54,15 @@
 
 #define MB (1024ull * 1024ull)
 #define N_LAYERS (28U)
+
+/* sdkl_npu_mm_f32f16_f32 wants n_row on a 32-row tile. Only
+   sdkl_npu_mm_u8i4_i32 documents (and, measured, delivers) arbitrary
+   dimensions -- passing M=1 here returns 0x8000040d and leaves SDKL unable to
+   free its buffers afterwards. shgemm_f32f16_f32 rounds up for the same
+   reason (hexkl_mm.cpp:311), so padding here is not an artifact of the probe:
+   it is what the decode path really does. */
+#define F16_TILE_ROWS (32U)
+#define DECODE_MP (F16_TILE_ROWS) /* M=1 decode, rounded up to one tile */
 
 static double now_us(void) {
   struct timespec ts;
@@ -158,7 +168,9 @@ typedef struct {
 /*!
   @brief One decode-shaped matmul, optionally preceded by the staging memcpy.
 
-  M is 1: this is decode, one token, one row of activations.
+  Decode is one token, so the real M is 1 -- but the fp16 kernel takes a
+  32-row tile, so DECODE_MP rows go in and only row 0 is read back. That is
+  not the probe rounding for convenience; it is what shgemm_f32f16_f32 does.
 */
 static int run_one(int domain, const weight *w, void *scratch, float *X,
                    float *A, int staged, totals *t, int check) {
@@ -176,16 +188,21 @@ static int run_one(int domain, const weight *w, void *scratch, float *X,
   }
 
   const double t1 = now_us();
-  const int rc = sdkl_npu_mm_f32f16_f32(domain, 1, (int)s->N, (int)s->K, A, X,
-                                        (const _Float16 *)W);
+  const int rc = sdkl_npu_mm_f32f16_f32(domain, (int)DECODE_MP, (int)s->N,
+                                        (int)s->K, A, X, (const _Float16 *)W);
   t->mm_us += now_us() - t1;
 
   if (rc != 0) {
-    printf("    [%s] sdkl_npu_mm_f32f16_f32 failed rc=%d\n", s->name, rc);
+    printf("    [%s] sdkl_npu_mm_f32f16_f32 failed rc=%d (0x%x)\n", s->name, rc,
+           (unsigned)rc);
+    printf("    once this fails, SDKL cannot free its buffers either -- the "
+           "munmap errors\n    that follow are fallout, not separate "
+           "problems.\n");
     return -1;
   }
 
   if (check) {
+    /* Row 0 is the real decode row; rows 1..DECODE_MP-1 are tile padding. */
     for (unsigned n = 0; n < s->N; n++) {
       if (fabsf(A[n] - (float)s->K) > 0.5f) {
         printf("    [%s] WRONG at %u: got %.1f, expected %u\n", s->name, n,
@@ -240,18 +257,21 @@ static int measure(int domain, weight *ws, size_t n, unsigned iters,
     if (ws[i].shape->K > max_K) max_K = ws[i].shape->K;
   }
 
+  /* Both sized for the padded row count, exactly as shgemm_f32f16_f32 does. */
   void *Xv = NULL, *Av = NULL;
-  if (sdkl_npu_alloc((size_t)max_K * sizeof(float), &Xv) != 0 ||
-      sdkl_npu_alloc((size_t)max_N * sizeof(float), &Av) != 0) {
+  if (sdkl_npu_alloc((size_t)DECODE_MP * max_K * sizeof(float), &Xv) != 0 ||
+      sdkl_npu_alloc((size_t)DECODE_MP * max_N * sizeof(float), &Av) != 0) {
     printf("  activation alloc failed\n");
     sdkl_npu_free(scratch);
     return -1;
   }
   float *X = (float *)Xv, *A = (float *)Av;
-  for (unsigned i = 0; i < max_K; i++)
+  for (size_t i = 0; i < (size_t)DECODE_MP * max_K; i++)
     X[i] = 1.0f;
 
-  /* Correctness once, before any timing. */
+  /* Correctness once, before any timing. Bail on the first failure: a failed
+     call leaves SDKL in a state where even the frees below report errors, and
+     continuing only buries the one message that matters. */
   totals warm = {0, 0, 0};
   for (size_t i = 0; i < n; i++)
     if (run_one(domain, &ws[i], scratch, X, A, 1, &warm, 1) != 0) {
