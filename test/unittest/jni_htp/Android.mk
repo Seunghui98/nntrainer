@@ -14,6 +14,25 @@ endif
 GTEST_ROOT        := $(NNTRAINER_ROOT)/subprojects/googletest/googletest
 NNTRAINER_LIB_DIR := $(NNTRAINER_ROOT)/builddir/jni/arm64-v8a
 
+# remote.h and the rest of the FastRPC headers come from the Hexagon SDK, not
+# from the HexKL addon. When the addon is installed inside an SDK tree
+# ($HEXAGON_SDK_ROOT/<ver>/addons/hexkl_addon) they sit two levels up, which is
+# what this used to hardcode. A standalone unzip of the 1.0.0-beta2 package has
+# no SDK above it, so the path has to be found rather than assumed. Order:
+# an explicit HEXKL_INCS_DIR, the addon's own incs/, $HEXAGON_SDK_ROOT/incs,
+# then the in-SDK-tree layout as the last resort so existing setups are
+# unaffected.
+HEXKL_INCS_DIR := $(HEXKL_INCS_DIR)
+ifeq ($(HEXKL_INCS_DIR),)
+  ifneq ($(wildcard $(HEXKL_ADDON_ROOT)/incs/remote.h),)
+    HEXKL_INCS_DIR := $(HEXKL_ADDON_ROOT)/incs
+  else ifneq ($(wildcard $(HEXAGON_SDK_ROOT)/incs/remote.h),)
+    HEXKL_INCS_DIR := $(HEXAGON_SDK_ROOT)/incs
+  else
+    HEXKL_INCS_DIR := $(HEXKL_ADDON_ROOT)/../../incs
+  endif
+endif
+
 # ---- prebuilt: libnntrainer.so ----
 include $(CLEAR_VARS)
 LOCAL_MODULE             := nntrainer
@@ -95,8 +114,8 @@ include $(CLEAR_VARS)
 LOCAL_MODULE     := unittest_nntrainer_htp_backend
 LOCAL_CFLAGS     := \
     -I$(GTEST_ROOT)/include \
-    -I$(HEXKL_ADDON_ROOT)/../../incs \
-    -I$(HEXKL_ADDON_ROOT)/../../incs/stddef \
+    -I$(HEXKL_INCS_DIR) \
+    -I$(HEXKL_INCS_DIR)/stddef \
     -pthread -fexceptions \
     -DMIN_CPP_VERSION=201703L \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
@@ -116,8 +135,8 @@ include $(CLEAR_VARS)
 LOCAL_MODULE     := unittest_nntrainer_htp_kernels
 LOCAL_CFLAGS     := \
     -I$(GTEST_ROOT)/include \
-    -I$(HEXKL_ADDON_ROOT)/../../incs \
-    -I$(HEXKL_ADDON_ROOT)/../../incs/stddef \
+    -I$(HEXKL_INCS_DIR) \
+    -I$(HEXKL_INCS_DIR)/stddef \
     -pthread -fexceptions \
     -DMIN_CPP_VERSION=201703L \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
@@ -155,7 +174,7 @@ LOCAL_CFLAGS     := \
     -pthread -fexceptions \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
     -Drestrict=__restrict \
-    -I$(HEXKL_ADDON_ROOT)/../../incs \
+    -I$(HEXKL_INCS_DIR) \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
 LOCAL_CXXFLAGS   += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS     := -llog
@@ -173,7 +192,7 @@ LOCAL_CFLAGS     := \
     -pthread \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
     -Drestrict=__restrict \
-    -I$(HEXKL_ADDON_ROOT)/../../incs \
+    -I$(HEXKL_INCS_DIR) \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
 LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := hexkl_pin_probe.c
@@ -191,7 +210,7 @@ LOCAL_CFLAGS     := \
     -pthread \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
     -Drestrict=__restrict \
-    -I$(HEXKL_ADDON_ROOT)/../../incs \
+    -I$(HEXKL_INCS_DIR) \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
 LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := hexkl_gemv_probe.c

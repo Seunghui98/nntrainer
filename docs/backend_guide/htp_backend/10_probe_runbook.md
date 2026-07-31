@@ -38,7 +38,38 @@ export HEXKL_LIB_SUBDIR=6.4.0.2/armv8_android26
 The probes link `libsdkl.so` through this (`test/unittest/jni_htp/Android.mk`).
 Leaving it unset keeps the beta1 layout (`lib/<abi>/`) and will not find beta2.
 
-### 0.2 The matching CDSP skeleton
+### 0.2 The Hexagon SDK headers
+
+`remote.h` is a **Hexagon SDK** header, not a HexKL one, and beta2's `sdkl.h`
+includes it. When the addon is installed inside an SDK tree
+(`$HEXAGON_SDK_ROOT/<ver>/addons/hexkl_addon`) it is two levels up, which is
+what the build used to assume. A standalone unzip of the beta2 package has no
+SDK above it, and the build fails with:
+
+```
+fatal error: 'remote.h' file not found
+```
+
+Find it:
+
+```bash
+find $HEXKL_SDK_ROOT -name remote.h        # does the addon ship its own incs/?
+ls $HEXAGON_SDK_ROOT/incs/remote.h         # or is an SDK installed separately?
+```
+
+`Android.mk` looks in `$(HEXKL_ADDON_ROOT)/incs`, then `$(HEXAGON_SDK_ROOT)/incs`,
+then the in-SDK-tree path, so if either of those two hits nothing needs setting.
+Otherwise point it at whichever directory contains `remote.h`:
+
+```bash
+export HEXKL_INCS_DIR=/path/to/hexagon_sdk/incs
+```
+
+If neither exists, the Hexagon SDK has to be installed — same `qpm-cli` route as
+HexKL. Match the version to `HEXKL_LIB_SUBDIR` (6.4.0.2 here) so the FastRPC
+headers agree with the library.
+
+### 0.3 The matching CDSP skeleton
 
 `libsdkl.so` is only the host half; the DSP half is a skeleton `.so` that
 FastRPC loads, and it has to be **beta2's, for your device's Hexagon version**:
@@ -60,7 +91,7 @@ predecessor V75, `0x79` is V79. Match the skeleton to that.
 > adb shell mkdir -p /data/local/tmp/hexkl_beta2
 > ```
 
-### 0.3 What "PASS" is worth
+### 0.4 What "PASS" is worth
 
 `hexkl_gemv_probe` prints the CDSP version string (`1_0_56_beta.2_HEXAGON_V73`
 style). **If it does not say `beta.2`, the run proves nothing about the beta2
