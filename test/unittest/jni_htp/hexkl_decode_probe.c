@@ -232,60 +232,79 @@ static void report(const char *label, const totals *t, unsigned iters,
 /* ------------------------------------------------------------------ */
 
 /*!
+  @brief Per-shape NPU buffers, sized exactly.
+
+  Not an optimisation -- a correctness requirement. hexkl_mm.cpp's NpuScratch
+  keys its pool on the exact byte size because handing sdkl a buffer left over
+  from a larger shape "produced wrong results on device", and an earlier
+  version of this probe reproduced that: one X and one A sized for the largest
+  shape gave q_proj a correct first 128 elements and zeros after. The real
+  decode path allocates per size, so this does too. There are only seven
+  shapes, and their sizes collapse to three, so this stays small.
+*/
+typedef struct {
+  void *scratch; /* staging destination, wbytes(shape) */
+  void *X;       /* fp32 activation, DECODE_MP * K */
+  void *A;       /* fp32 result,     DECODE_MP * N */
+} shapebufs;
+
+static void shapebufs_free(shapebufs *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (b[i].scratch) sdkl_npu_free(b[i].scratch);
+    if (b[i].X) sdkl_npu_free(b[i].X);
+    if (b[i].A) sdkl_npu_free(b[i].A);
+  }
+}
+
+/*!
   @brief Time the staged and resident paths over `n` weights.
   @param scale multiply per-iteration figures by this to get a per-token number
 */
 static int measure(int domain, weight *ws, size_t n, unsigned iters,
                    unsigned scale) {
-  /* One scratch buffer at the largest weight size: the decode path reuses a
-     size-keyed pool, and every weight here is staged into it in turn. */
-  size_t max_bytes = 0;
-  for (size_t i = 0; i < n; i++)
-    if (ws[i].bytes > max_bytes)
-      max_bytes = ws[i].bytes;
+  shapebufs bufs[N_WEIGHTS];
+  memset(bufs, 0, sizeof(bufs));
 
-  void *scratch = NULL;
-  if (sdkl_npu_alloc(max_bytes, &scratch) != 0 || scratch == NULL) {
-    printf("  scratch alloc failed (%.1f MB)\n",
-           (double)max_bytes / (double)MB);
-    return -1;
+  for (size_t i = 0; i < N_WEIGHTS; i++) {
+    const wshape *sh = &LAYER[i];
+    const size_t x_bytes = (size_t)DECODE_MP * sh->K * sizeof(float);
+    const size_t a_bytes = (size_t)DECODE_MP * sh->N * sizeof(float);
+    if (sdkl_npu_alloc(wbytes(sh), &bufs[i].scratch) != 0 ||
+        sdkl_npu_alloc(x_bytes, &bufs[i].X) != 0 ||
+        sdkl_npu_alloc(a_bytes, &bufs[i].A) != 0) {
+      printf("  buffer alloc failed for %s\n", sh->name);
+      shapebufs_free(bufs, N_WEIGHTS);
+      return -1;
+    }
+    /* Mirror the decode path: zero the padding rows, real data in row 0. */
+    memset(bufs[i].X, 0, x_bytes);
+    float *X = (float *)bufs[i].X;
+    for (unsigned k = 0; k < sh->K; k++)
+      X[k] = 1.0f;
+    memset(bufs[i].A, 0, a_bytes);
   }
-
-  unsigned max_N = 0, max_K = 0;
-  for (size_t i = 0; i < n; i++) {
-    if (ws[i].shape->N > max_N) max_N = ws[i].shape->N;
-    if (ws[i].shape->K > max_K) max_K = ws[i].shape->K;
-  }
-
-  /* Both sized for the padded row count, exactly as shgemm_f32f16_f32 does. */
-  void *Xv = NULL, *Av = NULL;
-  if (sdkl_npu_alloc((size_t)DECODE_MP * max_K * sizeof(float), &Xv) != 0 ||
-      sdkl_npu_alloc((size_t)DECODE_MP * max_N * sizeof(float), &Av) != 0) {
-    printf("  activation alloc failed\n");
-    sdkl_npu_free(scratch);
-    return -1;
-  }
-  float *X = (float *)Xv, *A = (float *)Av;
-  for (size_t i = 0; i < (size_t)DECODE_MP * max_K; i++)
-    X[i] = 1.0f;
 
   /* Correctness once, before any timing. Bail on the first failure: a failed
      call leaves SDKL in a state where even the frees below report errors, and
      continuing only buries the one message that matters. */
   totals warm = {0, 0, 0};
-  for (size_t i = 0; i < n; i++)
-    if (run_one(domain, &ws[i], scratch, X, A, 1, &warm, 1) != 0) {
-      sdkl_npu_free(scratch);
-      sdkl_npu_free(Xv);
-      sdkl_npu_free(Av);
+  for (size_t i = 0; i < n; i++) {
+    shapebufs *b = &bufs[i % N_WEIGHTS];
+    if (run_one(domain, &ws[i], b->scratch, (float *)b->X, (float *)b->A, 1,
+                &warm, 1) != 0) {
+      shapebufs_free(bufs, N_WEIGHTS);
       return -1;
     }
+  }
   printf("  known-answer check passed on all %zu weights\n\n", n);
 
   totals staged = {0, 0, 0};
   for (unsigned it = 0; it < iters; it++)
-    for (size_t i = 0; i < n; i++)
-      run_one(domain, &ws[i], scratch, X, A, 1, &staged, 0);
+    for (size_t i = 0; i < n; i++) {
+      shapebufs *b = &bufs[i % N_WEIGHTS];
+      run_one(domain, &ws[i], b->scratch, (float *)b->X, (float *)b->A, 1,
+              &staged, 0);
+    }
   report("staged", &staged, iters, scale);
 
   size_t resident_n = 0;
@@ -295,8 +314,11 @@ static int measure(int domain, weight *ws, size_t n, unsigned iters,
   if (resident_n == n) {
     totals res = {0, 0, 0};
     for (unsigned it = 0; it < iters; it++)
-      for (size_t i = 0; i < n; i++)
-        run_one(domain, &ws[i], scratch, X, A, 0, &res, 0);
+      for (size_t i = 0; i < n; i++) {
+        shapebufs *b = &bufs[i % N_WEIGHTS];
+        run_one(domain, &ws[i], b->scratch, (float *)b->X, (float *)b->A, 0,
+                &res, 0);
+      }
     report("resident", &res, iters, scale);
 
     const double saved =
@@ -314,9 +336,7 @@ static int measure(int domain, weight *ws, size_t n, unsigned iters,
            resident_n, n);
   }
 
-  sdkl_npu_free(scratch);
-  sdkl_npu_free(Xv);
-  sdkl_npu_free(Av);
+  shapebufs_free(bufs, N_WEIGHTS);
   return 0;
 }
 
