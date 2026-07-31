@@ -357,6 +357,108 @@ static int measure(int domain, weight *ws, size_t n, unsigned iters,
   useful part: they say whether the kernel wrote a smaller region than asked
   or wrote the full region in an unexpected order.
 */
+/*!
+  @brief Print where the correct values landed, as runs.
+
+  "first wrong at 64 but 288 of 1024 correct" says the written region is
+  scattered, and no amount of arithmetic on the totals recovers the pattern.
+  The positions do.
+*/
+static void dump_runs(const float *A, unsigned n, float want) {
+  printf("      row 0 pattern: ");
+  unsigned printed = 0, i = 0;
+  while (i < n && printed < 12) {
+    const int ok = fabsf(A[i] - want) < 0.5f;
+    unsigned j = i;
+    while (j < n && (fabsf(A[j] - want) < 0.5f) == ok)
+      j++;
+    printf("%s%u-%u%s", printed ? ", " : "", i, j - 1, ok ? " ok" : " --");
+    i = j;
+    printed++;
+  }
+  if (i < n)
+    printf(", ... (%u more)", n - i);
+  printf("\n");
+}
+
+/*!
+  @brief One shape at one n_row. Returns 0 when row 0 is entirely correct.
+*/
+static int try_shape(int domain, const wshape *sh, unsigned n_row, int dump) {
+  weight w;
+  if (weight_init(&w, sh, 0) != 0)
+    return -1;
+
+  const size_t x_bytes = (size_t)n_row * sh->K * sizeof(float);
+  const size_t a_elems = (size_t)n_row * sh->N;
+  void *scratch = NULL, *Xv = NULL, *Av = NULL;
+  if (sdkl_npu_alloc(w.bytes, &scratch) != 0 ||
+      sdkl_npu_alloc(x_bytes, &Xv) != 0 ||
+      sdkl_npu_alloc(a_elems * sizeof(float), &Av) != 0) {
+    printf("      n_row=%u: buffer alloc failed\n", n_row);
+    weight_free(&w);
+    return -1;
+  }
+
+  float *X = (float *)Xv, *A = (float *)Av;
+  memset(X, 0, x_bytes);
+  for (unsigned k = 0; k < sh->K; k++)
+    X[k] = 1.0f; /* row 0 only, as the decode path does */
+  memset(A, 0, a_elems * sizeof(float));
+  memcpy(scratch, w.host_wh, w.bytes);
+
+  const int rc =
+    sdkl_npu_mm_f32f16_f32(domain, (int)n_row, (int)sh->N, (int)sh->K, A, X,
+                           (const _Float16 *)scratch);
+
+  int res = -1;
+  if (rc != 0) {
+    printf("      n_row=%u: REJECTED rc=%d (0x%x)\n", n_row, rc, (unsigned)rc);
+  } else {
+    long first_bad = -1;
+    size_t row0_ok = 0, nonzero = 0;
+    for (unsigned c = 0; c < sh->N; c++) {
+      if (fabsf(A[c] - (float)sh->K) < 0.5f)
+        row0_ok++;
+      else if (first_bad < 0)
+        first_bad = (long)c;
+    }
+    for (size_t e = 0; e < a_elems; e++)
+      if (A[e] != 0.0f)
+        nonzero++;
+
+    if (first_bad < 0) {
+      printf("      n_row=%u: row 0 fully correct (%u), %zu non-zero in "
+             "%u x %u\n",
+             n_row, sh->N, nonzero, n_row, sh->N);
+      res = 0;
+    } else {
+      printf("      n_row=%u: %zu/%u correct, first wrong at %ld, %zu non-zero "
+             "in %u x %u\n",
+             n_row, row0_ok, sh->N, first_bad, nonzero, n_row, sh->N);
+      if (dump)
+        dump_runs(A, sh->N, (float)sh->K);
+    }
+  }
+
+  sdkl_npu_free(scratch);
+  sdkl_npu_free(Xv);
+  sdkl_npu_free(Av);
+  weight_free(&w);
+  return res;
+}
+
+/*!
+  @brief Walk from a known-good shape up to the real ones, at two row counts.
+
+  sdkl_npu_probe verifies 32x32x32 and the model runs these FC shapes through
+  shgemm_f32f16_f32 every day, so a failure in between is about this probe or
+  about a shape boundary. The first run showed the written region is correct
+  wherever it exists and simply stops early -- scattered, not garbage -- and
+  that the cutoff tracks n_col and ignores n_inner. So this reports the
+  positions, and tries n_row at 32 (what shgemm_f32f16_f32 uses) and 64 in
+  case the row count is the thing that has to grow with n_col.
+*/
 static int mode_shapes(int domain) {
   static const wshape S[] = {
     {"32x32 (sdkl_npu_probe's shape)", 32, 32},
@@ -367,82 +469,24 @@ static int mode_shapes(int domain) {
     {"1024x3072 (ffn_down)", 1024, 3072},
   };
   const size_t n = sizeof(S) / sizeof(S[0]);
+  static const unsigned ROWS[] = {32, 64};
 
-  printf("\n=== mode: shapes (n_row=%u throughout) ===\n", DECODE_MP);
+  printf("\n=== mode: shapes ===\n");
 
   size_t ok = 0;
   for (size_t i = 0; i < n; i++) {
-    const wshape *sh = &S[i];
-    printf("  --- %s  N=%u K=%u\n", sh->name, sh->N, sh->K);
-
-    weight w;
-    if (weight_init(&w, sh, 0) != 0)
-      continue;
-
-    const size_t x_bytes = (size_t)DECODE_MP * sh->K * sizeof(float);
-    const size_t a_elems = (size_t)DECODE_MP * sh->N;
-    void *scratch = NULL, *Xv = NULL, *Av = NULL;
-    if (sdkl_npu_alloc(w.bytes, &scratch) != 0 ||
-        sdkl_npu_alloc(x_bytes, &Xv) != 0 ||
-        sdkl_npu_alloc(a_elems * sizeof(float), &Av) != 0) {
-      printf("      buffer alloc failed\n");
-      weight_free(&w);
-      continue;
-    }
-
-    float *X = (float *)Xv, *A = (float *)Av;
-    memset(X, 0, x_bytes);
-    for (unsigned k = 0; k < sh->K; k++)
-      X[k] = 1.0f; /* row 0 only, as the decode path does */
-    memset(A, 0, a_elems * sizeof(float));
-    memcpy(scratch, w.host_wh, w.bytes);
-
-    const int rc = sdkl_npu_mm_f32f16_f32(domain, (int)DECODE_MP, (int)sh->N,
-                                          (int)sh->K, A, X,
-                                          (const _Float16 *)scratch);
-    if (rc != 0) {
-      printf("      REJECTED rc=%d (0x%x)\n", rc, (unsigned)rc);
-    } else {
-      /* Row 0 should be all K; every padded row should be 0. */
-      long first_bad = -1;
-      size_t row0_ok = 0;
-      for (unsigned c = 0; c < sh->N; c++) {
-        if (fabsf(A[c] - (float)sh->K) < 0.5f)
-          row0_ok++;
-        else if (first_bad < 0)
-          first_bad = (long)c;
-      }
-      size_t nonzero = 0, correct = 0;
-      for (size_t e = 0; e < a_elems; e++) {
-        if (A[e] != 0.0f)
-          nonzero++;
-        if (fabsf(A[e] - (float)sh->K) < 0.5f)
-          correct++;
-      }
-
-      if (first_bad < 0) {
-        printf("      row 0 fully correct (%u elements)\n", sh->N);
+    printf("  --- %s  N=%u K=%u\n", S[i].name, S[i].N, S[i].K);
+    for (size_t r = 0; r < sizeof(ROWS) / sizeof(ROWS[0]); r++)
+      if (try_shape(domain, &S[i], ROWS[r], /*dump=*/r == 0) == 0)
         ok++;
-      } else {
-        printf("      row 0 correct for %zu of %u, first wrong at %ld\n",
-               row0_ok, sh->N, first_bad);
-      }
-      printf("      whole %u x %u buffer: %zu non-zero, %zu equal to K\n",
-             DECODE_MP, sh->N, nonzero, correct);
-    }
-
-    sdkl_npu_free(scratch);
-    sdkl_npu_free(Xv);
-    sdkl_npu_free(Av);
-    weight_free(&w);
   }
 
-  printf("\n  %zu/%zu shapes fully correct\n", ok, n);
-  printf("  If 32x32 passes and a larger one does not, compare the non-zero "
-         "count against\n  n_row x n_col: a smaller count means the kernel "
-         "wrote a smaller region than\n  asked for, an equal count in the "
-         "wrong places means a layout difference.\n");
-  return ok == n ? 0 : 1;
+  printf("\n  %zu/%zu (shape, n_row) combinations fully correct\n", ok,
+         n * (sizeof(ROWS) / sizeof(ROWS[0])));
+  printf("  Read the run pattern: a fixed-size ok/-- alternation is a layout "
+         "stride, a\n  single ok run followed by nothing is the kernel "
+         "stopping early.\n");
+  return ok == n * 2 ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------ */
