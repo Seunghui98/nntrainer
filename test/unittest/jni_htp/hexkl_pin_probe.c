@@ -310,17 +310,21 @@ static int mode_sweep(int domain, size_t target) {
   const size_t n = sizeof(SIZES_MB) / sizeof(SIZES_MB[0]);
 
   size_t best = 0;
+  int hit_limit = 0; /* set when a size actually failed */
   for (size_t i = 0; i < n; i++) {
     const size_t bytes = SIZES_MB[i] * MB;
     printf("  --- %zu MB%s\n", SIZES_MB[i],
            bytes >= target && best * MB < target ? "   <-- lm_head needs this"
                                                  : "");
     void *p = try_pin(bytes, "sweep");
-    if (!p)
+    if (!p) {
+      hit_limit = 1;
       break;
+    }
     const int rc = check_run(domain, &b, "held");
     sdkl_npu_free(p);
     if (rc != 0) {
+      hit_limit = 1;
       printf("  the kernel stopped working at %zu MB; the last good size is "
              "%zu MB\n",
              SIZES_MB[i], best);
@@ -329,9 +333,16 @@ static int mode_sweep(int domain, size_t target) {
     best = SIZES_MB[i];
   }
 
-  printf("\n  largest single block that allocated AND left the kernel "
-         "working: %zu MB\n",
-         best);
+  /* Reporting the last entry of the list as "the largest" would be a lie when
+     nothing ever failed -- the ceiling is then above the list, not at it. */
+  if (hit_limit)
+    printf("\n  largest single block that allocated AND left the kernel "
+           "working: %zu MB\n",
+           best);
+  else
+    printf("\n  every size in the list worked; the ceiling is ABOVE %zu MB "
+           "(the probe ran out of sizes, it did not find a limit)\n",
+           best);
   printf("  lm_head u8i4 needs %.1f MB -> %s\n", (double)target / (double)MB,
          (best * MB >= target) ? "FITS, the resident plan is viable"
                                : "DOES NOT FIT, see the fallback");
@@ -379,11 +390,13 @@ static int mode_total(int domain) {
   const size_t MAX_BLOCKS = 64; // 1 GiB, well past anything plausible
   void *held[64];
   size_t n_held = 0, total = 0;
+  int hit_limit = 0; /* set when an allocation or a check actually failed */
 
   for (; n_held < MAX_BLOCKS; n_held++) {
     void *p = NULL;
     if (sdkl_npu_alloc(STEP, &p) != 0 || p == NULL) {
       printf("  alloc failed at %.1f MB held\n", (double)total / (double)MB);
+      hit_limit = 1;
       break;
     }
     volatile uint8_t *q = (volatile uint8_t *)p;
@@ -394,6 +407,7 @@ static int mode_total(int domain) {
       printf("  block at %.1f MB does not hold writes\n",
              (double)total / (double)MB);
       sdkl_npu_free(p);
+      hit_limit = 1;
       break;
     }
 
@@ -412,6 +426,7 @@ static int mode_total(int domain) {
         // added since then are the suspect range.
         total = (total > STEP * 4) ? total - STEP * 4 : 0;
         n_held++; // this block was recorded in held[]; free it too
+        hit_limit = 1;
         break;
       }
     }
@@ -420,8 +435,14 @@ static int mode_total(int domain) {
   for (size_t i = 0; i < n_held; i++)
     sdkl_npu_free(held[i]);
 
-  printf("\n  usable cumulative NPU budget: about %.1f MB\n",
-         (double)total / (double)MB);
+  if (hit_limit)
+    printf("\n  usable cumulative NPU budget: about %.1f MB\n",
+           (double)total / (double)MB);
+  else
+    printf("\n  usable cumulative NPU budget: AT LEAST %.1f MB -- the probe "
+           "stopped at its own\n  %zu-block cap without hitting a device "
+           "limit, so this is a floor, not a ceiling\n",
+           (double)total / (double)MB, MAX_BLOCKS);
   printf("  lm_head weight resident            -> %s\n",
          total >= lmhead ? "FITS" : "DOES NOT FIT");
   printf("  lm_head weight + accumulator       -> %s\n",

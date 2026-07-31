@@ -119,25 +119,45 @@ Every mode re-runs a known-answer matmul (`X = W = 1`, every element must equal
 of this work found over-allocation corrupting SDKL's internal state instead of
 returning an error.
 
-### Reading the result
+### Measured — the gate is wide open
 
-| outcome | what to do |
-| :-- | :-- |
-| ≥ 285 MiB cumulative | everything resident. Proceed, raise the cap to cover it. |
-| ≥ 75 MiB cumulative | lm_head weight resident; decoder weights stream. Proceed. |
-| ≥ 74 MiB single, less cumulative | proceed, but §4's fix (1) becomes mandatory, not optional. |
-| < 74 MiB | **stop.** u8i4 lm_head is not viable; fall back to CPU int4 (`QS4CX-FP16`), which halves Q6_K's bytes without needing the NPU. |
+Galaxy S25 Ultra, `1_0_56_beta.2_HEXAGON_V79`:
 
-The accumulator row of the table above assumes the current `Mp = 64` wrapper.
-Once §4's fix (1) lands it drops from 37.1 MiB to 594 KB, so the milestones
-become 74.2 MiB for lm_head alone and 285 MiB for a fully resident model —
-`hexkl_pin_probe total` prints both figures, but read them against the fixed
-numbers.
+- `sweep`: every size up to **256 MB** allocated and left the kernel producing
+  correct results. Nothing failed — the probe ran out of sizes rather than
+  finding a ceiling.
+- `total`: **at least 1024 MB** cumulative, again without a failure; that is
+  the probe's own 64-block cap, not the device's limit.
+
+So all three milestones clear, with room to spare:
+
+| | need | verdict |
+| :-- | --: | :-- |
+| lm_head weight | 74.2 MiB | **FITS** |
+| + its accumulator (before §4) | 111.3 MiB | **FITS** |
+| whole model resident, u8i4 everywhere | 321.3 MiB | **FITS** |
+
+Two things follow, and the second is bigger than this document:
+
+- **`INT_WEIGHT_MAX_BYTES = 48 MiB` is far too conservative** and is the only
+  thing standing between the current code and a resident lm_head weight.
+- **The whole model can be resident.** With `fc_layer_dtype=QINT4_HTP` the 28
+  decoder weights are 210 MiB, comfortably inside the budget — which means the
+  per-token weight staging `memcpy` at `hexkl_mm.cpp:487` can go away entirely.
+  At fp16 that staging moves roughly 881 MB per token, which is the same order
+  as the whole 102 ms/token generation time. See §2's note on measuring before
+  believing it, but if it holds, that is worth an order of magnitude more than
+  lm_head is.
+
+Caveat on the number: allocating 1 GiB and keeping a small matmul correct is not
+the same as *using* 1 GiB of resident weights under thermal and memory pressure
+with the rest of the model live. Treat ≥1 GiB as a floor that removes the
+question, not as a licence to skip measuring the real thing.
 
 `sdkl_npu_init_config_t` was on this list as a possible way to shrink SDKL's
 internal scratch reservation. It is **an empty struct** in beta2 ("reserved for
-future use"), so there is nothing to tune — passing `NULL` is the only option
-and the budget is whatever the probe reports.
+future use"), so there is nothing to tune — and after these numbers, nothing to
+want.
 
 ---
 
@@ -462,10 +482,32 @@ selection.
 
 ### Performance
 
-Report the `MmProfile` breakdown (`scan / stage / quant / npu / dequant`) for
-the lm_head call specifically, and check that `stage_us` is near zero after the
-first token — a non-trivial `stage_us` every token means the weight is **not**
-resident and §3's gate was misread.
+**Measured kernel time**, `hexkl_gemv_probe lmhead`, weight already resident in
+NPU memory, `N = 151936`, `K = 1024`:
+
+| | time | traffic | effective |
+| :-- | --: | --: | --: |
+| `M = 1` (what lm_head needs) | **6.88 ms** | 74.8 MiB | 11.3 GB/s |
+| `M = 64` (what the wrapper asks for today) | 27.3 ms | 111.3 MiB | 4.3 GB/s |
+
+Two readings:
+
+- **`M = 1` is 4× faster, not merely cheaper in memory.** The kernel does not
+  silently pad back to 64 — §4's fix buys kernel time as well as the 37 MiB
+  accumulator, the `memset` and the pool thrash.
+- **11.3 GB/s is not fast.** On a part whose LPDDR5X peaks near 76 GB/s, a
+  bandwidth-bound kernel reading 74 MiB in 6.88 ms is leaving a lot on the
+  table. That is inside `sdkl_npu_mm_u8i4_i32` and not ours to fix, but it is
+  the number that decides whether the NPU beats a multithreaded CPU int4 kernel
+  moving the same 74 MiB — and at 11.3 GB/s that is genuinely in doubt. It
+  makes step 0 (measure `QS4CX-FP16`) the deciding measurement rather than a
+  formality.
+
+For the integrated path, report the `MmProfile` breakdown
+(`scan / stage / quant / npu / dequant`) for the lm_head call specifically, and
+check that `stage_us` is near zero after the first token — a non-trivial
+`stage_us` every token means the weight is **not** resident despite §3 saying
+there is room.
 
 Two baselines, not one:
 
