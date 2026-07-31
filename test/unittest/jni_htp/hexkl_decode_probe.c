@@ -29,7 +29,11 @@
  * would buy per token. Both are timed separately from the matmuls, so the
  * answer is not just "faster" but "how much of the token was never compute".
  *
- *   usage: hexkl_decode_probe [one|shapes|layer|full] [args]  (default: layer)
+ *   usage: hexkl_decode_probe [stagecost|one|shapes|layer|full] [args]
+ *
+ *     stagecost  the staging memcpy alone, no matmul. This is the number the
+ *                probe exists for and it does not need a correct matmul.
+ *                hexkl_decode_probe stagecost [layer|full]
  *
  *     one    a single matmul at one shape, with three allocations and nothing
  *            freed beforehand -- the control for whether allocation churn is
@@ -587,6 +591,95 @@ static int mode_one(int domain, unsigned N, unsigned K, unsigned n_row) {
   return 1;
 }
 
+/*!
+  @brief The staging memcpy alone, without the matmul.
+
+  This is the measurement the probe exists for, and it never needed the
+  matmul. hexkl_mm.cpp:487 copies the whole WH weight from host into an NPU
+  buffer before every decode call; the question is how many milliseconds per
+  token that costs against the ~102 ms a token takes today. A memcpy's cost
+  does not depend on whether the matmul that follows is correct.
+
+  Reproducing sdkl_npu_mm_f32f16_f32 outside nntrainer's wrapper turned out to
+  have its own puzzle -- correct output for a shrinking prefix of each 1/16th
+  of n_col, unaffected by n_row, n_inner, or allocation churn -- and chasing
+  it further would not move this number. When the matmul side is wanted, the
+  right way is through nntrainer::hmx::shgemm_f32f16_f32 itself, which needs
+  the beta2 migration first.
+
+  Host buffers are separate per weight so a token walks the same amount of
+  memory a real one does; reusing one buffer would measure the cache instead.
+*/
+static int mode_stagecost(int domain, int full, unsigned iters) {
+  (void)domain;
+  const size_t n = full ? N_WEIGHTS * N_LAYERS : N_WEIGHTS;
+  const unsigned scale = full ? 1u : N_LAYERS;
+
+  printf("\n=== mode: stagecost (%s) ===\n", full ? "all 28 layers" : "one layer x 28");
+
+  /* One NPU destination per distinct shape, exactly as the size-keyed scratch
+     pool in hexkl_mm.cpp ends up doing. */
+  void *dst[N_WEIGHTS];
+  memset(dst, 0, sizeof(dst));
+  for (size_t i = 0; i < N_WEIGHTS; i++)
+    if (sdkl_npu_alloc(wbytes(&LAYER[i]), &dst[i]) != 0 || dst[i] == NULL) {
+      printf("  NPU scratch alloc failed for %s\n", LAYER[i].name);
+      for (size_t j = 0; j < i; j++)
+        sdkl_npu_free(dst[j]);
+      return -1;
+    }
+
+  /* Host sources, one per weight. */
+  void **src = (void **)calloc(n, sizeof(void *));
+  size_t built = 0, total_bytes = 0;
+  for (; built < n; built++) {
+    const size_t b = wbytes(&LAYER[built % N_WEIGHTS]);
+    src[built] = malloc(b);
+    if (src[built] == NULL)
+      break;
+    memset(src[built], 0x5A, b); /* touch it so the pages are really there */
+    total_bytes += b;
+  }
+  if (built != n) {
+    printf("  only %zu/%zu host buffers (%.1f MB) could be allocated\n", built,
+           n, (double)total_bytes / (double)MB);
+    goto done;
+  }
+
+  printf("  %zu weights, %.1f MB per token across %u layers\n\n", n,
+         (double)total_bytes / (double)MB * scale, N_LAYERS);
+
+  {
+    double us = 0.0;
+    for (unsigned it = 0; it < iters; it++)
+      for (size_t i = 0; i < n; i++) {
+        const size_t b = wbytes(&LAYER[i % N_WEIGHTS]);
+        const double t0 = now_us();
+        memcpy(dst[i % N_WEIGHTS], src[i], b);
+        us += now_us() - t0;
+      }
+
+    const double per_token_us = us / iters * scale;
+    const double per_token_mb = (double)total_bytes / (double)MB * scale;
+
+    printf("  staging %.1f MB per token: %.2f ms at %.1f GB/s\n", per_token_mb,
+           per_token_us / 1000.0,
+           per_token_mb * (double)MB / per_token_us / 1000.0);
+    printf("  generation measured at 9.8 TPS (about 102 ms per token), so "
+           "staging is %.0f%%\n  of a token -- and residency would remove all "
+           "of it (hexkl_pin_probe: >= 1 GiB\n  holdable).\n",
+           per_token_us / 1000.0 / 102.0 * 100.0);
+  }
+
+done:
+  for (size_t i = 0; i < built; i++)
+    free(src[i]);
+  free(src);
+  for (size_t i = 0; i < N_WEIGHTS; i++)
+    sdkl_npu_free(dst[i]);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -620,6 +713,14 @@ int main(int argc, char **argv) {
   memset(version, 0, sizeof(version));
   if (sdkl_npu_get_version(domain, version) == 0)
     printf("[DECODE PROBE] CDSP version = %s\n", version);
+
+  if (strcmp(mode, "stagecost") == 0) {
+    const int sfull = (argc > 2) && strcmp(argv[2], "full") == 0;
+    const int sres = mode_stagecost(domain, sfull, iters);
+    sdkl_npu_finalize(domain);
+    printf("\n[DECODE PROBE] done\n");
+    return sres;
+  }
 
   if (strcmp(mode, "one") == 0) {
     const unsigned oN = (argc > 2) ? (unsigned)atoi(argv[2]) : 1024u;
