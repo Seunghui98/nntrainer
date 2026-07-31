@@ -213,11 +213,16 @@ LOCAL_CFLAGS     := \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
     -Drestrict=__restrict \
     -I$(HEXKL_INCS_DIR) \
+    -I$(HEXKL_ADDON_ROOT)/include \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
 # Link the addon library directly rather than through the sdkl_armv8 prebuilt:
 # that module loses the libsdkl.so target collision described above and the
 # builddir copy gets linked instead. ndk-build will not stage the .so into
 # libs/ this way, which is fine -- the runbook pushes it from the addon path.
+# ndk-build warns "non-system libraries in linker flags: -lsdkl" and says this
+# is likely to produce an incorrect build. What it is warning about is exactly
+# what is being given up on purpose: it no longer tracks the dependency or
+# stages the library. Expect the warning; it is not a problem here.
 LOCAL_LDLIBS     := -llog $(HEXKL_SDKL_LDLIBS)
 LOCAL_SRC_FILES  := hexkl_pin_probe.c
 include $(BUILD_EXECUTABLE)
@@ -234,6 +239,7 @@ LOCAL_CFLAGS     := \
     -DENABLE_FP16=1 -DUSE__FP16=1 \
     -Drestrict=__restrict \
     -I$(HEXKL_INCS_DIR) \
+    -I$(HEXKL_ADDON_ROOT)/include \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
 # Same as hexkl_pin_probe: link the addon library directly, bypassing the
 # libsdkl.so prebuilt collision.
