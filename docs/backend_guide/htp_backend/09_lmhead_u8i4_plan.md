@@ -41,15 +41,33 @@ The only lever that matters is bytes moved per token.
 | FP32 | 622 MB | — |
 | FP16 | 311 MB | — |
 | Q6_K (today) | **121.7 MiB** | CPU |
+| QS4CX-FP16 | **~74 MiB** | CPU |
 | QINT4_HTP (u8i4) | **74.2 MiB** | NPU |
 
-u8i4 moves ~39 % fewer bytes *and* moves them off the CPU. FP16 on HMX would be
-4× the traffic of Q6_K — it is the wrong lever here even though it is the
-obvious NPU dtype. That is the whole argument.
+u8i4 moves ~39 % fewer bytes than Q6_K *and* moves them off the CPU. FP16 on
+HMX would be 4× the traffic of Q6_K — it is the wrong lever here even though it
+is the obvious NPU dtype. That is the whole argument.
 
 The cost is precision: Q6_K is ~6.56 bits with 16-element sub-blocks, while
 `quantize_qint4_weight` is symmetric int4 with **one scale per output channel**
 (1024 values per scale). That is a large step down and is the main risk — see §8.
+
+### Measure the CPU int4 baseline first
+
+Note the third row. `QS4CX-FP16` moves the *same* bytes as u8i4 and needs
+nothing from this plan — no branch merge, no NPU residency, no CPU fallback,
+no `engine` change. Just a re-quantise.
+
+Being bandwidth-bound cuts both ways: if the weight is 74 MiB in DDR either
+way, the engine reading it matters much less than the byte count, and u8i4's
+remaining advantages over CPU int4 are power, freeing the CPU, and whatever
+extra memory bandwidth the DSP can sustain. Those are real but they are not
+the 39 % the Q6_K comparison suggests.
+
+**So measure `QS4CX-FP16` before doing any of §4–§7.** It is a day of work, it
+sets the bar u8i4 has to clear, and if it clears the milestone on its own the
+rest of this plan does not need to happen. §10 records it as a fallback; it is
+better understood as the baseline.
 
 ---
 
@@ -153,6 +171,47 @@ Fixes, in order of preference:
    accumulator is 4.6 MiB and fits the pool. Costs nothing in weight bytes.
 4. **Raise `SCRATCH_MAX_BYTES`** — only after (1)–(3), and only if the probe
    says there is room.
+
+### Why QNN shows no padding, and what that does and does not mean
+
+A QNN deployment of the same layer reportedly has no padding at all. The
+difference is not that QNN found a way around the hardware — HMX is a tile
+engine either way — it is **where the padding sits**:
+
+- QNN is a **graph compiler**. It knows at `finalize()` that the op is
+  `[1, 1024] × [1024, 151936]`, declares the output tensor as `1 × 151936`
+  (594 KB), and emits a loop nest specialised to `M = 1`. Any tile padding
+  lives inside the generated kernel and costs the caller nothing.
+- HexKL is a **precompiled library with a fixed signature**. `M % 64 == 0` is
+  an API precondition, so the host wrapper pads (`hexkl_mm.cpp:705`) — and the
+  caller pays for it in memory and in a `memset`.
+
+There is very likely a second reason: **a GEMV has no activation reuse**, which
+is the entire premise of a matrix engine, so a compiler is free to map `M = 1`
+onto HVX instead of HMX. `sdkl_npu_mm_*` is HMX by construction and has no such
+choice. (Inferred from the structure, not from reading QNN — checking whether
+the op shows up as HVX or HMX in a QNN profile would confirm it.)
+
+What follows for us:
+
+- The wasted MACs (63 of every 64) cost **no time**. The path is bandwidth-bound
+  on the 74 MiB weight, and idle MAC slots do not slow a memory-bound loop. On
+  that axis QNN's advantage is approximately zero.
+- The costs that are real are (a) and (b) above, and both are fixable **without
+  changing engines**. "Use HVX" and "stop paying for the padding" land in nearly
+  the same place.
+- An HVX u8i4 GEMV entry point is still the right long-term ask of the HexKL
+  owner — `hexkl_mm.cpp:473` already notes a dedicated GEMV kernel as the thing
+  that would remove both the staging memcpy and the padding.
+
+Two cheap experiments settle the fix list:
+
+1. Call `sdkl_npu_mm_u8i4_i32` with `M = 1` directly. If it errors, `M % 64` is
+   a genuine SDKL precondition; if it returns the right answer, it is wrapper
+   policy and fix (1) is trivial.
+2. Check whether the kernel writes all `Mp` rows or only `M`. All rows means
+   keep the buffer but drop the `memset`; only `M` means the buffer shrinks to
+   594 KB and (b) disappears entirely.
 
 ---
 
@@ -306,7 +365,13 @@ the lm_head call specifically, and check that `stage_us` is near zero after the
 first token — a non-trivial `stage_us` every token means the weight is **not**
 resident and §3's gate was misread.
 
-Baseline to beat: the Q6_K `dotQnK` time per token, measured on the same device.
+Two baselines, not one:
+
+- **Q6_K `dotQnK`** — what ships today. u8i4 must beat it or there is no point.
+- **`QS4CX-FP16` CPU int4** — the same 74 MiB on the CPU. This is the honest
+  comparison, because it isolates "moved to the NPU" from "moved fewer bytes".
+  If u8i4 does not beat it by enough to justify §4 and §7, it does not justify
+  §4 and §7.
 
 ---
 
@@ -314,28 +379,37 @@ Baseline to beat: the Q6_K `dotQnK` time per token, measured on the same device.
 
 | # | step | blocked by |
 | --: | :-- | :-- |
-| 0 | run `hexkl_pin_probe sweep` **and** `total` | — |
-| 1 | read `sdkl_npu_init_config_t` in beta2's `sdkl.h` | — |
-| 2 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 0 says FITS |
-| 3 | fix the accumulator size / memset / pool thrash (§4) | 2 |
-| 4 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
-| 5 | quantise to `QINT4_HTP` (§5.2) | 2, 4 |
-| 6 | `engine=cpu` → `COMPUTE_ENGINE` (§6) | 2 |
-| 7 | u8i4 CPU fallback (§7) | 2 |
-| 8 | accuracy validation (§8) | 5, 6 |
-| 9 | performance, then enable by default | 3, 7, 8 |
+| 0 | quantise to `QS4CX-FP16` and measure it — the baseline u8i4 must clear (§2) | — |
+| 1 | run `hexkl_pin_probe sweep` **and** `total` | — |
+| 2 | read `sdkl_npu_init_config_t` in beta2's `sdkl.h` | — |
+| 3 | the two `M = 1` experiments in §4 | — |
+| 4 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 1 says FITS, 0 leaves room to win |
+| 5 | fix the accumulator size / memset / pool thrash (§4) | 3, 4 |
+| 6 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
+| 7 | quantise to `QINT4_HTP` (§5.2) | 4, 6 |
+| 8 | `engine=cpu` → `COMPUTE_ENGINE` (§6) | 4 |
+| 9 | u8i4 CPU fallback (§7) | 4 |
+| 10 | accuracy validation (§8) | 7, 8 |
+| 11 | performance, then enable by default | 5, 9, 10 |
 
-Steps 0, 1 and 4 need nothing merged and can start now.
+Steps 0–3 and 6 need nothing merged and can start now. **Step 0 is the one that
+can make steps 4–11 unnecessary**, so it goes first even though it is not part
+of the u8i4 path.
 
 ---
 
-## 10. If the gate fails
+## 10. The CPU int4 path — baseline, and fallback if the gate fails
 
 `QS4CX-FP16` — CPU int4, already supported by `quantize.cpp`'s `dtype_str_map`.
 It halves Q6_K's bytes (about 74 MiB) without needing NPU residency at all, so
-it captures most of the bandwidth win and none of the residency risk. lm_head
+it captures the entire bandwidth win and none of the residency risk. lm_head
 stays on the CPU, `engine=cpu` stays, and the qwen3-0.6b milestone is met with
 the FC layers on the NPU and lm_head on an int4 CPU kernel.
 
-That is a smaller result, not a failed one — and it is worth pricing before
-spending the effort in §4 and §7.
+It appears twice in this document on purpose. As a **fallback** it is what to do
+when §3's probe says 74 MiB cannot stay resident. As a **baseline** (§2, §8, and
+step 0 of §9) it is what u8i4 has to beat, and the reason to run it first: it
+costs one re-quantise, and the two paths move the same number of bytes, so the
+entire u8i4 argument rests on what the NPU adds *beyond* the byte count.
+
+Either way it is a smaller result, not a failed one.
