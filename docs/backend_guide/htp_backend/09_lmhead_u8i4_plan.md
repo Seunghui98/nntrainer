@@ -159,17 +159,60 @@ So a 37 MiB `sdkl_npu_alloc`/`free` pair happens **once per generated token**,
 plus re-allocating every FC accumulator. This is a fastrpc mmap round trip, not
 a pool hit.
 
+### The 64-row tile is a real SDKL constraint, so (a) is not a bug
+
+The padding looked at first like caller-side caution that could simply be
+removed. The evidence in this tree says otherwise:
+
+- `hexkl_mm.cpp:276` cites **`§2, sdkl.h 6.4.0.1`** — the constraints are
+  documented in the header, not inferred.
+- `hexkl_mm.cpp:299` says **"verified on V79/V81"** — someone measured it.
+- fp16 rounds to **32** (`(M + 31u) & ~31u`) while u8i8/u8i4 round to **64**.
+  A dtype-dependent figure is a hardware tile spec — int8 processes twice the
+  rows per tile pass — not a safety margin someone picked.
+
+Confirm the exact u8i4 wording with
+`grep -n -B3 -A8 "u8i4\|n_row\|align" $HEXKL_SDK_ROOT/include/sdkl.h`, but plan
+on it being real.
+
+**That settles the second experiment too.** If `M = 64` is what the kernel is
+told, it computes 64 rows and writes 64 rows — rows 1..63 come out as computed
+zeros from the zero-padded activation, but they are still written. So the
+37 MiB of write traffic is **structural**, not a defect, and no host-side change
+removes it.
+
+Which reverses the "engine does not matter" reading:
+
+| | read | write | total per token |
+| :-- | --: | --: | --: |
+| HMX u8i4, best case (memset gone) | 74.2 | 37.1 | **111.3 MiB** |
+| HVX GEMV | 74.2 | 0.6 | **74.8 MiB** |
+| QS4CX CPU int4 | 74.2 | 0.6 | **74.8 MiB** |
+
+The wasted MACs really are free. The wasted *output writes* are not:
+**for lm_head specifically, HMX moves about 1.5× the bytes of a GEMV.** It also
+means HMX u8i4 moves more bytes than the CPU int4 baseline it is meant to beat,
+so the DSP has to win that 1.5× back on bandwidth and power alone — possible,
+but not a given. This raises the value of step 0 in §9.
+
+None of this touches the FC layers: `Mp = 32` and `N ≤ 3072` put their
+accumulators at 393 KB, where a 32× write amplification is irrelevant. The
+problem is created entirely by `N = 151936`.
+
 Fixes, in order of preference:
 
-1. **Do not pad `M` for the accumulator.** If SDKL genuinely requires
-   `M % 64 == 0` for the *activation*, it does not follow that the caller must
-   hand it a 64-row output buffer it will only read one row of — verify what the
-   kernel writes, and size `C` to what is actually needed.
-2. **Drop the `memset`.** The kernel overwrites the accumulator; confirm on
-   device and remove it.
-3. **Chunk `N`.** Split 151936 into e.g. 8 × 18992 (still `% 32 == 0`) so the
-   accumulator is 4.6 MiB and fits the pool. Costs nothing in weight bytes.
-4. **Raise `SCRATCH_MAX_BYTES`** — only after (1)–(3), and only if the probe
+1. **Drop the `memset`.** Now *more* certain, not less: if the kernel writes all
+   64 rows, pre-zeroing them is provably redundant. 37 MiB per token, for free.
+   Confirm results are unchanged and remove it.
+2. **Chunk `N`.** Split 151936 into e.g. 8 × 18992 (still `% 32 == 0`) so the
+   accumulator is 4.6 MiB instead of 37.1. This bounds the *footprint* — it fits
+   the pool, ends the thrash in (b), and gives 32 MiB back to the residency
+   budget — but the total write traffic is unchanged.
+3. **Ask the HexKL owner for a u8i4 GEMV entry point.** The 1.5× above cannot be
+   recovered from the host, which moves this from a nice-to-have to the only
+   remaining lever. `hexkl_mm.cpp:473` already names a dedicated GEMV kernel as
+   what would remove the staging memcpy and the padding together.
+4. **Raise `SCRATCH_MAX_BYTES`** — only after (1)–(2), and only if the probe
    says there is room.
 
 ### Why QNN shows no padding, and what that does and does not mean
@@ -194,24 +237,12 @@ the op shows up as HVX or HMX in a QNN profile would confirm it.)
 
 What follows for us:
 
-- The wasted MACs (63 of every 64) cost **no time**. The path is bandwidth-bound
-  on the 74 MiB weight, and idle MAC slots do not slow a memory-bound loop. On
-  that axis QNN's advantage is approximately zero.
-- The costs that are real are (a) and (b) above, and both are fixable **without
-  changing engines**. "Use HVX" and "stop paying for the padding" land in nearly
-  the same place.
-- An HVX u8i4 GEMV entry point is still the right long-term ask of the HexKL
-  owner — `hexkl_mm.cpp:473` already notes a dedicated GEMV kernel as the thing
-  that would remove both the staging memcpy and the padding.
-
-Two cheap experiments settle the fix list:
-
-1. Call `sdkl_npu_mm_u8i4_i32` with `M = 1` directly. If it errors, `M % 64` is
-   a genuine SDKL precondition; if it returns the right answer, it is wrapper
-   policy and fix (1) is trivial.
-2. Check whether the kernel writes all `Mp` rows or only `M`. All rows means
-   keep the buffer but drop the `memset`; only `M` means the buffer shrinks to
-   594 KB and (b) disappears entirely.
+- Neither engine is compute-limited here. lm_head is 155.6 MMAC, 10.0 GMAC even
+  with the padding; both HMX and HVX clear that in well under a millisecond
+  while the 74 MiB read takes 2.5–3.7 ms. **The wasted MACs cost no time.**
+- What QNN actually avoids is the 37 MiB of padded output writes, and per the
+  section above that is not recoverable from the host. So the gap is real, and
+  an HVX u8i4 GEMV entry point is the fix — item (3) in the list above.
 
 ---
 
@@ -382,7 +413,7 @@ Two baselines, not one:
 | 0 | quantise to `QS4CX-FP16` and measure it — the baseline u8i4 must clear (§2) | — |
 | 1 | run `hexkl_pin_probe sweep` **and** `total` | — |
 | 2 | read `sdkl_npu_init_config_t` in beta2's `sdkl.h` | — |
-| 3 | the two `M = 1` experiments in §4 | — |
+| 3 | confirm the 64-row tile in `sdkl.h`, drop the `memset`, and raise the GEMV request (§4) | — |
 | 4 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 1 says FITS, 0 leaves room to win |
 | 5 | fix the accumulator size / memset / pool thrash (§4) | 3, 4 |
 | 6 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
