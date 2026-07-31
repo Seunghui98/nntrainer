@@ -93,20 +93,25 @@ ifeq ($(HEXKL_LIB_SUBDIR),)
   HEXKL_LIB_SUBDIR := armv8_android26
 endif
 
-# `sdkl` and `sdkl_armv8` are both prebuilts whose source file is named
-# libsdkl.so, so ndk-build derives the same install target for the two and
-# prints "overriding recipe for target .../libsdkl.so". The later recipe --
-# sdkl_armv8, the addon copy -- wins on a clean tree, which is what the probes
-# want. But a copy left in obj/ by a previous build of the *other* one is newer
-# than nothing and does not get replaced, so a stale libsdkl.so survives and
-# the link fails with undefined sdkl_* symbols. That is the signature of a
-# beta1 library under beta2 sources, and `rm -rf obj libs` is the fix.
-ifneq ($(wildcard $(NNTRAINER_LIB_DIR)/libsdkl.so),)
-  $(info [jni_htp] two libsdkl.so sources are in play:)
-  $(info [jni_htp]   $(NNTRAINER_LIB_DIR)/libsdkl.so)
-  $(info [jni_htp]   $(HEXKL_ADDON_ROOT)/lib/$(HEXKL_LIB_SUBDIR)/libsdkl.so)
-  $(info [jni_htp] if the link reports undefined sdkl_* symbols, rm -rf obj libs and rebuild)
-endif
+# WARNING: `sdkl` and `sdkl_armv8` are both prebuilts whose source file is
+# named libsdkl.so, so ndk-build derives the same install target for the two
+# and prints
+#   warning: overriding recipe for target 'obj/local/arm64-v8a/libsdkl.so'
+# Only one of them is ever installed, and it is `sdkl` -- the copy meson left
+# in builddir/ -- regardless of which module a binary lists in
+# LOCAL_SHARED_LIBRARIES, and regardless of whether obj/ was cleaned first.
+# So every consumer of `sdkl_armv8` below is in fact linking the builddir
+# library. That went unnoticed while both were the same HexKL revision; it
+# stops being harmless the moment they differ, and shows up as a link failure
+# naming symbols the older revision does not have.
+#
+# The two probes avoid this by linking the addon library directly through
+# LOCAL_LDLIBS instead of declaring a prebuilt module, so they are unaffected
+# by whichever libsdkl.so wins the collision. The remaining consumers
+# (sdkl_npu_probe, unittest_nntrainer_htp_kernels) still have the old
+# behaviour and should be moved the same way, or the two prebuilts collapsed
+# into one, before they are used against a mixed setup.
+HEXKL_SDKL_LDLIBS := -L$(HEXKL_ADDON_ROOT)/lib/$(HEXKL_LIB_SUBDIR) -lsdkl
 
 include $(CLEAR_VARS)
 LOCAL_MODULE             := sdkl_armv8
@@ -209,9 +214,12 @@ LOCAL_CFLAGS     := \
     -Drestrict=__restrict \
     -I$(HEXKL_INCS_DIR) \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
-LOCAL_LDLIBS     := -llog
+# Link the addon library directly rather than through the sdkl_armv8 prebuilt:
+# that module loses the libsdkl.so target collision described above and the
+# builddir copy gets linked instead. ndk-build will not stage the .so into
+# libs/ this way, which is fine -- the runbook pushes it from the addon path.
+LOCAL_LDLIBS     := -llog $(HEXKL_SDKL_LDLIBS)
 LOCAL_SRC_FILES  := hexkl_pin_probe.c
-LOCAL_SHARED_LIBRARIES := sdkl_armv8
 include $(BUILD_EXECUTABLE)
 
 # ---- executable: hexkl_gemv_probe (armv8 libsdkl, no gtest, no libnntrainer) ----
@@ -227,7 +235,8 @@ LOCAL_CFLAGS     := \
     -Drestrict=__restrict \
     -I$(HEXKL_INCS_DIR) \
     -march=armv8.2-a+fp16+dotprod+i8mm -O2
-LOCAL_LDLIBS     := -llog
+# Same as hexkl_pin_probe: link the addon library directly, bypassing the
+# libsdkl.so prebuilt collision.
+LOCAL_LDLIBS     := -llog $(HEXKL_SDKL_LDLIBS)
 LOCAL_SRC_FILES  := hexkl_gemv_probe.c
-LOCAL_SHARED_LIBRARIES := sdkl_armv8
 include $(BUILD_EXECUTABLE)
