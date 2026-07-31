@@ -123,14 +123,21 @@ returning an error.
 
 | outcome | what to do |
 | :-- | :-- |
-| ≥ 321 MiB cumulative | everything resident. Proceed, raise the cap to cover it. |
-| ≥ 112 MiB cumulative | lm_head weight + accumulator resident; decoder weights stream. Proceed. |
-| ≥ 74 MiB single, < 112 cumulative | proceed, but §4 becomes mandatory, not optional. |
+| ≥ 285 MiB cumulative | everything resident. Proceed, raise the cap to cover it. |
+| ≥ 75 MiB cumulative | lm_head weight resident; decoder weights stream. Proceed. |
+| ≥ 74 MiB single, less cumulative | proceed, but §4's fix (1) becomes mandatory, not optional. |
 | < 74 MiB | **stop.** u8i4 lm_head is not viable; fall back to CPU int4 (`QS4CX-FP16`), which halves Q6_K's bytes without needing the NPU. |
 
-Also worth one read before running: `sed -n '355,460p' $HEXKL_SDK_ROOT/include/sdkl.h`
-— `sdkl_npu_init_config_t` is new in beta2 and may let the ~400 MB internal
-scratch reservation shrink, which would move every number above.
+The accumulator row of the table above assumes the current `Mp = 64` wrapper.
+Once §4's fix (1) lands it drops from 37.1 MiB to 594 KB, so the milestones
+become 74.2 MiB for lm_head alone and 285 MiB for a fully resident model —
+`hexkl_pin_probe total` prints both figures, but read them against the fixed
+numbers.
+
+`sdkl_npu_init_config_t` was on this list as a possible way to shrink SDKL's
+internal scratch reservation. It is **an empty struct** in beta2 ("reserved for
+future use"), so there is nothing to tune — passing `NULL` is the only option
+and the budget is whatever the probe reports.
 
 ---
 
@@ -159,90 +166,87 @@ So a 37 MiB `sdkl_npu_alloc`/`free` pair happens **once per generated token**,
 plus re-allocating every FC accumulator. This is a fastrpc mmap round trip, not
 a pool hit.
 
-### The 64-row tile is a real SDKL constraint, so (a) is not a bug
+### The padding is not required. The header says so.
 
-The padding looked at first like caller-side caution that could simply be
-removed. The evidence in this tree says otherwise:
+`hexkl_mm.cpp:695` asserts "SDKL requires M%64==0" with no citation. The 1.0.0-beta2
+header contradicts it, in the doc block for this exact function:
 
-- `hexkl_mm.cpp:276` cites **`§2, sdkl.h 6.4.0.1`** — the constraints are
-  documented in the header, not inferred.
-- `hexkl_mm.cpp:299` says **"verified on V79/V81"** — someone measured it.
-- fp16 rounds to **32** (`(M + 31u) & ~31u`) while u8i8/u8i4 round to **64**.
-  A dtype-dependent figure is a hardware tile spec — int8 processes twice the
-  rows per tile pass — not a safety margin someone picked.
+> `sdkl_npu_mm_u8i4_i32` — This kernel is optimized for int32 matmul on the
+> Hexagon NPU. **It accepts arbitrary (unaligned) dimensions and handles X
+> layout conversion and output padding internally.**
 
-Confirm the exact u8i4 wording with
-`grep -n -B3 -A8 "u8i4\|n_row\|align" $HEXKL_SDK_ROOT/include/sdkl.h`, but plan
-on it being real.
+Neither `M % 64` nor `N % 32` is a precondition. The kernel pads for itself.
 
-**That settles the second experiment too.** If `M = 64` is what the kernel is
-told, it computes 64 rows and writes 64 rows — rows 1..63 come out as computed
-zeros from the zero-padded activation, but they are still written. So the
-37 MiB of write traffic is **structural**, not a defect, and no host-side change
-removes it.
+Two details confirm this is deliberate and specific to u8i4:
 
-Which reverses the "engine does not matter" reading:
+- **Only u8i4 carries that sentence.** `sdkl_npu_mm_u8i8_i32`'s note says only
+  that buffers should come from `sdkl_npu_alloc()` — which is *address*
+  alignment, not dimension alignment. The `Mp = 64` rounding may still be
+  needed there.
+- **Only u8i4 takes `size_t n_row`**; every other kernel in the header takes
+  `int`. It was reworked after the others.
 
-| | read | write | total per token |
-| :-- | --: | --: | --: |
-| HMX u8i4, best case (memset gone) | 74.2 | 37.1 | **111.3 MiB** |
-| HVX GEMV | 74.2 | 0.6 | **74.8 MiB** |
-| QS4CX CPU int4 | 74.2 | 0.6 | **74.8 MiB** |
+So `shgemm_u8i4_i32` should pass `n_row = M` and size its buffers to `M`:
 
-The wasted MACs really are free. The wasted *output writes* are not:
-**for lm_head specifically, HMX moves about 1.5× the bytes of a GEMV.** It also
-means HMX u8i4 moves more bytes than the CPU int4 baseline it is meant to beat,
-so the DSP has to win that 1.5× back on bandwidth and power alone — possible,
-but not a given. This raises the value of step 0 in §9.
+| | now (`Mp = 64`) | per the header (`M = 1`) |
+| :-- | --: | --: |
+| X buffer | 64 KiB | 1 KiB |
+| **C accumulator** | **37.1 MiB** | **594 KiB** |
+| `memset` | 37.1 MiB | 594 KiB |
+| pool thrash (b) | every token | gone |
+| **traffic per token** | **111.3 MiB** | **74.8 MiB** |
+
+`A` is documented as **row-major** `[n_row, n_col]`, and the padding is
+internal, so the 64-row accumulator stays in VTCM / the HMX accumulator and only
+the real rows reach DDR. That puts HMX at the same 74.8 MiB as an HVX GEMV or
+the CPU int4 baseline — **there is no 1.5× penalty and no reason to ask for an
+HVX GEMV entry point.**
 
 None of this touches the FC layers: `Mp = 32` and `N ≤ 3072` put their
-accumulators at 393 KB, where a 32× write amplification is irrelevant. The
-problem is created entirely by `N = 151936`.
+accumulators at 393 KB either way. `N = 151936` created the entire problem.
 
-Fixes, in order of preference:
+Fixes, in order:
 
-1. **Drop the `memset`.** Now *more* certain, not less: if the kernel writes all
-   64 rows, pre-zeroing them is provably redundant. 37 MiB per token, for free.
-   Confirm results are unchanged and remove it.
-2. **Chunk `N`.** Split 151936 into e.g. 8 × 18992 (still `% 32 == 0`) so the
-   accumulator is 4.6 MiB instead of 37.1. This bounds the *footprint* — it fits
-   the pool, ends the thrash in (b), and gives 32 MiB back to the residency
-   budget — but the total write traffic is unchanged.
-3. **Ask the HexKL owner for a u8i4 GEMV entry point.** The 1.5× above cannot be
-   recovered from the host, which moves this from a nice-to-have to the only
-   remaining lever. `hexkl_mm.cpp:473` already names a dedicated GEMV kernel as
-   what would remove the staging memcpy and the padding together.
-4. **Raise `SCRATCH_MAX_BYTES`** — only after (1)–(2), and only if the probe
-   says there is room.
+1. **Pass `M` instead of `Mp`** and size X and C to `M`. Verify against a CPU
+   reference — the header's claim is worth one known-answer check before the
+   padding comes out, since a silently wrong result is the bad failure here.
+   This alone removes (a) and (b) completely.
+2. **Drop the `memset`.** At `M = 1` it is 594 KB rather than 37 MiB, so it stops
+   mattering much, but the kernel overwrites `A` and it is still redundant.
+3. **Reconsider the `N % 32` throw** at `hexkl_mm.cpp:700` and the matching one
+   in `quantize_qint4_weight`. If the kernel accepts unaligned `n_col`, these
+   are over-restrictive. `N = 151936` is aligned, so this changes nothing for
+   lm_head — but it would matter for any other vocab size.
+4. **Chunk `N`** — only if (1) turns out not to hold on device. It bounds the
+   accumulator to 4.6 MiB but leaves the write traffic unchanged.
 
-### Why QNN shows no padding, and what that does and does not mean
+### Why QNN shows no padding
 
-A QNN deployment of the same layer reportedly has no padding at all. The
-difference is not that QNN found a way around the hardware — HMX is a tile
-engine either way — it is **where the padding sits**:
+A QNN deployment of the same layer has no padding at all. It is worth being
+precise about why, because it is the same reason `sdkl_npu_mm_u8i4_i32` does
+not either.
 
-- QNN is a **graph compiler**. It knows at `finalize()` that the op is
-  `[1, 1024] × [1024, 151936]`, declares the output tensor as `1 × 151936`
-  (594 KB), and emits a loop nest specialised to `M = 1`. Any tile padding
-  lives inside the generated kernel and costs the caller nothing.
-- HexKL is a **precompiled library with a fixed signature**. `M % 64 == 0` is
-  an API precondition, so the host wrapper pads (`hexkl_mm.cpp:705`) — and the
-  caller pays for it in memory and in a `memset`.
+HMX is a tile engine in both cases; the question is only **where the padding
+sits**. QNN is a graph compiler — it knows at `finalize()` that the op is
+`[1, 1024] × [1024, 151936]`, declares a `1 × 151936` output, and keeps the
+tile padding inside the generated kernel. `sdkl_npu_mm_u8i4_i32` does the same
+thing behind a library call ("handles ... output padding internally"). **Our
+wrapper is the only place that hoisted the padding out to the caller**, and it
+did so on an assumption the header does not support.
 
-There is very likely a second reason: **a GEMV has no activation reuse**, which
-is the entire premise of a matrix engine, so a compiler is free to map `M = 1`
-onto HVX instead of HMX. `sdkl_npu_mm_*` is HMX by construction and has no such
-choice. (Inferred from the structure, not from reading QNN — checking whether
-the op shows up as HVX or HMX in a QNN profile would confirm it.)
+A secondary point that still holds: a GEMV has no activation reuse, which is the
+premise of a matrix engine, so a compiler is free to map `M = 1` onto HVX
+instead. Whether QNN does is unverified and no longer decision-relevant.
 
-What follows for us:
+What follows:
 
-- Neither engine is compute-limited here. lm_head is 155.6 MMAC, 10.0 GMAC even
-  with the padding; both HMX and HVX clear that in well under a millisecond
-  while the 74 MiB read takes 2.5–3.7 ms. **The wasted MACs cost no time.**
-- What QNN actually avoids is the 37 MiB of padded output writes, and per the
-  section above that is not recoverable from the host. So the gap is real, and
-  an HVX u8i4 GEMV entry point is the fix — item (3) in the list above.
+- Neither engine is compute-limited here. lm_head is 155.6 MMAC — 10.0 GMAC even
+  if all 64 padded rows were computed — and both HMX and HVX clear that in well
+  under a millisecond while the 74 MiB read takes 2.5–3.7 ms. **The wasted MACs
+  cost no time**, and once the padded rows stop reaching DDR the wasted writes
+  cost nothing either.
+- So there is no engine question left for lm_head. Fix (1) above and HMX lands
+  at the same traffic as any GEMV would.
 
 ---
 
@@ -412,20 +416,22 @@ Two baselines, not one:
 | --: | :-- | :-- |
 | 0 | quantise to `QS4CX-FP16` and measure it — the baseline u8i4 must clear (§2) | — |
 | 1 | run `hexkl_pin_probe sweep` **and** `total` | — |
-| 2 | read `sdkl_npu_init_config_t` in beta2's `sdkl.h` | — |
-| 3 | confirm the 64-row tile in `sdkl.h`, drop the `memset`, and raise the GEMV request (§4) | — |
-| 4 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 1 says FITS, 0 leaves room to win |
-| 5 | fix the accumulator size / memset / pool thrash (§4) | 3, 4 |
-| 6 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
-| 7 | quantise to `QINT4_HTP` (§5.2) | 4, 6 |
-| 8 | `engine=cpu` → `COMPUTE_ENGINE` (§6) | 4 |
-| 9 | u8i4 CPU fallback (§7) | 4 |
-| 10 | accuracy validation (§8) | 7, 8 |
-| 11 | performance, then enable by default | 5, 9, 10 |
+| 2 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 1 says FITS, 0 leaves room to win |
+| 3 | pass `M` instead of `Mp` in `shgemm_u8i4_i32`, size X/C to `M`, verify against CPU (§4 fix 1) | 2 |
+| 4 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
+| 5 | quantise to `QINT4_HTP` (§5.2) | 2, 4 |
+| 6 | `engine=cpu` → `COMPUTE_ENGINE` (§6) | 2 |
+| 7 | u8i4 CPU fallback (§7) | 2 |
+| 8 | accuracy validation (§8) | 5, 6 |
+| 9 | performance, then enable by default | 3, 7, 8 |
 
-Steps 0–3 and 6 need nothing merged and can start now. **Step 0 is the one that
-can make steps 4–11 unnecessary**, so it goes first even though it is not part
+Steps 0, 1 and 4 need nothing merged and can start now. **Step 0 is the one that
+can make steps 2–9 unnecessary**, so it goes first even though it is not part
 of the u8i4 path.
+
+Two items that used to sit here are resolved and are gone: reading
+`sdkl_npu_init_config_t` (it is an empty struct — §3) and the `M = 1`
+experiments (the header answers them — §4).
 
 ---
 

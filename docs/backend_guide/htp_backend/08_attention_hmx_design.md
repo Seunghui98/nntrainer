@@ -105,9 +105,34 @@ beta1; beta2 needs a signed Product Kit License Agreement). Relevant changes:
 | Micro API shipped (`hexkl_micro.h`, `libhexkl_micro.a`) | makes the hand-written-DSP-kernel option real rather than theoretical. |
 | `hexkl_micro_hw_init` takes **three** args | `(vtcm_base, vtcm_size, hmx_fp16_rate)`. beta1 probes pass two. |
 
-Naming: the kernels that keep the output dtype in the name (`..._i32`) write the
-raw accumulator; the newer names without it apply the output conversion inside
-the kernel.
+### The naming is about layout, not output dtype
+
+`sdkl_npu_mm_u8i4` and `sdkl_npu_mm_u8i4_i32` both produce int32. The suffix
+marks the **layout contract**, and the same split runs through the fp16
+kernels:
+
+| kernel | X and A layout | who converts |
+| :-- | :-- | :-- |
+| `sdkl_npu_mm_u8i4` | **AH** | the caller |
+| `sdkl_npu_mm_u8i4_i32` | **row-major** | the kernel, internally |
+| `sdkl_npu_mm_f16` | **AH** | the caller |
+| `sdkl_npu_mm_f16f16_f16` | **row-major** | the kernel, internally |
+
+The unsuffixed forms are the HMX-native ones — "the ideal kernel … assuming the
+caller handles layout and type preparation". The suffixed forms are the
+convenience wrappers.
+
+This is the seam that matters for attention: a fused `Q·Kᵀ → softmax → P·V`
+that keeps the score matrix on the DSP needs the **AH-native** kernels, since
+the suffixed ones round-trip through row-major on every call. It is also why
+probe (5) in `hexkl_layout_probe.c` — is the accumulator's AH the same AH that
+`rm_to_ah` produces — decides whether that fusion is reachable at all.
+
+`sdkl_npu_mm_u8i4_i32` additionally documents that it "accepts arbitrary
+(unaligned) dimensions and handles X layout conversion and output padding
+internally". No other kernel in the header says this, and it is the only one
+taking `size_t` dimensions rather than `int`. See
+[09](09_lmhead_u8i4_plan.md) §4 for what that changes.
 
 ---
 
