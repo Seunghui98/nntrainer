@@ -9,6 +9,7 @@ Three probes, answering three questions that the
 | :-- | :-- | :-- | :-- |
 | `hexkl_gemv_probe` | host (ARM) | does `sdkl_npu_mm_u8i4_i32` accept an unaligned `n_row`? | [09](09_lmhead_u8i4_plan.md) §4 |
 | `hexkl_pin_probe` | host (ARM) | how much NPU memory can stay resident? | [09](09_lmhead_u8i4_plan.md) §3 |
+| `hexkl_decode_probe` | host (ARM) | how much of a decode token is weight staging rather than matmul? | [09](09_lmhead_u8i4_plan.md) §2 |
 | `hexkl_layout_probe` | DSP | what do RM / AH / WH actually permute to? | [08](08_attention_hmx_design.md) §3 |
 
 Run them in that order. `hexkl_gemv_probe small` is seconds and decides the
@@ -301,6 +302,51 @@ attention work ([08](08_attention_hmx_design.md) §5, Option B):
 > uint8_t *matX, ...)` uses the opposite (and matches SDKL's A=output
 > convention), while *inside* it the locals go back to `X_rows = A_rows`. Read
 > the call sites, not the parameter names.
+
+---
+
+## 3.5 `hexkl_decode_probe` — where a decode token actually goes
+
+`hexkl_mm.cpp:487` copies the whole WH weight from host into NPU scratch on
+every decode call. For qwen3-0.6b at fp16 that is 30 MiB per layer and 840 MiB
+per generated token across 28 layers — the same order as the ~102 ms/token that
+9.8 TPS implies. Neither branch instruments `shgemm_f32f16_f32`, so this
+measures it from outside instead.
+
+```bash
+ndk-build -C test/unittest/jni_htp NDK_PROJECT_PATH=. \
+  APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk \
+  hexkl_decode_probe -j$(nproc)
+adb push test/unittest/jni_htp/obj/local/arm64-v8a/hexkl_decode_probe $D/
+adb shell chmod +x $D/hexkl_decode_probe
+
+adb shell "cd $D && LD_LIBRARY_PATH=$D ADSP_LIBRARY_PATH=$D \
+  ./hexkl_decode_probe layer"
+adb shell "cd $D && LD_LIBRARY_PATH=$D ADSP_LIBRARY_PATH=$D \
+  ./hexkl_decode_probe full"
+```
+
+It runs qwen3-0.6b's seven FC shapes at `M = 1` two ways — staged (a host WH
+weight memcpy'd into NPU scratch before each matmul, what the code does today)
+and resident (the weight allocated in NPU memory once, which
+[§2](#2-hexkl_pin_probe--the-residency-budget) showed there is room for) — and
+reports staging and matmul time separately.
+
+`layer` uses one layer's 30 MiB and multiplies by 28. `full` builds all 28
+layers, 840 MiB of host buffers and as much again in NPU memory. **Prefer
+`full`**: `layer` re-reads the same 30 MiB every iteration, which is far kinder
+to cache than a real token's walk through 840 MiB, so it flatters the staged
+case.
+
+What the output decides:
+
+| | |
+| :-- | :-- |
+| staging ≫ matmul | the decode bottleneck is memory movement, not compute. Making FC weights resident is worth more than anything in [09](09_lmhead_u8i4_plan.md), and the pin probe already showed the budget is there. |
+| staging ≈ matmul or less | the 881 MB/token hypothesis is wrong; decode time is elsewhere and the lm_head plan stays the main thread. |
+
+If fewer weights fit in NPU memory than were asked for, the probe says so and
+skips the resident half — which is its own answer for that configuration.
 
 ---
 

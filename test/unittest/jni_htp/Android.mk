@@ -246,3 +246,21 @@ LOCAL_CFLAGS     := \
 LOCAL_LDLIBS     := -llog $(HEXKL_SDKL_LDLIBS)
 LOCAL_SRC_FILES  := hexkl_gemv_probe.c
 include $(BUILD_EXECUTABLE)
+
+# ---- executable: hexkl_decode_probe (armv8 libsdkl, no gtest, no libnntrainer) ----
+# Splits a decode token into weight staging and matmul, with qwen3-0.6b's real
+# FC shapes at M=1, to size the per-token memcpy at hexkl_mm.cpp:487 against
+# the matmuls it feeds. Neither branch instruments shgemm_f32f16_f32, which is
+# the path qwen3-0.6b actually runs, so this measures it from outside.
+include $(CLEAR_VARS)
+LOCAL_MODULE     := hexkl_decode_probe
+LOCAL_CFLAGS     := \
+    -pthread \
+    -DENABLE_FP16=1 -DUSE__FP16=1 \
+    -Drestrict=__restrict \
+    -I$(HEXKL_INCS_DIR) \
+    -I$(HEXKL_ADDON_ROOT)/include \
+    -march=armv8.2-a+fp16+dotprod+i8mm -O2
+LOCAL_LDLIBS     := -llog $(HEXKL_SDKL_LDLIBS)
+LOCAL_SRC_FILES  := hexkl_decode_probe.c
+include $(BUILD_EXECUTABLE)
