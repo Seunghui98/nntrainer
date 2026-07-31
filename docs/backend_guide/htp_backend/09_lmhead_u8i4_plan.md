@@ -184,8 +184,37 @@ dimension alignment. So `Mp = 64` was very likely correct against beta1, which
 is what the "verified on V79/V81" comment at `hexkl_mm.cpp:299` is recording.
 The wrapper is not wrong-headed; it is one SDK revision behind.
 
-**None of that is a measurement.** It is one Doxygen sentence in a beta SDK,
-and three things keep it from being settled:
+### Measured on device — `n_row` yes, `n_col` no
+
+`hexkl_gemv_probe small`, Galaxy S25 Ultra, `1_0_56_beta.2_HEXAGON_V79`:
+
+| M | N | K | result | rows past `M` |
+| --: | --: | --: | :-- | :-- |
+| 64 | 32 | 32 | correct (control) | — |
+| **1** | 32 | 32 | **correct** | **untouched** |
+| **1** | 96 | 32 | **correct** | **untouched** |
+| 1 | **100** | 32 | **wrong — 4 of 100** | untouched |
+| **7** | 64 | 32 | **correct** | **untouched** |
+| **33** | 64 | 64 | **correct** | **untouched** |
+
+**Unaligned `n_row` works, and the kernel does not write past row `M-1`.** Both
+halves of the question came back the good way: `A` can be passed as `M` rows and
+sized to `M` rows. 37.1 MiB → 594 KB, the `memset` and the pool thrash go with
+it, and traffic per token drops from 111.3 MiB to 74.8 — the same as any GEMV.
+
+**Unaligned `n_col` does not work**, and the failure says exactly why:
+`100 = 3 × 32 + 4`, the first 96 columns are correct, and only the trailing
+4 are garbage (`A[96] = 20`, expected 32). A partial tile is not handled. So
+beta2's "arbitrary (unaligned) dimensions" covers `n_row` and overstates
+`n_col`, and the `N % 32` throws at `hexkl_mm.cpp:700` and in
+`quantize_qint4_weight` are **correct — keep them**.
+
+The rest of this section is why the doc string was not taken at face value; it
+is kept because the reasoning applies the next time a beta doc string decides
+something.
+
+**The claim alone was not a measurement.** It is one Doxygen sentence in a beta
+SDK, and three things kept it from being settled:
 
 - Beta documentation runs ahead of implementation routinely. The same header
   ships `sdkl_npu_init_config_t` as an empty "reserved for future use" struct
@@ -217,19 +246,20 @@ adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp \
   ./hexkl_gemv_probe small"     # then `lmhead` for the real shape
 ```
 
-Two consequences, assuming the probe confirms it:
+Two consequences:
 
 - **This fix requires the beta2 migration.** Every SDKL layout call in the tree
   still uses beta1 spellings; the rename table is in
   [08](08_attention_hmx_design.md) §4. Signatures are unchanged, so it is
   mechanical, but it has to happen first.
 - **It does not transfer to u8i8.** `sdkl_npu_mm_u8i8_i32` carries no such
-  sentence in either revision, so `shgemm_u8i8_i32` should keep its `Mp = 64`.
+  sentence in either revision and was not probed, so `shgemm_u8i8_i32` keeps
+  its `Mp = 64` until someone measures it.
 
-So `shgemm_u8i4_i32`, once on beta2, should pass `n_row = M` and size its
-buffers to `M`:
+So `shgemm_u8i4_i32`, once on beta2, passes `n_row = M` and sizes its buffers
+to `M`:
 
-| | now (`Mp = 64`) | per the header (`M = 1`) |
+| | now (`Mp = 64`) | measured (`M = 1`) |
 | :-- | --: | --: |
 | X buffer | 64 KiB | 1 KiB |
 | **C accumulator** | **37.1 MiB** | **594 KiB** |
@@ -237,29 +267,25 @@ buffers to `M`:
 | pool thrash (b) | every token | gone |
 | **traffic per token** | **111.3 MiB** | **74.8 MiB** |
 
-`A` is documented as **row-major** `[n_row, n_col]`, and the padding is
-internal, so the 64-row accumulator stays in VTCM / the HMX accumulator and only
-the real rows reach DDR. That puts HMX at the same 74.8 MiB as an HVX GEMV or
-the CPU int4 baseline — **there is no 1.5× penalty and no reason to ask for an
-HVX GEMV entry point.**
+`A` is row-major `[n_row, n_col]` and the padding is internal, so the 64-row
+accumulator stays in VTCM / the HMX accumulator and only the real rows reach
+DDR — which is what the probe's untouched poison rows confirm. That puts HMX at
+the same 74.8 MiB as an HVX GEMV or the CPU int4 baseline: **no 1.5× penalty,
+and no reason to ask for an HVX GEMV entry point.**
 
 None of this touches the FC layers: `Mp = 32` and `N ≤ 3072` put their
 accumulators at 393 KB either way. `N = 151936` created the entire problem.
 
 Fixes, in order:
 
-1. **Pass `M` instead of `Mp`** and size X and C to `M`. Verify against a CPU
-   reference — the header's claim is worth one known-answer check before the
-   padding comes out, since a silently wrong result is the bad failure here.
-   This alone removes (a) and (b) completely.
-2. **Drop the `memset`.** At `M = 1` it is 594 KB rather than 37 MiB, so it stops
-   mattering much, but the kernel overwrites `A` and it is still redundant.
-3. **Reconsider the `N % 32` throw** at `hexkl_mm.cpp:700` and the matching one
-   in `quantize_qint4_weight`. If the kernel accepts unaligned `n_col`, these
-   are over-restrictive. `N = 151936` is aligned, so this changes nothing for
-   lm_head — but it would matter for any other vocab size.
-4. **Chunk `N`** — only if (1) turns out not to hold on device. It bounds the
-   accumulator to 4.6 MiB but leaves the write traffic unchanged.
+1. **Pass `M` instead of `Mp`** and size X and C to `M`. Measured good above;
+   this alone removes (a) and (b) completely.
+2. **Drop the `memset`.** At `M = 1` it is 594 KB rather than 37 MiB, so it
+   stops mattering much, but the kernel overwrites `A` and it is redundant.
+3. **Leave the `N % 32` throws alone.** `hexkl_mm.cpp:700` and
+   `quantize_qint4_weight` are correct: the probe's `N = 100` case returned
+   garbage in exactly the trailing partial tile.
+4. **Chunking `N`** is no longer needed — it was the fallback for (1) failing.
 
 ### Why QNN shows no padding
 

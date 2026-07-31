@@ -268,6 +268,27 @@ tracked in this document instead.
 | `test/unittest/jni_htp/hexkl_pin_probe.c` | host (ARM) | how much NPU memory can stay resident |
 | `test/unittest/jni_htp/hexagon/hexkl_layout_probe.c` | DSP | what RM/AH/WH actually permute to, read off the hardware |
 
-The layout probe also prints `hmx_fp16_rate`. **Zero there means the device has
-no HMX fp16**, which invalidates every `mm_f16`-based plan above before anything
-else is worth measuring — run it first.
+### The fp16 gate is cleared
+
+`hmx_fp16_rate` was the precondition on everything above: zero there means the
+device has no HMX fp16 and no `mm_f16`-based plan is worth measuring.
+`sdkl_npu_get_hw_info` reports it, and `hexkl_gemv_probe` prints it on the way
+past. Galaxy S25 Ultra, `1_0_56_beta.2_HEXAGON_V79`:
+
+```
+[HW_INFO] Hexagon Architecture Version: 35961     (0x8C79 -> ISA 0x79 = V79)
+[HW_INFO] HMX FP16 Rate (ops/cycle): 8
+[HW_INFO] Number of HVX Units: 6
+[HW_INFO] VTCM total size (bytes): 18874368       (18 MiB)
+```
+
+**8 ops/cycle, so HMX fp16 exists.** The direction is open.
+
+**VTCM is 18 MiB**, considerably more than the single-digit MB assumed while
+sizing Option B. It is still nowhere near the 74 MiB an lm_head weight needs, so
+nothing changes for §6 — but for attention it is roomy: a full set of Q, K and
+score tiles for one head fits with margin, which is what a fused
+`Q·Kᵀ → softmax → P·V` needs to keep the intermediate resident.
+
+The DSP-side layout probe is still the one that answers §3 — what RM, AH and WH
+actually permute to, and whether the accumulator's AH matches `rm_to_ah`'s.

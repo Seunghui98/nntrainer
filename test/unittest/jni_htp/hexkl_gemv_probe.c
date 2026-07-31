@@ -75,6 +75,10 @@ static double now_us(void) {
 typedef struct {
   unsigned M, N, K;
   const char *note;
+  // Which claim the case is evidence for. n_row and n_col turned out to be
+  // governed by different rules, and a summary that pools them says nothing
+  // useful about either.
+  enum { CASE_CONTROL, CASE_NROW, CASE_NCOL } tests;
 } probe_case;
 
 typedef struct {
@@ -218,11 +222,11 @@ static int run_case(int domain, const probe_case *c) {
     const size_t beyond = b.a_elems - (size_t)c->M * c->N;
     if (touched == 0)
       printf("      rows %u..%u untouched (%zu poisoned elements intact)\n"
-             "        -> A can be allocated at M rows: %.1f MB instead of "
-             "%.1f MB\n",
+             "        -> A can be allocated at M rows: %.1f KB instead of "
+             "%.1f KB\n",
              c->M, Mp - 1, beyond,
-             (double)((size_t)c->M * c->N * sizeof(int32_t)) / (double)MB,
-             (double)(b.a_elems * sizeof(int32_t)) / (double)MB);
+             (double)((size_t)c->M * c->N * sizeof(int32_t)) / 1024.0,
+             (double)(b.a_elems * sizeof(int32_t)) / 1024.0);
     else
       printf("      rows %u..%u WERE written (%zu/%zu elements changed)\n"
              "        -> A must stay allocated at %u rows even when passing "
@@ -243,27 +247,54 @@ static int mode_small(int domain) {
   printf("\n=== mode: small ===\n");
 
   static const probe_case CASES[] = {
-    {64, 32, 32, "aligned control -- must pass"},
-    {1, 32, 32, "the lm_head row count"},
-    {1, 96, 32, "N aligned, larger"},
-    {1, 100, 32, "N NOT a multiple of 32"},
-    {7, 64, 32, "M unaligned and not 1"},
-    {33, 64, 64, "M straddles the tile"},
+    {64, 32, 32, "aligned control -- must pass", CASE_CONTROL},
+    {1, 32, 32, "the lm_head row count", CASE_NROW},
+    {1, 96, 32, "N aligned, larger", CASE_NROW},
+    {1, 100, 32, "N NOT a multiple of 32", CASE_NCOL},
+    {7, 64, 32, "M unaligned and not 1", CASE_NROW},
+    {33, 64, 64, "M straddles the tile", CASE_NROW},
   };
   const size_t n = sizeof(CASES) / sizeof(CASES[0]);
 
-  size_t passed = 0;
-  for (size_t i = 0; i < n; i++)
-    if (run_case(domain, &CASES[i]) == 0)
-      passed++;
+  size_t nrow_ok = 0, nrow_total = 0;
+  size_t ncol_ok = 0, ncol_total = 0;
+  int control_ok = 0;
 
-  printf("\n  %zu/%zu cases produced correct results\n", passed, n);
-  if (passed == n)
-    printf("  -> the beta2 claim holds at these shapes; hexkl_mm.cpp can pass "
-           "M directly\n");
-  else
-    printf("  -> the claim does NOT hold; keep the Mp padding\n");
-  return passed == n ? 0 : 1;
+  for (size_t i = 0; i < n; i++) {
+    const int ok = run_case(domain, &CASES[i]) == 0;
+    switch (CASES[i].tests) {
+    case CASE_CONTROL: control_ok = ok; break;
+    case CASE_NROW:    nrow_total++; nrow_ok += ok; break;
+    case CASE_NCOL:    ncol_total++; ncol_ok += ok; break;
+    }
+  }
+
+  printf("\n  --- verdict ---\n");
+
+  if (!control_ok) {
+    printf("  the aligned control failed. Something is wrong with the setup,\n"
+           "  not with the kernel -- nothing below means anything.\n");
+    return 1;
+  }
+
+  printf("  unaligned n_row: %zu/%zu correct -> %s\n", nrow_ok, nrow_total,
+         nrow_ok == nrow_total
+           ? "SUPPORTED. hexkl_mm.cpp can pass M and size C to M rows."
+           : "NOT supported. Keep the Mp padding.");
+
+  printf("  unaligned n_col: %zu/%zu correct -> %s\n", ncol_ok, ncol_total,
+         ncol_ok == ncol_total
+           ? "supported too; the N %% 32 throws are over-restrictive."
+           : "NOT supported. The N %% 32 throws are correct, keep them.");
+
+  printf("\n  beta2's \"accepts arbitrary (unaligned) dimensions\" therefore "
+         "covers\n  %s.\n",
+         (nrow_ok == nrow_total && ncol_ok != ncol_total)
+           ? "n_row but not n_col"
+           : (nrow_ok == nrow_total ? "both" : "neither"));
+
+  // Only n_row governs the lm_head accumulator, so that is the exit status.
+  return nrow_ok == nrow_total ? 0 : 1;
 }
 
 /*!
@@ -278,8 +309,8 @@ static int mode_lmhead(int domain) {
          "allocate,\n  that is the pin budget answering, not this test.\n");
 
   static const probe_case CASES[] = {
-    {1, 151936, 1024, "what lm_head actually needs"},
-    {64, 151936, 1024, "what the wrapper asks for today"},
+    {1, 151936, 1024, "what lm_head actually needs", CASE_NROW},
+    {64, 151936, 1024, "what the wrapper asks for today", CASE_CONTROL},
   };
 
   int rc = 0;
