@@ -61,9 +61,22 @@ LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 include $(PREBUILT_SHARED_LIBRARY)
 
 # ---- prebuilt: libsdkl_armv8.so (armv8, used by sdkl_npu_probe) ----
+# The addon's lib layout changed between revisions: 1.0.0-beta1 is
+#   lib/<abi>/libsdkl.so
+# while 1.0.0-beta2 inserts the Hexagon SDK version it was built against,
+#   lib/<sdk_version>/<abi>/libsdkl.so
+# so the ABI directory alone no longer locates the library. HEXKL_LIB_SUBDIR
+# is whatever sits between lib/ and libsdkl.so; check with `ls $HEXKL_SDK_ROOT/lib`
+# and export e.g. HEXKL_LIB_SUBDIR=6.4.0.2/armv8_android26 for beta2. The
+# default keeps beta1 working unchanged.
+HEXKL_LIB_SUBDIR := $(HEXKL_LIB_SUBDIR)
+ifeq ($(HEXKL_LIB_SUBDIR),)
+  HEXKL_LIB_SUBDIR := armv8_android26
+endif
+
 include $(CLEAR_VARS)
 LOCAL_MODULE             := sdkl_armv8
-LOCAL_SRC_FILES          := $(HEXKL_ADDON_ROOT)/lib/armv8_android26/libsdkl.so
+LOCAL_SRC_FILES          := $(HEXKL_ADDON_ROOT)/lib/$(HEXKL_LIB_SUBDIR)/libsdkl.so
 LOCAL_C_INCLUDES         := $(HEXKL_ADDON_ROOT)/include
 LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 include $(PREBUILT_SHARED_LIBRARY)
