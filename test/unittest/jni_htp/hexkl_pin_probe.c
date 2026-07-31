@@ -404,7 +404,7 @@ static int mode_total(int domain) {
     // (64 MiB) still brackets the failure closely enough to act on.
     if ((n_held + 1) % 4 == 0) {
       char tag[32];
-      snprintf(tag, sizeof(tag), "%zuMB", total / MB);
+      snprintf(tag, sizeof(tag), "%zuMB", (size_t)(total / MB));
       if (check_run(domain, &b, tag) != 0) {
         printf("  the kernel stopped working with %.1f MB held\n",
                (double)total / (double)MB);

@@ -123,6 +123,25 @@ Two things about that invocation are load-bearing:
   the file, including the `libnntrainer.so` and `libccapi-nntrainer.so`
   prebuilts, which need a meson build that these probes do not.
 
+> **Clean `obj/` and `libs/` when switching HexKL revisions.** Two prebuilts in
+> `Android.mk` have a source file named `libsdkl.so` — the addon's, and the
+> armv9 copy meson leaves in `builddir/jni/arm64-v8a/` — so ndk-build gives
+> them the same install target and says `overriding recipe for target
+> .../libsdkl.so`. On a clean tree the addon's wins, which is what you want,
+> but a copy left over from a previous build is not replaced. The symptom is a
+> link failure naming beta2-only symbols:
+>
+> ```
+> ld.lld: error: undefined symbol: sdkl_npu_get_hw_info
+> ld.lld: error: undefined symbol: sdkl_cpu_i4_rm_to_i4_wh
+> ```
+>
+> That is a beta1 library under beta2 sources. Fix:
+>
+> ```bash
+> rm -rf test/unittest/jni_htp/obj test/unittest/jni_htp/libs
+> ```
+
 ### Deploy
 
 ```bash

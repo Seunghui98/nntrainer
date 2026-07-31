@@ -93,6 +93,21 @@ ifeq ($(HEXKL_LIB_SUBDIR),)
   HEXKL_LIB_SUBDIR := armv8_android26
 endif
 
+# `sdkl` and `sdkl_armv8` are both prebuilts whose source file is named
+# libsdkl.so, so ndk-build derives the same install target for the two and
+# prints "overriding recipe for target .../libsdkl.so". The later recipe --
+# sdkl_armv8, the addon copy -- wins on a clean tree, which is what the probes
+# want. But a copy left in obj/ by a previous build of the *other* one is newer
+# than nothing and does not get replaced, so a stale libsdkl.so survives and
+# the link fails with undefined sdkl_* symbols. That is the signature of a
+# beta1 library under beta2 sources, and `rm -rf obj libs` is the fix.
+ifneq ($(wildcard $(NNTRAINER_LIB_DIR)/libsdkl.so),)
+  $(info [jni_htp] two libsdkl.so sources are in play:)
+  $(info [jni_htp]   $(NNTRAINER_LIB_DIR)/libsdkl.so)
+  $(info [jni_htp]   $(HEXKL_ADDON_ROOT)/lib/$(HEXKL_LIB_SUBDIR)/libsdkl.so)
+  $(info [jni_htp] if the link reports undefined sdkl_* symbols, rm -rf obj libs and rebuild)
+endif
+
 include $(CLEAR_VARS)
 LOCAL_MODULE             := sdkl_armv8
 LOCAL_SRC_FILES          := $(HEXKL_ADDON_ROOT)/lib/$(HEXKL_LIB_SUBDIR)/libsdkl.so
