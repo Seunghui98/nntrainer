@@ -113,15 +113,28 @@ static int bufs_init(bufs *b, unsigned M, unsigned N, unsigned K) {
   b->a_elems = (size_t)Mp * N;
   const size_t a_bytes = b->a_elems * sizeof(int32_t);
 
-  // sdkl_cpu_i4_rm_to_i4_wh wants one i4 per int8 byte on the way in and packs
-  // two per byte on the way out; over-allocating to the unpacked size keeps
-  // any tile padding past N*K/2 in bounds. Same policy as quantize_qint4_weight.
-  const size_t w_unpacked = (size_t)N * K * sizeof(int8_t);
+  /* The weight layout works in whole 32x32 tiles. Qualcomm's own beta1 sample
+     for this kernel rounds n_col and n_inner up to 32 for the layout call and
+     sizes the output from the rounded dims, then passes the *real* dims to the
+     matmul:
 
-  if (sdkl_npu_alloc(x_bytes, &b->X) || sdkl_npu_alloc(w_unpacked, &b->W) ||
+       n_col_32   = (N_COL   + 31) & ~31;
+       n_inner_32 = (N_INNER + 31) & ~31;
+       sdkl_cpu_rm_to_wh_i4(W, W_cpu, n_inner_32, n_col_32);
+       sdkl_npu_mm_u8i4_i32(domain, N_ROW, N_COL, N_INNER, ...);
+
+     An earlier version of this probe passed the real dims to the layout call,
+     which leaves the trailing partial tile built differently from what the
+     kernel reads -- and that is what the N=100 case was really measuring. */
+  const unsigned N32 = (N + 31u) & ~31u;
+  const unsigned K32 = (K + 31u) & ~31u;
+  const size_t rm_elems = (size_t)N32 * K32;
+  const size_t wh_bytes = rm_elems / 2;
+
+  if (sdkl_npu_alloc(x_bytes, &b->X) || sdkl_npu_alloc(rm_elems, &b->W) ||
       sdkl_npu_alloc(a_bytes, &b->A)) {
     printf("    [alloc] failed (X=%.1f MB, W=%.1f MB, A=%.1f MB)\n",
-           (double)x_bytes / (double)MB, (double)w_unpacked / (double)MB,
+           (double)x_bytes / (double)MB, (double)rm_elems / (double)MB,
            (double)a_bytes / (double)MB);
     bufs_free(b);
     return -1;
@@ -129,24 +142,29 @@ static int bufs_init(bufs *b, unsigned M, unsigned N, unsigned K) {
 
   memset(b->X, 1, x_bytes); // every activation byte = 1
 
+  /* wt_old is row-major [wt_rows][wt_cols] = [K32][N32], per the argument
+     order below. Real entries are 1, the tile padding is 0, so the padded
+     columns contribute nothing and columns 0..N-1 must still sum to K. */
   int8_t *w_rm = (int8_t *)b->W;
-  for (size_t i = 0; i < (size_t)N * K; i++)
-    w_rm[i] = 1;
+  memset(w_rm, 0, rm_elems);
+  for (unsigned k = 0; k < K; k++)
+    for (unsigned n = 0; n < N; n++)
+      w_rm[(size_t)k * N32 + n] = 1;
 
   // The packer is not in-place, so convert into scratch and copy back --
   // exactly what quantize_qint4_weight does.
   void *wh = NULL;
-  if (sdkl_npu_alloc(w_unpacked, &wh) != 0 || wh == NULL) {
+  if (sdkl_npu_alloc(rm_elems, &wh) != 0 || wh == NULL) {
     printf("    [alloc] WH scratch failed\n");
     bufs_free(b);
     return -1;
   }
-  // Device-verified argument order (see quantizer.cpp): the i4 packer takes
-  // (wt_rows = K, wt_cols = N) -- the inner dimension first.
-  const int rc = sdkl_cpu_i4_rm_to_i4_wh((uint8_t *)wh, w_rm, (size_t)K,
-                                         (size_t)N);
+  // Argument order confirmed twice: quantize_qint4_weight's device-verified
+  // comment, and the vendor sample above -- (wt_rows = inner, wt_cols = col).
+  const int rc = sdkl_cpu_i4_rm_to_i4_wh((uint8_t *)wh, w_rm, (size_t)K32,
+                                         (size_t)N32);
   if (rc == 0)
-    memcpy(b->W, wh, (size_t)N * K / 2);
+    memcpy(b->W, wh, wh_bytes);
   sdkl_npu_free(wh);
 
   if (rc != 0) {
@@ -250,7 +268,7 @@ static int mode_small(int domain) {
     {64, 32, 32, "aligned control -- must pass", CASE_CONTROL},
     {1, 32, 32, "the lm_head row count", CASE_NROW},
     {1, 96, 32, "N aligned, larger", CASE_NROW},
-    {1, 100, 32, "N NOT a multiple of 32", CASE_NCOL},
+    {1, 100, 32, "N NOT a multiple of 32 (layout built on 128)", CASE_NCOL},
     {7, 64, 32, "M unaligned and not 1", CASE_NROW},
     {33, 64, 64, "M straddles the tile", CASE_NROW},
   };

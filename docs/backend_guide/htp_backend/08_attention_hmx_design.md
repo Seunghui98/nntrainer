@@ -100,7 +100,7 @@ beta1; beta2 needs a signed Product Kit License Agreement). Relevant changes:
 | change | why it matters here |
 | :-- | :-- |
 | **`sdkl_npu_mm_u8i8` and `sdkl_npu_mm_u8i4`** (AH-native) | **new in beta2** — beta1 shipped only the `_i32` row-major forms. A fused attention chain needs these; under beta1 it was not expressible at all. |
-| `sdkl_npu_mm_u8i4_i32` now "accepts arbitrary (unaligned) dimensions and handles X layout conversion and output padding internally" | **new sentence in beta2.** beta1's doc block for the same function does not say it, which means `hexkl_mm.cpp`'s `Mp = 64` was likely correct against beta1 and is stale against beta2. See [09](09_lmhead_u8i4_plan.md) §4. |
+| `sdkl_npu_mm_u8i4_i32` now "accepts arbitrary (unaligned) dimensions and handles X layout conversion and output padding internally" | **New sentence, but not new behaviour.** beta1's own sample for this kernel already passes `n_row` unpadded while rounding `n_col` and `n_inner` up to 32, so beta2 documented what was already true. `hexkl_mm.cpp`'s `Mp = 64` looks copied from the u8i8 wrapper rather than verified. See [09](09_lmhead_u8i4_plan.md) §4. |
 | `sdkl_npu_mm_f16f16_f16` | fp16 in, fp16 out. Removes *all* dtype conversion from the attention path, which is fp16 end to end on device. |
 | `sdkl_npu_get_hw_info` / `sdkl_npu_hw_info_t` | new. Reports `vtcm_size`, `num_hvx_units`, `hmx_fp16_rate`. `hexkl_pin_probe.c` calls it, so that probe is beta2-only. |
 | New AH converters: `sdkl_cpu_u8_rm_to_u8_ah(_inplace)`, `sdkl_cpu_f32_rm_to_f16_ah`, `sdkl_cpu_f16_ah_to_f32_rm`, non-inplace `sdkl_cpu_f16_rm_to_f16_ah` | new. Needed to feed the AH-native kernels above. |

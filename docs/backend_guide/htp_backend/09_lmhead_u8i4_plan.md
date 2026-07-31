@@ -192,23 +192,44 @@ So a 37 MiB `sdkl_npu_alloc`/`free` pair happens **once per generated token**,
 plus re-allocating every FC accumulator. This is a fastrpc mmap round trip, not
 a pool hit.
 
-### beta2 removed the padding requirement. The wrapper is stale, not wrong.
+### The `M % 64` in the wrapper has no source, in either revision
 
-`hexkl_mm.cpp:695` asserts "SDKL requires M%64==0" with no citation. The
-1.0.0-beta2 header contradicts it, in the doc block for this exact function:
+`hexkl_mm.cpp:695` asserts "SDKL requires M%64==0" with no citation. beta2's
+header contradicts it, in the doc block for this exact function:
 
 > `sdkl_npu_mm_u8i4_i32` — This kernel is optimized for int32 matmul on the
 > Hexagon NPU. **It accepts arbitrary (unaligned) dimensions and handles X
 > layout conversion and output padding internally.**
 
-Neither `M % 64` nor `N % 32` is a precondition. The kernel pads for itself.
+That sentence is absent from beta1, which first looked like a behaviour change.
+**It is not — beta1's own example for this kernel gives it away.** The vendor's
+`sdkl_npu_mm_u8i4_i32` sample under 1.0.0-beta1 opens with:
 
-**That sentence does not exist in beta1.** beta1's doc block for the same
-function says only the usual "assumes A/X row-major, W in WH" plus a note that
-buffers should come from `sdkl_npu_alloc()` — which is *address* alignment, not
-dimension alignment. So `Mp = 64` was very likely correct against beta1, which
-is what the "verified on V79/V81" comment at `hexkl_mm.cpp:299` is recording.
-The wrapper is not wrong-headed; it is one SDK revision behind.
+```c
+size_t n_col_32   = (N_COL + 31) & ~31;
+size_t n_inner_32 = (N_INNER + 31) & ~31;
+/*                  there is no n_row_32                */
+
+sdkl_cpu_rm_to_wh_i4(W_npu, W_cpu, n_inner_32, n_col_32);   /* padded dims  */
+sdkl_npu_mm_u8i4_i32(domain, N_ROW, N_COL, N_INNER, ...);   /* real dims    */
+```
+
+It rounds `n_col` and `n_inner` up to 32 — defensively, since both are already
+multiples of 32 in the sample — and **does not touch `n_row` at all**, passing
+it straight through. The author padded exactly what needed padding, and `n_row`
+was not on that list.
+
+So beta2 documented an existing behaviour rather than changing one, and the
+wrapper's `Mp = 64` was most likely copied from `shgemm_u8i8_i32` rather than
+verified for u8i4. (`N_ROW` is 1024 in the sample, already a multiple of 64, so
+this is inference from the shape of the code, not proof. The measurement below
+is the proof — for beta2.)
+
+The one thing that sample *does* establish beyond doubt is the weight-layout
+convention: `sdkl_cpu_rm_to_wh_i4(out, in, wt_rows = n_inner, wt_cols = n_col)`,
+which is the argument order `quantize_qint4_weight` uses and had marked only as
+"device-verified". It also passes X and A as plain `malloc` memory — only the
+weight comes from `sdkl_npu_alloc`.
 
 ### Measured on device — `n_row` yes, `n_col` no
 
@@ -228,11 +249,16 @@ halves of the question came back the good way: `A` can be passed as `M` rows and
 sized to `M` rows. 37.1 MiB → 594 KB, the `memset` and the pool thrash go with
 it, and traffic per token drops from 111.3 MiB to 74.8 — the same as any GEMV.
 
-**Unaligned `n_col` does not work**, and the failure says exactly why:
-`100 = 3 × 32 + 4`, the first 96 columns are correct, and only the trailing
-4 are garbage (`A[96] = 20`, expected 32). A partial tile is not handled. So
-beta2's "arbitrary (unaligned) dimensions" covers `n_row` and overstates
-`n_col`, and the `N % 32` throws at `hexkl_mm.cpp:700` and in
+**The `n_col` result is not trustworthy.** `100 = 3 × 32 + 4`, the first 96
+columns are correct and only the trailing 4 are wrong (`A[96] = 20`, expected
+32) — but the probe built that weight by calling `sdkl_cpu_i4_rm_to_i4_wh` with
+the *real* `n_col`, where the vendor sample passes the 32-padded one. The
+trailing partial tile was therefore never laid out the way the kernel expects,
+so this may be the probe's bug rather than a kernel constraint. Re-run with a
+padded layout call before concluding anything about `n_col`.
+
+Nothing for lm_head depends on it either way: 151936 is 4748 whole tiles. Until
+it is re-measured, the `N % 32` throws at `hexkl_mm.cpp:700` and in
 `quantize_qint4_weight` are **correct — keep them**.
 
 The rest of this section is why the doc string was not taken at face value; it
