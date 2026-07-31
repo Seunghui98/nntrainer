@@ -29,7 +29,13 @@
  * would buy per token. Both are timed separately from the matmuls, so the
  * answer is not just "faster" but "how much of the token was never compute".
  *
- *   usage: hexkl_decode_probe [layer|full] [iters]     (default: layer 20)
+ *   usage: hexkl_decode_probe [shapes|layer|full] [iters]  (default: layer 20)
+ *
+ *     shapes run one matmul per shape, from a known-good 32x32 up to the real
+ *            FC sizes, and report where the result stops being correct plus
+ *            how much of the output buffer was written at all. Run this first
+ *            if `layer` reports a wrong element: it turns "why is index 128
+ *            special" into a measurement instead of a theory.
  *
  *     layer  one decoder layer's seven weights (30 MiB), looped; the per-token
  *            figure is 28x that. Cheap, and the per-byte costs it measures do
@@ -340,6 +346,105 @@ static int measure(int domain, weight *ws, size_t n, unsigned iters,
   return 0;
 }
 
+/*!
+  @brief Walk from a known-good shape up to the real ones, reporting where the
+         result stops being correct.
+
+  sdkl_npu_probe verifies 32x32x32 and the model runs these FC shapes through
+  shgemm_f32f16_f32 every day, so a failure in between is about this probe or
+  about a shape boundary, and guessing which is a waste of a device. The
+  correct-element and non-zero counts over the whole padded buffer are the
+  useful part: they say whether the kernel wrote a smaller region than asked
+  or wrote the full region in an unexpected order.
+*/
+static int mode_shapes(int domain) {
+  static const wshape S[] = {
+    {"32x32 (sdkl_npu_probe's shape)", 32, 32},
+    {"1024x1024 (k_proj)", 1024, 1024},
+    {"2048x1024 (q_proj)", 2048, 1024},
+    {"3072x1024 (ffn_gate)", 3072, 1024},
+    {"1024x2048 (o_proj)", 1024, 2048},
+    {"1024x3072 (ffn_down)", 1024, 3072},
+  };
+  const size_t n = sizeof(S) / sizeof(S[0]);
+
+  printf("\n=== mode: shapes (n_row=%u throughout) ===\n", DECODE_MP);
+
+  size_t ok = 0;
+  for (size_t i = 0; i < n; i++) {
+    const wshape *sh = &S[i];
+    printf("  --- %s  N=%u K=%u\n", sh->name, sh->N, sh->K);
+
+    weight w;
+    if (weight_init(&w, sh, 0) != 0)
+      continue;
+
+    const size_t x_bytes = (size_t)DECODE_MP * sh->K * sizeof(float);
+    const size_t a_elems = (size_t)DECODE_MP * sh->N;
+    void *scratch = NULL, *Xv = NULL, *Av = NULL;
+    if (sdkl_npu_alloc(w.bytes, &scratch) != 0 ||
+        sdkl_npu_alloc(x_bytes, &Xv) != 0 ||
+        sdkl_npu_alloc(a_elems * sizeof(float), &Av) != 0) {
+      printf("      buffer alloc failed\n");
+      weight_free(&w);
+      continue;
+    }
+
+    float *X = (float *)Xv, *A = (float *)Av;
+    memset(X, 0, x_bytes);
+    for (unsigned k = 0; k < sh->K; k++)
+      X[k] = 1.0f; /* row 0 only, as the decode path does */
+    memset(A, 0, a_elems * sizeof(float));
+    memcpy(scratch, w.host_wh, w.bytes);
+
+    const int rc = sdkl_npu_mm_f32f16_f32(domain, (int)DECODE_MP, (int)sh->N,
+                                          (int)sh->K, A, X,
+                                          (const _Float16 *)scratch);
+    if (rc != 0) {
+      printf("      REJECTED rc=%d (0x%x)\n", rc, (unsigned)rc);
+    } else {
+      /* Row 0 should be all K; every padded row should be 0. */
+      long first_bad = -1;
+      size_t row0_ok = 0;
+      for (unsigned c = 0; c < sh->N; c++) {
+        if (fabsf(A[c] - (float)sh->K) < 0.5f)
+          row0_ok++;
+        else if (first_bad < 0)
+          first_bad = (long)c;
+      }
+      size_t nonzero = 0, correct = 0;
+      for (size_t e = 0; e < a_elems; e++) {
+        if (A[e] != 0.0f)
+          nonzero++;
+        if (fabsf(A[e] - (float)sh->K) < 0.5f)
+          correct++;
+      }
+
+      if (first_bad < 0) {
+        printf("      row 0 fully correct (%u elements)\n", sh->N);
+        ok++;
+      } else {
+        printf("      row 0 correct for %zu of %u, first wrong at %ld\n",
+               row0_ok, sh->N, first_bad);
+      }
+      printf("      whole %u x %u buffer: %zu non-zero, %zu equal to K\n",
+             DECODE_MP, sh->N, nonzero, correct);
+    }
+
+    sdkl_npu_free(scratch);
+    sdkl_npu_free(Xv);
+    sdkl_npu_free(Av);
+    weight_free(&w);
+  }
+
+  printf("\n  %zu/%zu shapes fully correct\n", ok, n);
+  printf("  If 32x32 passes and a larger one does not, compare the non-zero "
+         "count against\n  n_row x n_col: a smaller count means the kernel "
+         "wrote a smaller region than\n  asked for, an equal count in the "
+         "wrong places means a layout difference.\n");
+  return ok == n ? 0 : 1;
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -347,6 +452,7 @@ int main(int argc, char **argv) {
   const unsigned iters = (argc > 2) ? (unsigned)atoi(argv[2]) : 20u;
   const int domain = CDSP_DOMAIN_ID;
   const int full = (strcmp(mode, "full") == 0);
+  const int shapes = (strcmp(mode, "shapes") == 0);
 
   size_t per_layer_bytes = 0;
   for (size_t i = 0; i < N_WEIGHTS; i++)
@@ -372,6 +478,13 @@ int main(int argc, char **argv) {
   memset(version, 0, sizeof(version));
   if (sdkl_npu_get_version(domain, version) == 0)
     printf("[DECODE PROBE] CDSP version = %s\n", version);
+
+  if (shapes) {
+    const int sres = mode_shapes(domain);
+    sdkl_npu_finalize(domain);
+    printf("\n[DECODE PROBE] done\n");
+    return sres;
+  }
 
   const size_t n = full ? N_WEIGHTS * N_LAYERS : N_WEIGHTS;
   const unsigned scale = full ? 1u : N_LAYERS;
