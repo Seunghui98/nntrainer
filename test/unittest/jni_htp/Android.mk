@@ -179,3 +179,21 @@ LOCAL_LDLIBS     := -llog
 LOCAL_SRC_FILES  := hexkl_pin_probe.c
 LOCAL_SHARED_LIBRARIES := sdkl_armv8
 include $(BUILD_EXECUTABLE)
+
+# ---- executable: hexkl_gemv_probe (armv8 libsdkl, no gtest, no libnntrainer) ----
+# Checks whether sdkl_npu_mm_u8i4_i32 really accepts an unaligned n_row, which
+# is what beta2's doc string claims and what lm_head's accumulator size rides
+# on. Uses the beta2-only sdkl_cpu_i4_rm_to_i4_wh and sdkl_npu_get_hw_info, so
+# it will not link against a beta1 libsdkl.
+include $(CLEAR_VARS)
+LOCAL_MODULE     := hexkl_gemv_probe
+LOCAL_CFLAGS     := \
+    -pthread \
+    -DENABLE_FP16=1 -DUSE__FP16=1 \
+    -Drestrict=__restrict \
+    -I$(HEXKL_ADDON_ROOT)/../../incs \
+    -march=armv8.2-a+fp16+dotprod+i8mm -O2
+LOCAL_LDLIBS     := -llog
+LOCAL_SRC_FILES  := hexkl_gemv_probe.c
+LOCAL_SHARED_LIBRARIES := sdkl_armv8
+include $(BUILD_EXECUTABLE)

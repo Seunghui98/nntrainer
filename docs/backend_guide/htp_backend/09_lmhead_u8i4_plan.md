@@ -184,7 +184,40 @@ dimension alignment. So `Mp = 64` was very likely correct against beta1, which
 is what the "verified on V79/V81" comment at `hexkl_mm.cpp:299` is recording.
 The wrapper is not wrong-headed; it is one SDK revision behind.
 
-Two consequences:
+**None of that is a measurement.** It is one Doxygen sentence in a beta SDK,
+and three things keep it from being settled:
+
+- Beta documentation runs ahead of implementation routinely. The same header
+  ships `sdkl_npu_init_config_t` as an empty "reserved for future use" struct
+  in both revisions.
+- "Handles output padding internally" reads two ways: the kernel keeps its own
+  padded buffer and copies `n_row` rows out, or it expects the *caller's*
+  buffer to be padded. Under the second reading, shrinking `A` to `M` rows is a
+  heap overrun.
+- The version markers in `hexkl_mm.cpp` ("sdkl.h 6.4.0.1", "sdkl 6.4") are
+  **Hexagon SDK** versions, not HexKL ones, so they do not pin which HexKL
+  revision was tested. And since the u8i4 wrapper was written after the u8i8
+  one, its `M % 64` line was plausibly copied rather than verified — meaning
+  unaligned `M` may never have been tried on this kernel at all.
+
+`test/unittest/jni_htp/hexkl_gemv_probe.c` settles it without betting on the
+answer: `A` is always allocated at the padded size and poison-filled, only `M`
+is passed, and the rows past `M` are read back afterwards. That gives both
+answers — is the result correct, and does the kernel write past row `M-1` — in
+one run, with no overrun risk if the second reading turns out to be the right
+one. It also varies `N` on and off a 32 boundary, since the same sentence
+covers `n_col`.
+
+```bash
+export HEXKL_LIB_SUBDIR=6.4.0.2/armv8_android26
+ndk-build -C test/unittest/jni_htp NDK_PROJECT_PATH=. \
+  APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk \
+  hexkl_gemv_probe -j$(nproc)
+adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp \
+  ./hexkl_gemv_probe small"     # then `lmhead` for the real shape
+```
+
+Two consequences, assuming the probe confirms it:
 
 - **This fix requires the beta2 migration.** Every SDKL layout call in the tree
   still uses beta1 spellings; the rename table is in
@@ -426,13 +459,14 @@ Two baselines, not one:
 | 1 | run `hexkl_pin_probe sweep` **and** `total` | — |
 | 2 | merge `origin/claude/u8i4-split/8-qkv-chain` (kernel, quantizer, dtype, `ComputeOps` seam, and the `HexKLFcCompare` / `HexKLFcE2E` / `HexKLQkvChain` tools) | 1 says FITS, 0 leaves room to win |
 | 3 | migrate the tree to beta2 layout-function names ([08](08_attention_hmx_design.md) §4) | 2 |
-| 3a | pass `M` instead of `Mp` in `shgemm_u8i4_i32`, size X/C to `M`, verify against CPU (§4 fix 1) | 3 |
+| 3a | run `hexkl_gemv_probe small` — does the kernel accept an unaligned `n_row`? (§4) | 3 |
+| 3b | if 3a passes: pass `M` instead of `Mp` in `shgemm_u8i4_i32`, size X/C to `M` | 3a |
 | 4 | untie the converter, produce the FP32 untied model (§5.1) | — (can run in parallel) |
 | 5 | quantise to `QINT4_HTP` (§5.2) | 2, 4 |
 | 6 | `engine=cpu` → `COMPUTE_ENGINE` (§6) | 2 |
 | 7 | u8i4 CPU fallback (§7) | 2 |
 | 8 | accuracy validation (§8) | 5, 6 |
-| 9 | performance, then enable by default | 3a, 7, 8 |
+| 9 | performance, then enable by default | 3b, 7, 8 |
 
 Steps 0, 1 and 4 need nothing merged and can start now. **Step 0 is the one that
 can make steps 2–9 unnecessary**, so it goes first even though it is not part
