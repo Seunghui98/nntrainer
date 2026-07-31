@@ -29,7 +29,12 @@
  * would buy per token. Both are timed separately from the matmuls, so the
  * answer is not just "faster" but "how much of the token was never compute".
  *
- *   usage: hexkl_decode_probe [shapes|layer|full] [iters]  (default: layer 20)
+ *   usage: hexkl_decode_probe [one|shapes|layer|full] [args]  (default: layer)
+ *
+ *     one    a single matmul at one shape, with three allocations and nothing
+ *            freed beforehand -- the control for whether allocation churn is
+ *            what `shapes` is really measuring.
+ *            hexkl_decode_probe one [N] [K] [n_row]
  *
  *     shapes run one matmul per shape, from a known-good 32x32 up to the real
  *            FC sizes, and report where the result stops being correct plus
@@ -489,6 +494,99 @@ static int mode_shapes(int domain) {
   return ok == n * 2 ? 0 : 1;
 }
 
+/*!
+  @brief One shape, one matmul, three allocations, nothing freed first.
+
+  The `shapes` runs produced something that does not fit a single story: the
+  correct values drift the way a wrong row stride does, but the total count of
+  non-zero elements is far below n_col, and a permutation cannot lose values.
+  Meanwhile n_row and n_inner make no difference at all -- only n_col does.
+
+  The real model runs these same shapes through shgemm_f32f16_f32 every day.
+  The difference is buffer lifetime: nntrainer takes its buffers from
+  long-lived pools, while the probe allocates and frees per shape and per
+  weight. SDKL's free path is visibly fragile -- an earlier run left it
+  printing "Failed to munmap buffer" for every outstanding allocation -- and a
+  new allocation landing on a mapping that was not fully released would look
+  exactly like this: correct wherever the memory is really there, zero
+  everywhere else.
+
+  So this mode does the minimum: allocate W, X and A once, build the weight in
+  place in W, run one matmul, check. No temporary buffer, no host copy, no
+  free before the call. If a shape that fails inside `shapes` passes here, the
+  fault is allocation churn rather than the shape.
+
+    hexkl_decode_probe one [N] [K] [n_row]      (default 1024 1024 32)
+*/
+static int mode_one(int domain, unsigned N, unsigned K, unsigned n_row) {
+  printf("\n=== mode: one  N=%u K=%u n_row=%u ===\n", N, K, n_row);
+  printf("  three allocations, nothing freed before the call\n");
+
+  const size_t w_bytes = (size_t)N * K * sizeof(_Float16);
+  const size_t x_bytes = (size_t)n_row * K * sizeof(float);
+  const size_t a_elems = (size_t)n_row * N;
+
+  void *Wv = NULL, *Xv = NULL, *Av = NULL;
+  if (sdkl_npu_alloc(w_bytes, &Wv) != 0 ||
+      sdkl_npu_alloc(x_bytes, &Xv) != 0 ||
+      sdkl_npu_alloc(a_elems * sizeof(float), &Av) != 0) {
+    printf("  alloc failed (W %.1f MB, X %.1f KB, A %.1f KB)\n",
+           (double)w_bytes / (double)MB, (double)x_bytes / 1024.0,
+           (double)(a_elems * sizeof(float)) / 1024.0);
+    return -1;
+  }
+
+  /* Build the weight where it will be used -- no staging, no host copy. */
+  _Float16 *W = (_Float16 *)Wv;
+  for (size_t i = 0; i < (size_t)N * K; i++)
+    W[i] = (_Float16)1.0f;
+  const int wrc = sdkl_cpu_f16_rm_to_f16_wh_inplace(N, K, W);
+  if (wrc != 0) {
+    printf("  rm_to_wh failed rc=%d\n", wrc);
+    return -1;
+  }
+
+  float *X = (float *)Xv, *A = (float *)Av;
+  memset(X, 0, x_bytes);
+  for (unsigned k = 0; k < K; k++)
+    X[k] = 1.0f;
+  memset(A, 0, a_elems * sizeof(float));
+
+  const int rc = sdkl_npu_mm_f32f16_f32(domain, (int)n_row, (int)N, (int)K, A,
+                                        X, (const _Float16 *)W);
+  if (rc != 0) {
+    printf("  REJECTED rc=%d (0x%x)\n", rc, (unsigned)rc);
+    return -1;
+  }
+
+  long first_bad = -1;
+  size_t row0_ok = 0, nonzero = 0;
+  for (unsigned c = 0; c < N; c++) {
+    if (fabsf(A[c] - (float)K) < 0.5f)
+      row0_ok++;
+    else if (first_bad < 0)
+      first_bad = (long)c;
+  }
+  for (size_t e = 0; e < a_elems; e++)
+    if (A[e] != 0.0f)
+      nonzero++;
+
+  if (first_bad < 0) {
+    printf("  row 0 fully correct (%u), %zu non-zero in %u x %u\n", N, nonzero,
+           n_row, N);
+    printf("  -> the shape is fine; `shapes` fails because of allocation "
+           "churn, not the shape\n");
+    return 0;
+  }
+
+  printf("  %zu/%u correct, first wrong at %ld, %zu non-zero in %u x %u\n",
+         row0_ok, N, first_bad, nonzero, n_row, N);
+  dump_runs(A, N, (float)K);
+  printf("  -> same failure with minimal allocation, so churn is not the "
+         "cause\n");
+  return 1;
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -522,6 +620,16 @@ int main(int argc, char **argv) {
   memset(version, 0, sizeof(version));
   if (sdkl_npu_get_version(domain, version) == 0)
     printf("[DECODE PROBE] CDSP version = %s\n", version);
+
+  if (strcmp(mode, "one") == 0) {
+    const unsigned oN = (argc > 2) ? (unsigned)atoi(argv[2]) : 1024u;
+    const unsigned oK = (argc > 3) ? (unsigned)atoi(argv[3]) : 1024u;
+    const unsigned oR = (argc > 4) ? (unsigned)atoi(argv[4]) : DECODE_MP;
+    const int ores = mode_one(domain, oN, oK, oR);
+    sdkl_npu_finalize(domain);
+    printf("\n[DECODE PROBE] done\n");
+    return ores;
+  }
 
   if (shapes) {
     const int sres = mode_shapes(domain);
