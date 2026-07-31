@@ -3,6 +3,12 @@
 Milestone: run **qwen3-0.6b end to end on the HTP backend**. The FC layers are
 done; `lm_head` is the remaining matmul on the CPU.
 
+> **Read [11](11_decode_time_budget.md) first.** lm_head measures 6.88 ms of a
+> 102 ms token. The weight-staging `memcpy` in the decode path measures 39.3 ms
+> of the same token and is gated on a constant rather than on a model
+> conversion. This plan is still needed for the milestone — running the model
+> entirely on the NPU — but it is no longer the largest thing available.
+
 Two decisions are already made and are not revisited here:
 
 - **`tie_word_embeddings` is off.** lm_head has to run on the NPU, and the tied

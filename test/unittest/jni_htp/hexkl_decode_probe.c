@@ -617,7 +617,8 @@ static int mode_stagecost(int domain, int full, unsigned iters) {
   const size_t n = full ? N_WEIGHTS * N_LAYERS : N_WEIGHTS;
   const unsigned scale = full ? 1u : N_LAYERS;
 
-  printf("\n=== mode: stagecost (%s) ===\n", full ? "all 28 layers" : "one layer x 28");
+  printf("\n=== mode: stagecost (%s), %u iterations ===\n",
+         full ? "all 28 layers" : "one layer x 28", iters);
 
   /* One NPU destination per distinct shape, exactly as the size-keyed scratch
      pool in hexkl_mm.cpp ends up doing. */
@@ -695,7 +696,8 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < N_WEIGHTS; i++)
     per_layer_bytes += wbytes(&LAYER[i]);
 
-  printf("[DECODE PROBE] mode=%s iters=%u domain=%d\n", mode, iters, domain);
+  /* iters is only meaningful for the modes that loop; each prints its own. */
+  printf("[DECODE PROBE] mode=%s domain=%d\n", mode, domain);
   printf("[DECODE PROBE] qwen3-0.6b fp16: %.1f MB per layer, %.1f MB per token "
          "across %u layers\n",
          (double)per_layer_bytes / (double)MB,
