@@ -21,13 +21,18 @@
  *   before  allocate first, then try to matmul. Shows whether holding the
  *           block starves the kernel's own scratch.
  *   sweep   same as `after`, but step the size up to find where it breaks.
+ *   total   accumulate blocks without freeing, to find the whole-process
+ *           budget. lm_head is not the only resident weight -- with
+ *           fc_layer_dtype=QINT4_HTP the 28 decoder layers want about 210 MiB
+ *           of their own -- so "one 74 MiB block fits" does not answer whether
+ *           the model as a whole can stay resident.
  *
  * Allocating is not the test. Every mode re-runs the matmul while the block is
  * held and checks the result, because a previous round of this work found that
  * over-allocating made the kernel's scratch allocation fail and corrupted
  * SDKL's internal state rather than returning an error.
  *
- *   usage: hexkl_pin_probe [after|before|sweep]   (default: sweep)
+ *   usage: hexkl_pin_probe [after|before|sweep|total]   (default: sweep)
  *
  * Run it alone. A failure mode here is a SIGSEGV inside SDKL, so do not fold
  * it into another binary.
@@ -57,6 +62,32 @@
 static size_t lmhead_u8i4_bytes(void) {
   const size_t N = 151936, K = 1024;
   return N * K / 2 + N * sizeof(float) + N * sizeof(int32_t);
+}
+
+/* Only the packed weight has to live in NPU memory; the scale and the
+   zero-point correction are read on the host during dequantize. */
+static size_t lmhead_u8i4_npu_bytes(void) {
+  const size_t N = 151936, K = 1024;
+  return N * K / 2;
+}
+
+/* The int32 accumulator shgemm_u8i4_i32 hands to sdkl_npu_mm_u8i4_i32. M is
+   padded to the 64-row tile even when decoding one token, so a vocab-wide
+   output costs 64 rows no matter what. This is NPU memory too, and it is easy
+   to forget when only the weight is being counted. */
+static size_t lmhead_u8i4_accum_bytes(void) {
+  const size_t N = 151936, Mp = 64;
+  return Mp * N * sizeof(int32_t);
+}
+
+/* Every u8i4 FC weight in the 28 decoder layers, packed two per byte:
+   q[1024x2048] k[1024x1024] v[1024x1024] o[2048x1024]
+   gate[1024x3072] up[1024x3072] down[3072x1024]. */
+static size_t decoder_u8i4_npu_bytes(void) {
+  const size_t H = 1024, Q = 2048, KV = 1024, F = 3072, L = 28;
+  const size_t per_layer =
+    (H * Q + H * KV + H * KV + Q * H + H * F + H * F + F * H) / 2;
+  return per_layer * L;
 }
 
 /* ------------------------------------------------------------------ */
@@ -309,6 +340,99 @@ static int mode_sweep(int domain, size_t target) {
   return 0;
 }
 
+/*!
+  @brief Accumulate blocks without freeing, to find the whole-process budget.
+
+  `sweep` answers "how large can one resident weight be". That is not the
+  question the model asks: with fc_layer_dtype=QINT4_HTP every decoder weight
+  wants to stay resident too, and they are allocated before lm_head ever runs.
+  So this holds 16 MiB blocks until either the allocation fails or the kernel
+  stops producing the right answer, and reports the cumulative total against
+  the three milestones that decide the design.
+*/
+static int mode_total(int domain) {
+  printf("\n=== mode: total (cumulative budget, nothing freed) ===\n");
+
+  const size_t lmhead = lmhead_u8i4_npu_bytes();
+  const size_t accum = lmhead_u8i4_accum_bytes();
+  const size_t decoder = decoder_u8i4_npu_bytes();
+
+  printf("  milestones:\n");
+  printf("    lm_head weight            %6.1f MB\n",
+         (double)lmhead / (double)MB);
+  printf("    + its i32 accumulator     %6.1f MB\n",
+         (double)(lmhead + accum) / (double)MB);
+  printf("    + 28 decoder u8i4 weights %6.1f MB  (whole model resident)\n",
+         (double)(lmhead + accum + decoder) / (double)MB);
+
+  check_bufs b;
+  if (check_init(&b) != 0)
+    return -1;
+  if (check_run(domain, &b, "pre") != 0) {
+    check_free(&b);
+    return -1;
+  }
+
+  // 16 MiB steps: fine enough to place the ceiling usefully, coarse enough
+  // that a 512 MiB budget is 32 allocations rather than hundreds.
+  const size_t STEP = 16 * MB;
+  const size_t MAX_BLOCKS = 64; // 1 GiB, well past anything plausible
+  void *held[64];
+  size_t n_held = 0, total = 0;
+
+  for (; n_held < MAX_BLOCKS; n_held++) {
+    void *p = NULL;
+    if (sdkl_npu_alloc(STEP, &p) != 0 || p == NULL) {
+      printf("  alloc failed at %.1f MB held\n", (double)total / (double)MB);
+      break;
+    }
+    volatile uint8_t *q = (volatile uint8_t *)p;
+    q[0] = 0xA5;
+    q[STEP / 2] = 0x5A;
+    q[STEP - 1] = 0xC3;
+    if (q[0] != 0xA5 || q[STEP / 2] != 0x5A || q[STEP - 1] != 0xC3) {
+      printf("  block at %.1f MB does not hold writes\n",
+             (double)total / (double)MB);
+      sdkl_npu_free(p);
+      break;
+    }
+
+    held[n_held] = p;
+    total += STEP;
+
+    // Re-checking every block would dominate the run time; every fourth
+    // (64 MiB) still brackets the failure closely enough to act on.
+    if ((n_held + 1) % 4 == 0) {
+      char tag[32];
+      snprintf(tag, sizeof(tag), "%zuMB", total / MB);
+      if (check_run(domain, &b, tag) != 0) {
+        printf("  the kernel stopped working with %.1f MB held\n",
+               (double)total / (double)MB);
+        // Back off to the last total that passed a check: the four blocks
+        // added since then are the suspect range.
+        total = (total > STEP * 4) ? total - STEP * 4 : 0;
+        n_held++; // this block was recorded in held[]; free it too
+        break;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < n_held; i++)
+    sdkl_npu_free(held[i]);
+
+  printf("\n  usable cumulative NPU budget: about %.1f MB\n",
+         (double)total / (double)MB);
+  printf("  lm_head weight resident            -> %s\n",
+         total >= lmhead ? "FITS" : "DOES NOT FIT");
+  printf("  lm_head weight + accumulator       -> %s\n",
+         total >= lmhead + accum ? "FITS" : "DOES NOT FIT");
+  printf("  whole model resident (u8i4 everywhere) -> %s\n",
+         total >= lmhead + accum + decoder ? "FITS" : "DOES NOT FIT");
+
+  check_free(&b);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -345,6 +469,8 @@ int main(int argc, char **argv) {
     res = mode_after(domain, target);
   else if (strcmp(mode, "before") == 0)
     res = mode_before(domain, target);
+  else if (strcmp(mode, "total") == 0)
+    res = mode_total(domain);
   else
     res = mode_sweep(domain, target);
 
