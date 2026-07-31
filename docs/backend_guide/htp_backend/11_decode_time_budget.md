@@ -61,12 +61,44 @@ compute.** llama.cpp's `dspqueue` batching (see
 
 `hexkl_pin_probe total` held **≥ 1024 MiB** of NPU memory with the kernel still
 producing correct results, and never found a ceiling — it stopped at its own
-64-block cap. So residency is not the constraint. The constraint is a constant:
+64-block cap. So residency is not the constraint.
+
+### The constraint was not the cap — it was a bypass
+
+`hexkl_mm.cpp` had an NPU-resident decode cache (`g_wh_cache`) all along. The
+decode path never reached it for a WH-baked model:
 
 ```cpp
-WH_CACHE_MAX_BYTES   = 64 MiB   // hexkl_mm.cpp:80   — the fp16 path
-INT_WEIGHT_MAX_BYTES = 48 MiB   // the u8i4 path (u8i4 branch)
+const _FP16 *wh_host = lookupPrefillWH(B, N, K);
+if (wh_host != nullptr) {
+    void *W_transient = g_scratch_W.get(w_bytes);
+    std::memcpy(W_transient, wh_host, w_bytes);   // every call
+} else {
+    // g_wh_cache — the resident path, reached only on a registry *miss*
+}
 ```
+
+qwen3-0.6b ships WH-baked, so `lookupPrefillWH` always hits and the resident
+cache is dead code. The registry was added to avoid re-running `rm_to_wh` — and
+it does — but it took a permanent full-weight `memcpy` in exchange.
+
+**Fixed**: both sources now fill the same cache. The registry is a cheap way to
+*populate* it (a copy, no `rm_to_wh`) rather than a reason to skip it. The first
+call for a weight costs what the old path cost; every call after copies nothing.
+
+The cap moves with it, from a 64 MiB constant to `whCacheMaxBytes()`:
+
+```cpp
+NNTR_HTP_WH_CACHE_MB=<mib>   // default 960, covers qwen3-0.6b fp16 (840 MiB)
+                             // set 64 to restore the old behaviour
+```
+
+A weight that cannot be made resident — cap full, allocation failed, conversion
+failed — falls back to the old transient staging rather than failing the call,
+so overshooting the cap is safe.
+
+The u8i4 path has the same shape of problem in `INT_WEIGHT_MAX_BYTES = 48 MiB`
+(u8i4 branch), which needs the same treatment when that branch lands.
 
 | approach | NPU held | staging per token | needs |
 | :-- | --: | --: | :-- |

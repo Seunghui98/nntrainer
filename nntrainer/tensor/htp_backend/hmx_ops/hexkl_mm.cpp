@@ -75,9 +75,35 @@ struct WHEntry {
   size_t bytes;
 };
 
-// Weight cache with a hard cap on total NPU bytes to avoid DMA exhaustion.
-// When the cap is exceeded, the oldest entry (by insertion order) is evicted.
-static constexpr size_t WH_CACHE_MAX_BYTES = 64 * 1024 * 1024; // 64 MB
+/**
+ * @brief Byte cap for the decode WH weight cache, overridable at runtime.
+ *
+ * The old 64 MB constant predated any measurement of what the NPU can hold.
+ * hexkl_pin_probe has since held >= 1 GiB with the kernel still producing
+ * correct results, and qwen3-0.6b's 28 decoder layers want 840 MiB at fp16 --
+ * so the cap, not the hardware, is what forced a per-token re-upload. See
+ * docs/backend_guide/htp_backend/11_decode_time_budget.md.
+ *
+ * It stays a knob rather than a bare constant because the right value is a
+ * memory/latency trade the device owner has to make: holding every weight
+ * means the host WH copies and the NPU copies are live at once, so qwen3-0.6b
+ * at fp16 costs roughly 840 MiB twice. NNTR_HTP_WH_CACHE_MB sets it in MiB;
+ * dropping it back to 64 restores the previous behaviour without a rebuild.
+ *
+ * Overshooting is safe: a weight that cannot be made resident falls back to
+ * the transient staging path rather than failing the call.
+ */
+static size_t whCacheMaxBytes() {
+  static const size_t cap = []() -> size_t {
+    if (const char *e = std::getenv("NNTR_HTP_WH_CACHE_MB")) {
+      const long mb = std::strtol(e, nullptr, 10);
+      if (mb > 0)
+        return (size_t)mb * 1024ull * 1024ull;
+    }
+    return 960ull * 1024ull * 1024ull; // covers qwen3-0.6b fp16 (840 MiB)
+  }();
+  return cap;
+}
 // Byte cap for pinned prefill WH weights. Must stay below the measured NPU
 // DMA pool (Task 1 probe) minus per-call transient headroom (X_npu + A_npu +
 // one W_transient, a few MB for prefill shapes). 48 MB is safe under the
@@ -465,80 +491,101 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
   }
 
   // --- Decode (M==1) weight staging ---
-  // Fast path: reuse the pre-baked WH registry (same weight pointer as
-  // prefill), staging into transient scratch with a plain memcpy — no
-  // rm_to_wh. Mirrors the M>1 prefill fast path (see above). Falls back to the
-  // g_wh_cache path on a registry miss so the result is always correct.
-  // NOTE: this removes the rm_to_wh thrash but not the per-token full-weight
-  // staging memcpy nor the Mp=32 padding; a dedicated GEMV kernel (out of
-  // scope) would remove those. See the fix-first design doc.
+  //
+  // Both sources of WH bytes fill the same NPU-resident cache. The pre-baked
+  // registry used to bypass it: on a hit it copied the whole weight into
+  // transient scratch on *every* call. Measured on a Galaxy S25 Ultra that is
+  // 840 MiB and 39.3 ms per generated token for qwen3-0.6b, against a token
+  // that takes 102 ms -- 38% of decode spent re-uploading weights that had not
+  // changed. hexkl_pin_probe measured >= 1 GiB of NPU memory holdable, so the
+  // registry is better used as a cheap way to *fill* the cache (a memcpy, no
+  // rm_to_wh) than as a reason to skip it.
+  //
+  // On the first call for a weight this costs exactly what the old path cost.
+  // Every call after that copies nothing.
   const _Float16 *W_wh = nullptr;
-  const _FP16 *wh_host =
-    lookupPrefillWH(reinterpret_cast<const void *>(B), N, K);
-  if (wh_host != nullptr) {
-    const size_t w_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
-    void *W_transient = g_scratch_W.get(w_bytes);
-    if (W_transient == nullptr) {
-      cleanup();
-      throw std::runtime_error(
-        "shgemm_f32f16_f32: W scratch alloc failed (decode)");
-    }
-    std::memcpy(W_transient, wh_host, w_bytes);
-    W_wh = static_cast<const _Float16 *>(W_transient);
-  } else {
-    // --- Weight cache: convert RM->WH once per unique weight pointer ---
-    // FSU is off for engine=htp (transformer FSU guard), so B pointer is
-    // stable. Cache is size-limited (WH_CACHE_MAX_BYTES) to avoid NPU DMA
-    // exhaustion; FIFO eviction removes the oldest entry when the limit is
-    // exceeded.
-    void *W_npu_cached = nullptr;
-    {
-      std::lock_guard<std::mutex> lk(g_wh_cache.mtx);
-      auto it = g_wh_cache.cache.find(B);
-      if (it == g_wh_cache.cache.end() || it->second.N != N ||
-          it->second.K != K) {
-        // Cache miss: evict stale entry for same B pointer if present.
-        if (it != g_wh_cache.cache.end()) {
-          g_wh_cache.total_bytes -= it->second.bytes;
-          sdkl_npu_free(it->second.npu);
-          auto oit =
-            std::find(g_wh_cache.order.begin(), g_wh_cache.order.end(), B);
-          if (oit != g_wh_cache.order.end())
-            g_wh_cache.order.erase(oit);
-          g_wh_cache.cache.erase(it);
-        }
-        // Evict oldest entries until we are below the cap.
-        const size_t new_bytes = N * K * sizeof(_FP16);
-        while (g_wh_cache.total_bytes + new_bytes > WH_CACHE_MAX_BYTES &&
-               !g_wh_cache.order.empty())
-          g_wh_cache.evict_one();
+  {
+    std::lock_guard<std::mutex> lk(g_wh_cache.mtx);
 
-        void *new_npu = nullptr;
-        err = sdkl_npu_alloc(new_bytes, &new_npu);
-        if (err != 0 || new_npu == nullptr) {
+    auto it = g_wh_cache.cache.find(B);
+    if (it != g_wh_cache.cache.end() &&
+        (it->second.N != N || it->second.K != K)) {
+      // Same host pointer, different shape: the old upload is stale.
+      g_wh_cache.total_bytes -= it->second.bytes;
+      npuFreeIfAlive(it->second.npu);
+      auto oit =
+        std::find(g_wh_cache.order.begin(), g_wh_cache.order.end(), B);
+      if (oit != g_wh_cache.order.end())
+        g_wh_cache.order.erase(oit);
+      g_wh_cache.cache.erase(it);
+      it = g_wh_cache.cache.end();
+    }
+
+    if (it != g_wh_cache.cache.end()) {
+      W_wh = static_cast<const _Float16 *>(it->second.npu); // resident: no copy
+    } else {
+      const size_t new_bytes = (size_t)N * (size_t)K * sizeof(_FP16);
+      while (g_wh_cache.total_bytes + new_bytes > whCacheMaxBytes() &&
+             !g_wh_cache.order.empty())
+        g_wh_cache.evict_one();
+
+      void *new_npu = nullptr;
+      if (sdkl_npu_alloc(new_bytes, &new_npu) != 0)
+        new_npu = nullptr;
+
+      // Where the WH bytes come from: the pre-baked registry if this weight
+      // was baked offline (a plain copy), otherwise an RM->WH conversion.
+      const _FP16 *wh_host =
+        lookupPrefillWH(reinterpret_cast<const void *>(B), N, K);
+
+      if (new_npu != nullptr) {
+        bool filled = true;
+        if (wh_host != nullptr) {
+          std::memcpy(new_npu, wh_host, new_bytes);
+        } else {
+          copyForWHBake(B, N, K, TransB, static_cast<_FP16 *>(new_npu));
+          const int werr = sdkl_cpu_rm_to_wh_f16_inplace(
+            (size_t)N, (size_t)K, (_Float16 *)new_npu);
+          if (werr != 0) {
+            npuFreeIfAlive(new_npu);
+            new_npu = nullptr;
+            filled = false;
+          }
+        }
+        if (filled && new_npu != nullptr) {
+          g_wh_cache.cache[B] = {new_npu, N, K, new_bytes};
+          g_wh_cache.order.push_back(B);
+          g_wh_cache.total_bytes += new_bytes;
+          W_wh = static_cast<const _Float16 *>(new_npu);
+        }
+      }
+
+      if (W_wh == nullptr) {
+        // Could not make it resident -- the cap is full of live entries, the
+        // allocation failed, or the conversion did. Fall back to the old
+        // transient staging so the call still produces a correct result; only
+        // the per-call copy comes back.
+        void *W_transient = g_scratch_W.get(new_bytes);
+        if (W_transient == nullptr) {
           cleanup();
           throw std::runtime_error(
-            "shgemm_f32f16_f32: weight NPU alloc failed (err=" +
-            std::to_string(err) + ")");
+            "shgemm_f32f16_f32: W scratch alloc failed (decode)");
         }
-        copyForWHBake(B, N, K, TransB, static_cast<_FP16 *>(new_npu));
-        int werr = sdkl_cpu_rm_to_wh_f16_inplace((size_t)N, (size_t)K,
-                                                 (_Float16 *)new_npu);
-        if (werr != 0) {
-          sdkl_npu_free(new_npu);
-          cleanup();
-          throw std::runtime_error("rm_to_wh_f16_inplace failed: " +
-                                   std::to_string(werr));
+        if (wh_host != nullptr) {
+          std::memcpy(W_transient, wh_host, new_bytes);
+        } else {
+          copyForWHBake(B, N, K, TransB, static_cast<_FP16 *>(W_transient));
+          const int werr = sdkl_cpu_rm_to_wh_f16_inplace(
+            (size_t)N, (size_t)K, (_Float16 *)W_transient);
+          if (werr != 0) {
+            cleanup();
+            throw std::runtime_error("rm_to_wh_f16_inplace failed (decode): " +
+                                     std::to_string(werr));
+          }
         }
-        g_wh_cache.cache[B] = {new_npu, N, K, new_bytes};
-        g_wh_cache.order.push_back(B);
-        g_wh_cache.total_bytes += new_bytes;
-        W_npu_cached = new_npu;
-      } else {
-        W_npu_cached = it->second.npu;
+        W_wh = static_cast<const _Float16 *>(W_transient);
       }
     }
-    W_wh = static_cast<const _Float16 *>(W_npu_cached);
   }
 
   // sdkl_npu_mm_f32f16_f32 is write-only (not accumulate); beta != 0 is
