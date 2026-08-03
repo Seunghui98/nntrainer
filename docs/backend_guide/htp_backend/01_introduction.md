@@ -26,4 +26,5 @@ Due to the structural characteristics of the NPU tiles' parallel execution units
 - [08. Attention on HMX — Design Record](08_attention_hmx_design.md): What was decided about putting `mha_core`'s attention on HMX, the RM/AH/WH layouts, the HexKL 1.0.0-beta2 changes, and what the work is blocked on. Analysis only; not implemented.
 - [09. lm_head on the NPU as u8i4](09_lmhead_u8i4_plan.md): The active plan for the last remaining CPU matmul in qwen3-0.6b — the residency gate that decides it, the model preparation, and the order of work.
 - [10. Probe Runbook](10_probe_runbook.md): How to build, deploy and read the HTP probes on device, and what each outcome does to the plans in 09 and 11.
+- [12. Handoff](12_handoff.md): Where this line of work stands — what is measured, what is implemented but unrun, which branches are in play, and what to do next. **Start here if you are picking this up.**
 - [11. Where a Decode Token Goes](11_decode_time_budget.md): 39.3 ms of a 102 ms token is a weight-staging `memcpy`. What removes it, and what that does to the ordering in 09.
