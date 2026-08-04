@@ -7,29 +7,67 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
- * @brief  HTP (Hexagon/HMX) ComputeOps entry point.
+ * @brief  HTP (Hexagon/HMX) ComputeOps subclass — NPU dispatch entry point.
+ *
+ * Parallels ClComputeOps: overrides only the accelerated ops and their
+ * supports_*() predicates; everything else falls through to the base
+ * ComputeOps defaults. Actual HexKL calls live in hmx_ops/hexkl_mm.
  *
  * Compiled only when ENABLE_HEXKL is defined.
  *
- * This commit registers the vendor and the accessor its context resolves
- * through; no kernel is wired to the NPU yet, so the table it hands back
- * *is* the CPU table. An engine="htp" model therefore runs correctly,
- * just without acceleration.
- *
- * A dedicated HtpComputeOps subclass arrives with the first accelerated
- * kernel, which is also the commit that makes one necessary: with nothing
- * overridden, a subclass would only duplicate get_cpu_ops(). Actual HexKL
- * calls live in hmx_ops/hexkl_mm.
+ * Phase 0: skeleton. supports_shgemm() reports whether the NPU came up;
+ * shgemm() forwards to the (stub) HMX op. Wiring this table into the
+ * active dispatch (g_compute_ops / a Context) is a later phase.
  */
 
 #ifdef ENABLE_HEXKL
 
 #include <compute_ops.h>
+#include <cpu_ops_table.h>
+#include <hexkl_mm.h>
 #include <htp_backend.h>
 
 namespace nntrainer {
 
-ComputeOps *get_htp_ops() { return get_cpu_ops(); }
+/**
+ * @brief ComputeOps subclass for delegating operations to the HTP NPU backend.
+ */
+class HtpComputeOps : public CpuComputeOps {
+public:
+#ifdef ENABLE_FP16
+  // F32 activations x F16 weights -> F32. First targeted kernel (§5.2).
+  bool supports_shgemm() const override {
+    return HtpBackend::global().enabled();
+  }
+
+  void shgemm(unsigned int order, bool tA, bool tB, unsigned int M,
+              unsigned int N, unsigned int K, float alpha, const float *A,
+              unsigned int lda, const _FP16 *B, unsigned int ldb, float beta,
+              float *C, unsigned int ldc) override {
+    hmx::shgemm_f32f16_f32(order, tA, tB, M, N, K, alpha, A, lda, B, ldb, beta,
+                           C, ldc);
+  }
+#endif // ENABLE_FP16
+
+  // U8 activations x I8 weights (WH-layout) -> I32 accumulator -> FP32 output.
+  // No ENABLE_FP16 dependency.
+  bool supports_shgemm_u8i8() const override {
+    return HtpBackend::global().enabled();
+  }
+
+  void shgemm_u8i8(unsigned int order, unsigned int M, unsigned int N,
+                   unsigned int K, const float *A, unsigned int /** lda */,
+                   const int8_t *B, const float *wt_scale,
+                   const int32_t *zp_corr, float *C,
+                   unsigned int /** ldc */) override {
+    hmx::shgemm_u8i8_i32(M, N, K, A, B, wt_scale, zp_corr, C);
+  }
+};
+
+ComputeOps *get_htp_ops() {
+  static HtpComputeOps instance;
+  return &instance;
+}
 
 } // namespace nntrainer
 

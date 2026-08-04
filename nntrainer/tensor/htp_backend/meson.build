@@ -8,6 +8,10 @@ htp_backend_headers = [
   'sdkl_compat.h',
 ]
 
+subdir('hmx_ops')
+nntrainer_inc += include_directories('hmx_ops')
+nntrainer_inc_abs += meson.current_source_dir() / 'hmx_ops'
+
 foreach s : htp_backend_sources
   nntrainer_sources += meson.current_source_dir() / s
 endforeach

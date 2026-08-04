@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #ifdef ENABLE_FP16
@@ -241,6 +242,19 @@ public:
                                      unsigned int M, unsigned int N,
                                      unsigned int K, unsigned int group_size);
 
+  // ===========================================================================
+  // Integer quantized BLAS (u8i8 path)
+  // ===========================================================================
+  virtual bool supports_shgemm_u8i8() const { return false; }
+
+  virtual void shgemm_u8i8(unsigned int order, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, unsigned int lda,
+                           const int8_t *B, const float *wt_scale,
+                           const int32_t *zp_corr, float *C, unsigned int ldc) {
+    throw std::runtime_error(
+      "ComputeOps::shgemm_u8i8: not implemented for this backend");
+  }
+
 #ifdef ENABLE_FP16
   // ===========================================================================
   // FP16 BLAS
@@ -328,12 +342,22 @@ public:
   // ===========================================================================
   // Mixed precision BLAS
   // ===========================================================================
+  /**
+   * @brief Accelerator predicate for shgemm (F32 x F16 -> F32).
+   *
+   * Defaults to false; accelerator backends (e.g. HTP/HMX) override it
+   * to gate the NPU path with a CPU fallback at the call site. CPU
+   * backends leave it false and always run shgemm() directly.
+   */
+  virtual bool supports_shgemm() const { return false; }
+
   virtual void shgemm(const unsigned int TStorageOrder, bool TransA,
                       bool TransB, const unsigned int M, const unsigned int N,
                       const unsigned int K, const float alpha, const float *A,
                       const unsigned int lda, const _FP16 *B,
                       const unsigned int ldb, const float beta, float *C,
                       const unsigned int ldc);
+
   virtual void shgemv(const unsigned int TStorageOrder, bool TransA,
                       const unsigned int M, const unsigned int N,
                       const float alpha, const float *A, const unsigned int lda,

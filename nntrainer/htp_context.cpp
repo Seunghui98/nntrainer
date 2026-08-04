@@ -36,12 +36,8 @@ HtpContext::createLayerObject(const int int_key,
 
 void HtpContext::initialize() noexcept {
   // Ensure the CPU backend ops table exists — it is both the fallback
-  // and the base class of HtpComputeOps. Go through ensureComputeOps()
-  // rather than init_backend() directly: init_backend() is not
-  // idempotent (__ggml_init, __openblas_set_num_threads), and
-  // ensureComputeOps() is the call_once funnel every other Context
-  // routes through.
-  ensureComputeOps();
+  // and the base class of HtpComputeOps.
+  init_backend();
 
   auto cd = getContextData();
   if (!cd)
