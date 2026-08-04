@@ -1,9 +1,14 @@
 # Attention on HMX — Design Record
 
-Status: **analysis complete, implementation deferred.** The attention path is
-entangled with HVX work owned by someone else (the softmax kernels), so this
-document records what was decided and why, so the work can be picked up when
-that lands. The active milestone is [lm_head on u8i4](09_lmhead_u8i4_plan.md).
+Status: **analysis superseded by measurement.** This document was written
+when the attention path looked entangled with HVX work owned by someone else
+(the softmax kernels) and Option B (the micro API) looked theoretical. Both
+premises turned out false: [14](14_mha_fp16_micro_verified.md) measures both
+`mha_core` matmuls on the micro API, on device, and finds the softmax round
+trip costs ~1% of the total — not gating. **Read 14 first.** This document is
+kept for the parts of the analysis 14 does not repeat (RM/AH/WH mechanics,
+the beta2 migration notes, §7's llama.cpp survey) — every claim 14
+contradicts is marked inline below rather than silently removed.
 
 ---
 
@@ -49,15 +54,28 @@ The first instinct — that `P · V` is harder than `Q · Kᵀ` — is backwards
 
 SDKL requires `N % 32 == 0`. `P · V` satisfies it for free because `N` is
 `head_dim`. `Q · Kᵀ` has `N = kv_len`, which changes every token, so it needs
-padding on every call. **`P · V` is the stage to do first.**
+padding on every call. **`P · V` is the stage to do first** — true for the
+**macro** API this section is reasoning about.
+
+**Reversed for the micro API — [14](14_mha_fp16_micro_verified.md) §5.7.** Once
+you own the tile loop, SDKL's `N % 32` constraint does not apply, and the real
+considerations point the other way: written as `Sᵀ = K·Qᵀ`, `Q·Kᵀ` needs no
+transpose, its output *is* the existing scores layout, its accumulation depth
+(K=128) carries none of `P·V`'s fp16-accumulation risk, and it depends on
+nothing from the softmax owner. Do `Q·Kᵀ` first on the micro API.
 
 ### The GQA stride problem
 
 The cache is laid out `[kv_position][kv_head][head_dim]`. A single kv_head is
 therefore *strided*, not contiguous (see `neon_impl.cpp:2431`). SDKL wants a
-contiguous `[N, K]`. So the cache does **not** already match the kernel's
-expectation whenever `num_heads_KV > 1` — a gather/pack step is unavoidable, and
-its cost has to be counted against the GEMM's gain.
+contiguous `[N, K]`, and a `sdkl_npu_mm_*` call cannot express the stride, so
+under the **macro** API a gather/pack step is unavoidable.
+
+**This is wrong for the micro API — [14](14_mha_fp16_micro_verified.md) §5.4.**
+A single 2D DMA descriptor (`row_size=head_dim*2, src_stride=nch*head_dim*2,
+nrows=kv_len`) reads the strided cache directly; the "gather" is a DMA
+parameter, not a compute step, and doc 14 measured a whole layer's K cache
+(all kv_heads) moved in one such descriptor at 53 GB/s.
 
 ---
 
@@ -189,7 +207,12 @@ HMX ops, keep the intermediate resident.
 - Requires a Hexagon toolchain path nntrainer does not have today, and the
   softmax between the two matmuls is HVX work owned by someone else.
 
-**Decision: A first, B only if the measured stage-boundary cost justifies it.**
+**Decision, superseded — [14](14_mha_fp16_micro_verified.md):** this section's
+premise (micro is theoretical, softmax fusion is gating) is measured false.
+Option B was built, runs on device, beats the CPU 2.4-65× depending on shape,
+and does **not** need the fused/VTCM-resident softmax to win — the unfused
+round trip costs ~1% of the total (§6/§7 below still describe a real, optional
+follow-up, not a blocker).
 
 ---
 
@@ -204,6 +227,11 @@ buffer per call. The point is that `rm_to_wh` is the expensive part (~2.7 ms for
 the shapes measured) and the memcpy is not (~22 µs); keeping the *converted*
 bytes around means only the cheap half is paid per token. Only the newly
 appended KV entry needs converting each step.
+
+**Confirmed, not just designed — [14](14_mha_fp16_micro_verified.md) §5.5.**
+V's full re-bake measured 123.7 µs/head; the append-time incremental bake (the
+newly-dirtied k-tile only) measured 3.35 µs/head — a 32× gap, and the entire
+reason decode P·V beats the CPU.
 
 ---
 
@@ -229,35 +257,36 @@ What does transfer, all host-side:
 
 ---
 
-## 8. Blocked on the HVX owner
+## 8. The HVX owner — one optional ask, not a blocker
 
-The softmax is not ours. What is needed from that side, and nothing more:
+This section originally read as a blocking checklist. **It is not one —
+[14](14_mha_fp16_micro_verified.md) §7 measured the unfused round trip to CPU
+softmax at ~1% of the per-layer total.** Only one item survives as worth
+raising, and it is optional:
 
-1. A softmax entry point that consumes the **triangular-packed, head-minor**
-   `out_` layout, or agreement to change that layout.
-2. fp16 in / fp16 out (the on-device dtype).
-3. Whether the online/streaming form is available, which decides whether the
-   flash-attention shape is reachable.
-4. Where the sliding-window and sink masks are applied — before or inside.
-5. Whether it can run on a VTCM-resident buffer (required for Option B).
+1. Whether the softmax entry point can write `P` as `[gqa, kv]` instead of
+   the current triangular-packed, head-minor `[kv, gqa]` — saves ~7 µs/head
+   of DSP-side transpose if yes, costs a measured ~1-2% of the per-layer total
+   either way if no (doc 14 §6).
 
-Everything else previously bundled into a single checklist — WH bake timing,
-cache residency, layout conversion — belongs to the HMX/layout owner and is
-tracked in this document instead.
+Items 2-5 of the original checklist (fp16 in/out, streaming softmax,
+mask placement, VTCM-resident softmax) are now moot for the path doc 14
+verified: it does not fuse the three stages, so none of them gate it. They
+remain relevant only if a *fused* design is revisited later, which doc 14 §1
+found unnecessary for the measured win.
 
 ---
 
-## 9. Implementation order, when unblocked
+## 9. Implementation order — superseded
 
-1. **Seam.** `mha_core.cpp` has no `ComputeOps` seam. Add one — a *single*
-   fused `attn_forward`, not three ops. Three ops would force the intermediate
-   through host memory at every boundary, which is the cost the fusion exists
-   to avoid.
-2. **`P · V` on HMX** behind that seam, CPU path unchanged and selected by a
-   shape gate.
-3. **GQA row-folding** in the pack step.
-4. **`Q · Kᵀ`** with `N` padded to 32.
-5. Revisit Option B only with stage-boundary numbers in hand.
+This order assumed a fused single op was necessary (step 1) and P·V-first
+(step 2). Both are corrected by [14](14_mha_fp16_micro_verified.md): the seam
+does **not** need to be a single fused `attn_forward` — three ops (or two,
+since softmax stays CPU-side either way) cost only the ~1% round-trip §8
+measured, and `Q·Kᵀ` goes first. The real next step is **wiring the kernels
+doc 14 verified into a `ComputeOps` seam and solving the persistent-skel /
+FastRPC problem doc 14 §7 flags** — that is tracked as separate architecture
+work, not as an update to this list.
 
 ---
 
@@ -284,11 +313,13 @@ past. Galaxy S25 Ultra, `1_0_56_beta.2_HEXAGON_V79`:
 
 **8 ops/cycle, so HMX fp16 exists.** The direction is open.
 
-**VTCM is 18 MiB**, considerably more than the single-digit MB assumed while
-sizing Option B. It is still nowhere near the 74 MiB an lm_head weight needs, so
-nothing changes for §6 — but for attention it is roomy: a full set of Q, K and
-score tiles for one head fits with margin, which is what a fused
-`Q·Kᵀ → softmax → P·V` needs to keep the intermediate resident.
+**VTCM is 18 MiB** per `sdkl_npu_get_hw_info` — **but `hexkl_micro_hw_init`
+reports 8 MiB, confirmed across every run of both the MHA and the FC micro
+benches** ([14](14_mha_fp16_micro_verified.md) §7). The two APIs disagree and
+this is unresolved; use 8 MiB for any VTCM budget check until reconciled. It
+did not change any conclusion in doc 14 (everything measured fit
+comfortably), but it would matter for a larger fused design, and it means the
+74 MiB lm_head comparison in §6 above should be read against 8 MiB, not 18.
 
 The DSP-side layout probe is still the one that answers §3 — what RM, AH and WH
 actually permute to, and whether the accumulator's AH matches `rm_to_ah`'s.
