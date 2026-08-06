@@ -85,8 +85,13 @@ int nntr_hvx_close(remote_handle64 handle) {
     return AEE_SUCCESS;
   }
   for (uint32_t i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
-    if (s->weights.slots[i].in_use) {
-      hexkl_weight_u8i4_release(&s->weights, i);
+    if (s->weights_u8i4.slots[i].in_use) {
+      hexkl_weight_u8i4_release(&s->weights_u8i4, i);
+    }
+  }
+  for (uint32_t i = 0; i < HEXKL_MM_U8I8_MAX_WEIGHTS; ++i) {
+    if (s->weights_u8i8.slots[i].in_use) {
+      hexkl_weight_u8i8_release(&s->weights_u8i8, i);
     }
   }
   int res = AEE_SUCCESS;
