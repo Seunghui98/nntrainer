@@ -22,8 +22,10 @@
 #include "hvx_exp_f32.h"
 #include "hvx_softmax_f32.h"
 
-/** @brief f32 lanes per HVX vector in 128B mode. */
-#define LANES 32u
+/** @brief HVX vector width in bytes (128B mode). */
+#define VLEN 128u
+/** @brief f32 lanes per HVX vector. */
+#define LANES (VLEN / sizeof(float))
 
 /** @brief Fails unless the DSP actually has a 128-byte HVX context. */
 static int have_hvx(void) {
