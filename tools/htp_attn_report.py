@@ -206,17 +206,40 @@ def per_layer(rec, ink, width):
         spread = [f"{WIDTH_LABEL[w]} {vals[w]:,.0f}" for w in WIDTHS if vals[w]]
         out.append(ink.dim(f"  {'':<20}{'  '.join(spread)}"))
 
+        # Compare the KERNEL against the plan and against CPU, not the wall
+        # clock. Wall = dsp + FastRPC transport, and transport is the one term
+        # here that is not reproducible (see the note below), so basing a
+        # "13x over" on it charges the kernel for measurement noise.
+        dsp = get(rec, "ATTN_STAGE", f"forward_{regime}_kv{kv}_I8I8",
+                  "dsp_total_us") or best
         pred = PREDICTED_US.get(regime)
         if pred:
             out.append(ink.dim(
                 f"  {'':<20}plan §2 predicts {pred:,.0f} us"
-                f"  ->  {best / pred:,.0f}x over"))
+                f"  ->  {dsp / pred:,.0f}x over (dsp only)"))
         cpu = CPU_BAR_US.get(regime)
         if cpu:
             out.append(ink.dim(
                 f"  {'':<20}CPU bar {cpu:,.0f} us"
-                f"  ->  {best / cpu:,.1f}x slower than CPU"))
+                f"  ->  {dsp / cpu:,.1f}x slower than CPU (dsp only)"))
         out.append("")
+
+    # dsp_total repeats to a fraction of a percent; the wall clock does not.
+    # Say which of the two the reader should be reasoning about, with the
+    # measured spread rather than an adjective.
+    for regime, kv in shapes(rec):
+        paths = [f"forward_{regime}_kv{kv}_{w}" for w in WIDTHS]
+        sd = spread_pct([get(rec, "ATTN_STAGE", p, "dsp_total_us")
+                         for p in paths])
+        tr = [get(rec, "ATTN_STAGE", p, "transport_us") for p in paths]
+        tr = [t for t in tr if t]
+        if sd is None or len(tr) < 2:
+            continue
+        out.append(ink.dim(
+            f"  spread over the four widths at kv={kv} "
+            f"{'decode' if regime == 'dec' else 'prefill'}: "
+            f"dsp {sd:.2f}%, transport {min(tr):,.0f}-{max(tr):,.0f} us"))
+    out.append("")
     tok = get(rec, "ATTN_FIELD", f"forward_dec_kv1024_I8I8",
               "us_per_token_all_layers")
     if tok:
@@ -293,37 +316,105 @@ def breakdown(rec, ink, width, wd="I8I8"):
     return out
 
 
-def cost_model(rec, ink, width, wd="I8I8"):
-    out = [rule(ink, "Cost against layer_run call count", width)]
+# The geometry FusedForwardPerLayerCost runs at (Qwen3-0.6B), repeated here
+# because the log carries stage totals rather than the loop bounds that
+# produced them. layer_run_calls is the check: if the count derived from these
+# does not match what the DSP reported, the constants are stale and no
+# per-block number gets published.
+ATTN_CFG = {"nch": 8, "gqa": 2, "head_dim": 128, "T": 256, "M_band": 64,
+            "n_query_pre": 128}
+
+
+def geometry(regime, kv):
+    """(rows in one band, bands, blocks per head-band, total blocks, calls)."""
+    c = ATTN_CFG
+    m = (1 if regime == "dec" else c["n_query_pre"]) * c["gqa"]
+    bands = -(-m // c["M_band"])
+    n_blocks = -(-kv // c["T"])
+    return (min(m, c["M_band"]), bands, n_blocks,
+            c["nch"] * bands * n_blocks, c["nch"] * bands * (1 + n_blocks))
+
+
+def spread_pct(vals):
+    vals = [v for v in vals if v]
+    if len(vals) < 2 or not min(vals):
+        return None
+    return 100.0 * (max(vals) - min(vals)) / min(vals)
+
+
+def per_block(rec, ink, width, wd="I8I8"):
+    """What one (head, band, block) costs, which is what actually compares.
+
+    us/call across shapes was the old verdict and it was too weak to carry
+    one: it mixes the Q.Kt call (which spans every block) with the P.V calls
+    (one per block), so it moves with n_blocks for reasons that say nothing
+    about the kernel. Normalising each mm stage to one block does compare,
+    and it is what makes the M-invariance below readable as a finding.
+    """
+    out = [rule(ink, "What one block costs", width)]
     rows = []
     for regime, kv in shapes(rec):
         path = f"forward_{regime}_kv{kv}_{wd}"
-        wall = get(rec, "ATTN_FIELD", path, "us_per_layer")
         calls = get(rec, "ATTN_STAGE", path, "layer_run_calls")
-        if not wall or not calls:
+        qk = get(rec, "ATTN_STAGE", path, "qk_us")
+        pv = get(rec, "ATTN_STAGE", path, "pv_us")
+        sm = get(rec, "ATTN_STAGE", path, "softmax_us")
+        if not calls or qk is None or pv is None:
             continue
-        rows.append((regime, kv, calls, wall, wall / calls))
+        mrows, _bands, _nb, blocks, want = geometry(regime, kv)
+        if int(calls) != want:
+            out.append("  " + ink(
+                f"kv={kv} {regime}: {calls:,.0f} layer_run calls, geometry "
+                f"says {want}. ATTN_CFG is stale -- not normalising.", 1))
+            continue
+        rows.append((regime, kv, mrows, qk / blocks, pv / blocks,
+                     (sm or 0.0) / blocks))
     if not rows:
-        return out + ["  (needs ATTN_STAGE layer_run_calls)"]
+        return out + ["  (needs ATTN_STAGE stage totals)"]
 
-    vmax = max(r[4] for r in rows)
-    barw = max(16, width - 56)
-    out.append(ink.dim(f"  {'shape':<20}{'calls':>7}{'wall us':>11}"
-                       f"{'us/call':>10}"))
-    for regime, kv, calls, wall, per in rows:
+    # Padded, deliberately: the integer accumulator is M_band rows wide, so an
+    # M=2 band issues exactly the MACs an M=64 one does. Quoting the useful
+    # MACs would hide the waste this section exists to show.
+    macs = ATTN_CFG["M_band"] * ATTN_CFG["head_dim"] * ATTN_CFG["T"]
+    out.append(ink.dim(f"  {'shape':<20}{'rows/band':>10}{'Q.Kt/blk':>10}"
+                       f"{'P.V/blk':>10}{'softmax/blk':>13}{'Q.Kt GMAC/s':>13}"))
+    for regime, kv, mrows, q, p, s in rows:
         name = f"kv={kv:<5}{'decode' if regime == 'dec' else 'prefill'}"
-        out.append(f"  {name:<20}{calls:>7,.0f}{wall:>11,.0f}{per:>10,.0f}  "
-                   + ink(bar(per, vmax, barw), 3))
+        out.append(f"  {name:<20}{mrows:>10}{q:>10.1f}{p:>10.1f}{s:>13.2f}"
+                   f"{macs / q / 1e3:>13.2f}")
+    out.append(ink.dim("  us per (head, band, block); GMAC/s counts the PADDED "
+                       "rows the accumulator issues"))
+    out.append("")
 
-    lo, hi = min(r[4] for r in rows), max(r[4] for r in rows)
-    flat = hi <= lo * 1.6
-    verdict = ("us/call is flat across shapes: the cost tracks HOW MANY TIMES "
-               "layer_run is\n  entered, not the arithmetic inside it -- the "
-               "malloc storm MHA_HTP_U8_TASKS.md\n  1.8 predicted."
-               if flat else
-               "us/call varies with shape: the cost is not a per-call "
-               "constant, so look at\n  the stage breakdown above instead.")
-    out += ["", "  " + ink(verdict, 3 if flat else None)]
+    # 1. rows: decode and prefill at the same kv differ only in rows/band.
+    for _r, kv, mrows, q, p, s in rows:
+        if _r != "dec":
+            continue
+        pre = [r for r in rows if r[0] == "pre" and r[1] == kv]
+        if not pre:
+            continue
+        _r2, _kv2, mrows2, q2, p2, s2 = pre[0]
+        out.append(f"  kv={kv}: {mrows2 // mrows}x the rows costs  "
+                   + ink(f"Q.Kt x{q2 / q:.2f}", 3) + "  "
+                   + ink(f"P.V x{p2 / p:.2f}", 3)
+                   + (("  " + ink(f"softmax x{s2 / s:.1f}", 2)) if s else ""))
+
+    # 2. width: the two weight operands, over the same shape.
+    for regime, kv in shapes(rec):
+        paths = [f"forward_{regime}_kv{kv}_{w}" for w in WIDTHS]
+        sq = spread_pct([get(rec, "ATTN_STAGE", p, "qk_us") for p in paths])
+        sp = spread_pct([get(rec, "ATTN_STAGE", p, "pv_us") for p in paths])
+        if sq is None or sp is None:
+            continue
+        name = f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}"
+        out.append(f"  {name}: all four weight widths lie within  "
+                   + ink(f"Q.Kt {sq:.2f}%", 3) + "  " + ink(f"P.V {sp:.2f}%", 3))
+
+    out += ["", "  " + ink(
+        "Neither the row count nor the weight width moves the mm stages, while\n"
+        "  softmax -- the one stage with no row padding -- tracks rows almost\n"
+        "  exactly. So the mm cost is per-call overhead, not arithmetic, and\n"
+        "  narrowing the weights cannot help until that overhead is gone.", 3)]
     return out
 
 
@@ -407,7 +498,7 @@ def main():
     out += gates(rec, ink, cols)
     out += [""] + per_layer(rec, ink, cols)
     out += [""] + breakdown(rec, ink, cols, args.width)
-    out += cost_model(rec, ink, cols, args.width)
+    out += per_block(rec, ink, cols, args.width)
     out += [""]
     print("\n".join(out))
 
@@ -416,7 +507,7 @@ def main():
         sections = "\n".join(
             gates(rec, plain, 100) + [""] + per_layer(rec, plain, 100) + [""]
             + breakdown(rec, plain, 100, args.width)
-            + cost_model(rec, plain, 100, args.width))
+            + per_block(rec, plain, 100, args.width))
         write_html(rec, args.html, sections)
     return 0
 
