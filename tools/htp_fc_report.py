@@ -148,6 +148,19 @@ def get(rec, kind, path, field, default=None):
     return rec.get((kind, path, field), default)
 
 
+def nh_of(rec, path):
+    """Handles per call, i.e. how many matmuls one call carried.
+
+    A group call amortises everything that happens ONCE PER CALL -- the first
+    weight's synchronous DMA drain, and the activation quantization it shares
+    -- across n_handles matmuls. So every per-call number has to be divided by
+    this before it can sit beside a one-handle row. Comparing the totals is
+    what made the cross path read as a regression when it is a 1.2-1.5x win.
+    See kGroups in test/unittest/unittest_hvx_fc.cpp.
+    """
+    return int(get(rec, "FC_FIELD", path, "n_handles", 1) or 1)
+
+
 def rows(rec):
     """Every (path, shape name, M, K, N) the log carries, in M order."""
     out = []
@@ -252,20 +265,31 @@ def headline(rec, ink, width, qnn):
     if not rs:
         return out + ["  (no FC timings in these logs)", ""]
 
-    vmax = max(get(rec, "FC_FIELD", p, "us_avg_1_10") or 0.0
+    def per_mm(path, kind, field):
+        v = get(rec, kind, path, field)
+        return None if v is None else v / nh_of(rec, path)
+
+    if any(nh_of(rec, p) > 1 for p, _n, _m, _k, _N in rs):
+        out.append(ink.dim("  PER MATMUL: a group row's call total is divided "
+                           "by its handle count, so it can be read"))
+        out.append(ink.dim("  against the one-handle row above it. The call "
+                           "total is on the iters line."))
+        out.append("")
+    vmax = max(per_mm(p, "FC_FIELD", "us_avg_1_10") or 0.0
                for p, _n, _m, _k, _N in rs)
     barw = max(16, width - 60)
     lw = 24
     for path, name, M, K, N in rs:
-        avg = get(rec, "FC_FIELD", path, "us_avg_1_10")
+        nh = nh_of(rec, path)
+        avg = per_mm(path, "FC_FIELD", "us_avg_1_10")
         if avg is None:
             continue
-        lo = get(rec, "FC_FIELD", path, "us_min")
-        hi = get(rec, "FC_FIELD", path, "us_max")
-        first = get(rec, "FC_FIELD", path, "us_first")
+        lo = per_mm(path, "FC_FIELD", "us_min")
+        hi = per_mm(path, "FC_FIELD", "us_max")
+        first = per_mm(path, "FC_FIELD", "us_first")
         ini = get(rec, "FC_FIELD", path, "init_us")
-        dsp = get(rec, "FC_STAGE", path, "dsp_total_us")
-        tr = get(rec, "FC_STAGE", path, "transport_us")
+        dsp = per_mm(path, "FC_STAGE", "dsp_total_us")
+        tr = per_mm(path, "FC_STAGE", "transport_us")
         label = f"{name} {K}x{N} M={M}"
         out.append(f"  {label:<{lw}}{ink(bar(avg, vmax, barw, pad=True), 4)}"
                    f"{avg:>10,.0f}")
@@ -276,6 +300,8 @@ def headline(rec, ink, width, qnn):
             line += f"  run1 {first:,.0f}"
         if ini is not None:
             line += f"  |  init {ini:,.0f}"
+        if nh > 1:
+            line += f"  |  {nh} matmuls/call, call total {avg * nh:,.0f}"
         out.append(ink.dim(line))
         # dsp and transport BOTH come from the instrumented run, so they add
         # up to each other and not to the production wall above. Subtracting
@@ -327,14 +353,18 @@ def efficiency(rec, ink, width):
         avg = get(rec, "FC_FIELD", path, "us_avg_1_10")
         if not dsp or not avg:
             continue
+        nh = nh_of(rec, path)
         mm = micro_mms(M, K, N)
         model_us = mm * C_MM_US
         # The remainder after the five probes is what the model predicts; the
-        # probes are the terms it does not model.
+        # probes are the terms it does not model. Both sides are per matmul --
+        # micro-mm count is per matmul, so dsp has to be divided to match, or
+        # a group row reads as n_handles times slower than the model.
         probe_sum = sum(get(rec, "FC_STAGE", path, pr) or 0.0 for pr in PROBES)
-        measured_mm = dsp - probe_sum
-        gmacs = macs(M, K, N) / dsp / 1000.0
-        payload_mb = M * (K + N) * 4.0 / 1048576.0
+        measured_mm = (dsp - probe_sum) / nh
+        gmacs = macs(M, K, N) / (dsp / nh) / 1000.0
+        # One activation in, n_handles output blocks out.
+        payload_mb = M * (K + nh * N) * 4.0 / 1048576.0
         transport_us = get(rec, "FC_STAGE", path, "transport_us")
         gbs = (payload_mb / 1024.0) / (transport_us / 1e6) if transport_us \
             else 0.0
@@ -378,6 +408,7 @@ def breakdown(rec, ink, width):
         transport = get(rec, "FC_STAGE", path, "transport_us")
         stride = get(rec, "FC_STAGE", path, "acc_stride")
 
+        nh = nh_of(rec, path)
         title = f"{name} M={M}"
         line = f"  {ink(title, None, bold=True)}   dsp {dsp:,.0f} us"
         if transport:
@@ -388,17 +419,22 @@ def breakdown(rec, ink, width):
             out.append(ink.dim(f"    production wall (no instrumentation) "
                                f"{avg:,.0f} us"))
 
-        barw = max(20, width - 58)
+        barw = max(20, width - (70 if nh > 1 else 58))
+        if nh > 1:
+            out.append(ink.dim(f"    every value is the whole call, for "
+                               f"{nh} matmuls; us/mm is the amortised share"))
+        def cell(v):
+            """us and % of the call, then the per-matmul share for a group."""
+            t = f"{v:>9,.0f} us{v / dsp * 100:>7.1f}%"
+            return t + (f"{v / nh:>9,.1f}/mm" if nh > 1 else "")
         for pr in PROBES:
             v = get(rec, "FC_STAGE", path, pr) or 0.0
             out.append(f"    {PROBE_LABEL[pr]:<36}"
                        + ink(bar(v, dsp, barw, PROBE_GLYPH[pr], pad=True),
-                             PROBE_COLOR[pr])
-                       + f"{v:>9,.0f} us{v / dsp * 100:>7.1f}%")
+                             PROBE_COLOR[pr]) + cell(v))
         rest = dsp - sum(get(rec, "FC_STAGE", path, pr) or 0.0 for pr in PROBES)
         out.append(ink.dim(f"    {'micro-mm + loop (remainder)':<36}"
-                           + bar(rest, dsp, barw, "_", pad=True)
-                           + f"{rest:>9,.0f} us{rest / dsp * 100:>7.1f}%"))
+                           + bar(rest, dsp, barw, "_", pad=True) + cell(rest)))
         if stride is not None:
             state = (f"in-place tile dequant ACTIVE (row stride {stride:.0f})"
                      if stride else
@@ -514,7 +550,31 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
         verdict = (f"{ratio:,.1f}x QNN" if ratio >= 1.0
                    else f"{1.0 / ratio:,.1f}x FASTER than QNN")
         out.append(f"    QNN {q_compute:,.1f} us   HexKL {ours_compute:,.0f} "
-                   f"us   ->  " + ink(verdict, 3, bold=True))
+                   f"us   ->  " + ink(verdict, 3, bold=True)
+                   + ink.dim("   (one handle per call: the first weight's DMA "
+                             "is fully exposed)"))
+        # A group call amortises that DMA. QNN quotes an isolated op, so the
+        # row above is the honest like-for-like; but a real model issues q/k/v
+        # as a group, so the amortised number is what a model would see, and
+        # leaving it out would understate the shipped path.
+        grp = [r for r in rows(rec)
+               if r[2] == at_m and nh_of(rec, r[0]) > 1]
+        if grp:
+            gp = grp[0][0]
+            gnh = nh_of(rec, gp)
+            gdsp = get(rec, "FC_STAGE", gp, "dsp_total_us")
+            gmoved = sum(get(rec, "FC_STAGE", gp, f) or 0.0
+                         for f in ("quant_us", "dequant_us", "acc_read_us",
+                                   "acc_copy_us"))
+            if gdsp:
+                gc = (gdsp - gmoved) / gnh
+                gr = gc / q_compute
+                gv = (f"{gr:,.1f}x QNN" if gr >= 1.0
+                      else f"{1.0 / gr:,.1f}x FASTER than QNN")
+                out.append(f"    QNN {q_compute:,.1f} us   HexKL {gc:,.0f} "
+                           f"us   ->  " + ink(gv, 2, bold=True)
+                           + ink.dim(f"   ({gnh} handles per call, weight DMA "
+                                     f"amortised)"))
     else:
         out.append(ink.dim(f"    QNN {q_compute:,.1f} us   HexKL not measured "
                            f"yet -- run unittest_hvx_fc"))
@@ -542,6 +602,15 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
             f"{q_compute:,.1f} us is {gbs:,.1f} GB/s, which is a DDR read: "
             f"read it as M=1 (decode)."))
     out.append("")
+    out.append(ink.dim(
+        "  And a width we do not match: QNN's weight is i4, ours i8, so we "
+        "read twice the"))
+    out.append(ink.dim(
+        "  weight bytes per call. At M=1 that bucket is a DDR read, so it is "
+        "most of the gap;"))
+    out.append(ink.dim(
+        "  QNN's own 1.0 MiB in 69.9 us is 15.0 GB/s against the ~41 GB/s "
+        "this DMA measures."))
     out.append(ink.dim(
         "  Not comparable without saying so: QNN's graph is uint8 in AND "
         "uint8 out, so it"))
