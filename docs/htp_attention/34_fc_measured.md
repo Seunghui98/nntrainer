@@ -85,6 +85,44 @@ The verdicts, in the order they matter:
 M=64 is the baseline every QNN number is read against (§2), so the flow is
 annotated at that shape, with QNN's corresponding stage beside each of ours.
 
+```mermaid
+flowchart TB
+  subgraph ARM["ARM caller"]
+    IN["act f32, 256 KB"]
+    OUT["out f32, 512 KB"]
+    REG["weight register, ONCE per weight:<br/>quantize + WH bake -- init 12.2 ms"]
+  end
+
+  subgraph DSP["CDSP -- dsp_total 156 us&nbsp;&nbsp;(QNN accelerate execute: 347 us)"]
+    Q["1. quant -- 22 us, 14%<br/>per-row minmax, f32 to u8,<br/>AH pack in VTCM, HVX worker pool<br/>(QNN input load: 44.5)"]
+    DMA["2. weight DMA -- 35 us, 22%<br/>WH tiles DDR to VTCM, ring,<br/>double-buffered: weight i+1<br/>prefetched while i computes"]
+    MM["3. HMX micro-mm -- 40 us, 26%<br/>2,048 x 64x32x32, ~0.02 us each<br/>(2+3 = 75 vs QNN FC 69.9)"]
+    RD["4. acc_read -- 26 us, 17%<br/>HMX accumulator to VTCM tile, vendor"]
+    DQ["5. dequant IN PLACE -- 33 us, 21%<br/>i32 to f32 on the VTCM tile,<br/>straight to the DDR output<br/>(4+5 = 59 vs QNN output format 151.1)"]
+  end
+
+  WH[("WH bytes resident<br/>in DSP heap")]
+  DEL["acc_copy: VTCM to DDR staging,<br/>then dequant DDR to DDR<br/>52.8 us per readout<br/>(QNN's writeback: 72.9)"]
+
+  IN -->|"FastRPC in"| Q
+  REG --> WH
+  WH --> DMA
+  Q --> MM
+  DMA --> MM
+  MM --> RD
+  RD --> DQ
+  DQ -->|"FastRPC out<br/>transport total 326 us (QNN 166)"| OUT
+  RD -.->|"DELETED by in-place dequant (80db05e)"| DEL
+
+  classDef del fill:none,stroke:#e45756,stroke-dasharray:5 4;
+  classDef once fill:none,stroke-dasharray:2 3;
+  class DEL del;
+  class REG,WH once;
+```
+
+The same figure in plain ASCII, for terminals and for contexts where
+mermaid does not render:
+
     ARM                            CDSP                    us    %   QNN us
     ---                            ----                    ---------------
     act f32 256 KB --FastRPC--> [1] quant: per-row minmax   22  14%   44.5
