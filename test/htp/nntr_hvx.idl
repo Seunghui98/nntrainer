@@ -137,4 +137,16 @@ interface nntr_hvx : remote_handle64 {
                           in float scale, in uint32 is_causal,
                           in uint32 window, in sequence<float> sink,
                           in sequence<float> q, rout sequence<float> attn_out);
+
+   // Same forward, plus the DSP-internal per-stage microseconds:
+   // [qk, softmax, pv, accum, gather, total, layer_run_calls]. DEBUG ONLY and
+   // stripped before the PR. The host times the whole call, this times the
+   // inside, and the difference is the FastRPC transport -- which is how §2's
+   // transport share gets checked rather than assumed.
+   AEEResult attn_forward_timed(in uint32 h, in uint32 kv_from,
+                                in uint32 n_query, in float scale,
+                                in uint32 is_causal, in uint32 window,
+                                in sequence<float> sink, in sequence<float> q,
+                                rout sequence<float> attn_out,
+                                rout sequence<uint32> stage_us);
 };
