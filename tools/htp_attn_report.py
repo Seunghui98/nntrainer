@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Render the HTP attention device run as tables, and optionally as HTML.
+"""Render the HTP attention device run as charts in the terminal.
 
 Reads the ``*_FIELD`` / ``ATTN_STAGE`` marker lines the device tests emit and
-turns them into something readable. The markers are keyed by name rather than
-by column position on purpose: a report script keyed by position silently
-printed a stale number for every shape past the first, twice, in this project
-(MHA_HTP_PLAN.md 9.7).
+draws them. The markers are keyed by name, never by column position: a
+position-keyed report script silently printed a stale number for every shape
+past the first here, twice (MHA_HTP_PLAN.md 9.7).
 
 Usage
-    tools/htp_attn_report.py                       # reads the default /tmp logs
-    tools/htp_attn_report.py run.log               # or any files you name
+    tools/htp_attn_report.py                       # the three default /tmp logs
+    tools/htp_attn_report.py run.log ...           # or files you name
+    tools/htp_attn_report.py --width I4I4          # breakdown at another width
     tools/htp_attn_report.py --html report.html    # also write a HTML report
+    tools/htp_attn_report.py --no-color            # plain text
 
-Stdlib only: this has to run on whatever machine the device is plugged into.
+Stdlib only: this runs on whatever machine the device is plugged into.
 """
 
 import argparse
 import html
 import os
 import re
+import shutil
 import sys
 
 DEFAULT_LOGS = [
@@ -35,7 +37,6 @@ MARKER = re.compile(
 
 WIDTHS = ["I8I8", "I4I4", "I8I4", "I4I8"]
 WIDTH_LABEL = {"I8I8": "I8,I8", "I4I4": "I4,I4", "I8I4": "I8,I4", "I4I8": "I4,I8"}
-# qk and pv are the two layer_run consumers; the rest are ours.
 STAGES = ["qk_us", "softmax_us", "pv_us", "accum_us", "gather_us"]
 STAGE_LABEL = {
     "qk_us": "Q.Kt",
@@ -44,10 +45,44 @@ STAGE_LABEL = {
     "accum_us": "f32 accum",
     "gather_us": "gather+1/l",
 }
+# One colour per stage, and one glyph each so the stacked bar still reads
+# without colour (piped to a file, NO_COLOR, a mono terminal).
+STAGE_COLOR = {"qk_us": 4, "softmax_us": 3, "pv_us": 1, "accum_us": 2,
+               "gather_us": 5}
+STAGE_GLYPH = {"qk_us": "#", "softmax_us": "=", "pv_us": "*", "accum_us": "+",
+               "gather_us": "."}
+STAGE_HTML = {"qk_us": "#4c78a8", "softmax_us": "#e6a817", "pv_us": "#e45756",
+              "accum_us": "#54a24b", "gather_us": "#b279a2"}
+
+# MHA_HTP_PLAN.md 2's predictions, for the gap to be visible rather than
+# recomputed by the reader every time.
+PREDICTED_US = {"dec": 825.0, "pre": 1250.0}
+CPU_BAR_US = {"dec": 1170.0}
+
+BLOCKS = " ▏▎▍▌▋▊▉█"
+
+
+class Ink:
+    """ANSI colour, off when the output is not a terminal."""
+
+    def __init__(self, on):
+        self.on = on
+
+    def __call__(self, s, code=None, bold=False):
+        if not self.on or code is None and not bold:
+            return s
+        pre = ""
+        if bold:
+            pre += "\033[1m"
+        if code is not None:
+            pre += f"\033[3{code}m"
+        return f"{pre}{s}\033[0m"
+
+    def dim(self, s):
+        return f"\033[2m{s}\033[0m" if self.on else s
 
 
 def parse(paths):
-    """-> {(kind, path, field): value}, values kept as float where possible."""
     out = {}
     for p in paths:
         if not os.path.exists(p):
@@ -71,7 +106,6 @@ def get(rec, kind, path, field, default=None):
 
 
 def shapes(rec):
-    """Which (regime, kv_len) the forward timing covered, in run order."""
     seen = []
     for (kind, path, _f) in rec:
         if kind != "ATTN_FIELD" or not path.startswith("forward_"):
@@ -82,186 +116,236 @@ def shapes(rec):
     return sorted(seen, key=lambda t: (t[1], t[0]))
 
 
-def fmt(v, nd=1):
-    if v is None:
-        return "-"
-    if isinstance(v, str):
-        return v
-    return f"{v:,.{nd}f}"
+def bar(value, vmax, width, glyph=None, pad=False):
+    """A horizontal bar.
+
+    Unicode eighths when drawing solid, a repeated glyph when the bar has to
+    survive without colour. @a pad fills the rest of the cell with spaces so
+    the column after it lines up -- do that here, before any colour escape is
+    wrapped around the result, or the padding counts invisible bytes.
+    """
+    if vmax <= 0:
+        return " " * width if pad else ""
+    n = max(0.0, min(1.0, value / vmax)) * width
+    if glyph:
+        out = glyph * int(round(n))
+    else:
+        full = int(n)
+        rest = int((n - full) * 8)
+        out = "█" * full + (BLOCKS[rest] if rest else "")
+    return out.ljust(width) if pad else out
 
 
-def table(rows, headers, align=None):
-    """Fixed-width text table. Returns a list of lines."""
-    cols = len(headers)
-    align = align or ["l"] + ["r"] * (cols - 1)
-    w = [len(h) for h in headers]
-    for r in rows:
-        for i, c in enumerate(r):
-            w[i] = max(w[i], len(str(c)))
-    def line(cells):
-        parts = []
-        for i, c in enumerate(cells):
-            parts.append(str(c).ljust(w[i]) if align[i] == "l"
-                         else str(c).rjust(w[i]))
-        return "  " + "  ".join(parts)
-    out = [line(headers), "  " + "  ".join("-" * x for x in w)]
-    out += [line(r) for r in rows]
+def rule(ink, title, width):
+    head = f"─ {title} "
+    return ink("╭" + head + "─" * max(0, width - len(head) - 1), 6, bold=True)
+
+
+def header(ink, width):
+    return [ink("  HTP attention -- device run", 6, bold=True), ""]
+
+
+def gates(rec, ink, width):
+    checks = [
+        ("S band vs host model, 384 cases", "ATTN_FIELD", "scores",
+         "max_rel_err", lambda v: v == 0.0, "bit-identical"),
+        ("  its reference dynamic range", "ATTN_FIELD", "scores",
+         "min_ref_dynamic_range", lambda v: v > 0, "> 0, else the 0 is vacuous"),
+        ("  V width never reaches S", "ATTN_FIELD", "scores",
+         "v_width_invariant", lambda v: v == 1, "bitwise invariant"),
+        ("  release then re-register", "ATTN_FIELD", "scores",
+         "lifecycle_repeatable", lambda v: v == 1, "reproduces bitwise"),
+        ("fused forward vs host model", "ATTN_FIELD", "forward",
+         "max_rel_err", lambda v: v <= 5e-3, "tolerance 5e-3 at (I8,I8)"),
+        ("blocked softmax, p, 756 cases", "BLOCKED_FIELD", "softmax_blocked",
+         "max_abs_err_p", lambda v: v <= 1e-6, "<= 1e-6"),
+        ("  l summation-order margin", "BLOCKED_FIELD", "softmax_blocked",
+         "l_sum_order_margin", lambda v: v <= 1.0, "<= 1.0"),
+    ]
+    out = [rule(ink, "Correctness gates", width)]
+    for label, kind, path, field, ok, note in checks:
+        v = get(rec, kind, path, field)
+        if v is None:
+            out.append(f"  {ink('?', 3)} {label:<34} {'-':>10}  {ink.dim(note)}")
+            continue
+        good = ok(v)
+        mark = ink("PASS", 2, bold=True) if good else ink("FAIL", 1, bold=True)
+        out.append(f"  {mark} {label:<34} {v:>10.3g}  {ink.dim(note)}")
     return out
 
 
-def section(title):
-    return ["", f"== {title} " + "=" * max(0, 68 - len(title)), ""]
-
-
-def correctness(rec):
-    """The gates, so a green run is visible at a glance rather than scrolled."""
-    checks = [
-        ("S band vs host model, 384 cases", "ATTN_FIELD", "scores",
-         "max_rel_err", "0 means bit-identical"),
-        ("  reference dynamic range", "ATTN_FIELD", "scores",
-         "min_ref_dynamic_range", "> 0, else the 0 above is vacuous"),
-        ("  V width never reaches S", "ATTN_FIELD", "scores",
-         "v_width_invariant", "1 = bitwise invariant"),
-        ("  lifecycle repeatable", "ATTN_FIELD", "scores",
-         "lifecycle_repeatable", "1 = re-register reproduces"),
-        ("fused forward vs host model", "ATTN_FIELD", "forward",
-         "max_rel_err", "tolerance 5e-3 at (I8,I8)"),
-        ("blocked softmax, 756 cases: p", "BLOCKED_FIELD", "softmax_blocked",
-         "max_abs_err_p", "<= 1e-6"),
-        ("  l summation-order margin", "BLOCKED_FIELD", "softmax_blocked",
-         "l_sum_order_margin", "<= 1.0"),
-    ]
-    rows = []
-    for label, kind, path, field, note in checks:
-        v = get(rec, kind, path, field)
-        rows.append([label, "-" if v is None else f"{v:g}", note])
-    return table(rows, ["check", "value", "expected"], ["l", "r", "l"])
-
-
-def per_layer(rec):
+def per_layer(rec, ink, width):
+    out = [rule(ink, "Cost per fused layer, us (wall, includes transport)",
+                width)]
     rows = []
     for regime, kv in shapes(rec):
-        row = [f"{kv}", "decode" if regime == "dec" else "prefill"]
-        for wd in WIDTHS:
-            row.append(fmt(get(rec, "ATTN_FIELD", f"forward_{regime}_kv{kv}_{wd}",
-                               "us_per_layer")))
-        tok = get(rec, "ATTN_FIELD", f"forward_{regime}_kv{kv}_I8I8",
-                  "us_per_token_all_layers")
-        row.append("-" if tok is None else f"{tok / 1000.0:,.1f}")
-        rows.append(row)
-    return table(rows,
-                 ["kv_len", "regime"] + [WIDTH_LABEL[w] for w in WIDTHS]
-                 + ["28 layers (ms)"])
+        vals = {w: get(rec, "ATTN_FIELD", f"forward_{regime}_kv{kv}_{w}",
+                       "us_per_layer") for w in WIDTHS}
+        if vals["I8I8"] is None:
+            continue
+        rows.append((regime, kv, vals))
+    if not rows:
+        return out + ["  (no forward timing in these logs)"]
+
+    vmax = max(v for _r, _k, vs in rows for v in vs.values() if v)
+    barw = max(18, width - 56)
+    for regime, kv, vals in rows:
+        name = f"kv={kv:<5}{'decode' if regime == 'dec' else 'prefill'}"
+        best = vals["I8I8"]
+        out.append(f"  {name:<20}{ink(bar(best, vmax, barw, pad=True), 4)}"
+                   f"{best:>10,.0f}")
+        spread = [f"{WIDTH_LABEL[w]} {vals[w]:,.0f}" for w in WIDTHS if vals[w]]
+        out.append(ink.dim(f"  {'':<20}{'  '.join(spread)}"))
+
+        pred = PREDICTED_US.get(regime)
+        if pred:
+            out.append(ink.dim(
+                f"  {'':<20}plan §2 predicts {pred:,.0f} us"
+                f"  ->  {best / pred:,.0f}x over"))
+        cpu = CPU_BAR_US.get(regime)
+        if cpu:
+            out.append(ink.dim(
+                f"  {'':<20}CPU bar {cpu:,.0f} us"
+                f"  ->  {best / cpu:,.1f}x slower than CPU"))
+        out.append("")
+    tok = get(rec, "ATTN_FIELD", f"forward_dec_kv1024_I8I8",
+              "us_per_token_all_layers")
+    if tok:
+        out.append(f"  {ink('decode, 28 layers:', None, bold=True)} "
+                   f"{tok / 1000.0:,.1f} ms of attention per token")
+    return out
 
 
-def breakdown(rec, width="I8I8"):
-    """Where the DSP-internal time actually goes, per stage, with shares."""
-    rows = []
+def breakdown(rec, ink, width, wd="I8I8"):
+    out = [rule(ink, f"Where the DSP time goes ({WIDTH_LABEL[wd]})", width)]
+    legend = "  ".join(
+        ink(STAGE_GLYPH[s] + " " + STAGE_LABEL[s], STAGE_COLOR[s])
+        for s in STAGES)
+    out += ["  " + legend, ""]
+
+    drew = False
     for regime, kv in shapes(rec):
-        path = f"forward_{regime}_kv{kv}_{width}"
-        vals = {s: get(rec, "ATTN_STAGE", path, s) for s in STAGES}
+        path = f"forward_{regime}_kv{kv}_{wd}"
         total = get(rec, "ATTN_STAGE", path, "dsp_total_us")
+        if not total:
+            continue
+        drew = True
         wall = get(rec, "ATTN_FIELD", path, "us_per_layer")
         transport = get(rec, "ATTN_STAGE", path, "transport_us")
         calls = get(rec, "ATTN_STAGE", path, "layer_run_calls")
-        if total is None:
-            continue
-        row = [f"{kv}", "decode" if regime == "dec" else "prefill"]
+
+        title = f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}"
+        out.append(f"  {ink(title, None, bold=True)}"
+                   f"   dsp {total:,.0f} us"
+                   + (f" + transport {transport:,.0f} us" if transport else "")
+                   + (f" = wall {wall:,.0f} us" if wall else "")
+                   + (f"   [{calls:,.0f} layer_run calls]" if calls else ""))
+
+        barw = max(20, width - 50)
+        stacked = ""
         for s in STAGES:
-            v = vals[s]
-            pct = (100.0 * v / total) if (v is not None and total) else None
-            row.append("-" if v is None else f"{v:,.0f} ({pct:.0f}%)")
-        row += [fmt(total, 0), fmt(transport, 0), fmt(wall, 0), fmt(calls, 0)]
-        rows.append(row)
-    if not rows:
-        return ["  (no ATTN_STAGE lines -- run a build that has "
-                "attn_forward_timed)"]
-    return table(rows,
-                 ["kv_len", "regime"] + [STAGE_LABEL[s] for s in STAGES]
-                 + ["dsp total", "transport", "wall", "layer_run"])
+            v = get(rec, "ATTN_STAGE", path, s) or 0.0
+            seg = bar(v, total, barw, STAGE_GLYPH[s]) if v else ""
+            stacked += ink(seg, STAGE_COLOR[s])
+        out.append("    " + stacked)
+
+        for s in STAGES:
+            v = get(rec, "ATTN_STAGE", path, s)
+            if v is None:
+                continue
+            pct = 100.0 * v / total
+            out.append(f"    {STAGE_LABEL[s]:<12}"
+                       + ink(bar(v, total, barw, pad=True), STAGE_COLOR[s])
+                       + f"{v:>9,.0f} us {pct:>5.1f}%")
+        out.append("")
+    if not drew:
+        out.append("  (no ATTN_STAGE lines -- needs a build with "
+                   "attn_forward_timed)")
+    return out
 
 
-def cost_model(rec, width="I8I8"):
-    """Total time against layer_run call count.
-
-    If the per-call figure is flat across shapes, the cost is dominated by how
-    many times layer_run is entered rather than by the arithmetic inside it --
-    which is the malloc storm MHA_HTP_U8_TASKS.md 1.8 predicted.
-    """
+def cost_model(rec, ink, width, wd="I8I8"):
+    out = [rule(ink, "Cost against layer_run call count", width)]
     rows = []
     for regime, kv in shapes(rec):
-        path = f"forward_{regime}_kv{kv}_{width}"
+        path = f"forward_{regime}_kv{kv}_{wd}"
         wall = get(rec, "ATTN_FIELD", path, "us_per_layer")
         calls = get(rec, "ATTN_STAGE", path, "layer_run_calls")
         if not wall or not calls:
             continue
-        rows.append([f"{kv}", "decode" if regime == "dec" else "prefill",
-                     fmt(calls, 0), fmt(wall, 0), fmt(wall / calls, 0)])
+        rows.append((regime, kv, calls, wall, wall / calls))
     if not rows:
-        return ["  (needs ATTN_STAGE layer_run_calls)"]
-    return table(rows, ["kv_len", "regime", "layer_run calls", "wall us",
-                        "us per call"])
+        return out + ["  (needs ATTN_STAGE layer_run_calls)"]
+
+    vmax = max(r[4] for r in rows)
+    barw = max(16, width - 56)
+    out.append(ink.dim(f"  {'shape':<20}{'calls':>7}{'wall us':>11}"
+                       f"{'us/call':>10}"))
+    for regime, kv, calls, wall, per in rows:
+        name = f"kv={kv:<5}{'decode' if regime == 'dec' else 'prefill'}"
+        out.append(f"  {name:<20}{calls:>7,.0f}{wall:>11,.0f}{per:>10,.0f}  "
+                   + ink(bar(per, vmax, barw), 3))
+
+    lo, hi = min(r[4] for r in rows), max(r[4] for r in rows)
+    flat = hi <= lo * 1.6
+    verdict = ("us/call is flat across shapes: the cost tracks HOW MANY TIMES "
+               "layer_run is\n  entered, not the arithmetic inside it -- the "
+               "malloc storm MHA_HTP_U8_TASKS.md\n  1.8 predicted."
+               if flat else
+               "us/call varies with shape: the cost is not a per-call "
+               "constant, so look at\n  the stage breakdown above instead.")
+    out += ["", "  " + ink(verdict, 3 if flat else None)]
+    return out
 
 
-def bar_svg(labels, values, colors, width=760, row_h=26):
-    """One stacked bar per row, pure SVG so the report needs no JS or CDN."""
+def bar_svg(labels, values, width=760, row_h=26):
     if not values:
         return ""
     total_max = max(sum(v) for v in values) or 1.0
-    h = row_h * len(labels) + 30
+    h = row_h * len(labels) + 20
     parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" '
              f'style="max-width:{width}px" role="img">']
     for i, (lab, vs) in enumerate(zip(labels, values)):
         y = i * row_h + 4
         x = 150.0
-        parts.append(f'<text x="0" y="{y + 14}" font-size="12" '
+        parts.append(f'<text x="0" y="{y + 13}" font-size="12" '
                      f'fill="currentColor">{html.escape(lab)}</text>')
-        for v, c in zip(vs, colors):
+        for s, v in zip(STAGES, vs):
             w = (width - 170.0) * v / total_max
             if w > 0.3:
                 parts.append(f'<rect x="{x:.1f}" y="{y}" width="{w:.1f}" '
-                             f'height="16" fill="{c}"><title>{v:,.0f} us'
-                             f'</title></rect>')
+                             f'height="16" fill="{STAGE_HTML[s]}">'
+                             f'<title>{STAGE_LABEL[s]}: {v:,.0f} us</title>'
+                             f'</rect>')
             x += w
     parts.append("</svg>")
     return "".join(parts)
 
 
-def write_html(rec, path):
-    colors = ["#4c78a8", "#f58518", "#54a24b", "#e45756", "#b279a2"]
+def write_html(rec, path, plain_sections):
     labels, values = [], []
     for regime, kv in shapes(rec):
         p = f"forward_{regime}_kv{kv}_I8I8"
         vs = [get(rec, "ATTN_STAGE", p, s) or 0.0 for s in STAGES]
-        if sum(vs) == 0:
-            continue
-        labels.append(f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}")
-        values.append(vs)
-
+        if sum(vs):
+            labels.append(f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}")
+            values.append(vs)
     legend = " ".join(
-        f'<span style="color:{c}">&#9632;</span> {html.escape(STAGE_LABEL[s])}'
-        for s, c in zip(STAGES, colors))
-
-    def pre(lines):
-        return "<pre>" + html.escape("\n".join(lines)) + "</pre>"
-
+        f'<span style="color:{STAGE_HTML[s]}">&#9632;</span> '
+        f'{html.escape(STAGE_LABEL[s])}' for s in STAGES)
     body = f"""<title>HTP attention device report</title>
 <style>
 :root {{ color-scheme: light dark; }}
-body {{ font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-        margin: 2rem auto; max-width: 900px; padding: 0 1rem; }}
-h1 {{ font-size: 1.3rem; }} h2 {{ font-size: 1rem; margin-top: 2rem; }}
+body {{ font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 2rem auto; max-width: 940px; padding: 0 1rem; }}
+h1 {{ font-size: 1.25rem; }}
 pre {{ overflow-x: auto; padding: .75rem; border-radius: 6px;
        background: rgba(127,127,127,.12); }}
 </style>
 <h1>HTP attention &mdash; device run</h1>
-<h2>Correctness gates</h2>{pre(correctness(rec))}
-<h2>Cost per fused layer (us, includes FastRPC transport)</h2>
-{pre(per_layer(rec))}
-<h2>Where the DSP time goes (I8,I8)</h2>
-<p>{legend}</p>{bar_svg(labels, values, colors)}
-{pre(breakdown(rec))}
-<h2>Cost against layer_run call count</h2>{pre(cost_model(rec))}
+<p>{legend}</p>
+{bar_svg(labels, values)}
+<pre>{html.escape(plain_sections)}</pre>
 """
     with open(path, "w") as fh:
         fh.write(body)
@@ -269,14 +353,19 @@ pre {{ overflow-x: auto; padding: .75rem; border-radius: 6px;
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("logs", nargs="*", default=None,
-                    help="device run logs (default: the three /tmp ones)")
-    ap.add_argument("--html", metavar="FILE", help="also write a HTML report")
-    ap.add_argument("--width", default="I8I8", choices=WIDTHS,
-                    help="width pair for the breakdown tables (default I8I8)")
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("logs", nargs="*")
+    ap.add_argument("--html", metavar="FILE")
+    ap.add_argument("--width", default="I8I8", choices=WIDTHS)
+    ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
+
+    use_color = (sys.stdout.isatty() and not args.no_color
+                 and os.environ.get("NO_COLOR") is None)
+    ink = Ink(use_color)
+    cols = min(shutil.get_terminal_size((100, 24)).columns, 110)
 
     rec = parse(args.logs or DEFAULT_LOGS)
     if not rec:
@@ -285,20 +374,21 @@ def main():
         return 1
 
     out = []
-    out += section("Correctness gates")
-    out += correctness(rec)
-    out += section("Cost per fused layer, us (includes FastRPC transport)")
-    out += per_layer(rec)
-    out += section(f"Where the DSP time goes ({WIDTH_LABEL[args.width]})")
-    out += breakdown(rec, args.width)
-    out += section("Cost against layer_run call count")
-    out += cost_model(rec, args.width)
-    out += ["", "  A flat 'us per call' means the cost tracks how many times",
-            "  layer_run is entered, not the arithmetic inside it.", ""]
+    out += header(ink, cols)
+    out += gates(rec, ink, cols)
+    out += [""] + per_layer(rec, ink, cols)
+    out += [""] + breakdown(rec, ink, cols, args.width)
+    out += cost_model(rec, ink, cols, args.width)
+    out += [""]
     print("\n".join(out))
 
     if args.html:
-        write_html(rec, args.html)
+        plain = Ink(False)
+        sections = "\n".join(
+            gates(rec, plain, 100) + [""] + per_layer(rec, plain, 100) + [""]
+            + breakdown(rec, plain, 100, args.width)
+            + cost_model(rec, plain, 100, args.width))
+        write_html(rec, args.html, sections)
     return 0
 
 
