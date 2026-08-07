@@ -36,7 +36,13 @@ MARKER = re.compile(
 )
 
 WIDTHS = ["I8I8", "I4I4", "I8I4", "I4I8"]
-WIDTH_LABEL = {"I8I8": "I8,I8", "I4I4": "I4,I4", "I8I4": "I8,I4", "I4I8": "I4,I8"}
+# A width pair is (Kt width, V width) -- the two WEIGHT operands. Both
+# activations (Q for S, P for O) are always u8, so the pair names the two
+# micro-mms that actually run: S = Q(u8) x Kt(iN), O = P(u8) x V(iN). Label
+# them that way; "I4,I4" reads like u4 x i4 to anyone who has not read
+# MHA_HTP_U8_TASKS.md §0.2, and there is no u4 anything in this path.
+WIDTH_LABEL = {"I8I8": "u8i8/u8i8", "I4I4": "u8i4/u8i4",
+               "I8I4": "u8i8/u8i4", "I4I8": "u8i4/u8i8"}
 STAGES = ["qk_us", "softmax_us", "pv_us", "accum_us", "gather_us"]
 STAGE_LABEL = {
     "qk_us": "Q.Kt",
@@ -142,7 +148,10 @@ def rule(ink, title, width):
 
 
 def header(ink, width):
-    return [ink("  HTP attention -- device run", 6, bold=True), ""]
+    return [ink("  HTP attention -- device run", 6, bold=True),
+            ink.dim("  widths name the two micro-mms: "
+                    "S = Q(u8) x Kt(i4|i8), O = P(u8) x V(i4|i8)"),
+            ""]
 
 
 def gates(rec, ink, width):
