@@ -235,7 +235,7 @@ def per_layer(rec, ink, width):
         ini = get(rec, "ATTN_FIELD", p8, "init_us")
         if lo is not None and hi is not None:
             out.append(ink.dim(
-                f"  {'':<20}10 iters: avg(2-10) {best:,.0f}  min {lo:,.0f}  "
+                f"  {'':<20}10 iters: avg(1-10) {best:,.0f}  min {lo:,.0f}  "
                 f"max {hi:,.0f}"
                 + (f"  run1 {first:,.0f}" if first is not None else "")
                 + (f"  |  init {ini:,.0f}" if ini is not None else "")))
