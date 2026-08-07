@@ -11,6 +11,7 @@ for every shape past the first in this project, twice (MHA_HTP_PLAN.md 9.7).
 Usage
     tools/htp_fc_report.py                          # /tmp/hvx_fc_device_run.log
     tools/htp_fc_report.py run.log ...              # or files you name
+    tools/htp_fc_report.py --qnn-profile            # vs QNN stage by stage
     tools/htp_fc_report.py --qnn 512=1.45,1024=3.21 # overlay QNN ms per M
                                                     # (those two are the
                                                     #  ATTENTION numbers --
@@ -55,6 +56,46 @@ PROBE_HTML = {"quant_us": "#e6a817", "dequant_us": "#54a24b",
               "acc_read_us": "#4c78a8", "acc_copy_us": "#e45756",
               "drain_us": "#b279a2"}
 REMAINDER_HTML = "#8c8c8c"
+
+# QNN's own per-stage breakdown of one fully connected op, recorded here so the
+# comparison is against numbers that are written down rather than remembered.
+# Reported by the QNN side of this evaluation; the shape is q_proj and the
+# sequence length is not stated -- qnn_implied_m() below backs it out.
+QNN_PROFILES = {
+    "u8i4": {
+        "label": "QNN u8i4, one FC op (reported on S26 Ultra)",
+        "init_us": 5097.0,        # context/binary load, once
+        "cold_us": 1263.0,        # first inference
+        "netrun_us": 513.0,       # execute() entry to return
+        "host_overhead_us": 128.0,  # NetRun - RPC execute
+        "rpc_execute_us": 385.0,  # host <-> device
+        "non_accel_rpc_us": 39.0,  # RPC execute - accelerate execute
+        "accel_execute_us": 347.0,  # the device timeline
+        "input_us": 44.5,         # input slice / load (uint8)
+        "fc_us": 69.9,            # FC: weight load + compute
+        "outfmt_us": 151.1,       # output format / layout (uint8)
+        "writeback_us": 72.9,     # output writeback
+        "idle_us": 5.2,           # idle / misc / overlap
+    },
+}
+
+# What lines up with what. QNN's graph is uint8 in and uint8 out, so it has no
+# stage that corresponds to our f32 quant/dequant -- their "output format" is
+# the accumulator drain plus a requantize, which is the same work our acc_read
+# and dequant do, at a quarter of the output bytes. Our terms are given as a
+# list of FC_STAGE fields to add up; "__compute" is dsp_total minus every
+# probe that is data movement, i.e. the micro-mms and the weight DMA.
+QNN_MAP = [
+    ("Input slice / load (uint8)", "input_us",
+     ["quant_us"], "quant (f32 -> u8 AH)"),
+    ("FC (weight load + compute)", "fc_us",
+     ["__compute"], "micro-mm + weight DMA"),
+    ("Output format / layout (uint8)", "outfmt_us",
+     ["acc_read_us", "dequant_us"], "acc_read + dequant"),
+    ("Output writeback", "writeback_us",
+     ["acc_copy_us"], "acc_copy (0 when in place)"),
+    ("Idle / misc / overlap", "idle_us", [], "(unattributed)"),
+]
 
 # HMX int8 micro-mm geometry, mirrored from hexkl_micro.h, and the per-mm cost
 # the cost model measured on this device.
@@ -371,6 +412,148 @@ def breakdown(rec, ink, width):
     return out
 
 
+def qnn_implied_m(prof, K, N):
+    """Which M could QNN's fc_us possibly have been measured at?
+
+    Their table does not say, and it changes what the number means. Two facts
+    bound it: the MACs a given M needs, and the weight bytes the op must read
+    at least once. Print both rates per candidate M and let the impossible
+    ones disqualify themselves -- an implied MAC rate in the thousands of
+    GMAC/s is not a fast implementation, it is the wrong M.
+    """
+    out = []
+    w_bytes = K * N / 2.0  # u8i4: two weight values per byte
+    for M in (1, 512, 1024):
+        gmacs = (float(M) * K * N) / prof["fc_us"] / 1000.0
+        out.append((M, gmacs))
+    return out, w_bytes / prof["fc_us"] / 1000.0
+
+
+def qnn_compare(rec, ink, width, prof_name, at_m):
+    """QNN's stage breakdown beside ours, stage by stage.
+
+    The point of this section is NOT the ratio. It is that both stacks split
+    an FC op the same way -- a small multiply surrounded by a large amount of
+    getting data into and out of the accumulator -- and QNN's own numbers say
+    so before ours are even in: their output-format bucket is 2.2x their
+    compute bucket. A comparison that only quoted totals would hide that the
+    two stacks are losing to the same thing.
+    """
+    prof = QNN_PROFILES.get(prof_name)
+    if prof is None:
+        return []
+    rs = [r for r in rows(rec) if r[2] == at_m]
+    if not rs:
+        rs = rows(rec)[:1]
+    out = [rule(ink, f"Against QNN's own breakdown -- {prof['label']}", width)]
+    if not rs:
+        # Still worth printing: QNN's numbers alone answer "where does an FC
+        # op go" without any measurement of ours.
+        ours = None
+        path = name = None
+        K = N = None
+    else:
+        path, name, M, K, N = rs[0]
+        ours = path
+        if M != at_m:
+            out.append(ink.dim(f"  (no M={at_m} row in the log; comparing "
+                               f"against M={M})"))
+        at_m = M
+
+    def ours_us(fields):
+        if ours is None:
+            return None
+        if fields == ["__compute"]:
+            dsp = get(rec, "FC_STAGE", ours, "dsp_total_us")
+            if not dsp:
+                return None
+            moved = sum(get(rec, "FC_STAGE", ours, f) or 0.0
+                        for f in ("quant_us", "dequant_us", "acc_read_us",
+                                  "acc_copy_us"))
+            return dsp - moved
+        if not fields:
+            return None
+        vals = [get(rec, "FC_STAGE", ours, f) for f in fields]
+        if all(v is None for v in vals):
+            return None
+        return sum(v or 0.0 for v in vals)
+
+    SEP = "  " + "-" * 43 + "|" + "-" * 45
+
+    def line(left, lv, right, rv):
+        lt = f"{lv:>9,.1f}" if lv is not None else f"{'-':>9}"
+        rt = f"{rv:>10,.0f}" if rv is not None else f"{'-':>10}"
+        return f"  {left:<32}{lt}  |  {right:<30}{rt}"
+
+    out.append(f"  {'QNN':<32}{'us':>9}  |  {'HexKL':<30}{'us':>10}")
+    out.append(SEP)
+    for qlabel, qfield, ofields, olabel in QNN_MAP:
+        out.append(line(qlabel, prof[qfield], olabel, ours_us(ofields)))
+    out.append(SEP)
+    dsp = get(rec, "FC_STAGE", ours, "dsp_total_us") if ours else None
+    wall = get(rec, "FC_FIELD", ours, "us_avg_1_10") if ours else None
+    tr = get(rec, "FC_STAGE", ours, "transport_us") if ours else None
+    ini = get(rec, "FC_FIELD", ours, "init_us") if ours else None
+    out.append(line("accelerate execute (device)", prof["accel_execute_us"],
+                    "dsp_total", dsp))
+    out.append(line("NetRun - accelerate execute",
+                    prof["netrun_us"] - prof["accel_execute_us"],
+                    "transport (FastRPC)", tr))
+    out.append(line("NetRun (steady state)", prof["netrun_us"], "wall", wall))
+    out.append(line("one-time init", prof["init_us"], "init (weight bake)",
+                    ini))
+    out.append("")
+
+    # The question this section was added to answer.
+    ours_compute = ours_us(["__compute"])
+    q_compute = prof["fc_us"]
+    out.append("  " + ink("COMPUTE ONLY -- no quant, no dequant, no layout:",
+                          None, bold=True))
+    if ours_compute:
+        ratio = ours_compute / q_compute
+        verdict = (f"{ratio:,.1f}x QNN" if ratio >= 1.0
+                   else f"{1.0 / ratio:,.1f}x FASTER than QNN")
+        out.append(f"    QNN {q_compute:,.1f} us   HexKL {ours_compute:,.0f} "
+                   f"us   ->  " + ink(verdict, 3, bold=True))
+    else:
+        out.append(ink.dim(f"    QNN {q_compute:,.1f} us   HexKL not measured "
+                           f"yet -- run unittest_hvx_fc"))
+    q_share = q_compute / prof["accel_execute_us"] * 100.0
+    line2 = f"    of the device timeline that is multiply: QNN {q_share:.0f}%"
+    if ours_compute and dsp:
+        line2 += f", HexKL {ours_compute / dsp * 100:.0f}%"
+    out.append(ink.dim(line2))
+    out.append(ink.dim(
+        f"    QNN's own output-format bucket is "
+        f"{prof['outfmt_us'] / q_compute:.1f}x its compute bucket -- the "
+        f"accumulator readout dominates on both stacks."))
+    out.append("")
+
+    if K and N:
+        cands, gbs = qnn_implied_m(prof, K, N)
+        out.append(ink.dim("  QNN's table does not say which M it measured. "
+                           "Backed out of fc_us:"))
+        for M, gmacs in cands:
+            note = ("plausible" if gmacs < 2000.0
+                    else "above any HMX int8 peak -- not this M")
+            out.append(ink.dim(f"    M={M:<6}{gmacs:>10,.0f} GMAC/s   {note}"))
+        out.append(ink.dim(
+            f"    and {K * N / 2 / 1048576:.1f} MiB of i4 weight in "
+            f"{q_compute:,.1f} us is {gbs:,.1f} GB/s, which is a DDR read: "
+            f"read it as M=1 (decode)."))
+    out.append("")
+    out.append(ink.dim(
+        "  Not comparable without saying so: QNN's graph is uint8 in AND "
+        "uint8 out, so it"))
+    out.append(ink.dim(
+        "  never pays an f32 quant or dequant, and moves a quarter of the "
+        "output bytes we do."))
+    out.append(ink.dim(
+        "  The two rows above them are therefore an alignment of PURPOSE, "
+        "not of work."))
+    return out + [""]
+
+
 def bar_svg(labels, values, width=760):
     """Stacked probe bars plus the remainder, for the HTML report."""
     if not labels:
@@ -450,6 +633,13 @@ def main():
     ap.add_argument("logs", nargs="*")
     ap.add_argument("--qnn", metavar="M=ms,...",
                     help="QNN milliseconds per sequence length, to overlay")
+    ap.add_argument("--qnn-profile", metavar="NAME", nargs="?",
+                    const="u8i4", choices=sorted(QNN_PROFILES),
+                    help="compare stage by stage against a recorded QNN "
+                         "breakdown (default profile: u8i4)")
+    ap.add_argument("--qnn-m", type=int, default=1, metavar="M",
+                    help="which of our M rows the QNN profile is compared "
+                         "against (default 1 -- see the derivation it prints)")
     ap.add_argument("--html", metavar="FILE")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
@@ -473,13 +663,17 @@ def main():
     out += headline(rec, ink, cols, qnn)
     out += breakdown(rec, ink, cols)
     out += efficiency(rec, ink, cols)
+    if args.qnn_profile:
+        out += qnn_compare(rec, ink, cols, args.qnn_profile, args.qnn_m)
     print("\n".join(out))
 
     if args.html:
         plain = Ink(False)
         sections = "\n".join(
             gates(rec, plain, 100) + headline(rec, plain, 100, qnn)
-            + breakdown(rec, plain, 100) + efficiency(rec, plain, 100))
+            + breakdown(rec, plain, 100) + efficiency(rec, plain, 100)
+            + (qnn_compare(rec, plain, 100, args.qnn_profile, args.qnn_m)
+               if args.qnn_profile else []))
         write_html(rec, args.html, sections)
     return 0
 
