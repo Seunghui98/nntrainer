@@ -995,7 +995,8 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
 	 $(LOCAL_PATH)/../htp/generated \
 	 $(HEXAGON_SDK_ROOT)/incs \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
-	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/inc
 
 LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
 	 -lcdsprpc

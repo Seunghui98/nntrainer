@@ -26,6 +26,11 @@
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
+#if __has_include(<HAP_power.h>)
+#include <HAP_power.h>
+#define NNTR_HVX_HAVE_HAP_POWER 1
+#endif
+
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128u
 /** @brief f32 lanes per HVX vector. */
@@ -98,6 +103,38 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     free(s);
     return AEE_ENOMEMORY;
   }
+
+#ifdef NNTR_HVX_HAVE_HAP_POWER
+  /* Vote the DSP's clocks up and its wake latency down, once, for the
+   * session's lifetime. This is the DSP half of the measured 90 -> 3,900 us
+   * transport spread: without a vote the core power-collapses between
+   * FastRPC calls and every call pays the DCVS ramp back up. Best effort by
+   * design -- a device that rejects the vote runs exactly as before, only
+   * slower to wake, so failures are logged and ignored. The votes die with
+   * this PD; close() does not need to unwind them. */
+  {
+    HAP_power_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_apptype;
+    req.apptype = HAP_POWER_COMPUTE_CLIENT_CLASS;
+    if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
+      FARF(HIGH, "nntr_hvx_open: apptype vote rejected (continuing)");
+    }
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_DCVS_v2;
+    req.dcvs_v2.dcvs_enable = 1;
+    req.dcvs_v2.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
+    req.dcvs_v2.set_latency = 1;
+    req.dcvs_v2.latency = 100; /* us of wake latency we are willing to pay */
+    req.dcvs_v2.set_dcvs_params = 1;
+    req.dcvs_v2.dcvs_params.min_corner = HAP_DCVS_VCORNER_NOM;
+    req.dcvs_v2.dcvs_params.target_corner = HAP_DCVS_VCORNER_TURBO;
+    req.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_TURBO;
+    if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
+      FARF(HIGH, "nntr_hvx_open: DCVS vote rejected (continuing)");
+    }
+  }
+#endif
 
   *handle = (remote_handle64)s;
   return AEE_SUCCESS;
