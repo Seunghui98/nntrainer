@@ -136,5 +136,5 @@ interface nntr_hvx : remote_handle64 {
    AEEResult attn_forward(in uint32 h, in uint32 kv_from, in uint32 n_query,
                           in float scale, in uint32 is_causal,
                           in uint32 window, in sequence<float> sink,
-                          in sequence<float> q, rout sequence<float> out);
+                          in sequence<float> q, rout sequence<float> attn_out);
 };
