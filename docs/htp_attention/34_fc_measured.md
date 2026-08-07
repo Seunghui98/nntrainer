@@ -87,41 +87,50 @@ annotated at that shape, with QNN's corresponding stage beside each of ours.
 
 ```mermaid
 flowchart TB
-  subgraph ARM["ARM caller"]
-    IN["act f32, 256 KB"]
-    OUT["out f32, 512 KB"]
-    REG["weight register, ONCE per weight:<br/>quantize + WH bake -- init 12.2 ms"]
+  IN(["input: activation, f32"])
+  W["weight<br/>prepared ONCE at load time"]
+
+  Q["1. quantize&nbsp;&nbsp;f32 to u8<br/><b>22 us</b>&nbsp;&nbsp;(QNN: 44.5)"]
+  MM["2. matmul on HMX<br/>weight load + multiply<br/><b>75 us</b>&nbsp;&nbsp;(QNN: 69.9)"]
+
+  subgraph OUTP["get the result out -- 59 us total&nbsp;&nbsp;(QNN: 224)"]
+    RD["3. read the accumulator<br/><b>26 us</b>"]
+    DQ["4. dequantize, in place<br/>i32 to f32<br/><b>33 us</b>"]
   end
 
-  subgraph DSP["CDSP -- dsp_total 156 us&nbsp;&nbsp;(QNN accelerate execute: 347 us)"]
-    Q["1. quant -- 22 us, 14%<br/>per-row minmax, f32 to u8,<br/>AH pack in VTCM, HVX worker pool<br/>(QNN input load: 44.5)"]
-    DMA["2. weight DMA -- 35 us, 22%<br/>WH tiles DDR to VTCM, ring,<br/>double-buffered: weight i+1<br/>prefetched while i computes"]
-    MM["3. HMX micro-mm -- 40 us, 26%<br/>2,048 x 64x32x32, ~0.02 us each<br/>(2+3 = 75 vs QNN FC 69.9)"]
-    RD["4. acc_read -- 26 us, 17%<br/>HMX accumulator to VTCM tile, vendor"]
-    DQ["5. dequant IN PLACE -- 33 us, 21%<br/>i32 to f32 on the VTCM tile,<br/>straight to the DDR output<br/>(4+5 = 59 vs QNN output format 151.1)"]
-  end
+  OUT(["output: f32"])
 
-  WH[("WH bytes resident<br/>in DSP heap")]
-  DEL["acc_copy: VTCM to DDR staging,<br/>then dequant DDR to DDR<br/>52.8 us per readout<br/>(QNN's writeback: 72.9)"]
+  IN --> Q --> MM
+  W -.-> MM
+  MM --> RD --> DQ --> OUT
 
-  IN -->|"FastRPC in"| Q
-  REG --> WH
-  WH --> DMA
-  Q --> MM
-  DMA --> MM
-  MM --> RD
-  RD --> DQ
-  DQ -->|"FastRPC out<br/>transport total 326 us (QNN 166)"| OUT
-  RD -.->|"DELETED by in-place dequant (80db05e)"| DEL
-
-  classDef del fill:none,stroke:#e45756,stroke-dasharray:5 4;
-  classDef once fill:none,stroke-dasharray:2 3;
-  class DEL del;
-  class REG,WH once;
+  classDef once fill:none,stroke-dasharray:3 3;
+  class W once;
 ```
 
-The same figure in plain ASCII, for terminals and for contexts where
-mermaid does not render:
+Total on the DSP: **156 us, vs QNN 347 us** -- and the whole gap is in the
+"get the result out" half, not in the multiply. Why that half got cheap:
+
+```mermaid
+flowchart LR
+  subgraph B["BEFORE"]
+    A1[accumulator] --> C1["copy tile to DDR<br/><b>52.8 us each</b>"] --> D1["dequantize<br/>in DDR"]
+  end
+  subgraph N["NOW"]
+    A2[accumulator] --> D2["dequantize right where<br/>the tile sits -- <b>copy: 0 us</b>"]
+  end
+  B ~~~ N
+  classDef del stroke:#e45756;
+  class C1 del;
+```
+
+The middle step is simply gone: the tile is dequantized where the hardware
+put it, and the f32 result goes straight to the output. (QNN still pays a
+copy -- its "output writeback" is 72.9 us.)
+
+
+The full detail (DMA double-buffering, VTCM, FastRPC costs), in plain
+ASCII for terminals and for contexts where mermaid does not render:
 
     ARM                            CDSP                    us    %   QNN us
     ---                            ----                    ---------------
