@@ -167,18 +167,9 @@ def env(rec, ink, width):
     itxt = {1: ("ION-backed", 2), 0: ("unavailable (plain heap)", 1),
             -1: ("compiled out (pre-26393ab build)", 1)}.get(
         int(io) if io is not None else -1)
-    out = [rule(ink, "What this run actually had turned on", width)]
+    out = [rule(ink, "Transport controls this run actually had", width)]
     out.append("  RPC latency QoS   " + ink(qtxt[0], qtxt[1], bold=True))
     out.append("  q/out buffers     " + ink(itxt[0], itxt[1], bold=True))
-    for regime, kv in shapes(rec):
-        bv = get(rec, "ATTN_STAGE", f"forward_{regime}_kv{kv}_I8I8",
-                 "band_vtcm")
-        if bv is None:
-            continue
-        out.append("  s_band at kv=%-5d" % kv
-                   + (ink("VTCM-resident", 2, bold=True) if bv
-                      else ink("heap (did not fit)", 1, bold=True)))
-        break
     if (q is not None and q <= 0) or (io is not None and io <= 0):
         out.append(ink.dim("  transport numbers below were measured WITHOUT "
                            "the disabled controls."))

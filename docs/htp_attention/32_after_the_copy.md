@@ -71,6 +71,33 @@ problem on the same accelerator with different choices:
 | 5 | FastRPC: layer batching + QoS vote | decode wall (28 x ~430 us) | decode e2e 2-3x | host-side seam change |
 | 6 | fp16 HMX attention path a la ggml (D-diag online softmax) | quant+dequant+accum wholesale | the endgame; ref_14 already verified fp16 micro on this device | new kernel family; PR-sized |
 
+## 5. Falsified on device, do not retry without new evidence
+
+**s_band in VTCM (2fa199c, reverted).** The premise was that s_band carries
+~32 MB of DDR traffic per prefill layer for a 256 KB buffer, so parking it
+in VTCM would delete that traffic. Measured A/B with everything else fixed
+(poll QoS and ION on in both), kv=1024 prefill:
+
+| stage | s_band in DDR | in VTCM | |
+|---|---|---|---|
+| dequant (writes it) | 2,357 | 2,353 | **no change** |
+| quant (reads it) | 1,166 | 1,155 | **no change** |
+| softmax (pool, 6 threads) | 806 | 1,050 | **+30%** |
+| gather+1/l | 877 | 1,002 | +14% |
+| dsp_total | 6,820 | **7,239** | **+6%** |
+
+Two things this settles. The producer and consumer of s_band did not care
+where it lived, so that traffic was never reaching DDR -- 256 KB reused
+within a band iteration stays in L2, and the "32 MB" was 32 MB of L2 hits.
+And the one stage that got worse is the one running on the worker pool:
+prefill softmax +30% at kv=1024 and +50% at kv=512, while DECODE softmax,
+which takes the inline single-threaded path, was 15 and 30 us in both runs
+-- unchanged to the microsecond. Six HVX threads contending for VTCM banks
+lose to six threads hitting L2.
+
+Anything that moves a pool-parallel working set into VTCM inherits this.
+A single-threaded stage might still win there; nothing measured says so yet.
+
 Not worth it, measured: pooling the tile dequant (1.5 us per tile against a
 multi-us fork/join -- the pool pays at the >= 100 us jobs it now runs),
 V-width narrowing for speed (still within noise), decode-side kernel work
