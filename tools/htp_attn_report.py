@@ -155,6 +155,25 @@ def header(ink, width):
             ""]
 
 
+def env(rec, ink, width):
+    q = get(rec, "ATTN_FIELD", "env", "rpc_poll_qos")
+    io = get(rec, "ATTN_FIELD", "env", "ion_buffers")
+    if q is None and io is None:
+        return []
+    qtxt = {2: ("poll mode", 2), 1: ("PM mode", 3), 0: ("REJECTED at runtime", 1),
+            -1: ("not in this SDK", 1)}.get(int(q) if q is not None else -1)
+    itxt = {1: ("ION-backed", 2), 0: ("alloc FAILED", 1),
+            -1: ("librpcmem.a not found at build", 1)}.get(
+        int(io) if io is not None else -1)
+    out = [rule(ink, "Transport controls this run actually had", width)]
+    out.append("  RPC latency QoS   " + ink(qtxt[0], qtxt[1], bold=True))
+    out.append("  q/out buffers     " + ink(itxt[0], itxt[1], bold=True))
+    if (q is not None and q <= 0) or (io is not None and io <= 0):
+        out.append(ink.dim("  transport numbers below were measured WITHOUT "
+                           "the disabled controls."))
+    return out + [""]
+
+
 def gates(rec, ink, width):
     checks = [
         ("S band vs host model, 384 cases", "ATTN_FIELD", "scores",
@@ -599,6 +618,7 @@ def main():
 
     out = []
     out += header(ink, cols)
+    out += env(rec, ink, cols)
     out += gates(rec, ink, cols)
     out += [""] + per_layer(rec, ink, cols)
     out += [""] + breakdown(rec, ink, cols, args.width)

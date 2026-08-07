@@ -1001,7 +1001,11 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
 # rpcmem ships as a static archive, not inside libcdsprpc.so. Both the
 # define and the archive are gated on the same wildcard so the code's ION
 # path only compiles in when it can actually link.
-NNTR_RPCMEM_A := $(wildcard $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/ship/android_aarch64/librpcmem.a)
+NNTR_RPCMEM_A := $(firstword \
+	 $(wildcard $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/ship/android_aarch64/librpcmem.a) \
+	 $(wildcard $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/ship/android*/librpcmem.a) \
+	 $(wildcard $(HEXAGON_SDK_ROOT)/libs/rpcmem/ship/android*/librpcmem.a) \
+	 $(wildcard $(HEXAGON_SDK_ROOT)/libs/common/rpcmem/ship/android*/librpcmem.a))
 ifneq ($(NNTR_RPCMEM_A),)
 LOCAL_CFLAGS += -DNNTR_RPCMEM_LINKED=1
 endif
