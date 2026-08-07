@@ -265,6 +265,14 @@ def per_layer(rec, ink, width):
             f"{'decode' if regime == 'dec' else 'prefill'}: "
             f"dsp {sd:.2f}%, transport {min(tr):,.0f}-{max(tr):,.0f} us"))
     out.append("")
+    ovh = [get(rec, "ATTN_STAGE", f"forward_{r}_kv{k}_I8I8",
+               "probe_overhead_us") for r, k in shapes(rec)]
+    ovh = [v for v in ovh if v is not None]
+    if ovh:
+        out.append(ink.dim(
+            f"  walls above are the UNINSTRUMENTED attn_forward; the probed "
+            f"run costs {min(ovh):,.0f}-{max(ovh):,.0f} us more"))
+        out.append("")
     tok = get(rec, "ATTN_FIELD", f"forward_dec_kv1024_I8I8",
               "us_per_token_all_layers")
     if tok:
