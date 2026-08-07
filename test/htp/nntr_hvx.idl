@@ -106,8 +106,8 @@ interface nntr_hvx : remote_handle64 {
    // combinations are four (K and V are independent, §0.2) and four copies of
    // every attention entry point is not a surface worth carrying.
    AEEResult attn_register(in uint32 nch, in uint32 gqa, in uint32 head_dim,
-                           in uint32 max_kv, in uint32 T, in uint32 w_k,
-                           in uint32 w_v, rout uint32 h);
+                           in uint32 max_kv, in uint32 T, in uint32 M_band,
+                           in uint32 w_k, in uint32 w_v, rout uint32 h);
 
    AEEResult attn_release(in uint32 h);
 
@@ -124,4 +124,17 @@ interface nntr_hvx : remote_handle64 {
    AEEResult attn_scores_debug(in uint32 h, in uint32 head, in uint32 M,
                                in sequence<float> q_band,
                                rout sequence<float> out_s);
+
+   // The whole layer in ONE round trip: Q.Kt, masked softmax and P.V, with S
+   // and P never crossing the host boundary. An unfused seam would pay the
+   // ~404 us fixed FastRPC cost three times per layer instead of once, which
+   // is the entire reason softmax runs on the DSP (MHA_HTP_PLAN.md §2).
+   //
+   // This replaces exactly compute_kcaches + softmax_triangle +
+   // compute_fp16vcache_transposed in mha_core's incremental path. RoPE and
+   // the Q/K/V and output projections stay where they are.
+   AEEResult attn_forward(in uint32 h, in uint32 kv_from, in uint32 n_query,
+                          in float scale, in uint32 is_causal,
+                          in uint32 window, in sequence<float> sink,
+                          in sequence<float> q, rout sequence<float> out);
 };
