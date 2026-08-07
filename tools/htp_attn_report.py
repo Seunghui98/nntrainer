@@ -36,13 +36,13 @@ MARKER = re.compile(
 )
 
 WIDTHS = ["I8I8", "I4I4", "I8I4", "I4I8"]
-# A width pair is (Kt width, V width) -- the two WEIGHT operands. Both
-# activations (Q for S, P for O) are always u8, so the pair names the two
-# micro-mms that actually run: S = Q(u8) x Kt(iN), O = P(u8) x V(iN). Label
-# them that way; "I4,I4" reads like u4 x i4 to anyone who has not read
-# MHA_HTP_U8_TASKS.md §0.2, and there is no u4 anything in this path.
-WIDTH_LABEL = {"I8I8": "u8i8/u8i8", "I4I4": "u8i4/u8i4",
-               "I8I4": "u8i8/u8i4", "I4I8": "u8i4/u8i8"}
+# ONE thing varies across these four runs: the width of the Kt cache and the
+# width of the V cache. The activation side is u8 in every one of them, so
+# spelling it out ("u8i4/u8i8") puts the invariant in the label and buries the
+# variable -- which is exactly what made the earlier "I4,I4" read as u4 x i4.
+# Write only what changes, and say the K/V ordering once, in the section title.
+WIDTH_LABEL = {"I8I8": "i8/i8", "I4I4": "i4/i4",
+               "I8I4": "i8/i4", "I4I8": "i4/i8"}
 STAGES = ["qk_us", "softmax_us", "pv_us", "accum_us", "gather_us"]
 STAGE_LABEL = {
     "qk_us": "Q.Kt",
@@ -149,8 +149,9 @@ def rule(ink, title, width):
 
 def header(ink, width):
     return [ink("  HTP attention -- device run", 6, bold=True),
-            ink.dim("  widths name the two micro-mms: "
-                    "S = Q(u8) x Kt(i4|i8), O = P(u8) x V(i4|i8)"),
+            ink.dim("  i8/i4 pairs are the Kt and V cache widths, in that "
+                    "order. Activations are u8 throughout,"),
+            ink.dim("  so i4 means a u8 x i4 matmul -- nothing here is u4."),
             ""]
 
 
@@ -165,7 +166,7 @@ def gates(rec, ink, width):
         ("  release then re-register", "ATTN_FIELD", "scores",
          "lifecycle_repeatable", lambda v: v == 1, "reproduces bitwise"),
         ("fused forward vs host model", "ATTN_FIELD", "forward",
-         "max_rel_err", lambda v: v <= 5e-3, "tolerance 5e-3 at (I8,I8)"),
+         "max_rel_err", lambda v: v <= 5e-3, "tolerance 5e-3 at Kt/V = i8/i8"),
         ("blocked softmax, p, 756 cases", "BLOCKED_FIELD", "softmax_blocked",
          "max_abs_err_p", lambda v: v <= 1e-6, "<= 1e-6"),
         ("  l summation-order margin", "BLOCKED_FIELD", "softmax_blocked",
@@ -184,7 +185,7 @@ def gates(rec, ink, width):
 
 
 def per_layer(rec, ink, width):
-    out = [rule(ink, "Cost per fused layer, us (wall, includes transport)",
+    out = [rule(ink, "Cost per fused layer, us (wall) -- Kt/V cache width",
                 width)]
     rows = []
     for regime, kv in shapes(rec):
@@ -249,7 +250,8 @@ def per_layer(rec, ink, width):
 
 
 def breakdown(rec, ink, width, wd="I8I8"):
-    out = [rule(ink, f"Where the DSP time goes ({WIDTH_LABEL[wd]})", width)]
+    out = [rule(ink, f"Where the DSP time goes (Kt/V = {WIDTH_LABEL[wd]})",
+                width)]
     legend = "  ".join(
         ink(STAGE_GLYPH[s] + " " + STAGE_LABEL[s], STAGE_COLOR[s])
         for s in STAGES)
@@ -351,7 +353,7 @@ def per_block(rec, ink, width, wd="I8I8"):
     about the kernel. Normalising each mm stage to one block does compare,
     and it is what makes the M-invariance below readable as a finding.
     """
-    out = [rule(ink, "What one block costs", width)]
+    out = [rule(ink, f"What one block costs (Kt/V = {WIDTH_LABEL[wd]})", width)]
     rows = []
     for regime, kv in shapes(rec):
         path = f"forward_{regime}_kv{kv}_{wd}"
