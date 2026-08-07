@@ -234,12 +234,32 @@ def breakdown(rec, ink, width, wd="I8I8"):
         transport = get(rec, "ATTN_STAGE", path, "transport_us")
         calls = get(rec, "ATTN_STAGE", path, "layer_run_calls")
 
+        parts_sum = sum(get(rec, "ATTN_STAGE", path, st) or 0.0 for st in STAGES)
         title = f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}"
         out.append(f"  {ink(title, None, bold=True)}"
                    f"   dsp {total:,.0f} us"
                    + (f" + transport {transport:,.0f} us" if transport else "")
                    + (f" = wall {wall:,.0f} us" if wall else "")
                    + (f"   [{calls:,.0f} layer_run calls]" if calls else ""))
+
+        # The stages partition the DSP-internal time, so they must add up to
+        # it. When they do not, the instrumentation is mispaired -- a stale t0
+        # spanning several stages inflates one of them -- and drawing a 180%
+        # bar would present that as a measurement.
+        if parts_sum > total * 1.05:
+            out.append("    " + ink(
+                f"BROKEN: stages sum to {parts_sum:,.0f} us against a "
+                f"{total:,.0f} us total ({100 * parts_sum / total:.0f}%).",
+                1, bold=True))
+            out.append("    " + ink.dim(
+                "The timers are mispaired, not the kernel slow. Not drawing "
+                "this."))
+            out.append("")
+            continue
+        if parts_sum < total * 0.8:
+            out.append("    " + ink(
+                f"note: stages account for {100 * parts_sum / total:.0f}% of "
+                f"the DSP total; the rest is unattributed.", 3))
 
         barw = max(20, width - 50)
         stacked = ""
