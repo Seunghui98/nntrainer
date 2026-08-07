@@ -215,14 +215,17 @@ def per_layer(rec, ink, width):
                   "dsp_total_us") or best
         pred = PREDICTED_US.get(regime)
         if pred:
+            gap = (f"{dsp / pred:,.1f}x over" if dsp > pred
+                   else f"UNDER it at {dsp:,.0f} us")
             out.append(ink.dim(
-                f"  {'':<20}plan §2 predicts {pred:,.0f} us"
-                f"  ->  {dsp / pred:,.0f}x over (dsp only)"))
+                f"  {'':<20}plan §2 predicts {pred:,.0f} us  ->  "
+                f"{gap} (dsp only)"))
         cpu = CPU_BAR_US.get(regime)
         if cpu:
+            vs = (f"{dsp / cpu:,.1f}x slower than CPU" if dsp > cpu
+                  else f"{cpu / dsp:,.1f}x FASTER than CPU")
             out.append(ink.dim(
-                f"  {'':<20}CPU bar {cpu:,.0f} us"
-                f"  ->  {dsp / cpu:,.1f}x slower than CPU (dsp only)"))
+                f"  {'':<20}CPU bar {cpu:,.0f} us  ->  {vs} (dsp only)"))
         out.append("")
 
     # dsp_total repeats to a fraction of a percent; the wall clock does not.
@@ -412,13 +415,26 @@ def per_block(rec, ink, width, wd="I8I8"):
         out.append(f"  {name}: all four weight widths lie within  "
                    + ink(f"Q.Kt {sq:.2f}%", 3) + "  " + ink(f"P.V {sp:.2f}%", 3))
 
-    out += ["", "  " + ink(
-        "Neither the row count nor the weight width moves the mm stages, while\n"
-        "  softmax -- the one stage with no row padding -- still scales with\n"
-        "  rows. (Its ratio fell from ~38x to ~8x when PHASE B moved onto the\n"
-        "  worker pool; 32x the rows over ~6 threads is about that.) So the mm\n"
-        "  cost is per-call overhead, not arithmetic, and narrowing the weights\n"
-        "  cannot help until that overhead is gone.", 3)]
+    # Derived, not asserted: this exact sentence has gone stale twice as the
+    # kernel changed underneath it.
+    qk_ratio = None
+    dec_rows = [r for r in rows if r[0] == "dec"]
+    pre_rows = [r for r in rows if r[0] == "pre" and dec_rows
+                and r[1] == dec_rows[0][1]]
+    if dec_rows and pre_rows and dec_rows[0][3]:
+        qk_ratio = pre_rows[0][3] / dec_rows[0][3]
+    if qk_ratio is not None and qk_ratio < 1.6:
+        verdict = (
+            "The mm stages do not move with the row count: their cost is\n"
+            "  per-call overhead, not arithmetic, and narrowing the weights\n"
+            "  cannot help until it is gone.")
+    else:
+        verdict = (
+            "The mm stages now scale with the row count -- per-call overhead\n"
+            "  no longer dominates them. What remains per call is in the\n"
+            "  probes above: quant, the vendor acc_read floor, and the f32\n"
+            "  accumulate.")
+    out += ["", "  " + ink(verdict, 3)]
     return out
 
 
@@ -504,7 +520,15 @@ def readout_split(rec, ink, width, wd="I8I8"):
     if dec:
         _r, _kv, vals, _q, _n = dec[0]
         rd, cp = vals["acc_read_us"] or 0.0, vals["acc_copy_us"] or 0.0
-        if rd + cp > 0:
+        stride = get(rec, "ATTN_STAGE", f"forward_dec_kv{_kv}_{wd}",
+                     "acc_stride")
+        if stride:
+            out += ["  " + ink(
+                f"In-place tile dequant is ACTIVE (derived row stride "
+                f"{stride:.0f}). The DDR round trip is\n  gone; acc_read is "
+                f"the vendor drain floor. The Tier 1 question is settled.",
+                2), ""]
+        elif rd + cp > 0:
             if rd >= 2.0 * cp:
                 verdict = ("acc_read carries it: the cost is the vendor HMX "
                            "drain. Dequant-from-VTCM\n  (1a) cannot shrink "
