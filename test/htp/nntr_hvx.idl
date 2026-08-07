@@ -71,6 +71,22 @@ interface nntr_hvx : remote_handle64 {
                            in sequence<float> act_f32,
                            rout sequence<float> out_cat);
 
+   // Same layer call, plus the DSP-internal microseconds:
+   // [dsp_total, quant, dequant, acc_read, acc_copy, drain, acc_stride].
+   // DEBUG ONLY and stripped before the PR, same as attn_forward_timed.
+   //
+   // A fully connected layer carries M*K floats in and M*N floats out -- 12 MB
+   // per call at Qwen3-0.6B's q_proj with M=1024 -- so the host-side wall clock
+   // is part FastRPC and part compute in a ratio nobody should have to guess
+   // at. This makes the split measured rather than assumed, which is what lets
+   // the result be compared against a per-op QNN number that has no host
+   // transfer in it at all.
+   AEEResult mm_u8i8_layer_timed(in uint32 M, in uint32 K,
+                                 in sequence<uint32> w_handles,
+                                 in sequence<float> act_f32,
+                                 rout sequence<float> out_cat,
+                                 rout sequence<uint32> stage_us);
+
    // For HVX softmax verification. exp is broken out as its own entry
    // because looking at softmax output alone hides exp's relative error --
    // sum normalization cancels it out. xLen must be a multiple of 32 --

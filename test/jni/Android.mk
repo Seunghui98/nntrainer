@@ -997,8 +997,32 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
 	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
 
-# rpcmem is resolved at runtime with dlsym (see RpcMemApi in the test):
-# the device's libcdsprpc.so exports it, the SDK's link stub does not.
+# rpcmem is resolved at runtime with dlsym (see htp_rpc_bench.h): the device's
+# libcdsprpc.so exports it, the SDK's link stub does not.
+LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
+	 -lcdsprpc -ldl
+
+LOCAL_STATIC_LIBRARIES := googletest_main
+
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_hvx_fc
+LOCAL_CFLAGS := -Igoogletest/include -pthread -fexceptions -O3 -DNDK_BUILD=1
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_hvx_fc.cpp \
+	 ../htp/generated/nntr_hvx_stub.c
+
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
+	 $(LOCAL_PATH)/../htp/generated \
+	 $(HEXAGON_SDK_ROOT)/incs \
+	 $(HEXAGON_SDK_ROOT)/incs/stddef \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
+
 LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
 	 -lcdsprpc -ldl
 
