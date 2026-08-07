@@ -67,6 +67,10 @@ test_target = [
   ['unittest_nntrainer_tensor', []],
   ['unittest_nntrainer_quantizer', []],
   ['unittest_hexkl_kv_quant', ['../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_quant.cpp']],
+  ['unittest_mha_htp_host_model', [
+    '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_quant.cpp',
+    'mha_htp_host_model.cpp'
+  ]],
   ['unittest_util_func', []],
   ['unittest_nntrainer_models', [
     'models' / 'models_test_utils.cpp', 'models' / 'models_golden_test.cpp'
