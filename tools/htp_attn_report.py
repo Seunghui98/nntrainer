@@ -228,6 +228,18 @@ def per_layer(rec, ink, width):
         spread = [f"{WIDTH_LABEL[w]} {vals[w]:,.0f}" for w in WIDTHS if vals[w]]
         out.append(ink.dim(f"  {'':<20}{'  '.join(spread)}"))
 
+        p8 = f"forward_{regime}_kv{kv}_I8I8"
+        lo = get(rec, "ATTN_FIELD", p8, "us_min")
+        hi = get(rec, "ATTN_FIELD", p8, "us_max")
+        first = get(rec, "ATTN_FIELD", p8, "us_first")
+        ini = get(rec, "ATTN_FIELD", p8, "init_us")
+        if lo is not None and hi is not None:
+            out.append(ink.dim(
+                f"  {'':<20}10 iters: avg(2-10) {best:,.0f}  min {lo:,.0f}  "
+                f"max {hi:,.0f}"
+                + (f"  run1 {first:,.0f}" if first is not None else "")
+                + (f"  |  init {ini:,.0f}" if ini is not None else "")))
+
         # Compare the KERNEL against the plan and against CPU, not the wall
         # clock. Wall = dsp + FastRPC transport, and transport is the one term
         # here that is not reproducible (see the note below), so basing a
@@ -302,11 +314,19 @@ def breakdown(rec, ink, width, wd="I8I8"):
 
         parts_sum = sum(get(rec, "ATTN_STAGE", path, st) or 0.0 for st in STAGES)
         title = f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}"
+        # dsp_total and transport both come from the INSTRUMENTED run, so
+        # they add up to that run's wall, not to us_per_layer -- which is now
+        # the uninstrumented production number. Show the equation that
+        # balances, and the production wall beside it.
+        probed = total + (transport or 0.0)
         out.append(f"  {ink(title, None, bold=True)}"
                    f"   dsp {total:,.0f} us"
                    + (f" + transport {transport:,.0f} us" if transport else "")
-                   + (f" = wall {wall:,.0f} us" if wall else "")
+                   + f" = probed {probed:,.0f} us"
                    + (f"   [{calls:,.0f} layer_run calls]" if calls else ""))
+        if wall:
+            out.append(ink.dim(f"    production wall (no instrumentation) "
+                               f"{wall:,.0f} us"))
 
         # The stages partition the DSP-internal time, so they must add up to
         # it. When they do not, the instrumentation is mispaired -- a stale t0
