@@ -99,4 +99,29 @@ interface nntr_hvx : remote_handle64 {
                                  in sequence<float> sink,
                                  rout sequence<float> band_out,
                                  rout sequence<float> l_out);
+
+   // --- Attention (MHA_HTP_U8_TASKS.md Task 6) --------------------------
+   //
+   // ONE register entry taking both widths, not one entry per width: the
+   // combinations are four (K and V are independent, §0.2) and four copies of
+   // every attention entry point is not a surface worth carrying.
+   AEEResult attn_register(in uint32 nch, in uint32 gqa, in uint32 head_dim,
+                           in uint32 max_kv, in uint32 T, in uint32 w_k,
+                           in uint32 w_v, rout uint32 h);
+
+   AEEResult attn_release(in uint32 h);
+
+   // Appends KV positions and re-registers only the blocks they land in.
+   AEEResult attn_kv_append(in uint32 h, in uint32 kv_from, in uint32 n_rows,
+                            in sequence<uint16> k_rows,
+                            in sequence<uint16> v_rows);
+
+   // DEBUG ONLY, and stripped before the PR: returns the raw S band so it can
+   // be compared against mha_htp_host_forward's PHASE A. Without a per-stage
+   // output a wrong O gives no signal about which stage produced it
+   // (MHA_HTP_PLAN.md §9.5). Mirrors how mm_u8i4_from_f32 returns
+   // intermediates as an accuracy harness.
+   AEEResult attn_scores_debug(in uint32 h, in uint32 head, in uint32 M,
+                               in sequence<float> q_band,
+                               rout sequence<float> out_s);
 };
