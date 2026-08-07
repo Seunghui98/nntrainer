@@ -444,6 +444,82 @@ def bar_svg(labels, values, width=760, row_h=26):
     return "".join(parts)
 
 
+PROBES = ["acc_read_us", "acc_copy_us", "dequant_us", "quant_us", "drain_us"]
+PROBE_LABEL = {"acc_read_us": "acc_read  (HMX acc -> VTCM, vendor)",
+               "acc_copy_us": "acc_copy  (VTCM -> DDR scratch, ours)",
+               "dequant_us": "dequant   (i32 -> f32, DDR -> DDR)",
+               "quant_us": "quant     (act f32 -> u8 AH in VTCM)",
+               "drain_us": "drain     (DMA waits)"}
+
+
+def readout_split(rec, ink, width, wd="I8I8"):
+    """Tier 0: which half of the 52 us readout is the 52 us.
+
+    The probes subdivide qk_us + pv_us -- same run, same clock -- so the
+    remainder after subtracting all five is the micro-mms plus loop overhead,
+    and the model predicts THAT at ~0.38 us per mm. acc_read vs acc_copy is
+    the decision this section exists for: acc_read is a vendor call whose
+    cost we can only avoid (fewer readouts, or no HMX for tiny M), acc_copy
+    and dequant are ours to delete (dequant straight from VTCM).
+    """
+    out = [rule(ink, f"Inside layer_run -- Tier 0 probes (Kt/V = "
+                     f"{WIDTH_LABEL[wd]})", width)]
+    c = ATTN_CFG
+    rows = []
+    for regime, kv in shapes(rec):
+        path = f"forward_{regime}_kv{kv}_{wd}"
+        vals = {pr: get(rec, "ATTN_STAGE", path, pr) for pr in PROBES}
+        if vals["acc_read_us"] is None:
+            continue
+        qkpv = ((get(rec, "ATTN_STAGE", path, "qk_us") or 0.0)
+                + (get(rec, "ATTN_STAGE", path, "pv_us") or 0.0))
+        _m, bands, nb, _blocks, _calls = geometry(regime, kv)
+        readouts = c["nch"] * bands * nb * (c["T"] // 32 + c["head_dim"] // 32)
+        rows.append((regime, kv, vals, qkpv, readouts))
+    if not rows:
+        return out + ["  (no probe fields -- needs a skel built after the "
+                      "Tier 0 commit)", ""]
+
+    for regime, kv, vals, qkpv, readouts in rows:
+        name = f"kv={kv} {'decode' if regime == 'dec' else 'prefill'}"
+        out.append(f"  {ink(name, None, bold=True)}   qk+pv {qkpv:,.0f} us, "
+                   f"{readouts} readouts")
+        barw = max(20, width - 62)
+        for pr in PROBES:
+            v = vals[pr] or 0.0
+            per = (f"  = {v / readouts:5.1f} us/readout"
+                   if pr in ("acc_read_us", "acc_copy_us") else "")
+            out.append(f"    {PROBE_LABEL[pr]:<38}"
+                       + bar(v, qkpv, barw, pad=True) + f" {v:>9,.0f} us{per}")
+        rest = qkpv - sum(vals[pr] or 0.0 for pr in PROBES)
+        out.append(ink.dim(f"    {'micro-mm + loop (remainder)':<38}"
+                           f"{'':{barw}} {rest:>9,.0f} us"))
+        out.append("")
+
+    # The verdict only needs one shape; decode kv=512 is the cleanest (M=2
+    # makes quant/dequant negligible, so the two acc legs stand alone).
+    dec = [r for r in rows if r[0] == "dec"]
+    if dec:
+        _r, _kv, vals, _q, _n = dec[0]
+        rd, cp = vals["acc_read_us"] or 0.0, vals["acc_copy_us"] or 0.0
+        if rd + cp > 0:
+            if rd >= 2.0 * cp:
+                verdict = ("acc_read carries it: the cost is the vendor HMX "
+                           "drain. Dequant-from-VTCM\n  (1a) cannot shrink "
+                           "this -- go to 1c (HVX GEMV for small M) and 2a "
+                           "(T=512,\n  fewer P.V readouts).")
+            elif cp >= 2.0 * rd:
+                verdict = ("acc_copy carries it: the cost is on the DDR side, "
+                           "which is our code.\n  1a (dequant straight from "
+                           "the VTCM result tile) proceeds as planned.")
+            else:
+                verdict = ("acc_read and acc_copy split it -- both routes "
+                           "needed: 1a for the copy\n  half, 1c/2a for the "
+                           "vendor half.")
+            out += ["  " + ink(verdict, 3), ""]
+    return out
+
+
 def write_html(rec, path, plain_sections):
     labels, values = [], []
     for regime, kv in shapes(rec):
@@ -500,6 +576,7 @@ def main():
     out += gates(rec, ink, cols)
     out += [""] + per_layer(rec, ink, cols)
     out += [""] + breakdown(rec, ink, cols, args.width)
+    out += readout_split(rec, ink, cols, args.width)
     out += per_block(rec, ink, cols, args.width)
     out += [""]
     print("\n".join(out))
@@ -509,6 +586,7 @@ def main():
         sections = "\n".join(
             gates(rec, plain, 100) + [""] + per_layer(rec, plain, 100) + [""]
             + breakdown(rec, plain, 100, args.width)
+            + readout_split(rec, plain, 100, args.width)
             + per_block(rec, plain, 100, args.width))
         write_html(rec, args.html, sections)
     return 0
