@@ -57,6 +57,16 @@ interface nntr_hvx : remote_handle64 {
    // at uint8 (HMX's activation port is always 8-bit) and widens only the
    // weight, so the accuracy risk relative to u8i4 is narrower -- this is
    // why it is worth having alongside u8i4 rather than instead of it.
+   // Same as mm_u8i4_layer, plus the DSP-side stage breakdown. Separate
+   // entry point rather than an optional out-param: the production path must
+   // not pay for the probes, and a caller that wants the breakdown is asking
+   // for a different contract, not a flag.
+   AEEResult mm_u8i4_layer_timed(in uint32 M, in uint32 K,
+                                 in sequence<uint32> w_handles,
+                                 in sequence<float> act_f32,
+                                 rout sequence<float> out_cat,
+                                 rout sequence<uint32> stage_us);
+
    AEEResult weight_register_u8i8(in uint32 K, in uint32 N,
                                   in sequence<int8> w_i8_rm,
                                   in sequence<float> w_scale,

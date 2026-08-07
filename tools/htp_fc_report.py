@@ -277,8 +277,8 @@ def headline(rec, ink, width, qnn):
         out.append("")
     vmax = max(per_mm(p, "FC_FIELD", "us_avg_1_10") or 0.0
                for p, _n, _m, _k, _N in rs)
-    barw = max(16, width - 60)
-    lw = 24
+    barw = max(16, width - 64)
+    lw = 28  # wide enough for "qproj_i4_x3 1024x2048 M=1024"
     for path, name, M, K, N in rs:
         nh = nh_of(rec, path)
         avg = per_mm(path, "FC_FIELD", "us_avg_1_10")
@@ -602,15 +602,28 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
             f"{q_compute:,.1f} us is {gbs:,.1f} GB/s, which is a DDR read: "
             f"read it as M=1 (decode)."))
     out.append("")
+    # Which width the two rows above actually used, and what the other one
+    # cost, because "1.8x faster than QNN" is only a like-for-like claim if
+    # the weight is the same width QNN quoted.
+    cmp_w = "i4" if (name and "_i4" in name) else (
+        "i8" if (name and "_i8" in name) else "?")
+    other = [r for r in rows(rec)
+             if r[2] == at_m and nh_of(rec, r[0]) == 1
+             and ("_i8" in r[1] if cmp_w == "i4" else "_i4" in r[1])]
     out.append(ink.dim(
-        "  And a width we do not match: QNN's weight is i4, ours i8, so we "
-        "read twice the"))
-    out.append(ink.dim(
-        "  weight bytes per call. At M=1 that bucket is a DDR read, so it is "
-        "most of the gap;"))
-    out.append(ink.dim(
-        "  QNN's own 1.0 MiB in 69.9 us is 15.0 GB/s against the ~41 GB/s "
-        "this DMA measures."))
+        f"  Width: the two rows above are u8{cmp_w}, the same width QNN "
+        f"quoted."))
+    if other:
+        od = get(rec, "FC_STAGE", other[0][0], "dsp_total_us")
+        if od and dsp:
+            out.append(ink.dim(
+                f"  The other width measured {od:,.0f} us dsp against "
+                f"{dsp:,.0f} here -- the gap is the weight DMA, which is the"))
+            out.append(ink.dim(
+                "  only term that scales with the width. QNN's own 1.0 MiB "
+                "in 69.9 us is 15.0 GB/s,"))
+            out.append(ink.dim(
+                "  against the ~41 GB/s this DMA measures."))
     out.append(ink.dim(
         "  Not comparable without saying so: QNN's graph is uint8 in AND "
         "uint8 out, so it"))
