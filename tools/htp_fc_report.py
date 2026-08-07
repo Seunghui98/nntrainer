@@ -466,7 +466,7 @@ def qnn_implied_m(prof, K, N):
 
 
 def qnn_compare(rec, ink, width, prof_name, at_m):
-    """QNN's stage breakdown beside ours, stage by stage.
+    """QNN's stage breakdown beside ours, one column per weight width.
 
     The point of this section is NOT the ratio. It is that both stacks split
     an FC op the same way -- a small multiply surrounded by a large amount of
@@ -474,115 +474,162 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
     so before ours are even in: their output-format bucket is 2.2x their
     compute bucket. A comparison that only quoted totals would hide that the
     two stacks are losing to the same thing.
+
+    Both widths get a column because only one of them is a like-for-like
+    comparison -- QNN's weight is i4 -- while the other is what this tree
+    shipped first, and reading either alone has misled once already.
     """
     prof = QNN_PROFILES.get(prof_name)
     if prof is None:
         return []
-    rs = [r for r in rows(rec) if r[2] == at_m]
-    if not rs:
-        rs = rows(rec)[:1]
     out = [rule(ink, f"Against QNN's own breakdown -- {prof['label']}", width)]
-    if not rs:
-        # Still worth printing: QNN's numbers alone answer "where does an FC
-        # op go" without any measurement of ours.
-        ours = None
-        path = name = None
-        K = N = None
-    else:
-        path, name, M, K, N = rs[0]
-        ours = path
-        if M != at_m:
-            out.append(ink.dim(f"  (no M={at_m} row in the log; comparing "
-                               f"against M={M})"))
-        at_m = M
 
-    def ours_us(fields):
-        if ours is None:
+    # One column per width, isolated (single handle) rows only: QNN quotes an
+    # isolated op, so that is the row the table proper compares. The group
+    # rows are picked up separately for the verdict below.
+    at = [r for r in rows(rec) if r[2] == at_m] or rows(rec)
+    if at and at[0][2] != at_m:
+        out.append(ink.dim(f"  (no M={at_m} row in the log; comparing against "
+                           f"M={at[0][2]})"))
+        at_m = at[0][2]
+
+    def pick(tag, grouped):
+        """The path for one width, isolated or grouped. tag None means an
+        untagged log from before the width sweep existed."""
+        for path, name, M, K, N in at:
+            if M != at_m:
+                continue
+            if (nh_of(rec, path) > 1) != grouped:
+                continue
+            if tag is None or ("_" + tag) in name:
+                return path, K, N
+        return None, None, None
+
+    tags = [t for t in ("i4", "i8") if pick(t, False)[0] is not None]
+    if not tags:
+        tags = [None]  # an older log with no width in the path name
+    cols = [(t, pick(t, False)[0]) for t in tags]
+    K = N = None
+    for t in tags:
+        _p, K, N = pick(t, False)
+        if K:
+            break
+
+    def stage(path, fields):
+        """One HexKL cell. __compute is dsp minus everything that only moves
+        data, i.e. the term QNN's FC bucket is."""
+        if path is None:
             return None
         if fields == ["__compute"]:
-            dsp = get(rec, "FC_STAGE", ours, "dsp_total_us")
+            # The test publishes this per probe run; prefer its median over
+            # deriving one from the median stage set, and see spread() for why
+            # the range matters at small M.
+            med = get(rec, "FC_STAGE", path, "compute_us_med")
+            if med is not None:
+                return med
+            dsp = get(rec, "FC_STAGE", path, "dsp_total_us")
             if not dsp:
                 return None
-            moved = sum(get(rec, "FC_STAGE", ours, f) or 0.0
+            moved = sum(get(rec, "FC_STAGE", path, f) or 0.0
                         for f in ("quant_us", "dequant_us", "acc_read_us",
                                   "acc_copy_us"))
             return dsp - moved
         if not fields:
             return None
-        vals = [get(rec, "FC_STAGE", ours, f) for f in fields]
+        vals = [get(rec, "FC_STAGE", path, f) for f in fields]
         if all(v is None for v in vals):
             return None
         return sum(v or 0.0 for v in vals)
 
-    SEP = "  " + "-" * 43 + "|" + "-" * 45
+    LW, QW, OW, CW = 30, 8, 26, 9
+    SEP = "  " + "-" * (LW + QW) + "|" + "-" * (OW + CW * len(cols) + 4)
 
-    def line(left, lv, right, rv):
-        lt = f"{lv:>9,.1f}" if lv is not None else f"{'-':>9}"
-        rt = f"{rv:>10,.0f}" if rv is not None else f"{'-':>10}"
-        return f"  {left:<32}{lt}  |  {right:<30}{rt}"
+    def line(qlabel, qv, olabel, vals):
+        lt = f"{qv:>{QW},.1f}" if qv is not None else f"{'-':>{QW}}"
+        cells = "".join(f"{v:>{CW},.0f}" if v is not None else f"{'-':>{CW}}"
+                        for v in vals)
+        return f"  {qlabel:<{LW}}{lt}  |  {olabel:<{OW}}{cells}"
 
-    out.append(f"  {'QNN':<32}{'us':>9}  |  {'HexKL':<30}{'us':>10}")
+    head_cells = "".join(f"{('u8' + t) if t else 'us':>{CW}}" for t, _p in cols)
+    out.append(f"  {'QNN':<{LW}}{'us':>{QW}}  |  {'HexKL':<{OW}}{head_cells}")
     out.append(SEP)
     for qlabel, qfield, ofields, olabel in QNN_MAP:
-        out.append(line(qlabel, prof[qfield], olabel, ours_us(ofields)))
+        out.append(line(qlabel, prof[qfield], olabel,
+                        [stage(p, ofields) for _t, p in cols]))
     out.append(SEP)
-    dsp = get(rec, "FC_STAGE", ours, "dsp_total_us") if ours else None
-    wall = get(rec, "FC_FIELD", ours, "us_avg_1_10") if ours else None
-    tr = get(rec, "FC_STAGE", ours, "transport_us") if ours else None
-    ini = get(rec, "FC_FIELD", ours, "init_us") if ours else None
     out.append(line("accelerate execute (device)", prof["accel_execute_us"],
-                    "dsp_total", dsp))
+                    "dsp_total",
+                    [get(rec, "FC_STAGE", p, "dsp_total_us") for _t, p in cols]))
     out.append(line("NetRun - accelerate execute",
                     prof["netrun_us"] - prof["accel_execute_us"],
-                    "transport (FastRPC)", tr))
-    out.append(line("NetRun (steady state)", prof["netrun_us"], "wall", wall))
+                    "transport (FastRPC)",
+                    [get(rec, "FC_STAGE", p, "transport_us") for _t, p in cols]))
+    out.append(line("NetRun (steady state)", prof["netrun_us"], "wall",
+                    [get(rec, "FC_FIELD", p, "us_avg_1_10") for _t, p in cols]))
     out.append(line("one-time init", prof["init_us"], "init (weight bake)",
-                    ini))
+                    [get(rec, "FC_FIELD", p, "init_us") for _t, p in cols]))
     out.append("")
 
     # The question this section was added to answer.
-    ours_compute = ours_us(["__compute"])
     q_compute = prof["fc_us"]
     out.append("  " + ink("COMPUTE ONLY -- no quant, no dequant, no layout:",
                           None, bold=True))
-    if ours_compute:
-        ratio = ours_compute / q_compute
-        verdict = (f"{ratio:,.1f}x QNN" if ratio >= 1.0
-                   else f"{1.0 / ratio:,.1f}x FASTER than QNN")
-        out.append(f"    QNN {q_compute:,.1f} us   HexKL {ours_compute:,.0f} "
-                   f"us   ->  " + ink(verdict, 3, bold=True)
-                   + ink.dim("   (one handle per call: the first weight's DMA "
-                             "is fully exposed)"))
-        # A group call amortises that DMA. QNN quotes an isolated op, so the
-        # row above is the honest like-for-like; but a real model issues q/k/v
-        # as a group, so the amortised number is what a model would see, and
-        # leaving it out would understate the shipped path.
-        grp = [r for r in rows(rec)
-               if r[2] == at_m and nh_of(rec, r[0]) > 1]
-        if grp:
-            gp = grp[0][0]
-            gnh = nh_of(rec, gp)
-            gdsp = get(rec, "FC_STAGE", gp, "dsp_total_us")
-            gmoved = sum(get(rec, "FC_STAGE", gp, f) or 0.0
-                         for f in ("quant_us", "dequant_us", "acc_read_us",
-                                   "acc_copy_us"))
-            if gdsp:
-                gc = (gdsp - gmoved) / gnh
-                gr = gc / q_compute
-                gv = (f"{gr:,.1f}x QNN" if gr >= 1.0
-                      else f"{1.0 / gr:,.1f}x FASTER than QNN")
-                out.append(f"    QNN {q_compute:,.1f} us   HexKL {gc:,.0f} "
-                           f"us   ->  " + ink(gv, 2, bold=True)
-                           + ink.dim(f"   ({gnh} handles per call, weight DMA "
-                                     f"amortised)"))
-    else:
+
+    def spread(path):
+        """lo-hi of the compute bucket over the probe runs, or None.
+
+        Published because the probes are 1 us resolution and one acc_read is
+        ~0.38 us: at M=1 the split is dominated by sampling, while dsp_total
+        is not. A wide range here means read the verdict as an order of
+        magnitude, not a ratio."""
+        lo = get(rec, "FC_STAGE", path, "compute_us_lo")
+        hi = get(rec, "FC_STAGE", path, "compute_us_hi")
+        return None if lo is None or hi is None else (lo, hi)
+
+    def verdict_row(label, grouped, colour):
+        """One verdict line across every width, isolated or amortised."""
+        parts = []
+        for t, _p in cols:
+            path, _K, _N = pick(t, grouped)
+            v = stage(path, ["__compute"])
+            if v is None:
+                continue
+            nh = nh_of(rec, path) if path else 1
+            v /= nh
+            r = v / q_compute
+            txt = (f"{r:,.1f}x QNN" if r >= 1.0
+                   else f"{1.0 / r:,.1f}x FASTER")
+            name = ("u8" + t) if t else "HexKL"
+            sp = spread(path)
+            rng = ""
+            if sp and (sp[1] - sp[0]) > 0.15 * max(1.0, sp[1]):
+                rng = f" [{sp[0] / nh:,.0f}-{sp[1] / nh:,.0f}]"
+            parts.append(f"{name} {v:,.0f}{rng} us (" + ink(txt, colour) + ")")
+        if not parts:
+            return None
+        return f"    {label:<22}QNN {q_compute:,.1f} us   " + "   ".join(parts)
+
+    v1 = verdict_row("isolated, 1 handle", False, 3)
+    if v1:
+        out.append(v1)
+    vg = verdict_row("amortised, group", True, 2)
+    if vg:
+        out.append(vg)
+    if not v1 and not vg:
         out.append(ink.dim(f"    QNN {q_compute:,.1f} us   HexKL not measured "
                            f"yet -- run unittest_hvx_fc"))
     q_share = q_compute / prof["accel_execute_us"] * 100.0
-    line2 = f"    of the device timeline that is multiply: QNN {q_share:.0f}%"
-    if ours_compute and dsp:
-        line2 += f", HexKL {ours_compute / dsp * 100:.0f}%"
-    out.append(ink.dim(line2))
+    out.append(ink.dim(
+        f"    of the device timeline that is multiply: QNN {q_share:.0f}%"))
+    out.append(ink.dim(
+        "    a bracket is the spread over the probe runs: 1 us timer "
+        "resolution against a"))
+    out.append(ink.dim(
+        "    0.38 us accumulator read, so at M=1 the split is sampling-bound "
+        "and the ratio is"))
+    out.append(ink.dim(
+        "    indicative only. dsp_total, one timestamp pair per call, is not "
+        "affected."))
     out.append(ink.dim(
         f"    QNN's own output-format bucket is "
         f"{prof['outfmt_us'] / q_compute:.1f}x its compute bucket -- the "
@@ -602,28 +649,15 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
             f"{q_compute:,.1f} us is {gbs:,.1f} GB/s, which is a DDR read: "
             f"read it as M=1 (decode)."))
     out.append("")
-    # Which width the two rows above actually used, and what the other one
-    # cost, because "1.8x faster than QNN" is only a like-for-like claim if
-    # the weight is the same width QNN quoted.
-    cmp_w = "i4" if (name and "_i4" in name) else (
-        "i8" if (name and "_i8" in name) else "?")
-    other = [r for r in rows(rec)
-             if r[2] == at_m and nh_of(rec, r[0]) == 1
-             and ("_i8" in r[1] if cmp_w == "i4" else "_i4" in r[1])]
-    out.append(ink.dim(
-        f"  Width: the two rows above are u8{cmp_w}, the same width QNN "
-        f"quoted."))
-    if other:
-        od = get(rec, "FC_STAGE", other[0][0], "dsp_total_us")
-        if od and dsp:
-            out.append(ink.dim(
-                f"  The other width measured {od:,.0f} us dsp against "
-                f"{dsp:,.0f} here -- the gap is the weight DMA, which is the"))
-            out.append(ink.dim(
-                "  only term that scales with the width. QNN's own 1.0 MiB "
-                "in 69.9 us is 15.0 GB/s,"))
-            out.append(ink.dim(
-                "  against the ~41 GB/s this DMA measures."))
+    if "i4" in tags:
+        out.append(ink.dim(
+            "  The u8i4 column is the like-for-like one: QNN's weight is i4. "
+            "u8i8 reads twice the"))
+        out.append(ink.dim(
+            "  weight bytes, and the weight DMA is the only term the width "
+            "moves -- which is why the"))
+        out.append(ink.dim(
+            "  two columns differ by roughly that DMA and by nothing else."))
     out.append(ink.dim(
         "  Not comparable without saying so: QNN's graph is uint8 in AND "
         "uint8 out, so it"))
@@ -631,8 +665,8 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
         "  never pays an f32 quant or dequant, and moves a quarter of the "
         "output bytes we do."))
     out.append(ink.dim(
-        "  The two rows above them are therefore an alignment of PURPOSE, "
-        "not of work."))
+        "  The rows above are therefore an alignment of PURPOSE, not of "
+        "work."))
     return out + [""]
 
 
