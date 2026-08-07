@@ -794,27 +794,31 @@ TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
  * between them because the number of kv positions a query row averages over is
  * what sets it.
  *
- * nch = 1 deliberately. Cache heads are independent, so nch only replicates
- * the same per-head arithmetic -- it multiplies the runtime and leaves the
- * measured error exactly where it is. gqa = 8, head_dim = 128, T = 256 is the
- * deployed per-head shape (§1.8 recommends T = 256).
+ * The shape is Qwen3-0.6B's attention config, read off
+ * Applications/CausalLM/api/model_config.cpp's register_qwen3_0_6b():
+ * num_key_value_heads 8, num_attention_heads 16 (so gqa = 2), head_dim 128,
+ * 28 layers, sliding_window UINT_MAX (i.e. none) and no sink. T = 256 is
+ * §1.8's recommendation, M_band = 64 satisfies M_band <= T.
  *
  * This test REPORTS, it does not gate: no threshold is asserted beyond the
  * shared tolerance table, for the same reason the device benches print rather
- * than assert. us_per_layer is absent on purpose -- it is a device number and
- * a host figure for it would be worse than none.
+ * than assert. There is deliberately no us_per_layer column -- timing is a
+ * device number, and a host figure for it would be worse than none.
  */
 TEST(MhaHtpHostModel, SequenceLengthReport) {
+  /* Qwen3-0.6B, per register_qwen3_0_6b(). */
+  const uint32_t kNch = 8, kGqa = 2, kHeadDim = 128, kLayers = 28;
+
   std::printf("\n"
-              "sequence-length report -- max|model - fp32| / max|fp32|, and "
-              "resident KV per head\n"
+              "Qwen3-0.6B attention: nch=%u gqa=%u head_dim=%u, %u layers\n"
+              "max relative error = max|model - fp32| / max|fp32| over out\n"
               "%-6s %-8s %-7s %10s %14s   %s\n",
-              "kv_len", "regime", "w_k,w_v", "max_rel_err", "resident_kv_kib",
-              "micro mm");
+              kNch, kGqa, kHeadDim, kLayers, "kv_len", "regime", "w_k,w_v",
+              "max_rel_err", "resident_kv_kib", "micro mm");
 
   for (uint32_t kv_len : {512u, 1024u}) {
     for (uint32_t n_query : {1u, 128u}) {
-      Cfg c{kv_len, n_query, 8, 1, 128, 256, 64, true, WIN_0, false};
+      Cfg c{kv_len, n_query, kGqa, kNch, kHeadDim, 256, 64, true, WIN_0, false};
       float err[4];
       measure_config(c, err);
 
@@ -829,12 +833,23 @@ TEST(MhaHtpHostModel, SequenceLengthReport) {
                                            : "u8i4 K / u8i8 V");
         std::printf("%-6u %-8s %-7s %10.2e %14.1f   %s\n", kv_len,
                     n_query == 1 ? "decode" : "prefill", pair, err[w],
-                    resident_kv_kib(c, kWidths[w][0], kWidths[w][1]), mm);
+                    resident_kv_kib(c, kWidths[w][0], kWidths[w][1]) * kNch,
+                    mm);
       }
     }
   }
-  std::printf("[ SEQLEN  ] kv_len 512 and 1024, decode and prefill, all four "
-              "width pairs\n");
+  /* resident_kv_kib above is the whole layer (all nch heads, K and V). The
+   * model carries kLayers of them, which is the number that decides whether
+   * the cache fits at all. */
+  const Cfg big{1024, 1, kGqa, kNch, kHeadDim, 256, 64, true, WIN_0, false};
+  std::printf(
+    "[ SEQLEN  ] kv_len 512 and 1024, decode and prefill, all four "
+    "width pairs\n"
+    "[ SEQLEN  ] whole model at kv_len 1024, %u layers: "
+    "u8i8 %.1f MiB, u8i4 %.1f MiB\n",
+    kLayers,
+    resident_kv_kib(big, HEXKL_W_I8, HEXKL_W_I8) * kNch * kLayers / 1024.0,
+    resident_kv_kib(big, HEXKL_W_I4, HEXKL_W_I4) * kNch * kLayers / 1024.0);
 }
 
 /** @brief The matrix proves its own coverage: a dropped shape has bitten this
