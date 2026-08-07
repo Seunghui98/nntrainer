@@ -90,9 +90,9 @@ rather than as a step of its own.
     for n_tile in 0 .. N/32 - 1              decode has M=2, so 62 of the 64
       acc_clear                              accumulator rows are padding.
       for k_tile in 0 .. K/32 - 1
-          HMX micro-mm ......................  0.38 us   64x32x32, ~172 GMAC/s
-      acc_read_int32      [HMX acc -> VTCM] +
-      copy_32b_to_submat  [VTCM -> DDR]     +  52 us     8 KB, ~157 MB/s
+          HMX micro-mm ......................  ~0.1 us   64x32x32 (probed)
+      acc_read_int32      [HMX acc -> VTCM]     0.3 us   vendor drain: free
+      copy_32b_to_submat  [VTCM -> DDR]        52.8 us   8 KB, ~155 MB/s <== HERE
   drain DMA
   hvx_dequant_i32_to_f32  [DDR -> DDR]
 
@@ -104,10 +104,16 @@ rather than as a step of its own.
                                 multiplies that filled it
 ```
 
-A two-parameter model -- 0.38 us per micro-mm, 52 us per accumulator readout --
-predicts all four attention shapes and the standalone `layer_x4` micro-mm
-benchmark within 7%. Accumulator readout is 96% of decode DSP time and 75-78%
-of prefill.
+A two-parameter model -- ~0.1 us per micro-mm, 52.8 us per accumulator
+readout -- predicts all four attention shapes and the standalone `layer_x4`
+micro-mm benchmark within 7%. The Tier 0 probes then split the readout: the
+vendor drain into VTCM costs 0.3-0.4 us, and `copy_32b_to_submatrix` to the
+DDR scratch carries the remaining 52.8 us, identical at every shape and both
+widths. The bottleneck is one strided 8 KB store loop into uncached DDR --
+96% of decode qk+pv, 84% of prefill -- and it is entirely deletable: the
+tile is already in VTCM when the copy starts, so dequant can read it there
+and write f32 straight to the output, no scratch at all. After that, prefill's
+next items are activation quant (5.7-10.1 ms, ~10%) and softmax (3.4 ms).
 
 ## 4. Where this differs from the intended design
 
