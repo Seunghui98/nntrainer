@@ -88,28 +88,61 @@ annotated at that shape, with QNN's corresponding stage beside each of ours.
 ```mermaid
 flowchart TB
   IN(["input: activation, f32"])
-  W["weight<br/>prepared ONCE at load time"]
 
   Q["1. quantize&nbsp;&nbsp;f32 to u8<br/><b>22 us</b>&nbsp;&nbsp;(QNN: 44.5)"]
-  MM["2. matmul on HMX<br/>weight load + multiply<br/><b>75 us</b>&nbsp;&nbsp;(QNN: 69.9)"]
 
-  subgraph OUTP["get the result out -- 59 us total&nbsp;&nbsp;(QNN: 224)"]
-    RD["3. read the accumulator<br/><b>26 us</b>"]
-    DQ["4. dequantize, in place<br/>i32 to f32<br/><b>33 us</b>"]
+  subgraph MMS["2. weight load + multiply -- <b>75 us</b>&nbsp;&nbsp;(QNN: 69.9)"]
+    direction LR
+    W["weight tiles<br/>prepared ONCE at load time,<br/>kept in DSP memory"]
+    DMA["DMA into fast on-chip<br/>memory (VTCM)<br/>2 buffers, ping-pong"]
+    MM["HMX multiply"]
+    W --> DMA
+    DMA -->|"the NEXT weight loads<br/>WHILE this one multiplies"| MM
+  end
+
+  subgraph OUTP["3 + 4. get the result out -- <b>59 us</b>&nbsp;&nbsp;(QNN: 224)"]
+    direction LR
+    RD["3. read the<br/>accumulator<br/><b>26 us</b>"]
+    DQ["4. dequantize<br/>in place, i32 to f32<br/><b>33 us</b>"]
+    RD --> DQ
   end
 
   OUT(["output: f32"])
 
-  IN --> Q --> MM
-  W -.-> MM
-  MM --> RD --> DQ --> OUT
+  IN --> Q --> MMS --> OUTP --> OUT
 
   classDef once fill:none,stroke-dasharray:3 3;
   class W once;
 ```
 
 Total on the DSP: **156 us, vs QNN 347 us** -- and the whole gap is in the
-"get the result out" half, not in the multiply. Why that half got cheap:
+"get the result out" half, not in the multiply.
+
+Two mechanisms carry that result. First, the **DMA pipelining** inside step
+2: with 2 VTCM buffers, weight i+1 streams in while weight i is multiplying,
+so in a call that carries several matmuls only the FIRST load is ever waited
+on:
+
+```mermaid
+gantt
+  title one call, 3 matmuls -- only load 1 costs time
+  dateFormat X
+  axisFormat %s
+  section weight DMA
+  load w1 (exposed, 35 us) : 0, 35
+  load w2 (hidden)         : 35, 70
+  load w3 (hidden)         : 75, 110
+  section HMX multiply
+  multiply w1              : 35, 75
+  multiply w2              : 75, 115
+  multiply w3              : 115, 155
+```
+
+Measured: one matmul alone pays 75 us; three in one call pay **55 us each**
+(the DMA wait per matmul falls 35 -> 12.3 us). That 55 is the number that
+beats QNN's 69.9.
+
+Second, the **deleted copy** in the "get the result out" half:
 
 ```mermaid
 flowchart LR
