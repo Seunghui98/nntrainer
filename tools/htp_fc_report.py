@@ -550,6 +550,20 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
                         for v in vals)
         return f"  {qlabel:<{LW}}{lt}  |  {olabel:<{OW}}{cells}"
 
+    # Which M our columns are, stated on the face of the table: the two sides
+    # are not the same row count, and a reader who assumes they are will read
+    # our quant and dequant as much worse than they are.
+    out.append(ink.dim(
+        f"  our columns are M={at_m}; QNN's row count is not stated and backs "
+        f"out to M=1 (see below)."))
+    if at_m > 1:
+        out.append(ink.dim(
+            f"  so our quant and dequant cover {at_m} rows against QNN's 1, "
+            f"while the accumulator is 64 rows"))
+        out.append(ink.dim(
+            "  wide either way -- the multiply and the weight DMA are the "
+            "row-count-independent terms."))
+    out.append("")
     head_cells = "".join(f"{('u8' + t) if t else 'us':>{CW}}" for t, _p in cols)
     out.append(f"  {'QNN':<{LW}}{'us':>{QW}}  |  {'HexKL':<{OW}}{head_cells}")
     out.append(SEP)
@@ -622,14 +636,27 @@ def qnn_compare(rec, ink, width, prof_name, at_m):
     out.append(ink.dim(
         f"    of the device timeline that is multiply: QNN {q_share:.0f}%"))
     out.append(ink.dim(
-        "    a bracket is the spread over the probe runs: 1 us timer "
+        "    a bracket is the spread over the probe runs. The probes are 1 us "
         "resolution against a"))
-    out.append(ink.dim(
-        "    0.38 us accumulator read, so at M=1 the split is sampling-bound "
-        "and the ratio is"))
-    out.append(ink.dim(
-        "    indicative only. dsp_total, one timestamp pair per call, is not "
-        "affected."))
+    if at_m == 1:
+        out.append(ink.dim(
+            "    0.38 us accumulator read, and at M=1 there are only 64 of "
+            "them per matmul, so this"))
+        out.append(ink.dim(
+            "    split is sampling-bound -- read the ratio as indicative. "
+            "dsp_total, one timestamp"))
+        out.append(ink.dim(
+            "    pair per call, is not affected. M=64 is the smallest row "
+            "count where the split holds."))
+    else:
+        out.append(ink.dim(
+            f"    0.38 us accumulator read, but at M={at_m} each probe covers "
+            f"enough calls for the split to"))
+        out.append(ink.dim(
+            "    hold: acc_read comes out the same at both widths here, as it "
+            "must, since the"))
+        out.append(ink.dim(
+            "    accumulator readout cannot depend on the weight width."))
     out.append(ink.dim(
         f"    QNN's own output-format bucket is "
         f"{prof['outfmt_us'] / q_compute:.1f}x its compute bucket -- the "
