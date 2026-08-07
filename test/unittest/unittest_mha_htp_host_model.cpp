@@ -38,6 +38,7 @@
 #include <fp16.h>
 #include <nntrainer_error.h>
 
+#include "htp_backend/hvx/hvx_softmax_blocked_f32.h"
 #include "mha_htp_host_model.h"
 
 namespace {
@@ -569,6 +570,67 @@ TEST(MhaHtpSoftmax, SegmentSplitIsInvisible) {
   }
   std::printf("[ SEGMENT ] bitwise-identical over %zu configurations "
               "(n_seg = 1, 2, 4)\n",
+              checked);
+}
+
+/**
+ * @brief The DEVICE kernel's block arithmetic, checked on the host.
+ *
+ * hvx_softmax_blocked_f32 turns a row's logical range [begin, end) into a
+ * contiguous local slice per block. That conversion is the off-by-one trap
+ * the whole block design hides -- window T-1, T and T+1 all land differently
+ * -- and it is pure integer code with no HVX in it, so it can be proven here
+ * instead of only through a device run.
+ *
+ * The check is exhaustive rather than sampled: for every (n_seg, T, begin,
+ * end) the slices must select EXACTLY the positions the reference's own
+ * `pos in [begin, end)` predicate selects, with no gaps and no overlap.
+ */
+TEST(MhaHtpSoftmax, DeviceBlockRangeMatchesReference) {
+  size_t checked = 0;
+  for (uint32_t T : {32u, 64u, 256u}) {
+    for (uint32_t n_seg : {1u, 2u, 5u}) {
+      const uint32_t kv = n_seg * T;
+      /* Every window class the matrix names, plus the boundaries either side
+       * of each block edge. */
+      std::vector<uint32_t> pts = {0u, 1u, T - 1u, T, T + 1u, kv - 1u, kv};
+      if (n_seg > 1) {
+        pts.push_back(2u * T - 1u);
+        pts.push_back(2u * T);
+        pts.push_back(2u * T + 1u);
+      }
+      for (uint32_t b : pts) {
+        for (uint32_t e : pts) {
+          if (b > kv || e > kv) {
+            continue;
+          }
+          std::vector<char> got(kv, 0);
+          for (uint32_t j = 0; j < n_seg; ++j) {
+            uint32_t lo = 0, hi = 0;
+            hvx_softmax_seg_range(j, T, b, e, &lo, &hi);
+            ASSERT_LE(lo, hi) << "T=" << T << " j=" << j;
+            ASSERT_LE(hi, T) << "T=" << T << " j=" << j;
+            for (uint32_t t = lo; t < hi; ++t) {
+              const uint32_t pos = j * T + t;
+              ASSERT_EQ(got[pos], 0)
+                << "position " << pos << " selected twice, T=" << T
+                << " b=" << b << " e=" << e;
+              got[pos] = 1;
+            }
+          }
+          for (uint32_t pos = 0; pos < kv; ++pos) {
+            const char want = (pos >= b && pos < e) ? 1 : 0;
+            ASSERT_EQ(got[pos], want)
+              << "T=" << T << " n_seg=" << n_seg << " b=" << b << " e=" << e
+              << " pos=" << pos;
+          }
+          ++checked;
+        }
+      }
+    }
+  }
+  std::printf("[ BLOCKRG ] device block arithmetic matches the reference over "
+              "%zu (n_seg, T, begin, end) combinations\n",
               checked);
 }
 

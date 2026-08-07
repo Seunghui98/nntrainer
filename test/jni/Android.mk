@@ -957,9 +957,14 @@ LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := \
 	 ../unittest/unittest_hvx_softmax.cpp \
+	 ../unittest/mha_htp_host_model.cpp \
+	 ../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_quant.c \
 	 ../htp/generated/nntr_hvx_stub.c
 
-LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
+	 $(LOCAL_PATH)/../../nntrainer/tensor \
+	 $(LOCAL_PATH)/../../nntrainer/tensor/htp_backend \
+	 $(LOCAL_PATH)/../htp/generated \
 	 $(HEXAGON_SDK_ROOT)/incs \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
 	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs

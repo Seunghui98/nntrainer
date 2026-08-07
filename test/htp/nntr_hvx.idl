@@ -81,4 +81,22 @@ interface nntr_hvx : remote_handle64 {
    AEEResult softmax_f32(in uint32 M, in uint32 K, in uint32 m_first,
                          in float scale, in sequence<float> x,
                          rout sequence<float> y);
+
+   // PHASE B of the fused attention loop, exposed on its own so it can be
+   // gated against the host model (test/unittest/mha_htp_host_model.cpp)
+   // before the attention endpoint that will call it in-process exists.
+   //
+   // The band arrives flattened as n_seg contiguous M x T blocks -- the same
+   // bytes hexkl_mm_u8iX_layer_run's out_cat holds, in the same order -- and
+   // comes back holding UNNORMALIZED exp values, plus l per row. Flattening
+   // it into one buffer is a marshalling convenience for this harness only;
+   // on device the blocks are already adjacent in VTCM and the kernel takes
+   // the pointer array directly. Pass an empty sink to mean "no sink".
+   AEEResult softmax_blocked_f32(in uint32 n_seg, in uint32 T, in uint32 M,
+                                 in float scale, in sequence<float> band_in,
+                                 in sequence<uint32> begin,
+                                 in sequence<uint32> end,
+                                 in sequence<float> sink,
+                                 rout sequence<float> band_out,
+                                 rout sequence<float> l_out);
 };
