@@ -80,57 +80,67 @@ The verdicts, in the order they matter:
   later call start from resident WH bytes. Untouched by any optimization
   pass to date.
 
-## 3. The flow as built, annotated with the run (i4, M=1024, x1)
+## 3. The flow as built, at the comparison point (i4, M=64, x1)
 
-    ARM                              CDSP                        us     %
-    ---                              ----                        --------
-    act f32 4 MB --FastRPC--> [1] quant: per-row minmax scan,   633   28%
-                                  f32->u8, pack to AH in VTCM
-                                  (HVX, 5-worker pool + caller)
-                                       |
-    weight: DSP-heap resident,         v
-    WH-baked ONCE at register --> [2] DMA ring: WH tiles         39    2%
-    (init 12.2 ms, not per call)      DDR->VTCM, double-         (wait only)
-                                      buffered, next weight
-                                      prefetched during [3]
-                                       |
-                                       v
-                              [3] HMX micro-mms 64x32x32        619   28%
-                                  32,768 mms, ~0.019 us each
-                                       |
-                                       v
-                              [4] acc_read: accumulator ->      380   17%
-                                  VTCM tile (vendor drain)
-                                       |
-                                       v
-                              [5] dequant IN PLACE on the       558   25%
-                                  VTCM tile: i32->f32, zp
-                                  correction, straight to
-                                  the DDR output
-                                       |
-    out f32 8 MB <--FastRPC----------- +          [dsp_total  2,229]
-                                                  [transport    963]
+M=64 is the baseline every QNN number is read against (§2), so the flow is
+annotated at that shape, with QNN's corresponding stage beside each of ours.
+
+    ARM                            CDSP                    us    %   QNN us
+    ---                            ----                    ---------------
+    act f32 256 KB --FastRPC--> [1] quant: per-row minmax   22  14%   44.5
+                                    scan, f32->u8, pack to       (input
+                                    AH in VTCM (HVX pool)         load)
+                                        |
+    weight: DSP-heap resident,          v
+    WH-baked ONCE at register ---> [2] DMA ring: WH tiles   35  22%   \
+    (init 12.2 ms, not per call)       DDR->VTCM, double-        [2]+[3]
+                                       buffered (wait only)       = 75
+                                        |                             |
+                                        v                            69.9
+                                [3] HMX micro-mms 64x32x32  40  26%  (FC =
+                                    2,048 mms, ~0.02 us each      weight+
+                                        |                         compute)
+                                        v
+                                [4] acc_read: accumulator   26  17%   \
+                                    -> VTCM tile (vendor)        [4]+[5]
+                                        |                         = 59
+                                        v                             |
+                                [5] dequant IN PLACE on     33  21%  151.1
+                                    the VTCM tile, i32->f32       (output
+                                    straight to DDR out           format)
+                                        |
+    out f32 512 KB <--FastRPC---------- +      [dsp_total   156      347 ]
+                                               [transport   326      166 ]
+                                               [wall        516      513 ]
 
 The stage this flow no longer has -- deleted by the in-place dequant
-(80db05e), and the reason the acc_copy row is 0 in every breakdown:
+(80db05e), and the reason acc_copy is 0 in every breakdown while QNN's
+"output writeback" costs 72.9 us:
 
     [4] acc tile --copy_32b_to_submatrix--> DDR staging --dequant--> DDR out
-        52.8 us per readout when it existed; at 1,024 readouts this shape
-        would pay ~54 ms. The breakdown line "in-place tile dequant ACTIVE
-        (row stride 32)" is the runtime ramp-probe confirming the layout
-        that makes skipping it safe.
+        52.8 us per readout when it existed. The breakdown line "in-place
+        tile dequant ACTIVE (row stride 32)" is the runtime ramp-probe
+        confirming the layout that makes skipping it safe.
 
-## 4. What each optimization did, with its evidence line
+At prefill the same flow shifts weight: M=1024 is quant 633 + drain 39 +
+mm 619 + acc_read 380 + dequant 558 = 2,229 us, i.e. quant+dequant grow to
+53% -- that shift is what makes §5's u8-endpoint conclusion, not this shape.
 
-| # | optimization | where | evidence in this run |
+## 4. What each optimization did, evidence at M=64 unless marked
+
+Ordered by impact. C attacks the weight DMA INSIDE the DSP; E attacks the
+FastRPC round trip on the host side -- both "batch several matmuls", but
+they delete different costs, so they are different rows.
+
+| # | optimization | flow stage | effect (measured) |
 |---|---|---|---|
-| 1 | weight residency + one-time WH bake | `weight_register_*` | init 11-12 ms once; zero bake in any per-call number |
-| 2 | in-place tile dequant (ramp-probed layout) | `hexkl_acc_tile.c`, `hvx_dequant_i32.c` | acc_copy = 0 us in all 24 breakdowns; "ACTIVE (row stride 32)" |
-| 3 | cross-matmul weight prefetch (DMA ring, double buffer) | `hexkl_mm_u8i*_dma.c` | drain 39 us at x1 stays ~40-120 us for a WHOLE x3/x6 group: per-mm 39 -> 6.7 us; compute-only 75 -> 55 us/mm |
-| 4 | pooled + vectorized activation quant | `hvx_quant_u8.c` | 633 us for a 4 MB scan+pack+AH scatter at M=1024 |
-| 5 | poll-QoS + ION payload buffers | `htp_rpc_bench.h` | transport at x6 M=1024 sustains 44.6 GB/s -- the pipe, not the driver, is now the transport bound |
-| 6 | group calls amortise FastRPC | caller | transport/mm 963 -> 364 -> 190 us (x1 -> x3 -> x6); decode wall/mm 325 -> 98 us |
-| 7 | session-scoped hw_init + HMX lock | `nntr_hvx_open` | absent from every per-call number |
+| A | in-place tile dequant, layout ramp-probed at runtime | [4]->[5] | acc_copy = 0 (QNN's writeback: 72.9); our [4]+[5] = 59 vs QNN's output stage 151.1, at 64x the rows |
+| B | weight residency + one-time WH bake | [2] | zero bake in any per-call number; paid once at init (12.2 ms) |
+| C | cross-matmul DMA prefetch (ring, double buffer) | [2] | compute 75 -> 55 us/mm (x1 -> x3); drain 35 -> 12.3 us/mm |
+| D | vectorized quant + HVX worker pool | [1] | 22 us for 64 rows vs QNN's 44.5 for its 1-row input stage |
+| E | group calls: one FastRPC for a q/k/v set | RPC | transport 326 -> 68 us/mm, wall 516 -> 200 us/mm (x6) |
+| F | poll-QoS + ION payload buffers | RPC | keeps the pipe the bound: 44.6 GB/s sustained at the 52 MB x6 M=1024 payload |
+| G | session-scoped hw_init + HMX lock + VTCM | -- | absent from every per-call number |
 
 What was measured and REJECTED stays in 32 §5 (s_band VTCM, pooled tile
 dequant, constant P params) -- nothing here re-opens those.
