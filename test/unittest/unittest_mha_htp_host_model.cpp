@@ -576,12 +576,94 @@ TEST(MhaHtpSoftmax, SegmentSplitIsInvisible) {
  * Whole-kernel model
  *=========================================================================*/
 
-TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
-  const hexkl_w_width widths[4][2] = {{HEXKL_W_I8, HEXKL_W_I8},
-                                      {HEXKL_W_I4, HEXKL_W_I4},
-                                      {HEXKL_W_I8, HEXKL_W_I4},
-                                      {HEXKL_W_I4, HEXKL_W_I8}};
+/** @brief The four (w_k, w_v) pairs, in the order every table below prints. */
+const hexkl_w_width kWidths[4][2] = {{HEXKL_W_I8, HEXKL_W_I8},
+                                     {HEXKL_W_I4, HEXKL_W_I4},
+                                     {HEXKL_W_I8, HEXKL_W_I4},
+                                     {HEXKL_W_I4, HEXKL_W_I8}};
 
+/**
+ * @brief Run one config through the fp32 ground truth and all four widths.
+ *
+ * @param[out] err  max relative error per width pair, in kWidths order.
+ */
+void measure_config(const Cfg &c, float err[4]) {
+  const uint32_t nHq = c.nch * c.gqa;
+  const uint32_t kv_from = c.kv_len - c.n_query;
+  const uint32_t window = resolve_window(c);
+  Rng rng(c.kv_len * 7717u + c.n_query * 131u + c.gqa * 17u + c.nch);
+
+  std::vector<float> q((size_t)c.n_query * nHq * c.head_dim);
+  for (float &x : q) {
+    x = rng.sym();
+  }
+  /* Realistic KV content, per MHA_HTP_PLAN.md §9.2's "test data must be
+   * realistic, a ramp both flatters and misleads".
+   *
+   * Positions in a real KV cache are NOT independent: K and V are projections
+   * of a residual stream carrying a large shared per-channel component. That
+   * structure is the whole reason per-channel KV quantization works, and why
+   * QNN's shipping deployment can hold this cache at int8 on the same
+   * silicon.
+   *
+   * i.i.d. zero-mean-per-position content is the opposite case and it is
+   * degenerate here, not merely pessimistic: the attention output becomes a
+   * near-total cancellation, so max|out| collapses to ~1/sqrt(kv_len) of the
+   * input scale while the averaged quantization noise falls at the same rate.
+   * The relative error then saturates around 7e-2 at i4 for EVERY shape,
+   * carrying no information about the kernel at all -- measured. */
+  std::vector<float> base_k((size_t)c.nch * c.head_dim);
+  std::vector<float> base_v(base_k.size());
+  for (size_t i = 0; i < base_k.size(); ++i) {
+    base_k[i] = rng.sym();
+    base_v[i] = rng.sym();
+  }
+  std::vector<uint16_t> k16((size_t)c.kv_len * c.nch * c.head_dim);
+  std::vector<uint16_t> v16(k16.size());
+  std::vector<float> k32(k16.size()), v32(k16.size());
+  for (uint32_t r = 0; r < c.kv_len; ++r) {
+    for (uint32_t h = 0; h < c.nch; ++h) {
+      for (uint32_t d = 0; d < c.head_dim; ++d) {
+        const size_t i = ((size_t)r * c.nch + h) * c.head_dim + d;
+        const size_t ch = (size_t)h * c.head_dim + d;
+        k16[i] = nntrainer::compute_fp32_to_fp16(base_k[ch] + 0.5f * rng.sym());
+        v16[i] = nntrainer::compute_fp32_to_fp16(base_v[ch] + 0.5f * rng.sym());
+        /* The fp32 truth reads the SAME values the quantizer sees, so the only
+         * error reported is quantization -- not fp16 rounding. */
+        k32[i] = nntrainer::compute_fp16_to_fp32(k16[i]);
+        v32[i] = nntrainer::compute_fp16_to_fp32(v16[i]);
+      }
+    }
+  }
+  std::vector<float> sink(nHq);
+  for (float &x : sink) {
+    x = rng.sym() * 2.0f;
+  }
+
+  std::vector<float> ref((size_t)c.n_query * nHq * c.head_dim, 0.0f);
+  ground_truth(c, kv_from, q, k32, v32, sink, ref);
+
+  for (int w = 0; w < 4; ++w) {
+    std::vector<float> got(ref.size(), 0.0f);
+    mha_htp_host_forward(
+      c.n_query, kv_from, c.nch, c.gqa, c.head_dim, c.T, c.M_band, c.is_causal,
+      window, c.sink ? sink.data() : nullptr, kWidths[w][0], kWidths[w][1],
+      q.data(), k16.data(), v16.data(), got.data());
+    err[w] = max_rel_err(got, ref);
+  }
+}
+
+/** @brief Resident KV bytes per cache head, both operands, at these widths.
+ *         The WH bake stores one value per weight element at w/8 bytes, so
+ *         this is what the DMA actually moves and what VTCM residency is
+ *         bounded by (MHA_HTP_U8_TASKS.md §0.3). */
+double resident_kv_kib(const Cfg &c, hexkl_w_width w_k, hexkl_w_width w_v) {
+  const uint32_t n_blocks = (c.kv_len + c.T - 1) / c.T;
+  const double vals = (double)n_blocks * c.T * c.head_dim; /* per operand */
+  return vals * ((int)w_k / 8.0 + (int)w_v / 8.0) / 1024.0;
+}
+
+TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
   std::printf("\n"
               "max relative error = max|model - fp32| / max|fp32| over out\n"
               "%-34s %8s %8s %8s %8s\n",
@@ -597,79 +679,13 @@ TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
   size_t n_ratio = 0;
 
   for (const Cfg &c : configs()) {
-    const uint32_t nHq = c.nch * c.gqa;
-    const uint32_t kv_from = c.kv_len - c.n_query;
-    const uint32_t window = resolve_window(c);
-    Rng rng(c.kv_len * 7717u + c.n_query * 131u + c.gqa * 17u + c.nch);
-
-    std::vector<float> q((size_t)c.n_query * nHq * c.head_dim);
-    for (float &x : q) {
-      x = rng.sym();
-    }
-    /* Realistic KV content, per MHA_HTP_PLAN.md §9.2's "test data must be
-     * realistic, a ramp both flatters and misleads".
-     *
-     * Positions in a real KV cache are NOT independent: K and V are
-     * projections of a residual stream carrying a large shared per-channel
-     * component. That structure is the whole reason per-channel KV
-     * quantization works, and why QNN's shipping deployment can hold this
-     * cache at int8 on the same silicon.
-     *
-     * i.i.d. zero-mean-per-position content is the opposite case and it is
-     * degenerate here, not merely pessimistic: the attention output becomes a
-     * near-total cancellation, so max|out| collapses to ~1/sqrt(kv_len) of the
-     * input scale while the averaged quantization noise falls at the same
-     * rate. The relative error then saturates around 7e-2 at i4 for EVERY
-     * shape, carrying no information about the kernel at all -- measured, and
-     * reported alongside this commit. */
-    std::vector<float> base_k((size_t)c.nch * c.head_dim);
-    std::vector<float> base_v(base_k.size());
-    for (size_t i = 0; i < base_k.size(); ++i) {
-      base_k[i] = rng.sym();
-      base_v[i] = rng.sym();
-    }
-    std::vector<uint16_t> k16((size_t)c.kv_len * c.nch * c.head_dim);
-    std::vector<uint16_t> v16(k16.size());
-    std::vector<float> k32(k16.size()), v32(k16.size());
-    for (uint32_t r = 0; r < c.kv_len; ++r) {
-      for (uint32_t h = 0; h < c.nch; ++h) {
-        for (uint32_t d = 0; d < c.head_dim; ++d) {
-          const size_t i = ((size_t)r * c.nch + h) * c.head_dim + d;
-          const size_t ch = (size_t)h * c.head_dim + d;
-          k16[i] =
-            nntrainer::compute_fp32_to_fp16(base_k[ch] + 0.5f * rng.sym());
-          v16[i] =
-            nntrainer::compute_fp32_to_fp16(base_v[ch] + 0.5f * rng.sym());
-          /* The fp32 truth reads the SAME values the quantizer sees, so the
-           * only error the table reports is quantization -- not fp16
-           * rounding. */
-          k32[i] = nntrainer::compute_fp16_to_fp32(k16[i]);
-          v32[i] = nntrainer::compute_fp16_to_fp32(v16[i]);
-        }
-      }
-    }
-    std::vector<float> sink(nHq);
-    for (float &x : sink) {
-      x = rng.sym() * 2.0f;
-    }
-
-    std::vector<float> ref((size_t)c.n_query * nHq * c.head_dim, 0.0f);
-    ground_truth(c, kv_from, q, k32, v32, sink, ref);
+    float err[4];
+    measure_config(c, err);
 
     char shape[96];
     std::snprintf(shape, sizeof(shape), "%u,%u,%u,%u,%u,%u,%u,%d,%u,%d",
                   c.kv_len, c.n_query, c.gqa, c.nch, c.head_dim, c.T, c.M_band,
-                  c.is_causal ? 1 : 0, window, c.sink ? 1 : 0);
-
-    float err[4];
-    for (int w = 0; w < 4; ++w) {
-      std::vector<float> got(ref.size(), 0.0f);
-      mha_htp_host_forward(
-        c.n_query, kv_from, c.nch, c.gqa, c.head_dim, c.T, c.M_band,
-        c.is_causal, window, c.sink ? sink.data() : nullptr, widths[w][0],
-        widths[w][1], q.data(), k16.data(), v16.data(), got.data());
-      err[w] = max_rel_err(got, ref);
-    }
+                  c.is_causal ? 1 : 0, resolve_window(c), c.sink ? 1 : 0);
 
     std::printf("%-34s %8.2e %8.2e %8.2e %8.2e\n", shape, err[0], err[1],
                 err[2], err[3]);
@@ -681,13 +697,13 @@ TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
     }
 
     for (int w = 0; w < 4; ++w) {
-      const float tol = tolerance_for(widths[w][0], widths[w][1]);
+      const float tol = tolerance_for(kWidths[w][0], kWidths[w][1]);
       if (!(err[w] <= tol)) {
         ++failures;
       }
       EXPECT_LE(err[w], tol)
-        << "shape " << shape << " (" << width_name(widths[w][0]) << ","
-        << width_name(widths[w][1]) << ") -- a finding to report, not a bound "
+        << "shape " << shape << " (" << width_name(kWidths[w][0]) << ","
+        << width_name(kWidths[w][1]) << ") -- a finding to report, not a bound "
         << "to raise";
     }
   }
@@ -700,6 +716,63 @@ TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
                 "            dropping K to i4 (I4,I8)/(I8,I8) = %5.1fx\n",
                 n_ratio, std::exp(log_v / n_ratio), std::exp(log_k / n_ratio));
   }
+}
+
+/**
+ * @brief The deployment numbers: both micro matmul paths at the two sequence
+ *        lengths that matter, kv_len = 512 and 1024.
+ *
+ * Reports every (w_k, w_v) pair, so hexkl_micro_hmx_mm_u8i4 and _u8i8 are both
+ * covered on both operands -- (I8,I8) is u8i8 throughout, (I4,I4) is u8i4
+ * throughout, and the two mixed rows are what decide whether the per-operand
+ * knob of MHA_HTP_U8_TASKS.md §0.2 is worth keeping.
+ *
+ * Decode (n_query = 1) and prefill (n_query = 128) both run: they are the two
+ * regimes §1.8 says behave differently, and the error does not transfer
+ * between them because the number of kv positions a query row averages over is
+ * what sets it.
+ *
+ * nch = 1 deliberately. Cache heads are independent, so nch only replicates
+ * the same per-head arithmetic -- it multiplies the runtime and leaves the
+ * measured error exactly where it is. gqa = 8, head_dim = 128, T = 256 is the
+ * deployed per-head shape (§1.8 recommends T = 256).
+ *
+ * This test REPORTS, it does not gate: no threshold is asserted beyond the
+ * shared tolerance table, for the same reason the device benches print rather
+ * than assert. us_per_layer is absent on purpose -- it is a device number and
+ * a host figure for it would be worse than none.
+ */
+TEST(MhaHtpHostModel, SequenceLengthReport) {
+  std::printf("\n"
+              "sequence-length report -- max|model - fp32| / max|fp32|, and "
+              "resident KV per head\n"
+              "%-6s %-8s %-7s %10s %14s   %s\n",
+              "kv_len", "regime", "w_k,w_v", "max_rel_err", "resident_kv_kib",
+              "micro mm");
+
+  for (uint32_t kv_len : {512u, 1024u}) {
+    for (uint32_t n_query : {1u, 128u}) {
+      Cfg c{kv_len, n_query, 8, 1, 128, 256, 64, true, WIN_0, false};
+      float err[4];
+      measure_config(c, err);
+
+      for (int w = 0; w < 4; ++w) {
+        char pair[8];
+        std::snprintf(pair, sizeof(pair), "%s,%s", width_name(kWidths[w][0]),
+                      width_name(kWidths[w][1]));
+        const char *mm =
+          (kWidths[w][0] == kWidths[w][1])
+            ? (kWidths[w][0] == HEXKL_W_I4 ? "u8i4 both" : "u8i8 both")
+            : (kWidths[w][0] == HEXKL_W_I8 ? "u8i8 K / u8i4 V"
+                                           : "u8i4 K / u8i8 V");
+        std::printf("%-6u %-8s %-7s %10.2e %14.1f   %s\n", kv_len,
+                    n_query == 1 ? "decode" : "prefill", pair, err[w],
+                    resident_kv_kib(c, kWidths[w][0], kWidths[w][1]), mm);
+      }
+    }
+  }
+  std::printf("[ SEQLEN  ] kv_len 512 and 1024, decode and prefill, all four "
+              "width pairs\n");
 }
 
 /** @brief The matrix proves its own coverage: a dropped shape has bitten this
