@@ -240,6 +240,16 @@ def per_layer(rec, ink, width):
                 + (f"  run1 {first:,.0f}" if first is not None else "")
                 + (f"  |  init {ini:,.0f}" if ini is not None else "")))
 
+        # us_per_layer is the FORWARD only. A running model also pays this
+        # step's KV append, every token, in every layer, before forward can
+        # run -- and init above is the whole-cache append, which is not that.
+        app = get(rec, "ATTN_FIELD", p8, "append_us")
+        step = get(rec, "ATTN_FIELD", p8, "step_us")
+        if app is not None and step is not None:
+            out.append(ink.dim(
+                f"  {'':<20}per step: kv_append {app:,.0f} + forward "
+                f"{best:,.0f} = {step:,.0f} us"))
+
         # Compare the KERNEL against the plan and against CPU, not the wall
         # clock. Wall = dsp + FastRPC transport, and transport is the one term
         # here that is not reproducible (see the note below), so basing a
@@ -290,6 +300,11 @@ def per_layer(rec, ink, width):
     if tok:
         out.append(f"  {ink('decode, 28 layers:', None, bold=True)} "
                    f"{tok / 1000.0:,.1f} ms of attention per token")
+        step = get(rec, "ATTN_FIELD", "forward_dec_kv1024_I8I8", "step_us")
+        if step:
+            out.append(ink.dim(
+                f"  {'':<20}with the per-token KV append: "
+                f"{step * 28 / 1000.0:,.1f} ms"))
     return out
 
 
