@@ -995,23 +995,12 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
 	 $(LOCAL_PATH)/../htp/generated \
 	 $(HEXAGON_SDK_ROOT)/incs \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
-	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs \
-	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/inc
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
 
-# rpcmem ships as a static archive, not inside libcdsprpc.so. Both the
-# define and the archive are gated on the same wildcard so the code's ION
-# path only compiles in when it can actually link.
-NNTR_RPCMEM_A := $(firstword \
-	 $(wildcard $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/ship/android_aarch64/librpcmem.a) \
-	 $(wildcard $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/ship/android*/librpcmem.a) \
-	 $(wildcard $(HEXAGON_SDK_ROOT)/libs/rpcmem/ship/android*/librpcmem.a) \
-	 $(wildcard $(HEXAGON_SDK_ROOT)/libs/common/rpcmem/ship/android*/librpcmem.a))
-ifneq ($(NNTR_RPCMEM_A),)
-LOCAL_CFLAGS += -DNNTR_RPCMEM_LINKED=1
-endif
-
+# rpcmem is resolved at runtime with dlsym (see RpcMemApi in the test):
+# the device's libcdsprpc.so exports it, the SDK's link stub does not.
 LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
-	 -lcdsprpc $(NNTR_RPCMEM_A)
+	 -lcdsprpc -ldl
 
 LOCAL_STATIC_LIBRARIES := googletest_main
 

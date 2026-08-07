@@ -160,10 +160,12 @@ def env(rec, ink, width):
     io = get(rec, "ATTN_FIELD", "env", "ion_buffers")
     if q is None and io is None:
         return []
-    qtxt = {2: ("poll mode", 2), 1: ("PM mode", 3), 0: ("REJECTED at runtime", 1),
-            -1: ("not in this SDK", 1)}.get(int(q) if q is not None else -1)
-    itxt = {1: ("ION-backed", 2), 0: ("alloc FAILED", 1),
-            -1: ("librpcmem.a not found at build", 1)}.get(
+    qtxt = {2: ("poll mode", 2), 1: ("PM mode", 3),
+            0: ("REJECTED at runtime", 1),
+            -1: ("compiled out (pre-26393ab build)", 1)}.get(
+        int(q) if q is not None else -1)
+    itxt = {1: ("ION-backed", 2), 0: ("unavailable (plain heap)", 1),
+            -1: ("compiled out (pre-26393ab build)", 1)}.get(
         int(io) if io is not None else -1)
     out = [rule(ink, "Transport controls this run actually had", width)]
     out.append("  RPC latency QoS   " + ink(qtxt[0], qtxt[1], bold=True))
