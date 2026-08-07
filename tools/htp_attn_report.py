@@ -414,9 +414,11 @@ def per_block(rec, ink, width, wd="I8I8"):
 
     out += ["", "  " + ink(
         "Neither the row count nor the weight width moves the mm stages, while\n"
-        "  softmax -- the one stage with no row padding -- tracks rows almost\n"
-        "  exactly. So the mm cost is per-call overhead, not arithmetic, and\n"
-        "  narrowing the weights cannot help until that overhead is gone.", 3)]
+        "  softmax -- the one stage with no row padding -- still scales with\n"
+        "  rows. (Its ratio fell from ~38x to ~8x when PHASE B moved onto the\n"
+        "  worker pool; 32x the rows over ~6 threads is about that.) So the mm\n"
+        "  cost is per-call overhead, not arithmetic, and narrowing the weights\n"
+        "  cannot help until that overhead is gone.", 3)]
     return out
 
 

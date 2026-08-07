@@ -113,7 +113,8 @@ widths. The bottleneck is one strided 8 KB store loop into uncached DDR --
 96% of decode qk+pv, 84% of prefill -- and it is entirely deletable: the
 tile is already in VTCM when the copy starts, so dequant can read it there
 and write f32 straight to the output, no scratch at all. After that, prefill's
-next items are activation quant (5.7-10.1 ms, ~10%) and softmax (3.4 ms).
+next item is activation quant (5.7-10.1 ms, ~10%) -- softmax was second until
+PHASE B moved onto the worker pool and dropped to 0.5-0.7 ms.
 
 ## 4. Where this differs from the intended design
 
