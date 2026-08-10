@@ -12,7 +12,11 @@
 #   3. unittest_hvx_mm_u8i4 passes on-device -- the original u8i4 accuracy
 #      harness (Shape1-4), the u8i4 layer-endpoint tests, and the u8i8
 #      layer-endpoint tests
-#   4. the reported layer_x4/harness speedup (u8i4) lands near doc13 §3a's
+#   4. unittest_hvx_softmax passes on-device -- the HVX vector exp and the
+#      row-wise f32 softmax. A separate binary because it shares no fixture
+#      with the matmul tests, and run from here because a device test the
+#      repo's own runner does not invoke is not a gate.
+#   5. the reported layer_x4/harness speedup (u8i4) lands near doc13 §3a's
 #      1.7-2x, and the u8i8-vs-u8i4 ratio is sane (both printed, not
 #      asserted -- see the ReportPerCallCost* tests' comments)
 #
@@ -110,16 +114,19 @@ fi
     APP_BUILD_SCRIPT=./Android.mk \
     NNTRAINER_ROOT="$REPO_ROOT" \
     HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
-    unittest_hvx_mm_u8i4
+    unittest_hvx_mm_u8i4 unittest_hvx_softmax
 )
 TEST_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4"
 [ -f "$TEST_BIN" ] || fail "test binary did not build: $TEST_BIN"
+SOFTMAX_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_softmax"
+[ -f "$SOFTMAX_BIN" ] || fail "test binary did not build: $SOFTMAX_BIN"
 
 # --- 4. push + run -----------------------------------------------------------
-log "4/4  Pushing to $DEVICE:$DEVICE_TMP and running"
+log "4/5  Pushing to $DEVICE:$DEVICE_TMP and running"
 adb shell "mkdir -p $DEVICE_TMP"
 adb push "$SKEL" "$DEVICE_TMP/" >/dev/null
 adb push "$TEST_BIN" "$DEVICE_TMP/" >/dev/null
+adb push "$SOFTMAX_BIN" "$DEVICE_TMP/" >/dev/null
 # c++_shared runtime the test binary links against (APP_STL in Application.mk)
 CXX_SHARED="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 [ -f "$CXX_SHARED" ] && adb push "$CXX_SHARED" "$DEVICE_TMP/" >/dev/null
@@ -130,9 +137,16 @@ adb shell "cd $DEVICE_TMP && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
   ./unittest_hvx_mm_u8i4" 2>&1 | tee /tmp/hvx_mm_u8i4_device_run.log
 
+log "5/5  HVX vector exp and row-wise f32 softmax"
+adb shell "cd $DEVICE_TMP && \
+  chmod +x unittest_hvx_softmax && \
+  LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
+  ./unittest_hvx_softmax" 2>&1 | tee /tmp/hvx_softmax_device_run.log
+
 echo
 log "Summary"
 grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD" /tmp/hvx_mm_u8i4_device_run.log || true
+grep -E "^\[  (PASSED|FAILED)" /tmp/hvx_softmax_device_run.log || true
 echo
 echo "Full log: /tmp/hvx_mm_u8i4_device_run.log"
 echo "Gate to clear before starting PR③: all PASSED, and the printed"
