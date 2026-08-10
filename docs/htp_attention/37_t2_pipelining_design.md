@@ -1,78 +1,78 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# 37 -- T2 design: pipelining attention so HMX and HVX both run
+# 37 -- T2 설계: HMX와 HVX가 둘 다 돌게 attention을 pipelining하기
 
-Design doc for doc 36's T2. Doc 36 gives it one paragraph and the number
-"~1.85x"; this says what that number is a number *of*, what the two candidate
-mechanisms are, why only one of them should be built first, and what has to be
-true before any of it is measurable.
+doc 36의 T2 설계 문서입니다. doc 36은 T2에 한 문단과 "~1.85x"라는 숫자만
+줬는데, 이 문서는 **그 숫자가 무엇에 대한 숫자인지**, 후보 메커니즘이 왜 둘인지,
+그중 **하나만 먼저 만들어야 하는 이유**, 그리고 측정이 가능해지려면 무엇이 먼저
+참이어야 하는지를 씁니다.
 
-Not implemented. Prerequisite: **T1 (integer requantize) lands first** -- doc
-35 §3, and §1 below re-derives why for attention specifically.
+아직 구현 안 됨. 선행 조건: **T1 (integer requantize)이 먼저 랜딩해야 합니다** --
+doc 35 §3, 그리고 attention에 한정한 재유도는 아래 §1.
 
-## 1. What "1.85x" refers to, and what attention alone actually gets
+## 1. "1.85x"가 가리키는 범위, 그리고 attention만 놓고 보면 얼마인가
 
-The number is **block-scope**, not SDPA-scope, and the two differ enough to
-change the plan.
+이 숫자는 **block scope**이지 SDPA scope이 아닙니다. 그리고 둘의 차이가 계획을
+바꿀 만큼 큽니다.
 
-Overlap can remove at most `min(HVX_total, HMX_total)` -- you cannot hide more
-of one lane than the other lane has room for. So:
+오버랩이 지울 수 있는 최대치는 `min(HVX_total, HMX_total)`입니다 -- 한쪽 lane을
+다른 lane이 가진 공간보다 더 많이 숨길 수는 없습니다. 따라서:
 
-| scope | | HVX | HMX | total | ceiling |
+| 범위 | | HVX | HMX | 합계 | 천장 |
 |---|---|---|---|---|---|
-| SDPA (kv=1024 prefill) | today | 5,206 | 1,614 | 6,820 | 1.31x |
-| SDPA | after T1 | 2,740 | 1,614 | 4,354 | **1.59x** |
-| whole block | after T1 | 3,731 | 4,396 | 8,127 | **1.85x** |
+| SDPA (kv=1024 prefill) | 현재 | 5,206 | 1,614 | 6,820 | 1.31x |
+| SDPA | T1 이후 | 2,740 | 1,614 | 4,354 | **1.59x** |
+| block 전체 | T1 이후 | 3,731 | 4,396 | 8,127 | **1.85x** |
 
-Derivation chain, so the confidence is visible: SDPA's lanes are **measured**
+신뢰도가 보이도록 유도 사슬을 밝힙니다. SDPA의 lane 분할은 **실측**입니다
 (doc 32 §5: dequant 2,357, quant 1,166, softmax 806, gather 877, dsp_total
-6,820). "After T1" assumes the integer requantize keeps ~30% of quant+dequant
--- an **assumption**, not a measurement. The block row adds q/k/v and o_proj
-**scaled from measured q_proj** (doc 35 §2). So 1.59x rests on one assumption,
-1.85x on two.
+6,820). "T1 이후"는 integer requantize가 quant+dequant의 ~30%를 남긴다는
+**가정**이지 측정이 아닙니다. block 행은 여기에 q/k/v와 o_proj를 **실측 q_proj에서
+스케일한 값**으로 더한 것입니다 (doc 35 §2). 즉 **1.59x는 가정 1개, 1.85x는 가정
+2개** 위에 서 있습니다.
 
-**The consequence for ordering:** T2 confined to SDPA is worth 1.59x; T2 across
-a fused block is worth 1.85x. That is why doc 36 §5 puts **T3 (fuse the block)
-before T2** -- the projections are where the HMX work is, and without them
-attention's HMX lane is only 37% of its own post-T1 total. Building T2 inside
-SDPA alone leaves HMX idle 63% of the time no matter how well it is scheduled.
+**순서에 대한 결론:** T2를 SDPA 안에만 넣으면 1.59x, fused block 전체에 걸치면
+1.85x입니다. 이것이 doc 36 §5가 **T3 (block 융합)을 T2보다 앞에** 놓은 구체적인
+이유입니다 -- HMX 일감은 projection 쪽에 있고, 그게 없으면 attention 자체의 HMX
+lane은 T1 이후 자기 총량의 37%밖에 안 됩니다. SDPA 안에서만 T2를 만들면 아무리
+스케줄링을 잘해도 **HMX가 63% 놉니다.**
 
-## 2. Two levels of pipelining -- and they share ONE budget
+## 2. pipelining 층위는 둘, 그런데 예산은 하나
 
-The fused loop today (`hexkl_attn_u8.c:397`):
+현재의 fused loop (`hexkl_attn_u8.c:397`):
 
 ```
 for n in kv_heads:
   for b0 in query rows, step M_band:
-    gather   q rows -> q_gather                      HVX-ish (scalar memcpy)
-    PHASE A  scores(): ALL n_blocks in one call      HMX + HVX interleaved
-    PHASE B  softmax over the whole band             HVX (worker pool)
-    PHASE C  per block: P.V                          HMX + HVX interleaved
+    gather   q 행들 -> q_gather                       HVX 계열 (scalar memcpy)
+    PHASE A  scores(): n_blocks 전부를 한 번의 call로   HMX + HVX 교대
+    PHASE B  band 전체에 대한 masked softmax           HVX (worker pool)
+    PHASE C  block마다: P.V                            HMX + HVX 교대
 ```
 
-PHASE A and C are already mixed lanes: inside `layer_run` the per-tile
-sequence is `mm -> acc_read -> dequant`, i.e. HMX then HVX, **sequentially**.
-So there are two distinct places to pipeline:
+PHASE A와 C는 이미 lane이 섞여 있습니다. `layer_run` 내부의 tile당 순서가
+`mm -> acc_read -> dequant`, 즉 HMX 다음 HVX인데 **순차적으로** 돕니다. 그래서
+pipelining할 자리가 두 군데입니다:
 
-| level | what overlaps what | HVX work it hides | scope |
+| 층위 | 무엇과 무엇이 겹치나 | 숨기는 HVX 작업 | 적용 범위 |
 |---|---|---|---|
-| **tile** | `mm(i+1)` ‖ `dequant(i)`, inside `layer_run` | dequant | A and C; **also FC** |
-| **band** | band `k+1`'s PHASE A ‖ band `k`'s PHASE B | softmax, gather | attention only |
+| **tile** | `mm(i+1)` ‖ `dequant(i)`, `layer_run` 내부 | dequant | A와 C, **그리고 FC도** |
+| **band** | band `k+1`의 PHASE A ‖ band `k`의 PHASE B | softmax, gather | attention 전용 |
 
-They hide **different** HVX work but draw on the **same** HMX lane. The bound
-is `min(HVX, HMX)` for the whole call regardless of mechanism, so:
+둘은 **다른** HVX 작업을 숨기지만 **같은** HMX lane에서 예산을 끌어옵니다.
+메커니즘이 무엇이든 한 call의 상한은 `min(HVX, HMX)`이므로:
 
-> **These do not multiply. Planning "1.6x from tiles times 1.3x from bands" is
-> wrong** -- together they still cannot exceed the §1 ceiling.
+> **이 둘은 곱해지지 않습니다. "tile에서 1.6x 곱하기 band에서 1.3x"로 계획하면
+> 틀립니다** -- 둘을 합쳐도 §1의 천장을 넘을 수 없습니다.
 
-After T1, SDPA's hideable HVX is ~1,057 of dequant+quant against 1,614 of HMX.
-**Tile-level pipelining alone can absorb all of it.** Band-level only becomes
-useful if tile-level leaves HMX idle -- i.e. once softmax (806) and gather
-(877) are the residual, which is exactly the post-T2 state §6 describes.
+T1 이후 SDPA에서 숨길 수 있는 HVX는 dequant+quant 약 1,057이고 HMX는 1,614입니다.
+**tile 층위만으로 이미 전부 흡수됩니다.** band 층위는 tile 층위가 HMX를 놀릴 때에만
+쓸모가 생기고, 그건 softmax(806)와 gather(877)만 남은 상태 -- 정확히 §6이 말하는
+post-T2 상태입니다.
 
-**Therefore: build tile-level only.** It is doc 35 §4-§5's design unchanged, it
-needs no cross-band state, and it pays in FC too. Band-level is a contingency
-with a measurement gate in front of it (§5 step 4), not a plan.
+**따라서: tile 층위만 만듭니다.** doc 35 §4-§5의 설계 그대로이고, band 간 상태가
+필요 없고, FC에서도 값을 냅니다. band 층위는 계획이 아니라 **측정 게이트 뒤에 둔
+예비책**입니다 (§5 step 4).
 
 ```mermaid
 gantt
@@ -93,94 +93,91 @@ gantt
   PHASE C  dequant hidden: 66, 78
 ```
 
-Shape only -- the bars are proportions from §1's lane split, not measurements.
-Note what the figure makes obvious: **softmax stays exposed.** That is the
-band-level gap, and §6 is about whether it is worth closing.
+막대는 §1의 lane 분할에서 뽑은 **비율**이지 측정값이 아닙니다. 이 그림이 분명하게
+보여주는 것: **softmax는 여전히 노출된 채 남습니다.** 그게 band 층위가 노리는
+빈틈이고, 그걸 메울 가치가 있는지는 §6에서 다룹니다.
 
-## 3. What has to change
+## 3. 무엇을 고쳐야 하나
 
-Three code changes, all previously scoped in doc 35 §4-§5:
+세 가지 코드 변경이고, 전부 doc 35 §4-§5에서 이미 범위가 잡힌 것들입니다:
 
-1. **`hvx_worker_pool_submit()` / `_wait()`.** The pool is fork-join only;
-   `hvx_worker_pool_run()` blocks and runs unit 0 on the caller. Pipelining
-   needs every unit on a worker, because the caller is busy issuing HMX. The
-   parked-thread machinery and the `(n_threads, i, ctx)` contract already
-   exist -- this is an addition, not a rewrite.
-2. **A second accumulator result buffer in VTCM**, alternating per chunk.
-   `hexkl_acc_layout_get()` ramp-probes the permutation at ONE `result_off`;
-   with two it must probe both or assert they agree, and fail loudly rather
-   than silently emit wrong bytes.
-3. **Chunked, not per-tile.** Dequant is ~0.55 us per tile against a
-   multi-microsecond fork/join -- doc 32 already measured that and it is what
-   killed pooling the tile dequant the first time. Pipeline a chunk of 16
-   N-tiles: ~15.6 us HMX against ~8.7 us HVX per chunk, 256 KB of
-   double-buffered VTCM staging. Chunk size is one constant, swept on device.
+1. **`hvx_worker_pool_submit()` / `_wait()`.** 현재 pool은 fork-join 전용입니다 --
+   `hvx_worker_pool_run()`은 블로킹이고 unit 0을 caller 스레드에서 돌립니다.
+   pipelining하려면 모든 unit이 worker에 있어야 합니다. caller는 HMX를 발행하느라
+   바쁘니까요. parked 스레드 기계와 `(n_threads, i, ctx)` 계약은 이미 있으므로
+   **재작성이 아니라 추가**입니다.
+2. **VTCM에 accumulator result buffer를 하나 더** 두고 chunk마다 번갈아 씁니다.
+   `hexkl_acc_layout_get()`은 `result_off` **한 곳에서만** ramp-probe로 permutation을
+   알아냅니다. 두 개가 되면 양쪽 다 probe하거나 둘이 일치함을 assert해야 하고,
+   조용히 틀린 바이트를 내는 대신 **큰 소리로 실패해야** 합니다.
+3. **tile 단위가 아니라 chunk 단위로.** dequant는 tile당 ~0.55 us인데 fork/join은
+   수 us입니다 -- doc 32가 이미 측정했고, 그게 처음에 tile dequant pooling을 기각한
+   이유입니다. **N-tile 16개 chunk** 단위로: chunk당 HMX ~15.6 us 대 HVX ~8.7 us,
+   double-buffered VTCM staging 256 KB. chunk 크기는 상수 하나이고 기기에서 sweep합니다.
 
-**Topology: HMX stays on the caller thread**, dequant goes async to the pool
-(doc 35 §4a). ggml locks HMX *inside* its own queue thread
-(`hmx-queue.c:46-49`), which is only necessary if the lock is thread-affine;
-ours is taken once in `nntr_hvx_open` and used from later FastRPC calls, and
-we do not know which of those two facts explains it. Inverting the topology
-means never having to find out.
+**토폴로지: HMX는 caller 스레드에 그대로 두고**, dequant만 pool로 async 보냅니다
+(doc 35 §4a). ggml은 HMX lock을 자기 queue 스레드 **안에서** 겁니다
+(`hmx-queue.c:46-49`). 그건 lock이 thread-affine일 때만 필요한 일인데, 우리는
+`nntr_hvx_open`에서 한 번 걸고 이후 다른 FastRPC call에서 씁니다. **둘 중 어느
+사실이 그걸 설명하는지 모릅니다.** 토폴로지를 뒤집으면 끝까지 알 필요가 없습니다.
 
-## 4. Instrumentation has to change BEFORE the code
+## 4. 계측이 코드보다 먼저 바뀌어야 합니다
 
-Once stages overlap, `quant_us + dequant_us + acc_read_us + ...` exceeds
-`dsp_total_us`, and the reports' "remainder = micro-mm" arithmetic breaks
-**silently** -- it will print a plausible negative-ish number rather than
-fail. Both `tools/htp_fc_report.py` and `tools/htp_attn_report.py` derive the
-micro-mm term that way today.
+stage가 겹치기 시작하면 `quant_us + dequant_us + acc_read_us + ...`가
+`dsp_total_us`를 넘어가고, 리포트의 "remainder = micro-mm" 산술이 **조용히**
+깨집니다 -- 실패하는 게 아니라 그럴듯한 숫자를 찍습니다. `tools/htp_fc_report.py`와
+`tools/htp_attn_report.py` 둘 다 지금 그 방식으로 micro-mm 항을 구합니다.
 
-So step 0 of the build is: **per-lane totals** (`hmx_busy_us`, `hvx_busy_us`)
-plus a `pipelined` flag in the stage vector, and reports that show lane
-occupancy instead of a stacked breakdown when the flag is set. Without it,
-a working pipeline and a broken one produce the same-looking report.
+그래서 빌드의 step 0은 이것입니다: **lane별 합계** (`hmx_busy_us`, `hvx_busy_us`)와
+stage 벡터의 `pipelined` 플래그, 그리고 플래그가 켜지면 stacked breakdown 대신
+**lane 점유율**을 보여주는 리포트. 이게 없으면 **잘 도는 pipeline과 망가진 pipeline이
+똑같은 리포트를 냅니다.**
 
-This is also T5 (doc 36) arriving early, and it is worth doing for its own
-sake: it gives us the parallel-compression figure that is currently the one
-QNN number with no counterpart on our side (1.0x vs their 4.1x).
+이건 T5 (doc 36)를 앞당기는 것이기도 하고, 그 자체로 값어치가 있습니다 -- 현재
+QNN 수치 중 우리 쪽에 대응물이 없는 유일한 항목인 **parallel compression** (그쪽
+4.1x 대 우리 1.0x)이 생깁니다.
 
-## 5. Staging, with a gate on each step
+## 5. 단계별 진행과 게이트
 
-| step | work | gate before continuing |
+| step | 작업 | 다음으로 넘어가기 전 게이트 |
 |---|---|---|
-| 0 | per-lane busy totals + `pipelined` flag; reports show occupancy | with overlap OFF, lanes sum to `dsp_total` |
-| 1 | `hvx_worker_pool_submit/wait`; unit 0 moves off the caller | every existing bitwise gate still PASSes, timings unchanged |
-| 2 | second result buffer + layout probe asserts both offsets | bitwise gates PASS; `acc_stride` reported for both buffers |
-| 3 | chunked tile pipelining in `layer_run` (FC and attention share it) | bitwise PASS; `dsp_total` drops; sweep chunk size; **lanes overlap in the occupancy view** |
-| 4 | ONLY if step 3 leaves HMX idle and softmax exposed: band-level | measured HMX idle > 25% after step 3 |
+| 0 | lane별 busy 합계 + `pipelined` 플래그, 리포트에 점유율 표시 | 오버랩 OFF 상태에서 lane 합이 `dsp_total`과 일치 |
+| 1 | `hvx_worker_pool_submit/wait`; unit 0을 caller에서 분리 | 기존 bitwise gate 전부 PASS, 타이밍 변화 없음 |
+| 2 | result buffer 2개 + layout probe가 양쪽 offset 일치 assert | bitwise PASS; 두 buffer 모두 `acc_stride` 보고됨 |
+| 3 | `layer_run`의 chunk 단위 tile pipelining (FC/attention 공유) | bitwise PASS; `dsp_total` 감소; chunk 크기 sweep; **점유율 뷰에서 lane이 실제로 겹침** |
+| 4 | step 3이 HMX를 놀리고 softmax가 노출된 경우에만: band 층위 | step 3 이후 측정된 HMX idle > 25% |
 
-Step 1 is separable and worth landing alone: it changes no arithmetic, so any
-timing change it causes is pure scheduling noise and tells us the pool's
-async path is sound before correctness and performance are both in flight.
+step 1은 따로 랜딩할 가치가 있습니다. 산술을 전혀 안 바꾸므로 여기서 생기는
+타이밍 변화는 순수한 스케줄링 노이즈이고, **정확도와 성능이 동시에 흔들리기 전에**
+pool의 async 경로가 멀쩡한지만 확인됩니다.
 
-## 6. What T2 cannot fix, and what that implies
+## 6. T2가 못 고치는 것, 그리고 그 함의
 
-After T1 and a perfect T2, SDPA's residual is **softmax 806 + gather 877 =
-1,683 us** with HMX exhausted. Two observations follow, both for a later doc
-rather than this one:
+T1과 완벽한 T2 이후 SDPA에 남는 것은 **softmax 806 + gather 877 = 1,683 us**이고
+HMX는 이미 소진된 상태입니다. 여기서 두 가지가 따라오는데, 이 문서가 아니라 다음
+문서에서 다룰 일입니다:
 
-- **`gather` at 877 us is a scalar `memcpy` loop** (`hexkl_attn_u8.c:402-409`)
-  copying q rows into `q_gather` one head at a time. It is 20% of post-T1 SDPA
-  and nothing in T1-T4 touches it. It should be measured in cycles/element
-  (T5) before anyone assumes it is cheap -- this is precisely the shape of
-  QNN's own `mul_op` blind spot (ref_16 §9.1).
-- **Softmax at 806 us is already pool-parallel** and doc 32 §5 measured it
-  getting *worse* in VTCM. The remaining lever there is algorithmic (online
-  softmax, ref_16 §9.3), not scheduling.
+- **`gather` 877 us는 scalar `memcpy` 루프입니다** (`hexkl_attn_u8.c:402-409`).
+  q 행을 head 하나씩 `q_gather`로 복사합니다. post-T1 SDPA의 **20%**인데 T1~T4
+  어느 것도 이걸 건드리지 않습니다. 싸다고 가정하기 전에 cycles/element(T5)로
+  먼저 재야 합니다 -- **QNN 자신의 `mul_op` 맹점과 정확히 같은 모양**입니다
+  (ref_16 §9.1).
+- **softmax 806 us는 이미 pool 병렬**이고, doc 32 §5는 이걸 VTCM에 올렸을 때
+  **더 나빠지는 것**을 측정했습니다. 여기 남은 레버는 스케줄링이 아니라 알고리즘
+  (online softmax, ref_16 §9.3)입니다.
 
-## 7. Record when done
+## 7. 끝나면 기록할 것
 
-Whatever happens, write the outcome into doc 32 §5's "falsified on device"
-section in the same form: the A/B table with everything else fixed, and the
-stage that moved. Two specific predictions to score:
+결과가 어떻든 doc 32 §5의 "falsified on device" 절에 같은 형식으로 씁니다:
+다른 모든 조건을 고정한 A/B 표와, 실제로 움직인 stage. 점수 매길 예측 두 개를
+미리 박아둡니다:
 
-1. tile pipelining reaches within 20% of the §1 ceiling for its scope, **or**
-   VTCM bank contention eats it -- doc 32 §5 measured a pool-parallel stage
-   losing 30% to exactly that, and this puts HMX writing a VTCM tile beside
-   workers reading one;
-2. band-level is unnecessary because step 3 already exhausts HMX.
+1. tile pipelining이 해당 scope의 §1 천장 대비 20% 이내에 도달한다, **또는**
+   VTCM bank 경합이 이득을 먹는다 -- doc 32 §5는 pool 병렬 stage가 정확히 그것
+   때문에 30% 잃는 것을 측정했고, 이번 건은 HMX가 VTCM tile에 쓰는 옆에서 worker가
+   VTCM tile을 읽는 구조입니다;
+2. step 3이 이미 HMX를 소진하므로 band 층위는 불필요하다.
 
-If (1) fails the way doc 32 §5 predicts, T2 is dead for the same reason
-s_band-in-VTCM was, and the honest move is to record it and go straight to §6's
-algorithmic items.
+(1)이 doc 32 §5가 예고한 방식으로 실패하면, T2는 s_band-in-VTCM과 **같은 이유로**
+죽은 것이고, 정직한 수순은 그걸 기록하고 §6의 알고리즘 항목으로 바로 넘어가는
+것입니다.
