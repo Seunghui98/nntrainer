@@ -106,7 +106,11 @@ async to the existing pool. ggml locks HMX inside its own thread, which means
 the lock is thread-affine and ours is taken on the open thread -- inverting
 the topology avoids that question entirely.
 
-**Worth ~1.85x on whatever T1 leaves.**
+**Worth ~1.85x on whatever T1 leaves** -- block-scope. Confined to SDPA it is
+only 1.59x, because attention's own HMX lane is 37% of its post-T1 total and
+overlap cannot hide more than the smaller lane holds. That gap is why T3 comes
+first. **Full design, including why only ONE of the two candidate mechanisms
+should be built: `37_t2_pipelining_design.md`.**
 
 ### T3 -- One DSP call for the whole attention block
 
