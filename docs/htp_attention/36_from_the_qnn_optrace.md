@@ -3,9 +3,11 @@
 # 36 -- What to build, read off the QNN optrace
 
 Source: a QAIRT 2.47 HTP optrace of ONE Qwen3-0.6B attention block, seq 1024,
-w8 (`Qwen3-0.6B_attn_quant_w8_1024_chromeTrace_opTrace.json`), analysed
-separately. This doc does not repeat that analysis -- it maps it onto OUR
-codebase and orders the work by what it is worth to US.
+w8 (`Qwen3-0.6B_attn_quant_w8_1024_chromeTrace_opTrace.json`), analysed in a
+separate session. **That analysis is kept verbatim in
+`ref_16_qnn_optrace_analysis.md`** -- every section number cited below (§1.5,
+§2.1, §7.3, ...) refers to it. This doc does not repeat it: it maps it onto
+OUR codebase and orders the work by what it is worth to US.
 
 Note the two QNN numbers are not the same measurement: this trace says
 **4.72 ms** for the block (5,666,199 cycles @ 1.2 GHz), the org comparison
