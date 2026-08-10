@@ -105,7 +105,7 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   }
 
 #ifdef NNTR_HVX_HAVE_HAP_POWER
-  /* Vote the DSP's clocks up and its wake latency down, once, for the
+  /** Vote the DSP's clocks up and its wake latency down, once, for the
    * session's lifetime. This is the DSP half of the measured 90 -> 3,900 us
    * transport spread: without a vote the core power-collapses between
    * FastRPC calls and every call pays the DCVS ramp back up. Best effort by

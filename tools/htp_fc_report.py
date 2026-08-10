@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# @package htp_fc_report
+# @brief Render the HTP fully-connected device run as charts in the terminal.
 """Render the HTP fully-connected device run as charts in the terminal.
 
 The counterpart to tools/htp_attn_report.py, for the other half of the QNN

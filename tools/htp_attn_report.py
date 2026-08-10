@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# @package htp_attn_report
+# @brief Render the HTP attention device run as charts in the terminal.
 """Render the HTP attention device run as charts in the terminal.
 
 Reads the ``*_FIELD`` / ``ATTN_STAGE`` marker lines the device tests emit and

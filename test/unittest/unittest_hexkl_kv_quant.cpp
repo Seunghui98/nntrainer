@@ -57,17 +57,17 @@ width_props props_for(hexkl_w_width w) {
   return {-127, 127, 127.0f};
 }
 
-/* Theoretical round-trip bound for one element: scale * (1 + 0.5*ulp) where
+/** Theoretical round-trip bound for one element: scale * (1 + 0.5*ulp) where
  * ulp is the quant step (= scale). Round-to-nearest-ties-away adds at most
  * half a step, so |x - q*scale| <= scale/2. Return as absolute bound and also
  * as relative bound = (scale/2) / |x| when x != 0. */
 float roundtrip_abs_bound(float scale) { return scale * 0.5f; }
 
-/* Range-dynamic bound used in (a): max over the block of
+/** Range-dynamic bound used in (a): max over the block of
  *   max(scale/2, scale/2 / |x|) -- but the test needs a per-element relative
  *   check, so we compute it inline below. */
 
-/* Build the CPU-cache-layout fp16 block for one head, with deterministic
+/** Build the CPU-cache-layout fp16 block for one head, with deterministic
  * softmax-like non-negative content for V and small signed content for K
  * (K can be signed; softmax-like is irrelevant for K but fine).
  *
@@ -86,7 +86,7 @@ std::vector<uint16_t> make_block_fp16(uint32_t T, uint32_t head_dim,
   for (uint32_t r = 0; r < n_rows_valid; ++r) {
     for (uint32_t h = 0; h < nch; ++h) {
       for (uint32_t d = 0; d < head_dim; ++d) {
-        /* Small signed pattern with a per-position offset so different kv
+        /** Small signed pattern with a per-position offset so different kv
          * positions (K, per-N axis) get different scales. Values in ~[-1,1].
          * For V the column axis is head_dim, so vary d too. */
         float v;
@@ -179,7 +179,7 @@ packed_kt pack_v(const std::vector<uint16_t> &buf, const shape_cfg &c,
   return pv;
 }
 
-/* Re-float the input values actually consumed by the quantizer, in pack order,
+/** Re-float the input values actually consumed by the quantizer, in pack order,
  * for round-trip comparison. Kt: for r in [0,nrv), d in [0,head_dim). */
 std::vector<float> input_kt_in_pack_order(const std::vector<uint16_t> &buf,
                                           const shape_cfg &c) {
@@ -193,7 +193,7 @@ std::vector<float> input_kt_in_pack_order(const std::vector<uint16_t> &buf,
   }
   return v;
 }
-/* V: for d in [0,head_dim), t in [0,nrv) -- column-major so each column is
+/** V: for d in [0,head_dim), t in [0,nrv) -- column-major so each column is
  * contiguous in pack order. */
 std::vector<float> input_v_in_pack_order(const std::vector<uint16_t> &buf,
                                          const shape_cfg &c) {
@@ -215,7 +215,7 @@ void check_round_trip_range_tail_colsum(
   uint32_t inner_valid, uint32_t input_outer_stride, hexkl_w_width w,
   const std::string &label) {
   width_props p = props_for(w);
-  /* Layout invariant for BOTH Kt and V:
+  /** Layout invariant for BOTH Kt and V:
    *   out_rm: per-N axis is `n` (length N_axis_len), other axis `inner`
    *   (length N_inner). Element (inner, n) at `inner * N_axis_len + n`.
    *     Kt: out_rm[d][r] at d*T + r        -> N_axis_len=T, N_inner=head_dim.
@@ -233,7 +233,7 @@ void check_round_trip_range_tail_colsum(
     EXPECT_GE(q, p.lo) << label << ": RANGE underflow at index " << i;
     EXPECT_LE(q, p.hi) << label << ": RANGE overflow at index " << i;
   }
-  /* (a) ROUND TRIP over the VALID region only. Theoretical bound: absolute
+  /** (a) ROUND TRIP over the VALID region only. Theoretical bound: absolute
    *   |x - q*scale| <= scale/2 (round-to-nearest-ties-away). "Relative" is just
    *   abs/|x| -- no separate rel bound; the task's "compute the bound from the
    *   width and the row's dynamic range" is exactly scale = amax/denom, so the
@@ -253,7 +253,7 @@ void check_round_trip_range_tail_colsum(
         << " abs_bound=" << abs_bound;
     }
   }
-  /* (b) COLSUM: independent sum over the FULL column (all N_inner rows,
+  /** (b) COLSUM: independent sum over the FULL column (all N_inner rows,
    *   tail is zero). colsum[n] = sum_inner rm[inner*N_axis_len+n]. */
   for (uint32_t n = 0; n < N_axis_len; ++n) {
     int32_t independent = 0;
@@ -263,7 +263,7 @@ void check_round_trip_range_tail_colsum(
     EXPECT_EQ(colsum[n], independent)
       << label << ": COLSUM mismatch at n=" << n;
   }
-  /* (c) TAIL on n axis (Kt): n in [n_axis_valid, N_axis_len) zero, scale 1.0f,
+  /** (c) TAIL on n axis (Kt): n in [n_axis_valid, N_axis_len) zero, scale 1.0f,
    *   colsum 0. */
   for (uint32_t n = n_axis_valid; n < N_axis_len; ++n) {
     EXPECT_EQ(scale[n], 1.0f) << label << ": TAIL n-scale at n=" << n;
@@ -273,7 +273,7 @@ void check_round_trip_range_tail_colsum(
         << label << ": TAIL n-rm at n=" << n << " inner=" << inner;
     }
   }
-  /* (c) TAIL on inner axis (V): inner in [inner_valid, N_inner) zero across
+  /** (c) TAIL on inner axis (V): inner in [inner_valid, N_inner) zero across
    *   all n. V's scale is per-n and all n are valid, so no scale check here. */
   for (uint32_t inner = inner_valid; inner < N_inner; ++inner) {
     for (uint32_t n = 0; n < N_axis_len; ++n) {
@@ -289,7 +289,7 @@ void check_consistency(const std::vector<int8_t> &rm_i4,
                        const std::vector<float> &scale_i8, uint32_t N_axis_len,
                        uint32_t N_inner, uint32_t n_axis_valid,
                        uint32_t inner_valid, const std::string &label) {
-  /* (e) i4 and i8 agree in SIGN and in relative ORDER on every element.
+  /** (e) i4 and i8 agree in SIGN and in relative ORDER on every element.
    *   "i8 is a refinement of i4": i8 has finer granularity, so where i4 TIES
    *   (0) or near-ties, i8 may distinguish in either direction. The real
    *   check is when BOTH widths produce a nonzero distinction:
@@ -332,7 +332,7 @@ void check_consistency(const std::vector<int8_t> &rm_i4,
         }
       }
     } else {
-      /* strided sampling: cover the column at ~sqrt(FULL_PAIR_CAP) stride so
+      /** strided sampling: cover the column at ~sqrt(FULL_PAIR_CAP) stride so
        *   sampled pairs span the full range, not just the head. */
       uint32_t stride = (uint32_t)std::sqrt((double)inner_valid);
       if (stride < 1) {
@@ -397,7 +397,7 @@ TEST(hexkl_kv_quant, v_block_all_configs) {
       "V  T=" + std::to_string(c.T) + " hd=" + std::to_string(c.head_dim) +
       " nch=" + std::to_string(c.nch) + " head=" + std::to_string(c.head) +
       " nrv=" + std::to_string(c.n_rows_valid);
-    /* V: N axis = head_dim (full, no tail on n). inner = T (rows), tail on
+    /** V: N axis = head_dim (full, no tail on n). inner = T (rows), tail on
      *   inner in [nrv, T). input stride = nrv (V input packed d-outer). */
     check_round_trip_range_tail_colsum(
       p4.rm, p4.scale, p4.colsum, input,
