@@ -39,6 +39,14 @@ typedef struct {
   hexkl_weight_u8i4_table weights_u8i4;
   hexkl_weight_u8i8_table weights_u8i8;
   hvx_worker_pool *quant_pool; /**< sized from the HVX unit count in open() */
+  uint8_t *rope_cos_u8;
+  uint8_t *rope_sin_u8;
+  int16_t *rope_cos_q15;
+  int16_t *rope_sin_q15;
+  uint32_t rope_cache_positions;
+  uint32_t rope_cache_dim;
+  float rope_cache_theta;
+  uint32_t rope_cache_generation;
 } nntr_hvx_session;
 
 #endif /* __NNTR_HVX_SESSION_H__ */

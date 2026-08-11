@@ -117,6 +117,21 @@ interface nntr_hvx : remote_handle64 {
                      in int32 zp_out, rout sequence<uint8> y,
                      rout uint32 n_saturated);
 
+   // Builds and caches QNN-compatible QUInt8 sin/cos tables. The cache is
+   // session-owned and the returned generation changes only on a new config.
+   AEEResult rope_cache_init(in uint32 n_positions, in uint32 dim,
+                             in float theta, rout uint32 generation);
+   AEEResult rope_cache_clear();
+
+   // Uses the session cache for positions [position_start, position_start +
+   // n_rows). The cached table is QUInt8 (scale 1/127, zero point 128).
+   AEEResult rope_u8_cached(in uint32 n_rows, in uint32 width, in uint32 dim,
+                            in uint32 position_start, in sequence<uint8> x,
+                            in sequence<float> s_in,
+                            in sequence<int32> zp_in, in float s_out,
+                            in int32 zp_out, rout sequence<uint8> y,
+                            rout uint32 n_saturated);
+
    // PHASE B of the fused attention loop, exposed on its own so it can be
    // gated against the host model (test/unittest/mha_htp_host_model.cpp)
    // before the attention endpoint that will call it in-process exists.

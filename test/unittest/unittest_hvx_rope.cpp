@@ -162,6 +162,86 @@ TEST_F(HvxRope, LaneOrderAndSaturationAreObservable) {
   EXPECT_GT(dsp_sat, 0u);
 }
 
+TEST_F(HvxRope, GeneratesQnnUint8CacheAndReusesIt) {
+  constexpr uint32_t positions = 16;
+  constexpr uint32_t dim = 64;
+  constexpr uint32_t rows = 3;
+  constexpr uint32_t width = 64;
+  constexpr float theta = 1000000.0f;
+  constexpr float table_scale = 1.0f / 127.0f;
+  constexpr int32_t table_zp = 128;
+  uint32_t generation = 0;
+  ASSERT_EQ(
+    nntr_hvx_rope_cache_init(handle_, positions, dim, theta, &generation),
+    AEE_SUCCESS);
+  ASSERT_NE(generation, 0u);
+  uint32_t same_generation = 0;
+  ASSERT_EQ(
+    nntr_hvx_rope_cache_init(handle_, positions, dim, theta, &same_generation),
+    AEE_SUCCESS);
+  EXPECT_EQ(same_generation, generation);
+
+  std::vector<uint8_t> x(rows * width), cached(x.size()), direct(x.size());
+  std::vector<float> scale(rows, 0.25f);
+  std::vector<int32_t> zp(rows, 127);
+  const uint32_t position_start = 2;
+  const uint32_t half = dim / 2;
+  std::vector<int16_t> cos(rows * half), sin(rows * half);
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = static_cast<uint8_t>((i * 37u + 11u) & 255u);
+  }
+  for (uint32_t m = 0; m < rows; ++m) {
+    const uint32_t pos = position_start + m;
+    for (uint32_t k = 0; k < half; ++k) {
+      const float angle =
+        static_cast<float>(pos) *
+        ::powf(theta, -2.0f * static_cast<float>(k) / static_cast<float>(dim));
+      const auto qnn = [](float value) {
+        return static_cast<uint8_t>(
+          std::max(0.0f, std::min(255.0f, ::nearbyintf(value / table_scale) +
+                                            static_cast<float>(table_zp))));
+      };
+      const auto q15 = [](uint8_t value) {
+        const int32_t v = static_cast<int32_t>(::nearbyintf(
+          (static_cast<int>(value) - table_zp) * table_scale * 32768.0f));
+        return static_cast<int16_t>(std::max(-32768, std::min(32767, v)));
+      };
+      cos[m * half + k] = q15(qnn(std::cos(angle)));
+      sin[m * half + k] = q15(qnn(std::sin(angle)));
+    }
+  }
+  uint32_t cached_sat = 0;
+  ASSERT_EQ(nntr_hvx_rope_u8_cached(
+              handle_, rows, width, dim, position_start, x.data(), x.size(),
+              scale.data(), scale.size(), zp.data(), zp.size(), 0.5f, 123,
+              cached.data(), cached.size(), &cached_sat),
+            AEE_SUCCESS);
+  uint32_t direct_sat = 0;
+  ASSERT_EQ(nntr_hvx_rope_u8(handle_, rows, width, dim, x.data(), x.size(),
+                             scale.data(), scale.size(), zp.data(), zp.size(),
+                             cos.data(), cos.size(), sin.data(), sin.size(),
+                             0.5f, 123, direct.data(), direct.size(),
+                             &direct_sat),
+            AEE_SUCCESS);
+  EXPECT_EQ(cached_sat, direct_sat);
+  EXPECT_EQ(cached, direct);
+  ASSERT_EQ(nntr_hvx_rope_cache_clear(handle_), AEE_SUCCESS);
+}
+
+TEST_F(HvxRope, RejectsCacheRangeMismatch) {
+  uint32_t generation = 0;
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, 4, 64, 1000000.0f, &generation),
+            AEE_SUCCESS);
+  std::vector<uint8_t> x(64), y(64);
+  std::vector<float> scale(1, 1.0f);
+  std::vector<int32_t> zp(1, 0);
+  uint32_t saturated = 0;
+  EXPECT_EQ(nntr_hvx_rope_u8_cached(handle_, 1, 64, 64, 4, x.data(), x.size(),
+                                    scale.data(), 1, zp.data(), 1, 1.0f, 0,
+                                    y.data(), y.size(), &saturated),
+            AEE_EBADPARM + kDspOffset);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
