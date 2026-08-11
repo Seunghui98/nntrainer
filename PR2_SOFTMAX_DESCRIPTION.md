@@ -9,9 +9,8 @@ three files.
 
 ## Commits to be reviewed in this PR
 
-c3844f7d [test] Add FastRPC entries for the HVX softmax bring-up<br/>
 
-[test] Add FastRPC entries for the HVX softmax bring-up
+<details><summary>c3844f7d [test] Add FastRPC entries for the HVX softmax bring-up</summary><br />
 
 Open two IDL entries and wire the skel and the device test around them.
 Both return zeroed output for now; the kernels land in the next commits.
@@ -37,11 +36,11 @@ FastRPC boundary as 0x8000040e, not the host's plain 14.
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
+</details>
 
 
-7cee5de6 [htp] Add a vector exp for f32 lanes on HVX<br/>
 
-[htp] Add a vector exp for f32 lanes on HVX
+<details><summary>7cee5de6 [htp] Add a vector exp for f32 lanes on HVX</summary><br />
 
 exp(x) = 2^k * exp(r): k goes into the exponent field via a single bit
 add, so the polynomial only has to cover r, which round-to-nearest
@@ -78,11 +77,11 @@ a path that cannot be taken. The header states the domain instead.
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
+</details>
 
 
-91f36bc4 [htp] Add a row-wise f32 softmax on HVX with tail handling<br/>
 
-[htp] Add a row-wise f32 softmax on HVX with tail handling
+<details><summary>91f36bc4 [htp] Add a row-wise f32 softmax on HVX with tail handling</summary><br />
 
 Three passes per row: max, then exp with the sum accumulated alongside
 in qf32, then normalize. The exp results go straight into the output
@@ -115,11 +114,11 @@ max subtraction the test exists to check is still required.
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: GLM 5.2 <noreply@z.ai>
 
+</details>
 
 
-a6eaf48f [test] Cover multi-row, in-place, negative scale and row ranges for softmax<br/>
 
-[test] Cover multi-row, in-place, negative scale and row ranges for softmax
+<details><summary>a6eaf48f [test] Cover multi-row, in-place, negative scale and row ranges for softmax</summary><br />
 
 Four properties of hvx_softmax_rows_f32 that the single-row tests could
 not see: rows stay independent, an in-place call gives the same answer as
@@ -144,11 +143,11 @@ entry, which is not worth widening the test surface for.
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: GLM 5.2 <noreply@z.ai>
 
+</details>
 
 
-c74d478a [test] Unify LANES and put the softmax IDL comments in English<br/>
 
-[test] Unify LANES and put the softmax IDL comments in English
+<details><summary>c74d478a [test] Unify LANES and put the softmax IDL comments in English</summary><br />
 
 LANES was spelled three ways across three files -- all of them 32, but
 with signedness that differed enough to need casts at the use sites.
@@ -165,11 +164,11 @@ No behaviour change.
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
+</details>
 
 
-3813d85f [chore] Fix doxygen tag on multi-line comments in HVX softmax/exp/add<br/>
 
-[chore] Fix doxygen tag on multi-line comments in HVX softmax/exp/add
+<details><summary>3813d85f [chore] Fix doxygen tag on multi-line comments in HVX softmax/exp/add</summary><br />
 
 The doxygen-cncpp checker rejects any multi-line /* */ comment that
 doesn't start with /**, same rule 5cf9969b fixed for hvx_quant_u8.c.
@@ -184,7 +183,7 @@ text is unchanged; no behaviour change.
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-
+</details>
 
 ### Summary
 
@@ -216,7 +215,5 @@ reviewed in parallel.
 ## Verified on device (Galaxy S25 Ultra, V79, unsigned-PD CDSP session)
 
     unittest_hvx_softmax    15/15 PASSED
-
----
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
