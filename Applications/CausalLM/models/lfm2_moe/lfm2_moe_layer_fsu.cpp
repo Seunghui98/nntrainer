@@ -102,8 +102,6 @@ void Lfm2SlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
     weight_regularizer_constant, weight_decay, "expert_bias", false);
 
   // Expert projection weights (FSU / virtual: last requestWeight arg = true).
-  expert_weights_quantized =
-    context.getWeightDataType() != ml::train::TensorDim::DataType::FP32;
   expert_gate_proj_indices.reserve(num_experts);
   expert_up_proj_indices.reserve(num_experts);
   expert_down_proj_indices.reserve(num_experts);
@@ -279,9 +277,9 @@ inline void Lfm2SlimMoELayer::compute_expert_forward(
     nntrainer::Tensor up_out(intermediate_dim);
 
     token_input.dot(gate_proj, gate_out);
-    acti_func.run_fn(gate_out, acti_out);
     token_input.dot(up_proj, up_out);
-    acti_out.multiply_i(up_out);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
 
     nntrainer::Tensor token_expert_output(token_output_dim);
     acti_out.dot(down_proj, token_expert_output);
@@ -329,9 +327,9 @@ inline void Lfm2SlimMoELayer::compute_expert_forward_no_critical(
     nntrainer::Tensor up_out(intermediate_dim);
 
     token_input.dot(gate_proj, gate_out);
-    acti_func.run_fn(gate_out, acti_out);
     token_input.dot(up_proj, up_out);
-    acti_out.multiply_i(up_out);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
 
     nntrainer::Tensor token_expert_output(token_output_dim);
     acti_out.dot(down_proj, token_expert_output);
@@ -402,10 +400,6 @@ void Lfm2SlimMoELayer::incremental_forwarding(
       }
     }
 
-    // Quantized expert weights are dispatched sequentially: their FC dot
-    // product internally uses ThreadManager::parallel_for, so running the
-    // outer per-expert loop through the same pool would nest parallel_for
-    // calls and deadlock.
     auto run_expert = [&](size_t expert_idx) {
       const auto &assignments = expert_assignments[expert_idx];
       if (assignments.empty())
@@ -419,21 +413,17 @@ void Lfm2SlimMoELayer::incremental_forwarding(
         input, expert_outputs[expert_idx], assignments,
         context.getWeight(expert_gate_proj_indices[expert_idx]),
         context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]),
-        hidden_size);
+        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
 
       context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
       context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
       context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
     };
 
-    if (expert_weights_quantized) {
-      for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx)
-        run_expert(expert_idx);
-    } else {
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(num_experts), run_expert);
-    }
+    // dot() parallelizes internally. Keep the expert loop serial for every
+    // weight dtype to avoid nested ThreadManager::parallel_for calls.
+    for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx)
+      run_expert(expert_idx);
 
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
@@ -482,7 +472,8 @@ void Lfm2SlimMoELayer::save(std::ofstream &file,
     }
 
     if (effective_dtype == ml::train::TensorDim::DataType::Q4_0) {
-      NNTR_THROW_IF(weight.getDataType() != ml::train::TensorDim::DataType::FP32,
+      NNTR_THROW_IF(weight.getDataType() !=
+                      ml::train::TensorDim::DataType::FP32,
                     std::runtime_error)
         << "Save with quantization only supports for FP32 weight.";
       nntrainer::TensorDim dim = weight.getDim();
@@ -506,7 +497,7 @@ void Lfm2SlimMoELayer::save(std::ofstream &file,
       std::vector<char> tmp(quant_weight.size());
 
       nntrainer::quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
-                              nullptr);
+                               nullptr);
       nntrainer::repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                              quant_weight.size(), N, K, target_isa);
       quant_weight.save(file);

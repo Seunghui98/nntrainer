@@ -12,8 +12,10 @@
 
 #include <acti_func.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cpu_backend.h>
+#include <cstdlib>
 #include <lfm2_moe_layer_cached.h>
 #include <node_exporter.h>
 #include <stdexcept>
@@ -28,8 +30,23 @@ static constexpr bool NORM_TOPK_PROB = true;
 static constexpr float ROUTED_SCALING_FACTOR = 1.0f;
 /** Extra experts (beyond top-k) tracked per token for LRU prefetch ordering. */
 static constexpr unsigned EXTRA_TOPK = 5;
-/** Maximum number of experts kept mmap-resident per layer. */
-static constexpr size_t CACHE_CAPACITY = 32;
+/** Default number of experts kept mmap-resident per layer. */
+static constexpr unsigned int DEFAULT_CACHE_CAPACITY = 32;
+
+static unsigned int getExpertCacheCapacity(unsigned int num_experts) {
+  const char *value = std::getenv("NNTR_MOE_CACHE_EXPERTS");
+  if (value == nullptr || *value == '\0' || *value == '-')
+    return std::min(num_experts, DEFAULT_CACHE_CAPACITY);
+
+  errno = 0;
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (errno == ERANGE || end == value || *end != '\0')
+    return std::min(num_experts, DEFAULT_CACHE_CAPACITY);
+
+  return static_cast<unsigned int>(
+    std::min<unsigned long>(num_experts, parsed));
+}
 
 Lfm2CachedSlimMoELayer::Lfm2CachedSlimMoELayer() :
   LayerImpl(),
@@ -44,6 +61,7 @@ Lfm2CachedSlimMoELayer::Lfm2CachedSlimMoELayer() :
   expert_bias_idx(std::numeric_limits<unsigned>::max()),
   loaded_expert_deque({}),
   need_load({}),
+  cache_capacity(0),
   router_logits_idx(std::numeric_limits<unsigned>::max()) {}
 
 void Lfm2CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
@@ -106,8 +124,6 @@ void Lfm2CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
     expert_bias_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "expert_bias", false);
 
-  expert_weights_quantized =
-    context.getWeightDataType() != ml::train::TensorDim::DataType::FP32;
   expert_gate_proj_indices.reserve(num_experts);
   expert_up_proj_indices.reserve(num_experts);
   expert_down_proj_indices.reserve(num_experts);
@@ -143,6 +159,7 @@ void Lfm2CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
       "expert_down_" + std::to_string(i), false, true));
     need_load.push_back(true);
   }
+  cache_capacity = getExpertCacheCapacity(num_experts);
 
   const unsigned batch_size = in_dim.batch();
   const unsigned seq_len = in_dim.height();
@@ -163,8 +180,7 @@ void Lfm2CachedSlimMoELayer::buildExpertAssignments(
   const float *logits = router_logits.getData<float>();
   const float *bias = expert_bias.getData<float>();
 
-  const unsigned extended =
-    std::min<unsigned>(topk + EXTRA_TOPK, num_experts);
+  const unsigned extended = std::min<unsigned>(topk + EXTRA_TOPK, num_experts);
 
   std::vector<float> sig(num_experts);
   std::vector<std::pair<float, int>> scored(num_experts);
@@ -220,39 +236,57 @@ inline void Lfm2CachedSlimMoELayer::compute_expert_forward(
   if (num_tokens == 0)
     return;
 
-  nntrainer::TensorDim token_input_dim({1, 1, 1, hidden_size},
+  nntrainer::TensorDim token_input_dim({1, 1, num_tokens, hidden_size},
                                        input.getTensorType());
-  nntrainer::TensorDim intermediate_dim({1, 1, 1, intermediate_size},
+  nntrainer::TensorDim intermediate_dim({1, 1, num_tokens, intermediate_size},
                                         input.getTensorType());
-  nntrainer::TensorDim token_output_dim({1, 1, 1, hidden_size},
-                                        input.getTensorType());
+  nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                      output.getTensorType());
+
+  nntrainer::Tensor gate_out(intermediate_dim);
+  nntrainer::Tensor acti_out(intermediate_dim);
+  nntrainer::Tensor up_out(intermediate_dim);
+  nntrainer::Tensor token_input;
+
+  if (num_tokens == 1) {
+    const size_t token_offset = token_assignments[0].first * hidden_size;
+    token_input =
+      input.getSharedDataTensor(token_input_dim, token_offset, true);
+  } else {
+    token_input = nntrainer::Tensor(token_input_dim);
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+      const size_t token_offset = token_assignments[i].first * hidden_size;
+      nntrainer::Tensor src =
+        input.getSharedDataTensor({1, 1, 1, hidden_size}, token_offset, true);
+      nntrainer::Tensor dst = token_input.getSharedDataTensor(
+        {1, 1, 1, hidden_size}, i * hidden_size, true);
+      dst.copyData(src);
+    });
+  }
+
+  token_input.dot(gate_proj, gate_out);
+  token_input.dot(up_proj, up_out);
+
+  if (num_tokens == 1) {
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
+  } else {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+      const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
+      nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
+                        gate_out.getData<float>() + offset,
+                        up_out.getData<float>() + offset);
+    });
+  }
+
+  acti_out.dot(down_proj, output);
 
   for (size_t i = 0; i < num_tokens; ++i) {
-    const unsigned token_idx = token_assignments[i].first;
-    const float weight = token_assignments[i].second;
-
-    size_t token_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_input =
-      input.getSharedDataTensor(token_input_dim, token_offset, true);
-
-    nntrainer::Tensor gate_out(intermediate_dim);
-    nntrainer::Tensor acti_out(intermediate_dim);
-    nntrainer::Tensor up_out(intermediate_dim);
-
-    token_input.dot(gate_proj, gate_out);
-    acti_func.run_fn(gate_out, acti_out);
-    token_input.dot(up_proj, up_out);
-    acti_out.multiply_i(up_out);
-
-    nntrainer::Tensor token_expert_output(token_output_dim);
-    acti_out.dot(down_proj, token_expert_output);
-
-    token_expert_output.multiply_i(weight);
-    size_t output_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_output =
-      output.getSharedDataTensor(token_output_dim, output_offset, true);
-
-    token_output.add_i(token_expert_output);
+    nntrainer::Tensor expert_token_output =
+      output.getSharedDataTensor(token_step_dim, i * hidden_size, true);
+    expert_token_output.multiply_i(token_assignments[i].second);
   }
 }
 
@@ -305,6 +339,7 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
                            expert_assignments, extra_top_k);
 
     std::vector<int> target_idx_vector;
+    target_idx_vector.reserve(num_experts);
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
       if (!expert_assignments[expert_idx].empty())
@@ -312,43 +347,66 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
     }
 
     std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-    for (int expert_idx : target_idx_vector)
-      expert_outputs[expert_idx] = nntrainer::Tensor(
-        total_tokens, 1, 1, hidden_size, output.getTensorType());
-
-    // Quantized expert weights are dispatched sequentially: their FC dot
-    // product internally uses ThreadManager::parallel_for, so running the
-    // outer per-expert loop through the same pool would nest parallel_for
-    // calls and deadlock.
-    auto run_expert = [&](size_t ti) {
-      int expert_idx = target_idx_vector[ti];
+    for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
+      expert_outputs[expert_idx] =
+        nntrainer::Tensor(static_cast<unsigned int>(assignments.size()), 1, 1,
+                          hidden_size, output.getTensorType());
+    }
+
+    auto deactivate_expert = [&](int expert_idx) {
+      context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
+      context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
+      context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
+    };
+
+    auto evict_lru_expert = [&]() {
+      const int expert_idx = loaded_expert_deque.front();
+      loaded_expert_deque.pop_front();
+      iteration_map.erase(expert_idx);
+      need_load[expert_idx] = true;
+      deactivate_expert(expert_idx);
+    };
+
+    // Serial outer loop: expert dot() operations parallelize internally.
+    // Enforce the cache limit before mapping a miss so resident mappings never
+    // exceed NNTR_MOE_CACHE_EXPERTS.
+    for (int expert_idx : target_idx_vector) {
+      const auto &assignments = expert_assignments[expert_idx];
+      bool temporary_mapping = false;
 
       if (need_load[expert_idx]) {
+        while (cache_capacity > 0 &&
+               loaded_expert_deque.size() >= cache_capacity)
+          evict_lru_expert();
+
         context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
         context.getWeight(expert_up_proj_indices[expert_idx]).activate();
         context.getWeight(expert_down_proj_indices[expert_idx]).activate();
 
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        loaded_expert_deque.push_back(expert_idx);
-        iteration_map[expert_idx] = --loaded_expert_deque.end();
-        need_load[expert_idx] = false;
+        if (cache_capacity == 0) {
+          temporary_mapping = true;
+        } else {
+          loaded_expert_deque.push_back(expert_idx);
+          iteration_map[expert_idx] = --loaded_expert_deque.end();
+          need_load[expert_idx] = false;
+        }
       }
 
-      compute_expert_forward(
-        input, expert_outputs[expert_idx], assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    };
+      try {
+        compute_expert_forward(
+          input, expert_outputs[expert_idx], assignments,
+          context.getWeight(expert_gate_proj_indices[expert_idx]),
+          context.getWeight(expert_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+      } catch (...) {
+        if (temporary_mapping)
+          deactivate_expert(expert_idx);
+        throw;
+      }
 
-    if (expert_weights_quantized) {
-      for (size_t ti = 0; ti < target_idx_vector.size(); ++ti)
-        run_expert(ti);
-    } else {
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(target_idx_vector.size()),
-                      run_expert);
+      if (temporary_mapping)
+        deactivate_expert(expert_idx);
     }
 
     // Refresh LRU recency using the extended top-k set (most recent last).
@@ -361,29 +419,18 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
       }
     }
 
-    // Evict least-recently-used experts beyond the cache capacity.
-    while (loaded_expert_deque.size() > CACHE_CAPACITY) {
-      int target_idx;
-      {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        target_idx = loaded_expert_deque.front();
-        loaded_expert_deque.pop_front();
-        iteration_map.erase(target_idx);
-        need_load[target_idx] = true;
-      }
-      context.getWeight(expert_gate_proj_indices[target_idx]).deactivate();
-      context.getWeight(expert_up_proj_indices[target_idx]).deactivate();
-      context.getWeight(expert_down_proj_indices[target_idx]).deactivate();
-    }
-
-    // Combine expert outputs.
-    int init = 0;
+    // Scatter compact expert outputs back to their original token positions.
+    nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                        output.getTensorType());
     for (int expert_idx : target_idx_vector) {
-      if (!init) {
-        output.copyData(expert_outputs[expert_idx]);
-        ++init;
-      } else {
-        output.add_i(expert_outputs[expert_idx]);
+      const auto &assignments = expert_assignments[expert_idx];
+      for (size_t i = 0; i < assignments.size(); ++i) {
+        nntrainer::Tensor token_output = output.getSharedDataTensor(
+          token_step_dim, assignments[i].first * hidden_size, true);
+        nntrainer::Tensor expert_token_output =
+          expert_outputs[expert_idx].getSharedDataTensor(token_step_dim,
+                                                         i * hidden_size, true);
+        token_output.add_i(expert_token_output);
       }
     }
 
@@ -427,7 +474,8 @@ void Lfm2CachedSlimMoELayer::save(std::ofstream &file,
     }
 
     if (effective_dtype == ml::train::TensorDim::DataType::Q4_0) {
-      NNTR_THROW_IF(weight.getDataType() != ml::train::TensorDim::DataType::FP32,
+      NNTR_THROW_IF(weight.getDataType() !=
+                      ml::train::TensorDim::DataType::FP32,
                     std::runtime_error)
         << "Save with quantization only supports for FP32 weight.";
       nntrainer::TensorDim dim = weight.getDim();
@@ -451,7 +499,7 @@ void Lfm2CachedSlimMoELayer::save(std::ofstream &file,
       std::vector<char> tmp(quant_weight.size());
 
       nntrainer::quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
-                              nullptr);
+                               nullptr);
       nntrainer::repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                              quant_weight.size(), N, K, target_isa);
       quant_weight.save(file);

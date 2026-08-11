@@ -34,7 +34,6 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 #include <list>
-#include <mutex>
 #include <unordered_map>
 
 namespace causallm {
@@ -111,11 +110,11 @@ public:
    * @note Overridden so the router gate and expert bias are never quantized
    *       (see Lfm2MoELayer::save for the full rationale).
    */
-  void save(std::ofstream &file, nntrainer::RunLayerContext &run_context,
-           bool opt_var, ml::train::ExecutionMode mode, bool trainable,
-           ml::train::TensorDim::DataType dtype =
-             ml::train::TensorDim::DataType::NONE,
-           ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
+  void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
 
   /**
    * @copydoc Layer::getType()
@@ -143,11 +142,6 @@ private:
   unsigned int num_experts;      /**< number of experts */
   unsigned int topk;             /**< number of experts per token, i.e., topk */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
-  /**
-   * @brief True when expert projection weights are quantized (e.g. Q4_0).
-   * @note See Lfm2MoELayer for the nested-parallel_for deadlock rationale.
-   */
-  bool expert_weights_quantized = false;
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation>
     moe_props;
@@ -163,7 +157,7 @@ private:
   std::list<int> loaded_expert_deque;
   std::unordered_map<int, std::list<int>::iterator> iteration_map;
   std::vector<bool> need_load;
-  std::mutex cache_mutex;
+  unsigned int cache_capacity; /**< mmap-resident expert limit */
 
   // intermediate tensor index
   unsigned int router_logits_idx;
