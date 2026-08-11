@@ -22,6 +22,7 @@
 #include <tie_word_embedding.h>
 #include <util_func.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace causallm {
@@ -368,8 +369,25 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
           : input_step.clone(nntrainer::TensorDim::DataType::FP32);
       const float *input_data = input_fp32.getData<float>();
       float *logits = hidden_step.getData<float>();
-      nntrainer::gemv_q4_0_rowwise(vocab_size, hidden_size, input_data,
-                                   weight_data, logits);
+      std::vector<char> quantized_activation(
+        nntrainer::q4_0_gemv_activation_size(hidden_size));
+      nntrainer::quantize_q4_0_gemv_activation(hidden_size, input_data,
+                                               quantized_activation.data());
+
+      auto &tm = nntrainer::ThreadManager::Global();
+      constexpr size_t chunks_per_thread = 4;
+      const size_t num_chunks = std::max<size_t>(
+        1, std::min(static_cast<size_t>(vocab_size),
+                    static_cast<size_t>(tm.getComputeThreadCount()) *
+                      chunks_per_thread));
+
+      tm.parallel_for(0, num_chunks, [&](size_t chunk) {
+        const size_t row_begin = chunk * vocab_size / num_chunks;
+        const size_t row_end = (chunk + 1) * vocab_size / num_chunks;
+        nntrainer::gemv_q4_0_rowwise_range(row_begin, row_end, hidden_size,
+                                           quantized_activation.data(),
+                                           weight_data, logits);
+      });
     } else {
       input_step.dot(weight, hidden_step, false, true);
     }
