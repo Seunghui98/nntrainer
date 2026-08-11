@@ -39,7 +39,7 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   }
 
   // hw_init and the HMX lock happen once here, for the session's whole
-  // lifetime, instead of per call (doc15 §3/§4) -- every other entry point
+  // lifetime, instead of per call -- every other entry point
   // in this skel reaches vtcm_base/vtcm_size/config_off through the
   // session rather than re-acquiring either.
   uint32_t hmx_fp16_rate = 0;
