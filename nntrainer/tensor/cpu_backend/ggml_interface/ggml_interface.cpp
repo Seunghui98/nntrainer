@@ -111,6 +111,9 @@ float __ggml_vec_dot_q6_K(const unsigned int K, const void *__restrict v_q6_K,
 void __ggml_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
                               const float *A, const void *B, float *C) {
   assert(K % QK4_0 == 0);
+  if (N == 0)
+    return;
+
   const size_t blocks_per_row = K / QK4_0;
   const size_t activation_size = sizeof(block_q8_0) * blocks_per_row;
   const size_t weight_row_size = sizeof(block_q4_0) * blocks_per_row;
@@ -120,9 +123,18 @@ void __ggml_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
 
   const char *weight_data = static_cast<const char *>(B);
   auto &tm = ThreadManager::Global();
-  tm.parallel_for(0, static_cast<size_t>(N), [&](size_t row) {
-    nntr_vec_dot_q4_0_q8_0(K, C + row, weight_data + row * weight_row_size,
-                           quantized_activation.data());
+  constexpr size_t chunks_per_thread = 4;
+  const size_t num_chunks = std::min(
+    static_cast<size_t>(N),
+    static_cast<size_t>(tm.getComputeThreadCount()) * chunks_per_thread);
+
+  tm.parallel_for(0, num_chunks, [&](size_t chunk) {
+    const size_t row_begin = chunk * N / num_chunks;
+    const size_t row_end = (chunk + 1) * N / num_chunks;
+    for (size_t row = row_begin; row < row_end; ++row) {
+      nntr_vec_dot_q4_0_q8_0(K, C + row, weight_data + row * weight_row_size,
+                             quantized_activation.data());
+    }
   });
 }
 
