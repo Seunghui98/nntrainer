@@ -18,7 +18,8 @@
 ## Binary layout (USE_EMBEDDING=false, tie_word_embeddings=true):
 ##   [embed_tokens.T] [per-layer weights] [embedding_norm]
 ##   Dense layers (id < num_dense_layers) use the dense SwiGLU FFN; MoE layers
-##   emit: router gate.T, expert_bias, then per expert up.T, gate.T, down.T
+##   emit: router gate.T, expert_bias, then per expert
+##         cat(gate, up).T, down.T
 ##   (matching Lfm2MoELayer::finalize weight request order).
 ##
 ## Requirements: torch >= 2.0, numpy
@@ -262,7 +263,8 @@ def save_nntrainer_bin(W: dict, path: pathlib.Path) -> None:
     FC weights are transposed on save (nntrainer stores [in, out], tensors here
     are [out, in]). The conv weight is already [K, F]. The embedding is stored
     FIRST because embedding0 is the first weighted layer in the graph.
-    MoE layers save: gate.T, expert_bias, then per expert up.T, gate.T, down.T.
+    MoE layers save: gate.T, expert_bias, then per expert
+    cat(gate, up).T, down.T.
     """
     def write(f, t: torch.Tensor) -> None:
         f.write(t.float().contiguous().cpu().numpy().tobytes())
@@ -290,8 +292,10 @@ def save_nntrainer_bin(W: dict, path: pathlib.Path) -> None:
                 write(f, W[f"layers.{i}.moe.gate.weight"].T)          # [DIM, E]
                 write(f, W[f"layers.{i}.moe.expert_bias"])            # [E]
                 for e in range(NUM_EXPERTS):
-                    write(f, W[f"layers.{i}.moe.experts.{e}.w3"].T)   # up
-                    write(f, W[f"layers.{i}.moe.experts.{e}.w1"].T)   # gate
+                    gate_up = torch.cat(
+                        [W[f"layers.{i}.moe.experts.{e}.w1"],
+                         W[f"layers.{i}.moe.experts.{e}.w3"]], dim=0)
+                    write(f, gate_up.T)                                # gate | up
                     write(f, W[f"layers.{i}.moe.experts.{e}.w2"].T)   # down
             else:
                 write(f, W[f"layers.{i}.feed_forward.w3.weight"].T)   # up

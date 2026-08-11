@@ -135,8 +135,7 @@ private:
     moe_props;
 
   // weight indices
-  std::vector<unsigned int> expert_gate_proj_indices;
-  std::vector<unsigned int> expert_up_proj_indices;
+  std::vector<unsigned int> expert_gate_up_proj_indices;
   std::vector<unsigned int> expert_down_proj_indices;
   unsigned int gate_idx;
   unsigned int expert_bias_idx;
@@ -144,17 +143,15 @@ private:
   // intermediate tensor indices
   unsigned int router_logits_idx;
   unsigned int decode_expert_output_idx;
-  unsigned int decode_gate_output_idx;
+  unsigned int decode_gate_up_output_idx;
   unsigned int decode_activation_output_idx;
-  unsigned int decode_up_output_idx;
 
   /** Reusable backing tensors shared by all active experts in one pass. */
   struct ExpertWorkspace {
     nntrainer::Tensor *token_input;
     nntrainer::Tensor *expert_output;
-    nntrainer::Tensor *gate_output;
+    nntrainer::Tensor *gate_up_output;
     nntrainer::Tensor *activation_output;
-    nntrainer::Tensor *up_output;
   };
 
   /**
@@ -175,9 +172,8 @@ private:
   inline void compute_expert_forward(
     const nntrainer::Tensor &input, nntrainer::Tensor &output,
     const std::vector<std::pair<unsigned, float>> &token_assignments,
-    const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
-    const nntrainer::Tensor &down_proj, unsigned int hidden_size,
-    ExpertWorkspace &workspace);
+    const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
+    unsigned int hidden_size, ExpertWorkspace &workspace);
 
   /**
    * @brief Compute weighted expert output in assignment order
@@ -185,9 +181,8 @@ private:
   inline void compute_expert_forward_no_critical(
     const nntrainer::Tensor &input, nntrainer::Tensor &expert_output,
     const std::vector<std::pair<unsigned, float>> &token_assignments,
-    const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
-    const nntrainer::Tensor &down_proj, unsigned int hidden_size,
-    ExpertWorkspace &workspace);
+    const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
+    unsigned int hidden_size, ExpertWorkspace &workspace);
 };
 } // namespace causallm
 
