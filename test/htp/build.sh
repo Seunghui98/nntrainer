@@ -7,7 +7,7 @@
 #   The SDK must be 6.1.1.0 or newer: HexKL ships libhexkl_micro.a for v79
 #   only from lib/6.1.1.0 up. 6.4.0.1 is the verified combination.
 # Override the target with: HEX_ARCH=v75 ./build.sh
-# Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
+# Set HexKL path:           HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
 
 set -eu
 
@@ -15,7 +15,7 @@ set -eu
 : "${DEFAULT_HEXAGON_TOOLS_ROOT:?source setup_sdk_env.source first}"
 
 HEX_ARCH="${HEX_ARCH:-v79}"
-HEXKL_ROOT="${HEXKL_ROOT:-$HOME/Downloads/hexkl_addon}"
+HEXKL_ROOT="${HEXKL_ROOT:?set HEXKL_ROOT to your hexkl_addon path}"
 HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.1}"
 HEXKL_TOOLS_VARIANT="${HEXKL_TOOLS_VARIANT:-toolv19}"
 HEXKL_LIB="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_ARCH}/libhexkl_micro.a"
