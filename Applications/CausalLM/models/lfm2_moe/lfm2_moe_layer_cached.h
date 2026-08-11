@@ -178,7 +178,7 @@ private:
     std::vector<int> &extra_top_k);
 
   /**
-   * @brief expert forward computation without memory copies
+   * @brief Run one expert as a token batch into compact output storage
    */
   inline void compute_expert_forward(
     const nntrainer::Tensor &input, nntrainer::Tensor &output,

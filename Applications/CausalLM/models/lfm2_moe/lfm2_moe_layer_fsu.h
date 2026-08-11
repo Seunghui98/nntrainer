@@ -157,7 +157,7 @@ private:
     std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments);
 
   /**
-   * @brief expert forward computation without memory copies
+   * @brief Run one expert as a token batch and stream its compact output
    */
   inline void compute_expert_forward(
     const nntrainer::Tensor &input, nntrainer::Tensor &output,
@@ -166,7 +166,7 @@ private:
     const nntrainer::Tensor &down_proj, unsigned int hidden_size);
 
   /**
-   * @brief expert forward computation without critical section
+   * @brief Compute weighted expert output in assignment order
    */
   inline void compute_expert_forward_no_critical(
     const nntrainer::Tensor &input, nntrainer::Tensor &expert_output,

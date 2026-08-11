@@ -346,14 +346,6 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
         target_idx_vector.push_back(expert_idx);
     }
 
-    std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-    for (int expert_idx : target_idx_vector) {
-      const auto &assignments = expert_assignments[expert_idx];
-      expert_outputs[expert_idx] =
-        nntrainer::Tensor(static_cast<unsigned int>(assignments.size()), 1, 1,
-                          hidden_size, output.getTensorType());
-    }
-
     auto deactivate_expert = [&](int expert_idx) {
       context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
       context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
@@ -371,8 +363,13 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
     // Serial outer loop: expert dot() operations parallelize internally.
     // Enforce the cache limit before mapping a miss so resident mappings never
     // exceed NNTR_MOE_CACHE_EXPERTS.
+    nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                        output.getTensorType());
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
+      nntrainer::Tensor expert_output(
+        static_cast<unsigned int>(assignments.size()), 1, 1, hidden_size,
+        output.getTensorType());
       bool temporary_mapping = false;
 
       if (need_load[expert_idx]) {
@@ -395,10 +392,21 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
 
       try {
         compute_expert_forward(
-          input, expert_outputs[expert_idx], assignments,
+          input, expert_output, assignments,
           context.getWeight(expert_gate_proj_indices[expert_idx]),
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+
+        // Stream this expert's compact output into the final output before
+        // computing the next expert, preserving ascending expert order.
+        for (size_t i = 0; i < assignments.size(); ++i) {
+          nntrainer::Tensor token_output = output.getSharedDataTensor(
+            token_step_dim, assignments[i].first * hidden_size, true);
+          nntrainer::Tensor expert_token_output =
+            expert_output.getSharedDataTensor(token_step_dim, i * hidden_size,
+                                              true);
+          token_output.add_i(expert_token_output);
+        }
       } catch (...) {
         if (temporary_mapping)
           deactivate_expert(expert_idx);
@@ -416,21 +424,6 @@ void Lfm2CachedSlimMoELayer::incremental_forwarding(
         loaded_expert_deque.erase(it->second);
         loaded_expert_deque.push_back(extra_top_k[i]);
         iteration_map[extra_top_k[i]] = --loaded_expert_deque.end();
-      }
-    }
-
-    // Scatter compact expert outputs back to their original token positions.
-    nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
-                                        output.getTensorType());
-    for (int expert_idx : target_idx_vector) {
-      const auto &assignments = expert_assignments[expert_idx];
-      for (size_t i = 0; i < assignments.size(); ++i) {
-        nntrainer::Tensor token_output = output.getSharedDataTensor(
-          token_step_dim, assignments[i].first * hidden_size, true);
-        nntrainer::Tensor expert_token_output =
-          expert_outputs[expert_idx].getSharedDataTensor(token_step_dim,
-                                                         i * hidden_size, true);
-        token_output.add_i(expert_token_output);
       }
     }
 
