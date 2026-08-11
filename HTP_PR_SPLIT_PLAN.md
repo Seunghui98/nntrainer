@@ -26,14 +26,14 @@
 
 ---
 
-## 2. 분할 결과 (push 완료)
+## 2. 분할 결과 (push 완료 · 2026-08-11 #4236 `2f22a22` 기준으로 리베이스됨)
 
 `origin = Seunghui98/nntrainer`
 
 ```
-main (ff2f556 = #4226 머지됨)
+main (9a3b5b8, #4226 포함)
  │
- ├─ PR-1  #4236  hvx_mm_op                                    5 commits  +1,238
+ ├─ PR-1  #4236  hvx_mm_op                        [READY2MERGE]  7 commits  +1,222
  │   │            u8i4(A8W4) 정확도 파이프라인
  │   │
  │   ├─ PR-2  claude/pr-split-cleanup-plan-42mprx-02-hvx-softmax
@@ -146,6 +146,7 @@ PR 로 올릴 때는 위 6개 주제 단위로 **squash 해서 새로 쌓는 것
 
 **지금 당장 해야 하는 것**
 
+- [x] #4244 / #4249 를 재구성 내용으로 force-push (2026-08-11, #4236 `2f22a22` 위로 리베이스 완료)
 - [ ] #4245 를 닫고 PR-2 / PR-3 두 개로 다시 연다 (head 가 `dlwlzzero` fork 라 push 불가)
 - [ ] #4244 head(`htp/u8i8-dma-cross`)를 PR-4 내용으로 force-push, base 를 PR-3 로 변경
 - [ ] #4249 head(`htp/quant-dequant-hvx-opt`)를 PR-5 내용으로 force-push, base 를 PR-4 로 변경
