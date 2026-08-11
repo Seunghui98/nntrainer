@@ -68,6 +68,17 @@
 #include "htp_backend/hmx/hexkl_kv_quant.h"
 
 /**
+ * @brief Host reference for the u8-in/u8-out HVX RoPE contract.
+ *
+ * cos_q15 and sin_q15 contain only the first half of each row. Rounding is
+ * round-to-nearest-even, matching hvx_sf_to_w_rne on the DSP.
+ */
+void rope_u8_ref(const uint8_t *x, uint8_t *y, uint32_t n_rows, uint32_t width,
+                 uint32_t dim, const float *s_in, const int32_t *zp_in,
+                 const int16_t *cos_q15, const int16_t *sin_q15, float s_out,
+                 int32_t zp_out, uint32_t *n_saturated);
+
+/**
  * @brief Unnormalized softmax output plus the per-row denominator.
  *
  * @a p is block-major and mirrors the input segmentation exactly: element

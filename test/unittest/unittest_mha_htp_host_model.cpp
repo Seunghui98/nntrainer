@@ -762,8 +762,9 @@ TEST(MhaHtpHostModel, MatchesFp32GroundTruth) {
       const float tol = tolerance_for(kWidths[w][0], kWidths[w][1]);
       float allowed_tol = tol;
       if (kWidths[w][1] == HEXKL_W_I4) {
-        // V's quantization error is not averaged on small windows or near causal pos 0,
-        // landing at its ceiling of ~7.5e-2. Allow up to 8e-2 for these edge cases in CI.
+        // V's quantization error is not averaged on small windows or near
+        // causal pos 0, landing at its ceiling of ~7.5e-2. Allow up to 8e-2 for
+        // these edge cases in CI.
         allowed_tol = 8e-2f;
       }
       if (!(err[w] <= tol)) {
@@ -935,6 +936,58 @@ TEST(MhaHtpHostModel, MatrixCoverage) {
   std::printf("[ COVER   ] %zu configurations, all axis values >= 2, all four "
               "(kv%%32, nq%%32) parities present\n",
               cs.size());
+}
+
+TEST(MhaHtpHostModel, RopeU8IdentityIsWithinOneLsb) {
+  const uint32_t rows = 2, width = 64, dim = 64, half = dim / 2;
+  std::vector<uint8_t> x(rows * width), y(rows * width);
+  std::vector<float> scale = {0.25f, 0.25f};
+  std::vector<int32_t> zp = {127, 31};
+  std::vector<int16_t> cos(rows * half, 32767), sin(rows * half, 0);
+  for (uint32_t i = 0; i < x.size(); ++i) {
+    x[i] = (uint8_t)((i * 37u + 11u) & 255u);
+  }
+
+  uint32_t saturated = 99;
+  rope_u8_ref(x.data(), y.data(), rows, width, dim, scale.data(), zp.data(),
+              cos.data(), sin.data(), scale[0], zp[0], &saturated);
+  EXPECT_EQ(saturated, 0u);
+  for (uint32_t i = 0; i < x.size(); ++i) {
+    EXPECT_LE(std::abs((int)y[i] - (int)x[i]), 1) << "element " << i;
+  }
+}
+
+TEST(MhaHtpHostModel, RopeU8ReportsSaturation) {
+  const uint32_t rows = 1, width = 64, dim = 64, half = dim / 2;
+  std::vector<uint8_t> x(width, 255), y(width);
+  std::vector<float> scale = {1.0f};
+  std::vector<int32_t> zp = {0};
+  std::vector<int16_t> cos(half, 32767), sin(half, 0);
+  uint32_t saturated = 0;
+  rope_u8_ref(x.data(), y.data(), rows, width, dim, scale.data(), zp.data(),
+              cos.data(), sin.data(), 0.125f, 0, &saturated);
+  EXPECT_GT(saturated, 0u);
+  for (uint8_t v : y) {
+    EXPECT_LE(v, 255u);
+  }
+}
+
+TEST(MhaHtpHostModel, RopeU8UsesQ15LaneOrder) {
+  const uint32_t rows = 1, width = 64, dim = 64, half = dim / 2;
+  std::vector<uint8_t> x(width, 200), y(width);
+  std::vector<float> scale = {1.0f};
+  std::vector<int32_t> zp = {0};
+  std::vector<int16_t> cos(half), sin(half, 0);
+  for (uint32_t k = 0; k < half; ++k) {
+    cos[k] = (int16_t)(k * 256u);
+  }
+  uint32_t saturated = 0;
+  rope_u8_ref(x.data(), y.data(), rows, width, dim, scale.data(), zp.data(),
+              cos.data(), sin.data(), 1.0f, 0, &saturated);
+  EXPECT_EQ(y[0], 0u);
+  EXPECT_EQ(y[1], 2u);
+  EXPECT_EQ(y[2], 3u);
+  EXPECT_EQ(y[15], 29u);
 }
 
 } // namespace

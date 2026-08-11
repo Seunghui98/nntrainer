@@ -20,6 +20,46 @@
 #include <cmath>
 #include <cstring>
 
+void rope_u8_ref(const uint8_t *x, uint8_t *y, uint32_t n_rows, uint32_t width,
+                 uint32_t dim, const float *s_in, const int32_t *zp_in,
+                 const int16_t *cos_q15, const int16_t *sin_q15, float s_out,
+                 int32_t zp_out, uint32_t *n_saturated) {
+  const uint32_t half = dim / 2u;
+  *n_saturated = 0u;
+  std::memcpy(y, x, (size_t)n_rows * width);
+
+  for (uint32_t m = 0; m < n_rows; ++m) {
+    const uint8_t *row = x + (size_t)m * width;
+    uint8_t *out = y + (size_t)m * width;
+    const double inv = (double)s_in[m] / ((double)s_out * 32768.0);
+    const int32_t z = zp_in[m];
+    const int16_t *cq = cos_q15 + (size_t)m * half;
+    const int16_t *sq = sin_q15 + (size_t)m * half;
+
+    for (uint32_t w = 0; w + dim <= width; w += dim) {
+      for (uint32_t k = 0; k < half; ++k) {
+        const double a = (double)((int32_t)row[w + k] - z);
+        const double b = (double)((int32_t)row[w + k + half] - z);
+        const double c = (double)cq[k];
+        const double s = (double)sq[k];
+        const double t0 = a * c - b * s;
+        const double t1 = a * s + b * c;
+        const double q0 = std::nearbyint(t0 * inv) + (double)zp_out;
+        const double q1 = std::nearbyint(t1 * inv) + (double)zp_out;
+
+        if (q0 < 0.0 || q0 > 255.0) {
+          ++*n_saturated;
+        }
+        if (q1 < 0.0 || q1 > 255.0) {
+          ++*n_saturated;
+        }
+        out[w + k] = (uint8_t)std::max(0.0, std::min(255.0, q0));
+        out[w + k + half] = (uint8_t)std::max(0.0, std::min(255.0, q1));
+      }
+    }
+  }
+}
+
 namespace {
 
 /**

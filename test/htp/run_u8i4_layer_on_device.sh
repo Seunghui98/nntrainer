@@ -86,7 +86,7 @@ fi
 [ -f "$LIBNNTRAINER" ] || fail "libnntrainer.so did not build: $LIBNNTRAINER"
 
 # --- 3. ARM gtest -----------------------------------------------------------
-log "3/4  Building unittest_hvx_mm_u8i4 + _softmax + _attn (ndk-build, arm64-v8a)"
+log "3/4  Building unittest_hvx_mm_u8i4 + _softmax + _rope + _attn (ndk-build, arm64-v8a)"
 GTEST_SUBMODULE="$REPO_ROOT/subprojects/googletest"
 if [ ! -f "$GTEST_SUBMODULE/googletest/include/gtest/gtest.h" ]; then
   echo "  googletest submodule looks unfetched -- running git submodule update"
@@ -111,7 +111,7 @@ fi
     NNTRAINER_ROOT="$REPO_ROOT" \
     HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
     unittest_hvx_mm_u8i4 unittest_hvx_softmax unittest_hvx_attn \
-    unittest_hvx_fc
+    unittest_hvx_rope unittest_hvx_fc
 )
 TEST_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4"
 [ -f "$TEST_BIN" ] || fail "test binary did not build: $TEST_BIN"
@@ -124,6 +124,8 @@ SOFTMAX_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_softmax"
 # forward will run.
 ATTN_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_attn"
 [ -f "$ATTN_BIN" ] || fail "test binary did not build: $ATTN_BIN"
+ROPE_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_rope"
+[ -f "$ROPE_BIN" ] || fail "test binary did not build: $ROPE_BIN"
 # The other half of the QNN comparison table: one fully connected layer at
 # Qwen3-0.6B's q_proj shape, u8 x i8, reported the way QNN net-run reports.
 FC_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_fc"
@@ -135,6 +137,7 @@ adb shell "mkdir -p $DEVICE_TMP"
 adb push "$SKEL" "$DEVICE_TMP/" >/dev/null
 adb push "$TEST_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$SOFTMAX_BIN" "$DEVICE_TMP/" >/dev/null
+adb push "$ROPE_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$ATTN_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$FC_BIN" "$DEVICE_TMP/" >/dev/null
 # c++_shared runtime the test binary links against (APP_STL in Application.mk)
@@ -155,14 +158,21 @@ adb shell "cd $DEVICE_TMP && \
   ./unittest_hvx_softmax" 2>&1 | tee /tmp/hvx_softmax_device_run.log
 
 echo
-log "4c/4  Attention PHASE A (S = Q.Kt) against the host model"
+log "4c/4  HVX uint8 RoPE against the host reference"
+adb shell "cd $DEVICE_TMP && \
+  chmod +x unittest_hvx_rope && \
+  LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
+  ./unittest_hvx_rope" 2>&1 | tee /tmp/hvx_rope_device_run.log
+
+echo
+log "4d/4  Attention PHASE A (S = Q.Kt) against the host model"
 adb shell "cd $DEVICE_TMP && \
   chmod +x unittest_hvx_attn && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
   ./unittest_hvx_attn" 2>&1 | tee /tmp/hvx_attn_device_run.log
 
 echo
-log "4d/4  Fully connected layer cost (Qwen3-0.6B q_proj, u8 x i8)"
+log "4e/4  Fully connected layer cost (Qwen3-0.6B q_proj, u8 x i8)"
 adb shell "cd $DEVICE_TMP && \
   chmod +x unittest_hvx_fc && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
@@ -172,6 +182,7 @@ echo
 log "Summary"
 grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD" /tmp/hvx_mm_u8i4_device_run.log || true
 grep -E "^\[  (PASSED|FAILED)|BLOCKED_FIELD" /tmp/hvx_softmax_device_run.log || true
+grep -E "^\[  (PASSED|FAILED)|ROPE_FIELD" /tmp/hvx_rope_device_run.log || true
 grep -E "^\[  (PASSED|FAILED)|ATTN_FIELD" /tmp/hvx_attn_device_run.log || true
 grep -E "^\[  (PASSED|FAILED)|FC_FIELD" /tmp/hvx_fc_device_run.log || true
 echo

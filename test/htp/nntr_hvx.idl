@@ -108,6 +108,15 @@ interface nntr_hvx : remote_handle64 {
                          in float scale, in sequence<float> x,
                          rout sequence<float> y);
 
+   // QNN-style uint8-in/uint8-out RoPE accuracy harness. cos/sin are Q15
+   // half-tables, and s_in/zp_in may be per-row or length-one broadcast.
+   AEEResult rope_u8(in uint32 n_rows, in uint32 width, in uint32 dim,
+                     in sequence<uint8> x, in sequence<float> s_in,
+                     in sequence<int32> zp_in, in sequence<int16> cos_q15,
+                     in sequence<int16> sin_q15, in float s_out,
+                     in int32 zp_out, rout sequence<uint8> y,
+                     rout uint32 n_saturated);
+
    // PHASE B of the fused attention loop, exposed on its own so it can be
    // gated against the host model (test/unittest/mha_htp_host_model.cpp)
    // before the attention endpoint that will call it in-process exists.
