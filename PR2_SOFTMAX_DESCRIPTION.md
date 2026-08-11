@@ -35,6 +35,7 @@ FastRPC boundary as 0x8000040e, not the host's plain 14.
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
 
 </details>
 
@@ -76,6 +77,7 @@ a path that cannot be taken. The header states the domain instead.
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
 
 </details>
 
@@ -113,6 +115,7 @@ max subtraction the test exists to check is still required.
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: GLM 5.2 <noreply@z.ai>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
 
 </details>
 
@@ -142,6 +145,7 @@ entry, which is not worth widening the test surface for.
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: GLM 5.2 <noreply@z.ai>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
 
 </details>
 
@@ -163,6 +167,7 @@ No behaviour change.
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
 
 </details>
 
@@ -182,6 +187,7 @@ text is unchanged; no behaviour change.
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
 
 </details>
 
@@ -217,3 +223,4 @@ reviewed in parallel.
     unittest_hvx_softmax    15/15 PASSED
 
 Signed-off-by: dlwlzzero <dlwlzzero@gmail.com>
+Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
