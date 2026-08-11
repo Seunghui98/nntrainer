@@ -16,14 +16,15 @@ set -eu
 
 HEX_ARCH="${HEX_ARCH:-v79}"
 HEXKL_ROOT="${HEXKL_ROOT:?set HEXKL_ROOT to your hexkl_addon path}"
-HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.1}"
+HEXAGON_SDK_VER="${HEXAGON_SDK_VER:-$(basename "$HEXAGON_SDK_ROOT")}"
 HEXKL_TOOLS_VARIANT="${HEXKL_TOOLS_VARIANT:-toolv19}"
-HEXKL_LIB="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_ARCH}/libhexkl_micro.a"
+HEXKL_LIB="$HEXKL_ROOT/lib/$HEXAGON_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_ARCH}/libhexkl_micro.a"
 
 if [ ! -f "$HEXKL_LIB" ]; then
     echo "Error: HexKL static library not found:" >&2
     echo "  $HEXKL_LIB" >&2
-    echo "HexKL provides v79 only for lib/6.1.1.0 and newer." >&2
+    echo "Available under $HEXKL_ROOT/lib:" >&2
+    ls "$HEXKL_ROOT/lib" 2>/dev/null >&2 || echo "  (none)" >&2
     exit 1
 fi
 
@@ -59,4 +60,4 @@ SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
     "$HEXKL_LIB" \
     -o build/libnntr_hvx_skel.so
 
-echo "built: $SCRIPT_DIR/build/libnntr_hvx_skel.so ($HEX_ARCH, hexkl $HEXKL_SDK_VER)"
+echo "built: $SCRIPT_DIR/build/libnntr_hvx_skel.so ($HEX_ARCH, hexkl $HEXAGON_SDK_VER)"
