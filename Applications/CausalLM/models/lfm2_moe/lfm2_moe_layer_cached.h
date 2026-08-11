@@ -159,8 +159,21 @@ private:
   std::vector<bool> need_load;
   unsigned int cache_capacity; /**< mmap-resident expert limit */
 
-  // intermediate tensor index
+  // intermediate tensor indices
   unsigned int router_logits_idx;
+  unsigned int decode_expert_output_idx;
+  unsigned int decode_gate_output_idx;
+  unsigned int decode_activation_output_idx;
+  unsigned int decode_up_output_idx;
+
+  /** Reusable backing tensors shared by all active experts in one pass. */
+  struct ExpertWorkspace {
+    nntrainer::Tensor *token_input;
+    nntrainer::Tensor *expert_output;
+    nntrainer::Tensor *gate_output;
+    nntrainer::Tensor *activation_output;
+    nntrainer::Tensor *up_output;
+  };
 
   /**
    * @brief Build the per-expert token assignments for LFM2 routing.
@@ -184,7 +197,8 @@ private:
     const nntrainer::Tensor &input, nntrainer::Tensor &output,
     const std::vector<std::pair<unsigned, float>> &token_assignments,
     const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
-    const nntrainer::Tensor &down_proj, unsigned int hidden_size);
+    const nntrainer::Tensor &down_proj, unsigned int hidden_size,
+    ExpertWorkspace &workspace);
 };
 } // namespace causallm
 
