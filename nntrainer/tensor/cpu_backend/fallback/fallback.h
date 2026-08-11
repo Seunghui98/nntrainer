@@ -1004,6 +1004,9 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+void gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                       const float *A, const void *B, float *C);
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *

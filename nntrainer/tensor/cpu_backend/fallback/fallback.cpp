@@ -16,14 +16,13 @@
 #include <compute_ops.h>
 #include <fallback.h>
 #include <fallback_internal.h>
+#include <ggml_interface.h>
 #include <nntrainer_error.h>
 
 namespace nntrainer {
 
 void init_backend() {
-  // Fallback build has no GGML / OpenBLAS to set up — bind the CPU
-  // ops table directly. Same shape as the ARM / x86 init_backend
-  // entry points so callers can use ensureComputeOps() uniformly.
+  __ggml_init();
   g_compute_ops = get_cpu_ops();
 }
 
@@ -233,6 +232,11 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
   return __fallback_gemm_q4_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+void gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                       const float *A, const void *B, float *C) {
+  __ggml_gemv_q4_0_rowwise(N, K, A, B, C);
 }
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,

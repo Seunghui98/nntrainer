@@ -11,12 +11,14 @@
  */
 
 #include <algorithm>
+#include <assert.h>
 #include <cmath>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 #include <string>
 #include <thread>
+#include <thread_manager.h>
 #include <vector>
 
 namespace nntrainer {
@@ -104,6 +106,24 @@ float __ggml_vec_dot_q6_K(const unsigned int K, const void *__restrict v_q6_K,
   nntr_vec_dot_q6_K_q8_K(K, &result, bs, v_q6_K, bx, v_q8_activation.data(), by,
                          nrc);
   return result;
+}
+
+void __ggml_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                              const float *A, const void *B, float *C) {
+  assert(K % QK4_0 == 0);
+  const size_t blocks_per_row = K / QK4_0;
+  const size_t activation_size = sizeof(block_q8_0) * blocks_per_row;
+  const size_t weight_row_size = sizeof(block_q4_0) * blocks_per_row;
+  std::vector<char> quantized_activation(activation_size);
+
+  nntr_quantize_row_q8_0(A, quantized_activation.data(), K);
+
+  const char *weight_data = static_cast<const char *>(B);
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(N), [&](size_t row) {
+    nntr_vec_dot_q4_0_q8_0(K, C + row, weight_data + row * weight_row_size,
+                           quantized_activation.data());
+  });
 }
 
 void __ggml_repack_q4_0_to_q4_0_4(void *dst, void *src, size_t data_size,

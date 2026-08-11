@@ -15,6 +15,7 @@
 #include <fallback_internal.h>
 #include <fp16.h>
 #include <gtest/gtest.h>
+#include <nntr_ggml_impl.h>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -72,6 +73,11 @@ typedef struct {
   uint16_t d;            // delta
   uint8_t qs[QK4_0 / 2]; // nibbles / quants
 } block_q4_0_testonly;
+
+typedef struct {
+  uint16_t d;       // delta
+  int8_t qs[QK4_0]; // quants
+} block_q8_0_testonly;
 /**
  * @brief q4_K block
  *
@@ -395,6 +401,42 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_quantization) {
   EXPECT_NEAR(mean_squared_error, 0., eps * K * N);
   EXPECT_NEAR(cos_sim, 0., eps * K * N);
   EXPECT_NEAR(max_differ, 0., eps * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, q4_0_rowwise_gemv) {
+  nntrainer::init_backend();
+
+  // N deliberately does not align to the q4_0x4/q4_0x8 packed kernels. The
+  // row-wise path must support arbitrary vocabulary sizes.
+  const unsigned int N = 37;
+  const unsigned int K = 256;
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+  std::vector<float> activation = generate_random_vector<float>(K);
+
+  const size_t weight_size =
+    static_cast<size_t>(N) * K / QK4_0 * sizeof(block_q4_0_testonly);
+  std::vector<char> q4_weight(weight_size);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+
+  std::vector<float> output(N);
+  nntrainer::gemv_q4_0_rowwise(N, K, activation.data(), q4_weight.data(),
+                               output.data());
+
+  const size_t activation_size = K / QK4_0 * sizeof(block_q8_0_testonly);
+  std::vector<char> q8_activation(activation_size);
+  std::vector<float> dequant_activation(K);
+  nntr_quantize_row_q8_0(activation.data(), q8_activation.data(), K);
+  nntr_dequantize_row_q8_0(q8_activation.data(), dequant_activation.data(), K);
+
+  std::vector<float> dequant_weight(K);
+  const size_t weight_row_size = weight_size / N;
+  for (unsigned int row = 0; row < N; ++row) {
+    nntrainer::dequantize_row_q4_0(q4_weight.data() + row * weight_row_size,
+                                   dequant_weight.data(), K);
+    const float expected = nntrainer::sdot(K, dequant_weight.data(), 1,
+                                           dequant_activation.data(), 1);
+    EXPECT_NEAR(output[row], expected, 1.0e-3f) << "row=" << row;
+  }
 }
 
 /**

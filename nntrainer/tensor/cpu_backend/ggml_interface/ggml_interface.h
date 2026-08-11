@@ -279,6 +279,18 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
                       const unsigned int K, const T *A, const unsigned int lda,
                       const void *B, const unsigned int ldb, T *C,
                       const unsigned int ldc);
+
+/**
+ * @brief Q4_0 row-major matrix-vector multiplication
+ *
+ * @param N Number of Q4_0 weight rows
+ * @param K Number of elements in each row
+ * @param A FP32 activation vector
+ * @param B Q4_0 weight rows in canonical block_q4_0 layout
+ * @param C FP32 output vector
+ */
+void __ggml_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                              const float *A, const void *B, float *C);
 /**
  * @brief (1xK)*(Kx1) dot product for q6_K and q8_K vectors
  *
