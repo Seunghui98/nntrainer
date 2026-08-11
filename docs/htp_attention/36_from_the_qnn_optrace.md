@@ -80,11 +80,11 @@ Three sub-items, in dependency order:
 3. **u8-in / u8-out endpoints** so op boundaries stop round-tripping through
    f32 DDR. `hexkl_mm_opts` already accepts caller-supplied `act_scale` /
    `act_zp`, so half the plumbing exists. Also cuts the FastRPC payload 4x.
-   **RoPE is already being built to this contract** — `40_rope_hvx_task.md`
-   takes QUInt8 in and QUInt8 out with an integer `mult`/`shift`
-   requantize, so it drops into a u8 boundary rather than needing one more
-   f32 round trip. Its §2 (output scale, saturation counter) is the piece
-   T1 has to get right for every op, worked out once.
+   **RoPE is already being built to this contract** — `40_rope_u8_task.md`
+   takes QUInt8 in and QUInt8 out, so it drops into a u8 boundary rather
+   than needing one more f32 round trip. Its §2.1 (what a second
+   requantize round costs: ~1.3% → ~1.8% relative score error) is the
+   arithmetic T1 has to redo for every op it converts, worked out once.
 
 **Worth ~4.4 ms of 12.9.** Biggest single item, and a prerequisite for T2
 being worth tuning.
