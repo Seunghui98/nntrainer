@@ -19,8 +19,12 @@ def save_lfm2_moe_for_nntrainer(params, config, dtype, output):
     """Write weights in the order requested by the NNTrainer LFM2-MoE graph."""
 
     output_dtype = np.dtype(dtype)
-    if output_dtype not in (np.dtype("float16"), np.dtype("float32")):
-        raise ValueError("data_type must be float16 or float32")
+    if output_dtype != np.dtype("float32"):
+        raise ValueError(
+            "LFM2-MoE conversion currently requires float32 because norms, "
+            "router weights, expert biases, and convolution weights are "
+            "stored as FP32 in the NNTrainer graph"
+        )
 
     num_layers = config.num_hidden_layers
     num_experts = config.num_experts
@@ -72,20 +76,21 @@ def save_lfm2_moe_for_nntrainer(params, config, dtype, output):
         conv_name, conv_weight = find_weight(
             f"{layer_prefix}conv.conv.weight"
         )
-        if conv_weight.ndim == 3:
-            if conv_weight.shape[1] != 1:
-                raise ValueError(
-                    f"{conv_name} must be a depthwise Conv1d weight, got "
-                    f"{tuple(conv_weight.shape)}"
-                )
-            conv_weight = conv_weight[:, 0, :].transpose(0, 1)
-        elif conv_weight.ndim == 2:
-            conv_weight = conv_weight.transpose(0, 1)
-        else:
+        expected_shape = (
+            config.hidden_size,
+            1,
+            config.conv_L_cache,
+        )
+        if tuple(conv_weight.shape) != expected_shape:
             raise ValueError(
-                f"{conv_name} must have two or three dimensions, got "
-                f"{conv_weight.ndim}"
+                f"{conv_name} must have shape {expected_shape}, got "
+                f"{tuple(conv_weight.shape)}"
             )
+
+        # PyTorch Conv1d cross-correlation stores the current-token
+        # coefficient at the last kernel index. NNTrainer causal_conv1d uses
+        # row 0 for the current token, followed by t-1, t-2, ... .
+        conv_weight = conv_weight[:, 0, :].flip(-1).transpose(0, 1)
         write_tensor(conv_name, conv_weight)
 
         write_weight(f"{layer_prefix}conv.out_proj.weight", transpose=True)
@@ -191,9 +196,7 @@ def main():
     parser.add_argument(
         "--output_name", type=str, default="./nntr_lfm2_8b_a1b_fp32.bin"
     )
-    parser.add_argument(
-        "--data_type", choices=("float16", "float32"), default="float32"
-    )
+    parser.add_argument("--data_type", choices=("float32",), default="float32")
     args = parser.parse_args()
 
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
