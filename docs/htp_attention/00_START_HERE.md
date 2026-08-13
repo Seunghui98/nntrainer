@@ -68,6 +68,7 @@ but it needs a device run afterwards, so it was not folded into this branch.
 | :-- | :-- |
 | **the flash-attention task** | `30_flash_attention_task.md` — self-contained, start there |
 | **the u8 RoPE task** | `40_rope_u8_task.md` — self-contained, start there |
+| **verifying the u8 RoPE fix on a real device** | `44_rope_u8_e2e_guide.md` |
 | implementing any task from the split | `11_u8_task_split.md` §1 (design) then your task in §3 |
 | prompting an agent to do one | `12_prompt_kit.md` |
 | the architecture, VTCM budget, sparsity, verification strategy | `10_mha_htp_plan.md` |
