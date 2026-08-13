@@ -138,18 +138,24 @@ doc 41의 accuracy baseline `cos/sin max absolute error : 0.003937`은
 ### 2.1 스케일을 어느 텐서에서 읽었는가
 
 doc 41이 값을 뽑은 곳은 `q::mul_op` / `q::Add.tcm`의 "representative
-tensors"입니다. 두 가지가 걸립니다.
+tensors"입니다.
 
-- **`q::mul_op`은 ref_16 §9.1이 GQA `repeat_kv`로 특정한 커널입니다** --
-  8,011,003 유닛사이클, 전체의 34.7%, 상위 15개 최장 커널이 전부 이것.
-  RoPE의 mul도 같은 커널 타입에 매핑될 수는 있지만, "representative"를
-  뽑으면 **GQA 텐서가 표본을 지배합니다.**
-- **`Add.tcm [1,8,16,1024]`은 ref_16 §4.1의 `node_Add_123`** -- score/mask
-  경로이지 RoPE가 아닙니다.
+**`q::mul_op`은 커널 타입이지 노드가 아닙니다.** ref_16 §9.1이 GQA
+`repeat_kv`로 특정한 것은 노드 `node_expand` / `node_expand_1`이고, 그것이
+`q::mul_op` 커널로 lowering된 것입니다. RoPE의 mul도 같은 커널 타입에
+매핑됩니다. 그래서 "representative `q::mul_op` 텐서"를 뽑으면 **어느 노드의
+것인지 알 수 없고**, 사이클 총량은 GQA가 지배하므로(8,011,003 유닛사이클,
+34.7%) 표본이 GQA 쪽으로 기울 가능성이 큽니다.
 
-그리고 더 중요한 것: **cos/sin 테이블의 스케일은 mul의 입출력 텐서가 아니라
-cos/sin `$Const` 텐서 자신의 encoding에서 읽어야 합니다.** 지금 코드가 쓰는
-`ROPE_QNN_TABLE_SCALE`은 테이블의 스케일인데, 값은 mul 텐서에서 왔습니다.
+`Add.tcm [1,8,16,1024]`도 마찬가지로 ref_16 §4.1의 `node_Add_123` --
+score/mask 경로 -- 와 같은 커널 타입입니다.
+
+**해결: 커널 타입이 아니라 `args["QNN Op Name"]`(= 원본 ONNX 노드 이름)으로
+필터링하세요.** §5.3의 실행 결과로 RoPE 노드가 특정 가능해졌습니다.
+
+그리고 별개로: **cos/sin 테이블의 스케일은 mul의 입출력 텐서가 아니라
+cos/sin `$Const` 텐서 자신의 encoding에서 읽어야 합니다.** 지금 코드의
+`ROPE_QNN_TABLE_SCALE`은 테이블의 스케일인데 값은 mul 텐서에서 왔습니다.
 서로 다른 텐서입니다.
 
 doc 41이 "Do not infer missing values from dtype alone"이라고 옳게 쓰고,
@@ -324,51 +330,90 @@ HVX kernel(4) -> IDL(5) -> 테스트(6,7) -> **QNN 캡처 비교(8)** 입니다.
 가설이 dominant일 거라 보고 16-32%로 측정됐고, 진짜 비용은 다른 데
 있었습니다.
 
-### 5.3 그리고 §8이 먼저 부딪힐 벽
+### 5.3 소멸 노드 실행 결과 -- per-op 경계는 살아 있습니다
 
-`ref_16` §1.4: RoPE의 `node_slice_2`, `node_slice_4`, `node_cat`,
-`node_cat_1`이 **컴파일 타임에 소멸**해 인접 op 안에서 0-cost 뷰 연산이
-됐습니다. §0: ONNX 60노드 중 **27개 소멸.**
+ref_16 부록의 스니펫을 실제로 돌렸습니다. 소멸 노드 33개:
 
-따라서 doc 41 §7이 비교하려는 중간 텐서(`mul_q0_cos`, `sub_result`, ...)가
-**실행 그래프에 존재하지 않을 수 있습니다.** 그러면 "per-op bit-parity"의
-대상 자체가 없습니다.
-
-이건 ref_16 부록의 스니펫으로 **2분이면** 확정됩니다:
-
-```python
-import onnx, json
-m = onnx.load('Qwen3-0.6B_prefill.onnx', load_external_data=False)
-d = json.load(open('Qwen3-0.6B_attn_quant_w8_1024_chromeTrace_opTrace.json'))
-ex = [e for e in d['traceEvents'] if e.get('ph')=='X' and e['pid']==0 and e['tid']!=1]
-qnn = {e['args'].get('QNN Op Name') for e in ex}
-print([n.name for n in m.graph.node if n.name not in qnn])   # 소멸 노드
+```
+node_Transpose_0  node_view
+node_pow_1  node_mean  node_add  node_Sqrt_12  node_rsqrt  node_mul  node_mul_1
+node_Transpose_13  node_view_1
+node_pow_2  node_mean_1  node_add_1  node_Sqrt_23  node_rsqrt_1  node_mul_2  node_mul_3
+node_Transpose_24  node_view_2  node_unsqueeze  node_unsqueeze_1
+node_slice_2  node_cat  node_slice_4  node_cat_1
+node_unsqueeze_2  node_unsqueeze_3  node__unsafe_view_1
+node_Reshape_145  node_Reshape_117  node_transpose_3  node_Transpose_130
 ```
 
-RoPE의 mul/add가 이 목록에 있으면 §1-7은 착수하지 마세요.
+**해부:**
+
+- `pow_1 / mean / add / Sqrt_12 / rsqrt / mul / mul_1` 7개와
+  `pow_2 / mean_1 / add_1 / Sqrt_23 / rsqrt_1 / mul_2 / mul_3` 7개는
+  **q_norm / k_norm의 RMSNorm 체인**입니다 -- ref_16 §1.1의
+  "`Pow → ReduceMean → Add(eps) → Sqrt → Reciprocal → Mul → Mul(weight)`,
+  14개 ONNX 노드가 2개 QNN 노드로"와 **정확히 일치**합니다.
+  따라서 `node_mul` ~ `node_mul_3`과 `node_add` / `node_add_1`은
+  **RMSNorm의 것이지 RoPE의 것이 아닙니다.**
+- `slice_2 / cat / slice_4 / cat_1`은 ref_16 §1.4가 말한 `rotate_half`이고,
+  `unsqueeze / unsqueeze_1`은 cos/sin의 broadcast 뷰입니다. 전부 0-cost.
+- **RoPE의 `mul` / `add`는 이 목록에 없습니다.** 즉 **실행됩니다.**
+  ref_16 §7.1의 span 표에 `node_mul_4`가 실제로 올라와 있는 것과 일치합니다
+  (77,695 ~ 4,500,706, 27개 노드와 겹침).
+
+**결론: doc 41 §"Target QNN-like path"의 그림이 맞습니다.** `rotate_half`는
+공짜 뷰이고, 실행되는 RoPE는 텐서당 `mul(x,cos)` / `mul(rot(x),sin)` / `add`
+= **u8 출력 3개**, q와 k 합쳐 muls 4 + adds 2입니다. per-op bit-parity의
+대상이 존재합니다.
+
+**따라서 §5.2의 스파이크(S2)로 진행합니다.** 그리고 §2.1의 blocker가
+풀립니다 -- 커널 타입이 아니라 `args["QNN Op Name"]`으로 필터링하면
+RoPE 노드의 encoding을 정확히 뽑을 수 있습니다.
+
+**주의:** `node_mul_4`가 RoPE의 첫 mul이라는 것은 HF export 순서에서
+추론한 것이지 ONNX를 읽어 확인한 것이 아닙니다. 아래로 확정하세요 --
+`rotate_half`의 `cat` 출력을 소비하는 노드가 곧 sin 쪽 mul입니다:
+
+```python
+import onnx, collections
+m = onnx.load('Qwen3-0.6B_prefill.onnx', load_external_data=False)
+cons = collections.defaultdict(list)
+for n in m.graph.node:
+    for i in n.input:
+        cons[i].append(n)
+for cat in ('node_cat', 'node_cat_1'):
+    n = next(x for x in m.graph.node if x.name == cat)
+    print(cat, '->', [(c.name, c.op_type) for c in cons[n.output[0]]])
+```
+
+숫자 하나 어긋남: 이 스니펫은 소멸 33개를 내놓는데 ref_16 §0은
+"실행 33 / 소멸 27"이라고 씁니다. 결론에는 영향이 없지만, ref_16의 그
+수치는 재확인이 필요합니다.
 
 ---
 
 ## 6. 제안하는 순서
 
 ```
+S1  [완료] RoPE의 mul/add가 실행되는지 확인 -> 실행됨 (§5.3)
+
 S0  §1.1 / §1.2 / §1.3 수정 + doc 40 §6.2 매트릭스 복원 + device 재실행
       -> 지금 "PASSED 5 tests"는 오버런과 좁은 매트릭스 위에 서 있습니다.
          여기부터 다시 시작하지 않으면 그 위의 모든 결론이 흔들립니다.
 
-S1  2분 스니펫: RoPE의 mul/add가 소멸 노드인지 확인 (§5.3)
-      -> 소멸이면 per-op 계획 종료. 그 사실을 doc 41에 기록.
+S1b 노드 이름을 확정하고(§5.3의 두 번째 스니펫) 그 이름으로 필터링해
+      RoPE mul/add/Const의 dtype/scale/zp/shape/order를 뽑는다.
+      -> doc 42 §7의 blocker 1, 2가 여기서 닫힙니다.
+      -> §1.3의 테이블 스케일 실제 값도 여기서 나옵니다 (cos/sin Const에서).
 
 S2  반나절 스파이크: QNN RoPE 입력/최종출력 덤프 -> 현재 fused 커널에 투입
       -> 최대 LSB 차이를 측정 (§5.2)
       -> <= 2 LSB 이면 per-op 불필요. 끝.
 
-S3  (S2가 크게 어긋날 때만) doc 41 §1-7. 단, 스케일은 cos/sin Const
-      텐서의 encoding에서 읽을 것 (§2.1), 그리고 §5.1의 정확도 손해를
-      PR 본문에 명시할 것.
+S3  (S2가 크게 어긋날 때만) doc 41 §1-7. 단, 스케일은 S1b의 값을 쓸 것,
+      그리고 §5.1의 정확도 손해(라운드 1 -> 3)를 PR 본문에 명시할 것.
 
-S4  §2.2 (thetas/attention_scaling을 받는 cache_init) -- S1/S2와 독립.
-      yarn/proportional/gemma4가 지금 조용히 틀립니다. 이건 per-op 여부와
+S4  §2.2 (thetas/attention_scaling을 받는 cache_init) -- S2/S3와 독립.
+      yarn/proportional/gemma4가 지금 조용히 틀립니다. per-op 여부와
       무관하게 고쳐야 합니다.
 
 S5  attn_forward 융합 (회전을 hvx_quant_pack_u8_ah의 AH 타일 쓰기 앞으로).
@@ -377,8 +422,11 @@ S5  attn_forward 융합 (회전을 hvx_quant_pack_u8_ah의 AH 타일 쓰기 앞�
 S6  §4의 HVX 벡터화 -- 정확도가 고정된 뒤에.
 ```
 
-**S0와 S1은 순서를 바꿀 수 없습니다.** S1이 "소멸"로 나오면 S3가 통째로
-사라지므로, S3를 위한 어떤 작업도 S1 전에 시작하면 안 됩니다.
+**S2를 S3보다 먼저 하는 것이 이 순서의 요점입니다.** per-op 경계가
+존재한다는 것(S1)이 per-op을 구현해야 한다는 뜻은 아닙니다 -- §5.1대로
+per-op은 재양자화를 1회에서 3회로 늘립니다. S2가 "현재 fused 커널이 이미
+QNN 출력과 2 LSB 안"이라고 답하면 S3는 정확도를 **악화시키는** 작업이
+됩니다. S2 없이 S3에 착수하지 마세요.
 
 ---
 
@@ -388,9 +436,9 @@ S6  §4의 HVX 벡터화 -- 정확도가 고정된 뒤에.
 
 | 질문 | 답 |
 | :-- | :-- |
-| 1. QNN RoPE operator order | **미해결, 그리고 §5.3 때문에 "존재하지 않음"이 답일 수 있음.** 스니펫 먼저 |
-| 2. 중간 텐서별 scale/zp | **미해결.** 지금 코드의 `1/127`은 (a) 관측값 `2/255`와 다르고 (§1.3) (b) RoPE가 아닐 가능성이 높은 텐서에서 왔습니다 (§2.1) |
-| 3. fixed-point vs float 검증 방법 | §5.2의 스파이크가 선행되어야 질문이 성립 |
+| 1. QNN RoPE operator order | **부분 해결 (§5.3).** mul/add는 실행되고 slice/cat/unsqueeze는 0-cost 뷰입니다. 텐서당 mul/mul/add 3단계. 노드 이름 확정만 남음 (S1b) |
+| 2. 중간 텐서별 scale/zp | **미해결이지만 경로가 열렸습니다 (S1b).** 지금 코드의 `1/127`은 (a) 관측값 `2/255`와 다르고 (§1.3) (b) 노드가 아니라 커널 타입에서 뽑은 표본입니다 (§2.1) |
+| 3. fixed-point vs float 검증 방법 | §5.2의 스파이크(S2)가 선행되어야 질문이 성립 |
 | 4. CPU/HVX 비교 지점 | 현재: 최종 출력만. doc 40 §6.2의 lane/tail/in-place 항목이 아직 비어 있음 (§3) |
 | 5. 완전한 cache key | **§2.2를 적용하면 대부분 사라집니다** -- `thetas` + `attention_scaling`이 세 scaling type과 partial rotary를 전부 흡수 |
 | 6. prefill/decode position 전달 | `position_start`로 이미 있음. 다만 `n_positions <= 4096` 천장 미문서화 (§2.6) |
