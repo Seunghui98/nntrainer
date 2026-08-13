@@ -20,8 +20,8 @@
 /**
  * The input bytes are staged into unaligned HVX vectors before arithmetic.
  * This keeps the FastRPC alignment contract honest while using HVX for the
- * complete rotate/requantize arithmetic. The scalar staging is deliberately
- * kept local; the fusion task can replace it with activation-port loads.
+ * complete rotate/requantize arithmetic. The scalar staging is a known
+ * ceiling -- see the ponytail note on hvx_rope_u8_rows in the header.
  */
 static void rope_block(const uint8_t *row, uint8_t *out, uint32_t offset,
                        uint32_t half, const int16_t *cos_q15,
@@ -75,27 +75,34 @@ static void rope_block(const uint8_t *row, uint8_t *out, uint32_t offset,
 
 void hvx_rope_u8_rows(const uint8_t *x, uint8_t *y, uint32_t m_first,
                       uint32_t m_last, uint32_t width, uint32_t dim,
-                      const float *s_in, const int32_t *zp_in,
+                      const float *s_in, uint32_t s_in_stride,
+                      const int32_t *zp_in, uint32_t zp_in_stride,
                       const int16_t *cos_q15, const int16_t *sin_q15,
                       float s_out, int32_t zp_out, uint32_t *n_saturated) {
   const uint32_t half = dim / 2u;
   const float inv_out = 1.0f / (s_out * 32768.0f);
+  /* Whole dim-sized segments only: the last partial segment, if any, is
+     left to the single post-loop memcpy below rather than being written
+     from inside the w-loop, which is what made the previous version's
+     tail copy index past the row (out + w + dim at the final w). */
+  const uint32_t rotated = width - (width % dim);
 
   for (uint32_t m = m_first; m < m_last; ++m) {
     const uint8_t *row = x + (size_t)m * width;
     uint8_t *out = y + (size_t)m * width;
     const int16_t *cq = cos_q15 + (size_t)m * half;
     const int16_t *sq = sin_q15 + (size_t)m * half;
-    const float vinv = s_in[m] * inv_out;
+    const int32_t zp = zp_in[(size_t)m * zp_in_stride];
+    const float vinv = s_in[(size_t)m * s_in_stride] * inv_out;
 
-    for (uint32_t w = 0; w + dim <= width; w += dim) {
+    for (uint32_t w = 0; w < rotated; w += dim) {
       for (uint32_t offset = 0; offset < half; offset += ROPE_LANES) {
-        rope_block(row + w, out + w, offset, half, cq, sq, zp_in[m], vinv,
-                   zp_out, n_saturated);
+        rope_block(row + w, out + w, offset, half, cq, sq, zp, vinv, zp_out,
+                   n_saturated);
       }
-      if (dim < width) {
-        memcpy(out + w + dim, row + w + dim, width - dim);
-      }
+    }
+    if (out != row && rotated < width) {
+      memcpy(out + rotated, row + rotated, width - rotated);
     }
   }
 }
