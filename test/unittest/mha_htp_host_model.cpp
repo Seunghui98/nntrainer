@@ -26,7 +26,13 @@ void rope_u8_ref(const uint8_t *x, uint8_t *y, uint32_t n_rows, uint32_t width,
                  int32_t zp_out, uint32_t *n_saturated) {
   const uint32_t half = dim / 2u;
   *n_saturated = 0u;
-  std::memcpy(y, x, (size_t)n_rows * width);
+  /* memcpy(p, p, n) with x == y is technically UB (the standard's "shall
+     not overlap" is written without a same-pointer exception), even though
+     every real implementation treats it as a no-op. y may alias x per the
+     kernel's contract, so this has to be guarded rather than relied on. */
+  if (y != x) {
+    std::memcpy(y, x, (size_t)n_rows * width);
+  }
 
   for (uint32_t m = 0; m < n_rows; ++m) {
     const uint8_t *row = x + (size_t)m * width;

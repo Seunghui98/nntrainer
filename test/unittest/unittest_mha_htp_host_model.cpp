@@ -939,10 +939,18 @@ TEST(MhaHtpHostModel, MatrixCoverage) {
 }
 
 TEST(MhaHtpHostModel, RopeU8IdentityIsWithinOneLsb) {
+  // s_out/zp_out are common to the whole call (rope_u8_ref's contract, and
+  // hvx_rope_u8.h's), so every row needs the SAME zp as zp_out for an
+  // identity rotation to reproduce the input code exactly: with a
+  // per-row zp differing from zp_out, cos=1/sin=0 still preserves the
+  // REAL value but shifts the CODE by (zp_out - zp_in), which is not what
+  // this test claims to check. (Caught by actually running this test --
+  // it silently asserted a false invariant on row 1 before, since nothing
+  // had executed `meson test unittest_mha_htp_host_model` -- doc 42/43.)
   const uint32_t rows = 2, width = 64, dim = 64, half = dim / 2;
   std::vector<uint8_t> x(rows * width), y(rows * width);
   std::vector<float> scale = {0.25f, 0.25f};
-  std::vector<int32_t> zp = {127, 31};
+  std::vector<int32_t> zp = {127, 127};
   std::vector<int16_t> cos(rows * half, 32767), sin(rows * half, 0);
   for (uint32_t i = 0; i < x.size(); ++i) {
     x[i] = (uint8_t)((i * 37u + 11u) & 255u);
@@ -972,7 +980,46 @@ TEST(MhaHtpHostModel, RopeU8ReportsSaturation) {
   }
 }
 
+TEST(MhaHtpHostModel, RopeU8InPlaceMatchesSeparateBuffer) {
+  /* FastRPC always hands the skel two distinct buffers (doc 43 §5), so
+   * y == x can only be exercised at this reference layer -- which is also
+   * where the seam decision (40_rope_u8_task.md §7 Stage 3 (c)) runs it:
+   * the ARM-side comparison path applies rope to its own copy in place. */
+  const uint32_t rows = 3, width = 192, dim = 64, half = dim / 2;
+  std::vector<uint8_t> x(rows * width), separate(x.size());
+  std::vector<float> scale = {0.25f, 0.5f, 0.125f};
+  std::vector<int32_t> zp = {0, 128, 255};
+  std::vector<int16_t> cos(rows * half), sin(rows * half);
+  for (uint32_t i = 0; i < x.size(); ++i) {
+    x[i] = (uint8_t)((i * 53u + 3u) & 255u);
+  }
+  for (uint32_t m = 0; m < rows; ++m) {
+    for (uint32_t k = 0; k < half; ++k) {
+      cos[m * half + k] = (int16_t)(32000 - (int)(k * 61u));
+      sin[m * half + k] = (int16_t)((int)(k * 37u) - 400);
+    }
+  }
+
+  std::vector<uint8_t> in_place = x;
+  uint32_t sat_in_place = 0, sat_separate = 0;
+  rope_u8_ref(in_place.data(), in_place.data(), rows, width, dim,
+              scale.data(), zp.data(), cos.data(), sin.data(), 0.5f, 100,
+              &sat_in_place);
+  rope_u8_ref(x.data(), separate.data(), rows, width, dim, scale.data(),
+              zp.data(), cos.data(), sin.data(), 0.5f, 100, &sat_separate);
+
+  EXPECT_EQ(sat_in_place, sat_separate);
+  EXPECT_EQ(in_place, separate);
+}
+
 TEST(MhaHtpHostModel, RopeU8UsesQ15LaneOrder) {
+  // With sin == 0, a == b == 200, zp == 0, s_in == s_out == 1: q0 == q1 ==
+  // nearbyint(200 * cos_q15[k] / 32768) == nearbyint(1.5625 * k). y[15]'s
+  // expected value used to be hand-computed as 29; the correct value is
+  // nearbyint(1.5625 * 15) == nearbyint(23.4375) == 23, confirmed only by
+  // actually running this test (it had never been executed -- doc 42/43).
+  // y[0..2] were already right (0, 2, 3), which is why only this one
+  // assertion caught it.
   const uint32_t rows = 1, width = 64, dim = 64, half = dim / 2;
   std::vector<uint8_t> x(width, 200), y(width);
   std::vector<float> scale = {1.0f};
@@ -987,7 +1034,7 @@ TEST(MhaHtpHostModel, RopeU8UsesQ15LaneOrder) {
   EXPECT_EQ(y[0], 0u);
   EXPECT_EQ(y[1], 2u);
   EXPECT_EQ(y[2], 3u);
-  EXPECT_EQ(y[15], 29u);
+  EXPECT_EQ(y[15], 23u);
 }
 
 } // namespace
