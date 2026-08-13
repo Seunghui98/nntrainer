@@ -34,6 +34,22 @@ std::string hex(int err) {
   return os.str();
 }
 
+/** @brief Default rope thetas, matching mha_core.cpp's
+ *         _compute_default_parameters: thetas[i] = theta_base^(-2i/dim). */
+std::vector<float> DefaultThetas(uint32_t dim, float theta_base) {
+  std::vector<float> thetas(dim / 2);
+  for (uint32_t i = 0; i < thetas.size(); ++i) {
+    thetas[i] = 1.0f / std::pow(theta_base, (2.0f * (float)i) / (float)dim);
+  }
+  return thetas;
+}
+
+/** @brief Matches rope_real_to_q15 in nntr_hvx_rope.c exactly. */
+int16_t RealToQ15(float value) {
+  int32_t v = (int32_t)std::nearbyint(value * 32768.0f);
+  return (int16_t)std::max(-32768, std::min(32767, v));
+}
+
 class HtpSession : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -78,9 +94,74 @@ TEST_F(HvxRope, RejectsBadLengths) {
   EXPECT_EQ(err, AEE_EBADPARM + kDspOffset) << "got " << hex(err);
 }
 
+/**
+ * @brief Regression test for the tail-copy overrun in the pre-fix kernel.
+ *
+ * hvx_rope_u8.c used to memcpy the unrotated tail with the destination
+ * computed as `out + w + dim` at the LAST w, i.e. one full row past the
+ * end of the output row -- width - dim bytes past the buffer on the last
+ * row. Comparing outputs alone can never see this: the overrun target got
+ * re-rotated and overwritten by the next iteration in every case except
+ * the very last row, so the visible result was always correct.
+ *
+ * This needs width/dim >= 2 and width % dim == 0 -- the shape the old test
+ * matrix never had (40_rope_u8_task.md §6.2's width/dim axis was missing
+ * entirely, doc 42/43). Large FastRPC sequence buffers are typically
+ * rpcmem/ION-backed and rounded up to page size, so bytes just past a
+ * non-page-aligned declared length often (not always -- hvx_softmax_util.h
+ * documents the same "usually hides it, occasionally does not" caveat)
+ * live in the same mapped page the DSP can still reach. This is a
+ * best-effort detector; the actual fix is the code change itself.
+ */
+TEST_F(HvxRope, DoesNotWritePastTheOutputBuffer) {
+  const uint32_t rows = 2, width = 512, dim = 64, half = dim / 2u;
+  constexpr uint8_t kGuard = 0xA5;
+  const size_t payload = (size_t)rows * width;
+  const size_t guard = 4096; // one page
+
+  std::vector<uint8_t> x(payload);
+  std::vector<uint8_t> y(payload + guard, kGuard);
+  std::vector<float> scale(rows, 0.25f);
+  std::vector<int32_t> zp = {17, 233};
+  std::vector<int16_t> cos((size_t)rows * half), sin(cos.size());
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = (uint8_t)((i * 31u + 5u) & 255u);
+  }
+  for (uint32_t m = 0; m < rows; ++m) {
+    for (uint32_t k = 0; k < half; ++k) {
+      cos[(size_t)m * half + k] = (int16_t)(31000 - (int)(k * 91u));
+      sin[(size_t)m * half + k] = (int16_t)((int)(k * 59u) - 800);
+    }
+  }
+  uint32_t saturated = 0;
+  ASSERT_EQ(nntr_hvx_rope_u8(handle_, rows, width, dim, x.data(),
+                             (int)payload, scale.data(), (int)scale.size(),
+                             zp.data(), (int)zp.size(), cos.data(),
+                             (int)cos.size(), sin.data(), (int)sin.size(),
+                             0.5f, 111, y.data(), (int)payload, &saturated),
+            AEE_SUCCESS);
+
+  for (size_t i = payload; i < y.size(); ++i) {
+    ASSERT_EQ(y[i], kGuard)
+      << "wrote " << (i - payload) << " bytes past the declared output length";
+  }
+}
+
 TEST_F(HvxRope, MatchesReferenceWithinOneLsb) {
-  for (const Case c :
-       std::vector<Case>{{1, 64, 64}, {3, 96, 64}, {2, 128, 128}}) {
+  // dim and width/dim each appear >= 2 times; n_rows covers the fixed
+  // matrix in 40_rope_u8_task.md §6.2 (1, 7, 32, 1024), each twice.
+  //   dim:       64 x3, 96 x2, 128 x3
+  //   width/dim: 1  x4, 8  x2, 16 x2
+  //   n_rows:    1  x2, 7  x2, 32 x2, 1024 x2
+  const std::vector<Case> cases = {
+    {1, 64, 64},      {1, 1024, 64},   {7, 96, 96},    {7, 768, 96},
+    {32, 128, 128},   {32, 2048, 128}, {1024, 512, 64}, {1024, 128, 128},
+  };
+
+  constexpr float kSOut = 0.5f;
+  constexpr int32_t kZpOut = 123;
+
+  for (const Case &c : cases) {
     const uint32_t half = c.dim / 2u;
     std::vector<uint8_t> x((size_t)c.rows * c.width);
     std::vector<uint8_t> out(x.size()), ref(x.size());
@@ -89,9 +170,12 @@ TEST_F(HvxRope, MatchesReferenceWithinOneLsb) {
     std::vector<int16_t> cos((size_t)c.rows * half);
     std::vector<int16_t> sin(cos.size());
 
+    // zp cycles through the three boundary values plus a per-row spread,
+    // covering 40_rope_u8_task.md §6.2's {0, 128, 255} + varying-per-row.
+    constexpr int32_t kZpValues[3] = {0, 128, 255};
     for (uint32_t m = 0; m < c.rows; ++m) {
-      scale[m] = 0.25f + 0.125f * (float)m;
-      zp[m] = 17 + (int32_t)m * 23;
+      scale[m] = 0.25f + 0.125f * (float)(m % 5);
+      zp[m] = kZpValues[m % 3];
       for (uint32_t k = 0; k < half; ++k) {
         cos[(size_t)m * half + k] = (int16_t)(32000 - (int)(k * 73u));
         sin[(size_t)m * half + k] = (int16_t)((int)(k * 41u) - 500);
@@ -103,30 +187,113 @@ TEST_F(HvxRope, MatchesReferenceWithinOneLsb) {
 
     uint32_t ref_sat = 0;
     rope_u8_ref(x.data(), ref.data(), c.rows, c.width, c.dim, scale.data(),
-                zp.data(), cos.data(), sin.data(), 0.5f, 123, &ref_sat);
+                zp.data(), cos.data(), sin.data(), kSOut, kZpOut, &ref_sat);
     uint32_t dsp_sat = 0;
     int err = nntr_hvx_rope_u8(
       handle_, c.rows, c.width, c.dim, x.data(), (int)x.size(), scale.data(),
       (int)scale.size(), zp.data(), (int)zp.size(), cos.data(), (int)cos.size(),
-      sin.data(), (int)sin.size(), 0.5f, 123, out.data(), (int)out.size(),
+      sin.data(), (int)sin.size(), kSOut, kZpOut, out.data(), (int)out.size(),
       &dsp_sat);
     ASSERT_EQ(err, AEE_SUCCESS) << "shape " << c.rows << "x" << c.width
                                 << " dim=" << c.dim << ": " << hex(err);
-    EXPECT_EQ(dsp_sat, ref_sat);
+    EXPECT_EQ(dsp_sat, ref_sat)
+      << "shape " << c.rows << "x" << c.width << " dim=" << c.dim;
 
     uint32_t mismatch = 0;
     int max_err = 0;
+    double sq_err = 0.0;
     for (size_t i = 0; i < out.size(); ++i) {
       const int e = std::abs((int)out[i] - (int)ref[i]);
       max_err = std::max(max_err, e);
       mismatch += e != 0;
-      EXPECT_LE(e, 1) << "element " << i;
+      sq_err += (double)e * (double)e;
+      EXPECT_LE(e, 1) << "shape " << c.rows << "x" << c.width
+                      << " dim=" << c.dim << " element " << i;
     }
+    const double rms_lsb = std::sqrt(sq_err / (double)out.size());
+
+    // amax_out <= sqrt(2) * amax_in per dim-sized rotation segment
+    // (40_rope_u8_task.md §2.1(a) / rope_u8_qnn_per_op_handoff §"orthogonal
+    // pair" argument): rotation preserves a^2+b^2 per pair, so the segment
+    // max can grow by at most sqrt(2). 0.05 slack absorbs quantization
+    // rounding at both ends.
+    double max_amax_ratio = 0.0;
+    for (uint32_t m = 0; m < c.rows; ++m) {
+      const uint8_t *xr = x.data() + (size_t)m * c.width;
+      const uint8_t *outr = out.data() + (size_t)m * c.width;
+      for (uint32_t w = 0; w + c.dim <= c.width; w += c.dim) {
+        float amax_in = 0.0f, amax_out = 0.0f;
+        for (uint32_t k = 0; k < half; ++k) {
+          const float a_in =
+            std::fabs(((float)xr[w + k] - (float)zp[m]) * scale[m]);
+          const float b_in =
+            std::fabs(((float)xr[w + half + k] - (float)zp[m]) * scale[m]);
+          const float a_out =
+            std::fabs(((float)outr[w + k] - (float)kZpOut) * kSOut);
+          const float b_out =
+            std::fabs(((float)outr[w + half + k] - (float)kZpOut) * kSOut);
+          amax_in = std::max({amax_in, a_in, b_in});
+          amax_out = std::max({amax_out, a_out, b_out});
+        }
+        if (amax_in > 0.0f) {
+          max_amax_ratio =
+            std::max(max_amax_ratio, (double)(amax_out / amax_in));
+        }
+      }
+    }
+    EXPECT_LE(max_amax_ratio, std::sqrt(2.0) + 0.05)
+      << "shape " << c.rows << "x" << c.width << " dim=" << c.dim;
+
     std::cout << "ROPE_FIELD rows=" << c.rows << " width=" << c.width
               << " dim=" << c.dim << " max_lsb=" << max_err
+              << " rms_lsb=" << rms_lsb
               << " mismatch_ratio=" << (double)mismatch / (double)out.size()
-              << " saturated=" << dsp_sat << std::endl;
+              << " saturated=" << dsp_sat
+              << " max_amax_ratio=" << max_amax_ratio << std::endl;
   }
+}
+
+/**
+ * @brief s_in/zp_in given as a length-1 broadcast must equal the same
+ *        value duplicated across every row.
+ */
+TEST_F(HvxRope, BroadcastEqualsPerRowSameValue) {
+  const uint32_t rows = 5, width = 128, dim = 64, half = dim / 2u;
+  std::vector<uint8_t> x((size_t)rows * width);
+  std::vector<uint8_t> broadcast_out(x.size()), per_row_out(x.size());
+  std::vector<int16_t> cos((size_t)rows * half), sin(cos.size());
+  for (uint32_t i = 0; i < x.size(); ++i) {
+    x[i] = (uint8_t)((i * 43u + 13u) & 255u);
+  }
+  for (uint32_t m = 0; m < rows; ++m) {
+    for (uint32_t k = 0; k < half; ++k) {
+      cos[(size_t)m * half + k] = (int16_t)(30000 - (int)(k * 51u));
+      sin[(size_t)m * half + k] = (int16_t)((int)(k * 29u) - 300);
+    }
+  }
+  std::vector<float> broadcast_scale = {0.375f};
+  std::vector<int32_t> broadcast_zp = {77};
+  std::vector<float> per_row_scale(rows, 0.375f);
+  std::vector<int32_t> per_row_zp(rows, 77);
+
+  uint32_t bsat = 0, psat = 0;
+  ASSERT_EQ(
+    nntr_hvx_rope_u8(handle_, rows, width, dim, x.data(), (int)x.size(),
+                     broadcast_scale.data(), 1, broadcast_zp.data(), 1,
+                     cos.data(), (int)cos.size(), sin.data(), (int)sin.size(),
+                     0.5f, 90, broadcast_out.data(), (int)broadcast_out.size(),
+                     &bsat),
+    AEE_SUCCESS);
+  ASSERT_EQ(
+    nntr_hvx_rope_u8(handle_, rows, width, dim, x.data(), (int)x.size(),
+                     per_row_scale.data(), (int)per_row_scale.size(),
+                     per_row_zp.data(), (int)per_row_zp.size(), cos.data(),
+                     (int)cos.size(), sin.data(), (int)sin.size(), 0.5f, 90,
+                     per_row_out.data(), (int)per_row_out.size(), &psat),
+    AEE_SUCCESS);
+
+  EXPECT_EQ(bsat, psat);
+  EXPECT_EQ(broadcast_out, per_row_out);
 }
 
 TEST_F(HvxRope, LaneOrderAndSaturationAreObservable) {
@@ -162,30 +329,53 @@ TEST_F(HvxRope, LaneOrderAndSaturationAreObservable) {
   EXPECT_GT(dsp_sat, 0u);
 }
 
-TEST_F(HvxRope, GeneratesQnnUint8CacheAndReusesIt) {
+TEST_F(HvxRope, GeneratesCacheAndReusesIt) {
   constexpr uint32_t positions = 16;
   constexpr uint32_t dim = 64;
   constexpr uint32_t rows = 3;
   constexpr uint32_t width = 64;
-  constexpr float theta = 1000000.0f;
-  constexpr float table_scale = 1.0f / 127.0f;
+  constexpr uint32_t half = dim / 2;
+  constexpr float theta_base = 1000000.0f;
+  constexpr float attention_scaling = 0.87f; // deliberately != 1.0
+  // Placeholder until the real QNN cos/sin Const encoding is extracted
+  // (doc 42 S1b); table_scale/table_zp are carried only for the cache key,
+  // not used to build the Q15 table (nntr_hvx.idl's rope_cache_init).
+  constexpr float table_scale = 2.0f / 255.0f;
   constexpr int32_t table_zp = 128;
+
+  const std::vector<float> thetas = DefaultThetas(dim, theta_base);
   uint32_t generation = 0;
-  ASSERT_EQ(
-    nntr_hvx_rope_cache_init(handle_, positions, dim, theta, &generation),
-    AEE_SUCCESS);
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, positions, thetas.data(),
+                                     (int)thetas.size(), attention_scaling,
+                                     table_scale, table_zp, &generation),
+            AEE_SUCCESS);
   ASSERT_NE(generation, 0u);
   uint32_t same_generation = 0;
-  ASSERT_EQ(
-    nntr_hvx_rope_cache_init(handle_, positions, dim, theta, &same_generation),
-    AEE_SUCCESS);
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, positions, thetas.data(),
+                                     (int)thetas.size(), attention_scaling,
+                                     table_scale, table_zp, &same_generation),
+            AEE_SUCCESS);
   EXPECT_EQ(same_generation, generation);
+
+  // A different attention_scaling must bump the generation -- this is
+  // exactly what doc 43 §2.3/§2.4 fixed: the old cache ignored it.
+  uint32_t different_generation = 0;
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, positions, thetas.data(),
+                                     (int)thetas.size(), attention_scaling * 2,
+                                     table_scale, table_zp,
+                                     &different_generation),
+            AEE_SUCCESS);
+  EXPECT_NE(different_generation, generation);
+  // Restore the cache the rest of this test relies on.
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, positions, thetas.data(),
+                                     (int)thetas.size(), attention_scaling,
+                                     table_scale, table_zp, &generation),
+            AEE_SUCCESS);
 
   std::vector<uint8_t> x(rows * width), cached(x.size()), direct(x.size());
   std::vector<float> scale(rows, 0.25f);
   std::vector<int32_t> zp(rows, 127);
   const uint32_t position_start = 2;
-  const uint32_t half = dim / 2;
   std::vector<int16_t> cos(rows * half), sin(rows * half);
   for (size_t i = 0; i < x.size(); ++i) {
     x[i] = static_cast<uint8_t>((i * 37u + 11u) & 255u);
@@ -193,21 +383,9 @@ TEST_F(HvxRope, GeneratesQnnUint8CacheAndReusesIt) {
   for (uint32_t m = 0; m < rows; ++m) {
     const uint32_t pos = position_start + m;
     for (uint32_t k = 0; k < half; ++k) {
-      const float angle =
-        static_cast<float>(pos) *
-        ::powf(theta, -2.0f * static_cast<float>(k) / static_cast<float>(dim));
-      const auto qnn = [](float value) {
-        return static_cast<uint8_t>(
-          std::max(0.0f, std::min(255.0f, ::nearbyintf(value / table_scale) +
-                                            static_cast<float>(table_zp))));
-      };
-      const auto q15 = [](uint8_t value) {
-        const int32_t v = static_cast<int32_t>(::nearbyintf(
-          (static_cast<int>(value) - table_zp) * table_scale * 32768.0f));
-        return static_cast<int16_t>(std::max(-32768, std::min(32767, v)));
-      };
-      cos[m * half + k] = q15(qnn(std::cos(angle)));
-      sin[m * half + k] = q15(qnn(std::sin(angle)));
+      const float angle = static_cast<float>(pos) * thetas[k];
+      cos[m * half + k] = RealToQ15(std::cos(angle) * attention_scaling);
+      sin[m * half + k] = RealToQ15(std::sin(angle) * attention_scaling);
     }
   }
   uint32_t cached_sat = 0;
@@ -228,9 +406,62 @@ TEST_F(HvxRope, GeneratesQnnUint8CacheAndReusesIt) {
   ASSERT_EQ(nntr_hvx_rope_cache_clear(handle_), AEE_SUCCESS);
 }
 
-TEST_F(HvxRope, RejectsCacheRangeMismatch) {
+/**
+ * @brief A zeroed theta produces an (approximately, Q15-limited) identity
+ *        rotation -- the mechanism partial rotary relies on
+ *        (40_rope_u8_task.md §1.4): the caller does not need a "skip this
+ *        channel" code path, just a zero in thetas.
+ */
+TEST_F(HvxRope, ZeroedThetaGivesIdentityRotation) {
+  constexpr uint32_t dim = 64;
+  constexpr uint32_t half = dim / 2;
+  constexpr uint32_t width = dim;
+  constexpr uint32_t rows = 1;
+  constexpr uint32_t position = 5;
+
+  std::vector<float> thetas = DefaultThetas(dim, 1000000.0f);
+  // Emulate a partial-rotary factor of 0.5: the upper half of the rotated
+  // dimension gets angle 0 at every position.
+  for (uint32_t k = half / 2; k < half; ++k) {
+    thetas[k] = 0.0f;
+  }
+
   uint32_t generation = 0;
-  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, 4, 64, 1000000.0f, &generation),
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, position + 1, thetas.data(),
+                                     (int)thetas.size(), 1.0f, 1.0f, 0,
+                                     &generation),
+            AEE_SUCCESS);
+
+  std::vector<uint8_t> x(width), out(width);
+  for (uint32_t i = 0; i < width; ++i) {
+    x[i] = (uint8_t)(20 + i * 3);
+  }
+  std::vector<float> scale(1, 0.1f);
+  std::vector<int32_t> zp(1, 128);
+  uint32_t saturated = 0;
+  ASSERT_EQ(nntr_hvx_rope_u8_cached(handle_, rows, width, dim, position,
+                                    x.data(), (int)x.size(), scale.data(), 1,
+                                    zp.data(), 1, 0.1f, 128, out.data(),
+                                    (int)out.size(), &saturated),
+            AEE_SUCCESS);
+
+  // theta == 0 -> cos(0) == 1 (Q15's closest representable value, 32767)
+  // and sin(0) == 0, so those lanes are within one requantization LSB of
+  // the input -- not bit-exact, since Q15 cannot hit 1.0 exactly
+  // (40_rope_u8_task.md §1.4).
+  for (uint32_t k = half / 2; k < half; ++k) {
+    EXPECT_LE(std::abs((int)out[k] - (int)x[k]), 1) << "lane " << k;
+    EXPECT_LE(std::abs((int)out[half + k] - (int)x[half + k]), 1)
+      << "lane " << (half + k);
+  }
+}
+
+TEST_F(HvxRope, RejectsCacheRangeMismatch) {
+  const std::vector<float> thetas = DefaultThetas(64, 1000000.0f);
+  uint32_t generation = 0;
+  ASSERT_EQ(nntr_hvx_rope_cache_init(handle_, 4, thetas.data(),
+                                     (int)thetas.size(), 1.0f, 1.0f, 0,
+                                     &generation),
             AEE_SUCCESS);
   std::vector<uint8_t> x(64), y(64);
   std::vector<float> scale(1, 1.0f);
