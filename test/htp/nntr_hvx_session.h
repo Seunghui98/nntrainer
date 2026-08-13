@@ -39,13 +39,23 @@ typedef struct {
   hexkl_weight_u8i4_table weights_u8i4;
   hexkl_weight_u8i8_table weights_u8i8;
   hvx_worker_pool *quant_pool; /**< sized from the HVX unit count in open() */
-  uint8_t *rope_cos_u8;
-  uint8_t *rope_sin_u8;
+  /**
+   * RoPE Q15 sin/cos cache. Keyed on the full (n_positions, thetas,
+   * attention_scaling, table_scale, table_zp) tuple -- not just theta --
+   * because those five values are what precompute_freqs on ARM reduces
+   * every rope scaling type and the partial rotary factor to
+   * (nntr_hvx.idl's rope_cache_init comment, doc 43 §2.3/§2.4). No QNN
+   * uint8-encoded intermediate table is kept: nothing on the DSP side
+   * reads it, so keeping it was dead memory (doc 43 §2.5).
+   */
   int16_t *rope_cos_q15;
   int16_t *rope_sin_q15;
+  float *rope_thetas;     /**< rope_cache_half entries, the cache key */
   uint32_t rope_cache_positions;
-  uint32_t rope_cache_dim;
-  float rope_cache_theta;
+  uint32_t rope_cache_half; /**< dim / 2 the cache was built with */
+  float rope_cache_attention_scaling;
+  float rope_cache_table_scale;
+  int32_t rope_cache_table_zp;
   uint32_t rope_cache_generation;
 } nntr_hvx_session;
 

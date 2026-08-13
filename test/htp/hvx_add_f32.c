@@ -156,10 +156,9 @@ int nntr_hvx_close(remote_handle64 handle) {
     }
   }
   hvx_worker_pool_destroy(s->quant_pool);
-  free(s->rope_cos_u8);
-  free(s->rope_sin_u8);
   free(s->rope_cos_q15);
   free(s->rope_sin_q15);
+  free(s->rope_thetas);
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {
     res = hexkl_micro_hmx_unlock();

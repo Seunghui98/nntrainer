@@ -117,14 +117,25 @@ interface nntr_hvx : remote_handle64 {
                      in int32 zp_out, rout sequence<uint8> y,
                      rout uint32 n_saturated);
 
-   // Builds and caches QNN-compatible QUInt8 sin/cos tables. The cache is
-   // session-owned and the returned generation changes only on a new config.
-   AEEResult rope_cache_init(in uint32 n_positions, in uint32 dim,
-                             in float theta, rout uint32 generation);
+   // Builds and caches a Q15 sin/cos table for [0, n_positions), one entry
+   // per position per element of thetas. thetas and attention_scaling are
+   // exactly what precompute_freqs (mha_core.cpp) already computes on ARM
+   // -- default/yarn/proportional rope scaling and a partial rotary factor
+   // all reduce to these two, so the DSP does not re-derive any of them
+   // (doc 40 §1.3(b), doc 43 §2.3/§2.4). table_scale/table_zp are carried
+   // through only to keep the cache key complete; the table itself is
+   // always stored as Q15, never as the QNN-encoded uint8 intermediate.
+   // The cache is session-owned and the returned generation changes only
+   // on a new (n_positions, thetas, attention_scaling, table_scale,
+   // table_zp).
+   AEEResult rope_cache_init(in uint32 n_positions, in sequence<float> thetas,
+                             in float attention_scaling, in float table_scale,
+                             in int32 table_zp, rout uint32 generation);
    AEEResult rope_cache_clear();
 
    // Uses the session cache for positions [position_start, position_start +
-   // n_rows). The cached table is QUInt8 (scale 1/127, zero point 128).
+   // n_rows). dim must be 2 * the thetas length rope_cache_init was called
+   // with.
    AEEResult rope_u8_cached(in uint32 n_rows, in uint32 width, in uint32 dim,
                             in uint32 position_start, in sequence<uint8> x,
                             in sequence<float> s_in,
