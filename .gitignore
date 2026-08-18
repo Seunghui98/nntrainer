@@ -88,3 +88,6 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+# meson wrap-git lock file (local build state, not source)
+subprojects/.wraplock
+
