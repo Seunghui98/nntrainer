@@ -2,6 +2,13 @@ LOCAL_PATH := $(call my-dir)
 
 MESON_HAS_TFLITE := @MESON_HAS_TFLITE@
 
+# ml-api include path; empty when ml-api is absent (capi off).
+MESON_HAS_ML_API := @MESON_HAS_ML_API@
+ML_API_INCLUDE :=
+ifeq ($(MESON_HAS_ML_API),1)
+ML_API_INCLUDE := @MESON_ML_API_COMMON_ROOT@/include
+endif
+
 ifeq ($(MESON_HAS_TFLITE),1)
 
 include $(CLEAR_VARS)
@@ -30,15 +37,18 @@ LOCAL_EXPORT_CFLAGS += -DUSE_BLAS=1
 
 include $(PREBUILT_STATIC_LIBRARY)
 
+# guarded: ml-api prebuilt only exists when capi is enabled.
+ifeq ($(MESON_HAS_ML_API),1)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := ml-api-inference
 
 LOCAL_SRC_FILES := @MESON_ML_API_COMMON_ROOT@/lib/arm64-v8a/libnnstreamer-native.so
-LOCAL_EXPORT_C_INCLUDES := @MESON_ML_API_COMMON_ROOT@/include
+LOCAL_EXPORT_C_INCLUDES := $(ML_API_INCLUDE)
 LOCAL_LDFLAGS 	    += "-Wl,-z,max-page-size=16384"
 
 include $(PREBUILT_SHARED_LIBRARY)
+endif
 
 include $(CLEAR_VARS)
 
@@ -182,12 +192,12 @@ include $(CLEAR_VARS)
 LOCAL_MODULE        := nntrainer
 LOCAL_SRC_FILES     := @MESON_NNTRAINER_SRCS@
 # @todo ML_API_COMMON_ROOT should be included by exporting ml-api-common lib later
-LOCAL_C_INCLUDES    := @MESON_NNTRAINER_INCS@ @MESON_ML_API_COMMON_ROOT@/include
+LOCAL_C_INCLUDES    := @MESON_NNTRAINER_INCS@ $(ML_API_INCLUDE)
 LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 
 LOCAL_ARM_NEON      := true
-LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
-LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ @MESON_CXXFLAGS@
+LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @MESON_CXXFLAGS@
 # Opt-in lower-peak-memory inference planner (off by default). The YOLOv11
 # inference build sets ENABLE_MEMORY_PLANNER_V3=1 on the ndk-build command line.
 ifeq ($(ENABLE_MEMORY_PLANNER_V3), 1)
@@ -216,12 +226,12 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE        := ccapi-nntrainer
 LOCAL_SRC_FILES     := @MESON_CCAPI_NNTRAINER_SRCS@
-LOCAL_C_INCLUDES    := @MESON_CCAPI_NNTRAINER_INCS@ @MESON_ML_API_COMMON_ROOT@/include
+LOCAL_C_INCLUDES    := @MESON_CCAPI_NNTRAINER_INCS@ $(ML_API_INCLUDE)
 LOCAL_EXPORT_C_INCLUDES := $(LOCAL_C_INCLUDES)
 
 LOCAL_ARM_NEON      := true
-LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
-LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ -DVERSION_MAJOR=@VERSION_MAJOR@ -DVERSION_MINOR=@VERSION_MINOR@ -DVERSION_MICRO=@VERSION_MICRO@ @MESON_CXXFLAGS@
+LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DVERSION_MAJOR=@VERSION_MAJOR@ -DVERSION_MINOR=@VERSION_MINOR@ -DVERSION_MICRO=@VERSION_MICRO@ @MESON_CXXFLAGS@
 LOCAL_MODULE_TAGS   := optional
 
 LOCAL_LDLIBS        := -llog -landroid
@@ -231,6 +241,8 @@ LOCAL_SHARED_LIBRARIES += nntrainer
 
 include $(BUILD_SHARED_LIBRARY)
 
+# capi-nntrainer needs ml-api, so build it only when ml-api is present.
+ifeq ($(MESON_HAS_ML_API),1)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE        := capi-nntrainer
@@ -239,8 +251,8 @@ LOCAL_C_INCLUDES    := @MESON_CAPI_NNTRAINER_INCS@
 LOCAL_EXPORT_C_INCLUDES := $(LOCAL_C_INCLUDES)
 
 LOCAL_ARM_NEON      := true
-LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
-LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ @MESON_CXXFLAGS@
+LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @MESON_CXXFLAGS@
 LOCAL_MODULE_TAGS   := optional
 
 LOCAL_LDLIBS        := -llog -landroid
@@ -249,6 +261,7 @@ LOCAL_LDFLAGS 	    += "-Wl,-z,max-page-size=16384"
 LOCAL_SHARED_LIBRARIES += ccapi-nntrainer nntrainer ml-api-inference
 
 include $(BUILD_SHARED_LIBRARY)
+endif
 
 ifeq (@MESON_ENABLE_NPU@,1)
 
@@ -259,8 +272,8 @@ LOCAL_SRC_FILES     := @MESON_QNN_SRCS@
 LOCAL_C_INCLUDES    := @MESON_QNN_INCS@ @MESON_ML_API_COMMON_ROOT@/include @MESON_NNTRAINER_INCS@
 LOCAL_EXPORT_C_INCLUDES := $(LOCAL_C_INCLUDES)
 
-LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
-LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ @MESON_CXXFLAGS@ -DENABLE_QNN=1 -DPLUGGABLE=1
+LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @MESON_CXXFLAGS@ -DENABLE_QNN=1 -DPLUGGABLE=1
 LOCAL_MODULE_TAGS   := optional
 
 LOCAL_LDLIBS        := -llog -landroid
