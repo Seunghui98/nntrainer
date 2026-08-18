@@ -30,6 +30,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/siglip2 \
+    $(LOCAL_PATH)/../models/pelang \
     $(LOCAL_PATH)/../models/bert_decoder \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
@@ -87,6 +88,9 @@ LOCAL_SRC_FILES := \
     ../layers/per_layer_slice.cpp \
     ../layers/scalar_multiply.cpp \
     ../layers/logit_softcapping.cpp \
+    ../layers/pe_rope.cpp \
+    ../layers/pe_cls_pos.cpp \
+    ../layers/layer_scale.cpp \
     ../layers/mha_core.cpp \
     ../layers/lm_head.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
@@ -109,6 +113,7 @@ LOCAL_SRC_FILES := \
     ../layers/shared_fully_connected_layer.cpp \
     ../api/streamer.cpp \
     ../models/siglip2/siglip2_vision_encoder.cpp \
+    ../models/pelang/pelang_vision_encoder.cpp \
     ../models/bert_decoder/bert_decoder.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
@@ -225,6 +230,9 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/per_layer_slice.cpp \
     ../layers/scalar_multiply.cpp \
     ../layers/logit_softcapping.cpp \
+    ../layers/pe_rope.cpp \
+    ../layers/pe_cls_pos.cpp \
+    ../layers/layer_scale.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
@@ -247,6 +255,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../api/streamer.cpp \
     ../models/siglip2/siglip2_vision_encoder.cpp \
     ../models/siglip2/stb_image_impl.cpp \
+    ../models/pelang/pelang_vision_encoder.cpp \
     ../models/bert_decoder/bert_decoder.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
@@ -267,6 +276,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/siglip2 \
+    $(LOCAL_PATH)/../models/pelang \
     $(LOCAL_PATH)/../models/bert_decoder \
 
 include $(BUILD_EXECUTABLE)

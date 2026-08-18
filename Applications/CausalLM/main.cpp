@@ -49,6 +49,7 @@
 #if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
 #endif
+#include "pelang/pelang_vision_encoder.h"
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
@@ -292,38 +293,46 @@ static int runDumpEncoder(int argc, char *argv[]) {
         ? nntr_cfg["model_file_name"].get<std::string>()
         : nntr_cfg["encoder_model_file_name"].get<std::string>();
 
-    auto enc =
-      std::make_unique<causallm::Siglip2VisionEncoder>(cfg, gen_cfg, nntr_cfg);
-    enc->initialize();
-    enc->load_weight(dir + "/" + weight_name);
+    // Dispatch by nntr_config["encoder_backend"]. Default = siglip2 (G10 gate
+    // preserves the v2.3 path with no config change).
+    auto run_dump = [&](auto &enc, size_t proj_dim) {
+      enc.initialize();
+      enc.load_weight(dir + "/" + weight_name);
 
-    std::vector<float> out;
-    if (!pixel_npy.empty()) {
-      // [1,3,img,img] derived from the encoder's image_size (config-driven, not
-      // tied to any fixed checkpoint resolution).
-      const json &enc_cfg = cfg.contains("encoder") ? cfg["encoder"] : cfg;
-      const size_t img =
-        enc_cfg.value("image_size", nntr_cfg.value("img_size", 224u));
-      const size_t pixels = 3u * img * img;
-      auto px = readNpyF32(pixel_npy, pixels);
-      out = enc->encodePixels(px.data(), px.size());
+      std::vector<float> out;
+      if (!pixel_npy.empty()) {
+        const json &enc_cfg = cfg.contains("encoder") ? cfg["encoder"] : cfg;
+        const size_t img =
+          enc_cfg.value("image_size", nntr_cfg.value("img_size", 224u));
+        const size_t pixels = 3u * img * img;
+        auto px = readNpyF32(pixel_npy, pixels);
+        out = enc.encodePixels(px.data(), px.size());
+      } else {
+        out = enc.encode(image);
+      }
+
+      std::cout << "[dump-encoder] first 5:";
+      for (size_t i = 0; i < 5 && i < out.size(); ++i)
+        std::cout << " " << out[i];
+      std::cout << "\n";
+
+      const std::string shape = "(1, " + std::to_string(out.size() / proj_dim) +
+                                ", " + std::to_string(proj_dim) + ")";
+      writeNpyF32("nntr_encoder_hidden.npy", out, shape);
+      std::cout << "Dumped encoder output to nntr_encoder_hidden.npy ("
+                << out.size() << " floats, shape " << shape << ")\n";
+    };
+
+    const std::string backend = nntr_cfg.value("encoder_backend", "siglip2");
+    if (backend == "pelang_l14_448") {
+      auto enc =
+        std::make_unique<causallm::PELangVisionEncoder>(cfg, gen_cfg, nntr_cfg);
+      run_dump(*enc, causallm::PELangVisionEncoder::ENC_TO_DEC_DIM);
     } else {
-      out = enc->encode(image);
+      auto enc = std::make_unique<causallm::Siglip2VisionEncoder>(cfg, gen_cfg,
+                                                                  nntr_cfg);
+      run_dump(*enc, causallm::Siglip2VisionEncoder::ENC_TO_DEC_DIM);
     }
-
-    std::cout << "[dump-encoder] first 5:";
-    for (size_t i = 0; i < 5 && i < out.size(); ++i)
-      std::cout << " " << out[i];
-    std::cout << "\n";
-
-    // Output is [1, num_patches, ENC_TO_DEC_DIM]; derive the shape from the
-    // projection dim and the actual element count (no hardcoded resolution).
-    const size_t dim = causallm::Siglip2VisionEncoder::ENC_TO_DEC_DIM;
-    const std::string shape = "(1, " + std::to_string(out.size() / dim) + ", " +
-                              std::to_string(dim) + ")";
-    writeNpyF32("nntr_encoder_hidden.npy", out, shape);
-    std::cout << "Dumped encoder output to nntr_encoder_hidden.npy ("
-              << out.size() << " floats, shape " << shape << ")\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &e) {
     std::cerr << "[!] FATAL ERROR (--dump-encoder): " << e.what() << "\n";
@@ -346,7 +355,10 @@ static int runDecoderInitParity(const std::string &model_dir) {
     mtt = nntr.value("model_tensor_type", mtt);
     fc_dt = nntr.value("fc_layer_dtype", fc_dt);
     embd_dt = nntr.value("embedding_dtype", embd_dt);
-    if (nntr.contains("model_file_name"))
+    if (nntr.contains("decoder_model_file_name"))
+      weight_file =
+        model_dir + "/" + nntr["decoder_model_file_name"].get<std::string>();
+    else if (nntr.contains("model_file_name"))
       weight_file =
         model_dir + "/" + nntr["model_file_name"].get<std::string>();
   } catch (const std::exception &) {
@@ -354,10 +366,18 @@ static int runDecoderInitParity(const std::string &model_dir) {
   }
 
   try {
-    constexpr size_t ENC_COUNT = 1u * 196 * 256; // 50176
+    json nntr_par;
+    try {
+      nntr_par = causallm::LoadJsonFile(model_dir + "/nntr_config.json");
+    } catch (const std::exception &) {
+    }
+    const unsigned int enc_len_v = nntr_par.value("enc_len", 196u);
+    const unsigned int dec_hidden_v =
+      nntr_par.value("decoder_hidden_size", 256u);
+    const size_t ENC_COUNT = static_cast<size_t>(enc_len_v) * dec_hidden_v;
     auto enc = readNpyF32(model_dir + "/golden.encoder_hidden.npy", ENC_COUNT);
 
-    auto dec = std::make_unique<causallm::BertDecoder>();
+    auto dec = std::make_unique<causallm::BertDecoder>(nntr_par);
     dec->setTensorTypes(mtt, fc_dt, embd_dt);
     dec->initialize();
     dec->load_weight(weight_file);

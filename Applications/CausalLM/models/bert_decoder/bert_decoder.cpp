@@ -49,6 +49,30 @@ std::string toStringPrecise(float v) {
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
+// Config-driven constructor
+//
+// Calls the no-arg ctor first (picks up all v2.3 BERT-small defaults +
+// publishes them to the base Transformer fields), then overrides the four
+// config-driven dimensions from `nntr_config.json` and re-publishes the
+// affected base fields (DIM / NUM_HEADS / NUM_KEY_VALUE_HEADS /
+// INTERMEDIATE_SIZE). Missing keys keep the v2.3 defaults — G10 regression
+// for the SigLIP2 path remains correct without nntr_config edits.
+// ---------------------------------------------------------------------------
+
+BertDecoder::BertDecoder(const json &nntr_cfg) : BertDecoder() {
+  BD_DIM = nntr_cfg.value("decoder_hidden_size", BD_DIM);
+  BD_NUM_HEADS = nntr_cfg.value("decoder_num_heads", BD_NUM_HEADS);
+  BD_INTERMEDIATE_SIZE =
+    nntr_cfg.value("decoder_intermediate_size", BD_INTERMEDIATE_SIZE);
+  BD_ENC_LEN = nntr_cfg.value("enc_len", static_cast<unsigned int>(196));
+
+  DIM = BD_DIM;
+  NUM_HEADS = BD_NUM_HEADS;
+  NUM_KEY_VALUE_HEADS = BD_NUM_HEADS;
+  INTERMEDIATE_SIZE = BD_INTERMEDIATE_SIZE;
+}
+
+// ---------------------------------------------------------------------------
 // initialize
 // ---------------------------------------------------------------------------
 
@@ -158,7 +182,8 @@ std::pair<std::vector<Tensor>, Tensor> BertDecoder::constructDecoderGraph() {
 
   // Encoder hidden states [1,1,196,256] — unused until Task 5 cross-attn, but
   // declared here so the input signature remains stable across tasks.
-  Tensor encoder_hidden({1, 1, 196, BD_DIM}, "encoder_hidden");
+  Tensor encoder_hidden({1u, 1u, BD_ENC_LEN, static_cast<unsigned int>(BD_DIM)},
+                         "encoder_hidden");
 
   // ===== Embeddings =====
   // word_emb: in_dim=30522, out_dim=256 (NOT tie_word_embeddings; LM tie Task
@@ -841,15 +866,15 @@ bool BertDecoder::smokeTest() {
   std::vector<float> in_token_buf(1, 101.0f); // [CLS]
   std::vector<float> in_pos_buf(1, 0.0f);
   std::vector<float> in_type_buf(1, 0.0f);
-  std::vector<float> in_enc(static_cast<size_t>(196) * BD_DIM, 0.0f);
+  std::vector<float> in_enc(static_cast<size_t>(BD_ENC_LEN) * BD_DIM, 0.0f);
 
   // Dummy zero-filled cross-attention K/V cache buffers (UINT16 placeholders,
   // 196 x 256 elements => 2 bytes each). Task 7 fills these from the encoder
   // K/V projections; for the self-attn smoke we just bind valid storage so the
   // graph runs end-to-end. One shared zero buffer per K and V is sufficient
   // since the smoke only checks the self-attn path does not regress.
-  std::vector<uint16_t> cross_k_dummy(static_cast<size_t>(196) * BD_DIM, 0);
-  std::vector<uint16_t> cross_v_dummy(static_cast<size_t>(196) * BD_DIM, 0);
+  std::vector<uint16_t> cross_k_dummy(static_cast<size_t>(BD_ENC_LEN) * BD_DIM, 0);
+  std::vector<uint16_t> cross_v_dummy(static_cast<size_t>(BD_ENC_LEN) * BD_DIM, 0);
 
   // Build name -> ptr lookup table
   std::unordered_map<std::string, float *> name_to_ptr;

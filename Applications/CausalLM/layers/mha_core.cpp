@@ -119,8 +119,8 @@ MHACoreLayer::MHACoreLayer() :
     props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
     props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal(),
-    props::UseGemmAttention(), props::CrossAttention()),
+    props::AttnLogitSoftcapping(), props::IsCausal(), props::UseGemmAttention(),
+    props::CrossAttention()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -255,10 +255,10 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 #else
     ml::train::TensorDim cache_key_dim(
       {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+      {context.getFormat(), ml::train::TensorDim::DataType::FP32});
     ml::train::TensorDim cache_value_dim(
       {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+      {context.getFormat(), ml::train::TensorDim::DataType::FP32});
 #endif
 
     tensor_idx[AttentionParams::cache_key] = context.requestTensor(
@@ -1980,7 +1980,7 @@ void MHACoreLayer::updateTensorsByInputDimensions(
 #ifdef ENABLE_FP16
   kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP16);
 #else
-  kv_cache_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
+  kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP32);
 #endif
   kv_cache_dim.height(max_timestep);
 

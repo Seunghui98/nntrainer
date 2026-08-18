@@ -40,6 +40,9 @@ causallm_layer_dependencies += [
     causallm_per_layer_slice_dep,
     causallm_scalar_multiply_dep,
     causallm_logit_softcapping_dep,
+    causallm_pe_rope_dep,
+    causallm_pe_cls_pos_dep,
+    causallm_layer_scale_dep,
 ]
 
 subdir('models')

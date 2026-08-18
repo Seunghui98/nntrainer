@@ -1,0 +1,15 @@
+{
+  "architectures": ["PELangVisionEncoder"],
+  "model_type": "pelang_l14_448_bert_small",
+  "dtype": "float32",
+  "encoder": {
+    "hidden_size": 1024,
+    "image_size": 448,
+    "intermediate_size": 4096,
+    "layer_norm_eps": 1e-05,
+    "num_attention_heads": 16,
+    "num_channels": 3,
+    "num_hidden_layers": 23,
+    "patch_size": 14
+  }
+}

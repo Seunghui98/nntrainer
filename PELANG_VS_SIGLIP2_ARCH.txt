@@ -1,0 +1,139 @@
+================================================================================
+ ScreenAI caption encoder 교체 — SigLIP2-B/16-224  vs  PE-Lang-L14-448
+ (nntrainer 그래프 관점.  * = 신규,  x = 제거,  ! = 값/형태 변경)
+================================================================================
+
+┌─ 현행 (v2.3) ────────────────────────┐  ┌─ 신규 (v3.0.0-C62) ──────────────────┐
+│ Siglip2VisionEncoder                 │  │ PELangVisionEncoder                  │
+│ HF SiglipVisionModel                 │  │ timm vit_pe_lang_large_patch14_448   │
+│                                      │  │ (EVA 계열, Meta Perception Encoder)  │
+└──────────────────────────────────────┘  └──────────────────────────────────────┘
+
+  input0 [1,3,224,224]                      input0 [1,3,448,448]                !
+    │                                         │
+    ▼                                         ▼
+  conv2d  k=16 s=16 valid                   conv2d  k=14 s=14 valid            !
+    filters=768   bias=YES                     filters=1024  bias=NO           !
+    CRS = 3*16*16 = 768  (32*24) Q8_0 OK       CRS = 3*14*14 = 588  Q8_0 불가!  !
+    │                                         │
+    ▼ reshape + permute                       ▼ reshape + permute
+  [1,1,196,768]                             [1,1,1024,1024]
+    │                                         │
+    ▼ addition                                ▼ addition
+  pos_embedding [1,1,196,768]               pe_pos_embed [1,1,1024,1024]        !
+    │                                         │      (= positional_embedding[1:])
+    │                                         ▼ concat(axis=2)                  *
+    │                                       pe_cls_row [1,1,1,1024]             *
+    │                                         │  (= class_embedding + pos[0], 상수)
+    │                                         ▼   → [1,1,1025,1024]
+    │                                         ▼ layer_norm  eps=1e-5            *
+    │                                       pe_ln_pre
+    │                                         │
+    ├─────────── 12 blocks ──────────┐        ├─────────── 23 blocks ──────────┐ !
+    │                                │        │                               │
+    │  ┌──────────────────────────┐  │        │  ┌─────────────────────────┐  │
+    │  │ layer_norm  eps=1e-6   ! │  │        │  │ layer_norm  eps=1e-5  ! │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ wq / wk / wv  (3 FC)     │  │        │  │ wq / wk / wv  (3 FC)    │  │
+    │  │   768→768, bias          │  │        │  │  1024→1024, bias        │  │
+    │  │   src: 분리된 q/k/v      │  │        │  │  src: fused in_proj     │  │
+    │  │                          │  │        │  │       [3072,1024]     ! │  │
+    │  │                          │  │        │  │       → 컨버터가 3분할  │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │        ·                 │  │        │  │ pe_rope(q), pe_rope(k)* │  │
+    │  │  (position = abs only)   │  │        │  │  정적 2D axial 테이블   │  │
+    │  │                          │  │        │  │  interleaved, row 0 skip│  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ mha_core                 │  │        │  │ mha_core                │  │
+    │  │  heads=12  is_causal=F   │  │        │  │  heads=16  is_causal=F ! │  │
+    │  │  use_rope=F  N=196       │  │        │  │  use_rope=F  N=1025   ! │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ out FC 768→768, bias     │  │        │  │ out FC 1024→1024, bias  │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ addition (residual)      │  │        │  │ layer_scale             │  │
+    │  │  x = x + attn            │  │        │  │  x = x + gamma_1 ⊙ attn* │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ layer_norm  eps=1e-6     │  │        │  │ layer_norm  eps=1e-5    │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ fc1 768→3072, bias       │  │        │  │ fc1 1024→4096, bias   ! │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ activation "tanh_gelu" ! │  │        │  │ activation "gelu"(erf)! │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ fc2 3072→768, bias       │  │        │  │ fc2 4096→1024, bias     │  │
+    │  │        ↓                 │  │        │  │        ↓                │  │
+    │  │ addition (residual)      │  │        │  │ layer_scale             │  │
+    │  │  x = x + mlp             │  │        │  │  x = x + gamma_2 ⊙ mlp * │  │
+    │  └──────────────────────────┘  │        │  └─────────────────────────┘  │
+    └────────────────────────────────┘        └───────────────────────────────┘
+    │                                         │
+    ▼ layer_norm  eps=1e-6                    ▼      (post_ln 없음)            x
+  post_ln                                     │      timm norm = Identity
+    │                                         │
+    ▼ fully_connected                         ▼ fully_connected
+  enc_to_dec_proj  768→256, bias            enc_to_dec_proj 1024→512, bias    !
+    │                                         │
+    ▼                                         ▼
+  [1,196,256]                               [1,1025,512]                      !
+
+
+================================================================================
+ BERT decoder — 구조 동일, 치수만 변경 (새 아키텍처 아님)
+================================================================================
+
+                                    현행 (v2.3)      신규 (C62)
+  word/pos/type emb + LN(1e-12)     hidden 256   →   hidden 512            !
+  ┌─ 4 layers ────────────────────┐
+  │ self-attn  Q/K/V/O + LN       │   4 heads    →   8 heads               !
+  │      ↓                        │   head_dim 64    head_dim 64  (동일)
+  │ cross-attn Q/K/V/O + LN       │   K/V len 196 →  K/V len 1025          !
+  │      ↓                        │                  (include_cls_token=true)
+  │ FFN inter/out + LN            │   ffn 1024   →   ffn 2048              !
+  └───────────────────────────────┘   layers 4        layers 4     (동일)
+  lmhead_dense + LN + tied proj       vocab 30522      vocab 30522  (동일)
+
+  safetensors 키 구조 100% 동일 (114 tensors 확인) → 기존 컨버터 파라미터화로 재사용
+
+
+================================================================================
+ 연산량 (MAC / image 1장) — 20배
+================================================================================
+
+                         SigLIP2 (17.5 G)              PE-Lang (347.3 G)
+  patch conv    0.12 G   ▏                    0.62 G   ▏
+  attn QKVO     5.55 G   ████▌                98.9 G   ████████████▏
+  MLP          11.10 G   █████████           197.8 G   ████████████████████████▌
+  attention     0.71 G   ▋                    49.5 G   ██████▏
+  proj          0.04 G   ▏                    0.54 G   ▏
+              ─────────                     ─────────
+  total        17.51 G                       347.3 G       ← 19.8×
+              (1 눈금 ≈ 1.2 G)               (1 눈금 ≈ 8 G)
+
+  비중 변화:   MLP  64% → 57%
+               QKVO 32% → 29%
+               attn  4% → 14%   ← N=196→1025 이라 N² 항이 커진다. 최적화 우선순위 상승.
+
+  토큰 수      196 → 1025  (5.2×)
+  깊이         12  → 23    (1.9×)
+  hidden       768 → 1024  (1.33×)
+
+  cross-attn prefill (decoder, 이미지당 1회)
+               25.7 M → 537 M   (20.9×)
+
+  Q8_0 가중치 크기
+               encoder  92 MB → 322 MB  (3.5×)
+               decoder  13 MB →  28 MB
+
+
+================================================================================
+ nntrainer 쪽 신규 구현물
+================================================================================
+
+  * layers/pe_rope.{h,cpp}      정적 sin/cos 테이블 interleaved 회전, row 0 skip
+  * layers/layer_scale.{h,cpp}  out = residual + gamma ⊙ input  (2노드→1노드 융합)
+  * models/pelang/              PELangVisionEncoder
+  * res/pelang-encoder/         config / nntr_config / weight_converter / verify
+  ! models/bert_decoder/        하드코딩 상수 → config 주입
+  ! quantize.cpp                PE-Lang 팩토리 + patch conv Q8_0 차단
+  = layers/mha_core.cpp         변경 없음 (use_rope=false 로 그대로 사용)
+  = activation "gelu"           코어에 이미 있음 (ARM NEON 다항식 경로 포함)
+  = concat / permute / reshape   코어에 이미 있음

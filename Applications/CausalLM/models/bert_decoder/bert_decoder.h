@@ -60,10 +60,7 @@ class BertDecoder : virtual public Transformer {
 public:
   static constexpr const char *architectures = "BertDecoder";
 
-  // Hardcoded decoder constants matching the source BERT decoder.
-  static constexpr int BD_DIM = 256;
   static constexpr int BD_NUM_LAYERS = 4;
-  static constexpr int BD_NUM_HEADS = 4;
   static constexpr int BD_HEAD_DIM = 64;
   static constexpr unsigned int BD_NUM_VOCAB = 30522;
   static constexpr unsigned int BD_MAX_POSITION_EMBEDDINGS = 512;
@@ -73,18 +70,20 @@ public:
   static constexpr unsigned int BD_BATCH_SIZE = 1;
   static constexpr unsigned int BD_INIT_SEQ_LEN = 1;
   static constexpr unsigned int BD_MAX_SEQ_LEN = 512;
-  // Encoder (SigLIP2) output sequence length fed to cross-attention.
-  static constexpr unsigned int BD_ENC_LEN = 196;
-  // NUM_TO_GENERATE must be set for Transformer; use a reasonable default.
   static constexpr unsigned int BD_NUM_TO_GENERATE = 1;
 
-  // FFN intermediate size (4 * DIM = 1024 for BERT-small)
-  static constexpr int BD_INTERMEDIATE_SIZE = 1024;
+  // Config-driven dimensions. Defaults are the v2.3 BERT-small values; the
+  // json config ctor overrides them for PE-Lang (dim=512/heads=8/inter=2048/
+  // enc_len=1025). `BD_ENC_LEN` must drive every encoder-counted allocation
+  // (trap §6.11) — no hardcoded 196/256 literal may remain in this file.
+  int BD_DIM = 256;
+  int BD_NUM_HEADS = 4;
+  int BD_INTERMEDIATE_SIZE = 1024;
+  unsigned int BD_ENC_LEN = 196;
 
   /**
-   * @brief Construct a BertDecoder with hardcoded parameters.
-   *        Populates Transformer base fields directly (no JSON config
-   * required).
+   * @brief Construct a BertDecoder with the v2.3 BERT-small defaults; the
+   *        SigLIP2 path (G10 regression gate) uses this zero-arg ctor.
    */
   BertDecoder() : Transformer() {
     DIM = BD_DIM;
@@ -112,6 +111,16 @@ public:
     FSU_LOOKAHEAD = 1;
     NUM_TO_GENERATE = static_cast<int>(BD_NUM_TO_GENERATE);
   }
+
+  /**
+   * @brief Config-driven ctor: overrides BD_DIM / BD_NUM_HEADS /
+   *        BD_INTERMEDIATE_SIZE / BD_ENC_LEN from `nntr_config.json` keys
+   *        `decoder_hidden_size` / `decoder_num_heads` /
+   *        `decoder_intermediate_size` / `enc_len`. Missing keys fall back to
+   *        the v2.3 BERT-small defaults. The PE-Lang path (dim=512 /
+   *        heads=8 / inter=2048 / enc_len=1025) uses this ctor.
+   */
+  explicit BertDecoder(const json &nntr_cfg);
 
   virtual ~BertDecoder() = default;
 

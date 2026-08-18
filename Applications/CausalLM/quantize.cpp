@@ -90,6 +90,7 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "siglip2/siglip2_vision_encoder.h"
+#include "pelang/pelang_vision_encoder.h"
 #if !defined(_WIN32)
 #include "bert_decoder/bert_decoder.h"
 #endif
@@ -372,6 +373,11 @@ void registerAllModels() {
       return std::make_unique<causallm::Siglip2VisionEncoder>(
         cfg, generation_cfg, nntr_cfg);
     });
+  factory.registerModel(
+    "PELangVisionEncoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::PELangVisionEncoder>(
+        cfg, generation_cfg, nntr_cfg);
+    });
 #if !defined(_WIN32) && !defined(__ANDROID__)
   factory.registerModel(
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -382,10 +388,7 @@ void registerAllModels() {
 #if !defined(_WIN32)
   factory.registerModel(
     "BertDecoder", [](json cfg, json generation_cfg, json nntr_cfg) {
-      // BertDecoder hardcodes its dimensions; tensor dtypes come from
-      // nntr_config (FP32 for the source model). The graph is built FP32 to
-      // load FP32 weights; quantization happens at save via the dtype map.
-      auto dec = std::make_unique<causallm::BertDecoder>();
+      auto dec = std::make_unique<causallm::BertDecoder>(nntr_cfg);
       dec->setTensorTypes(nntr_cfg.value("model_tensor_type", "FP32-FP32"),
                           nntr_cfg.value("fc_layer_dtype", "FP32"),
                           nntr_cfg.value("embedding_dtype", "FP32"));
