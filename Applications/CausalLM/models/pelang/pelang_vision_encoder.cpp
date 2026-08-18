@@ -33,6 +33,12 @@
  */
 
 #include "pelang_vision_encoder.h"
+// stb_image implementation is provided by timm_vit_transformer.cpp (same
+// libcausallm.so target); include only for declarations here, matching
+// siglip2_vision_encoder.cpp's convention.
+#include "stb_image.inc"
+
+#include "pelang_bicubic_resize.h"
 
 #include <app_context.h>
 #include <engine.h>
@@ -53,21 +59,6 @@
 #include "layers/pe_rope.h"
 
 namespace causallm {
-
-/* -------------------------------------------------------------------------
- * Image preprocessing
- *
- * PE-Lang uses Pillow BICUBIC (a=-0.5, support=2.0) resize, NOT the BILINEAR
- * path SigLIP2 reproduces (plan §1.5). The bit-exact BICUBIC implementation
- * (PIL `Resample.c` fixed-point pipeline) is part of G7 (Phase 6+), gated
- * behind the on-device path. Phase 1-4 parity (G2/G3/G4) uses ONLY
- * `encodePixels()` with PyTorch-produced pixel.npy, so C++ resize never runs.
- *
- * `encode(path)` is therefore a deferred stub at this stage — calling it
- * throws a clear "not yet implemented" rather than silently producing wrong
- * numbers via the SigLIP2 BILINEAR arm. (ponytail: don't widen scope before
- * the easier parity win is captured.)
- * --------------------------------------------------------------------- */
 
 /* -------------------------------------------------------------------------
  * Parameter setup
@@ -402,14 +393,10 @@ std::vector<float> PELangVisionEncoder::encode(const std::string &image_path) {
   if (!is_initialized)
     throw std::runtime_error(
       "PELangVisionEncoder is not initialized. Call initialize() first.");
-  (void)image_path;
-  // ponytail: BICUBIC arm is §7/G7 work — deferred. Phase-1..4 parity
-  // verification uses encodePixels() exclusively, so encode(path) is a stub.
-  // Phase 6 (Quick.AI integration) replaces this with the real resizer.
-  throw std::runtime_error(
-    "PELangVisionEncoder::encode(path) not implemented yet — BICUBIC "
-    "preprocessing is G7 work. Use encodePixels() with a pre-prepared "
-    "pixel tensor for parity testing.");
+  std::vector<float> pixels = pelangLoadAndPreprocessImage(
+    image_path, static_cast<int>(IMG_SIZE), static_cast<int>(IMG_SIZE),
+    stbi_load, stbi_image_free);
+  return encodePixels(pixels.data(), pixels.size());
 }
 
 std::vector<float> PELangVisionEncoder::encodePixels(const float *pixel_data,

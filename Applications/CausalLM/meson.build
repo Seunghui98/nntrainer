@@ -261,6 +261,23 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Header-only (no libcausallm/pelang .so link needed): just gtest + the
+  # causallm_inc that already covers models/pelang for pelang_bicubic_resize.h.
+  unittest_pelang_bicubic_resize = executable(
+    'unittest_pelang_bicubic_resize',
+    meson.current_source_dir() / 'models' / 'pelang' / 'unittest_pelang_bicubic_resize.cpp',
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_pelang_bicubic_resize', unittest_pelang_bicubic_resize,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_pelang_bicubic_resize'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
