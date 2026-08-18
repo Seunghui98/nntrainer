@@ -908,17 +908,27 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
   const unsigned int num_qb = (N_q + Bq - 1) / Bq;
   auto &tm = nntrainer::ThreadManager::Global();
 
-  // Cache always stores half-precision (FP16-bit) values; read as raw uint16_t
-  // bits so we don't depend on ENABLE_FP16 / _FP16 / _Float16 being defined.
-  const uint16_t *Kbase;
-  const uint16_t *Vbase;
-#ifdef ENABLE_FP16
-  Kbase = reinterpret_cast<const uint16_t *>(b_cached_key.getData<_FP16>());
-  Vbase = reinterpret_cast<const uint16_t *>(b_cached_value.getData<_FP16>());
-#else
-  Kbase = b_cached_key.getData<uint16_t>();
-  Vbase = b_cached_value.getData<uint16_t>();
-#endif
+  // This flash path only has an FP16 compute kernel: it reads K/V as raw
+  // uint16_t FP16 bit patterns. On builds without ENABLE_FP16 (e.g. x86 FP32,
+  // used by the PE-Lang encoder for CPU parity) MHACoreLayer::finalize()
+  // allocates the K/V cache as FP32 instead, so reading it here as uint16_t
+  // would silently reinterpret FP32 bytes as garbage FP16 values. Guard
+  // instead of reinterpreting: this path is presently unreachable (gated by
+  // NNTR_ENABLE_GEMM_ATTENTION, never defined), but §4.2 of
+  // PELANG_L14_448_SUPPORT_PLAN.md proposes reviving it for N=1025 prefill,
+  // so fail loudly here rather than have that revival silently corrupt an
+  // FP32-cache build.
+  NNTR_THROW_IF(b_cached_key.getDataType() !=
+                    ml::train::TensorDim::DataType::FP16 ||
+                  b_cached_value.getDataType() !=
+                    ml::train::TensorDim::DataType::FP16,
+                std::invalid_argument)
+    << "gemm_attention() requires an FP16 K/V cache; got a non-FP16 cache "
+       "(e.g. FP32 on a non-ENABLE_FP16 build). Route this cache through the "
+       "reference compute_kcaches/compute_fp16vcache_transposed path instead.";
+
+  const uint16_t *Kbase = b_cached_key.getData<uint16_t>();
+  const uint16_t *Vbase = b_cached_value.getData<uint16_t>();
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
   // K/V always kept as raw FP16 bits (uint16). Q either FP32 (V-JEPA

@@ -1,7 +1,13 @@
-# PE-Lang-L14-448 Encoder nntrainer 포팅 — 핸드오프 문서
+# PE-Lang-L14-448 Encoder nntrainer 포팅 — 핸드오프 문서 (STALE — 참고용)
 
 > 작성일: 2026-08-18 | 브랜치: `feature/pelang-l14-448-encoder`
 > 작업자: Sisyphus (GLM 5.2) | 계획서: `PELANG_L14_448_SUPPORT_PLAN.md`
+
+> **이 문서는 §2의 compile() 블로커가 해결되기 전 시점의 스냅샷이다.**
+> 최신 상태(SOT)는 `PELANG_NEXT_AGENT_HANDOFF.md`를 볼 것. 아래 §2(블로커),
+> §4의 DBG 프린트 잔존 항목, §6의 `res/pelang-decoder/` 파일 목록은 이후
+> 커밋에서 전부 해소/변경되었으므로 더 이상 유효하지 않다 — Phase 1-4
+> 결정 사항과 함정 체크리스트(§4 결정사항, §7)만 참고할 것.
 
 ---
 
@@ -88,53 +94,29 @@
 - `main.cpp --decoder-init-parity`: `nntr_config.json`에서 `enc_len`/`decoder_hidden_size` 읽어 ENC_COUNT 계산 (하드코딩 196*256 제거)
 - G10 회귀 안전: 디폴트 ctor가 v2.3 값을 그대로 사용, 기존 SigLIP2 res는 수정 없이 동작
 
-### res 파일
+### res 파일 (STALE — 아래는 최종 레이아웃과 다름)
 
-**`res/pelang-encoder/`:**
-- `config.json` — encoder 구조 (hidden=1024, layers=23, heads=16, patch=14, image=448, eps=1e-5)
-- `nntr_config.json` — `encoder_backend: "pelang_l14_448"`, encoder/decoder 치수, `encoder_model_file_name`
-- `generation_config.json` — greedy 설정 (beam=1, max_length=77)
-- `nntr_pelang_encoder_fp32.bin` — 1.17 GB encoder 가중치
-- `golden.encoder_hidden.npy` — symlink → `pelang_golden/encoder_hidden.npy`
-
-**`res/pelang-decoder/`:**
-- `config.json` — decoder 구조 (hidden=512, heads=8, inter=2048, layers=4)
-- `nntr_config.json` — `decoder_hidden_size: 512`, `enc_len: 1025`, `model_file_name`
-- `generation_config.json`
-- `nntr_pelang_decoder_fp32.bin` — 132 MB decoder 가중치
-- `golden.encoder_hidden.npy` — 같은 symlink
+> 최종적으로는 별도 `res/pelang-decoder/` 디렉토리가 만들어지지 않았다.
+> encoder/decoder 치수가 전부 `res/pelang-encoder/nntr_config.json` 하나에
+> 통합되어 있고 (`encoder_model_file_name` / `decoder_model_file_name` 키로
+> 두 가중치 파일을 구분), `weight_converter.py`도 그 디렉토리 하나에서
+> encoder+decoder 두 파일을 함께 만든다. 실제 현재 레이아웃은
+> `res/pelang-encoder/{config.json, nntr_config.json,
+> generation_config.json, weight_converter.py}` 뿐이다 (가중치 `.bin`/
+> `.safetensors`와 golden npy는 체크아웃에 포함되지 않음 — 별도로 생성해야
+> 한다).
 
 ---
 
-## 2. 현재 블로커 — `model->compile()` 메모리 플래닝 실패
+## 2. (RESOLVED) `model->compile()` 메모리 플래닝 실패
 
-### 증상
-```
-[PE-Lang DBG] enc_to_dec_proj done, returning
-[!] FATAL ERROR (--dump-encoder): Creating shared tensor of size bigger than tensor memory.
-```
-
-### 분석
-- 그래프 생성(`constructModel()`)은 전부 성공 — 23블록 + enc_to_dec_proj까지 DBG 프린트 모두 출력됨
-- 에러 발생 위치: `Transformer::initialize()` 안의 `model->compile(x, y, INFERENCE)` 호출 (transformer.cpp:223)
-- 에러 메시지 출처: `nntrainer/tensor/tensor_base.cpp:228` — `getSharedDataTensor()`에서 `dim_.getDataLen() + offset > dim.getDataLen()` 조건
-- **0 layers + rope weight layers 제거 테스트**: `free(): invalid size` (heap corruption) → 블록/rope가 아니라 **patch embed 구조 자체**가 원인
-- **23 layers + rope weight layers 제거 테스트**: `[TensorDim] Trying to assign value <=0 to tensor dim` → rope_stash가 비어있어 pe_rope에 빈 텐서가 들어가서 차원 에러
-- 결론: 원래 에러("shared tensor size bigger")는 rope weight layers와 블록 구조가 **조합될 때** 발생. 0-layer에서 rope를 빼면 다른 에러(heap corruption)로 바뀜 → 근본 원인은 patch embed의 weight/concat 구조가 메모리 플래너와 충돌
-
-### 의심 원인 (최종 정리)
-
- SigLIP2와 PE-Lang의 patch embed 차이점 중 하나가 플래너를 깨뜨림:
-1. **conv2d disable_bias=true** — SigLIP2는 bias 있음. bias 없는 conv의 출력 텐서 할당이 다를 수 있음
-2. **concat(axis=2)으로 [1,1,1,1024] + [1,1,1024,1024] 합치기** — SigLIP2는 concat 없이 addition만 사용. concat이 메모리 플래너에서 출력 크기 계산을 잘못할 수 있음
-3. **reshape target_shape이 3값** (`"1:1024:1024"`) — SigLIP2도 3값 (`"1:768:196"`)이라 동일. 차이 없음
-4. **weight layer 3개** (pos_embed + cls_row + rope_sin/cos) — SigLIP2는 1개(pos_embed). 여러 weight layer의 출력이 그래프에서 서로 다른 차원을 가지면 플래너가 aliasing 시도 시 크기 불일치
-
-### 디버깅 방법 (다음 에이전트용)
-1. **0-layer + rope 제거 + concat 제거**: concat을 addition으로 교체 (CLS를 pos_embed에 포함시키거나 brute-force add) → heap corruption 해결 여부
-2. **0-layer + rope 제거 + conv bias 추가**: `disable_bias="false"`로 변경 → heap corruption 해결 여부
-3. **0-layer + rope 제거 + weight layer 1개만**: pos_embed만 남기고 cls_row 제거 (CLS를 별도 처리)
-4. 위 3개 테스트로 원인 좁힌 후, nntrainer 코어 수정 또는 그래프 구조 회피
+이 절이 기록했던 블로커는 이후 커밋에서 해결되었다: `concat(pe_cls_row, patch_out)`
+을 범인으로 의심했던 §4가 맞았고, 해결책은 그 concat/addition 조합을 별도
+`pe_cls_pos` 커스텀 레이어(`Applications/CausalLM/layers/pe_cls_pos.{h,cpp}`)
+로 대체하는 것이었다. 현재 그래프는 concat 노드 없이
+`pe_cls_pos({patch_out, cls, pos})` 한 레이어로 CLS 결합 + pos add를 수행한다.
+`model->compile()`은 x86 FP32 빌드에서 정상적으로 통과한다.
+자세한 내용은 `PELANG_NEXT_AGENT_HANDOFF.md`를 볼 것.
 
 ---
 
@@ -143,7 +125,7 @@
 ### 즉시 (블로커 해결 후)
 | 단계 | 내용 | 게이트 |
 |------|------|--------|
-| 블로커 해결 | `model->compile()` 메모리 플래닝 에러 원인 파악 + 수정 | — |
+| ~~블로커 해결~~ | ~~`model->compile()` 메모리 플래닝 에러 원인 파악 + 수정~~ (RESOLVED — §2 참고) | — |
 | G2 | `encodePixels(pixel.npy)` 결과 vs s0/s1/s2/s3 단계별 golden — cos>0.9999, maxdiff<1e-3 | G2 |
 | G3 | `encoder_hidden.npy` 대비 cos>0.9999, rel-L2<1e-3 | G3 |
 | G4 | `--decoder-init-parity` 1-step argmax==2048, cos>0.999 | G4 |
@@ -174,8 +156,9 @@
 - PE-Lang의 RoPE 테이블은 **2D axial RoPE** (`ref_feat_shape=(32,32)`)로 timm이 빌드 타임에 생성, theta 단독으로는 재생 불가
 - 결론: mha_core 확장(interleaved 분기 + 외부 테이블 주입)은 Qwen3/Gemma 등 다른 모델이 의존하는 shared 코드를 건드림 → 회귀 리스크. 작은 전용 레이어가 더 안전한 diff. **pe_rope 유지 결정.**
 
-### 디버그 프린트
-`pelang_vision_encoder.cpp`에 `[PE-Lang DBG]` 프린트가 다수 남아 있음. 블로커 해결 후 전부 제거 필요.
+### 디버그 프린트 (RESOLVED)
+`[PE-Lang DBG]` 프린트는 블로커 해결과 함께 전부 제거되었다 —
+`pelang_vision_encoder.cpp`에 더 이상 남아 있지 않다.
 
 ### ponytail:` 주석
 코드에 `ponytail:` 마커 주석이 있음 (BICUBIC deferral, NEON deferral 등). 이 intentional — ponytail 모드 규칙에 따른 known-ceiling 표시.
@@ -204,9 +187,10 @@ export LD_LIBRARY_PATH=$PWD/build/nntrainer:$PWD/build/Applications/CausalLM/lay
   Applications/CausalLM/res/pelang-encoder \
   --input-pixels ~/workspace/models/pelang_golden/pixel.npy
 
-# G4: decoder parity
+# G4: decoder parity (STALE PATH FIXED — no separate pelang-decoder/ dir
+# exists; decoder dims live in the same res/pelang-encoder/nntr_config.json)
 ./build/Applications/CausalLM/nntr_causallm --decoder-init-parity \
-  Applications/CausalLM/res/pelang-decoder
+  Applications/CausalLM/res/pelang-encoder
 
 # Python에서 cos/maxdiff 비교
 python3 -c "
@@ -230,11 +214,8 @@ print(f'cos={cos:.8f} rel_l2={rel_l2:.6e} maxdiff={np.abs(a-b).max():.6e}')
 | `Applications/CausalLM/res/pelang-encoder/config.json` | encoder 구조 |
 | `Applications/CausalLM/res/pelang-encoder/nntr_config.json` | 런타임 config |
 | `Applications/CausalLM/res/pelang-encoder/generation_config.json` | 생성 설정 |
-| `Applications/CausalLM/res/pelang-encoder/nntr_pelang_encoder_fp32.bin` | 1.17 GB 가중치 |
-| `Applications/CausalLM/res/pelang-decoder/config.json` | decoder 구조 |
-| `Applications/CausalLM/res/pelang-decoder/nntr_config.json` | 런타임 config |
-| `Applications/CausalLM/res/pelang-decoder/generation_config.json` | 생성 설정 |
-| `Applications/CausalLM/res/pelang-decoder/nntr_pelang_decoder_fp32.bin` | 132 MB 가중치 |
+| `Applications/CausalLM/res/pelang-encoder/nntr_pelang_encoder_fp32.{bin,safetensors}` | 1.17 GB 가중치 (미체크인, weight_converter.py로 생성) |
+| `Applications/CausalLM/res/pelang-encoder/nntr_pelang_decoder_fp32.{bin,safetensors}` | 132 MB decoder 가중치. STALE: 별도 `res/pelang-decoder/`가 아니라 이 디렉토리 안에 함께 생성됨 (`nntr_config.json`의 `decoder_model_file_name` 참고) |
 | `Applications/CausalLM/layers/pe_rope.h` | RoPE 레이어 헤더 |
 | `Applications/CausalLM/layers/pe_rope.cpp` | RoPE 레이어 구현 |
 | `Applications/CausalLM/layers/layer_scale.h` | LayerScale 레이어 헤더 |

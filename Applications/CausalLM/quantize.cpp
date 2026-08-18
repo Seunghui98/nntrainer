@@ -560,13 +560,24 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
  *   enc_layer{i}_wq, _wk, _wv, _out, _fc1, _fc2
  * plus the single enc_to_dec_proj FC. All are 2D, so they take fc_dtype (Q4_0).
  *
- * For Q8_0 the patch_embed_conv is quantized too (stored [CRS, out_ch] by
- * Conv2DLayer::save, run via NCHW im2col + the interleaved int8 GEMM); for
- * Q4_0 it stays FP32 (a Q4_0 tensor must be 2D). pos_embedding and all
- * LayerNorms stay FP32.
+ * For Q8_0 the patch conv is quantized too where its im2col contraction
+ * dimension (CRS = num_channels * patch_size^2) is a multiple of the Q8_0
+ * block size 32 (stored [CRS, out_ch] by Conv2DLayer::save, run via NCHW
+ * im2col + the interleaved int8 GEMM); otherwise -- and always for Q4_0,
+ * which requires a 2D tensor -- it stays FP32. See
+ * `allow_patch_conv_quant`. pos_embedding and all LayerNorms stay FP32.
+ *
+ * @param patch_conv_name  Name of the patch-embed conv weight tensor in the
+ *                         graph ("patch_embed_conv" for SigLIP2,
+ *                         "pe_patch_conv" for PE-Lang).
+ * @param allow_patch_conv_quant  False when CRS % 32 != 0 (e.g. PE-Lang's
+ *                         3*14*14=588), which would produce an invalid Q8_0
+ *                         tensor if quantized.
  */
-std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
-                                                          DataType fc_dtype) {
+std::map<std::string, DataType>
+buildEncoderLayerDtypeMap(int enc_layers, DataType fc_dtype,
+                          const std::string &patch_conv_name,
+                          bool allow_patch_conv_quant) {
   std::map<std::string, DataType> dtype_map;
 
   const bool quant_fc =
@@ -583,12 +594,8 @@ std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
       dtype_map[pfx + "_fc2"] = fc_dtype;
     }
     dtype_map["enc_to_dec_proj"] = fc_dtype;
-    // Q8_0 also covers the 16x16 stride-16 patch conv: with no overlap it is a
-    // pure [196, 768] x [768, 768] matmul, stored [CRS, out_ch] by
-    // Conv2DLayer::save and consumed by the same interleaved int8 GEMM as the
-    // FCs (NCHW im2col + dotQnK). Q4_0 keeps the conv FP32 (unchanged).
-    if (fc_dtype == DataType::Q8_0)
-      dtype_map["patch_embed_conv"] = fc_dtype;
+    if (fc_dtype == DataType::Q8_0 && allow_patch_conv_quant)
+      dtype_map[patch_conv_name] = fc_dtype;
   }
 
   return dtype_map;
@@ -809,8 +816,47 @@ int main(int argc, char *argv[]) {
       output_dir = model_path;
     std::filesystem::create_directories(output_dir);
 
-    // Determine output filename
-    std::string original_bin = nntr_cfg["model_file_name"].get<std::string>();
+    std::string architecture =
+      cfg["architectures"].get<std::vector<std::string>>()[0];
+
+    // The SigLIP2 and PE-Lang vision encoders nest their layer count under
+    // cfg["encoder"] and the BERT decoder under cfg["decoder"] when a combined
+    // config.json is reused; fall back to the top-level field for a flat
+    // config.
+    const bool is_encoder = (architecture == "Siglip2VisionEncoder" ||
+                             architecture == "PELangVisionEncoder");
+    const bool is_decoder = (architecture == "BertDecoder");
+    int num_layers = 0;
+    if (is_encoder) {
+      num_layers = cfg.contains("encoder")
+                     ? cfg.at("encoder").value("num_hidden_layers", 12)
+                     : cfg.value("num_hidden_layers", 12);
+    } else if (is_decoder) {
+      num_layers = cfg.contains("decoder")
+                     ? cfg.at("decoder").value("num_hidden_layers", 4)
+                     : cfg.value("num_hidden_layers", 4);
+    } else {
+      num_layers = cfg["num_hidden_layers"].get<int>();
+    }
+
+    // Determine output filename. A combined resource directory (e.g. PE-Lang's
+    // res/pelang-encoder/, which stores both encoder and decoder dimensions in
+    // one nntr_config.json) may not carry a generic "model_file_name" -- fall
+    // back to the role-specific key, matching the lookup order main.cpp uses
+    // in runDumpEncoder / runDecoderInitParity.
+    std::string original_bin;
+    if (nntr_cfg.contains("model_file_name")) {
+      original_bin = nntr_cfg["model_file_name"].get<std::string>();
+    } else if (is_decoder && nntr_cfg.contains("decoder_model_file_name")) {
+      original_bin = nntr_cfg["decoder_model_file_name"].get<std::string>();
+    } else if (is_encoder && nntr_cfg.contains("encoder_model_file_name")) {
+      original_bin = nntr_cfg["encoder_model_file_name"].get<std::string>();
+    } else {
+      throw std::runtime_error(
+        "nntr_config.json at " + model_path +
+        " has no model_file_name (or role-specific "
+        "encoder_model_file_name / decoder_model_file_name)");
+    }
     if (output_bin_name.empty()) {
       output_bin_name =
         generateOutputBinName(original_bin, dataTypeToStr(fc_dtype),
@@ -830,27 +876,6 @@ int main(int argc, char *argv[]) {
 
     std::string src_weight_path = model_path + "/" + original_bin;
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
-
-    std::string architecture =
-      cfg["architectures"].get<std::vector<std::string>>()[0];
-
-    // The SigLIP2 vision encoder nests its layer count under cfg["encoder"] and
-    // the BERT decoder under cfg["decoder"] when a combined config.json is
-    // reused; fall back to the top-level field for a flat config.
-    const bool is_encoder = (architecture == "Siglip2VisionEncoder");
-    const bool is_decoder = (architecture == "BertDecoder");
-    int num_layers = 0;
-    if (is_encoder) {
-      num_layers = cfg.contains("encoder")
-                     ? cfg.at("encoder").value("num_hidden_layers", 12)
-                     : cfg.value("num_hidden_layers", 12);
-    } else if (is_decoder) {
-      num_layers = cfg.contains("decoder")
-                     ? cfg.at("decoder").value("num_hidden_layers", 4)
-                     : cfg.value("num_hidden_layers", 4);
-    } else {
-      num_layers = cfg["num_hidden_layers"].get<int>();
-    }
 
     std::cout << "  Architecture: " << architecture << "\n";
     std::cout << "  Num layers:   " << num_layers << "\n";
@@ -922,11 +947,24 @@ int main(int argc, char *argv[]) {
     }
 
     std::map<std::string, DataType> layer_dtype_map;
+    // Set inside the is_encoder branch below; also consulted when writing the
+    // quantized nntr_config.json in Step 5.
+    bool allow_patch_conv_quant = false;
     if (is_encoder) {
-      // SigLIP2 vision encoder: only its 2D FCs are quantized (conv/pos/LN stay
-      // FP32). embd_dtype is unused (the encoder has no embedding lookup
-      // table).
-      layer_dtype_map = buildEncoderLayerDtypeMap(num_layers, fc_dtype);
+      // Vision encoder: only its 2D FCs (+ the patch conv, when its CRS is a
+      // Q8_0-block-aligned multiple of 32) are quantized; pos/CLS/RoPE/
+      // LayerScale/LN stay FP32. embd_dtype is unused (the encoder has no
+      // embedding lookup table).
+      const json &enc_cfg = cfg.contains("encoder") ? cfg.at("encoder") : cfg;
+      const int patch_size = enc_cfg.value("patch_size", 16);
+      const int num_channels = enc_cfg.value("num_channels", 3);
+      const std::string patch_conv_name =
+        (architecture == "PELangVisionEncoder") ? "pe_patch_conv"
+                                                 : "patch_embed_conv";
+      allow_patch_conv_quant =
+        (num_channels * patch_size * patch_size) % 32 == 0;
+      layer_dtype_map = buildEncoderLayerDtypeMap(
+        num_layers, fc_dtype, patch_conv_name, allow_patch_conv_quant);
     } else if (is_decoder) {
       // BERT decoder: FCs -> fc_dtype, word/pos/type embeddings -> embd_dtype
       // (Q4_0/Q8_0 or Q6_K), LayerNorms/tied-LM-head stay FP32.
@@ -968,10 +1006,10 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["fc_layer_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
-    // The encoder's patch conv is quantized alongside the FCs for Q8_0 (the
-    // NCHW conv runs the same interleaved int8 GEMM); record its dtype so the
-    // runtime graph declares the matching weight tensor.
-    if (is_encoder && fc_dtype == DataType::Q8_0)
+    // The encoder's patch conv is quantized alongside the FCs for Q8_0 only
+    // when its CRS is 32-aligned (see allow_patch_conv_quant above); record
+    // its dtype so the runtime graph declares the matching weight tensor.
+    if (is_encoder && fc_dtype == DataType::Q8_0 && allow_patch_conv_quant)
       new_nntr_cfg["patch_embed_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
