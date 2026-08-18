@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <thread_manager.h>
 
 namespace causallm {
 
@@ -57,22 +58,27 @@ void LayerScaleLayer::runScale(nntrainer::RunLayerContext &context,
   const unsigned int C = dim.width();
   const unsigned int row_stride = C; // SEQ is height; one row = C floats
 
-  // ponytail: scalar loop is correct & simple. 1025*1024*46 = ~48M MACs total
-  // — well under 0.1% of encoder cost. NEON vfmaq_n_f32 fastpath is a Phase 5
-  // kernel task gated by §4.4 profiling; without a measured hotspot, do not
-  // speculate. (trap §6.13: avoid premature kernel work.)
-  for (unsigned int b = 0; b < batch; ++b) {
-    const float *in_b = in_data + b * dim.getFeatureLen();
-    const float *res_b = res_data + b * dim.getFeatureLen();
-    float *out_b = out_data + b * dim.getFeatureLen();
-    for (unsigned int r = from; r < to; ++r) {
-      const float *in_row = in_b + r * row_stride;
-      const float *res_row = res_b + r * row_stride;
-      float *out_row = out_b + r * row_stride;
+  // The MAC count is negligible (1025*1024*46 = ~48M total, <0.1% of encoder
+  // compute — see the file header), but each row round-trips 3*C*4 bytes
+  // through memory and this runs 46 times per encoder pass (23 layers * 2
+  // sub-blocks), so it is bandwidth- rather than compute-bound. Row-parallel
+  // via ThreadManager (already used the same way by mha_core.cpp) removes
+  // that bottleneck without needing a NEON kernel; the per-row inner loop
+  // itself is left as the simple scalar form (ponytail: no speculative SIMD
+  // without a measured hotspot — trap §6.13).
+  const unsigned int num_rows = (to > from) ? (to - from) : 0;
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(
+    0, static_cast<size_t>(batch) * num_rows, [&](size_t idx) {
+      const unsigned int b = static_cast<unsigned int>(idx / num_rows);
+      const unsigned int r = from + static_cast<unsigned int>(idx % num_rows);
+      const float *in_row = in_data + b * dim.getFeatureLen() + r * row_stride;
+      const float *res_row =
+        res_data + b * dim.getFeatureLen() + r * row_stride;
+      float *out_row = out_data + b * dim.getFeatureLen() + r * row_stride;
       for (unsigned int c = 0; c < C; ++c)
         out_row[c] = res_row[c] + g[c] * in_row[c];
-    }
-  }
+    });
 }
 
 void LayerScaleLayer::forwarding(nntrainer::RunLayerContext &context,

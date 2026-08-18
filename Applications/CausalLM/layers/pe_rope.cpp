@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <thread_manager.h>
 
 namespace causallm {
 
@@ -79,18 +80,27 @@ void PeRopeLayer::runRotate(nntrainer::RunLayerContext &context,
   // Clamp `to` to the available rows (the encoder prefill always covers
   // [0, SEQ); incremental mode may pass a slice).
   const unsigned int end = std::min<unsigned int>(to, seq);
+  const unsigned int num_rows = (end > from) ? (end - from) : 0;
 
-  for (unsigned int b = 0; b < batch; ++b) {
-    const float *qk_b = qk_data + b * dim.getFeatureLen();
-    float *out_b = out_data + b * dim.getFeatureLen();
-    for (unsigned int r = from; r < end; ++r) {
-      const float *qk_row = qk_b + r * row_stride;
-      float *out_row = out_b + r * row_stride;
+  // Cost is <0.05% of encoder MACs (file header), but this streams 2*C*4
+  // bytes per row through memory 46 times per encoder pass (q and k, 23
+  // layers), so it is bandwidth- not compute-bound. Row-parallel via
+  // ThreadManager (same pattern as mha_core.cpp and layer_scale.cpp) removes
+  // that bottleneck; the inner rotation loop stays scalar (ponytail: no
+  // speculative NEON without a measured hotspot — trap §6.13).
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(
+    0, static_cast<size_t>(batch) * num_rows, [&](size_t idx) {
+      const unsigned int b = static_cast<unsigned int>(idx / num_rows);
+      const unsigned int r = from + static_cast<unsigned int>(idx % num_rows);
+      const float *qk_row =
+        qk_data + b * dim.getFeatureLen() + r * row_stride;
+      float *out_row = out_data + b * dim.getFeatureLen() + r * row_stride;
       if (r < num_prefix) {
         // CLS row: identity (trap §6.6 — RoPE does NOT touch the prefix token).
         for (unsigned int c = 0; c < C; ++c)
           out_row[c] = qk_row[c];
-        continue;
+        return;
       }
       const unsigned int patch_idx = r - num_prefix;
       // sin/cos table is [1, 1, PATCH_N, head_dim] -> indexing patch_idx * head_dim.
@@ -110,8 +120,7 @@ void PeRopeLayer::runRotate(nntrainer::RunLayerContext &context,
           out_row[odd] = qo * c + qe * s;
         }
       }
-    }
-  }
+    });
 }
 
 void PeRopeLayer::forwarding(nntrainer::RunLayerContext &context,

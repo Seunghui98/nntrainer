@@ -231,6 +231,36 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_pe_rope = executable(
+    'unittest_pe_rope',
+    meson.current_source_dir() / 'layers' / 'unittest_pe_rope.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_pe_rope_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_pe_rope', unittest_pe_rope,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_pe_rope'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_layer_scale = executable(
+    'unittest_layer_scale',
+    meson.current_source_dir() / 'layers' / 'unittest_layer_scale.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_layer_scale_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_layer_scale', unittest_layer_scale,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_layer_scale'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
