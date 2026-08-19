@@ -1,0 +1,15 @@
+{
+  "model_tensor_type": "FP32-FP32",
+  "model_file_name": "nntr_pelang_decoder_fp32.safetensors",
+  "decoder_model_file_name": "nntr_pelang_decoder_fp32.safetensors",
+  "model_type": "Model",
+  "skip_tokenizer": true,
+  "embedding_dtype": "FP32",
+  "fc_layer_dtype": "FP32",
+  "batch_size": 1,
+  "decoder_hidden_size": 512,
+  "decoder_num_heads": 8,
+  "decoder_intermediate_size": 2048,
+  "enc_len": 1025,
+  "fsu": false
+}
