@@ -15,7 +15,7 @@
  *   - MLP activation is tanh_gelu (maps HF gelu_pytorch_tanh).
  *   - layer_norm_eps = 1e-6.
  *   - After post_layernorm, a final fully_connected(unit=256) named
- *     enc_to_dec_proj. Output is [1, 196, 256].
+ *     enc_to_dec_proj. Output is [1, num_patches, 256].
  *
  * Weight loading order (must match weight_converter.py::collect_encoder):
  *   patch_embed conv w, b -> pos_embed ->
@@ -341,7 +341,10 @@ void Siglip2VisionEncoder::setupParameters(json &cfg, json &generation_cfg,
 
   IMG_SIZE = enc_cfg.value("image_size", nntr_cfg.value("img_size", 224));
   PATCH_SIZE = enc_cfg.value("patch_size", nntr_cfg.value("patch_size", 16));
-  NUM_PATCHES = nntr_cfg.value("num_patches", 196u);
+  // Derive from the resolved image/patch size (224/16 -> 196, 384/16 -> 576)
+  // instead of hardcoding one resolution's patch count.
+  const unsigned int patches_per_side = IMG_SIZE / PATCH_SIZE;
+  NUM_PATCHES = nntr_cfg.value("num_patches", patches_per_side * patches_per_side);
   IMG_CHANNELS = 3;
 
   INIT_SEQ_LEN =
@@ -366,7 +369,7 @@ void Siglip2VisionEncoder::setupParameters(json &cfg, json &generation_cfg,
  * Weight order (matches collect_encoder):
  *   1. patch_embed_conv:weight  [768, 3, 16, 16] OIHW
  *   2. patch_embed_conv:bias    [768]
- *   3. pos_embedding:weight     [1, 1, 196, 768]
+ *   3. pos_embedding:weight     [1, 1, num_patches, 768]
  */
 Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
   const int embed_dim = DIM;
@@ -402,7 +405,7 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
                             withKey("direction", {1, 3, 2})}));
   h = transpose(h);
 
-  // Learned position embedding [1, 1, 196, 768]
+  // Learned position embedding [1, 1, num_patches, 768]
   LayerHandle pos_embed(
     createLayer("weight", {withKey("name", "pos_embedding"),
                            withKey("dim", "1:1:" + std::to_string(NUM_PATCHES) +
@@ -554,7 +557,7 @@ std::pair<Tensor, Tensor> Siglip2VisionEncoder::constructModel() {
                             withKey("packed", "false")}));
   h = post_ln(h);
 
-  // Encoder-to-decoder projection: [1, 196, 768] -> [1, 196, 256]
+  // Encoder-to-decoder projection: [1, num_patches, 768] -> [1, num_patches, 256]
   LayerHandle enc_proj(createLayer(
     "fully_connected", {withKey("name", "enc_to_dec_proj"),
                         withKey("unit", std::to_string(ENC_TO_DEC_DIM)),
@@ -668,7 +671,7 @@ void Siglip2VisionEncoder::run(const WSTR prompt, bool do_sample,
   std::vector<float> result = encode(image_path_str);
 
   std::cout << std::setprecision(9)
-            << "Encoder output [1,196,256], first 10 values:";
+            << "Encoder output [1," << NUM_PATCHES << ",256], first 10 values:";
   const int print_count = static_cast<int>(ENC_TO_DEC_DIM) > 10
                             ? 10
                             : static_cast<int>(ENC_TO_DEC_DIM);

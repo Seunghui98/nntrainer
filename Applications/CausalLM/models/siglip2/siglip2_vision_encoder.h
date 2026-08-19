@@ -8,7 +8,9 @@
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  SigLIP2 ViT-B/16 vision encoder with enc_to_dec projection.
- *         Produces [1, 196, 256] projected encoder hidden states.
+ *         Produces [1, num_patches, 256] projected encoder hidden states
+ *         (num_patches = (image_size / patch_size)^2, e.g. 196 for 224px,
+ *         576 for 384px).
  */
 
 #ifndef __SIGLIP2_VISION_ENCODER_H__
@@ -29,7 +31,7 @@ namespace causallm {
  *   - Post layer norm
  *   - Linear projection enc_to_dec_proj: [768 -> 256]
  *
- * Output: [1, 196, 256] projected encoder hidden states.
+ * Output: [1, num_patches, 256] projected encoder hidden states.
  */
 class Siglip2VisionEncoder : virtual public Transformer {
 
@@ -53,7 +55,8 @@ public:
   /**
    * @brief Run the encoder on an image and return projected hidden states.
    * @param image_path Path to input image file.
-   * @return Projected encoder hidden states [1, 196, 256] as raw float buffer.
+   * @return Projected encoder hidden states [1, num_patches, 256] as raw float
+   *         buffer.
    *         The buffer is owned by this object and valid until the next call.
    */
   std::vector<float> encode(const std::string &image_path);
@@ -67,7 +70,7 @@ public:
    *
    * @param pixel_data Pointer to 1*3*IMG_SIZE*IMG_SIZE floats in CHW order.
    * @param pixel_count Total number of floats (must equal 3*IMG_SIZE*IMG_SIZE).
-   * @return Projected encoder hidden states [1, 196, 256].
+   * @return Projected encoder hidden states [1, num_patches, 256].
    *
    * @note Internal/debug-only tooling — not part of the production interface.
    *       Production callers (Task 5+) use only initialize(), load_weight(),
@@ -127,7 +130,7 @@ protected:
 private:
   unsigned int IMG_SIZE = 224;    /**< Image height/width */
   unsigned int PATCH_SIZE = 16;   /**< Patch height/width */
-  unsigned int NUM_PATCHES = 196; /**< Number of patches */
+  unsigned int NUM_PATCHES = 196; /**< Number of patches (resolved in setupParameters) */
   unsigned int IMG_CHANNELS = 3;  /**< Image channels (RGB) */
 
   /** Owned buffer for the last encode() call output. */
