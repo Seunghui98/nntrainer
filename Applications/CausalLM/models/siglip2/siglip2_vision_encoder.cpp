@@ -46,19 +46,36 @@ namespace causallm {
  * --------------------------------------------------------------------- */
 
 /**
+ * @brief Pillow's bicubic_filter (Resample.c, a = -0.5), the BICUBIC kernel.
+ */
+static inline double siglip2BicubicFilter(double x) {
+  constexpr double a = -0.5;
+  if (x < 0.0)
+    x = -x;
+  if (x < 1.0)
+    return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+  if (x < 2.0)
+    return (((x - 5) * x + 8) * x - 4) * a;
+  return 0.0;
+}
+
+/**
  * @brief Precompute Pillow's resample coefficients for one axis.
  *
- * Reproduces Pillow's precompute_coeffs() (src/libImaging/Resample.c) for the
- * BILINEAR (triangle) filter exactly:
+ * Reproduces Pillow's precompute_coeffs() (src/libImaging/Resample.c) for
+ * either filter exactly:
  *   scale       = in_size / out_size
  *   filterscale = max(scale, 1)
- *   support     = 1.0 * filterscale            (BILINEAR support = 1.0)
+ *   support     = filter_support * filterscale (1.0 for BILINEAR, 2.0 for
+ *                 BICUBIC)
  *   center      = (xx + 0.5) * scale
  *   xmin        = max(0, floor(center - support))
  *   xmax        = min(in_size, ceil(center + support)) - xmin
- *   weight[k]   = bilinear((xmin + k + 0.5 - center) / filterscale)
+ *   weight[k]   = filter((xmin + k + 0.5 - center) / filterscale)
  *   weights normalized to sum to 1.
- * where bilinear(t) = 1 - |t| for |t| < 1, else 0.
+ * where BILINEAR's filter(t) = 1 - |t| for |t| < 1, else 0, and BICUBIC's
+ * filter is siglip2BicubicFilter (Pillow's a = -0.5 Catmull-Rom-family
+ * kernel).
  *
  * NOTE the half-pixel convention is center = (xx+0.5)*scale (NO trailing -0.5)
  * and the support is filterscale (= scale when downscaling), which is what
@@ -67,17 +84,20 @@ namespace causallm {
  *
  * @param in_size  source dimension
  * @param out_size destination dimension
+ * @param bicubic  use the BICUBIC filter (support 2.0) instead of BILINEAR
+ *                 (support 1.0)
  * @param bounds   out: 2*out_size ints (xmin, xmax per output pixel)
  * @param coeffs   out: out_size * ksize floats (row-major)
  * @return ksize   max number of source samples contributing per output pixel
  */
-static int siglip2PrecomputeCoeffs(int in_size, int out_size,
+static int siglip2PrecomputeCoeffs(int in_size, int out_size, bool bicubic,
                                    std::vector<int> &bounds,
                                    std::vector<double> &coeffs) {
+  const double filter_support = bicubic ? 2.0 : 1.0;
   const double scale =
     static_cast<double>(in_size) / static_cast<double>(out_size);
   const double filterscale = scale < 1.0 ? 1.0 : scale;
-  const double support = 1.0 * filterscale; // BILINEAR filter support == 1.0
+  const double support = filter_support * filterscale;
   const int ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
 
   bounds.assign(static_cast<size_t>(out_size) * 2, 0);
@@ -98,8 +118,9 @@ static int siglip2PrecomputeCoeffs(int in_size, int out_size,
     double wsum = 0.0;
     int x = 0;
     for (; x < xmax; ++x) {
-      double t = std::abs((x + xmin - center + 0.5) * ss);
-      double w = t < 1.0 ? 1.0 - t : 0.0; // bilinear (triangle) filter
+      double t = (x + xmin - center + 0.5) * ss;
+      double w = bicubic ? siglip2BicubicFilter(t)
+                         : (std::abs(t) < 1.0 ? 1.0 - std::abs(t) : 0.0);
       k[x] = w;
       wsum += w;
     }
@@ -118,8 +139,8 @@ static int siglip2PrecomputeCoeffs(int in_size, int out_size,
 }
 
 /**
- * @brief Resize an image buffer reproducing Pillow's Image.BILINEAR resample
- *        BIT-EXACTLY (uint8 path).
+ * @brief Resize an image buffer reproducing Pillow's Image.BILINEAR or
+ *        Image.BICUBIC resample BIT-EXACTLY (uint8 path).
  *
  * Performs the two separable passes Pillow uses (horizontal then vertical).
  * Crucially, this reproduces Pillow's *fixed-point integer* 8-bit resample
@@ -143,7 +164,8 @@ static int siglip2PrecomputeCoeffs(int in_size, int out_size,
  */
 static void siglip2ResizeImageFloat(const unsigned char *src, int src_w,
                                     int src_h, int channels, int dst_w,
-                                    int dst_h, std::vector<float> &dst_float) {
+                                    int dst_h, bool bicubic,
+                                    std::vector<float> &dst_float) {
   // Pillow's 8-bit fixed-point precision (Resample.c: PRECISION_BITS).
   constexpr int PRECISION_BITS = 32 - 8 - 2;
   const int64_t ROUND = static_cast<int64_t>(1) << (PRECISION_BITS - 1);
@@ -173,7 +195,8 @@ static void siglip2ResizeImageFloat(const unsigned char *src, int src_w,
   // ----- Horizontal pass: [src_h, src_w] -> [src_h, dst_w] -----
   std::vector<int> h_bounds;
   std::vector<double> h_coeffs;
-  const int h_ksize = siglip2PrecomputeCoeffs(src_w, dst_w, h_bounds, h_coeffs);
+  const int h_ksize =
+    siglip2PrecomputeCoeffs(src_w, dst_w, bicubic, h_bounds, h_coeffs);
   std::vector<int> h_icoeffs;
   quantize(h_coeffs, dst_w, h_ksize, h_icoeffs);
 
@@ -199,7 +222,8 @@ static void siglip2ResizeImageFloat(const unsigned char *src, int src_w,
   // ----- Vertical pass: [src_h, dst_w] -> [dst_h, dst_w] -----
   std::vector<int> v_bounds;
   std::vector<double> v_coeffs;
-  const int v_ksize = siglip2PrecomputeCoeffs(src_h, dst_h, v_bounds, v_coeffs);
+  const int v_ksize =
+    siglip2PrecomputeCoeffs(src_h, dst_h, bicubic, v_bounds, v_coeffs);
   std::vector<int> v_icoeffs;
   quantize(v_coeffs, dst_h, v_ksize, v_icoeffs);
 
@@ -226,14 +250,17 @@ static void siglip2ResizeImageFloat(const unsigned char *src, int src_w,
 /**
  * @brief Load, resize, and normalize an image into CHW float data.
  *
- * Uses siglip2ResizeImageFloat for resizing, which employs a triangle filter
- * matching PIL's Image.BILINEAR behaviour. The resized pixel values (in [0,255]
- * float range) are normalized to [-1, 1] without intermediate uint8 rounding,
- * giving near-exact parity with the PyTorch/PIL golden outputs.
+ * Uses siglip2ResizeImageFloat for resizing, which employs the requested
+ * filter (BILINEAR or BICUBIC — must match the source checkpoint's
+ * preprocessor_config.json "resample") to reproduce PIL's Image.resize()
+ * bit-exactly. The resized pixel values (in [0,255] float range) are
+ * normalized to [-1, 1] without intermediate uint8 rounding, giving
+ * near-exact parity with the PyTorch/PIL golden outputs.
  */
 static std::vector<float>
 siglip2LoadAndPreprocessImage(const std::string &filepath, int target_width,
-                              int target_height, bool normalize) {
+                              int target_height, bool normalize,
+                              bool bicubic) {
   int width, height, channels;
   unsigned char *image =
     stbi_load(filepath.c_str(), &width, &height, &channels, STBI_default);
@@ -269,12 +296,12 @@ siglip2LoadAndPreprocessImage(const std::string &filepath, int target_width,
                              std::to_string(channels));
   }
 
-  // Resize using triangle filter (float output in [0,255], matching PIL
-  // BILINEAR)
+  // Resize using the requested filter (float output in [0,255], matching PIL
+  // Image.BILINEAR or Image.BICUBIC)
   std::vector<float> resized_float;
   if (width != target_width || height != target_height) {
     siglip2ResizeImageFloat(rgb_ptr, width, height, rgb_channels, target_width,
-                            target_height, resized_float);
+                            target_height, bicubic, resized_float);
   } else {
     // No resize needed: convert uint8 to float directly
     resized_float.resize(
@@ -338,6 +365,13 @@ void Siglip2VisionEncoder::setupParameters(json &cfg, json &generation_cfg,
   ROPE_THETA = 0;
   TIE_WORD_EMBEDDINGS = false;
   SLIDING_WINDOW = UINT_MAX;
+
+  // Must match the source checkpoint's preprocessor_config.json "resample"
+  // (2 = BILINEAR, 3 = BICUBIC in PIL/HF's numbering); the 224px checkpoint
+  // this encoder was first verified against used BILINEAR, so that stays the
+  // default for configs that don't say otherwise.
+  const std::string resample = nntr_cfg.value("resample", "bilinear");
+  use_bicubic_resample_ = (resample == "bicubic");
 
   IMG_SIZE = enc_cfg.value("image_size", nntr_cfg.value("img_size", 224));
   PATCH_SIZE = enc_cfg.value("patch_size", nntr_cfg.value("patch_size", 16));
@@ -596,7 +630,8 @@ std::vector<float> Siglip2VisionEncoder::encode(const std::string &image_path) {
   }
 
   std::vector<float> image_data = siglip2LoadAndPreprocessImage(
-    image_path, static_cast<int>(IMG_SIZE), static_cast<int>(IMG_SIZE), true);
+    image_path, static_cast<int>(IMG_SIZE), static_cast<int>(IMG_SIZE), true,
+    use_bicubic_resample_);
 
   std::vector<float *> inputs{image_data.data()};
   std::vector<float *> labels;

@@ -132,6 +132,9 @@ private:
   unsigned int PATCH_SIZE = 16;   /**< Patch height/width */
   unsigned int NUM_PATCHES = 196; /**< Number of patches (resolved in setupParameters) */
   unsigned int IMG_CHANNELS = 3;  /**< Image channels (RGB) */
+  /** Use PIL BICUBIC (vs. BILINEAR) resize; must match the checkpoint's
+   *  preprocessor_config.json "resample" (nntr_config.json "resample"). */
+  bool use_bicubic_resample_ = false;
 
   /** Owned buffer for the last encode() call output. */
   std::vector<float> enc_output_buf_;
