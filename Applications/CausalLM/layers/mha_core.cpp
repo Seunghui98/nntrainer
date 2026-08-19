@@ -33,6 +33,19 @@ static std::mutex rope_init_mtx;
 
 #include <cstdint>
 
+// Diagnostic-only bisection switch (PE-Lang ARM accuracy investigation):
+// when NNTR_MHA_FORCE_FP32 is defined, this translation unit's *own*
+// ENABLE_FP16 branches (KV-cache dtype, internal Q/K/V/O FP16 compute) are
+// forced off below, while every ENABLE_FP16-dependent *declaration* that
+// affects this class's memory layout (mha_core.h's RopeCacheFP16 member,
+// already parsed by the #include above) is left untouched -- so the ABI
+// nntrainer core and every other translation unit see for MHACoreLayer is
+// unaffected; only this file's function-body dispatch changes. Not meant to
+// be defined in normal builds.
+#if defined(NNTR_MHA_FORCE_FP32) && defined(ENABLE_FP16)
+#undef ENABLE_FP16
+#endif
+
 inline float convert_scalar(uint16_t h) {
   return nntrainer::compute_fp16_to_fp32(h);
 }
