@@ -8,11 +8,12 @@
   "fc_layer_dtype": "FP32",
   "batch_size": 1,
   "patch_size": 16,
-  "img_size": 224,
-  "num_patches": 196,
+  "img_size": 384,
+  "num_patches": 576,
   "encoder_hidden_size": 768,
   "init_seq_len": 1,
-  "max_seq_len": 196,
+  "max_seq_len": 576,
+  "resample": "bicubic",
   "sample_input": "sample.png",
   "fsu": false
 }

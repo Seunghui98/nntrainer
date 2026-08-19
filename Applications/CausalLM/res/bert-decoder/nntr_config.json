@@ -7,6 +7,6 @@
   "fc_layer_dtype": "FP32",
   "batch_size": 1,
   "decoder_hidden_size": 256,
-  "enc_len": 196,
+  "enc_len": 576,
   "fsu": false
 }

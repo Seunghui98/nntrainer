@@ -2,22 +2,25 @@
 # Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
 ## @file verify_encoder.py
 ## @brief PyTorch reference + nntrainer parity check for the SigLIP2 vision
-##        encoder. Emits the golden projected encoder output [1,196,256] and the
-##        preprocessed pixel tensor, and (with --nntr-npy) compares the nntrainer
-##        dump (nntr_encoder_hidden.npy from `nntr_causallm --dump-encoder`).
+##        encoder. Emits the golden projected encoder output [1,num_patches,256]
+##        and the preprocessed pixel tensor, and (with --nntr-npy) compares the
+##        nntrainer dump (nntr_encoder_hidden.npy from
+##        `nntr_causallm --dump-encoder`).
 import argparse
 import numpy as np
 import torch
 from PIL import Image
-from transformers import VisionEncoderDecoderModel
+from transformers import AutoImageProcessor, VisionEncoderDecoderModel
 
 
-def preprocess(image_path, size=224):
-    img = Image.open(image_path).convert("RGB").resize((size, size), Image.BILINEAR)
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    arr = (arr - 0.5) / 0.5  # SigLIP normalization
-    arr = arr.transpose(2, 0, 1)[None]  # [1,3,224,224]
-    return torch.from_numpy(np.ascontiguousarray(arr))
+def preprocess(image_path, processor):
+    # Goes through the checkpoint's own AutoImageProcessor (resolution,
+    # resample filter, mean/std all come from its preprocessor_config.json)
+    # instead of a hardcoded size/filter, so this stays correct across
+    # checkpoints (this caught a hardcoded-BILINEAR/224 mismatch when the
+    # encoder moved from 224px to a 384px checkpoint using BICUBIC).
+    img = Image.open(image_path).convert("RGB")
+    return processor(images=img, return_tensors="pt").pixel_values
 
 
 def main():
@@ -38,7 +41,8 @@ def main():
     model = VisionEncoderDecoderModel.from_pretrained(
         args.ckpt, attn_implementation="eager"
     ).eval()
-    pixel = preprocess(args.image)
+    processor = AutoImageProcessor.from_pretrained(args.ckpt, use_fast=False)
+    pixel = preprocess(args.image, processor)
 
     with torch.no_grad():
         enc = model.get_encoder()(pixel_values=pixel, return_dict=True).last_hidden_state
@@ -47,7 +51,7 @@ def main():
             if getattr(model, "enc_to_dec_proj", None)
             else enc
         )
-    golden = proj.cpu().numpy().astype(np.float32)  # [1,196,256]
+    golden = proj.cpu().numpy().astype(np.float32)  # [1,num_patches,256]
 
     np.save(args.out + ".encoder_hidden.npy", golden)
     np.save(args.out + ".pixel.npy", pixel.cpu().numpy())
