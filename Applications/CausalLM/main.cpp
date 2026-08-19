@@ -394,6 +394,119 @@ static int runDecoderInitParity(const std::string &model_dir) {
 }
 
 /**
+ * @brief --caption-parity handler: greedy-decode the FULL caption token
+ *        sequence from a golden/dumped encoder output, so accuracy can be
+ *        judged at the level the plan's G6 gate actually specifies
+ *        ("greedy token sequence diff <= 1 token") instead of only the
+ *        single first-token argmax that --decoder-init-parity gives.
+ *
+ * Reads golden.encoder_hidden.npy from @p model_dir (same convention as
+ * --decoder-init-parity, so a dumped `nntr_encoder_hidden.npy` can be copied
+ * in to test a real encoder->decoder chain), prefills the cross-attention
+ * cache once, then drives decodeToken() at pos = 0, 1, 2, ... feeding back
+ * each argmax, stopping at eos_token_id or max_length.
+ *
+ * Prints the token ids and writes them to nntr_caption_tokens.npy (float32,
+ * cast to int on the Python side) for scripted comparison against the
+ * PyTorch reference caption.
+ */
+static int runCaptionParity(int argc, char *argv[]) {
+  const std::string model_dir = argv[2];
+
+  unsigned int max_tokens_override = 0;
+  for (int i = 3; i < argc; ++i) {
+    if (std::string(argv[i]) == "--max-tokens" && i + 1 < argc)
+      max_tokens_override =
+        static_cast<unsigned int>(std::stoul(argv[++i]));
+  }
+
+  std::string weight_file = model_dir + "/nntr_bert_decoder_fp32.bin";
+  std::string mtt = "FP32-FP32", fc_dt = "FP32", embd_dt = "FP32";
+  json nntr_par;
+  try {
+    nntr_par = causallm::LoadJsonFile(model_dir + "/nntr_config.json");
+    mtt = nntr_par.value("model_tensor_type", mtt);
+    fc_dt = nntr_par.value("fc_layer_dtype", fc_dt);
+    embd_dt = nntr_par.value("embedding_dtype", embd_dt);
+    if (nntr_par.contains("decoder_model_file_name"))
+      weight_file = model_dir + "/" +
+                    nntr_par["decoder_model_file_name"].get<std::string>();
+    else if (nntr_par.contains("model_file_name"))
+      weight_file =
+        model_dir + "/" + nntr_par["model_file_name"].get<std::string>();
+  } catch (const std::exception &) {
+    // No nntr_config.json — fall back to the FP32 defaults above.
+  }
+
+  // Generation settings: bos/eos/max_length come from generation_config.json
+  // when present (PE-Lang: bos=101, eos=102, max_length=77).
+  int bos_token = 101, eos_token = 102;
+  unsigned int max_tokens = 77;
+  try {
+    json gen = causallm::LoadJsonFile(model_dir + "/generation_config.json");
+    bos_token = gen.value("decoder_start_token_id", gen.value("bos_token_id", bos_token));
+    eos_token = gen.value("eos_token_id", eos_token);
+    max_tokens = gen.value("max_length", max_tokens);
+  } catch (const std::exception &) {
+  }
+  if (max_tokens_override)
+    max_tokens = max_tokens_override;
+
+  try {
+    const unsigned int enc_len_v = nntr_par.value("enc_len", 196u);
+    const unsigned int dec_hidden_v =
+      nntr_par.value("decoder_hidden_size", 256u);
+    const size_t ENC_COUNT = static_cast<size_t>(enc_len_v) * dec_hidden_v;
+    auto enc = readNpyF32(model_dir + "/golden.encoder_hidden.npy", ENC_COUNT);
+
+    auto dec = std::make_unique<causallm::BertDecoder>(nntr_par);
+    dec->setTensorTypes(mtt, fc_dt, embd_dt);
+    dec->initialize();
+    dec->load_weight(weight_file);
+
+    // Cross-attn K/V from the encoder output: computed once per image.
+    dec->prefillCrossCache(enc.data(), bos_token);
+    // decodeToken() does not reset the cache; drive it from position 0.
+    dec->setKVCachePosition(0);
+
+    std::vector<int> tokens;
+    int cur = bos_token;
+    for (unsigned int pos = 0; pos < max_tokens; ++pos) {
+      std::vector<float> logits = dec->decodeToken(enc.data(), cur, pos);
+      if (logits.empty()) {
+        std::cerr << "[caption] decodeToken returned no logits at pos " << pos
+                  << "\n";
+        return EXIT_FAILURE;
+      }
+      int next = static_cast<int>(
+        std::distance(logits.begin(),
+                      std::max_element(logits.begin(), logits.end())));
+      tokens.push_back(next);
+      if (next == eos_token)
+        break;
+      cur = next;
+    }
+
+    std::cout << "[caption] tensor_type=" << mtt << " fc=" << fc_dt
+              << " embd=" << embd_dt << " bos=" << bos_token
+              << " eos=" << eos_token << " max_length=" << max_tokens << "\n";
+    std::cout << "[caption] " << tokens.size() << " tokens:";
+    for (int t : tokens)
+      std::cout << " " << t;
+    std::cout << "\n";
+
+    std::vector<float> tok_f(tokens.begin(), tokens.end());
+    writeNpyF32("nntr_caption_tokens.npy", tok_f,
+                "(" + std::to_string(tok_f.size()) + ",)");
+    std::cout << "[caption] wrote nntr_caption_tokens.npy\n";
+    return EXIT_SUCCESS;
+  } catch (const std::exception &e) {
+    std::cerr << "[caption] FAILED: " << e.what() << "\n";
+    return EXIT_FAILURE;
+  }
+}
+
+/**
  * @brief Entry point for loading, initializing, and running a CausalLM model.
  */
 int main(int argc, char *argv[]) {
@@ -510,6 +623,9 @@ int main(int argc, char *argv[]) {
 
   if (argc >= 3 && std::string(argv[1]) == "--decoder-init-parity")
     return runDecoderInitParity(argv[2]);
+
+  if (argc >= 3 && std::string(argv[1]) == "--caption-parity")
+    return runCaptionParity(argc, argv);
 
   const std::string model_path = argv[1];
   std::string input_text;
