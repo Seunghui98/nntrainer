@@ -70,7 +70,7 @@ static inline void convApplySwishInplace(T *data, size_t n) {
     size_t i = start;
 
     if (use_approx) {
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(ENABLE_FP16)
       if constexpr (std::is_same_v<T, _FP16>) {
         const float32x4_t v_three = vdupq_n_f32(3.0f);
         const float32x4_t v_six_inv = vdupq_n_f32(1.0f / 6.0f);
