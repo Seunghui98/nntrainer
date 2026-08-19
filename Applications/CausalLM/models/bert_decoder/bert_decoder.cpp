@@ -156,9 +156,9 @@ std::pair<std::vector<Tensor>, Tensor> BertDecoder::constructDecoderGraph() {
   Tensor position_ids({1, 1, 1, BD_INIT_SEQ_LEN}, "position_ids");
   Tensor token_type_ids({1, 1, 1, BD_INIT_SEQ_LEN}, "token_type_ids");
 
-  // Encoder hidden states [1,1,196,256] — unused until Task 5 cross-attn, but
-  // declared here so the input signature remains stable across tasks.
-  Tensor encoder_hidden({1, 1, 196, BD_DIM}, "encoder_hidden");
+  // Encoder hidden states [1,1,enc_len_,256], consumed by cross-attention.
+  Tensor encoder_hidden({1, 1, enc_len_, static_cast<unsigned int>(BD_DIM)},
+                        "encoder_hidden");
 
   // ===== Embeddings =====
   // word_emb: in_dim=30522, out_dim=256 (NOT tie_word_embeddings; LM tie Task
@@ -409,15 +409,15 @@ Tensor BertDecoder::createCrossAttentionBlock(int layer_id, Tensor h,
   Tensor v = wv(encoder_hidden);
 
   // Static read-only cross-cache placeholders (input leaf nodes).
-  auto [cross_k, cross_v] = createCrossCachePlaceholders(layer_id, BD_ENC_LEN);
+  auto [cross_k, cross_v] = createCrossCachePlaceholders(layer_id, enc_len_);
 
   // MHA core in external-cache mode, cross_attention=true: query attends over
-  // all BD_ENC_LEN cached rows; cache is neither written nor advanced here.
+  // all enc_len_ cached rows; cache is neither written nor advanced here.
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", pfx + "_cross_attn"), withKey("num_heads", BD_NUM_HEADS),
      withKey("num_heads_kv", BD_NUM_HEADS / BD_GQA_SIZE),
-     withKey("max_timestep", std::to_string(BD_ENC_LEN)),
+     withKey("max_timestep", std::to_string(enc_len_)),
      withKey("rope_theta", ROPE_THETA), withKey("use_rope", "false"),
      withKey("is_causal", "false"), withKey("cross_attention", "true")}));
   Tensor a = mha({q, k, v, cross_k, cross_v});
@@ -449,7 +449,7 @@ Tensor BertDecoder::createCrossAttentionBlock(int layer_id, Tensor h,
 
 void BertDecoder::allocateCrossCacheBuffers() {
   const size_t cross_size =
-    static_cast<size_t>(BD_ENC_LEN) *
+    static_cast<size_t>(enc_len_) *
     static_cast<size_t>(BD_HEAD_DIM * BD_NUM_HEADS / BD_GQA_SIZE);
   if (cross_cache_k_.empty()) {
     cross_cache_k_.assign(BD_NUM_LAYERS, std::vector<uint16_t>(cross_size, 0));
@@ -563,15 +563,15 @@ void BertDecoder::prefillCrossCache(const float *enc_hidden, int token_id) {
   const unsigned int kv_width =
     static_cast<unsigned int>(BD_HEAD_DIM * BD_NUM_HEADS / BD_GQA_SIZE);
 
-  // encoder_hidden as an FP32 tensor [1,1,196,256]. dot() below reproduces the
-  // FC layer math exactly (FullyConnectedLayer::forwarding does
-  // input.dot(weight, false, false) then += bias).
+  // encoder_hidden as an FP32 tensor [1,1,enc_len_,256]. dot() below
+  // reproduces the FC layer math exactly (FullyConnectedLayer::forwarding
+  // does input.dot(weight, false, false) then += bias).
   ml::train::TensorDim enc_dim(
-    {BD_BATCH_SIZE, 1, BD_ENC_LEN, static_cast<unsigned int>(BD_DIM)},
+    {BD_BATCH_SIZE, 1, enc_len_, static_cast<unsigned int>(BD_DIM)},
     {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP32});
   nntrainer::Tensor enc = nntrainer::Tensor::Map<float>(
     const_cast<float *>(enc_hidden),
-    static_cast<unsigned int>(BD_ENC_LEN * BD_DIM * sizeof(float)), enc_dim, 0);
+    static_cast<unsigned int>(enc_len_ * BD_DIM * sizeof(float)), enc_dim, 0);
 
   // Destination cache tensor dtype MUST drive copyData() through the proper
   // FP32 -> fp16 *bit conversion*, matching how mha_core reads the cache and
@@ -593,7 +593,7 @@ void BertDecoder::prefillCrossCache(const float *enc_hidden, int token_id) {
   const auto cross_cache_store_dtype = ml::train::TensorDim::DataType::UINT16;
 #endif
   ml::train::TensorDim cache_dim(
-    {BD_BATCH_SIZE, 1, BD_ENC_LEN, kv_width},
+    {BD_BATCH_SIZE, 1, enc_len_, kv_width},
     {ml::train::TensorDim::Format::NCHW, cross_cache_store_dtype});
 
   // Compute K/V = encoder_hidden @ W(+b) directly from each layer's persistent
@@ -617,10 +617,10 @@ void BertDecoder::prefillCrossCache(const float *enc_hidden, int token_id) {
     // quantized weight (Q4_0/Q6_K/Q4_K), Tensor::dot routes to dotQnK, which
     // writes directly into output.getData<float>() WITHOUT allocating it —
     // passing a default-constructed (empty) tensor segfaults in the quantized
-    // GEMM. Allocate proj = [1,1,BD_ENC_LEN,kv_width] FP32 up front so both the
+    // GEMM. Allocate proj = [1,1,enc_len_,kv_width] FP32 up front so both the
     // FP32 and the quantized paths have a valid destination buffer.
     nntrainer::TensorDim proj_dim(
-      {BD_BATCH_SIZE, 1, BD_ENC_LEN, kv_width},
+      {BD_BATCH_SIZE, 1, enc_len_, kv_width},
       {nntrainer::Tformat::NCHW, nntrainer::TensorDim::DataType::FP32});
     nntrainer::Tensor proj(proj_dim, true /* allocate */);
     enc.dot(*w, proj, false, false);
@@ -835,21 +835,25 @@ bool BertDecoder::smokeTest() {
   // names ensures each buffer is passed to the correct slot.
   //
   // Sizes match the model input dims:
-  //   input0, position_ids, token_type_ids : [1,1,1,1] -> 1 float each
-  //   encoder_hidden : [1,1,196,256]       -> 196*256 floats
+  //   input0, position_ids, token_type_ids : [1,1,1,1]        -> 1 float each
+  //   encoder_hidden : [1,1,enc_len_,256]                     -> enc_len_*256
+  //                                                               floats
   //   cache_k/v_l{i} : [1,1,512,256]       -> 512*256 floats (from kv_cache_)
   std::vector<float> in_token_buf(1, 101.0f); // [CLS]
   std::vector<float> in_pos_buf(1, 0.0f);
   std::vector<float> in_type_buf(1, 0.0f);
-  std::vector<float> in_enc(static_cast<size_t>(196) * BD_DIM, 0.0f);
+  std::vector<float> in_enc(static_cast<size_t>(enc_len_) * BD_DIM, 0.0f);
 
   // Dummy zero-filled cross-attention K/V cache buffers (UINT16 placeholders,
-  // 196 x 256 elements => 2 bytes each). Task 7 fills these from the encoder
-  // K/V projections; for the self-attn smoke we just bind valid storage so the
-  // graph runs end-to-end. One shared zero buffer per K and V is sufficient
-  // since the smoke only checks the self-attn path does not regress.
-  std::vector<uint16_t> cross_k_dummy(static_cast<size_t>(196) * BD_DIM, 0);
-  std::vector<uint16_t> cross_v_dummy(static_cast<size_t>(196) * BD_DIM, 0);
+  // enc_len_ x 256 elements => 2 bytes each). prefillCrossCache() fills these
+  // from the encoder K/V projections; for the self-attn smoke we just bind
+  // valid storage so the graph runs end-to-end. One shared zero buffer per K
+  // and V is sufficient since the smoke only checks the self-attn path does
+  // not regress.
+  std::vector<uint16_t> cross_k_dummy(static_cast<size_t>(enc_len_) * BD_DIM,
+                                      0);
+  std::vector<uint16_t> cross_v_dummy(static_cast<size_t>(enc_len_) * BD_DIM,
+                                      0);
 
   // Build name -> ptr lookup table
   std::unordered_map<std::string, float *> name_to_ptr;

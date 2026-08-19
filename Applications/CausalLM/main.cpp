@@ -333,32 +333,37 @@ static int runDumpEncoder(int argc, char *argv[]) {
 
 /**
  * @brief --decoder-init-parity handler: inject a golden encoder output
- *        [1,196,256], run one decode step from the start token (101) at
- *        position 0, and save logits to nntr_decoder_init_logits.npy. Reads
+ *        [1,enc_len,256] (enc_len from nntr_config.json's "enc_len", default
+ *        196), run one decode step from the start token (101) at position 0,
+ *        and save logits to nntr_decoder_init_logits.npy. Reads
  *        nntr_config.json so the graph loads fp32 OR quantized (Q4_0/Q6_K)
  *        weights.
  */
 static int runDecoderInitParity(const std::string &model_dir) {
   std::string weight_file = model_dir + "/nntr_bert_decoder_fp32.bin";
   std::string mtt = "FP32-FP32", fc_dt = "FP32", embd_dt = "FP32";
+  unsigned int enc_len = 196;
   try {
     json nntr = causallm::LoadJsonFile(model_dir + "/nntr_config.json");
     mtt = nntr.value("model_tensor_type", mtt);
     fc_dt = nntr.value("fc_layer_dtype", fc_dt);
     embd_dt = nntr.value("embedding_dtype", embd_dt);
+    enc_len = nntr.value("enc_len", enc_len);
     if (nntr.contains("model_file_name"))
       weight_file =
         model_dir + "/" + nntr["model_file_name"].get<std::string>();
   } catch (const std::exception &) {
-    // No nntr_config.json — fall back to the FP32 defaults above.
+    // No nntr_config.json — fall back to the FP32/196-patch defaults above.
   }
 
   try {
-    constexpr size_t ENC_COUNT = 1u * 196 * 256; // 50176
-    auto enc = readNpyF32(model_dir + "/golden.encoder_hidden.npy", ENC_COUNT);
+    const size_t enc_count = static_cast<size_t>(enc_len) * 256;
+    auto enc =
+      readNpyF32(model_dir + "/golden.encoder_hidden.npy", enc_count);
 
     auto dec = std::make_unique<causallm::BertDecoder>();
     dec->setTensorTypes(mtt, fc_dt, embd_dt);
+    dec->setEncoderLength(enc_len);
     dec->initialize();
     dec->load_weight(weight_file);
 

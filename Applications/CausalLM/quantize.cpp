@@ -389,6 +389,7 @@ void registerAllModels() {
       dec->setTensorTypes(nntr_cfg.value("model_tensor_type", "FP32-FP32"),
                           nntr_cfg.value("fc_layer_dtype", "FP32"),
                           nntr_cfg.value("embedding_dtype", "FP32"));
+      dec->setEncoderLength(nntr_cfg.value("enc_len", 196u));
       return dec;
     });
 #endif

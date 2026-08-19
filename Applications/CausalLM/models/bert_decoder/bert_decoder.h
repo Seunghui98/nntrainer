@@ -14,7 +14,7 @@
  *   input0          [1,1,1,1]     token id
  *   position_ids    [1,1,1,1]
  *   token_type_ids  [1,1,1,1]
- *   encoder_hidden  [1,1,196,256] encoder hidden states for cross-attention
+ *   encoder_hidden  [1,1,enc_len,256] encoder hidden states for cross-attention
  *   cache_k_l0..N-1 [1,1,MAX_SEQ,DIM]  per-layer KV cache
  *   cache_v_l0..N-1 [1,1,MAX_SEQ,DIM]
  *
@@ -73,8 +73,11 @@ public:
   static constexpr unsigned int BD_BATCH_SIZE = 1;
   static constexpr unsigned int BD_INIT_SEQ_LEN = 1;
   static constexpr unsigned int BD_MAX_SEQ_LEN = 512;
-  // Encoder (SigLIP2) output sequence length fed to cross-attention.
-  static constexpr unsigned int BD_ENC_LEN = 196;
+  // Default encoder (SigLIP2) output sequence length fed to cross-attention,
+  // used when setEncoderLength() is not called. Matches the 224px encoder's
+  // 196 patches; call setEncoderLength() before initialize() for other
+  // resolutions (e.g. 576 for the 384px encoder).
+  static constexpr unsigned int BD_ENC_LEN_DEFAULT = 196;
   // NUM_TO_GENERATE must be set for Transformer; use a reasonable default.
   static constexpr unsigned int BD_NUM_TO_GENERATE = 1;
 
@@ -141,6 +144,17 @@ public:
   }
 
   /**
+   * @brief Override the encoder output sequence length fed to cross-attention
+   *        (BD_ENC_LEN_DEFAULT=196 otherwise). Must be called BEFORE
+   *        initialize() — it sizes the cross-cache placeholder tensors and
+   *        buffers baked into the graph at compile time.
+   *
+   * @param enc_len number of encoder rows (e.g. 196 for the 224px SigLIP2
+   *        encoder, 576 for the 384px one).
+   */
+  void setEncoderLength(unsigned int enc_len) { enc_len_ = enc_len; }
+
+  /**
    * @brief Initialize the decoder model (register layers, build graph,
    * compile).
    */
@@ -166,7 +180,7 @@ public:
    * Intended for --decoder-init-parity parity testing. Assumes weights are
    * already loaded. Allocates + binds KV cache if not done yet.
    *
-   * @param enc_hidden  Pointer to BD_ENC_LEN * BD_DIM floats (encoder hidden)
+   * @param enc_hidden  Pointer to enc_len_ * BD_DIM floats (encoder hidden)
    * @param token_id    Input token id (default: 101 = [CLS])
    * @param out_npy     Output .npy path for logits [1,1,1,BD_NUM_VOCAB]
    * @return argmax token index, or -1 on failure
@@ -197,7 +211,7 @@ public:
    * Idempotent w.r.t. allocation; recomputes K/V on every call (Task 7's
    * orchestrator calls this once per image). Assumes weights are loaded.
    *
-   * @param enc_hidden  Pointer to BD_ENC_LEN * BD_DIM floats (encoder hidden)
+   * @param enc_hidden  Pointer to enc_len_ * BD_DIM floats (encoder hidden)
    * @param token_id    Token id driving the throwaway forward (default 101=CLS)
    */
   void prefillCrossCache(const float *enc_hidden, int token_id = 101);
@@ -216,7 +230,7 @@ public:
    * enc_hidden (only the cross-cache it feeds is actually consumed by
    * cross-attn at runtime, but the input slot must still be supplied).
    *
-   * @param enc_hidden  Pointer to BD_ENC_LEN * BD_DIM floats (encoder hidden)
+   * @param enc_hidden  Pointer to enc_len_ * BD_DIM floats (encoder hidden)
    * @param token_id    Input token id for this step
    * @param pos         Sequence position (0-based) for this step
    * @return owned logits buffer [BD_NUM_VOCAB] (caller takes ownership via the
@@ -264,13 +278,13 @@ protected:
   /**
    * @brief Create the per-layer cross-attention K/V cache placeholders.
    *
-   * These are static read-only buffers of @c BD_ENC_LEN rows that are filled
+   * These are static read-only buffers of @c enc_len_ rows that are filled
    * once from the encoder hidden states (mechanism finalized in Task 7) and
    * read by mha_core in cross_attention mode. Declared as input leaf nodes
    * named cross_cache_k_l{layer_id} / cross_cache_v_l{layer_id}.
    *
    * @param layer_id  decoder layer index
-   * @param enc_len   number of encoder rows (BD_ENC_LEN)
+   * @param enc_len   number of encoder rows (enc_len_)
    * @return {cross_cache_k, cross_cache_v} placeholder tensors
    */
   std::pair<Tensor, Tensor> createCrossCachePlaceholders(int layer_id,
@@ -294,7 +308,7 @@ protected:
    *
    * @param layer_id        decoder layer index
    * @param h               post-self-attn-norm decoder hidden state
-   * @param encoder_hidden  encoder hidden states [1,1,BD_ENC_LEN,BD_DIM]
+   * @param encoder_hidden  encoder hidden states [1,1,enc_len_,BD_DIM]
    * @return output tensor after residual + LayerNorm
    */
   Tensor createCrossAttentionBlock(int layer_id, Tensor h,
@@ -342,9 +356,12 @@ protected:
   KVCacheManager kv_cache_;
   bool kv_cache_bound_ = false; /**< True once KV cache tensors are bound */
 
+  /** Encoder output sequence length; see setEncoderLength(). */
+  unsigned int enc_len_ = BD_ENC_LEN_DEFAULT;
+
   /**
    * @brief Host-owned cross-attention K/V cache, one UINT16 buffer per layer
-   *        of BD_ENC_LEN * kv_width fp16-encoded elements. Populated by
+   *        of enc_len_ * kv_width fp16-encoded elements. Populated by
    *        prefillCrossCache(); read by the decode-step cross-attn in
    *        cross_attention=true (read-only) mode.
    */
