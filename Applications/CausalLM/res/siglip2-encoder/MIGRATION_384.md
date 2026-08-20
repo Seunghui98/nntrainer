@@ -49,7 +49,7 @@ working, just not with the real checkpoint's actual weights.
 | `weight_converter.py` (decoder) key prefixes match the real checkpoint | **done** (auto-detect) — see Findings §6 |
 | `verify_encoder.py` / new `verify_decoder.py` support the real split checkpoint | done, functionally verified end-to-end against a synthetic checkpoint matching the real layer counts/layouts (torch/transformers ARE installable here via pip) — see Findings §7 |
 | Encoder parity vs the real 384px checkpoint | **PASS (x86 fp32)** — cosine 0.99999071, rel-L2 4.31e-3, `--input-pixels`-bypassed run — see Findings §8 |
-| Decoder parity vs the real 384px checkpoint | **not run yet** — encoder just passed; see Handoff |
+| Decoder parity vs the real 384px checkpoint | **PASS** — logits cosine 1.00000000, argmax exact match — see Findings §9 |
 
 ## Findings (2026-08-20 session)
 
@@ -322,6 +322,41 @@ fixed or documented:
   `res/bert-decoder/` directly, rather than copying the scripts alongside
   the data.
 
+### §9. Decoder parity PASSED against the real checkpoint — full pipeline now confirmed end to end
+
+**2026-08-20, fifth pass, same machine as §8:** decoder parity was run
+against the real `best/decoder` checkpoint (`BertLMHeadModel`,
+`hidden_size=512`/`num_attention_heads=8`/`intermediate_size=2048`/
+`num_hidden_layers=4`, matching Findings §2 exactly) using the encoder's
+just-verified `golden.encoder_hidden.npy` (`[1,576,512]`, from §8) as the
+cross-attention input, token 101 at position 0. Result: **logits cosine
+`1.00000000`, argmax exact match** — better than the encoder's already
+excellent 0.99999071 (expected: a single decode step through 4 layers has
+far less float accumulation-order drift than a 12-layer ViT forward pass).
+
+This closes the loop this doc's Handoff section was written for: **both
+the encoder and decoder halves of the 384px SigLIP2→BertDecoder pipeline
+are now confirmed correct against the real `screenai-caption-v40`
+checkpoint** (same architecture as `v4.0.0-S1`), using the exact
+config-driven dimension plumbing from Findings §2/§3 (`decoder_hidden_size`
+/ `decoder_num_heads` / `decoder_intermediate_size` in `nntr_config.json`,
+`setDecoderDims()`), the fixed `weight_converter.py` scripts from
+Findings §4/§6 (`--connector_path`, prefix auto-detection), and `.bin`
+output per the Findings §8 `.safetensors`-loader-bug workaround (the
+decoder conversion in this pass used `.bin` throughout — its
+`.safetensors` path was not separately tested, so the §8 bug's scope is
+still specifically confirmed only for `Siglip2VisionEncoder`, not ruled
+out for `BertDecoder`).
+
+`verify_decoder.py`'s `transformers` API usage (`BertLMHeadModel.
+from_pretrained()`, the forward signature, `.logits` shape) is now
+confirmed correct against a real checkpoint too — no fixes were needed
+from the synthetic-checkpoint version verified in Findings §7.
+
+Not yet done: on-device (Android/ARM) verification (`## 6. (Optional)
+On-device` below) — still untested in any form, no `ndk-build`/`adb`
+access has been available in any pass of this work so far.
+
 ## 0. Prerequisites
 
 Desktop x86 build. These are the packages this branch needed on a bare
@@ -526,46 +561,38 @@ The x86 encoder thresholds are the numbers PR #4007 actually measured at
 224px (cosine 0.999998). If 384px can't clear the same bar, suspect the
 resample filter first.
 
-## Handoff: what still needs a machine with the checkpoint
+## Handoff: what's left (on-device only)
 
-**2026-08-20, third pass:** all of Findings §2-§7 are now fixed and
-build-verified — `ENC_TO_DEC_DIM`/`BD_*` are config-driven, both
-`weight_converter.py` scripts handle the real split checkpoint's file
-layout and key prefixes, and `verify_encoder.py`/`verify_decoder.py` know
-how to load it. `ninja -C builddir-desktop Applications/CausalLM/
-nntr_causallm Applications/CausalLM/nntr_quantize` succeeds. **None of
-steps 3-5 above were actually run**, because this pass ran inside a Claude
-Code remote-execution container that has neither
-`/home/leeseunghui/workspace/v4.0.0-S1/` nor network access to
-huggingface.co (the outbound proxy 403s both `apt`'s non-default mirrors and
-`huggingface.co`; `pypi.org` works fine, so `pip install torch transformers
-safetensors numpy` succeeds, but there's no checkpoint to point them at).
+**2026-08-20, fifth pass — done:** everything this section originally asked
+for is now complete. Both encoder parity (Findings §8: cosine 0.99999071,
+rel-L2 4.31e-3) and decoder parity (Findings §9: logits cosine 1.00000000,
+argmax exact match) passed against the real checkpoint
+(`screenai-caption-v40`, same architecture as `v4.0.0-S1`), run on the
+machine that actually has it — not the Claude Code remote-execution
+container earlier passes of this doc were written from (that container has
+neither the checkpoint nor huggingface.co access; `pypi.org` is reachable
+there, which is how Findings §7's synthetic-checkpoint dry run was possible
+before real hardware access was available).
 
-To finish this, on a machine that actually has
-`/home/leeseunghui/workspace/v4.0.0-S1/` (or wherever the checkpoint lives):
+**What's left is on-device (Android/ARM) only** — "## 6. (Optional)
+On-device" below has never been attempted in any pass. If that's needed:
 
-1. `pip3 install torch transformers safetensors numpy` if not already
-   present.
-2. Run "## 3. Convert weights" through "## 5. Decoder parity" above exactly
-   as written, with `CKPT=/home/leeseunghui/workspace/v4.0.0-S1`.
-3. Watch for two things that would produce a plausible-looking but wrong
-   number instead of an obvious crash:
-   - `verify_encoder.py`'s printed `using resample=...` line — must say
-     bicubic, not bilinear (Findings §1/§7).
-   - `golden encoder_hidden shape` — must be `(1, 576, 512)`, not
-     `(1, 576, 256)` (the old 224px shape) or `(1, 576, 768)` (pre-connector
-     — wrong; the connector is already included in nntrainer's encoder
-     graph, see Findings §3).
-4. If `verify_decoder.py` fails to load `best/decoder` via
-   `BertLMHeadModel.from_pretrained()` — its API usage was verified against
-   a synthetic checkpoint but not the real one (Findings §7) — fix the load
-   path, but flag it explicitly in whatever report follows rather than
-   silently reshaping the comparison to make numbers line up.
-5. Report the actual PASS/FAIL numbers for each row in "## Pass criteria"
-   below (cosine, rel-L2, argmax match). Do not report success without
-   having actually run the comparison — a plausible-sounding number that
-   wasn't computed is worse than reporting the blocker.
-6. Commit with the existing style on this branch: `[CausalLM] ...` subject,
+1. Follow "## 6. (Optional) On-device" as written, remembering the
+   Findings §8 `.safetensors` bug: convert with plain `.bin` output (no
+   `--safetensors` flag) for both encoder and decoder — untested on
+   `.safetensors` either way, but `.bin` is the confirmed-working path.
+2. Watch for `ENABLE_FP16`-specific behavior: `Android.mk` builds with
+   `-DENABLE_FP16=1`, which switches `BertDecoder`'s KV-cache storage from
+   `UINT16` to native `FP16` (see the `#ifdef ENABLE_FP16` branches in
+   `bert_decoder.cpp`) — a code path never exercised on the x86 desktop
+   build used for Findings §8/§9, since that build doesn't define
+   `ENABLE_FP16`.
+3. Compare against the ARM fp16 threshold in "## Pass criteria" below
+   (cosine ≥ 0.999, looser than x86 fp32's 0.9999) — some numeric drift
+   from the fp16 KV-cache path is expected there.
+4. Report actual PASS/FAIL numbers, the same way Findings §8/§9 did — not
+   a plausible-sounding guess.
+5. Commit with the existing style on this branch: `[CausalLM] ...` subject,
    a body that explains why (not just what) and cites which Findings
    section it resolves, trailers:
    ```
@@ -573,8 +600,7 @@ To finish this, on a machine that actually has
    Co-authored-by: Claude <noreply@anthropic.com>
    ```
 
-If something is still genuinely blocked (e.g. `verify_decoder.py`'s
-`transformers` API assumptions don't match the real `best/decoder`
-checkpoint), say exactly where and what's needed — do not proceed on
-assumptions or paper over a shape/API mismatch with a workaround that
-changes what's being measured.
+Separately, worth a follow-up at some point but not blocking: the Findings
+§8 `.safetensors` loader bug in `Siglip2VisionEncoder` (loads without error,
+produces uncorrelated runtime output) should get its own root-cause fix
+rather than being permanently worked around with `.bin`-only conversions.
