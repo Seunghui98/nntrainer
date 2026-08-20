@@ -353,6 +353,21 @@ template <typename T> void UIntTensor<T>::copyData(const Tensor &from) {
     copy_fp32(from.size(), from.getData<float>(), (T *)getData());
     break;
   }
+  case ml::train::TensorDim::DataType::FP16: {
+    // Bit-preserving, NOT a value conversion. A 16-bit UINT tensor is
+    // nntrainer's fp16-bit container (the FP32 case above does not store
+    // integers either — copy_fp32 converts f32 -> f16 bits), so an FP16
+    // source is already in exactly the representation to store. This is what
+    // lets an ARM/ENABLE_FP16 mha_core, which converts its Q/K/V steps to
+    // FP16, write into a UINT16 external KV / cross-attention cache — the
+    // dtype such caches must have so NeuralNetwork::mapExternalTensor() maps
+    // the caller's 16-bit buffer raw (aliased) instead of reading it as FP32.
+    // Only meaningful for a 2-byte T; other widths keep throwing.
+    if (sizeof(T) != 2)
+      throw std::invalid_argument("Error: Unsupported data type");
+    copy(from.getData<uint16_t>());
+    break;
+  }
   default:
     throw std::invalid_argument("Error: Unsupported data type");
     break;
