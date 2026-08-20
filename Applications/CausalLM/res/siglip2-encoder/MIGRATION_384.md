@@ -309,8 +309,29 @@ double-check rather than something you need to act on.
 The real checkpoint is three separate files, not one merged
 `model.safetensors` — `CKPT` below is `v4.0.0-S1/`:
 
+> **Do NOT copy both `res/siglip2-encoder/` and `res/bert-decoder/`'s
+> `config.json`/`nntr_config.json`/`generation_config.json` into the SAME
+> directory.** Both resource directories use those exact filenames, and
+> `--dump-encoder`/`--decoder-init-parity` each just do
+> `LoadJsonFile(dir + "/config.json")` — if both get `cp`'d into one shared
+> `$W`, the second `cp` silently overwrites the first's `config.json` and
+> `nntr_config.json`. This actually happened in this session's first
+> real-checkpoint run: `--dump-encoder` loaded the **decoder's**
+> `nntr_config.json` (whose `model_file_name` points at
+> `nntr_bert_decoder_fp32.bin`, ~132MB) into the **encoder's** graph (which,
+> with no `image_size` in the wrong config.json, silently fell back to
+> `IMG_SIZE=224`/`NUM_PATCHES=196` and needs ~345MB) — nntrainer's loader has
+> no bounds check against the actual file size (`nntrainer/models/
+> neuralnet.cpp`'s `load()` computes each weight's read offset purely from
+> the graph's expected sizes, then `mmap`s the file and reads through it by
+> pointer arithmetic), so reading past the 132MB mapping mid-graph
+> segfaulted instead of throwing a catchable error. Use two separate output
+> directories, `$W/encoder` and `$W/decoder`, to avoid this entirely — never
+> point `--dump-encoder`/`--decoder-init-parity` at a directory that has
+> both resource sets copied into it.
+
 ```bash
-W=/tmp/siglip2-384-check && mkdir -p "$W"
+W=/tmp/siglip2-384-check && mkdir -p "$W/encoder" "$W/decoder"
 
 # encoder — vp prefix ("vision_model." vs "encoder.vision_model.") is now
 # auto-detected (Findings §6); --connector_path loads the connector from its
@@ -318,22 +339,24 @@ W=/tmp/siglip2-384-check && mkdir -p "$W"
 python3 Applications/CausalLM/res/siglip2-encoder/weight_converter.py \
   --model_path "$CKPT/siglip2-base-patch16-384/model.safetensors" \
   --connector_path "$CKPT/best/encoder_to_decoder.pt" \
-  --encoder_output "$W/nntr_siglip2_encoder_fp32.bin"
+  --encoder_output "$W/encoder/nntr_siglip2_encoder_fp32.bin"
+
+cp Applications/CausalLM/res/siglip2-encoder/{config.json,nntr_config.json,generation_config.json,sample.png} "$W/encoder/"
 
 # decoder — bp/cp prefixes ("bert."/"cls." vs "decoder.bert."/"decoder.cls.")
 # are also now auto-detected (Findings §6).
 python3 Applications/CausalLM/res/bert-decoder/weight_converter.py \
   --model_path "$CKPT/best/decoder/model.safetensors" \
-  --decoder_output "$W/nntr_bert_decoder_fp32.bin"
+  --decoder_output "$W/decoder/nntr_bert_decoder_fp32.bin"
 
-cp Applications/CausalLM/res/siglip2-encoder/{config.json,nntr_config.json,generation_config.json,sample.png} "$W/"
-cp Applications/CausalLM/res/bert-decoder/{config.json,nntr_config.json,generation_config.json,tokenizer.json} "$W/"
+cp Applications/CausalLM/res/bert-decoder/{config.json,nntr_config.json,generation_config.json,tokenizer.json} "$W/decoder/"
 ```
 
 Then replace `res/siglip2-encoder/nntr_siglip2_encoder_fp32.bin` and
 `res/bert-decoder/nntr_bert_decoder_fp32.bin` in the repo with the freshly
-converted files from `$W` (Findings §5 — do NOT leave any stale symlink to
-another workspace's 224px build in place, if one exists on your machine).
+converted files from `$W/encoder`/`$W/decoder` (Findings §5 — do NOT leave
+any stale symlink to another workspace's 224px build in place, if one
+exists on your machine).
 
 ## 4. Encoder parity
 
@@ -342,14 +365,14 @@ another workspace's 224px build in place, if one exists on your machine).
 combined checkpoint if you have one.
 
 ```bash
-cd "$W"
+cd "$W/encoder"
 python3 <nntrainer_repo>/Applications/CausalLM/res/siglip2-encoder/verify_encoder.py \
   --vision_path "$CKPT/siglip2-base-patch16-384" \
   --connector_path "$CKPT/best/encoder_to_decoder.pt" \
   --image sample.png --out golden --resample bicubic
 
 <nntrainer_repo>/builddir-desktop/Applications/CausalLM/nntr_causallm \
-  --dump-encoder "$W" sample.png
+  --dump-encoder "$W/encoder" sample.png
 
 python3 <nntrainer_repo>/Applications/CausalLM/res/siglip2-encoder/verify_encoder.py \
   --vision_path "$CKPT/siglip2-base-patch16-384" \
@@ -368,18 +391,21 @@ forces it, but double-check the log instead of assuming.
 
 ## 5. Decoder parity
 
-Copy the golden from step 4 into `res/bert-decoder/golden.encoder_hidden.npy`
+Copy the golden from step 4 into `$W/decoder/golden.encoder_hidden.npy`
 (shape `(1, 576, 512)` — see step 4) and confirm cross-attention actually
 consumes the new 576-length, 512-dim encoder output.
 
 ```bash
+cp "$W/encoder/golden.encoder_hidden.npy" "$W/decoder/golden.encoder_hidden.npy"
+
+cd "$W/decoder"
 <nntrainer_repo>/builddir-desktop/Applications/CausalLM/nntr_causallm \
-  --decoder-init-parity "$W"
+  --decoder-init-parity "$W/decoder"
 
 python3 <nntrainer_repo>/Applications/CausalLM/res/bert-decoder/verify_decoder.py \
   --decoder_path "$CKPT/best/decoder" \
-  --golden "$W/golden.encoder_hidden.npy" \
-  --nntr-npy "$W/nntr_decoder_init_logits.npy"
+  --golden "$W/decoder/golden.encoder_hidden.npy" \
+  --nntr-npy "$W/decoder/nntr_decoder_init_logits.npy"
 ```
 
 `verify_decoder.py` is new (Findings §7) — its `transformers` API usage
@@ -392,12 +418,19 @@ around it silently.
 
 ## 6. (Optional) On-device
 
+Same rule as step 3 — push encoder and decoder resources to **separate**
+device directories, not merged into one (see the warning under "## 3.
+Convert weights").
+
 ```bash
 cd Applications/CausalLM
 ./build_android.sh --cache && ./install_android.sh
-adb push "$W"/* /data/local/tmp/nntrainer/causallm/models/siglip2-384/
+adb push "$W/encoder"/* /data/local/tmp/nntrainer/causallm/models/siglip2-384-encoder/
+adb push "$W/decoder"/* /data/local/tmp/nntrainer/causallm/models/siglip2-384-decoder/
 adb shell /data/local/tmp/nntrainer/causallm/run_causallm.sh \
-  --dump-encoder /data/local/tmp/nntrainer/causallm/models/siglip2-384
+  --dump-encoder /data/local/tmp/nntrainer/causallm/models/siglip2-384-encoder
+adb shell /data/local/tmp/nntrainer/causallm/run_causallm.sh \
+  --decoder-init-parity /data/local/tmp/nntrainer/causallm/models/siglip2-384-decoder
 ```
 
 ## Pass criteria
