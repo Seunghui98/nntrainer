@@ -526,14 +526,12 @@ std::vector<float *> BertDecoder::runDecoderForward(
       kv_cache_.getKeyCache(static_cast<unsigned int>(i)).getData());
     name_to_ptr["cache_v_l" + std::to_string(i)] = reinterpret_cast<float *>(
       kv_cache_.getValueCache(static_cast<unsigned int>(i)).getData());
-    // Cross-cache buffers are 16-bit storage holding fp16 bits (UINT16 dtype on
-    // desktop, FP16 dtype on ARM — see createCrossCachePlaceholders /
-    // prefillCrossCache for why the dtype must diverge so copyData encodes real
-    // fp16 on both platforms). They are fed through the input vector exactly
-    // like the self-attn KV cache; the cross-cache input LAYER nodes (created
-    // in createCrossCachePlaceholders) are collected below via
-    // getType()=="input". mha_core reads them in cross_attention=true
-    // (read-only) mode.
+    // Cross-cache buffers are 16-bit storage holding fp16 bits (UINT16 dtype
+    // on both platforms — see createCrossCachePlaceholders). They are fed
+    // through the input vector exactly like the self-attn KV cache; the
+    // cross-cache input LAYER nodes (created in createCrossCachePlaceholders)
+    // are collected below via getType()=="input". mha_core reads them in
+    // cross_attention=true (read-only) mode.
     name_to_ptr["cross_cache_k_l" + std::to_string(i)] =
       reinterpret_cast<float *>(cross_k_bufs[i].data());
     name_to_ptr["cross_cache_v_l" + std::to_string(i)] =
@@ -562,34 +560,6 @@ std::vector<float *> BertDecoder::runDecoderForward(
       throw std::runtime_error("runDecoderForward: unknown input name '" + n +
                                "'");
     inference_inputs.push_back(it->second);
-  }
-
-  // Diagnostic: incremental_inference() pairs input[idx] with
-  // getInputDimension()[idx], but inference_inputs is built from layers whose
-  // getType()=="input". If those two lists differ in length or order, a buffer
-  // is mapped with another input's TensorDim — and for an FP16 dim
-  // mapExternalTensor() reads dataLen*4 bytes out of what may be a 16-bit
-  // buffer (see the ARM segfault in copy_fp32_to_fp16). Print both so the
-  // pairing is verifiable instead of assumed.
-  {
-    auto in_dims = model->getInputDimension();
-    std::cout << "[runDecoderForward] getInputDimension()=" << in_dims.size()
-              << " vs ordered_input_names=" << ordered_input_names.size()
-              << (in_dims.size() == ordered_input_names.size()
-                    ? ""
-                    : "  <<< MISMATCH")
-              << "\n";
-    for (size_t i = 0; i < in_dims.size(); ++i) {
-      std::cout << "  in_dim[" << i << "]=" << in_dims[i].batch() << ":"
-                << in_dims[i].channel() << ":" << in_dims[i].height() << ":"
-                << in_dims[i].width()
-                << " dataLen=" << in_dims[i].getDataLen()
-                << " dtypeSize=" << in_dims[i].getDataTypeSize() << "  name="
-                << (i < ordered_input_names.size() ? ordered_input_names[i]
-                                                   : std::string("<MISSING>"))
-                << "\n";
-    }
-    std::cout << std::flush;
   }
 
   std::vector<float *> labels;
