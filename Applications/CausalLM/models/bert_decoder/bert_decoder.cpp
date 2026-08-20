@@ -522,6 +522,34 @@ std::vector<float *> BertDecoder::runDecoderForward(
     inference_inputs.push_back(it->second);
   }
 
+  // Diagnostic: incremental_inference() pairs input[idx] with
+  // getInputDimension()[idx], but inference_inputs is built from layers whose
+  // getType()=="input". If those two lists differ in length or order, a buffer
+  // is mapped with another input's TensorDim — and for an FP16 dim
+  // mapExternalTensor() reads dataLen*4 bytes out of what may be a 16-bit
+  // buffer (see the ARM segfault in copy_fp32_to_fp16). Print both so the
+  // pairing is verifiable instead of assumed.
+  {
+    auto in_dims = model->getInputDimension();
+    std::cout << "[runDecoderForward] getInputDimension()=" << in_dims.size()
+              << " vs ordered_input_names=" << ordered_input_names.size()
+              << (in_dims.size() == ordered_input_names.size()
+                    ? ""
+                    : "  <<< MISMATCH")
+              << "\n";
+    for (size_t i = 0; i < in_dims.size(); ++i) {
+      std::cout << "  in_dim[" << i << "]=" << in_dims[i].batch() << ":"
+                << in_dims[i].channel() << ":" << in_dims[i].height() << ":"
+                << in_dims[i].width()
+                << " dataLen=" << in_dims[i].getDataLen()
+                << " dtypeSize=" << in_dims[i].getDataTypeSize() << "  name="
+                << (i < ordered_input_names.size() ? ordered_input_names[i]
+                                                   : std::string("<MISSING>"))
+                << "\n";
+    }
+    std::cout << std::flush;
+  }
+
   std::vector<float *> labels;
   return model->incremental_inference(BD_BATCH_SIZE, inference_inputs, labels,
                                       1, pos, pos + 1, false);
