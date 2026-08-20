@@ -48,8 +48,8 @@ working, just not with the real checkpoint's actual weights.
 | `weight_converter.py` (encoder) loads the `enc_to_dec_proj` connector correctly | **done** (`--connector_path`), but prefix auto-detect also needed — see Findings §4/§6 |
 | `weight_converter.py` (decoder) key prefixes match the real checkpoint | **done** (auto-detect) — see Findings §6 |
 | `verify_encoder.py` / new `verify_decoder.py` support the real split checkpoint | done, functionally verified end-to-end against a synthetic checkpoint matching the real layer counts/layouts (torch/transformers ARE installable here via pip) — see Findings §7 |
-| Encoder parity vs the real 384px checkpoint | **not run** — no checkpoint or network access in this environment; see Handoff |
-| Decoder parity vs the real 384px checkpoint | **not run** — same; see Handoff |
+| Encoder parity vs the real 384px checkpoint | **PASS (x86 fp32)** — cosine 0.99999071, rel-L2 4.31e-3, `--input-pixels`-bypassed run — see Findings §8 |
+| Decoder parity vs the real 384px checkpoint | **not run yet** — encoder just passed; see Handoff |
 
 ## Findings (2026-08-20 session)
 
@@ -249,6 +249,79 @@ environment gap hit along the way: this transformers version (5.15.1)
 requires `torchvision` for `AutoImageProcessor` even with `use_fast=False`;
 install it alongside the others if you hit the same `ImportError`.
 
+### §8. Encoder parity PASSED against the real checkpoint (x86 fp32) — and a real `.safetensors`-loader bug found along the way
+
+**2026-08-20, fourth pass, run on the actual machine with the checkpoint**
+(not this analysis session's container): encoder parity was run end to end
+against the real `screenai-caption-v40` checkpoint (same architecture as
+`v4.0.0-S1`, real `model.safetensors` + `encoder_to_decoder.pt`) and
+**passed**: cosine `0.99999071`, rel-L2 `4.31e-3` — both clear of the
+0.9999 / 1e-2 thresholds, close to PR #4007's 224px number (`0.999998`).
+Run with `--input-pixels golden.pixel.npy` (bypassing nntrainer's own image
+resize, feeding it the exact PyTorch-preprocessed pixels) to isolate
+encoder math from preprocessing during debugging; re-run without
+`--input-pixels` to also confirm the C++ resize path end to end.
+
+Getting there surfaced one real bug and two process pitfalls, all now
+fixed or documented:
+
+- **`nntrainer`'s `.safetensors` output format is broken for this custom
+  encoder graph.** The exact same conversion (`weight_converter.py
+  --connector_path ... --safetensors`) that produces a working `.bin` file
+  produces a `.safetensors` file that loads without error, with correct
+  file-level tensor data (independently verified byte-exact against the
+  source `encoder_to_decoder.pt` via a standalone Python check — the
+  connector's weight/bias tensors matched exactly), but gives **completely
+  uncorrelated output at runtime** (cosine ≈ -0.045, i.e. noise) — with the
+  identical config and weights, switching only the output format
+  (`--encoder_output foo.bin` vs `foo.safetensors` + `--safetensors`) took
+  cosine from -0.045 to 0.99999071. This means `nntr_causallm`'s
+  `.safetensors` loader for this encoder graph does not correctly map
+  tensors by name (or has some other bug) — **use `.bin` output for this
+  encoder until that loader bug is separately investigated and fixed; do
+  not trust `.safetensors` conversions for `Siglip2VisionEncoder` in the
+  meantime.** This wasn't caught earlier because Findings §1-§7 (and the
+  synthetic-checkpoint verification in §7's Update) never happened to
+  exercise the `.safetensors` output path against a real checkpoint's
+  actual runtime — only `.bin`.
+- **The HF-side `config.json` needed for `verify_encoder.py --vision_path`
+  and this repo's own `res/*/config.json` are NOT interchangeable, even
+  though they're both named `config.json` and both describe the same
+  model.** nntrainer's `config.json` nests architecture params under an
+  `"encoder"` key (`cfg.contains("encoder") ? cfg["encoder"] : cfg`); HF's
+  `SiglipVisionConfig`/`SiglipVisionModel.from_pretrained()` expects them
+  flat at the top level and silently falls back to library defaults
+  (`image_size=224`) for anything it can't find nested — which surfaces
+  later as a confusing `Reinit due to size mismatch: ckpt torch.Size([576,
+  768]) vs model torch.Size([196, 768])` from `transformers`' loader,
+  not an obvious "wrong config" error. Separately, the real checkpoint's
+  own top-level `config.json` (from the original `siglip2-base-patch16-384`
+  HF repo) is *also* not directly usable — it's the full `SiglipConfig`
+  (text+vision), with `image_size` nested under `"vision_config"` and most
+  vision-tower fields relying on `SiglipVisionConfig` defaults rather than
+  stating them explicitly. The fix that worked: flatten nntrainer's own
+  `"encoder"`-nested config.json into one file with everything at the top
+  level — this satisfies HF's loader (which just needs the fields present
+  anywhere at the top) *and* still satisfies nntrainer's C++ side (whose
+  fallback is exactly "no `encoder` key → read fields from the top level
+  directly"), so one flat `config.json` works for both consumers instead of
+  needing two.
+- **Local scratch copies of `weight_converter.py`/`verify_encoder.py` left
+  in ad hoc checkpoint resource directories (e.g. a `res/<checkpoint-name>/
+  encoder/` set up by hand, separate from `res/siglip2-encoder/`) drift out
+  of sync with fixes landed on this branch and are easy to invoke by
+  accident** (`python3 weight_converter.py` from inside that directory
+  silently picks up the stale local copy instead of the fixed one one
+  level up in `res/siglip2-encoder/`) — this cost several debugging rounds
+  in this session (`enc_to_dec_sd` `NameError`, missing `--connector_path`
+  argument, both from a stale local copy, not the real bug). When setting
+  up a new checkpoint's resource directory, keep only the checkpoint's own
+  data files there (weights, its own `config.json`/`nntr_config.json`,
+  `encoder_to_decoder.pt`, etc.) and always invoke the converter/verify
+  scripts by their path under `res/siglip2-encoder/` /
+  `res/bert-decoder/` directly, rather than copying the scripts alongside
+  the data.
+
 ## 0. Prerequisites
 
 Desktop x86 build. These are the packages this branch needed on a bare
@@ -330,12 +403,17 @@ The real checkpoint is three separate files, not one merged
 > point `--dump-encoder`/`--decoder-init-parity` at a directory that has
 > both resource sets copied into it.
 
+> Do NOT pass `--safetensors` to the encoder conversion below — Findings §8
+> found nntrainer's `.safetensors` loader is broken for `Siglip2VisionEncoder`
+> (loads without error but produces uncorrelated output at runtime). Plain
+> `.bin` output (the default, no flag needed) is what's confirmed working.
+
 ```bash
 W=/tmp/siglip2-384-check && mkdir -p "$W/encoder" "$W/decoder"
 
 # encoder — vp prefix ("vision_model." vs "encoder.vision_model.") is now
 # auto-detected (Findings §6); --connector_path loads the connector from its
-# own file (Findings §4).
+# own file (Findings §4). Do NOT add --safetensors here (Findings §8).
 python3 Applications/CausalLM/res/siglip2-encoder/weight_converter.py \
   --model_path "$CKPT/siglip2-base-patch16-384/model.safetensors" \
   --connector_path "$CKPT/best/encoder_to_decoder.pt" \
