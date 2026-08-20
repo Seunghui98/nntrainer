@@ -14,8 +14,8 @@
  *   - Q/K/V are three separate fully_connected layers fed from LN1 output.
  *   - MLP activation is tanh_gelu (maps HF gelu_pytorch_tanh).
  *   - layer_norm_eps = 1e-6.
- *   - After post_layernorm, a final fully_connected(unit=256) named
- *     enc_to_dec_proj. Output is [1, num_patches, 256].
+ *   - After post_layernorm, a final fully_connected(unit=enc_to_dec_dim_)
+ *     named enc_to_dec_proj. Output is [1, num_patches, enc_to_dec_dim_].
  *
  * Weight loading order (must match weight_converter.py::collect_encoder):
  *   patch_embed conv w, b -> pos_embed ->
@@ -381,6 +381,13 @@ void Siglip2VisionEncoder::setupParameters(json &cfg, json &generation_cfg,
   NUM_PATCHES = nntr_cfg.value("num_patches", patches_per_side * patches_per_side);
   IMG_CHANNELS = 3;
 
+  // enc_to_dec_proj output dim; must equal the paired BertDecoder's hidden
+  // size ("decoder_hidden_size" is the same key BertDecoder reads via
+  // setDecoderDims(), since the connector's output and the decoder's input
+  // are the same tensor by construction).
+  enc_to_dec_dim_ =
+    nntr_cfg.value("decoder_hidden_size", ENC_TO_DEC_DIM_DEFAULT);
+
   INIT_SEQ_LEN =
     nntr_cfg.value("init_seq_len", static_cast<unsigned int>(NUM_PATCHES));
   MAX_SEQ_LEN =
@@ -591,10 +598,10 @@ std::pair<Tensor, Tensor> Siglip2VisionEncoder::constructModel() {
                             withKey("packed", "false")}));
   h = post_ln(h);
 
-  // Encoder-to-decoder projection: [1, num_patches, 768] -> [1, num_patches, 256]
+  // Encoder-to-decoder projection: [1, num_patches, 768] -> [1, num_patches, enc_to_dec_dim_]
   LayerHandle enc_proj(createLayer(
     "fully_connected", {withKey("name", "enc_to_dec_proj"),
-                        withKey("unit", std::to_string(ENC_TO_DEC_DIM)),
+                        withKey("unit", std::to_string(enc_to_dec_dim_)),
                         withKey("disable_bias", "false")}));
   h = enc_proj(h);
 
@@ -640,7 +647,7 @@ std::vector<float> Siglip2VisionEncoder::encode(const std::string &image_path) {
     BATCH_SIZE, inputs, labels, NUM_PATCHES, 0, NUM_PATCHES, false);
 
   const int out_size =
-    static_cast<int>(NUM_PATCHES) * static_cast<int>(ENC_TO_DEC_DIM);
+    static_cast<int>(NUM_PATCHES) * static_cast<int>(enc_to_dec_dim_);
   enc_output_buf_.assign(output[0], output[0] + out_size);
   for (auto *p : output)
     delete[] p;
@@ -679,7 +686,7 @@ std::vector<float> Siglip2VisionEncoder::encodePixels(const float *pixel_data,
     BATCH_SIZE, inputs, labels, NUM_PATCHES, 0, NUM_PATCHES, false);
 
   const int out_size =
-    static_cast<int>(NUM_PATCHES) * static_cast<int>(ENC_TO_DEC_DIM);
+    static_cast<int>(NUM_PATCHES) * static_cast<int>(enc_to_dec_dim_);
   enc_output_buf_.assign(output[0], output[0] + out_size);
   for (auto *p : output)
     delete[] p;
@@ -706,10 +713,11 @@ void Siglip2VisionEncoder::run(const WSTR prompt, bool do_sample,
   std::vector<float> result = encode(image_path_str);
 
   std::cout << std::setprecision(9)
-            << "Encoder output [1," << NUM_PATCHES << ",256], first 10 values:";
-  const int print_count = static_cast<int>(ENC_TO_DEC_DIM) > 10
+            << "Encoder output [1," << NUM_PATCHES << "," << enc_to_dec_dim_
+            << "], first 10 values:";
+  const int print_count = static_cast<int>(enc_to_dec_dim_) > 10
                             ? 10
-                            : static_cast<int>(ENC_TO_DEC_DIM);
+                            : static_cast<int>(enc_to_dec_dim_);
   for (int i = 0; i < print_count; ++i) {
     std::cout << " [" << i << "]=" << result[i];
   }

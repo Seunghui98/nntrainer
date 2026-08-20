@@ -113,6 +113,24 @@ def save_safetensors(weights, output_path, dtype):
 #    (word-embedding projection is TIED — do NOT re-save the 30522×256 matrix)
 # ---------------------------------------------------------------------------
 
+def _detect_prefix(sd, candidates, probe_suffix):
+    """Return whichever of candidates + probe_suffix is a key in sd.
+
+    Two layouts have been seen for this model: a combined checkpoint that
+    prefixes decoder tensors with "decoder." (e.g. "decoder.bert...."), and
+    a standalone decoder-only checkpoint (e.g. the real
+    best/decoder/model.safetensors) that does not. Detect instead of
+    hardcoding one, so the same script works on either.
+    """
+    for candidate in candidates:
+        if f"{candidate}{probe_suffix}" in sd:
+            return candidate
+    raise KeyError(
+        f"Could not find {probe_suffix!r} under any of {candidates} in the "
+        "checkpoint — inspect its key names."
+    )
+
+
 def collect_decoder(sd, dtype):
     """Return ordered list of (nntr_name, ndarray) for the decoder file."""
     weights = []
@@ -121,7 +139,8 @@ def collect_decoder(sd, dtype):
         arr = tensor_to_numpy(tensor, dtype, transpose=transpose)
         weights.append((name, arr))
 
-    bp = "decoder.bert."
+    bp = _detect_prefix(sd, ("decoder.bert.", "bert."),
+                        "embeddings.word_embeddings.weight")
 
     # 1–4. Embeddings
     add("word_emb:weight",
@@ -203,7 +222,8 @@ def collect_decoder(sd, dtype):
             sd[f"{lp}output.LayerNorm.bias"])
 
     # 6. LM head (word-embedding projection is TIED — not re-saved)
-    cp = "decoder.cls."
+    cp = _detect_prefix(sd, ("decoder.cls.", "cls."),
+                        "predictions.bias")
     add("lmhead_dense:weight",
         sd[f"{cp}predictions.transform.dense.weight"], transpose=True)
     add("lmhead_dense:bias",

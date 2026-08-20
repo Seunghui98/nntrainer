@@ -8,9 +8,12 @@
  * @author Seunghui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  SigLIP2 ViT-B/16 vision encoder with enc_to_dec projection.
- *         Produces [1, num_patches, 256] projected encoder hidden states
- *         (num_patches = (image_size / patch_size)^2, e.g. 196 for 224px,
- *         576 for 384px).
+ *         Produces [1, num_patches, enc_to_dec_dim] projected encoder hidden
+ *         states (num_patches = (image_size / patch_size)^2, e.g. 196 for
+ *         224px, 576 for 384px; enc_to_dec_dim is config-driven via
+ *         nntr_config.json's "decoder_hidden_size", e.g. 256 for the 224px
+ *         checkpoint, 512 for the 384px one — it must equal the paired
+ *         BertDecoder's hidden size since the projection feeds it directly).
  */
 
 #ifndef __SIGLIP2_VISION_ENCODER_H__
@@ -29,15 +32,19 @@ namespace causallm {
  *   - Learned position embedding
  *   - 12x transformer blocks (pre-LN, separate Q/K/V, tanh_gelu MLP)
  *   - Post layer norm
- *   - Linear projection enc_to_dec_proj: [768 -> 256]
+ *   - Linear projection enc_to_dec_proj: [768 -> enc_to_dec_dim]
  *
- * Output: [1, num_patches, 256] projected encoder hidden states.
+ * Output: [1, num_patches, enc_to_dec_dim] projected encoder hidden states.
  */
 class Siglip2VisionEncoder : virtual public Transformer {
 
 public:
   static constexpr const char *architectures = "Siglip2VisionEncoder";
-  static constexpr unsigned int ENC_TO_DEC_DIM = 256;
+  /** Fallback enc_to_dec_proj output dim when nntr_config.json has no
+   *  "decoder_hidden_size" (matches the 224px checkpoint this encoder was
+   *  first verified against). Actual value is resolved in setupParameters()
+   *  and exposed via getEncToDecDim() — use that, not this constant. */
+  static constexpr unsigned int ENC_TO_DEC_DIM_DEFAULT = 256;
 
   /**
    * @brief Construct a Siglip2VisionEncoder object.
@@ -79,6 +86,13 @@ public:
    *       future releases.
    */
   std::vector<float> encodePixels(const float *pixel_data, size_t pixel_count);
+
+  /**
+   * @brief Get the resolved enc_to_dec_proj output dim (== the paired
+   *        decoder's hidden size). Valid after construction (resolved in
+   *        setupParameters() from nntr_config.json's "decoder_hidden_size").
+   */
+  unsigned int getEncToDecDim() const { return enc_to_dec_dim_; }
 
 protected:
   /**
@@ -132,6 +146,14 @@ private:
   unsigned int PATCH_SIZE = 16;   /**< Patch height/width */
   unsigned int NUM_PATCHES = 196; /**< Number of patches (resolved in setupParameters) */
   unsigned int IMG_CHANNELS = 3;  /**< Image channels (RGB) */
+  /** enc_to_dec_proj output dim; resolved in setupParameters() from
+   *  nntr_config.json's "decoder_hidden_size" (defaults to
+   *  ENC_TO_DEC_DIM_DEFAULT). Must equal the paired BertDecoder's hidden
+   *  size — baked into the graph at build time, so it must be correct
+   *  before initialize() is called (setupParameters() runs in the
+   *  constructor, before any initialize() call, so no extra setter is
+   *  needed here unlike BertDecoder's setEncoderLength()/setDecoderDims()). */
+  unsigned int enc_to_dec_dim_ = ENC_TO_DEC_DIM_DEFAULT;
   /** Use PIL BICUBIC (vs. BILINEAR) resize; must match the checkpoint's
    *  preprocessor_config.json "resample" (nntr_config.json "resample"). */
   bool use_bicubic_resample_ = false;

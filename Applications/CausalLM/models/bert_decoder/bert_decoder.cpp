@@ -156,7 +156,7 @@ std::pair<std::vector<Tensor>, Tensor> BertDecoder::constructDecoderGraph() {
   Tensor position_ids({1, 1, 1, BD_INIT_SEQ_LEN}, "position_ids");
   Tensor token_type_ids({1, 1, 1, BD_INIT_SEQ_LEN}, "token_type_ids");
 
-  // Encoder hidden states [1,1,enc_len_,256], consumed by cross-attention.
+  // Encoder hidden states [1,1,enc_len_,BD_DIM], consumed by cross-attention.
   Tensor encoder_hidden({1, 1, enc_len_, static_cast<unsigned int>(BD_DIM)},
                         "encoder_hidden");
 
@@ -563,7 +563,7 @@ void BertDecoder::prefillCrossCache(const float *enc_hidden, int token_id) {
   const unsigned int kv_width =
     static_cast<unsigned int>(BD_HEAD_DIM * BD_NUM_HEADS / BD_GQA_SIZE);
 
-  // encoder_hidden as an FP32 tensor [1,1,enc_len_,256]. dot() below
+  // encoder_hidden as an FP32 tensor [1,1,enc_len_,BD_DIM]. dot() below
   // reproduces the FC layer math exactly (FullyConnectedLayer::forwarding
   // does input.dot(weight, false, false) then += bias).
   ml::train::TensorDim enc_dim(
@@ -836,16 +836,16 @@ bool BertDecoder::smokeTest() {
   //
   // Sizes match the model input dims:
   //   input0, position_ids, token_type_ids : [1,1,1,1]        -> 1 float each
-  //   encoder_hidden : [1,1,enc_len_,256]                     -> enc_len_*256
+  //   encoder_hidden : [1,1,enc_len_,BD_DIM]                  -> enc_len_*BD_DIM
   //                                                               floats
-  //   cache_k/v_l{i} : [1,1,512,256]       -> 512*256 floats (from kv_cache_)
+  //   cache_k/v_l{i} : [1,1,512,BD_DIM]     -> 512*BD_DIM floats (from kv_cache_)
   std::vector<float> in_token_buf(1, 101.0f); // [CLS]
   std::vector<float> in_pos_buf(1, 0.0f);
   std::vector<float> in_type_buf(1, 0.0f);
   std::vector<float> in_enc(static_cast<size_t>(enc_len_) * BD_DIM, 0.0f);
 
   // Dummy zero-filled cross-attention K/V cache buffers (UINT16 placeholders,
-  // enc_len_ x 256 elements => 2 bytes each). prefillCrossCache() fills these
+  // enc_len_ x BD_DIM elements => 2 bytes each). prefillCrossCache() fills these
   // from the encoder K/V projections; for the self-attn smoke we just bind
   // valid storage so the graph runs end-to-end. One shared zero buffer per K
   // and V is sufficient since the smoke only checks the self-attn path does

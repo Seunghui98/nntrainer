@@ -382,14 +382,18 @@ void registerAllModels() {
 #if !defined(_WIN32)
   factory.registerModel(
     "BertDecoder", [](json cfg, json generation_cfg, json nntr_cfg) {
-      // BertDecoder hardcodes its dimensions; tensor dtypes come from
-      // nntr_config (FP32 for the source model). The graph is built FP32 to
-      // load FP32 weights; quantization happens at save via the dtype map.
+      // BertDecoder's dimensions come from nntr_config (see
+      // setDecoderDims()); tensor dtypes also come from nntr_config (FP32
+      // for the source model). The graph is built FP32 to load FP32
+      // weights; quantization happens at save via the dtype map.
       auto dec = std::make_unique<causallm::BertDecoder>();
       dec->setTensorTypes(nntr_cfg.value("model_tensor_type", "FP32-FP32"),
                           nntr_cfg.value("fc_layer_dtype", "FP32"),
                           nntr_cfg.value("embedding_dtype", "FP32"));
       dec->setEncoderLength(nntr_cfg.value("enc_len", 196u));
+      dec->setDecoderDims(nntr_cfg.value("decoder_hidden_size", 256),
+                         nntr_cfg.value("decoder_num_heads", 4),
+                         nntr_cfg.value("decoder_intermediate_size", 1024));
       return dec;
     });
 #endif
@@ -600,7 +604,8 @@ std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
  *
  * Embeddings (-> embd_dtype): word_emb / pos_emb / type_emb embedding_layer
  * lookup tables. The embedding_layer supports Q4_0/Q8_0 and Q6_K lookup/save
- * (Q4_0/Q8_0 need width % 32 == 0 — BD_DIM = 256, OK), so embd_dtype is fully
+ * (Q4_0/Q8_0 need width % 32 == 0 — BD_DIM is config-driven via
+ * setDecoderDims() now, e.g. 256 or 512, both OK), so embd_dtype is fully
  * configurable (FP32 / Q4_0 / Q8_0 / Q6_K) via --embd_dtype.
  *
  * Deliberately left FP32: all LayerNorms (emb_ln, *_self_ln, *_cross_ln,

@@ -14,7 +14,9 @@
  *   input0          [1,1,1,1]     token id
  *   position_ids    [1,1,1,1]
  *   token_type_ids  [1,1,1,1]
- *   encoder_hidden  [1,1,enc_len,256] encoder hidden states for cross-attention
+ *   encoder_hidden  [1,1,enc_len,BD_DIM] encoder hidden states for
+ *                   cross-attention (BD_DIM is config-driven; see
+ *                   setDecoderDims())
  *   cache_k_l0..N-1 [1,1,MAX_SEQ,DIM]  per-layer KV cache
  *   cache_v_l0..N-1 [1,1,MAX_SEQ,DIM]
  *
@@ -61,10 +63,17 @@ public:
   static constexpr const char *architectures = "BertDecoder";
 
   // Hardcoded decoder constants matching the source BERT decoder.
-  static constexpr int BD_DIM = 256;
+  // BD_DIM/BD_NUM_HEADS/BD_HEAD_DIM/BD_INTERMEDIATE_SIZE below are the
+  // *default* values (matching the 224px checkpoint's BERT-small decoder);
+  // they are non-const instance fields so setDecoderDims() can override them
+  // from nntr_config.json for other checkpoints (e.g. 512/8/64/2048 for the
+  // 384px checkpoint's decoder) before initialize() bakes them into the
+  // graph. BD_NUM_LAYERS and the rest below are unchanged across the
+  // checkpoints seen so far and stay compile-time constants.
+  int BD_DIM = 256;
   static constexpr int BD_NUM_LAYERS = 4;
-  static constexpr int BD_NUM_HEADS = 4;
-  static constexpr int BD_HEAD_DIM = 64;
+  int BD_NUM_HEADS = 4;
+  int BD_HEAD_DIM = 64;
   static constexpr unsigned int BD_NUM_VOCAB = 30522;
   static constexpr unsigned int BD_MAX_POSITION_EMBEDDINGS = 512;
   static constexpr unsigned int BD_TYPE_VOCAB_SIZE = 2;
@@ -81,8 +90,9 @@ public:
   // NUM_TO_GENERATE must be set for Transformer; use a reasonable default.
   static constexpr unsigned int BD_NUM_TO_GENERATE = 1;
 
-  // FFN intermediate size (4 * DIM = 1024 for BERT-small)
-  static constexpr int BD_INTERMEDIATE_SIZE = 1024;
+  // FFN intermediate size (default 4 * BD_DIM = 1024 for BERT-small; see
+  // setDecoderDims() for other checkpoints).
+  int BD_INTERMEDIATE_SIZE = 1024;
 
   /**
    * @brief Construct a BertDecoder with hardcoded parameters.
@@ -153,6 +163,33 @@ public:
    *        encoder, 576 for the 384px one).
    */
   void setEncoderLength(unsigned int enc_len) { enc_len_ = enc_len; }
+
+  /**
+   * @brief Override the decoder's hidden dims (BD_DIM=256/BD_NUM_HEADS=4/
+   *        BD_HEAD_DIM=64/BD_INTERMEDIATE_SIZE=1024 otherwise). Must be
+   *        called BEFORE initialize() — like setEncoderLength(), these sizes
+   *        are baked into the graph at build time. head_dim is derived as
+   *        hidden_size / num_heads (mirrors Siglip2VisionEncoder's
+   *        HEAD_DIM = DIM / NUM_HEADS pattern) rather than taking a separate
+   *        argument, since every checkpoint seen so far keeps that ratio.
+   *
+   * @param hidden_size decoder hidden size (e.g. 256 for the 224px
+   *        checkpoint's BERT-small decoder, 512 for the 384px one's).
+   * @param num_heads number of attention heads (self- and cross-attention
+   *        share this value; no GQA).
+   * @param intermediate_size FFN intermediate size (e.g. 4 * hidden_size).
+   */
+  void setDecoderDims(int hidden_size, int num_heads, int intermediate_size) {
+    BD_DIM = hidden_size;
+    BD_NUM_HEADS = num_heads;
+    BD_HEAD_DIM = hidden_size / num_heads;
+    BD_INTERMEDIATE_SIZE = intermediate_size;
+    DIM = BD_DIM;
+    NUM_HEADS = BD_NUM_HEADS;
+    HEAD_DIM = BD_HEAD_DIM;
+    NUM_KEY_VALUE_HEADS = BD_NUM_HEADS;
+    INTERMEDIATE_SIZE = BD_INTERMEDIATE_SIZE;
+  }
 
   /**
    * @brief Initialize the decoder model (register layers, build graph,

@@ -256,7 +256,9 @@ static void writeNpyF32(const std::string &path, const std::vector<float> &data,
 
 /**
  * @brief --dump-encoder handler: run Siglip2VisionEncoder and dump its
- *        [1, num_patches, ENC_TO_DEC_DIM] output to nntr_encoder_hidden.npy.
+ *        [1, num_patches, enc_to_dec_dim] output to nntr_encoder_hidden.npy
+ *        (enc_to_dec_dim from Siglip2VisionEncoder::getEncToDecDim(), itself
+ *        resolved from nntr_config.json's "decoder_hidden_size").
  *        Pixel/output shapes are derived from the model config (image_size) and
  *        the projection dim, not a fixed resolution. Optional --input-pixels
  *        <npy> feeds a [1, 3, image_size, image_size] tensor (bypassing the C++
@@ -316,9 +318,9 @@ static int runDumpEncoder(int argc, char *argv[]) {
       std::cout << " " << out[i];
     std::cout << "\n";
 
-    // Output is [1, num_patches, ENC_TO_DEC_DIM]; derive the shape from the
+    // Output is [1, num_patches, enc_to_dec_dim]; derive the shape from the
     // projection dim and the actual element count (no hardcoded resolution).
-    const size_t dim = causallm::Siglip2VisionEncoder::ENC_TO_DEC_DIM;
+    const size_t dim = enc->getEncToDecDim();
     const std::string shape = "(1, " + std::to_string(out.size() / dim) + ", " +
                               std::to_string(dim) + ")";
     writeNpyF32("nntr_encoder_hidden.npy", out, shape);
@@ -333,37 +335,47 @@ static int runDumpEncoder(int argc, char *argv[]) {
 
 /**
  * @brief --decoder-init-parity handler: inject a golden encoder output
- *        [1,enc_len,256] (enc_len from nntr_config.json's "enc_len", default
- *        196), run one decode step from the start token (101) at position 0,
- *        and save logits to nntr_decoder_init_logits.npy. Reads
- *        nntr_config.json so the graph loads fp32 OR quantized (Q4_0/Q6_K)
- *        weights.
+ *        [1,enc_len,decoder_hidden_size] (enc_len from nntr_config.json's
+ *        "enc_len", default 196; decoder_hidden_size from nntr_config.json,
+ *        default 256, plus its paired "decoder_num_heads"/
+ *        "decoder_intermediate_size", defaults 4/1024 — see
+ *        BertDecoder::setDecoderDims()), run one decode step from the start
+ *        token (101) at position 0, and save logits to
+ *        nntr_decoder_init_logits.npy. Reads nntr_config.json so the graph
+ *        loads fp32 OR quantized (Q4_0/Q6_K) weights.
  */
 static int runDecoderInitParity(const std::string &model_dir) {
   std::string weight_file = model_dir + "/nntr_bert_decoder_fp32.bin";
   std::string mtt = "FP32-FP32", fc_dt = "FP32", embd_dt = "FP32";
   unsigned int enc_len = 196;
+  int dec_hidden = 256, dec_heads = 4, dec_intermediate = 1024;
   try {
     json nntr = causallm::LoadJsonFile(model_dir + "/nntr_config.json");
     mtt = nntr.value("model_tensor_type", mtt);
     fc_dt = nntr.value("fc_layer_dtype", fc_dt);
     embd_dt = nntr.value("embedding_dtype", embd_dt);
     enc_len = nntr.value("enc_len", enc_len);
+    dec_hidden = nntr.value("decoder_hidden_size", dec_hidden);
+    dec_heads = nntr.value("decoder_num_heads", dec_heads);
+    dec_intermediate = nntr.value("decoder_intermediate_size", dec_intermediate);
     if (nntr.contains("model_file_name"))
       weight_file =
         model_dir + "/" + nntr["model_file_name"].get<std::string>();
   } catch (const std::exception &) {
-    // No nntr_config.json — fall back to the FP32/196-patch defaults above.
+    // No nntr_config.json — fall back to the FP32/196-patch/256-dim defaults
+    // above.
   }
 
   try {
-    const size_t enc_count = static_cast<size_t>(enc_len) * 256;
+    const size_t enc_count =
+      static_cast<size_t>(enc_len) * static_cast<size_t>(dec_hidden);
     auto enc =
       readNpyF32(model_dir + "/golden.encoder_hidden.npy", enc_count);
 
     auto dec = std::make_unique<causallm::BertDecoder>();
     dec->setTensorTypes(mtt, fc_dt, embd_dt);
     dec->setEncoderLength(enc_len);
+    dec->setDecoderDims(dec_hidden, dec_heads, dec_intermediate);
     dec->initialize();
     dec->load_weight(weight_file);
 

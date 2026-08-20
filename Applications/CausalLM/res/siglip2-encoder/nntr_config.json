@@ -11,6 +11,7 @@
   "img_size": 384,
   "num_patches": 576,
   "encoder_hidden_size": 768,
+  "decoder_hidden_size": 512,
   "init_seq_len": 1,
   "max_seq_len": 576,
   "resample": "bicubic",

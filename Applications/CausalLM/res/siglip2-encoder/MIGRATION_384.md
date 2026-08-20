@@ -14,10 +14,25 @@ part off to an agent.
 resample question (see Status) but also surfaced three *new* gaps this doc
 didn't previously know about — the decoder's hidden dims, the
 encoder→decoder connector's weight source, and a dead config field. See
-"## Findings" below before touching anything; the "Delegating the rest to
-an agent" section at the bottom has been rewritten to hand off the full,
-current picture. No code has been changed yet — this pass was analysis
-only, no build/convert/verify commands were actually run.
+"## Findings" below before touching anything.
+
+**2026-08-20 second update:** the Findings §2-4 fixes (config-driven
+`ENC_TO_DEC_DIM`/`BD_*` dims, `weight_converter.py` connector loading) were
+implemented and build-verified in *this* environment — a Claude Code
+remote-execution container, not the machine the checkpoint lives on. That
+container has neither `/home/leeseunghui/workspace/v4.0.0-S1/` nor
+huggingface.co reachable (outbound proxy returns 403 for both), so **the
+actual weight conversion and encoder/decoder parity runs against the real
+checkpoint (steps 3-5 below) were not executed** — see "## Handoff: what
+still needs a machine with the checkpoint" at the bottom for the exact
+commands to run there, and two more gaps this pass found (§6, §7) beyond
+the original three. What *was* possible here: pypi.org is reachable (unlike
+huggingface.co), so `torch`/`transformers`/`safetensors` install fine, and
+both `weight_converter.py` scripts plus both verify scripts were
+functionally run end-to-end against a synthetic checkpoint built locally
+with the real layer counts and both known key-prefix layouts (see Findings
+§7's "Update" note) — so the code paths themselves are exercised and
+working, just not with the real checkpoint's actual weights.
 
 ## Status
 
@@ -28,11 +43,13 @@ only, no build/convert/verify commands were actually run.
 | `BertDecoder` cross-attention length config-driven (`setEncoderLength()`) | done, build-verified |
 | `res/siglip2-encoder`, `res/bert-decoder` configs updated to 384px/576 | done |
 | `resample` filter (bilinear vs bicubic) confirmed against the real checkpoint | **confirmed: `"bicubic"` is correct** — see Findings §1 |
-| Decoder hidden dims (`BD_DIM` etc.) match the real checkpoint | **confirmed WRONG** — repo has 256, checkpoint is 512; see Findings §2 |
-| `ENC_TO_DEC_DIM` / decoder dims are config-driven (not hardcoded `constexpr`) | **not done** — see Findings §3 |
-| `weight_converter.py` (encoder) loads the `enc_to_dec_proj` connector correctly | **not done** — see Findings §4 |
-| Encoder parity vs the real 384px checkpoint | **not run** — checkpoint now available, code needs the Findings §2-4 fixes first |
-| Decoder parity vs the real 384px checkpoint | **not run** — same; also needs a regenerated golden |
+| Decoder hidden dims (`BD_DIM` etc.) match the real checkpoint | confirmed wrong at 256; config now says 512/2048/8 — see Findings §2 |
+| `ENC_TO_DEC_DIM` / decoder dims are config-driven (not hardcoded `constexpr`) | **done, build-verified** — see Findings §3 |
+| `weight_converter.py` (encoder) loads the `enc_to_dec_proj` connector correctly | **done** (`--connector_path`), but prefix auto-detect also needed — see Findings §4/§6 |
+| `weight_converter.py` (decoder) key prefixes match the real checkpoint | **done** (auto-detect) — see Findings §6 |
+| `verify_encoder.py` / new `verify_decoder.py` support the real split checkpoint | done, functionally verified end-to-end against a synthetic checkpoint matching the real layer counts/layouts (torch/transformers ARE installable here via pip) — see Findings §7 |
+| Encoder parity vs the real 384px checkpoint | **not run** — no checkpoint or network access in this environment; see Handoff |
+| Decoder parity vs the real 384px checkpoint | **not run** — same; see Handoff |
 
 ## Findings (2026-08-20 session)
 
@@ -144,6 +161,94 @@ argument (e.g. `--connector_path`) to load this separately.
   config-driven decoder hidden size as §2/§3, or it'll silently read the
   wrong number of floats once `BD_DIM` becomes 512.
 
+**§2-§5 status:** all fixed and build-verified in this pass (see the code
+diff on this branch). `ENC_TO_DEC_DIM` is now an instance field
+`enc_to_dec_dim_` resolved from `nntr_config.json`'s `"decoder_hidden_size"`
+(read in `Siglip2VisionEncoder::setupParameters()`, so it needs no separate
+setter — `setupParameters()` already runs in the constructor, before any
+`initialize()` call). `BD_DIM`/`BD_NUM_HEADS`/`BD_HEAD_DIM`/
+`BD_INTERMEDIATE_SIZE` are now instance fields with a new
+`BertDecoder::setDecoderDims(hidden, num_heads, intermediate)` setter,
+following the exact `setEncoderLength()` contract (call before
+`initialize()`); `main.cpp`'s `--decoder-init-parity` and `quantize.cpp`'s
+`BertDecoder` factory both call it now, reading `decoder_hidden_size` /
+`decoder_num_heads` / `decoder_intermediate_size` from `nntr_config.json`
+(`res/bert-decoder/nntr_config.json` and `res/siglip2-encoder/
+nntr_config.json` both updated to 512/8/2048; the previously-dead
+`decoder_hidden_size` key is now the actual source of truth). `main.cpp:360`
+no longer hardcodes `256`. The stale symlinks from §5 do not exist in this
+git repository (they were local files on the checkpoint machine, outside
+version control) — nothing to replace here; the Handoff section below
+covers creating the real files there instead.
+
+### §6. `weight_converter.py` key-prefix mismatch (found fixing §4, not previously known)
+
+Fixing §4's connector loading surfaced a second, blocking problem in the
+*same* function: `res/siglip2-encoder/weight_converter.py`'s
+`collect_encoder()` hardcodes `vp = "encoder.vision_model."`, but the real
+checkpoint's `siglip2-base-patch16-384/model.safetensors` (a standalone
+vision-tower-only file, per the Prerequisites in this doc's own header) only
+has `vision_model.*` keys — no `encoder.` prefix. Every tensor lookup before
+even reaching the connector would `KeyError`. Same problem in
+`res/bert-decoder/weight_converter.py`: `bp = "decoder.bert."` and
+`cp = "decoder.cls."` hardcoded, but the real
+`best/decoder/model.safetensors` uses bare `bert.*` / `cls.*` (114-tensor
+count matches either way, so the count assert wouldn't have caught this).
+
+Fixed both converters with a `_detect_prefix()`/`_detect_vision_prefix()`
+helper that checks which prefix variant is actually present in the loaded
+state dict and uses that, so the same script works on both the old combined
+checkpoint layout and the real split one.
+
+### §7. `verify_encoder.py` can't load the real checkpoint's structure at all
+
+`verify_encoder.py` assumed `transformers.VisionEncoderDecoderModel.
+from_pretrained(ckpt)` — a single HF repo dir with both the vision tower and
+the decoder under one `config.json`. The real checkpoint is three separate
+pieces (own `config.json`s for the vision tower and the decoder, connector
+in a raw `.pt`), so that call would fail outright before doing anything
+useful. Rewrote it to support both: `--ckpt` keeps the old combined-checkpoint
+path; `--vision_path` + `--connector_path` load the vision tower via
+`SiglipVisionModel.from_pretrained()` and the connector via `torch.load()`,
+applying it as a plain `linear(enc, weight, bias)`. Also added `--resample`
+(default `"bicubic"`), which now **forces** the resize filter on the
+`AutoImageProcessor` instead of trusting its `preprocessor_config.json`
+verbatim — that field is confirmed stale for this checkpoint (§1); silently
+trusting it would reproduce a wrong-but-plausible number. The script prints
+which resample it actually used, so a mismatch is visible instead of silent.
+
+Wrote a new `res/bert-decoder/verify_decoder.py` (didn't exist before — the
+`compare_bert_vs_python.sh` this doc's step 5 used to point to only exists
+in PR #4061's description text, not in this repository) that loads
+`BertLMHeadModel.from_pretrained(decoder_path)`, feeds it the golden
+(post-connector) encoder hidden state plus token 101 at position 0, and
+compares argmax + logits cosine against `nntr_decoder_init_logits.npy`.
+
+**Update:** `pip install torch transformers safetensors pillow torchvision`
+DOES work in this environment (pypi.org is reachable through the proxy even
+though huggingface.co and download.pytorch.org are not) — only the real
+checkpoint itself is unreachable. So both `weight_converter.py` scripts and
+both verify scripts were functionally exercised end-to-end against a
+*synthetic* checkpoint built locally with `transformers` (`SiglipVisionModel`
++ `BertLMHeadModel`, 12/4 layers to match the real layer counts so the
+converters' `assert len(...) == 199/114` pass, a separate raw
+`torch.save`'d connector `.pt`, and both the split "vision_model."-prefix
+layout and the old combined "encoder.vision_model."-prefix layout with an
+embedded connector for the fallback path). All four scripts ran cleanly:
+`_detect_vision_prefix`/`_detect_prefix` picked the right prefix in every
+layout tested, `--connector_path` loaded correctly, `verify_encoder.py`
+produced a `(1, num_patches, decoder_hidden_size)`-shaped golden with the
+resample line confirming `Resampling.BICUBIC` was actually used (not
+whatever the fake `preprocessor_config.json` said), and `verify_decoder.py`
+loaded `BertLMHeadModel`, ran a real forward pass, and its shape-check +
+cosine + argmax comparison logic all produced the expected PASS on a
+self-comparison. This confirms the code paths and `transformers` API usage
+are correct in general — it does **not** confirm anything about the real
+checkpoint's numbers (that needs the actual weights; see Handoff). The one
+environment gap hit along the way: this transformers version (5.15.1)
+requires `torchvision` for `AutoImageProcessor` even with `use_fast=False`;
+install it alongside the others if you hit the same `ImportError`.
+
 ## 0. Prerequisites
 
 Desktop x86 build. These are the packages this branch needed on a bare
@@ -184,76 +289,106 @@ model; keep your normal flags if your build already sets them.)
 
 ## 2. Check the resample filter before converting anything
 
-Do this before weight conversion — a resample mismatch produces a small,
-consistent error across every downstream number instead of an obvious
-failure.
+This is now a sanity check, not an open question — Findings §1 already
+confirmed `"bicubic"` is correct and it must NOT be changed to bilinear even
+though the checkpoint's own file disagrees:
 
 ```bash
-python3 -c "import json; print(json.load(open('$CKPT/preprocessor_config.json'))['resample'])"
-# 2 -> bilinear, 3 -> bicubic (PIL / HF numbering)
+python3 -c "import json; print(json.load(open('$CKPT/siglip2-base-patch16-384/preprocessor_config.json'))['resample'])"
+# prints 2 (bilinear) — this is the STALE value; ignore it, see Findings §1.
 ```
 
-Compare against `res/siglip2-encoder/nntr_config.json`'s `"resample"` key
-(currently set to `"bicubic"`, based on HF's `SiglipImageProcessor` default —
-not yet confirmed against an actual checkpoint) and fix it if it disagrees.
+`res/siglip2-encoder/nntr_config.json`'s `"resample"` key is already
+`"bicubic"` — leave it. `verify_encoder.py --resample` also now defaults to
+`bicubic` and forces it on the `AutoImageProcessor` regardless of what
+`preprocessor_config.json` says (Findings §7), so this step is now a
+double-check rather than something you need to act on.
 
 ## 3. Convert weights
+
+The real checkpoint is three separate files, not one merged
+`model.safetensors` — `CKPT` below is `v4.0.0-S1/`:
 
 ```bash
 W=/tmp/siglip2-384-check && mkdir -p "$W"
 
-# encoder — weight_converter.py reuses all 199 tensors unchanged; shapes are
-# read dynamically from the safetensors file, no script changes needed.
+# encoder — vp prefix ("vision_model." vs "encoder.vision_model.") is now
+# auto-detected (Findings §6); --connector_path loads the connector from its
+# own file (Findings §4).
 python3 Applications/CausalLM/res/siglip2-encoder/weight_converter.py \
-  --model_path "$CKPT/model.safetensors" \
+  --model_path "$CKPT/siglip2-base-patch16-384/model.safetensors" \
+  --connector_path "$CKPT/best/encoder_to_decoder.pt" \
   --encoder_output "$W/nntr_siglip2_encoder_fp32.bin"
 
-# decoder (BERT-small dims are unrelated to the vision resolution)
+# decoder — bp/cp prefixes ("bert."/"cls." vs "decoder.bert."/"decoder.cls.")
+# are also now auto-detected (Findings §6).
 python3 Applications/CausalLM/res/bert-decoder/weight_converter.py \
-  --model_path "$CKPT/model.safetensors" \
+  --model_path "$CKPT/best/decoder/model.safetensors" \
   --decoder_output "$W/nntr_bert_decoder_fp32.bin"
 
 cp Applications/CausalLM/res/siglip2-encoder/{config.json,nntr_config.json,generation_config.json,sample.png} "$W/"
 cp Applications/CausalLM/res/bert-decoder/{config.json,nntr_config.json,generation_config.json,tokenizer.json} "$W/"
 ```
 
+Then replace `res/siglip2-encoder/nntr_siglip2_encoder_fp32.bin` and
+`res/bert-decoder/nntr_bert_decoder_fp32.bin` in the repo with the freshly
+converted files from `$W` (Findings §5 — do NOT leave any stale symlink to
+another workspace's 224px build in place, if one exists on your machine).
+
 ## 4. Encoder parity
 
-`verify_encoder.py` builds the PyTorch golden through `AutoImageProcessor`
-(whatever resolution/filter/mean/std the checkpoint actually declares), then
-compares it against nntrainer's `--dump-encoder` output.
+`verify_encoder.py` now supports the real split layout directly via
+`--vision_path`/`--connector_path` (Findings §7); `--ckpt` still works for a
+combined checkpoint if you have one.
 
 ```bash
 cd "$W"
 python3 <nntrainer_repo>/Applications/CausalLM/res/siglip2-encoder/verify_encoder.py \
-  --ckpt "$CKPT" --image sample.png --out golden
+  --vision_path "$CKPT/siglip2-base-patch16-384" \
+  --connector_path "$CKPT/best/encoder_to_decoder.pt" \
+  --image sample.png --out golden --resample bicubic
 
 <nntrainer_repo>/builddir-desktop/Applications/CausalLM/nntr_causallm \
   --dump-encoder "$W" sample.png
 
 python3 <nntrainer_repo>/Applications/CausalLM/res/siglip2-encoder/verify_encoder.py \
-  --ckpt "$CKPT" --image sample.png --out golden \
+  --vision_path "$CKPT/siglip2-base-patch16-384" \
+  --connector_path "$CKPT/best/encoder_to_decoder.pt" \
+  --image sample.png --out golden --resample bicubic \
   --nntr-npy nntr_encoder_hidden.npy
 ```
 
-Check `golden encoder_hidden shape` prints `(1, 576, 256)` first — if it
-doesn't, either `config.json`'s `image_size` is wrong or the checkpoint
-itself isn't 384px.
+Check `golden encoder_hidden shape` prints `(1, 576, 512)` first (576
+patches, `decoder_hidden_size`=512 — NOT 256, and NOT 768; the projection
+is included) — if it doesn't, check `nntr_config.json`'s `image_size` /
+`decoder_hidden_size` against the checkpoint, or confirm the checkpoint
+itself is really 384px. Also confirm the printed
+`using resample=... (forced)` line actually says bicubic — the script
+forces it, but double-check the log instead of assuming.
 
 ## 5. Decoder parity
 
-Reuse the golden from step 4 as the decoder's golden and confirm
-cross-attention actually consumes the new 576-length encoder output.
+Copy the golden from step 4 into `res/bert-decoder/golden.encoder_hidden.npy`
+(shape `(1, 576, 512)` — see step 4) and confirm cross-attention actually
+consumes the new 576-length, 512-dim encoder output.
 
 ```bash
 <nntrainer_repo>/builddir-desktop/Applications/CausalLM/nntr_causallm \
   --decoder-init-parity "$W"
+
+python3 <nntrainer_repo>/Applications/CausalLM/res/bert-decoder/verify_decoder.py \
+  --decoder_path "$CKPT/best/decoder" \
+  --golden "$W/golden.encoder_hidden.npy" \
+  --nntr-npy "$W/nntr_decoder_init_logits.npy"
 ```
 
-Compare `nntr_decoder_init_logits.npy`'s argmax and cosine similarity
-against the PyTorch decoder run on the same `golden.encoder_hidden.npy`,
-following the same pattern as `compare_bert_vs_python.sh` in PR #4061's
-description.
+`verify_decoder.py` is new (Findings §7) — its `transformers` API usage
+(constructor args, forward signature, `.logits` shape) was functionally
+verified against a synthetic `BertLMHeadModel` checkpoint, but not against
+the real one. If `BertLMHeadModel.from_pretrained()` or its forward
+signature don't match what `best/decoder/config.json` actually declares,
+expect to need small fixes; report exactly what broke rather than working
+around it silently.
 
 ## 6. (Optional) On-device
 
@@ -280,92 +415,55 @@ The x86 encoder thresholds are the numbers PR #4007 actually measured at
 224px (cosine 0.999998). If 384px can't clear the same bar, suspect the
 resample filter first.
 
-## Delegating the rest to an agent
+## Handoff: what still needs a machine with the checkpoint
 
-Unlike the previous version of this doc, a real checkpoint now exists
-locally (see Findings above) — the blocker is no longer "no checkpoint",
-it's "the decoder's assumed dims and the connector's weight source are
-wrong, and three constants that should be config-driven per this branch's
-own established pattern aren't." Prompt template — self-contained, no
-further checkpoint hunting needed:
+**2026-08-20, third pass:** all of Findings §2-§7 are now fixed and
+build-verified — `ENC_TO_DEC_DIM`/`BD_*` are config-driven, both
+`weight_converter.py` scripts handle the real split checkpoint's file
+layout and key prefixes, and `verify_encoder.py`/`verify_decoder.py` know
+how to load it. `ninja -C builddir-desktop Applications/CausalLM/
+nntr_causallm Applications/CausalLM/nntr_quantize` succeeds. **None of
+steps 3-5 above were actually run**, because this pass ran inside a Claude
+Code remote-execution container that has neither
+`/home/leeseunghui/workspace/v4.0.0-S1/` nor network access to
+huggingface.co (the outbound proxy 403s both `apt`'s non-default mirrors and
+`huggingface.co`; `pypi.org` works fine, so `pip install torch transformers
+safetensors numpy` succeeds, but there's no checkpoint to point them at).
 
-```text
-Repo nntrainer, branch claude/siglip2-encoder-migration-zx5qp2 (base: PR
-#4061 / support/screen_ai). Follow
-Applications/CausalLM/res/siglip2-encoder/MIGRATION_384.md in full —
-especially the "## Findings (2026-08-20 session)" section — before making
-any change. That section documents, with exact file/line references and
-tensor-shape evidence already gathered, everything below; don't re-derive
-it from scratch.
+To finish this, on a machine that actually has
+`/home/leeseunghui/workspace/v4.0.0-S1/` (or wherever the checkpoint lives):
 
-Checkpoint (already located, no need to ask the user): 
-/home/leeseunghui/workspace/v4.0.0-S1/
-- encoder: siglip2-base-patch16-384/model.safetensors (vision_model.* only)
-- decoder: best/decoder/model.safetensors (bert.* , hidden=512, not 256)
-- connector: best/encoder_to_decoder.pt (raw torch state_dict, keys
-  "weight"/"bias", Linear(768,512), applied once before all decoder layers)
+1. `pip3 install torch transformers safetensors numpy` if not already
+   present.
+2. Run "## 3. Convert weights" through "## 5. Decoder parity" above exactly
+   as written, with `CKPT=/home/leeseunghui/workspace/v4.0.0-S1`.
+3. Watch for two things that would produce a plausible-looking but wrong
+   number instead of an obvious crash:
+   - `verify_encoder.py`'s printed `using resample=...` line — must say
+     bicubic, not bilinear (Findings §1/§7).
+   - `golden encoder_hidden shape` — must be `(1, 576, 512)`, not
+     `(1, 576, 256)` (the old 224px shape) or `(1, 576, 768)` (pre-connector
+     — wrong; the connector is already included in nntrainer's encoder
+     graph, see Findings §3).
+4. If `verify_decoder.py` fails to load `best/decoder` via
+   `BertLMHeadModel.from_pretrained()` — its API usage was verified against
+   a synthetic checkpoint but not the real one (Findings §7) — fix the load
+   path, but flag it explicitly in whatever report follows rather than
+   silently reshaping the comparison to make numbers line up.
+5. Report the actual PASS/FAIL numbers for each row in "## Pass criteria"
+   below (cosine, rel-L2, argmax match). Do not report success without
+   having actually run the comparison — a plausible-sounding number that
+   wasn't computed is worse than reporting the blocker.
+6. Commit with the existing style on this branch: `[CausalLM] ...` subject,
+   a body that explains why (not just what) and cites which Findings
+   section it resolves, trailers:
+   ```
+   Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
+   Co-authored-by: Claude <noreply@anthropic.com>
+   ```
 
-Already done on this branch (prior commits, build-verified only, never run
-against a real checkpoint): NUM_PATCHES config-driven, BICUBIC resample
-support, BertDecoder cross-attention length config-driven
-(setEncoderLength()), res/ configs bumped to 384px/576. The resample
-question is now closed — "bicubic" is confirmed correct (Findings §1) — do
-NOT change it to bilinear despite the checkpoint's own
-preprocessor_config.json saying resample:2; that field is a stale, unused
-HF artifact (see Findings §1 for why).
-
-Your job:
-1. Make ENC_TO_DEC_DIM (siglip2_vision_encoder.h) and BD_DIM /
-   BD_NUM_HEADS / BD_HEAD_DIM / BD_INTERMEDIATE_SIZE (bert_decoder.h)
-   config-driven instead of hardcoded `static constexpr`, mirroring the
-   existing setEncoderLength() setter pattern (called before initialize(),
-   since these are baked into the graph at build time). Wire them to
-   res/bert-decoder's existing (currently dead) "decoder_hidden_size"
-   nntr_config.json field and a new equivalent for the encoder connector
-   dim, and fix main.cpp:360's hardcoded "* 256". See Findings §2/§3 for
-   the exact current values (256/1024/4/64 today) vs the real checkpoint's
-   (512/2048/8/64).
-2. Fix res/siglip2-encoder/weight_converter.py: it currently reads
-   enc_to_dec_proj.weight/bias out of the SAME --model_path safetensors as
-   the encoder (weight_converter.py:167-168) — the real checkpoint doesn't
-   have that key there at all. Add a --connector_path argument to load it
-   from a separate encoder_to_decoder.pt-style file instead (see Findings
-   §4).
-3. Update res/bert-decoder/config.json ("decoder" block) and
-   res/bert-decoder/nntr_config.json to the real dims (512/2048/8), and
-   res/siglip2-encoder/nntr_config.json with the new connector-dim key
-   (512).
-4. Build (builddir-desktop may already exist from a prior session — try
-   `ninja -C builddir-desktop` first before re-running `meson setup`),
-   convert both encoder and decoder weights from the v4.0.0-S1 paths above,
-   and replace the stale symlinks in res/siglip2-encoder/ and
-   res/bert-decoder/ (currently pointing at a different workspace's old
-   224px build — Findings §5) with the freshly converted files.
-5. Run verify_encoder.py + nntr_causallm --dump-encoder; target cosine >=
-   0.9999, rel-L2 <= 1e-2 (x86 fp32, same bar PR #4007 hit at 224px).
-   Careful: verify_encoder.py's AutoImageProcessor may pick up this
-   checkpoint's stale bilinear preprocessor_config.json instead of the
-   confirmed-correct bicubic (Findings §1) — check what it actually does
-   and override if needed; don't trust a plausible-looking wrong number.
-6. Regenerate golden.encoder_hidden.npy at the new [1,576,768] pre-connector
-   / whatever shape the decoder actually consumes, and run nntr_causallm
-   --decoder-init-parity against a real PyTorch forward through
-   best/decoder + best/encoder_to_decoder.pt; target: argmax match, logits
-   cosine >= 0.9999.
-7. Report the numbers (PASS/FAIL per metric) and what you had to deviate
-   from this prompt on, if anything. Commit to this branch, matching the
-   existing commit style: "[CausalLM] ..." subject, detailed body
-   explaining why (not just what), Signed-off-by: SeungHui Lee
-   <shsh1004.lee@samsung.com>, Co-authored-by: Claude <noreply@anthropic.com>
-   trailers.
-
-If something is still genuinely blocked (e.g. decoder parity's PyTorch
-reference can't be reproduced), say exactly where and what you need — do
-not proceed on assumptions.
-```
-
-Two things worth keeping in that prompt specifically: **"do not proceed on
-assumptions"** — a silently-wrong resample or dimension produces a
-plausible-looking but incorrect number instead of an obvious failure; and
-**the commit style line** — this branch already has a fixed message format
-the agent won't otherwise know to follow.
+If something is still genuinely blocked (e.g. `verify_decoder.py`'s
+`transformers` API assumptions don't match the real `best/decoder`
+checkpoint), say exactly where and what's needed — do not proceed on
+assumptions or paper over a shape/API mismatch with a workaround that
+changes what's being measured.

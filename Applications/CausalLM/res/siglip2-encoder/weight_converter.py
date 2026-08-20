@@ -11,6 +11,7 @@ import json
 import struct
 
 import numpy as np
+import torch
 from safetensors.torch import load_file
 
 
@@ -108,15 +109,41 @@ def save_safetensors(weights, output_path, dtype):
 # 6.  enc_to_dec_proj weight(T), bias
 # ---------------------------------------------------------------------------
 
-def collect_encoder(sd, dtype):
-    """Return ordered list of (nntr_name, ndarray) for the encoder file."""
+def _detect_vision_prefix(sd):
+    """Return the vision-tower key prefix actually present in sd.
+
+    Two layouts have been seen for this model:
+      - combined VisionEncoderDecoderModel checkpoint: "encoder.vision_model."
+      - standalone vision-tower-only checkpoint (e.g. the real 384px
+        siglip2-base-patch16-384/model.safetensors): "vision_model."
+    Detect instead of hardcoding one, so the same script works on either.
+    """
+    for candidate in ("encoder.vision_model.", "vision_model."):
+        if f"{candidate}post_layernorm.weight" in sd:
+            return candidate
+    raise KeyError(
+        "Could not find a vision tower under 'encoder.vision_model.' or "
+        "'vision_model.' in the checkpoint — inspect its key names."
+    )
+
+
+def collect_encoder(sd, dtype, connector_sd=None):
+    """Return ordered list of (nntr_name, ndarray) for the encoder file.
+
+    connector_sd, if given, is a separate state dict (e.g. loaded from
+    encoder_to_decoder.pt via torch.load) holding the enc_to_dec_proj
+    connector as bare "weight"/"bias" keys. If omitted, the connector is
+    read out of sd itself under "enc_to_dec_proj.weight"/".bias" (the
+    layout of a combined VisionEncoderDecoderModel checkpoint that saves
+    everything into one safetensors file).
+    """
     weights = []
 
     def add(name, tensor, transpose=False):
         arr = tensor_to_numpy(tensor, dtype, transpose=transpose)
         weights.append((name, arr))
 
-    vp = "encoder.vision_model."
+    vp = _detect_vision_prefix(sd)
 
     # 1–2. Patch embedding (Conv2D — keep OIHW, no transpose)
     add("patch_embed_conv:weight",
@@ -125,9 +152,11 @@ def collect_encoder(sd, dtype):
     add("patch_embed_conv:bias",
         sd[f"{vp}embeddings.patch_embedding.bias"])
 
-    # 3. Position embedding [196,768] → [1,1,196,768]
-    pos = sd[f"{vp}embeddings.position_embedding.weight"]  # [196, 768]
-    pos_reshaped = pos.unsqueeze(0).unsqueeze(0)           # [1, 1, 196, 768]
+    # 3. Position embedding [num_patches,768] → [1,1,num_patches,768]
+    #    (196 for the 224px checkpoint, 576 for the 384px one — shape read
+    #    dynamically from the checkpoint, not hardcoded).
+    pos = sd[f"{vp}embeddings.position_embedding.weight"]
+    pos_reshaped = pos.unsqueeze(0).unsqueeze(0)
     add("pos_embedding:weight", pos_reshaped, transpose=False)
 
     # 4. Transformer layers
@@ -163,9 +192,21 @@ def collect_encoder(sd, dtype):
     add("post_ln:gamma", sd[f"{vp}post_layernorm.weight"])
     add("post_ln:beta",  sd[f"{vp}post_layernorm.bias"])
 
-    # 6. Encoder-to-decoder projection (written with encoder file)
-    add("enc_to_dec_proj:weight", sd["enc_to_dec_proj.weight"], transpose=True)
-    add("enc_to_dec_proj:bias",   sd["enc_to_dec_proj.bias"])
+    # 6. Encoder-to-decoder projection (written with encoder file).
+    # The real checkpoint (v4.0.0-S1) keeps this in a SEPARATE file
+    # (best/encoder_to_decoder.pt, a raw torch.save'd state_dict with bare
+    # "weight"/"bias" keys, no "enc_to_dec_proj." prefix) rather than inside
+    # the vision-tower safetensors — pass --connector_path to load it from
+    # there. Falls back to reading "enc_to_dec_proj.{weight,bias}" out of sd
+    # for the older combined-checkpoint layout when --connector_path is not
+    # given.
+    if connector_sd is not None:
+        conn = connector_sd
+        conn_weight, conn_bias = conn["weight"], conn["bias"]
+    else:
+        conn_weight, conn_bias = sd["enc_to_dec_proj.weight"], sd["enc_to_dec_proj.bias"]
+    add("enc_to_dec_proj:weight", conn_weight, transpose=True)
+    add("enc_to_dec_proj:bias",   conn_bias)
 
     return weights
 
@@ -203,7 +244,19 @@ def parse_args():
         "--model_path",
         type=str,
         default="model.safetensors",
-        help="Path to the source model.safetensors",
+        help="Path to the source model.safetensors (vision tower; combined "
+        "VisionEncoderDecoderModel checkpoints also work, see "
+        "--connector_path)",
+    )
+    parser.add_argument(
+        "--connector_path",
+        type=str,
+        default=None,
+        help="Path to a separate enc_to_dec_proj connector checkpoint (a "
+        "raw torch.save'd state_dict with bare 'weight'/'bias' keys, e.g. "
+        "best/encoder_to_decoder.pt). If omitted, the connector is read "
+        "out of --model_path under 'enc_to_dec_proj.weight'/'.bias' "
+        "instead (older combined-checkpoint layout).",
     )
     parser.add_argument(
         "--encoder_output",
@@ -234,9 +287,15 @@ def main():
     sd = load_file(args.model_path)
     print(f"Checkpoint loaded — {len(sd)} tensors total.")
 
+    connector_sd = None
+    if args.connector_path:
+        print(f"Loading connector: {args.connector_path}")
+        connector_sd = torch.load(args.connector_path, map_location="cpu")
+        print(f"Connector loaded — keys: {list(connector_sd.keys())}")
+
     dtype = args.data_type
 
-    enc_weights = collect_encoder(sd, dtype)
+    enc_weights = collect_encoder(sd, dtype, connector_sd=connector_sd)
     print(f"\nEncoder tensors: {len(enc_weights)}")
     assert len(enc_weights) == 199, (
         f"ENCODER COUNT MISMATCH: got {len(enc_weights)}, expected 199"
