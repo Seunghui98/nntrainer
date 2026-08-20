@@ -313,6 +313,27 @@ protected:
   Tensor createSelfAttentionBlock(int layer_id, Tensor h);
 
   /**
+   * @brief Create the per-layer self-attention K/V cache placeholders.
+   *
+   * Declared as UINT16 "input" leaf nodes named cache_k_l{layer_id} /
+   * cache_v_l{layer_id}, holding fp16 bits in 16-bit storage, and bound to the
+   * host-owned KVCacheManager buffers by allocateAndBindKVCache().
+   *
+   * BertDecoder deliberately does NOT use
+   * Transformer::createKVCachePlaceholders() here: that helper declares FP16
+   * placeholders on the ENABLE_FP16 (Android/ARM) build, which makes
+   * NeuralNetwork::mapExternalTensor() read the cache pointer as FP32
+   * (dataLen * 4 bytes) and copy into a new owning tensor — over-reading our
+   * 16-bit buffers 2x (segfault) and un-aliasing them from the setData()
+   * binding. See the call site in createSelfAttentionBlock() for the full
+   * rationale.
+   *
+   * @param layer_id  decoder layer index
+   * @return {cache_k, cache_v} placeholder tensors
+   */
+  std::pair<Tensor, Tensor> createBertKVCachePlaceholders(int layer_id);
+
+  /**
    * @brief Create the per-layer cross-attention K/V cache placeholders.
    *
    * These are static read-only buffers of @c enc_len_ rows that are filled

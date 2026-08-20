@@ -301,7 +301,25 @@ Tensor BertDecoder::createSelfAttentionBlock(int layer_id, Tensor h) {
   // External KV cache placeholders (created as input layers, bound at runtime
   // via allocateAndBindKVCache).  Names: cache_k_l{layer_id},
   // cache_v_l{layer_id}
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, BD_NUM_HEADS);
+  //
+  // Declared UINT16 on BOTH platforms rather than going through
+  // Transformer::createKVCachePlaceholders(), whose ENABLE_FP16 branch
+  // declares them FP16. The dtype decides what
+  // NeuralNetwork::incremental_inference() does with the pointer
+  // runDecoderForward() hands it, via mapExternalTensor():
+  //   * UINT16 -> Tensor::Map<uint16_t>: raw 16-bit map, zero-copy, aliases
+  //     the same memory allocateAndBindKVCache() bound with setData().
+  //   * FP16   -> maps the pointer as FP32 (dataLen * 4 bytes!) and
+  //     copyData()s into a new owning FP16 tensor. Our buffers hold fp16 bits
+  //     in 16-bit storage, so that over-reads 2x and segfaults — confirmed on
+  //     device in copy_fp32_to_fp16(), reading 262144 "floats" (0x100000 B)
+  //     out of a 0x80000 B cache and faulting exactly at the halfway point.
+  //     It would also silently un-alias the cache from the setData() binding.
+  // mha_core is indifferent to the choice: BertDecoder runs FP32 activations,
+  // so kcache/vcache reads take the `in.getDataType()==FP32` path, whose
+  // non-FP32-cache branch reads the cache via getData<uint16_t>() for any
+  // 2-byte dtype (mha_core.cpp) — identical for UINT16 and FP16.
+  auto [cache_k, cache_v] = createBertKVCachePlaceholders(layer_id);
 
   // MHA core: causal=true, use_rope=false (CRITICAL: rope_theta=0 +
   // use_rope=true
@@ -337,6 +355,32 @@ Tensor BertDecoder::createSelfAttentionBlock(int layer_id, Tensor h) {
 }
 
 // ---------------------------------------------------------------------------
+// createBertKVCachePlaceholders
+// ---------------------------------------------------------------------------
+
+std::pair<Tensor, Tensor>
+BertDecoder::createBertKVCachePlaceholders(int layer_id) {
+  const unsigned int kv_width =
+    static_cast<unsigned int>(BD_HEAD_DIM * BD_NUM_HEADS / BD_GQA_SIZE);
+  const std::string cache_shape =
+    std::to_string(BD_BATCH_SIZE) + ":1:" + std::to_string(BD_MAX_SEQ_LEN) +
+    ":" + std::to_string(kv_width);
+
+  // Always UINT16 — see the long note at the call site in
+  // createSelfAttentionBlock() for why this must not become FP16 on the
+  // ENABLE_FP16 build.
+  LayerHandle cache_k_input(createLayer(
+    "input", {withKey("name", "cache_k_l" + std::to_string(layer_id)),
+              withKey("input_shape", cache_shape),
+              withKey("input_dtype", "UINT16")}));
+  LayerHandle cache_v_input(createLayer(
+    "input", {withKey("name", "cache_v_l" + std::to_string(layer_id)),
+              withKey("input_shape", cache_shape),
+              withKey("input_dtype", "UINT16")}));
+  return {cache_k_input(Tensor()), cache_v_input(Tensor())};
+}
+
+// ---------------------------------------------------------------------------
 // createCrossCachePlaceholders
 // ---------------------------------------------------------------------------
 
@@ -347,25 +391,23 @@ BertDecoder::createCrossCachePlaceholders(int layer_id, unsigned int enc_len) {
   const std::string cache_shape = std::to_string(BD_BATCH_SIZE) +
                                   ":1:" + std::to_string(enc_len) + ":" +
                                   std::to_string(kv_width);
-#ifdef ENABLE_FP16
-  // ARM/Android FP16 build. Previously these were bare Tensors (getType() !=
-  // "input"), so they were NOT collected into runDecoderForward's
-  // ordered_input_names and the prefilled cross-cache buffer was never fed to
-  // the model — unlike the self-attn KV cache, the cross-cache has no separate
-  // setData() binding, so cross-attn read uninitialized/zero memory and the
-  // decode path became image-agnostic. Create real "input" LAYER nodes (FP16)
-  // so getType()=="input", they are collected, and they receive the prefilled
-  // cross-cache buffer through the input vector — exactly as on desktop.
-  // mapExternalTensor maps FP16 and UINT16 buffers identically (raw uint16_t,
-  // no conversion), so the fp16-bit buffer flows through unchanged and matches
-  // how mha_core reads the FP16 self-attn KV cache in cross_attention=true
-  // mode.
-  const char *cross_cache_dtype = "FP16";
-#else
-  // Desktop (non-FP16) build: UINT16 storage holding fp16 bits, same as the
-  // self-attn KV cache encoding.
+  // Real "input" LAYER nodes (not bare Tensors) so getType()=="input" and
+  // runDecoderForward's scan collects them: unlike the self-attn KV cache the
+  // cross-cache has no separate setData() binding, so the input vector is its
+  // only delivery path. When they were bare Tensors, cross-attn read
+  // uninitialized memory and the decode became image-agnostic.
+  //
+  // UINT16 on BOTH platforms — 16-bit storage holding fp16 bits. An earlier
+  // ARM fix declared these FP16 under ENABLE_FP16 on the premise that
+  // "mapExternalTensor maps FP16 and UINT16 buffers identically (raw
+  // uint16_t, no conversion)". That premise is false: mapExternalTensor's
+  // FP16 branch maps the incoming pointer as FP32 (dataLen * 4 bytes) and
+  // converts, because the external-tensor API's contract is that float* means
+  // real FP32 data. Feeding it 16-bit fp16-bit buffers over-reads 2x. Desktop
+  // never hit it (UINT16 branch); ARM segfaulted in copy_fp32_to_fp16().
+  // mha_core reads any non-FP32 cache via getData<uint16_t>() on the FP32
+  // activation path this model uses, so UINT16 is what it wants anyway.
   const char *cross_cache_dtype = "UINT16";
-#endif
   LayerHandle cross_k_input(createLayer(
     "input", {withKey("name", "cross_cache_k_l" + std::to_string(layer_id)),
               withKey("input_shape", cache_shape),
