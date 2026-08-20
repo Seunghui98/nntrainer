@@ -272,6 +272,21 @@ std::string resolve_architecture(std::string model_type,
     return "Gemma4ForCausalLM";
   }
 
+  // A real checkpoint's own config.json (e.g. best/decoder/config.json for
+  // the SigLIP2->BertDecoder caption pipeline) declares the actual HF class
+  // that trained the weights — "BertLMHeadModel", never "BertDecoder"
+  // (nntrainer's internal factory name). Map it here instead of requiring
+  // that file to be hand-edited; res/bert-decoder/config.json (this repo's
+  // own resource template, already "BertDecoder") is unaffected either way.
+  if (architecture == "BertLMHeadModel") {
+    return "BertDecoder";
+  }
+  // Same idea for a standalone SigLIP2 vision-tower checkpoint's own HF
+  // class name.
+  if (architecture == "SiglipVisionModel") {
+    return "Siglip2VisionEncoder";
+  }
+
   return architecture;
 }
 
@@ -830,6 +845,20 @@ int main(int argc, char *argv[]) {
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
 
+    // Resolve the config's raw HF architecture name (e.g. "BertLMHeadModel")
+    // to nntrainer's registered factory/dtype-map name (e.g. "BertDecoder")
+    // BEFORE using it below — is_encoder/is_decoder, num_layers, and the
+    // dtype-map dispatch near the end of main() all key off this string, so
+    // resolving it late (as a prior version of this function did, right
+    // before Factory::Instance().create()) left those checks comparing
+    // against the unresolved raw name and silently falling through to the
+    // wrong (generic Qwen-style) dtype-map branch even though model
+    // construction itself worked.
+    if (nntr_cfg.contains("model_type")) {
+      std::string model_type = nntr_cfg["model_type"].get<std::string>();
+      architecture = resolve_architecture(model_type, architecture);
+    }
+
     // The SigLIP2 vision encoder nests its layer count under cfg["encoder"] and
     // the BERT decoder under cfg["decoder"] when a combined config.json is
     // reused; fall back to the top-level field for a flat config.
@@ -865,10 +894,8 @@ int main(int argc, char *argv[]) {
 
     registerAllModels();
 
-    if (nntr_cfg.contains("model_type")) {
-      std::string model_type = nntr_cfg["model_type"].get<std::string>();
-      architecture = resolve_architecture(model_type, architecture);
-    }
+    // architecture was already resolved above, before is_encoder/is_decoder/
+    // num_layers were computed from it.
 
     // Resolve paths in nntr_cfg against the model directory.
     // Relative paths are anchored to model_path (existing behaviour).

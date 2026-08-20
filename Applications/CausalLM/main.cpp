@@ -210,6 +210,21 @@ std::string resolve_architecture(std::string model_type,
     return "Gemma4ForCausalLM";
   }
 
+  // A real checkpoint's own config.json (e.g. best/decoder/config.json for
+  // the SigLIP2->BertDecoder caption pipeline) declares the actual HF class
+  // that trained the weights — "BertLMHeadModel", never "BertDecoder"
+  // (nntrainer's internal factory name). Map it here instead of requiring
+  // that file to be hand-edited; res/bert-decoder/config.json (this repo's
+  // own resource template, already "BertDecoder") is unaffected either way.
+  if (architecture == "BertLMHeadModel") {
+    return "BertDecoder";
+  }
+  // Same idea for a standalone SigLIP2 vision-tower checkpoint's own HF
+  // class name.
+  if (architecture == "SiglipVisionModel") {
+    return "Siglip2VisionEncoder";
+  }
+
   return architecture;
 }
 
