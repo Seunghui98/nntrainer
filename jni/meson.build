@@ -91,10 +91,18 @@ if get_option('enable-htp')
   and_conf.set('MESON_ENABLE_HEXKL', 1)
   and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
   and_conf.set('MESON_HEXKL_INCLUDE_DIR', hexkl_root / 'include')
+  # libcdsprpc.so's link-time stub: HtpBackend's FastRPC session
+  # (nntr_hvx_open/close, remote_session_control) needs it at link time even
+  # though the actual symbols resolve against the device's own copy at
+  # runtime. hexagon_sdk_root is the same variable hexkl_lib_dir's directory
+  # derives from (fs.parent(fs.parent(hexkl_root))), already in scope here.
+  and_conf.set('MESON_HEXAGON_FASTRPC_LIB_DIR',
+              hexagon_sdk_root / 'ipc' / 'fastrpc' / 'remote' / 'ship' / 'android_aarch64')
 else
   and_conf.set('MESON_ENABLE_HEXKL', 0)
   and_conf.set('MESON_HEXKL_LIB_DIR', '')
   and_conf.set('MESON_HEXKL_INCLUDE_DIR', '')
+  and_conf.set('MESON_HEXAGON_FASTRPC_LIB_DIR', '')
 endif
 
 if tflite_dep.found()
