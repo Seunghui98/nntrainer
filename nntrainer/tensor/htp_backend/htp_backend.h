@@ -9,11 +9,21 @@
  * @bug    No known bugs except for NYI items
  * @brief  HTP (Hexagon Tensor Processor) backend lifecycle.
  *
- * Wraps the Qualcomm HexKL CPU Macro API (sdkl.h / libsdkl.so) NPU
- * lifecycle as a process-wide singleton. Initialization is attempted
- * once; if it fails (no device, missing skel, etc.) the backend is
- * left DISABLED and every HtpComputeOps::supports_*() returns false so
- * callers transparently fall back to the CPU path.
+ * Process-wide singleton, always disabled today: every
+ * HtpComputeOps::supports_*() returns false so callers transparently fall
+ * back to the CPU path. It used to own a Qualcomm HexKL CPU Macro API
+ * (sdkl.h / libsdkl.so) session, but that session had no caller left --
+ * docs/htp_attention/10_mha_htp_plan.md section 6 established there is no
+ * macro-API FC dispatch left on this lineage to migrate, so the session
+ * existed only to print a version string. Removed instead of kept: per
+ * the documented macro/micro one-way door, a macro-API session opened
+ * after any HexKL micro-API FastRPC session (the kernels this backend
+ * will dispatch to) fails permanently, so an unused macro session was a
+ * standing hazard, not a convenience.
+ *
+ * docs/htp_attention/40_moe_ffn_htp_task.md Stage 2 replaces this
+ * constructor with the real HexKL micro-API FastRPC session (nntr_hvx_open
+ * against the skel PR #4256 already ships and device-verified).
  *
  * Compiled only when ENABLE_HEXKL is defined (meson: -Denable-htp=true).
  */
@@ -27,48 +37,32 @@ namespace nntrainer {
 
 /**
  * @class HtpBackend
- * @brief Process-wide owner of the HexKL NPU session (init/finalize).
+ * @brief Process-wide owner of the HTP (HexKL micro-API/FastRPC) session.
  */
 class HtpBackend {
 public:
   /**
-   * @brief Access the process-wide singleton. The first call attempts
-   *        sdkl_npu_initialize() exactly once (thread-safe).
+   * @brief Access the process-wide singleton.
    */
   static HtpBackend &global();
 
   /**
-   * @brief Whether the NPU was successfully initialized and is usable.
-   *        When false, all HTP ops must defer to the CPU fallback.
+   * @brief Whether the HTP session is initialized and usable. Always
+   *        false until Stage 2 wires the real FastRPC session; when
+   *        false, all HTP ops must defer to the CPU fallback.
    */
   bool enabled() const { return enabled_; }
 
-  /**
-   * @brief Target CDSP domain id the session was initialized on.
-   */
-  int domain() const { return domain_; }
-
-  ~HtpBackend();
+  ~HtpBackend() = default;
 
   HtpBackend(const HtpBackend &) = delete;
   HtpBackend &operator=(const HtpBackend &) = delete;
 
 private:
-  HtpBackend();
+  HtpBackend() = default;
 
   bool enabled_ = false;
-  int domain_ = 0; ///< CDSP_DOMAIN_ID (resolved in the .cpp)
 };
-
-/**
- * @brief True while the NPU session is initialized and sdkl_npu_free is
- *        safe to call. Set false by HtpBackend's destructor immediately
- *        before sdkl_npu_finalize so namespace-scope statics destroyed
- *        afterwards skip freeing an already-finalized NPU. A plain flag
- *        (not HtpBackend::enabled()) avoids touching the singleton after
- *        its own destruction.
- */
-bool npuAlive();
 
 } // namespace nntrainer
 

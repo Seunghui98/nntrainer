@@ -5,7 +5,6 @@ htp_backend_sources = [
 
 htp_backend_headers = [
   'htp_backend.h',
-  'sdkl_compat.h',
 ]
 
 foreach s : htp_backend_sources

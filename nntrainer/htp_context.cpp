@@ -58,9 +58,9 @@ void HtpContext::initialize() noexcept {
     if (HtpBackend::global().enabled()) {
       cd->setComputeOps(get_htp_ops());
       // Model tensors (weights, activations) keep the default CPU allocator.
-      // The kernels stage into NPU-accessible buffers per call via
-      // sdkl_npu_alloc; routing every model tensor through an NPU allocator
-      // exhausts the DMA pool on a full transformer model.
+      // The kernels stage into NPU-accessible (ION/rpcmem) buffers per call;
+      // routing every model tensor through an NPU allocator exhausts the DMA
+      // pool on a full transformer model.
     } else
       cd->setComputeOps(get_cpu_ops());
   } catch (...) {

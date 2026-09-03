@@ -96,8 +96,9 @@ if get_option('enable-htp')
   subdir('htp_backend')
   nntrainer_inc += include_directories('htp_backend')
   nntrainer_inc_abs += meson.current_source_dir() / 'htp_backend'
-  # Hexagon SDK system headers needed by htp_backend.cpp (<remote.h>, <AEEStdErr.h>,
-  # <sdkl.h>).  hexagon_sdk_root is set in the top-level meson.build HTP block
+  # Hexagon SDK system headers (<remote.h>, <AEEStdErr.h>) that the Stage 2
+  # FastRPC client stub (docs/htp_attention/40_moe_ffn_htp_task.md) will need.
+  # hexagon_sdk_root is set in the top-level meson.build HTP block
   # (fs.parent(fs.parent(hexkl_root))) and is in meson's flat scope here.
   nntrainer_inc_abs += hexagon_sdk_root / 'incs'
   nntrainer_inc_abs += hexagon_sdk_root / 'incs' / 'stddef'
