@@ -67,6 +67,7 @@ but it needs a device run afterwards, so it was not folded into this branch.
 | you are doing | read |
 | :-- | :-- |
 | **the flash-attention task** | `30_flash_attention_task.md` — self-contained, start there |
+| **the LFM2-8B-A1B MoE FFN task** | `40_moe_ffn_htp_task.md` — self-contained, start there |
 | implementing any task from the split | `11_u8_task_split.md` §1 (design) then your task in §3 |
 | prompting an agent to do one | `12_prompt_kit.md` |
 | the architecture, VTCM budget, sparsity, verification strategy | `10_mha_htp_plan.md` |
