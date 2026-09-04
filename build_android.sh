@@ -25,8 +25,6 @@
 #   ANDROID_NDK  path to Android NDK. Auto-detected if unset.
 set -e
 
-cd /home/jwon/Desktop/workspace/release/Quick.AI/nntrainer
-
 # ── NDK detection ───────────────────────────────────────────────────────
 # Honor an existing ANDROID_NDK; otherwise fall back to the workspace default.
 if [ -z "$ANDROID_NDK" ]; then
