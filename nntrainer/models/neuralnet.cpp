@@ -1228,6 +1228,26 @@ void NeuralNetwork::load(const std::string &file_path,
     // Parse header: name -> (offset_start, size_in_bytes)
     auto name_offset_map = safetensors::parseHeader(header_json);
 
+    // A Q4_0 tensor is repacked into an ISA-specific layout that is
+    // indistinguishable from the header alone (save() records which one at
+    // nntr_q4_0_isa, see above). Loading the wrong one is not an error at
+    // the repack/dequant call site -- it silently reads garbage. Refuse it
+    // here instead.
+    auto metadata = safetensors::parseMetadata(header_json);
+    auto isa_it = metadata.find("nntr_q4_0_isa");
+    if (isa_it != metadata.end()) {
+#if defined(__aarch64__) || defined(__arm__)
+      const char *expected_isa = "arm";
+#else
+      const char *expected_isa = "x86";
+#endif
+      NNTR_THROW_IF(isa_it->second != expected_isa, std::runtime_error)
+        << "safetensors file " << f_path << " has Q4_0 weights packed for '"
+        << isa_it->second << "' but this build expects '" << expected_isa
+        << "'. Re-quantize with --isa " << expected_isa
+        << " (nntr_quantize), or run on a matching target.";
+    }
+
     // Assign file offsets to each weight by name
     std::unordered_set<const Tensor *> visited_st;
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
