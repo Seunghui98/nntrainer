@@ -213,8 +213,17 @@ TEST_P(Lfm2MoeTinyModelTest, PromptProducesExpectedLogits) {
   causallm_test::expectPromptProducesExpectedLogits(GetParam(), files);
 }
 
-// Q4_0 variant is intentionally omitted for LFM2-MoE (see qwen3_moe): the MoE
-// router gate is FP32 with width num_experts (=4), not divisible by 32.
+// Q4_0 variant is intentionally omitted for LFM2-MoE here, but not for the
+// reason this comment used to give: Lfm2MoELayer::save already special-cases
+// the router gate and expert_bias weights to DataType::NONE regardless of
+// dtype (lfm2_moe_layer.cpp), so the width-divisibility rule that blocks
+// Q4_0 for other layers (and unittest_causallm_qwen3_moe) never applies to
+// this layer's gate in the first place. The real reason: this suite's
+// PromptProducesExpectedLogits expects FP32-tolerance logits (atol=0.001),
+// which a Q4_0 case would fail on synthetic random weights. Q4_0 coverage
+// for LFM2-MoE lives in unittest_causallm_lfm2_moe_reference.cpp's
+// Q40MatchesHFReference instead, which carries the wider logits_atol_q40
+// tolerance a real quantized run needs.
 INSTANTIATE_TEST_SUITE_P(
   LFM2Moe, Lfm2MoeTinyModelTest,
   ::testing::Values(makeLfm2MoeCase(causallm_test::makeTinyFp32DataType())),
