@@ -214,6 +214,17 @@ public:
                                     float *matCdata, unsigned int M,
                                     unsigned int N, unsigned int K);
 
+  // The M > 1 gate FloatTensor::dot() applies around both calls above
+  // exists because, for CPU/GPU, a single-row GEMM is already fast
+  // without going through the batch/accel path -- that reasoning does
+  // not hold for HTP, where M == 1 (decode) is the FastRPC-amortization
+  // shape these kernels exist for (see docs/htp_attention/
+  // 40_moe_ffn_htp_task.md section2.2, 41_moe_ffn_e2e_and_perf_task.md
+  // sectionB3). This predicate lets a backend opt in at M == 1 without
+  // touching CPU/GPU's existing M > 1 behavior, which is intentional and
+  // must not change.
+  virtual bool accelerates_q4_0_at_m1() const { return false; }
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,

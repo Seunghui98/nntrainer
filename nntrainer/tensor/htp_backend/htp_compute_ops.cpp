@@ -44,6 +44,14 @@ class HtpComputeOps : public ComputeOps {
 public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
 
+  // decode (M == 1) is the shape this kernel exists for, not an edge case
+  // to avoid: the M=1 padding tax is ~40us against 113us of DSP-only work
+  // (156us at M=64 -- 64x the rows for 1.38x the cost, same 64-row-wide
+  // accumulator either way), so the GEMV-instead-of-HMX alternative is
+  // already rejected -- see docs/htp_attention/34_fc_measured.md section5.1
+  // and 41_moe_ffn_e2e_and_perf_task.md sectionB3.
+  bool accelerates_q4_0_at_m1() const override { return true; }
+
   // matAdata: Q4_0x4-repacked weight bytes, identity-cached across calls --
   // the same pointer for the lifetime of a loaded model (inference does not
   // move weight tensors), which is what makes registering once and keying
