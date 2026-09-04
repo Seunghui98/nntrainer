@@ -10,6 +10,13 @@ by reading the tree or explicitly marked as needing one.
 
 ---
 
+> **Stages 1-3 are done** (`3941d787c`, `d7f552ff4`, `5df5f013b`, `cd3536d14`),
+> verified by direct `get_htp_ops()` calls on device. The **model path has never
+> run** — E2E bring-up and the performance work continue in
+> `41_moe_ffn_e2e_and_perf_task.md`, which also corrects §2.2 (the `M > 1` gate
+> is on the Tier-1 path too) and §2.3 (grouping is mandatory, not optional —
+> Tier 1 issues 176 FastRPC calls per decoded token).
+
 ## 0. What this document is, and the mistake it corrects
 
 The goal: run LFM2-8B-A1B's MoE FFN (22 of 24 layers) through the HTP kernels
