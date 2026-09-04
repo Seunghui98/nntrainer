@@ -36,15 +36,24 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
   }
   // Layers [0, num_dense_layers) keep the dense SwiGLU FFN. Optional (default 0).
   NUM_DENSE_LAYERS = cfg.value("num_dense_layers", 0);
+
+  // MoE expert FFN weight dtype. Defaults to FC_LAYER_DTYPE (set by
+  // Lfm2CausalLM::setupParameters above) so an unquantized or fc_dtype==
+  // moe_dtype model is unaffected; nntr_quantize's --moe_dtype writes
+  // moe_layer_dtype when the two are meant to differ (see quantize.cpp's
+  // buildLayerDtypeMap docstring).
+  MOE_LAYER_DTYPE = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
 }
 
 Tensor Lfm2MoeCausalLM::createMoeLayer(const int layer_id, Tensor input) {
   LayerHandle moe(createLayer(
     "lfm2_moe",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-     withKey("unit", MOE_INTERMEDIATE_SIZE), withKey("num_experts", NUM_EXPERTS),
+     withKey("unit", MOE_INTERMEDIATE_SIZE),
+     withKey("num_experts", NUM_EXPERTS),
      withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
-     withKey("moe_activation", "swish")}));
+     withKey("moe_activation", "swish"),
+     withKey("weight_dtype", MOE_LAYER_DTYPE)}));
   return moe(input);
 }
 
