@@ -306,36 +306,75 @@ cannot pick them up via `meson configure`; delete or move it aside first) links
 `libnntrainer.so` clean through `ndk-build`. Run `generate_stub.sh` first with
 `HEXAGON_SDK_ROOT` pointed at the SDK root (not either hexkl_addon).
 
-### Stage 3 — Tier 1: single-weight accel, host-side plumbing first
+### Stage 3 — Tier 1: single-weight accel (done)
 
-Before any DSP call: the weight format conversion. LFM2 MoE saves weights as
-Q4_0 (block-scaled, `Lfm2MoELayer::save`,
-`Applications/CausalLM/models/lfm2_moe/lfm2_moe_layer.cpp`); HexKL's registry
-wants qs4cx (per-channel symmetric int4 + `colsum`, no block structure) —
-`test/unittest/unittest_hvx_mm_u8i4.cpp:84-135`'s `quantize_weights_qs4cx` is
-the reference to call, not reimplement (it already deliberately mirrors
-`__fallback_quant_nxk_qs4cx_f32`,
-`nntrainer/tensor/cpu_backend/fallback/fallback_internal.cpp:713`). Write the
-Q4_0→qs4cx converter as a pure host function first, and gate it on:
+LFM2 MoE saves weights as Q4_0, and — this was not obvious going in, see
+below — on any Android/ARM64 build (the only kind `ENABLE_HEXKL` compiles for)
+`repack_q4_0`'s ARM and DEFAULT branches both bake the loaded bytes into the
+**Q4_0x4** interleave, not plain per-block `block_q4_0`. HexKL's registry wants
+qs4cx (one scale + one colsum per output channel, not one scale per 32-wide
+block). `nntrainer::htp_q4_0_convert.h`'s `htp_qs4cx_from_q4_0x4` requantizes
+one into the other, going back through f32 (a real requantization, not a bit
+reshuffle — accuracy cost is measured, see below).
 
-**Gate (host-only, no device needed):** a gtest that round-trips a random K×N
-Q4_0 tensor through the converter and through
-`nntrainer::gemm_q4_0_fp32` / the fallback path, and checks the two dequantized
-matmul results agree within the tolerance implied by the width difference (Q4_0
-is block-scaled at 32-wide granularity; qs4cx is per-channel — expect a small,
-bounded, characterizable gap, not bit-exactness. Measure it, do not assume it).
+**Two things worth naming so the next session doesn't re-derive them:**
 
-Then: `HtpComputeOps::gemm_q4_0_accel_fp32` — lazy weight registration (a
-`std::unordered_map<const void*, uint32_t>` keyed on the Q4_0 tensor's data
-pointer → HexKL handle, registered on first sight via the Stage 3 converter,
-released never in this stage — that's Stage 6's problem) → `mm_u8i4_layer` with
-one handle.
+1. **There is no working "unpack repacked Q4_0" function to build this on —
+   look for `Q4_0Utils::dequantizeQ4_0x4` instead, which does the whole
+   decode in one call.** The obvious-looking path is `unpack_q4_0` (paired
+   inverse of `repack_q4_0`, same header) → `nntr_dequantize_row_q4_0`. That
+   path is a trap: `unpack_q4_0`'s **fallback**-backend implementation
+   (`fallback_internal.cpp`) is `throw std::runtime_error("NYI ...")` — real
+   only in the arm/x86 backends, and even those differ in which repack width
+   each backend's `unpack_q4_0` inverts. `Q4_0Utils::dequantizeQ4_0x4`
+   (`nntrainer/tensor/q4_0_utils.cpp`) is portable (no ISA guard) and
+   decodes Q4_0x4 straight to f32 in one call — no unpack step exists to look
+   for because none is needed.
+2. **`htp_q4_0_convert.{h,cpp}` live in `nntrainer/tensor/`, not
+   `htp_backend/`, and are not gated behind `ENABLE_HEXKL`.** The function has
+   no Hexagon SDK dependency — it is plain code against `Q4_0Utils`, same as
+   `q4_0_utils.cpp` next to it. Keeping it ungated is what let its accuracy
+   test run in the default host build; gating it behind `ENABLE_HEXKL` (the
+   instinctive choice, since only `HtpComputeOps` calls it) would have made
+   Stage 3's whole accuracy question undebuggable without a device.
 
-**Gate (needs a device):** `test/unittest/models/causallm_reference/lfm2_moe_tiny/`
-reference logits (`unittest_causallm_lfm2_moe_reference.cpp`) reproduce within
-tolerance when the tiny model runs under `engine=htp`. This is the first
-end-to-end signal and it needs zero residency work (§2.4) — the tiny model's
-whole weight set is ~32 KiB.
+`HtpComputeOps::gemm_q4_0_accel_fp32` (`htp_compute_ops.cpp`) is the first
+real override, shaped exactly like `ClComputeOps`'s equivalent: lazy weight
+registration (`std::unordered_map<const void*, uint32_t>` keyed on the Q4_0
+tensor's data pointer, registered on first sight, never released this stage —
+that's Stage 6's problem) via `nntr_hvx_weight_register_u8i4`, then
+`nntr_hvx_mm_u8i4_layer` with one handle.
+
+**Gate (host-only, no device): cleared.**
+`nntrainer_cpu_backend_standalone.htp_qs4cx_from_q4_0x4_accuracy`
+(`test/unittest/unittest_nntrainer_cpu_backend.cpp`) — quantize_q4_0 →
+repack_q4_0(ISA::ARM) → htp_qs4cx_from_q4_0x4 → reconstruct → compare
+against the original fp32 weight, plus a colsum cross-check. Measured:
+max_abs_err=0.189, mean_abs_err=0.045 on a random [-1,1] 768×512 weight.
+
+**Gate (device): cleared, on the connected Galaxy device (R5KL30G6MLT).**
+A standalone binary linking the real `-Denable-htp=true` Android build and
+calling `get_htp_ops()->gemm_q4_0_accel_fp32()` directly (§6 has the exact
+recipe). First measurement at a small shape (M=4,K=256,N=128) printed
+max_rel_err=939%, which looks alarming until read against this project's own
+established metric for this exact kernel: `unittest_hvx_mm_u8i4.cpp`'s
+already-device-verified accuracy harness reports max_rel up to **1908×** at
+M=64/K=1024/N=1024 as *passing*, because a handful of near-zero output
+elements make max-relative-error the wrong metric for 4-bit quantization —
+SNR is what that harness actually gates on. Re-measured with SNR at that
+harness's own shape: **22.8 dB**, against the harness's own **23.5 dB** for
+direct qs4cx quantization (no Q4_0 hop) at the same shape. The ~0.7 dB gap is
+this path's one extra hop, and it is small.
+
+**Not yet done, and the natural next increment before Stage 4:** the
+`lfm2_moe_tiny` reference-logit gate this section originally specified
+(`unittest_causallm_lfm2_moe_reference.cpp` reproducing under `engine=htp`
+end to end, through the real `Tensor::dot()` → `dotQnK` → `ComputeOps` path
+rather than a direct kernel call). The kernel-level verification above is
+strictly stronger evidence about the arithmetic; the model-level test is
+still worth running because it is the first check that the *dispatch path*
+(engine selection, tensor context, the real weight pointers a loaded model
+produces) works, not just the kernel called directly.
 
 ### Stage 4 — Tier 2: shared-activation batch, gate/up at decode
 
@@ -430,18 +469,112 @@ Not started by default; scoped here so it isn't invented ad hoc later.
 
 ## 6. Build and run
 
+### 6.1 Host-only gates
+
 ```bash
-# Host-only gates (Stage 3's converter test, any stage's CPU-path regression):
 meson build -Denable-transformer=true
 ninja -C build
-cd build && meson test unittest_causallm_models --print-errorlogs
-
-# Device gates (Stage 3 onward): package libnntr_hvx_skel.so (Stage 2) and
-# run the same unittest_causallm_models binary cross-compiled for
-# arm64-v8a with -Denable-htp=true, ADSP_LIBRARY_PATH pointing at the skel.
-# test/htp/run_u8i4_layer_on_device.sh is the existing recipe to extend, not
-# a new one to invent.
+meson configure build -Denable-test=true   # first time only
+ninja -C build
+cd build && meson test unittest_nntrainer_cpu_backend --print-errorlogs
 ```
+
+`unittest_nntrainer_cpu_backend`'s `htp_qs4cx_from_q4_0x4_accuracy` case is
+Stage 3's converter gate and needs no device or SDK — it is not gated behind
+`ENABLE_HEXKL` (§Stage 3).
+
+### 6.2 Device gates — the exact recipe this session used, paths included
+
+**Environment on the dev machine this was verified on** (adjust paths for a
+different machine, but keep the *distinction*, not just the values — see the
+hexkl_addon trap below):
+
+```bash
+export HEXAGON_SDK_ROOT=~/workspace/Hexagon_SDK/6.4.0.2
+export ANDROID_NDK=~/workspace/android-ndk-r26d
+```
+
+**Baseline first — confirm the already-verified kernels still work before
+trusting anything built on top of them:**
+
+```bash
+HEXKL_ROOT=~/workspace/hxkl-beta2/hexkl_addon \  # the STANDALONE beta drop
+HEXKL_SDK_VER=6.4.0.2 \
+bash test/htp/run_u8i4_layer_on_device.sh
+```
+
+All 38 tests across `unittest_hvx_mm_u8i4`/`_softmax`/`_attn`/`_fc` must
+pass. `speedup_vs_harness` printing 50×+ is expected, not a red flag — that
+test's own comment says "printed, never asserted"; the harness path rebakes
+the weight every call, layer_x4 doesn't, so the ratio is dominated by the
+~12 ms bake, not by anything this task changes.
+
+**Then the real `-Denable-htp=true` build — a trap to know about first:**
+there are two different `hexkl_addon` deliveries on a dev machine set up for
+this work, and they are for different consumers:
+
+| | layout | who wants it |
+| :-- | :-- | :-- |
+| SDK-bundled: `$HEXAGON_SDK_ROOT/addons/hexkl_addon` | `lib/<arch>/libsdkl.so` (flat) | `-Denable-htp=true -Dhexkl-sdk-root=` |
+| standalone beta drop (`hxkl-beta2/hexkl_addon` above) | `lib/<ver>/<arch>/libhexkl_micro.a` (versioned) | `HEXKL_ROOT` for `test/htp/build.sh` / `run_u8i4_layer_on_device.sh` |
+
+Pointing `-Dhexkl-sdk-root` at the standalone drop fails opaquely (missing
+version segment in the default `hexkl-lib-subdir`). Use the SDK-bundled one:
+
+```bash
+# Generate the FastRPC client stub once (Stage 2) -- meson errors by name
+# if this hasn't been run:
+HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT bash nntrainer/tensor/htp_backend/generate_stub.sh
+
+# A builddir that predates -Denable-htp/-Dhexkl-* in meson_options.txt cannot
+# pick them up via `meson configure` -- move an existing one aside first.
+mv builddir builddir.bak   # only if builddir already exists
+
+PATH="$ANDROID_NDK:$PATH" ./tools/package_android.sh --arm-arch=armv8.2-a \
+  -Denable-htp=true \
+  -Dhexkl-sdk-root=$HEXAGON_SDK_ROOT/addons/hexkl_addon \
+  -Dhexkl-lib-subdir=armv8_android26
+```
+
+Confirm the link is real before trusting anything downstream:
+
+```bash
+file builddir/jni/arm64-v8a/libnntrainer.so       # ELF ... ARM aarch64
+readelf -d builddir/jni/arm64-v8a/libnntrainer.so | grep NEEDED
+#   must list libcdsprpc.so and libsdkl.so
+```
+
+**On-device: push the skel, the library, and run.** The one thing that will
+silently produce `HtpBackend::enabled() == 0` (or worse, garbage results) is
+pushing the Hexagon SDK's `libcdsprpc.so` to the device — it is a link-time
+stub, not a runtime implementation, and it shadows the device's real one at
+`/vendor/lib64/libcdsprpc.so` if it's anywhere on `LD_LIBRARY_PATH`. **Do not
+push it.**
+
+```bash
+DEVICE_TMP=/data/local/tmp/htp_verify
+adb shell "mkdir -p $DEVICE_TMP"
+adb push builddir/jni/arm64-v8a/libnntrainer.so "$DEVICE_TMP/"
+adb push builddir/jni/arm64-v8a/libsdkl.so "$DEVICE_TMP/"        # unused dead weight (Stage 1), still linked
+adb push builddir/jni/arm64-v8a/libc++_shared.so "$DEVICE_TMP/"
+adb push test/htp/build/libnntr_hvx_skel.so "$DEVICE_TMP/"        # from the baseline run above
+# do NOT: adb push builddir/jni/arm64-v8a/libcdsprpc.so ...
+
+adb shell "cd $DEVICE_TMP && LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP ./your_test_binary"
+```
+
+`adb logcat -d | grep -iE "nntrainer|adsprpc"` is the fastest way to see
+what actually happened inside the FastRPC session — `remote_handle64_open`
+opening `libnntr_hvx_skel.so` on a domain, followed later by a clean
+`remote_handle64_close`, is what success looks like at the transport level,
+independent of whether the *numbers* it returns are also right.
+
+**For accuracy, use SNR, not max relative error.** A handful of near-zero
+output elements make max-relative-error explode under 4-bit quantization
+regardless of correctness — this project's own `unittest_hvx_mm_u8i4.cpp`
+prints `max_rel` up to 1908× on a passing, correct run. Compare SNR (dB)
+against the shape-matched number in `34_fc_measured.md` or the harness's own
+printed value instead.
 
 Paste complete output at each gate, not a summary — same rule as
 `30_flash_attention_task.md` §5.
