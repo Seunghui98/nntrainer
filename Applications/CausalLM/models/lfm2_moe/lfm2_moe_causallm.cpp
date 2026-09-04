@@ -17,7 +17,28 @@
 #include <llm_util.hpp>
 #include <model.h>
 
+#include <sstream>
+
 namespace causallm {
+
+namespace {
+/**
+ * @brief Parse a comma-separated list of layer_ids, e.g. "0,1,3". Blank
+ *        entries (from "", or a trailing/doubled comma) are skipped rather
+ *        than throwing, so an empty moe_htp_layers value stays "no
+ *        restriction" (see MOE_HTP_LAYERS's doc in the header).
+ */
+std::set<int> parseLayerIdList(const std::string &csv) {
+  std::set<int> ids;
+  std::stringstream ss(csv);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    if (!tok.empty())
+      ids.insert(std::stoi(tok));
+  }
+  return ids;
+}
+} // namespace
 
 void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
                                       json &nntr_cfg) {
@@ -43,9 +64,20 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
   // moe_layer_dtype when the two are meant to differ (see quantize.cpp's
   // buildLayerDtypeMap docstring).
   MOE_LAYER_DTYPE = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
+
+  // MoE FFN engine. Defaults to "cpu" so an existing run is unaffected
+  // unless nntr_config.json opts in; MOE_HTP_LAYERS (empty = every MoE
+  // layer) bounds a real checkpoint's device run to what the HTP weight
+  // registry can hold at once -- see the two fields' docs in the header.
+  MOE_ENGINE = nntr_cfg.value("moe_engine", std::string("cpu"));
+  MOE_HTP_LAYERS =
+    parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
 }
 
 Tensor Lfm2MoeCausalLM::createMoeLayer(const int layer_id, Tensor input) {
+  const std::string engine =
+    (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
+                                                               : "cpu";
   LayerHandle moe(createLayer(
     "lfm2_moe",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
@@ -53,7 +85,7 @@ Tensor Lfm2MoeCausalLM::createMoeLayer(const int layer_id, Tensor input) {
      withKey("num_experts", NUM_EXPERTS),
      withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
      withKey("moe_activation", "swish"),
-     withKey("weight_dtype", MOE_LAYER_DTYPE)}));
+     withKey("weight_dtype", MOE_LAYER_DTYPE), withKey("engine", engine)}));
   return moe(input);
 }
 
