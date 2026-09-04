@@ -14,6 +14,8 @@
 #ifndef __LFM2_MOE_CAUSALLM_H__
 #define __LFM2_MOE_CAUSALLM_H__
 
+#include <set>
+
 #include "lfm2_causallm.h"
 
 namespace causallm {
@@ -51,6 +53,18 @@ protected:
    * setupParameters) unless nntr_config.json carries its own
    * moe_layer_dtype, which nntr_quantize's --moe_dtype writes. */
   std::string MOE_LAYER_DTYPE;
+  /** engine ("cpu"/"htp"/...) for MoE FFN layers selected by
+   * MOE_HTP_LAYERS (or every MoE layer, if that set is empty); defaults to
+   * "cpu" so an existing model run is unaffected unless nntr_config.json
+   * opts in. See setupParameters / createMoeLayer. */
+  std::string MOE_ENGINE = "cpu";
+  /** layer_ids that get MOE_ENGINE; empty means "every MoE layer" (the
+   * whole-model case, e.g. the tiny fixture). Non-empty bounds a real
+   * checkpoint's device run to the handles/VTCM the residency wall allows
+   * (docs/htp_attention/40_moe_ffn_htp_task.md section2.4) -- layer_ids not
+   * in this set always get "cpu", regardless of MOE_ENGINE. Read from
+   * nntr_config.json's moe_htp_layers (comma-separated layer_ids). */
+  std::set<int> MOE_HTP_LAYERS;
 
   /**
    * @brief Create the variant-specific MoE layer for a given layer id.
