@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "htp_q4_0_convert.h"
 #include "int4_utils.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
@@ -485,6 +486,78 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_repack_unpack_dequantize) {
     EXPECT_EQ(ref_dequantized[i], roundtrip_dequantized[i])
       << "Mismatch at index " << i;
   }
+}
+
+/**
+ * @brief htp_qs4cx_from_q4_0x4 against the weight it was requantized from.
+ *
+ * This is a real requantization (Q4_0's per-32-block scale down to qs4cx's
+ * one-scale-per-column), not a bit reshuffle, so some accuracy loss beyond
+ * Q4_0's own is expected and is what this test measures rather than
+ * assumes -- see htp_q4_0_convert.h. Forces the ARM (q4_0x4) repack layout
+ * explicitly rather than relying on this host's default, because that is
+ * the only layout htp_qs4cx_from_q4_0x4 understands (ENABLE_HEXKL only
+ * ever builds for Android/ARM64); q4_0_utils.cpp's dequantizeQ4_0x4 is
+ * portable, so this is fully host-testable without a device.
+ */
+TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_q4_0x4_accuracy) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 768; // must be a multiple of 32 (Q4_0 block size)
+  const unsigned int N = 512;
+
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  int64_t q4_0_type_size = sizeof(block_q4_0_testonly);
+  size_t data_size = (static_cast<size_t>(K) * N / QK4_0) * q4_0_type_size;
+
+  std::vector<char> q4_weight(data_size);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+
+  std::vector<char> repacked(data_size);
+  nntrainer::repack_q4_0(repacked.data(), q4_weight.data(), data_size, N, K,
+                         ml::train::ISA::ARM);
+
+  std::vector<int8_t> q_w4_i8(static_cast<size_t>(K) * N);
+  std::vector<float> w_scale(N);
+  std::vector<int32_t> colsum_w(N);
+  nntrainer::htp_qs4cx_from_q4_0x4(repacked.data(), K, N, q_w4_i8.data(),
+                                   w_scale.data(), colsum_w.data());
+
+  // colsum_w must match a direct sum over the emitted int4 values -- this
+  // is the term HexKL's dequant uses to correct for unsigned activations,
+  // so a mismatch here is a silent wrong-answer bug, not a rounding one.
+  for (unsigned int n = 0; n < N; ++n) {
+    int32_t sum = 0;
+    for (unsigned int k = 0; k < K; ++k)
+      sum += q_w4_i8[static_cast<size_t>(k) * N + n];
+    EXPECT_EQ(sum, colsum_w[n]) << "colsum mismatch at n=" << n;
+  }
+
+  // Reconstruct and compare against the ORIGINAL fp32 weight (not Q4_0's own
+  // dequant) so the printed number is the whole double-quantization cost,
+  // the number that actually reaches the matmul.
+  float max_abs_err = 0.0f, sum_abs_err = 0.0f;
+  for (unsigned int n = 0; n < N; ++n) {
+    for (unsigned int k = 0; k < K; ++k) {
+      const float approx = q_w4_i8[static_cast<size_t>(k) * N + n] * w_scale[n];
+      const float err =
+        std::fabs(approx - weight[static_cast<size_t>(n) * K + k]);
+      max_abs_err = std::max(max_abs_err, err);
+      sum_abs_err += err;
+    }
+  }
+  const float mean_abs_err = sum_abs_err / (static_cast<float>(N) * K);
+  std::cout << "htp_qs4cx_from_q4_0x4: max_abs_err=" << max_abs_err
+            << " mean_abs_err=" << mean_abs_err << std::endl;
+
+  // generate_random_vector's range is the implicit full scale here; a 4-bit
+  // per-channel quantizer's own noise floor is ~1/30 of a channel's range,
+  // and Q4_0's is comparable, so bound generously above their sum rather
+  // than pin an exact number -- this is a smoke bound against a layout or
+  // sign bug, not a tight accuracy contract.
+  EXPECT_LT(max_abs_err, 0.5f);
+  EXPECT_LT(mean_abs_err, 0.1f);
 }
 
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
