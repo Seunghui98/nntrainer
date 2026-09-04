@@ -35,6 +35,8 @@
  *     --fc_dtype <type>   Target dtype for FC layers (default: Q4_0)
  *     --embd_dtype <type> Target dtype for embedding layer (default: FP32)
  *     --lmhead_dtype <type> Target dtype for LM head layer (default: FP32)
+ *     --moe_dtype <type>  Target dtype for MoE expert FFN layers
+ *                          (default: same as fc_dtype; no-op on non-MoE models)
  *     --output_bin <name> Output weight filename (auto-generated if omitted)
  *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
  *
@@ -432,6 +434,11 @@ void printUsage(const char *prog) {
     << "  --embd_dtype <type>   Target dtype for embedding (default: FP32)\n"
     << "  --lmhead_dtype <type> Target dtype for LM head (default: same as "
        "embd_dtype)\n"
+    << "  --moe_dtype <type>    Target dtype for MoE expert FFN layers "
+       "(default: same\n"
+    << "                        as fc_dtype). Only affects models with MoE "
+       "layers\n"
+    << "                        (e.g. LFM2-MoE); harmless elsewhere.\n"
     << "  --isa <arch>          Target instruction set architecture for "
        "quantized weights\n"
     << "                        (default: DEFAULT). Options: DEFAULT, X86, "
@@ -442,8 +449,9 @@ void printUsage(const char *prog) {
        "'safetensors'\n"
     << "  --config <path>       Use a target nntr_config.json instead of\n"
     << "                        individual dtype options. The fc_layer_dtype,\n"
-    << "                        embedding_dtype, and lmhead_dtype fields\n"
-    << "                        from this config will be used.\n"
+    << "                        embedding_dtype, lmhead_dtype, and\n"
+    << "                        moe_layer_dtype fields from this config will "
+       "be used.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
     << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K\n"
@@ -487,10 +495,19 @@ void printUsage(const char *prog) {
  *   - All FC layers (wq, wk, wv, attention_out, ffn_*) -> fc_dtype
  *   - output_of_causallm     -> lmhead_dtype
  *   - RMSNorm / other layers -> FP32 (not quantized)
+ *
+ * layer{i}_ffn_down is a special case: it is both the dense FFN's down
+ * projection (Transformer::createMlp) and the LFM2 MoE layer's node name
+ * (Lfm2MoeCausalLM::createMoeLayer). For i >= num_dense_layers it follows
+ * moe_dtype instead of fc_dtype, so the MoE experts can be quantized (or
+ * left FP32) independently of the rest of the FC layers. num_dense_layers
+ * is num_layers (never triggers the override) for any model whose config
+ * has no num_experts key, so this is a no-op for non-MoE architectures.
  */
 std::map<std::string, DataType>
 buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
-                   DataType lmhead_dtype, bool include_lmhead) {
+                   DataType lmhead_dtype, bool include_lmhead,
+                   int num_dense_layers, DataType moe_dtype) {
 
   std::map<std::string, DataType> dtype_map;
 
@@ -533,7 +550,13 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       // FFN FC layers - version3 (Qwen/Gemma LLMs)
       dtype_map[prefix + "_ffn_gate"] = fc_dtype;
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
-      dtype_map[prefix + "_ffn_down"] = fc_dtype;
+
+      // LFM2 MoE experts (see the moe_dtype note in this function's
+      // docstring); dense FFN layers keep following fc_dtype.
+      const DataType ffn_down_dtype =
+        (i >= num_dense_layers) ? moe_dtype : fc_dtype;
+      if (ffn_down_dtype != DataType::FP32 && ffn_down_dtype != DataType::NONE)
+        dtype_map[prefix + "_ffn_down"] = ffn_down_dtype;
 
       dtype_map[prefix + "_ffn_output"] = fc_dtype;
 
@@ -635,6 +658,7 @@ int main(int argc, char *argv[]) {
   std::string fc_dtype_str = "Q4_0";
   std::string embd_dtype_str = "FP32";
   std::string lmhead_dtype_str = "";
+  std::string moe_dtype_str = "";
   std::string isa_str = "DEFAULT";
   std::string output_bin_name = "";
   std::string target_config_path = "";
@@ -650,6 +674,8 @@ int main(int argc, char *argv[]) {
       embd_dtype_str = argv[++i];
     } else if (arg == "--lmhead_dtype" && i + 1 < argc) {
       lmhead_dtype_str = argv[++i];
+    } else if (arg == "--moe_dtype" && i + 1 < argc) {
+      moe_dtype_str = argv[++i];
     } else if (arg == "--isa" && i + 1 < argc) {
       isa_str = argv[++i];
     } else if (arg == "--output_bin" && i + 1 < argc) {
@@ -697,13 +723,17 @@ int main(int argc, char *argv[]) {
         embd_dtype_str = target_cfg["embedding_dtype"].get<std::string>();
       if (target_cfg.contains("lmhead_dtype"))
         lmhead_dtype_str = target_cfg["lmhead_dtype"].get<std::string>();
+      if (target_cfg.contains("moe_layer_dtype"))
+        moe_dtype_str = target_cfg["moe_layer_dtype"].get<std::string>();
       if (target_cfg.contains("model_file_name") && output_bin_name.empty())
         output_bin_name = target_cfg["model_file_name"].get<std::string>();
     }
 
-    // Default lmhead_dtype to embd_dtype if not specified
+    // Default lmhead_dtype to embd_dtype, moe_dtype to fc_dtype, if unset
     if (lmhead_dtype_str.empty())
       lmhead_dtype_str = embd_dtype_str;
+    if (moe_dtype_str.empty())
+      moe_dtype_str = fc_dtype_str;
 
     // Parse target ISA
     ml::train::ISA target_isa = strToISA(isa_str);
@@ -712,6 +742,7 @@ int main(int argc, char *argv[]) {
     DataType fc_dtype = strToDataType(fc_dtype_str);
     DataType embd_dtype = strToDataType(embd_dtype_str);
     DataType lmhead_dtype = strToDataType(lmhead_dtype_str);
+    DataType moe_dtype = strToDataType(moe_dtype_str);
 
     // Validate source model is FP32
     std::string src_tensor_type =
@@ -759,6 +790,7 @@ int main(int argc, char *argv[]) {
     std::cout << "  Source:       " << src_weight_path << "\n";
     std::cout << "  Target:       " << dst_weight_path << "\n";
     std::cout << "  FC dtype:     " << dataTypeToStr(fc_dtype) << "\n";
+    std::cout << "  MoE dtype:    " << dataTypeToStr(moe_dtype) << "\n";
     std::cout << "  Embed dtype:  " << dataTypeToStr(embd_dtype) << "\n";
     std::cout << "  LMHead dtype: " << dataTypeToStr(lmhead_dtype) << "\n";
     std::cout << "  Target ISA:   " << isaToStr(target_isa) << "\n";
@@ -823,8 +855,15 @@ int main(int argc, char *argv[]) {
       include_lmhead = false;
     }
 
-    auto layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
-                                              lmhead_dtype, include_lmhead);
+    // MoE experts (see buildLayerDtypeMap's docstring) only exist for models
+    // whose config carries num_experts; num_dense_layers = num_layers for
+    // every other model, which makes the moe_dtype override a no-op there.
+    int num_dense_layers = cfg.contains("num_experts")
+                             ? cfg.value("num_dense_layers", 0)
+                             : num_layers;
+    auto layer_dtype_map =
+      buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype, lmhead_dtype,
+                         include_lmhead, num_dense_layers, moe_dtype);
     addSentenceTransformerLayerDtypes(layer_dtype_map, nntr_cfg, model_path,
                                       fc_dtype);
 
@@ -857,6 +896,7 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["fc_layer_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
+    new_nntr_cfg["moe_layer_dtype"] = dataTypeToStr(moe_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
 

@@ -47,6 +47,10 @@ protected:
   unsigned int NUM_EXPERTS_PER_TOK = 0;
   unsigned int MOE_INTERMEDIATE_SIZE = 0;
   unsigned int NUM_DENSE_LAYERS = 0;
+  /** MoE expert FFN weight dtype; defaults to FC_LAYER_DTYPE (see
+   * setupParameters) unless nntr_config.json carries its own
+   * moe_layer_dtype, which nntr_quantize's --moe_dtype writes. */
+  std::string MOE_LAYER_DTYPE;
 
   /**
    * @brief Create the variant-specific MoE layer for a given layer id.
