@@ -14,6 +14,12 @@ Prerequisite reading, in this order:
 Where this doc and `40_moe_ffn_htp_task.md` disagree, **this one wins** and says
 so explicitly at the point of disagreement (there is exactly one, §3.3).
 
+> **The task that carries this forward is `42_moe_ffn_quantize_and_wiring_task.md`.**
+> It records the two decisions taken about the quantized file (one `--isa ARM`
+> Q4_0 file for every layer; the device belongs to the owner), and a read-only
+> audit that corrects §B5's framing of what "per-part quantize" needs and adds
+> the load-side ISA check nothing performs today.
+
 ---
 
 ## 0. What this doc is, and what it is not
