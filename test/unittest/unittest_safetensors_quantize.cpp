@@ -151,12 +151,16 @@ TEST(SafetensorsUtil, inspect_reports_quant_type_p) {
 // ===========================================================================
 
 static std::unique_ptr<nntrainer::NeuralNetwork>
-createFcNN(unsigned int input_width, unsigned int units) {
+createFcNN(unsigned int input_width, unsigned int units,
+           const std::string &weight_dtype = "") {
   auto nn = std::make_unique<nntrainer::NeuralNetwork>();
   nn->addLayer(ml::train::layer::Input(
     {"name=input", "input_shape=1:1:" + std::to_string(input_width)}));
-  nn->addLayer(ml::train::layer::FullyConnected(
-    {"name=dense", "unit=" + std::to_string(units)}));
+  std::vector<std::string> dense_props = {"name=dense",
+                                          "unit=" + std::to_string(units)};
+  if (!weight_dtype.empty())
+    dense_props.push_back("weight_dtype=" + weight_dtype);
+  nn->addLayer(ml::train::layer::FullyConnected(dense_props));
   nn->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
   nn->setProperty({"loss=mse", "batch_size=1"});
   nn->compile();
@@ -285,6 +289,89 @@ TEST(SafetensorsQuant, q4_0_records_target_isa_p) {
   auto md = st::parseMetadata(header_json);
   ASSERT_EQ(md.count("nntr_q4_0_isa"), 1u);
   EXPECT_EQ(md["nntr_q4_0_isa"], "arm");
+
+  remove(st_path.c_str());
+}
+
+// This build's own repack layout, mirroring the #if in neuralnet.cpp's
+// save() (metadata writer) and load() (the check under test) exactly, so
+// these tests pick "own ISA" / "the other ISA" correctly on an ARM CI runner
+// too instead of assuming an x86 host.
+#if defined(__aarch64__) || defined(__arm__)
+static constexpr auto OWN_ISA = ml::train::ISA::ARM;
+static constexpr auto OTHER_ISA = ml::train::ISA::X86;
+static const char *OWN_ISA_STR = "arm";
+static const char *OTHER_ISA_STR = "x86";
+#else
+static constexpr auto OWN_ISA = ml::train::ISA::X86;
+static constexpr auto OTHER_ISA = ml::train::ISA::ARM;
+static const char *OWN_ISA_STR = "x86";
+static const char *OTHER_ISA_STR = "arm";
+#endif
+
+/**
+ * @brief Q4_0's repack layout depends on the ISA it was quantized for and is
+ *        indistinguishable from the header alone -- reading the wrong one
+ *        silently produces garbage rather than an error. load() must refuse
+ *        a safetensors file whose recorded nntr_q4_0_isa does not match the
+ *        ISA this build actually expects, and name both ISAs in the error
+ *        so the fix (re-quantize with the right --isa) is obvious.
+ */
+TEST(SafetensorsQuant, q4_0_load_rejects_isa_mismatch_p) {
+  const unsigned int W = 32;
+  const unsigned int U = 32;
+  std::map<std::string, DataType> dtype_map = {{"dense", DataType::Q4_0}};
+
+  auto nn = createFcNN(W, U);
+  const std::string st_path = "st_isa_mismatch_test.safetensors";
+  ASSERT_NO_THROW(nn->save(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS,
+                           DataType::NONE, dtype_map, OTHER_ISA));
+
+  auto nn2 = createFcNN(W, U, "Q4_0");
+  try {
+    nn2->load(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS);
+    FAIL() << "Expected load() to throw on an ISA-mismatched Q4_0 file";
+  } catch (const std::exception &e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find(OTHER_ISA_STR), std::string::npos) << what;
+    EXPECT_NE(what.find(OWN_ISA_STR), std::string::npos) << what;
+  }
+
+  remove(st_path.c_str());
+}
+
+/**
+ * @brief The matching-ISA control for q4_0_load_rejects_isa_mismatch_p: a
+ *        file quantized for this build's own ISA must not trip the ISA
+ *        guard. This does not assert the whole load() succeeds -- loading a
+ *        Q4_0-declared weight from a bare ml::train::layer::FullyConnected
+ *        (as opposed to the CausalLM app's own weight-request path, which
+ *        LFM2/Gemma3/Gemma4's passing Q40MatchesHFReference tests already
+ *        cover end to end) hits an unrelated, pre-existing "Size of tensor
+ *        to copy must match" in the generic tensor read path with or
+ *        without this test's ISA change -- confirmed by the same failure on
+ *        a matching-ISA .bin round trip, where the guard under test never
+ *        runs at all (ponytail: out of scope here; a bare-NeuralNetwork
+ *        generic Q4_0 round trip has never been exercised by this test file
+ *        before, and fixing that generic gap belongs to whoever needs it).
+ */
+TEST(SafetensorsQuant, q4_0_load_accepts_matching_isa_p) {
+  const unsigned int W = 32;
+  const unsigned int U = 32;
+  std::map<std::string, DataType> dtype_map = {{"dense", DataType::Q4_0}};
+
+  auto nn = createFcNN(W, U);
+  const std::string st_path = "st_isa_match_test.safetensors";
+  ASSERT_NO_THROW(nn->save(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS,
+                           DataType::NONE, dtype_map, OWN_ISA));
+
+  auto nn2 = createFcNN(W, U, "Q4_0");
+  try {
+    nn2->load(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS);
+  } catch (const std::exception &e) {
+    EXPECT_EQ(std::string(e.what()).find("packed for"), std::string::npos)
+      << "load() rejected a matching-ISA file as an ISA mismatch: " << e.what();
+  }
 
   remove(st_path.c_str());
 }
