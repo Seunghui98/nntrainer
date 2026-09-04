@@ -4,21 +4,25 @@
 # This script builds libcausallm_core.so and nntrainer_causallm executable
 set -e
 
-export ANDROID_NDK=~/Desktop/workspace/android-ndk-r26d
-export PATH=${PATH}:${ANDROID_NDK}
-
 # Parse options
 USE_BUILD_CACHE=0
+USE_HTP=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --cache)
             USE_BUILD_CACHE=1
             shift
             ;;
+        --htp)
+            USE_HTP=1
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--cache]"
+            echo "Usage: $0 [--cache] [--htp]"
             echo "  --cache  Reuse existing nntrainer builddir if available"
+            echo "  --htp    Build with Hexagon HTP acceleration enabled"
+            echo "           (-Denable-htp=true). Requires HEXAGON_SDK_ROOT."
             exit 1
             ;;
     esac
@@ -89,12 +93,29 @@ check_artifact() {
     fi
 }
 
-# Check if NDK path is set
+# Determine ANDROID_NDK: honor an existing value, else fall back to a
+# candidate list, else error out by name -- mirrors the repo-root
+# build_android.sh's own NDK-detection block (that script previously
+# force-overwrote ANDROID_NDK to one hardcoded path here, unconditionally,
+# before this same check ran -- which meant this check could never fail
+# even when the hardcoded path didn't exist on the machine running it).
 if [ -z "$ANDROID_NDK" ]; then
-    log_error "ANDROID_NDK is not set. Please set it to your Android NDK path."
-    log_info "Example: export ANDROID_NDK=/path/to/android-ndk-r21d"
+    for candidate in \
+        "$HOME/Desktop/workspace/android-ndk-r26d" \
+        /opt/android-ndk-r26d; do
+        if [ -d "$candidate" ]; then
+            export ANDROID_NDK="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$ANDROID_NDK" ] || [ ! -d "$ANDROID_NDK" ]; then
+    log_error "ANDROID_NDK is not set (or does not exist). Please set it to your Android NDK path."
+    log_info "Example: export ANDROID_NDK=/path/to/android-ndk-r26d"
     exit 1
 fi
+export PATH="$PATH:$ANDROID_NDK"
 
 # Set NNTRAINER_ROOT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +131,21 @@ log_info "Working directory: $(pwd)"
 # Step 1: Build nntrainer for Android if not already built
 log_step "1/4" "Build nntrainer for Android"
 
+PACKAGE_ANDROID_ARGS=()
+if [ "$USE_HTP" -eq 1 ]; then
+    : "${HEXAGON_SDK_ROOT:?set HEXAGON_SDK_ROOT to a Hexagon SDK checkout (--htp requires it)}"
+    log_info "HTP acceleration enabled: HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT"
+    # Generates generated/nntr_hvx_stub.c, which meson.build errors out by
+    # name for if missing -- see that script's own header comment for why
+    # this is a manual step rather than a meson custom_target.
+    bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
+    # hexkl-lib-subdir already defaults to armv8_android26 (meson_options.txt),
+    # matching the device recipe in docs/htp_attention/40_moe_ffn_htp_task.md
+    # section6.2 -- only the SDK root (the trap: this must be the SDK-bundled
+    # hexkl_addon, not a standalone beta drop -- same section) needs passing.
+    PACKAGE_ANDROID_ARGS+=("-Denable-htp=true" "-Dhexkl-sdk-root=$HEXAGON_SDK_ROOT/addons/hexkl_addon")
+fi
+
 if [ "$USE_BUILD_CACHE" -eq 1 ] && [ -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
     log_info "Build cache enabled: reusing existing nntrainer builddir (skipping)"
 else
@@ -119,7 +155,7 @@ else
         log_info "Removing existing builddir..."
         rm -rf builddir
     fi
-    ./tools/package_android.sh
+    ./tools/package_android.sh "${PACKAGE_ANDROID_ARGS[@]}"
 fi
 
 # Check if build was successful
