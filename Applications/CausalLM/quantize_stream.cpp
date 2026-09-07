@@ -371,13 +371,10 @@ DType parseDType(const std::string &value) {
     return DType::Q4_K;
   if (dtype == "Q6_K" || dtype == "Q6K")
     return DType::Q6_K;
-  if (dtype == "QS4CX") {
-    // TODO: Add QS4CX streaming layout support for Qwen3 MoE weights.
-    throw std::invalid_argument(
-      "QS4CX is not supported by nntr_quantize_stream yet");
-  }
+  if (dtype == "QS4CX")
+    return DType::QS4CX;
   throw std::invalid_argument("Unsupported dtype: " + value +
-                              " (supported: FP32, Q4_0, Q4_K, Q6_K)");
+                              " (supported: FP32, Q4_0, Q4_K, Q6_K, QS4CX)");
 }
 
 const char *dtypeName(DType dtype) {
@@ -390,6 +387,8 @@ const char *dtypeName(DType dtype) {
     return "Q4_K";
   case DType::Q6_K:
     return "Q6_K";
+  case DType::QS4CX:
+    return "QS4CX";
   default:
     throw std::invalid_argument("Unknown dtype");
   }
@@ -425,6 +424,9 @@ const char *isaName(ml::train::ISA isa) {
   throw std::invalid_argument("Unknown ISA");
 }
 
+/** @brief Packed int4 bytes for one QS4CX output channel of @a columns */
+size_t qs4cxRowBytes(size_t columns) { return (columns + 1) / 2; }
+
 size_t quantizedSize(DType dtype, size_t rows, size_t columns, bool repack,
                      const std::string &name) {
   switch (dtype) {
@@ -453,6 +455,11 @@ size_t quantizedSize(DType dtype, size_t rows, size_t columns, bool repack,
     }
     return checkedMultiply(checkedMultiply(rows, columns / QK_K, name),
                            Q6_K_BLOCK_BYTES, name);
+  case DType::QS4CX:
+    // One int4 per weight packed two-per-byte, plus one f32 scale per output
+    // channel -- the layout layer_devel.h's QS4CX save branch writes, with
+    // every nibble first and every scale after (see writeQuantized).
+    return checkedMultiply(rows, qs4cxRowBytes(columns) + sizeof(float), name);
   default:
     break;
   }
@@ -503,6 +510,7 @@ public:
       writeQuantized(source, block_rows, columns, dtype, false, name);
       row += block_rows;
     }
+    flushQs4cxScales(dtype, name);
   }
 
   /**
@@ -533,6 +541,7 @@ public:
         }
       }
       writeQuantized(transposed, output_size, input_size, dtype, true, name);
+      flushQs4cxScales(dtype, name);
       return;
     }
 
@@ -644,6 +653,22 @@ private:
       written = nntrainer::quantize_q6_K(
         source.data(), quantized.data(), static_cast<int64_t>(rows),
         static_cast<int64_t>(columns), nullptr);
+    } else if (dtype == DType::QS4CX) {
+      // QS4CX stores every packed nibble first and every per-channel scale
+      // after, for the whole tensor (layer_devel.h). A chunked write would
+      // interleave the two, so only the nibbles go out now and the scales
+      // are held until flushQs4cxScales() closes the tensor. That buffer is
+      // one float per output channel -- 256 KiB for a 65k-row embedding.
+      std::vector<char> nibbles(
+        checkedMultiply(rows, qs4cxRowBytes(columns), name));
+      const size_t scale_begin = pending_scales_.size();
+      pending_scales_.resize(scale_begin + rows);
+      nntrainer::quant_qs4cx_f32(
+        rows, columns, const_cast<float *>(source.data()), nibbles.data(),
+        pending_scales_.data() + scale_begin,
+        /*is_nxk=*/true);
+      writeBytes(nibbles.data(), nibbles.size(), name);
+      return;
     }
 
     if (written != output_size) {
@@ -655,6 +680,21 @@ private:
     writeBytes(quantized.data(), quantized.size(), name);
   }
 
+  /**
+   * @brief Write the per-channel scales QS4CX deferred, closing the tensor
+   *
+   * A no-op for every other dtype, so callers can call it unconditionally
+   * once they have written a tensor's last chunk.
+   */
+  void flushQs4cxScales(DType dtype, const std::string &name) {
+    if (dtype != DType::QS4CX || pending_scales_.empty())
+      return;
+    writeBytes(pending_scales_.data(),
+               checkedMultiply(pending_scales_.size(), sizeof(float), name),
+               name);
+    pending_scales_.clear();
+  }
+
   void writeBlockedTransposed(size_t input_size, size_t output_size,
                               DType dtype, const std::string &name) {
     const std::streampos tensor_start = input_.tellg();
@@ -662,6 +702,8 @@ private:
       throw std::runtime_error("Failed to determine input offset for " + name);
     }
 
+    // QS4CX keeps row_alignment 1: its scale is per output channel over the
+    // full input width, so rows are independent and any block size is exact.
     size_t row_alignment = 1;
     if (dtype == DType::Q4_0)
       row_alignment = 32;
@@ -701,6 +743,7 @@ private:
       writeQuantized(transposed, block_rows, input_size, dtype, true, name);
       output_begin += block_rows;
     }
+    flushQs4cxScales(dtype, name);
 
     const size_t source_bytes = tensorBytes(input_size, output_size, name);
     input_.clear();
@@ -713,6 +756,8 @@ private:
   std::ifstream &input_;
   std::ofstream &output_;
   ml::train::ISA target_isa_;
+  /** QS4CX per-channel scales awaiting flushQs4cxScales() */
+  std::vector<float> pending_scales_;
 };
 
 void validateSourceConfig(const json &nntr_cfg) {
