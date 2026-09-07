@@ -105,22 +105,34 @@ build/Applications/CausalLM/nntr_quantize <fp32_model_dir> \
 ls <out_dir>/*_ARM.bin   # 반드시 존재해야 함. 다른 접미사면 잘못된 패킹
 ```
 
-### 3-1b. NPU int4 (QS4CX)
+**이 파일 안의 FFN(MoE expert) weight도 그냥 Q4_0입니다 — attention/embedding과
+바이트 포맷이 완전히 동일합니다.** "NPU용" 표시나 별도 레이아웃이 파일에
+들어가는 게 아닙니다. Hexagon HTP가 실제로 쓰는 int4-in-int8+scale+colsum
+포맷(hexkl 레지스트리)은 **디스크에 절대 구워지지 않습니다** — DSP의 VTCM이
+있어야 만들 수 있어서, 호스트에서는 애초에 만들 방법이 없습니다. 대신 폰에서
+모델을 로드할 때 레이어 하나가 처음 실행되는 순간
+`HtpComputeOps::gemm_q4_0_accel_fp32`가 `htp_qs4cx_from_q4_0x4`
+(`htp_compute_ops.cpp:88`)로 그 weight의 Q4_0 바이트를 RAM에서 즉석 변환해서
+DSP에 등록합니다. 즉 NPU로 갈지 CPU로 갈지는 **파일이 아니라 §3-2의
+`nntr_config.json` (`moe_engine`/`moe_htp_layers`)이 로드 시점에 결정**합니다.
+
+### 3-1b. QS4CX — 이건 Hexagon NPU용이 아닙니다, 헷갈리지 마세요
 
 `nntr_quantize_stream`은 `QS4CX`도 지원합니다 (`nntr_quantize`는 FC/임베딩만
 가능하고 MoE expert에서는 throw합니다 — `Lfm2MoELayer::save`가 Q4_0만 구현).
 
 ```bash
-# FFN expert를 NPU int4로, 나머지는 Q4_0
 build/Applications/CausalLM/nntr_quantize_stream <fp32_model_dir> -o <out_dir> \
   --fc_dtype Q4_0 --moe_dtype QS4CX --embd_dtype Q4_0 --lmhead_dtype Q4_0 --isa ARM
 ```
 
-주의: 이건 **hexkl(u8i4_i32) 레지스트리 포맷이 아닙니다.** QS4CX는 packed
-nibble + 채널별 scale이고 colsum이 없습니다. hexkl은 int4-in-int8 + scale +
-colsum을 요구하며, 그 변환은 여전히 런타임에
-`htp_qs4cx_from_q4_0x4`가 수행합니다 (docs 42 §1.3). HTP 경로용 파일은
-§3-1의 Q4_0 + `--isa ARM`을 쓰세요.
+**이 브랜치(HTP)와는 무관한 별도 가속 경로입니다.** QS4CX 텐서는
+`FloatTensor::dotQs4cx` (`float_tensor.cpp:1056`)로 디스패치되는데, 이건
+**ARM CPU(KleidiAI int4 matmul)** 경로지 Hexagon DSP가 아닙니다. hexkl
+레지스트리는 QS4CX의 packed-nibble+scale(colsum 없음) 포맷을 아예 못 읽습니다.
+HTP로 보낼 FFN 파일은 반드시 §3-1의 Q4_0 + `--isa ARM`을 쓰세요 — QS4CX로
+양자화해서 `moe_engine: "htp"`를 켜면 hexkl이 그 바이트를 잘못 해석해서
+조용히 틀린 결과를 냅니다.
 
 `--moe_dtype`은 기본값이 `--fc_dtype`과 같아서 위 명령에는 안 붙여도
 됩니다 (FFN도 이미 Q4_0). 이 옵션은 정확도 A/B 테스트용입니다:
