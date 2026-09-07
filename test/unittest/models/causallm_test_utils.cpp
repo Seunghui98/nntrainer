@@ -460,6 +460,7 @@ void expectEmbeddingNear(const std::vector<float> &got,
 namespace {
 
 constexpr const char *QUANTIZE_BIN_ENV = "NNTR_QUANTIZE_BIN";
+constexpr const char *QUANTIZE_STREAM_BIN_ENV = "NNTR_QUANTIZE_STREAM_BIN";
 
 /**
  * @brief nntrainer configs loaded from a fixture directory
@@ -501,6 +502,31 @@ bool runQuantize(const std::string &quantize_bin,
                     out_dir.string() + " --fc_dtype Q4_0 2>&1";
   int ret = std::system(cmd.c_str());
   return ret == 0;
+}
+
+/**
+ * @brief Compare two files byte for byte
+ */
+bool filesAreIdentical(const std::filesystem::path &lhs,
+                       const std::filesystem::path &rhs) {
+  std::ifstream a(lhs, std::ios::binary);
+  std::ifstream b(rhs, std::ios::binary);
+  if (!a.is_open() || !b.is_open())
+    return false;
+  return std::equal(
+    std::istreambuf_iterator<char>(a), std::istreambuf_iterator<char>(),
+    std::istreambuf_iterator<char>(b), std::istreambuf_iterator<char>());
+}
+
+/**
+ * @brief Resolve the single .bin a quantizer wrote into @a dir
+ */
+std::filesystem::path soleBinIn(const std::filesystem::path &dir) {
+  for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() == ".bin")
+      return entry.path();
+  }
+  return {};
 }
 
 /**
@@ -676,6 +702,55 @@ void runQ40DifferentialChecks(const DifferentialModel &model) {
                     fixture.input_ids, fixture.reference_tokens.size()));
   expectTokenPrefixMatch(q4_tokens, fixture.reference_tokens,
                          fixture.prefix_match_min);
+}
+
+/**
+ * @brief Assert nntr_quantize_stream reproduces nntr_quantize byte for byte
+ */
+void runStreamQuantizeParityChecks(const DifferentialModel &model) {
+  std::filesystem::path fixture_dir;
+  ReferenceFixture fixture;
+  std::string skip_reason;
+  if (!tryLoadFixture(model, fixture_dir, fixture, skip_reason))
+    GTEST_SKIP() << skip_reason;
+
+  const char *quantize_bin_env = std::getenv(QUANTIZE_BIN_ENV);
+  const char *stream_bin_env = std::getenv(QUANTIZE_STREAM_BIN_ENV);
+  if (!quantize_bin_env || std::string(quantize_bin_env).empty())
+    GTEST_SKIP() << "NNTR_QUANTIZE_BIN not set - parity test skipped";
+  if (!stream_bin_env || std::string(stream_bin_env).empty())
+    GTEST_SKIP() << "NNTR_QUANTIZE_STREAM_BIN not set - parity test skipped";
+
+  const auto base = std::filesystem::temp_directory_path() /
+                    ("nntrainer_" + model.fixture_name + "_stream_parity");
+  const auto mem_dir = base / "mem";
+  const auto stream_dir = base / "stream";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(mem_dir);
+  std::filesystem::create_directories(stream_dir);
+
+  ASSERT_TRUE(runQuantize(quantize_bin_env, fixture_dir, mem_dir))
+    << "nntr_quantize failed";
+  ASSERT_TRUE(runQuantize(stream_bin_env, fixture_dir, stream_dir))
+    << "nntr_quantize_stream failed";
+
+  const auto mem_bin = soleBinIn(mem_dir);
+  const auto stream_bin = soleBinIn(stream_dir);
+  ASSERT_FALSE(mem_bin.empty()) << "nntr_quantize produced no .bin";
+  ASSERT_FALSE(stream_bin.empty()) << "nntr_quantize_stream produced no .bin";
+
+  // The streaming quantizer walks the FP32 file tensor by tensor instead of
+  // loading the model, so any disagreement about the weight order or a
+  // tensor's shape shows up here as a byte difference (or as the stream
+  // quantizer's own end-of-file check failing above).
+  EXPECT_EQ(std::filesystem::file_size(mem_bin),
+            std::filesystem::file_size(stream_bin))
+    << mem_bin << " vs " << stream_bin;
+  EXPECT_TRUE(filesAreIdentical(mem_bin, stream_bin))
+    << "nntr_quantize_stream output differs from nntr_quantize: " << mem_bin
+    << " vs " << stream_bin;
+
+  std::filesystem::remove_all(base);
 }
 
 /**

@@ -657,6 +657,21 @@ void runQ40DifferentialChecks(const DifferentialModel &model);
 void runFp32EmbeddingDifferentialChecks(const DifferentialModel &model);
 
 /**
+ * @brief Assert nntr_quantize_stream reproduces nntr_quantize byte for byte
+ *
+ * The streaming quantizer never builds the model: it walks the FP32 .bin
+ * tensor by tensor from an architecture-specific description of the weight
+ * order, so its output being byte-identical is what proves that description
+ * matches the graph the in-memory quantizer actually loads.
+ *
+ * Skips when the fixture, NNTR_QUANTIZE_BIN, or NNTR_QUANTIZE_STREAM_BIN are
+ * absent.
+ *
+ * @param model Differential model descriptor
+ */
+void runStreamQuantizeParityChecks(const DifferentialModel &model);
+
+/**
  * @brief Run the Q4_0 differential checks for an embedding model
  *
  * Skips when the fixture, NNTR_QUANTIZE_BIN, or Q4_0 support for the

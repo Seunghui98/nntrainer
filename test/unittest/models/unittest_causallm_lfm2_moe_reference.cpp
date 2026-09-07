@@ -68,4 +68,16 @@ TEST(Lfm2MoeDifferentialTest, Q40MatchesHFReference) {
   causallm_test::runQ40DifferentialChecks(lfm2MoeModel());
 }
 
+/**
+ * @brief nntr_quantize_stream reproduces nntr_quantize byte for byte
+ *
+ * The bounded-memory quantizer exists because the real LFM2-8B-A1B FP32
+ * binary is 31.1 GB and nntr_quantize needs the whole model resident. This
+ * check is what keeps writeLfm2Moe's hand-written weight order honest
+ * against the graph.
+ */
+TEST(Lfm2MoeDifferentialTest, StreamQuantizeMatchesInMemory) {
+  causallm_test::runStreamQuantizeParityChecks(lfm2MoeModel());
+}
+
 } // namespace
