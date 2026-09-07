@@ -468,19 +468,49 @@ size_t quantizedSize(DType dtype, size_t rows, size_t columns, bool repack,
 
 class TensorWriter {
 public:
+  /**
+   * @param source_bytes size of the source .bin, only read in dry-run mode
+   * @param dry_run count the source bytes the layout walk needs, touching
+   *        neither stream -- see expectedInputBytes()
+   */
   TensorWriter(std::ifstream &input, std::ofstream &output,
-               ml::train::ISA target_isa) :
-    input_(input), output_(output), target_isa_(target_isa) {}
+               ml::train::ISA target_isa, size_t source_bytes = 0,
+               bool dry_run = false) :
+    input_(input),
+    output_(output),
+    target_isa_(target_isa),
+    source_bytes_(source_bytes),
+    dry_run_(dry_run) {}
+
+  bool isDryRun() const { return dry_run_; }
+
+  /** @brief FP32 source bytes the layout walk consumed (dry run only) */
+  size_t expectedInputBytes() const { return expected_input_bytes_; }
 
   void copyFp32(size_t elements, const std::string &name) {
-    copyBytes(checkedMultiply(elements, sizeof(float), name), name);
+    const size_t bytes = checkedMultiply(elements, sizeof(float), name);
+    if (dry_run_) {
+      expected_input_bytes_ += bytes;
+      return;
+    }
+    copyBytes(bytes, name);
   }
 
   void discardFp32(size_t elements, const std::string &name) {
-    discardBytes(checkedMultiply(elements, sizeof(float), name), name);
+    const size_t bytes = checkedMultiply(elements, sizeof(float), name);
+    if (dry_run_) {
+      expected_input_bytes_ += bytes;
+      return;
+    }
+    discardBytes(bytes, name);
   }
 
   bool hasRemainingBytes() {
+    // Gemma4's optional trailing embedding makes the layout depend on what is
+    // left in the source, so the dry run has to answer the same question from
+    // the byte count it has accumulated so far.
+    if (dry_run_)
+      return expected_input_bytes_ < source_bytes_;
     input_.peek();
     const bool remaining = !input_.eof();
     input_.clear();
@@ -489,8 +519,13 @@ public:
 
   void writeEmbedding(size_t rows, size_t columns, DType dtype,
                       const std::string &name) {
+    const size_t source_bytes = tensorBytes(rows, columns, name);
     if (dtype == DType::FP32) {
-      copyBytes(tensorBytes(rows, columns, name), name);
+      if (dry_run_) {
+        expected_input_bytes_ += source_bytes;
+        return;
+      }
+      copyBytes(source_bytes, name);
       return;
     }
     if (dtype == DType::Q4_K) {
@@ -498,6 +533,10 @@ public:
         "Q4_K embedding is not supported by the CausalLM embedding layer");
     }
     quantizedSize(dtype, rows, columns, false, name);
+    if (dry_run_) {
+      expected_input_bytes_ += source_bytes;
+      return;
+    }
 
     const size_t bytes_per_row = tensorBytes(1, columns, name);
     const size_t rows_per_block =
@@ -523,12 +562,20 @@ public:
                const std::string &name) {
     const size_t source_bytes = tensorBytes(input_size, output_size, name);
     if (dtype == DType::FP32) {
+      if (dry_run_) {
+        expected_input_bytes_ += source_bytes;
+        return;
+      }
       copyBytes(source_bytes, name);
       return;
     }
 
     // Validate the complete shape before writing any part of this tensor.
     quantizedSize(dtype, output_size, input_size, true, name);
+    if (dry_run_) {
+      expected_input_bytes_ += source_bytes;
+      return;
+    }
 
     if (source_bytes <= MAX_TENSOR_BUFFER_BYTES) {
       std::vector<float> source(tensorElements(input_size, output_size, name));
@@ -549,6 +596,9 @@ public:
   }
 
   void requireEndOfFile() {
+    // The dry run's own total is compared against the file size instead.
+    if (dry_run_)
+      return;
     const std::streampos consumed = input_.tellg();
     input_.peek();
     if (!input_.eof()) {
@@ -776,6 +826,9 @@ private:
   std::ifstream &input_;
   std::ofstream &output_;
   ml::train::ISA target_isa_;
+  size_t source_bytes_ = 0;
+  bool dry_run_ = false;
+  size_t expected_input_bytes_ = 0;
   /** QS4CX per-channel scales awaiting flushQs4cxScales() */
   std::vector<float> pending_scales_;
 };
@@ -838,8 +891,10 @@ void writeQwen3Moe(TensorWriter &writer, const Qwen3MoePlan &model,
                      expert_prefix + "_down");
     }
 
-    std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
-              << '\n';
+    if (!writer.isDryRun()) {
+      std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
+                << '\n';
+    }
   }
 
   writer.copyFp32(model.hidden_size, "output_norm");
@@ -932,8 +987,10 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
     }
     writer.copyFp32(1, prefix + "_layer_scalar");
 
-    std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
-              << '\n';
+    if (!writer.isDryRun()) {
+      std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
+                << '\n';
+    }
   }
 
   writer.copyFp32(model.hidden_size, "output_norm");
@@ -1038,8 +1095,10 @@ void writeLfm2Moe(TensorWriter &writer, const Lfm2MoePlan &model,
       }
     }
 
-    std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
-              << '\n';
+    if (!writer.isDryRun()) {
+      std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
+                << '\n';
+    }
   }
 
   writer.copyFp32(model.hidden_size, "output_norm");
@@ -1227,6 +1286,9 @@ int run(int argc, char **argv) {
   const size_t num_experts = is_qwen3_moe    ? qwen3_model.num_experts
                              : is_gemma4_moe ? gemma4_model.num_experts
                                              : lfm2_model.num_experts;
+  const size_t hidden_size = is_qwen3_moe    ? qwen3_model.hidden_size
+                             : is_gemma4_moe ? gemma4_model.hidden_size
+                                             : lfm2_model.hidden_size;
 
   if (!target_config.empty()) {
     const json requested = readJson(target_config);
@@ -1305,13 +1367,53 @@ int run(int argc, char **argv) {
             << "  LM head dtype: " << dtypeName(quant.lmhead_dtype) << '\n'
             << "  Target ISA: " << isaName(quant.target_isa) << '\n';
 
+  const auto walk = [&](TensorWriter &tensor_writer) {
+    if (is_qwen3_moe)
+      writeQwen3Moe(tensor_writer, qwen3_model, quant);
+    else if (is_gemma4_moe)
+      writeGemma4Moe(tensor_writer, gemma4_model, quant);
+    else
+      writeLfm2Moe(tensor_writer, lfm2_model, quant);
+  };
+
+  // Every shape below comes from config.json, while the FP32 .bin was written
+  // from the checkpoint's actual tensors. When the two disagree, the run
+  // otherwise dies on an EOF tens of GB and tens of minutes in, naming a
+  // tensor that is not itself the problem. Walk the layout first with the
+  // same code, consuming nothing, and compare the total against the file.
+  const uintmax_t source_bytes = std::filesystem::file_size(input_path);
+  TensorWriter probe(input, output, quant.target_isa,
+                     static_cast<size_t>(source_bytes), /*dry_run=*/true);
+  walk(probe);
+  if (probe.expectedInputBytes() != source_bytes) {
+    const bool file_is_short = probe.expectedInputBytes() > source_bytes;
+    const uintmax_t difference = file_is_short
+                                   ? probe.expectedInputBytes() - source_bytes
+                                   : source_bytes - probe.expectedInputBytes();
+    const size_t row_bytes =
+      checkedMultiply(hidden_size, sizeof(float), "hidden row");
+    std::string hint;
+    if (row_bytes != 0 && difference % row_bytes == 0) {
+      hint = " That difference is exactly " +
+             std::to_string(difference / row_bytes) + " rows of hidden_size (" +
+             std::to_string(hidden_size) + ").";
+    }
+    throw std::runtime_error(
+      "config.json describes " + std::to_string(probe.expectedInputBytes()) +
+      " bytes of FP32 weights, but " + input_path.string() + " is " +
+      std::to_string(source_bytes) + " bytes -- " + std::to_string(difference) +
+      " bytes " + (file_is_short ? "short" : "extra") + "." + hint +
+      " Either the conversion did not run to completion, or a config.json "
+      "field disagrees with the checkpoint's real tensor shapes (vocab_size, "
+      "intermediate_size, moe_intermediate_size, num_experts, "
+      "num_dense_layers, num_key_value_heads, head_dim, layer_types). Compare "
+      "the shapes weight_converter.py printed against those fields; the "
+      "converter writes the checkpoint's actual tensors, this tool trusts "
+      "config.json.");
+  }
+
   TensorWriter writer(input, output, quant.target_isa);
-  if (is_qwen3_moe)
-    writeQwen3Moe(writer, qwen3_model, quant);
-  else if (is_gemma4_moe)
-    writeGemma4Moe(writer, gemma4_model, quant);
-  else
-    writeLfm2Moe(writer, lfm2_model, quant);
+  walk(writer);
   output.close();
   if (!output)
     throw std::runtime_error("Failed to finalize " + output_path.string());
@@ -1320,7 +1422,7 @@ int run(int argc, char **argv) {
     copyAuxiliaryFiles(model_dir, output_dir);
   writeOutputConfig(model_dir, output_dir, output_bin, quant, nntr_cfg);
 
-  const uintmax_t input_size = std::filesystem::file_size(input_path);
+  const uintmax_t input_size = source_bytes;
   const uintmax_t output_size = std::filesystem::file_size(output_path);
   const double ratio = input_size == 0
                          ? 0.0
