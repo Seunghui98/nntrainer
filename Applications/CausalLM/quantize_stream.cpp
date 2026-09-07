@@ -50,6 +50,9 @@ struct QuantizationPlan {
   DType fc_dtype;
   DType embedding_dtype;
   DType lmhead_dtype;
+  /** MoE expert FFN dtype; defaults to fc_dtype. Mirrors nntr_quantize's
+   *  --moe_dtype so both quantizers accept the same options. */
+  DType moe_dtype;
   ml::train::ISA target_isa;
 };
 
@@ -81,6 +84,23 @@ struct Gemma4MoePlan {
   size_t per_layer_vocab_size;
   std::vector<std::string> layer_types;
   bool attention_k_eq_v;
+  bool tied_embeddings;
+};
+
+struct Lfm2MoePlan {
+  size_t hidden_size;
+  size_t vocab_size;
+  size_t num_layers;
+  size_t num_attention_heads;
+  size_t num_key_value_heads;
+  size_t head_dim;
+  size_t intermediate_size;     /**< dense SwiGLU FFN width */
+  size_t moe_intermediate_size; /**< per-expert FFN width */
+  size_t num_experts;
+  size_t num_dense_layers; /**< layers [0, this) keep the dense FFN */
+  size_t conv_dim;
+  size_t conv_l_cache;
+  std::vector<std::string> layer_types; /**< "conv" or "attention" per layer */
   bool tied_embeddings;
 };
 
@@ -267,6 +287,77 @@ Gemma4MoePlan makeGemma4MoePlan(const json &root_cfg) {
     std::move(layer_types),
     cfg.value("attention_k_eq_v", false),
     tied_embeddings,
+  };
+}
+
+Lfm2MoePlan makeLfm2MoePlan(const json &cfg) {
+  const std::string architecture = getArchitecture(cfg);
+  if (architecture != "Lfm2MoeForCausalLM") {
+    throw std::runtime_error("Unsupported LFM2 architecture: " + architecture);
+  }
+
+  const size_t hidden_size = getSize(cfg, "hidden_size");
+  const size_t num_layers = getSize(cfg, "num_hidden_layers");
+  const size_t num_attention_heads = getSize(cfg, "num_attention_heads");
+  if (num_attention_heads == 0) {
+    throw std::runtime_error("num_attention_heads must be greater than zero");
+  }
+
+  const size_t head_dim = cfg.contains("head_dim")
+                            ? getSize(cfg, "head_dim")
+                            : hidden_size / num_attention_heads;
+  const size_t num_key_value_heads = cfg.contains("num_key_value_heads")
+                                       ? getSize(cfg, "num_key_value_heads")
+                                       : num_attention_heads;
+  if (head_dim == 0 || num_key_value_heads == 0) {
+    throw std::runtime_error(
+      "head_dim and num_key_value_heads must be greater than zero");
+  }
+
+  // Lfm2CausalLM::setupParameters defaults conv_dim to hidden_size and
+  // requires layer_types; mirror both so a config it accepts is a config
+  // this tool accepts.
+  const size_t conv_dim =
+    cfg.contains("conv_dim") ? getSize(cfg, "conv_dim") : hidden_size;
+  const size_t conv_l_cache = cfg.value("conv_L_cache", size_t{0});
+
+  if (!cfg.contains("layer_types")) {
+    throw std::runtime_error("Lfm2Moe requires layer_types in config.json");
+  }
+  auto layer_types = cfg["layer_types"].get<std::vector<std::string>>();
+  if (layer_types.size() != num_layers) {
+    throw std::runtime_error("layer_types size must match num_hidden_layers");
+  }
+  for (const auto &type : layer_types) {
+    if (type != "conv" && type != "attention" && type != "full_attention")
+      throw std::runtime_error("Unsupported LFM2 layer type: " + type);
+    if (type == "conv" && conv_l_cache == 0)
+      throw std::runtime_error("conv layers require a non-zero conv_L_cache");
+  }
+
+  const size_t num_dense_layers = cfg.value("num_dense_layers", size_t{0});
+  if (num_dense_layers > num_layers) {
+    throw std::runtime_error("num_dense_layers exceeds num_hidden_layers");
+  }
+
+  return {
+    hidden_size,
+    getSize(cfg, "vocab_size"),
+    num_layers,
+    num_attention_heads,
+    num_key_value_heads,
+    head_dim,
+    getSize(cfg, "intermediate_size"),
+    getSize(cfg, "moe_intermediate_size"),
+    getSize(cfg, "num_experts"),
+    num_dense_layers,
+    conv_dim,
+    conv_l_cache,
+    std::move(layer_types),
+    // Hugging Face LFM2 configs omit tie_word_embeddings while the model
+    // defaults it to true and ships no standalone lm_head -- same default
+    // Lfm2CausalLM::setupParameters uses.
+    cfg.value("tie_word_embeddings", true),
   };
 }
 
@@ -796,6 +887,104 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
   writer.requireEndOfFile();
 }
 
+/**
+ * The tensor order below mirrors, in this order:
+ *   - the graph Lfm2CausalLM::constructModel builds (embedding, then one
+ *     conv or attention block per layer_types entry, then output_norm and
+ *     the LM head),
+ *   - Lfm2MoELayer::finalize's weight request order for the MoE FFN
+ *     (router gate, expert_bias, then per expert the fused gate|up and the
+ *     down projection),
+ *   - and res/lfm2_moe/lfm2-8b-a1b/weight_converter.py, which is what
+ *     actually writes the FP32 .bin this reads.
+ * All three have to agree; the converter is the authority when they differ,
+ * because it produced the bytes.
+ */
+void writeLfm2Moe(TensorWriter &writer, const Lfm2MoePlan &model,
+                  const QuantizationPlan &quant) {
+  writer.writeEmbedding(model.vocab_size, model.hidden_size,
+                        quant.embedding_dtype, "embedding0");
+
+  const size_t query_width =
+    checkedMultiply(model.num_attention_heads, model.head_dim, "query width");
+  const size_t kv_width =
+    checkedMultiply(model.num_key_value_heads, model.head_dim, "KV width");
+
+  for (size_t layer = 0; layer < model.num_layers; ++layer) {
+    const std::string prefix = "layer" + std::to_string(layer);
+
+    // operator_norm: _conv_norm on a conv layer, _attention_norm otherwise.
+    writer.copyFp32(model.hidden_size, prefix + "_operator_norm");
+
+    if (model.layer_types[layer] == "conv") {
+      // createConvBlock: in_proj expands to 3*conv_dim (gate_a|gate_b|gate_c),
+      // the depthwise kernel is [conv_L_cache, conv_dim] and explicitly FP32
+      // (weight_dtype=FP32 in the graph), out_proj comes back to hidden_size.
+      writer.writeFc(model.hidden_size,
+                     checkedMultiply(3, model.conv_dim, prefix + "_conv_in"),
+                     quant.fc_dtype, prefix + "_conv_in_proj");
+      writer.copyFp32(
+        tensorElements(model.conv_l_cache, model.conv_dim, prefix + "_conv"),
+        prefix + "_conv_conv");
+      writer.writeFc(model.conv_dim, model.hidden_size, quant.fc_dtype,
+                     prefix + "_conv_out_proj");
+    } else {
+      writer.writeFc(model.hidden_size, query_width, quant.fc_dtype,
+                     prefix + "_wq");
+      writer.copyFp32(model.head_dim, prefix + "_q_norm");
+      writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
+                     prefix + "_wk");
+      writer.copyFp32(model.head_dim, prefix + "_k_norm");
+      writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
+                     prefix + "_wv");
+      writer.writeFc(query_width, model.hidden_size, quant.fc_dtype,
+                     prefix + "_attention_out");
+    }
+
+    writer.copyFp32(model.hidden_size, prefix + "_ffn_norm");
+
+    if (layer < model.num_dense_layers) {
+      // Dense SwiGLU FFN, in NNTrainer's historical up, gate, down order.
+      writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
+                     prefix + "_ffn_up");
+      writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
+                     prefix + "_ffn_gate");
+      writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
+                     prefix + "_ffn_down");
+    } else {
+      // Router gate and expert bias are never quantized: Lfm2MoELayer::save
+      // forces both to DataType::NONE regardless of the requested dtype, and
+      // the gate is [hidden, num_experts] whose width is not a multiple of 32
+      // anyway.
+      writer.copyFp32(tensorElements(model.hidden_size, model.num_experts,
+                                     prefix + "_router"),
+                      prefix + "_router");
+      writer.copyFp32(model.num_experts, prefix + "_expert_bias");
+
+      for (size_t expert = 0; expert < model.num_experts; ++expert) {
+        const std::string expert_prefix =
+          prefix + "_expert" + std::to_string(expert);
+        writer.writeFc(
+          model.hidden_size,
+          checkedMultiply(2, model.moe_intermediate_size, expert_prefix),
+          quant.moe_dtype, expert_prefix + "_gate_up");
+        writer.writeFc(model.moe_intermediate_size, model.hidden_size,
+                       quant.moe_dtype, expert_prefix + "_down");
+      }
+    }
+
+    std::cout << "  Quantized layer " << layer + 1 << "/" << model.num_layers
+              << '\n';
+  }
+
+  writer.copyFp32(model.hidden_size, "output_norm");
+  if (!model.tied_embeddings) {
+    writer.writeFc(model.hidden_size, model.vocab_size, quant.lmhead_dtype,
+                   "output_of_causallm");
+  }
+  writer.requireEndOfFile();
+}
+
 std::string stripKnownDtypeSuffix(std::string base) {
   const std::vector<std::string> suffixes = {"_fp32", "_fp16", "_q40", "_q4_0",
                                              "_q4k",  "_q4_k", "_q6k", "_q6_k"};
@@ -906,6 +1095,7 @@ int run(int argc, char **argv) {
   std::string fc_dtype = "Q4_0";
   std::string embedding_dtype = "FP32";
   std::string lmhead_dtype;
+  std::string moe_dtype;
   std::string target_isa = "DEFAULT";
   std::string output_bin;
   std::filesystem::path target_config;
@@ -926,6 +1116,8 @@ int run(int argc, char **argv) {
       embedding_dtype = requireValue(argument);
     else if (argument == "--lmhead_dtype")
       lmhead_dtype = requireValue(argument);
+    else if (argument == "--moe_dtype")
+      moe_dtype = requireValue(argument);
     else if (argument == "--isa")
       target_isa = requireValue(argument);
     else if (argument == "--output_bin")
@@ -947,22 +1139,29 @@ int run(int argc, char **argv) {
   const bool is_qwen3_moe = architecture == "Qwen3MoeForCausalLM";
   const bool is_gemma4_moe = architecture == "Gemma4ForCausalLM" ||
                              architecture == "Gemma4ForConditionalGeneration";
-  if (!is_qwen3_moe && !is_gemma4_moe)
+  const bool is_lfm2_moe = architecture == "Lfm2MoeForCausalLM";
+  if (!is_qwen3_moe && !is_gemma4_moe && !is_lfm2_moe)
     throw std::runtime_error("Unsupported architecture: " + architecture);
 
   Qwen3MoePlan qwen3_model{};
   Gemma4MoePlan gemma4_model{};
+  Lfm2MoePlan lfm2_model{};
   if (is_qwen3_moe)
     qwen3_model = makeQwen3MoePlan(cfg);
-  else
+  else if (is_gemma4_moe)
     gemma4_model = makeGemma4MoePlan(cfg);
+  else
+    lfm2_model = makeLfm2MoePlan(cfg);
 
-  const bool tied_embeddings =
-    is_qwen3_moe ? qwen3_model.tied_embeddings : gemma4_model.tied_embeddings;
-  const size_t num_layers =
-    is_qwen3_moe ? qwen3_model.num_layers : gemma4_model.num_layers;
-  const size_t num_experts =
-    is_qwen3_moe ? qwen3_model.num_experts : gemma4_model.num_experts;
+  const bool tied_embeddings = is_qwen3_moe    ? qwen3_model.tied_embeddings
+                               : is_gemma4_moe ? gemma4_model.tied_embeddings
+                                               : lfm2_model.tied_embeddings;
+  const size_t num_layers = is_qwen3_moe    ? qwen3_model.num_layers
+                            : is_gemma4_moe ? gemma4_model.num_layers
+                                            : lfm2_model.num_layers;
+  const size_t num_experts = is_qwen3_moe    ? qwen3_model.num_experts
+                             : is_gemma4_moe ? gemma4_model.num_experts
+                                             : lfm2_model.num_experts;
 
   if (!target_config.empty()) {
     const json requested = readJson(target_config);
@@ -972,6 +1171,8 @@ int run(int argc, char **argv) {
       embedding_dtype = requested["embedding_dtype"].get<std::string>();
     if (requested.contains("lmhead_dtype"))
       lmhead_dtype = requested["lmhead_dtype"].get<std::string>();
+    if (requested.contains("moe_layer_dtype"))
+      moe_dtype = requested["moe_layer_dtype"].get<std::string>();
     if (requested.contains("model_file_name") && output_bin.empty())
       output_bin = requested["model_file_name"].get<std::string>();
     if (requested.contains("moe_cache_size"))
@@ -980,9 +1181,14 @@ int run(int argc, char **argv) {
 
   if (lmhead_dtype.empty())
     lmhead_dtype = embedding_dtype;
-  const QuantizationPlan quant{parseDType(fc_dtype),
-                               parseDType(embedding_dtype),
-                               parseDType(lmhead_dtype), parseIsa(target_isa)};
+  // Same default as nntr_quantize's --moe_dtype: the FC dtype, so a run that
+  // does not ask for a split is byte-identical to one that never had the
+  // option.
+  if (moe_dtype.empty())
+    moe_dtype = fc_dtype;
+  const QuantizationPlan quant{
+    parseDType(fc_dtype), parseDType(embedding_dtype), parseDType(lmhead_dtype),
+    parseDType(moe_dtype), parseIsa(target_isa)};
 
   if (tied_embeddings && quant.embedding_dtype != quant.lmhead_dtype) {
     throw std::invalid_argument(
@@ -1029,6 +1235,7 @@ int run(int argc, char **argv) {
             << "  Layers: " << num_layers << '\n'
             << "  Experts per layer: " << num_experts << '\n'
             << "  FC dtype: " << dtypeName(quant.fc_dtype) << '\n'
+            << "  MoE dtype: " << dtypeName(quant.moe_dtype) << '\n'
             << "  Embedding dtype: " << dtypeName(quant.embedding_dtype) << '\n'
             << "  LM head dtype: " << dtypeName(quant.lmhead_dtype) << '\n'
             << "  Target ISA: " << isaName(quant.target_isa) << '\n';
@@ -1036,8 +1243,10 @@ int run(int argc, char **argv) {
   TensorWriter writer(input, output, quant.target_isa);
   if (is_qwen3_moe)
     writeQwen3Moe(writer, qwen3_model, quant);
-  else
+  else if (is_gemma4_moe)
     writeGemma4Moe(writer, gemma4_model, quant);
+  else
+    writeLfm2Moe(writer, lfm2_model, quant);
   output.close();
   if (!output)
     throw std::runtime_error("Failed to finalize " + output_path.string());
