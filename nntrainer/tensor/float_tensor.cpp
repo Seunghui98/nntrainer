@@ -1059,6 +1059,21 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
+
+  // An accelerator that takes QS4CX directly skips the Q4_0 detour: the
+  // weight was quantized once, from FP32, and the int4 values on disk are
+  // already the ones the accelerator's registry wants. Reuses
+  // accelerates_q4_0_at_m1() for the M == 1 gate because it answers the
+  // same question -- whether decode is worth dispatching for this backend.
+  auto *o = getOps();
+  if (o->supports_gemm_qs4cx_accel_fp32() &&
+      (M > 1 || o->accelerates_q4_0_at_m1())) {
+    o->gemm_qs4cx_accel_fp32(input.getData<char>(), input.getScale<float>(),
+                             (float *)getData(), output.getData<float>(), M, N,
+                             K);
+    return output;
+  }
+
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)

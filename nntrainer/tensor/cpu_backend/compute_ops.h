@@ -225,6 +225,18 @@ public:
   // must not change.
   virtual bool accelerates_q4_0_at_m1() const { return false; }
 
+  // QS4CX weights reach an accelerator without the Q4_0 detour: a model
+  // quantized straight from FP32 into QS4CX carries the same int4 values
+  // HexKL's registry wants, so the conversion at the seam is a bit
+  // rearrangement plus a colsum rather than a second quantization (see
+  // htp_qs4cx_from_packed). matAdata / matAscale are QS4CX_Tensor's
+  // getData()/getScale() regions.
+  virtual bool supports_gemm_qs4cx_accel_fp32() const { return false; }
+  virtual void gemm_qs4cx_accel_fp32(void *matAdata, float *matAscale,
+                                     float *matBdata, float *matCdata,
+                                     unsigned int M, unsigned int N,
+                                     unsigned int K);
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,
