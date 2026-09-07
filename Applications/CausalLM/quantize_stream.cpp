@@ -598,9 +598,29 @@ private:
         static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
       throw std::overflow_error("Read size is too large for " + name);
     }
+    const std::streamoff offset_before = input_.tellg();
     input_.read(destination, static_cast<std::streamsize>(bytes));
-    if (input_.gcount() != static_cast<std::streamsize>(bytes)) {
-      throw std::runtime_error("Unexpected EOF while reading " + name);
+    const std::streamsize got = input_.gcount();
+    if (got != static_cast<std::streamsize>(bytes)) {
+      // A wrong shape formula and a truncated source file produce the same
+      // symptom (readExact comes up short), but they are not the same bug --
+      // one is in this file, the other is upstream. Report enough for the
+      // caller to tell which without a manual offset calculation: how far
+      // in this happened, and the source file's actual total size, which a
+      // truncated conversion (e.g. weight_converter.py killed partway
+      // through, OOM) makes far short of what the config implies.
+      input_.clear();
+      input_.seekg(0, std::ios::end);
+      const std::streamoff file_size = input_.tellg();
+      throw std::runtime_error(
+        "Unexpected EOF while reading " + name + ": needed " +
+        std::to_string(bytes) + " bytes at source offset " +
+        std::to_string(offset_before) + ", got " + std::to_string(got) +
+        ". The source file is only " + std::to_string(file_size) +
+        " bytes total. If that is far short of what this model's config "
+        "implies, the FP32 .bin is truncated or incomplete -- re-run "
+        "whatever produced it (e.g. weight_converter.py) to completion "
+        "before quantizing, rather than treating this as a shape bug.");
     }
   }
 
