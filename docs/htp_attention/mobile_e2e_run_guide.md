@@ -78,15 +78,49 @@ HTP 경로는 x4를 기대하므로 **에러 없이 조용히 틀린 결과**가
 막아뒀지만, `.bin` 포맷은 애초에 ISA를 기록할 수 없으므로 여전히 파일명
 접미사(`_ARM.bin`)를 직접 확인해야 합니다).
 
+> **32GB RAM 이하 머신이면 `nntr_quantize` 대신 `nntr_quantize_stream`을 쓰세요.**
+> `nntr_quantize`는 모델 전체를 FP32로 올린 뒤 양자화해서 피크 RSS가
+> 소스 크기의 약 2배입니다 (측정: 1416 MiB 소스 → 2781 MiB). LFM2-8B-A1B의
+> 31.1 GB FP32 파일이면 ~60 GB가 필요합니다. `nntr_quantize_stream`은 텐서
+> 하나씩 스트리밍해서 **모델 크기와 무관하게 ~120 MiB**로 끝납니다
+> (측정: 같은 모델 73 MiB / 118 MiB). 옵션은 동일하고, 출력은
+> byte-identical임을 tiny fixture와 1.2~1.4 GB 합성 모델에서 확인했습니다.
+> 유일한 제약: 입력이 `.bin`이어야 합니다 (safetensors 입력 미지원).
+
 ### 3-1. 기본 레시피 (FFN도 나머지도 전부 Q4_0)
 
 ```bash
+# 32GB 머신: 이걸 쓰세요 (피크 RAM ~120 MiB)
+build/Applications/CausalLM/nntr_quantize_stream <fp32_model_dir> \
+  -o <out_dir> \
+  --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 \
+  --isa ARM
+
+# 메모리가 충분하면 기존 도구도 동일한 결과를 냅니다
 build/Applications/CausalLM/nntr_quantize <fp32_model_dir> \
   -o <out_dir> \
   --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 \
   --isa ARM
+
 ls <out_dir>/*_ARM.bin   # 반드시 존재해야 함. 다른 접미사면 잘못된 패킹
 ```
+
+### 3-1b. NPU int4 (QS4CX)
+
+`nntr_quantize_stream`은 `QS4CX`도 지원합니다 (`nntr_quantize`는 FC/임베딩만
+가능하고 MoE expert에서는 throw합니다 — `Lfm2MoELayer::save`가 Q4_0만 구현).
+
+```bash
+# FFN expert를 NPU int4로, 나머지는 Q4_0
+build/Applications/CausalLM/nntr_quantize_stream <fp32_model_dir> -o <out_dir> \
+  --fc_dtype Q4_0 --moe_dtype QS4CX --embd_dtype Q4_0 --lmhead_dtype Q4_0 --isa ARM
+```
+
+주의: 이건 **hexkl(u8i4_i32) 레지스트리 포맷이 아닙니다.** QS4CX는 packed
+nibble + 채널별 scale이고 colsum이 없습니다. hexkl은 int4-in-int8 + scale +
+colsum을 요구하며, 그 변환은 여전히 런타임에
+`htp_qs4cx_from_q4_0x4`가 수행합니다 (docs 42 §1.3). HTP 경로용 파일은
+§3-1의 Q4_0 + `--isa ARM`을 쓰세요.
 
 `--moe_dtype`은 기본값이 `--fc_dtype`과 같아서 위 명령에는 안 붙여도
 됩니다 (FFN도 이미 Q4_0). 이 옵션은 정확도 A/B 테스트용입니다:
