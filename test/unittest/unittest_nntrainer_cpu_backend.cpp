@@ -560,6 +560,95 @@ TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_q4_0x4_accuracy) {
   EXPECT_LT(mean_abs_err, 0.1f);
 }
 
+/**
+ * @brief htp_qs4cx_from_packed rearranges, it does not requantize
+ *
+ * A weight quantized once from FP32 straight into QS4CX and then handed to
+ * HexKL must be at least as accurate as the same weight routed through
+ * Q4_0 first, because the second route quantizes twice. This test pins
+ * that ordering rather than just checking the new path runs.
+ */
+TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_packed_accuracy) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 768; // multiple of 32 so the Q4_0 comparison is legal
+  const unsigned int N = 512;
+
+  // [N][K] row-major: one output channel per row, which is what both
+  // quantize_q4_0(.., N, K, ..) and quant_qs4cx_f32(N, K, .., is_nxk=true)
+  // expect, so the same buffer feeds both routes.
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  // --- Route A: FP32 -> QS4CX (one quantization), then rearrange ---
+  const size_t nibble_bytes = static_cast<size_t>(N) * ((K + 1) / 2);
+  std::vector<uint8_t> qs4cx(nibble_bytes + N * sizeof(float));
+  float *qs4cx_scales = reinterpret_cast<float *>(qs4cx.data() + nibble_bytes);
+  nntrainer::quant_qs4cx_f32(N, K, weight.data(), qs4cx.data(), qs4cx_scales,
+                             true);
+
+  std::vector<int8_t> q_direct(static_cast<size_t>(K) * N);
+  std::vector<float> scale_direct(N);
+  std::vector<int32_t> colsum_direct(N);
+  nntrainer::htp_qs4cx_from_packed(qs4cx.data(), qs4cx_scales, K, N,
+                                   q_direct.data(), scale_direct.data(),
+                                   colsum_direct.data());
+
+  // colsum is HexKL's correction term for unsigned activations; a wrong one
+  // is a silent wrong answer, so recompute it independently.
+  for (unsigned int n = 0; n < N; ++n) {
+    int32_t sum = 0;
+    for (unsigned int k = 0; k < K; ++k)
+      sum += q_direct[static_cast<size_t>(k) * N + n];
+    EXPECT_EQ(sum, colsum_direct[n]) << "colsum mismatch at n=" << n;
+  }
+
+  // Every emitted value must be a legal int4.
+  for (size_t i = 0; i < q_direct.size(); ++i) {
+    ASSERT_GE(q_direct[i], -8);
+    ASSERT_LE(q_direct[i], 7);
+  }
+
+  // --- Route B: FP32 -> Q4_0 -> qs4cx (two quantizations) ---
+  const size_t q4_0_bytes =
+    (static_cast<size_t>(K) * N / QK4_0) * sizeof(block_q4_0_testonly);
+  std::vector<char> q4_weight(q4_0_bytes);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+  std::vector<char> repacked(q4_0_bytes);
+  nntrainer::repack_q4_0(repacked.data(), q4_weight.data(), q4_0_bytes, N, K,
+                         ml::train::ISA::ARM);
+
+  std::vector<int8_t> q_hop(static_cast<size_t>(K) * N);
+  std::vector<float> scale_hop(N);
+  std::vector<int32_t> colsum_hop(N);
+  nntrainer::htp_qs4cx_from_q4_0x4(repacked.data(), K, N, q_hop.data(),
+                                   scale_hop.data(), colsum_hop.data());
+
+  // --- Compare both reconstructions against the ORIGINAL fp32 ---
+  auto mean_abs_err = [&](const std::vector<int8_t> &q,
+                          const std::vector<float> &scale) {
+    double sum_abs_err = 0.0;
+    for (unsigned int n = 0; n < N; ++n) {
+      for (unsigned int k = 0; k < K; ++k) {
+        const float approx = q[static_cast<size_t>(k) * N + n] * scale[n];
+        sum_abs_err +=
+          std::fabs(approx - weight[static_cast<size_t>(n) * K + k]);
+      }
+    }
+    return static_cast<float>(sum_abs_err / (static_cast<double>(N) * K));
+  };
+
+  const float err_direct = mean_abs_err(q_direct, scale_direct);
+  const float err_hop = mean_abs_err(q_hop, scale_hop);
+  std::cout << "htp_qs4cx_from_packed: mean_abs_err=" << err_direct
+            << " (direct)  vs " << err_hop << " (via Q4_0)" << std::endl;
+
+  // The whole reason for quantizing the FFN straight to QS4CX: one
+  // quantization must beat two. Strict, because the comparison is on the
+  // same weight with the same per-channel scheme -- the only difference is
+  // the extra Q4_0 hop.
+  EXPECT_LT(err_direct, err_hop);
+}
+
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
