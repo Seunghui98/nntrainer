@@ -361,9 +361,17 @@ void Transformer::repack_weight() {
   }
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
-      // repack FC layer only
+      // repack FC and MoE FFN layers -- both can hold QS4CX weights.
+      // FloatTensor::dotQs4cx only needs a weight packed when it falls
+      // through to the CPU KleidiAI path (getPackedData()); the HTP path
+      // (gemm_qs4cx_accel_fp32) reads getData()/getScale() directly and
+      // never touches packed_data, so packing an HTP-dispatched expert's
+      // weight here is a harmless one-time no-op cost, not a correctness
+      // requirement -- but a CPU-dispatched MoE layer (any layer_id not in
+      // moe_htp_layers) throws "pack before run model" on its first token
+      // without this, because lfm2_moe was missing from this filter.
       if (l.getType() != "fully_connected" &&
-          l.getType() != "shared_fully_connected")
+          l.getType() != "shared_fully_connected" && l.getType() != "lfm2_moe")
         return;
 
       auto weights = context.getWeights();
