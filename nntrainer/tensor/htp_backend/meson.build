@@ -5,6 +5,7 @@ htp_backend_sources = [
 
 htp_backend_headers = [
   'htp_backend.h',
+  'htp_rpcmem.h',
 ]
 
 foreach s : htp_backend_sources
