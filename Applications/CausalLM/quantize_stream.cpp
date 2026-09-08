@@ -1170,6 +1170,14 @@ void writeOutputConfig(const std::filesystem::path &model_dir,
   nntr_cfg["fc_layer_dtype"] = dtypeName(quant.fc_dtype);
   nntr_cfg["embedding_dtype"] = dtypeName(quant.embedding_dtype);
   nntr_cfg["lmhead_dtype"] = dtypeName(quant.lmhead_dtype);
+  // Lfm2MoeCausalLM::setupParameters (and Qwen3's/Gemma4's MoE equivalents)
+  // read this key with a fallback to fc_layer_dtype -- writeLfm2Moe already
+  // writes the expert tensors in quant.moe_dtype's byte layout, so omitting
+  // this key here silently mismatches: a --moe_dtype QS4CX run's .bin holds
+  // QS4CX bytes while the loader tags those weights Q4_0 (fc_layer_dtype's
+  // value) and dispatches Q4_0 kernels against them -- a byte-layout
+  // mismatch, not just a missed optimization.
+  nntr_cfg["moe_layer_dtype"] = dtypeName(quant.moe_dtype);
 
   const std::filesystem::path output_config =
     std::filesystem::equivalent(model_dir, output_dir)
