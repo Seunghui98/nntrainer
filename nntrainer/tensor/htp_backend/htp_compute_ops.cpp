@@ -40,10 +40,12 @@
 #include <cpu_ops_table.h>
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
+#include <htp_rpcmem.h>
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -107,12 +109,15 @@ public:
         .count());
   }
 
-  void addRegister(uint64_t total_us, uint64_t convert_us, uint64_t rpc_us) {
+  void addRegister(uint64_t total_us, uint64_t convert_us, uint64_t rpc_us,
+                   bool ion) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++reg_calls_;
     reg_total_us_ += total_us;
     convert_us_ += convert_us;
     rpc_us_ += rpc_us;
+    if (ion)
+      ++reg_ion_calls_;
   }
 
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
@@ -174,11 +179,15 @@ private:
                  "[HTP-PROFILE]   register FastRPC   : %10.1f ms  (%.2f "
                  "ms/weight)\n"
                  "[HTP-PROFILE]   alloc + other      : %10.1f ms\n"
-                 "[HTP-PROFILE]   registration total : %10.1f ms\n",
+                 "[HTP-PROFILE]   registration total : %10.1f ms\n"
+                 "[HTP-PROFILE]   rpcmem/ION buffer  : %llu/%llu weights "
+                 "(the rest used plain heap -- pinned+mapped per call)\n",
                  (unsigned long long)reg_calls_, ms(convert_us_),
                  reg_calls_ ? ms(convert_us_) / reg_calls_ : 0.0, ms(rpc_us_),
                  reg_calls_ ? ms(rpc_us_) / reg_calls_ : 0.0,
-                 ms(reg_total_us_ - convert_us_ - rpc_us_), ms(reg_total_us_));
+                 ms(reg_total_us_ - convert_us_ - rpc_us_), ms(reg_total_us_),
+                 (unsigned long long)reg_ion_calls_,
+                 (unsigned long long)reg_calls_);
 
     // M==1 is decode's shape, but an expert that drew a single token during
     // prefill lands in the same row -- read the two as shapes, not phases.
@@ -221,6 +230,7 @@ private:
   int level_ = 0;
   std::mutex mutex_;
   uint64_t reg_calls_ = 0;
+  uint64_t reg_ion_calls_ = 0;
   uint64_t reg_total_us_ = 0;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
@@ -329,12 +339,13 @@ private:
       return it->second;
 
     const uint64_t t_begin = HtpProfile::nowUs();
-    std::vector<int8_t> q_w4_i8(static_cast<size_t>(K) * N);
+    HtpRpcBuffer q_w4_i8(static_cast<size_t>(K) * N);
     std::vector<float> w_scale(N);
     std::vector<int32_t> colsum_w(N);
     const uint64_t t_convert = HtpProfile::nowUs();
-    htp_qs4cx_from_q4_0x4(matAdata, K, N, q_w4_i8.data(), w_scale.data(),
-                          colsum_w.data());
+    htp_qs4cx_from_q4_0x4(matAdata, K, N,
+                          reinterpret_cast<int8_t *>(q_w4_i8.data()),
+                          w_scale.data(), colsum_w.data());
     const uint64_t convert_us = HtpProfile::nowUs() - t_convert;
 
     return register_locked(matAdata, session, K, N, q_w4_i8, w_scale, colsum_w,
@@ -350,11 +361,12 @@ private:
       return it->second;
 
     const uint64_t t_begin = HtpProfile::nowUs();
-    std::vector<int8_t> q_w4_i8(static_cast<size_t>(K) * N);
+    HtpRpcBuffer q_w4_i8(static_cast<size_t>(K) * N);
     std::vector<float> w_scale(N);
     std::vector<int32_t> colsum_w(N);
     const uint64_t t_convert = HtpProfile::nowUs();
-    htp_qs4cx_from_packed(matAdata, matAscale, K, N, q_w4_i8.data(),
+    htp_qs4cx_from_packed(matAdata, matAscale, K, N,
+                          reinterpret_cast<int8_t *>(q_w4_i8.data()),
                           w_scale.data(), colsum_w.data());
     const uint64_t convert_us = HtpProfile::nowUs() - t_convert;
 
@@ -368,7 +380,7 @@ private:
    *                   registration total (unused when profiling is off)
    *  @param convert_us microseconds the caller spent in htp_qs4cx_from_* */
   uint32_t register_locked(void *key, remote_handle64 session, uint32_t K,
-                           uint32_t N, const std::vector<int8_t> &q_w4_i8,
+                           uint32_t N, HtpRpcBuffer &q_w4_i8,
                            std::vector<float> &w_scale,
                            std::vector<int32_t> &colsum_w, uint64_t t_begin,
                            uint64_t convert_us) {
@@ -377,7 +389,7 @@ private:
     uint32_t handle = 0;
     const uint64_t t_rpc = HtpProfile::nowUs();
     const int err = nntr_hvx_weight_register_u8i4(
-      session, K, N, const_cast<int8_t *>(q_w4_i8.data()),
+      session, K, N, reinterpret_cast<int8_t *>(q_w4_i8.data()),
       static_cast<int>(q_w4_i8.size()), w_scale.data(), static_cast<int>(N),
       colsum_w.data(), static_cast<int>(N), bias.data(), static_cast<int>(N),
       &handle);
@@ -388,7 +400,8 @@ private:
     }
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0) {
-      profile.addRegister(HtpProfile::nowUs() - t_begin, convert_us, rpc_us);
+      profile.addRegister(HtpProfile::nowUs() - t_begin, convert_us, rpc_us,
+                          q_w4_i8.isIon());
     }
 
     // Kept resident for the process lifetime -- Stage 6 (residency, see
