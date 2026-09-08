@@ -13,10 +13,19 @@
  *
  * Compiled only when ENABLE_HEXKL is defined.
  *
- * HtpComputeOps overrides exactly the ops it accelerates and leaves
- * everything else to the ComputeOps base (default-throw) via inheritance --
- * mirrors ClComputeOps (nntrainer/tensor/cl_operations/cl_compute_ops.cpp),
- * which is the template this was copied from, not a design invented here.
+ * HtpComputeOps overrides exactly the ops it accelerates and inherits the
+ * CPU implementation of everything else from CpuComputeOps.
+ *
+ * It deliberately does NOT derive from the abstract ComputeOps base the way
+ * ClComputeOps does. A layer's engine covers every tensor in it, not just
+ * the ones this backend has a kernel for: Lfm2MoELayer's router gate is
+ * FP32 by construction (lfm2_moe_layer.cpp keeps gate and expert_bias
+ * unquantized), so with engine=htp its dot() reaches sgemm_fp32, which has
+ * no supports_* guard and no fallback of its own in FloatTensor::dot. Off
+ * the abstract base that threw "ComputeOps::sgemm_fp32 not implemented by
+ * this backend" on the first prefill. CpuComputeOps is stateless, so
+ * inheriting it costs nothing and makes every unaccelerated op behave the
+ * way it does with engine=cpu.
  *
  * gemm_q4_0_accel_fp32 is the first kernel: one FastRPC call per Q4_0 FC
  * dot(), single weight, single activation -- hexkl_mm_u8i4_layer_run with
@@ -28,6 +37,7 @@
 #ifdef ENABLE_HEXKL
 
 #include <compute_ops.h>
+#include <cpu_ops_table.h>
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
 
@@ -40,7 +50,7 @@
 
 namespace nntrainer {
 
-class HtpComputeOps : public ComputeOps {
+class HtpComputeOps : public CpuComputeOps {
 public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
 
