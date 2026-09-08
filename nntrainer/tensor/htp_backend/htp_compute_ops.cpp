@@ -32,6 +32,12 @@
  * n_handles=1 underneath. It is Tier 1 of docs/htp_attention/
  * 40_moe_ffn_htp_task.md section 3 and benefits every FC layer under
  * engine=htp, not just the LFM2 MoE FFN that motivated this task.
+ *
+ * gemm_q4_0_batch_fp32 is the same call with n_handles > 1: several
+ * weights sharing one activation (LFM2-MoE decode's selected experts'
+ * gate_up projections against the single routed token) go out as one
+ * FastRPC call so hexkl_mm_u8i4_layer_run can prefetch the next handle's
+ * weight while the current one computes.
  */
 
 #ifdef ENABLE_HEXKL
@@ -260,9 +266,68 @@ public:
                             unsigned int K) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const uint32_t handles[1] = {get_or_register(matAdata, session, K, N)};
+    const uint32_t handle = get_or_register(matAdata, session, K, N);
 
-    invokeLayer(session, handles, matBdata, matCdata, M, N, K);
+    invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
+  }
+
+  // Several Q4_0 weights that share ONE activation -- LFM2-MoE decode's
+  // top-K selected experts' gate_up projections, all against the single
+  // token just routed -- go out as ONE FastRPC call across their handles
+  // instead of one call per weight. hexkl_mm_u8i4_layer_run's own doc
+  // (test/htp/nntr_hvx.idl mm_u8i4_layer) says what that call buys beyond
+  // saving round trips: it double-buffers each handle's weight into VTCM
+  // with the next handle prefetched while the current one computes, which
+  // only happens with more than one handle in the call -- measured 1.7-2x
+  // over one-call-per-weight (docs/htp_attention/34_fc_measured.md
+  // section4 items C and E). Nothing here changes CPU: FloatTensor::dot's
+  // vector overload falls back to the same per-weight loop this replaces
+  // when supports_gemm_q4_0_batch_fp32() is false, so this is additive.
+  //
+  // NOTE: this override was written and syntax-checked in an earlier
+  // session but never actually landed in a commit -- Lfm2MoELayer's
+  // caller-side grouping shipped without it, so every "grouped" decode
+  // call silently fell through Tensor::dot's un-accelerated per-weight
+  // loop (ComputeOps::gemm_q4_0_fp32, plain CPU dequant+GEMM) instead of
+  // reaching HTP at all. Confirmed by NNTR_HTP_PROFILE=2 output showing
+  // zero calls of any shape for gate_up at M==1 after the caller-side
+  // change landed. This commit is that missing override.
+  bool supports_gemm_q4_0_batch_fp32() const override { return true; }
+
+  void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                            std::vector<float *> matCdata, unsigned int M,
+                            std::vector<unsigned int> N,
+                            unsigned int K) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t n = matAdata.size();
+    std::vector<uint32_t> handles(n);
+    unsigned int n_total = 0;
+    for (size_t i = 0; i < n; ++i) {
+      handles[i] = get_or_register(matAdata[i], session, K, N[i]);
+      n_total += N[i];
+    }
+
+    // mm_u8i4_layer returns one contiguous [M, sum(N)] block (doc order:
+    // "one contiguous M x handle[i].N block per handle in call order"), but
+    // matCdata is one pointer per weight -- stage into scratch, then scatter
+    // each weight's columns into its own output. M is small at this call's
+    // one real shape (decode, M==1), so this scratch and the extra copy are
+    // a handful of KB, not a hidden cost.
+    std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
+    invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
+               out_cat.data(), M, n_total, K);
+
+    unsigned int col_offset = 0;
+    for (size_t i = 0; i < n; ++i) {
+      for (unsigned int row = 0; row < M; ++row) {
+        std::memcpy(matCdata[i] + static_cast<size_t>(row) * N[i],
+                   out_cat.data() + static_cast<size_t>(row) * n_total +
+                     col_offset,
+                   N[i] * sizeof(float));
+      }
+      col_offset += N[i];
+    }
   }
 
   // A QS4CX weight was quantized once, straight from FP32, and already
@@ -280,10 +345,10 @@ public:
                              unsigned int K) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const uint32_t handles[1] = {
-      get_or_register_qs4cx(matAdata, matAscale, session, K, N)};
+    const uint32_t handle =
+      get_or_register_qs4cx(matAdata, matAscale, session, K, N);
 
-    invokeLayer(session, handles, matBdata, matCdata, M, N, K);
+    invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
   }
 
 private:
@@ -296,15 +361,16 @@ private:
    *  DSP probes cost nothing when nobody is measuring.
    */
   static void invokeLayer(remote_handle64 session, const uint32_t *handles,
-                          float *matBdata, float *matCdata, unsigned int M,
-                          unsigned int N, unsigned int K) {
+                          int num_handles, float *matBdata, float *matCdata,
+                          unsigned int M, unsigned int N, unsigned int K) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() == 0) {
-      const int err = nntr_hvx_mm_u8i4_layer(
-        session, M, K, handles, 1, matBdata, act_len, matCdata, out_len);
+      const int err = nntr_hvx_mm_u8i4_layer(session, M, K, handles,
+                                             num_handles, matBdata, act_len,
+                                             matCdata, out_len);
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer failed: err=" +
                                  std::to_string(err));
@@ -316,11 +382,11 @@ private:
     const bool timed = profile.level() >= 2;
     const uint64_t t0 = HtpProfile::nowUs();
     const int err =
-      timed ? nntr_hvx_mm_u8i4_layer_timed(session, M, K, handles, 1, matBdata,
-                                           act_len, matCdata, out_len, stage_us,
-                                           HTP_N_STAGES)
-            : nntr_hvx_mm_u8i4_layer(session, M, K, handles, 1, matBdata,
-                                     act_len, matCdata, out_len);
+      timed ? nntr_hvx_mm_u8i4_layer_timed(session, M, K, handles, num_handles,
+                                           matBdata, act_len, matCdata,
+                                           out_len, stage_us, HTP_N_STAGES)
+            : nntr_hvx_mm_u8i4_layer(session, M, K, handles, num_handles,
+                                     matBdata, act_len, matCdata, out_len);
     const uint64_t elapsed = HtpProfile::nowUs() - t0;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error(std::string(timed
