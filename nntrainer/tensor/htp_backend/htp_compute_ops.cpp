@@ -411,6 +411,13 @@ inline bool l2CheckEnabled() {
   return on;
 }
 
+/** @brief NNTR_L2_DIFF: run both MoE FFN paths and report their SNR. See
+ *         HtpComputeOps::l2Diff for what the number separates. */
+inline bool l2DiffEnabled() {
+  static const bool on = std::getenv("NNTR_L2_DIFF") != nullptr;
+  return on;
+}
+
 /** @brief Reports the first non-finite element of @a v, once per call. */
 inline void l2CheckFinite(const char *what, const float *v, size_t n,
                           unsigned M, unsigned K, unsigned N) {
@@ -659,6 +666,80 @@ public:
     invokeGateUpSwiglu(session, h_gu, matBdata, M, K, inter);
     invokeLayerU8InRaw(session, &h_dn, 1, htp_act_m_pad(M), matCdata, M, N[1],
                        inter);
+    if (l2DiffEnabled())
+      l2Diff(session, h_gu, h_dn, matBdata, matCdata, M, K, inter, N[1]);
+  }
+
+  /**
+   * @brief NNTR_L2_DIFF: the one control neither L2 attempt ever applied.
+   *
+   * Both attempts were gated on unittest_hvx_mm_u8i4's SNR against
+   * fill_deterministic weights and activations, passed at 138-141 dB, and
+   * still broke the real model -- so the variable nobody has held fixed is
+   * the DATA, not the kernel. This runs the unit test's exact reference
+   * (mm_u8i4_layer on gate_up, SwiGLU on the host with expf, mm_u8i4_layer
+   * on down) against the split-call path, on THIS model's registered weight
+   * bytes and THIS forward's real activation, and reports the SNR per call.
+   *
+   * It bisects the search in one run:
+   *   high SNR -> the kernels agree on real data too, so the fault is on the
+   *               ARM side of the call (what is fed in, what is done with
+   *               what comes out), not inside the DSP;
+   *   low SNR  -> the kernels genuinely disagree on real data, and the
+   *               synthetic distribution was hiding it -- the dB number to
+   *               chase, with the offending M printed next to it.
+   *
+   * Debug path: plain heap buffers, three extra FastRPC round trips per
+   * expert. Never on unless the env var is.
+   */
+  void l2Diff(remote_handle64 session, uint32_t h_gu, uint32_t h_dn,
+              const float *matBdata, const float *got, unsigned int M,
+              unsigned int K, unsigned int inter, unsigned int N_out) {
+    std::vector<float> act(static_cast<size_t>(M) * K);
+    std::memcpy(act.data(), matBdata, act.size() * sizeof(float));
+
+    std::vector<float> gu_out(static_cast<size_t>(M) * 2 * inter, 0.0f);
+    int err = nntr_hvx_mm_u8i4_layer(
+      session, M, K, &h_gu, 1, act.data(), static_cast<int>(act.size()),
+      gu_out.data(), static_cast<int>(gu_out.size()));
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr, "[L2-DIFF] reference gate_up failed: %d\n", err);
+      return;
+    }
+
+    // Same formula the unit tests' reference uses, and the same one
+    // Lfm2MoELayer's two-dot path runs through nntrainer::swiglu.
+    std::vector<float> mid(static_cast<size_t>(M) * inter);
+    for (unsigned int m = 0; m < M; ++m) {
+      for (unsigned int j = 0; j < inter; ++j) {
+        const float g = gu_out[static_cast<size_t>(m) * 2 * inter + j];
+        const float u = gu_out[static_cast<size_t>(m) * 2 * inter + inter + j];
+        mid[static_cast<size_t>(m) * inter + j] = g / (1.0f + std::exp(-g)) * u;
+      }
+    }
+
+    std::vector<float> ref(static_cast<size_t>(M) * N_out, 0.0f);
+    err = nntr_hvx_mm_u8i4_layer(session, M, inter, &h_dn, 1, mid.data(),
+                                 static_cast<int>(mid.size()), ref.data(),
+                                 static_cast<int>(ref.size()));
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr, "[L2-DIFF] reference down failed: %d\n", err);
+      return;
+    }
+
+    double sig = 0.0, noise = 0.0, max_abs_err = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      const double r = ref[i], d = static_cast<double>(got[i]) - r;
+      sig += r * r;
+      noise += d * d;
+      if (std::fabs(d) > max_abs_err)
+        max_abs_err = std::fabs(d);
+    }
+    const double snr = (noise == 0.0) ? 999.0 : 10.0 * std::log10(sig / noise);
+    std::fprintf(stderr,
+                 "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
+                 "max_abs_err=%g\n",
+                 M, K, inter, N_out, snr, max_abs_err);
   }
 
 private:
