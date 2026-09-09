@@ -792,26 +792,34 @@ public:
         row_max = std::max(row_max, v);
       }
 
-      // Bin-flip test: is this a rounding-boundary sensitivity, not a
-      // magnitude one? hvx_quant_rows_u8_params/hvx_quant_pack_u8_ah are
-      // the SAME function on both paths -- verified by inspection, not
-      // assumed -- so a difference cannot come from the quantizer having
-      // two implementations. What CAN differ is the float value handed to
-      // it: the reference quantizes the host's exact expf(); the device
-      // quantized its own hvx_exp_sf/hvx_recip_qf32 approximation (~1e-6
-      // relative error, well within spec -- doc 43's L2 fix candidate).
-      // That tiny difference is usually smaller than half a quantization
-      // step and rounds to the identical u8 level; occasionally an
-      // element sits close enough to a bin boundary that it doesn't.
-      // act_ah_buf_/act_scale_scratch_/act_zp_scratch_ still hold the
-      // device's own gate_up_swiglu output for this exact forward's worst
-      // row -- invokeLayerU8InRaw only reads them, never clears them --
-      // so this re-quantizes the host's `mid` with the DEVICE's OWN
-      // scale/zp (not a separately-derived one) and counts how many of
-      // the row's `inter` bytes disagree with what the device produced
-      // from its own SwiGLU value. A nonzero count here, at a magnitude
-      // consistent with row_sq_err, would confirm this over the row-span
-      // hypothesis; zero reopens the search.
+      // Bin-flip test, take 1 (dev_scale held fixed): is this a rounding-
+      // boundary sensitivity given a SHARED scale? hvx_quant_rows_u8_params/
+      // hvx_quant_pack_u8_ah are the SAME function on both paths -- verified
+      // by inspection, not assumed -- so a difference cannot come from the
+      // quantizer having two implementations. What CAN differ is the float
+      // value handed to it: the reference quantizes the host's exact
+      // expf(); the device quantized its own hvx_exp_sf/hvx_recip_qf32
+      // approximation (~1e-6 relative error, well within spec -- doc 43's
+      // L2 fix candidate). act_ah_buf_/act_scale_scratch_/act_zp_scratch_
+      // still hold the device's own gate_up_swiglu output for this exact
+      // forward's worst row -- invokeLayerU8InRaw only reads them, never
+      // clears them -- so this first pass re-quantizes `mid` with the
+      // DEVICE's OWN scale/zp and counts per-element disagreements.
+      //
+      // Take 2 (below, scale_diff/total_flips): the first round's result
+      // (0 flips on the two WORST calls, 1 flip on the three milder ones)
+      // means take 1 tests the wrong thing when it comes back clean --
+      // hvx_quant_rows_u8_params derives scale/zp from THIS row's own
+      // min/max, so if the approximation nudges the row's extreme value
+      // even slightly, the REFERENCE path (which quantizes `mid` with a
+      // scale/zp it computes fresh from `mid`'s own min/max, independent of
+      // the device's) uses a DIFFERENT scale than the device did -- not a
+      // sparse per-element flip but a systematic per-row bias that shifts
+      // every one of the row's `inter` dequantized values in the same
+      // direction, which a down matmul's summation does not cancel out.
+      // Reimplements hvx_quant_rows_u8_params' exact formula (source read,
+      // not guessed) on `mid` alone to get that independent scale/zp, then
+      // diffs against the device's actual bytes the same way take 1 did.
       constexpr uint32_t kTileRow = 64, kTileInner = 32, kActTileBytes = 2048;
       const uint32_t n_ktiles = inter / kTileInner;
       const uint32_t rb = static_cast<uint32_t>(worst_row) / kTileRow;
@@ -819,37 +827,64 @@ public:
       const float dev_scale = act_scale_scratch_[worst_row];
       const int32_t dev_zp = act_zp_scratch_[worst_row];
       const uint8_t *ah = act_ah_buf_->data();
-      uint32_t flips = 0;
-      int32_t max_flip = 0;
+
+      const float rmin = std::min(row_min, 0.0f);
+      const float rmax = std::max(row_max, 0.0f);
+      const float host_scale = (rmax > rmin) ? (rmax - rmin) / 255.0f : 1.0f;
+      const int32_t host_zp =
+        (rmax > rmin)
+          ? std::max(0, std::min(255, static_cast<int32_t>(
+                                        std::nearbyint(-rmin / host_scale))))
+          : 0;
+
+      uint32_t flips = 0, total_flips = 0;
+      int32_t max_flip = 0, max_total_flip = 0;
       for (uint32_t j = 0; j < inter; ++j) {
         const uint32_t kt = j / kTileInner, c = j % kTileInner;
         const size_t idx =
           (static_cast<size_t>(rb) * n_ktiles + kt) * kActTileBytes +
           r * kTileInner + c;
         const int32_t dev_byte = ah[idx];
-        int32_t host_byte =
+        const float v = mid[static_cast<size_t>(worst_row) * inter + j];
+
+        int32_t byte_dev_scale =
           dev_scale != 0.0f
-            ? static_cast<int32_t>(std::nearbyint(
-                mid[static_cast<size_t>(worst_row) * inter + j] / dev_scale)) +
-                dev_zp
+            ? static_cast<int32_t>(std::nearbyint(v / dev_scale)) + dev_zp
             : dev_zp;
-        host_byte = std::max(0, std::min(255, host_byte));
-        const int32_t d = dev_byte - host_byte;
-        if (d != 0) {
+        byte_dev_scale = std::max(0, std::min(255, byte_dev_scale));
+        const int32_t d1 = dev_byte - byte_dev_scale;
+        if (d1 != 0) {
           ++flips;
-          if (std::abs(d) > std::abs(max_flip))
-            max_flip = d;
+          if (std::abs(d1) > std::abs(max_flip))
+            max_flip = d1;
+        }
+
+        int32_t byte_host_scale =
+          static_cast<int32_t>(std::nearbyint(v / host_scale)) + host_zp;
+        byte_host_scale = std::max(0, std::min(255, byte_host_scale));
+        const int32_t d2 = dev_byte - byte_host_scale;
+        if (d2 != 0) {
+          ++total_flips;
+          if (std::abs(d2) > std::abs(max_total_flip))
+            max_total_flip = d2;
         }
       }
+      const double scale_diff_pct =
+        host_scale != 0.0f
+          ? 100.0 * (static_cast<double>(dev_scale) - host_scale) / host_scale
+          : 0.0;
 
-      std::fprintf(stderr,
-                   "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
-                   "max_abs_err=%g  worst_row=%zu row_sq_err=%g "
-                   "mid_range=[%.4f, %.4f] mid_span=%.4f  "
-                   "call_max_span=%.4f@row%zu  bin_flips=%u/%u max_flip=%d\n",
-                   M, K, inter, N_out, snr, max_abs_err, worst_row,
-                   worst_row_err, row_min, row_max, row_max - row_min,
-                   call_max_span, call_max_span_row, flips, inter, max_flip);
+      std::fprintf(
+        stderr,
+        "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
+        "max_abs_err=%g  worst_row=%zu row_sq_err=%g "
+        "mid_range=[%.4f, %.4f] mid_span=%.4f  call_max_span=%.4f@row%zu  "
+        "bin_flips=%u/%u max_flip=%d  dev_scale=%.6g host_scale=%.6g "
+        "scale_diff=%.4f%%  total_flips=%u/%u max_total_flip=%d\n",
+        M, K, inter, N_out, snr, max_abs_err, worst_row, worst_row_err, row_min,
+        row_max, row_max - row_min, call_max_span, call_max_span_row, flips,
+        inter, max_flip, dev_scale, host_scale, scale_diff_pct, total_flips,
+        inter, max_total_flip);
       return;
     }
     std::fprintf(stderr,
