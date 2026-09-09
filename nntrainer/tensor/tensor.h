@@ -570,6 +570,14 @@ public:
   }
 
   /**
+   * @brief     Get the compute ops this tensor dispatches through
+   * @note      Mirrors the internal op dispatch (per-tensor override if set,
+   *            else the global backend) so app-level callers route through
+   *            the same backend Tensor::dot() would pick.
+   */
+  ComputeOps *getOps() const { return itensor_->getOps(); }
+
+  /**
    * @brief     return scale pointer of Tensor
    * @retval    template T pointer
    */
