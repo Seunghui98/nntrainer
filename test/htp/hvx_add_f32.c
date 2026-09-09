@@ -58,8 +58,14 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   // lifetime, instead of per call (doc15 §3/§4) -- every other entry point
   // in this skel reaches vtcm_base/vtcm_size/config_off through the
   // session rather than re-acquiring either.
-  uint32_t hmx_fp16_rate = 0;
-  int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size, &hmx_fp16_rate);
+  // ponytail: this SDK checkout's hexkl_micro_hw_init takes two args, not
+  // the three-arg (+ hmx_fp16_rate) beta2 signature ref_08's docs describe
+  // -- a pre-existing SDK/doc mismatch unrelated to this session's work,
+  // found only because it blocked compiling the skel at all. Fixed
+  // mechanically to what this SDK's header actually declares; revisit if a
+  // newer hexkl_addon restores the three-arg form and something starts
+  // wanting hmx_fp16_rate.
+  int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size);
   if (res != AEE_SUCCESS) {
     FARF(ERROR, "nntr_hvx_open: hexkl_micro_hw_init failed: 0x%08x", res);
     free(s);
@@ -95,7 +101,12 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   // nntr_hvx_add_f32 uses to check HVX is present at all) minus one, since
   // this session's own FastRPC thread uses an HVX context too when it runs
   // quant's own share of the work.
+  const int hvx_units_raw = qurt_hvx_get_units();
   const uint32_t n_hvx = (qurt_hvx_get_units() >> 8) & 0xFFu;
+  (void)hvx_units_raw; // used only by FARF below, which may compile to nothing
+  FARF(HIGH,
+       "nntr_hvx_open: qurt_hvx_get_units()=0x%08x n_hvx=%u pool_workers=%u",
+       hvx_units_raw, (unsigned)n_hvx, (unsigned)(n_hvx > 1 ? n_hvx - 1 : 0));
   s->quant_pool = hvx_worker_pool_create(n_hvx > 1 ? n_hvx - 1 : 0);
   if (!s->quant_pool) {
     FARF(ERROR, "nntr_hvx_open: hvx_worker_pool_create failed");
