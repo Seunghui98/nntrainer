@@ -745,9 +745,30 @@ public:
     // 255 levels spread thinner and the row's requant noise rises without
     // ever going non-finite. `mid` is exactly that intermediate (pre-
     // quantization, host f32), already computed above for the reference --
-    // this reuses it rather than adding a DSP round trip. Printed only for
-    // calls the aggregate SNR flags as suspect, so the common (mid-140s dB)
-    // case stays one line.
+    // this reuses it rather than adding a DSP round trip.
+    //
+    // Printed for EVERY call, not just suspect ones: the first round only
+    // ever showed the bad calls' own spans (0.05-0.24), with nothing to
+    // compare them against, so the hypothesis was untestable -- a narrow
+    // span could mean "outlier-free" (hypothesis holds) or "this model's
+    // rows are always this narrow" (hypothesis is irrelevant). This line
+    // is the missing baseline.
+    float call_max_span = 0.0f;
+    size_t call_max_span_row = 0;
+    for (unsigned int m = 0; m < M; ++m) {
+      float row_min = mid[static_cast<size_t>(m) * inter];
+      float row_max = row_min;
+      for (unsigned int j = 0; j < inter; ++j) {
+        const float v = mid[static_cast<size_t>(m) * inter + j];
+        row_min = std::min(row_min, v);
+        row_max = std::max(row_max, v);
+      }
+      if (row_max - row_min > call_max_span) {
+        call_max_span = row_max - row_min;
+        call_max_span_row = m;
+      }
+    }
+
     if (snr < 100.0) {
       size_t worst_row = 0;
       double worst_row_err = -1.0;
@@ -773,15 +794,18 @@ public:
       std::fprintf(stderr,
                    "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
                    "max_abs_err=%g  worst_row=%zu row_sq_err=%g "
-                   "mid_range=[%.4f, %.4f] mid_span=%.4f\n",
+                   "mid_range=[%.4f, %.4f] mid_span=%.4f  "
+                   "call_max_span=%.4f@row%zu\n",
                    M, K, inter, N_out, snr, max_abs_err, worst_row,
-                   worst_row_err, row_min, row_max, row_max - row_min);
+                   worst_row_err, row_min, row_max, row_max - row_min,
+                   call_max_span, call_max_span_row);
       return;
     }
     std::fprintf(stderr,
                  "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
-                 "max_abs_err=%g\n",
-                 M, K, inter, N_out, snr, max_abs_err);
+                 "max_abs_err=%g  call_max_span=%.4f@row%zu\n",
+                 M, K, inter, N_out, snr, max_abs_err, call_max_span,
+                 call_max_span_row);
   }
 
 private:
