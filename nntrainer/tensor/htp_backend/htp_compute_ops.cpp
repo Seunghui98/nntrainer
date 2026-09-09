@@ -50,6 +50,7 @@
 #include <htp_rpcmem.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -227,6 +228,18 @@ public:
     }
   }
 
+  /** ARM-side staging: the memcpy of the activation into the rpcmem buffer
+   *  and of the result back out. It sits OUTSIDE every host_us window
+   *  above (those start after the copy, so that transport = host - dsp
+   *  stays a FastRPC number), which meant it was invisible -- and at this
+   *  model's shapes it is ~0.9 MB per expert, 64 times per layer. Counted
+   *  here so "HTP host time" stops understating what the path costs. */
+  void addStaging(uint64_t us, uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    staging_us_ += us;
+    staging_bytes_ += bytes;
+  }
+
   ~HtpProfile() {
     if (level_ != 0)
       dump();
@@ -310,26 +323,44 @@ private:
       if (level_ >= 2 && b.calls != 0) {
         const double dsp_per = static_cast<double>(b.dsp_us) / b.calls;
         const double host_per = static_cast<double>(b.host_us) / b.calls;
+        const double quant_per = static_cast<double>(b.quant_us) / b.calls;
+        const double swiglu_per = static_cast<double>(b.swiglu_us) / b.calls;
+        const double dequant_per = static_cast<double>(b.dequant_us) / b.calls;
+        const double acc_per = static_cast<double>(b.acc_us) / b.calls;
+        const double drain_per = static_cast<double>(b.drain_us) / b.calls;
+        // What the accelerator actually exists for, by subtraction: the DSP
+        // clock minus every stage that is a format change or a wait. Nothing
+        // on the DSP times the HMX issue loop directly, and adding a probe
+        // inside it would perturb what it measures -- this residue is the
+        // honest number, and it is the one to compare against the layer's
+        // MAC count. It also absorbs whatever the probes do not name, so
+        // treat it as an upper bound on the matmul, not an exact figure.
+        const double mm_per = dsp_per - (quant_per + swiglu_per + dequant_per +
+                                         acc_per + drain_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f swiglu %.1f dequant %.1f acc %.1f "
-                     "drain %.1f]",
+                     "drain %.1f | mm<=%.1f (%.1f%% of host)]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
-                     host_per - dsp_per,
-                     static_cast<double>(b.quant_us) / b.calls,
-                     static_cast<double>(b.swiglu_us) / b.calls,
-                     static_cast<double>(b.dequant_us) / b.calls,
-                     static_cast<double>(b.acc_us) / b.calls,
-                     static_cast<double>(b.drain_us) / b.calls);
+                     host_per - dsp_per, quant_per, swiglu_per, dequant_per,
+                     acc_per, drain_per, mm_per,
+                     host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0);
       }
       std::fprintf(stderr, "\n");
     }
 
-    std::fprintf(stderr,
-                 "[HTP-PROFILE] layer calls total : %10.1f ms\n"
-                 "[HTP-PROFILE] HTP host time     : %10.1f ms "
-                 "(registration + layer calls)\n\n",
-                 ms(invoke_us), ms(reg_total_us_ + invoke_us));
+    std::fprintf(
+      stderr,
+      "[HTP-PROFILE] layer calls total : %10.1f ms\n"
+      "[HTP-PROFILE] arm staging memcpy: %10.1f ms  (%.1f MB in+out, "
+      "%.1f GB/s) -- outside every host= above\n"
+      "[HTP-PROFILE] HTP host time     : %10.1f ms "
+      "(registration + layer calls + staging)\n\n",
+      ms(invoke_us), ms(staging_us_),
+      static_cast<double>(staging_bytes_) / (1024.0 * 1024.0),
+      staging_us_ ? static_cast<double>(staging_bytes_) / staging_us_ / 1000.0
+                  : 0.0,
+      ms(reg_total_us_ + invoke_us + staging_us_));
   }
 
   int level_ = 0;
@@ -338,10 +369,80 @@ private:
   uint64_t reg_calls_ = 0;
   uint64_t reg_ion_calls_ = 0;
   uint64_t reg_total_us_ = 0;
+  uint64_t staging_us_ = 0;
+  uint64_t staging_bytes_ = 0;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
   std::map<std::tuple<unsigned, unsigned, bool>, Bucket> buckets_;
 };
+
+/**
+ * @brief memcpy that charges itself to HtpProfile's staging line.
+ *
+ * Every host_us window in this file starts AFTER the activation is copied
+ * into the rpcmem buffer and ends BEFORE the result is copied back out, on
+ * purpose: that is what keeps `transport = host - dsp` a FastRPC number
+ * rather than a FastRPC-plus-memcpy number. The consequence was that the
+ * copies appeared nowhere at all, and on this model's MoE they are not
+ * small -- ~450 KB in and ~450 KB out per expert call, 64 calls per layer.
+ * Same copy, one accumulator, so the profile's bottom line stops
+ * understating what the path costs.
+ */
+/**
+ * @brief NNTR_L2_CHECK: does the DSP still hand back non-finite values?
+ *
+ * The two L2 failures in docs/htp_attention/43_moe_ffn_measured_next_
+ * levers.md section 7 were diagnosed as hvx_recip_qf32 returning NaN for
+ * any gate at or below hvx_swiglu_row_f32's exp clamp. That diagnosis is
+ * only worth what a device can confirm, and the model's own output cannot
+ * confirm it: wrong text is equally consistent with a dozen other causes.
+ * This is the discriminator. If it counts zero and the text is still
+ * wrong, the SwiGLU clamp is NOT the (whole) bug and the search moves
+ * elsewhere; if it counts non-zero, whatever skel is on the device does
+ * not have the fix in it.
+ *
+ * Cheap where it matters most: a NaN SwiGLU lane lands in its row's
+ * requantization scale (hvx_quant_rows_u8_params scans the whole row for
+ * min/max), so scanning m_pad floats -- 64 of them -- catches it before
+ * the value has spread anywhere. Off unless the env var is set.
+ */
+inline bool l2CheckEnabled() {
+  static const bool on = std::getenv("NNTR_L2_CHECK") != nullptr;
+  return on;
+}
+
+/** @brief Reports the first non-finite element of @a v, once per call. */
+inline void l2CheckFinite(const char *what, const float *v, size_t n,
+                          unsigned M, unsigned K, unsigned N) {
+  size_t bad = 0;
+  size_t first = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(v[i])) {
+      if (bad == 0)
+        first = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    std::fprintf(stderr,
+                 "[L2-CHECK] %s: %llu/%llu non-finite (first idx %llu = %g) "
+                 "M=%u K=%u N=%u\n",
+                 what, (unsigned long long)bad, (unsigned long long)n,
+                 (unsigned long long)first, static_cast<double>(v[first]), M, K,
+                 N);
+  }
+}
+
+inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
+  HtpProfile &p = HtpProfile::global();
+  if (p.level() == 0) {
+    std::memcpy(dst, src, bytes);
+    return;
+  }
+  const uint64_t t0 = HtpProfile::nowUs();
+  std::memcpy(dst, src, bytes);
+  p.addStaging(HtpProfile::nowUs() - t0, bytes);
+}
 
 } // namespace
 
@@ -604,8 +705,8 @@ private:
     ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
     float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
     float *out_cat = reinterpret_cast<float *>(out_buf_->data());
-    std::memcpy(act_f32, matBdata,
-                static_cast<size_t>(act_len) * sizeof(float));
+    stagedMemcpy(act_f32, matBdata,
+                 static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() == 0) {
@@ -616,8 +717,8 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer failed: err=" +
                                  std::to_string(err));
       }
-      std::memcpy(matCdata, out_cat,
-                  static_cast<size_t>(out_len) * sizeof(float));
+      stagedMemcpy(matCdata, out_cat,
+                   static_cast<size_t>(out_len) * sizeof(float));
       return;
     }
 
@@ -637,8 +738,8 @@ private:
                                              : "nntr_hvx_mm_u8i4_layer") +
                                " failed: err=" + std::to_string(err));
     }
-    std::memcpy(matCdata, out_cat,
-                static_cast<size_t>(out_len) * sizeof(float));
+    stagedMemcpy(matCdata, out_cat,
+                 static_cast<size_t>(out_len) * sizeof(float));
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
@@ -679,8 +780,8 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_u8in failed: err=" +
                                  std::to_string(err));
       }
-      std::memcpy(matCdata, out_cat,
-                  static_cast<size_t>(out_len) * sizeof(float));
+      stagedMemcpy(matCdata, out_cat,
+                   static_cast<size_t>(out_len) * sizeof(float));
       return;
     }
 
@@ -706,8 +807,8 @@ private:
                           : "nntr_hvx_mm_u8i4_layer_u8in") +
         " failed: err=" + std::to_string(err));
     }
-    std::memcpy(matCdata, out_cat,
-                static_cast<size_t>(out_len) * sizeof(float));
+    stagedMemcpy(matCdata, out_cat,
+                 static_cast<size_t>(out_len) * sizeof(float));
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
@@ -726,8 +827,8 @@ private:
     ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
     float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
     float *out_f32 = reinterpret_cast<float *>(out_buf_->data());
-    std::memcpy(act_f32, matBdata,
-                static_cast<size_t>(act_len) * sizeof(float));
+    stagedMemcpy(act_f32, matBdata,
+                 static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() == 0) {
@@ -737,8 +838,8 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_fused failed: err=" +
                                  std::to_string(err));
       }
-      std::memcpy(matCdata, out_f32,
-                  static_cast<size_t>(out_len) * sizeof(float));
+      stagedMemcpy(matCdata, out_f32,
+                   static_cast<size_t>(out_len) * sizeof(float));
       return;
     }
 
@@ -759,8 +860,8 @@ private:
                           : "nntr_hvx_mm_u8i4_layer_fused") +
         " failed: err=" + std::to_string(err));
     }
-    std::memcpy(matCdata, out_f32,
-                static_cast<size_t>(out_len) * sizeof(float));
+    stagedMemcpy(matCdata, out_f32,
+                 static_cast<size_t>(out_len) * sizeof(float));
     profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
@@ -786,8 +887,8 @@ private:
     }
     float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
     uint8_t *out_ah = act_ah_buf_->data();
-    std::memcpy(act_f32, matBdata,
-                static_cast<size_t>(act_len) * sizeof(float));
+    stagedMemcpy(act_f32, matBdata,
+                 static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() == 0) {
@@ -800,6 +901,9 @@ private:
         throw std::runtime_error(
           "nntr_hvx_mm_u8i4_gate_up_swiglu failed: err=" + std::to_string(err));
       }
+      if (l2CheckEnabled())
+        l2CheckFinite("gate_up_swiglu out_scale", act_scale_scratch_.data(),
+                      m_pad, M, K, 2 * inter);
       return;
     }
 
@@ -824,6 +928,9 @@ private:
                           : "nntr_hvx_mm_u8i4_gate_up_swiglu") +
         " failed: err=" + std::to_string(err));
     }
+    if (l2CheckEnabled())
+      l2CheckFinite("gate_up_swiglu out_scale", act_scale_scratch_.data(),
+                    m_pad, M, K, 2 * inter);
     profile.addInvokeGateUpSwiglu(M, K, 2 * inter, elapsed,
                                   timed ? stage_us : nullptr);
   }
@@ -855,8 +962,11 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_u8in failed: err=" +
                                  std::to_string(err));
       }
-      std::memcpy(matCdata, out_cat,
-                  static_cast<size_t>(out_len) * sizeof(float));
+      if (l2CheckEnabled())
+        l2CheckFinite("down out", out_cat, static_cast<size_t>(out_len), M, K,
+                      N);
+      stagedMemcpy(matCdata, out_cat,
+                   static_cast<size_t>(out_len) * sizeof(float));
       return;
     }
 
@@ -882,8 +992,10 @@ private:
                           : "nntr_hvx_mm_u8i4_layer_u8in") +
         " failed: err=" + std::to_string(err));
     }
-    std::memcpy(matCdata, out_cat,
-                static_cast<size_t>(out_len) * sizeof(float));
+    if (l2CheckEnabled())
+      l2CheckFinite("down out", out_cat, static_cast<size_t>(out_len), M, K, N);
+    stagedMemcpy(matCdata, out_cat,
+                 static_cast<size_t>(out_len) * sizeof(float));
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
