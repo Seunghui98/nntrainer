@@ -418,6 +418,34 @@ inline bool l2DiffEnabled() {
   return on;
 }
 
+/**
+ * @brief NNTR_L2_SHADOW: run the fused path, then hand the model the
+ *        REFERENCE result instead of the fused one.
+ *
+ * Splits "the fused path computes wrong values" from "the fused path has a
+ * side effect" -- the two remaining stories, and no SNR number can tell
+ * them apart. Under this flag both paths execute in full, touching every
+ * buffer, taking every lock, leaving every piece of state exactly as a
+ * normal fused run would; only the floats the layer goes on to use are
+ * swapped for the reference's.
+ *
+ *   text becomes correct -> the values are the fault, and the 67-80 dB
+ *                           calls are worth chasing;
+ *   text still broken    -> the values are NOT the fault (they match the
+ *                           working path at 142 dB on 84% of calls
+ *                           anyway), and the bug is a side effect --
+ *                           aliasing, a clobbered workspace, retained
+ *                           state -- that differencing output values can
+ *                           never surface.
+ *
+ * Implies NNTR_L2_DIFF: the reference it hands over is the one l2Diff
+ * already computes.
+ */
+inline bool l2ShadowEnabled() {
+  static const bool on = std::getenv("NNTR_L2_SHADOW") != nullptr;
+  return on;
+}
+
 /** @brief Reports the first non-finite element of @a v, once per call. */
 inline void l2CheckFinite(const char *what, const float *v, size_t n,
                           unsigned M, unsigned K, unsigned N) {
@@ -666,7 +694,7 @@ public:
     invokeGateUpSwiglu(session, h_gu, matBdata, M, K, inter);
     invokeLayerU8InRaw(session, &h_dn, 1, htp_act_m_pad(M), matCdata, M, N[1],
                        inter);
-    if (l2DiffEnabled())
+    if (l2DiffEnabled() || l2ShadowEnabled())
       l2Diff(session, h_gu, h_dn, matBdata, matCdata, M, K, inter, N[1]);
   }
 
@@ -693,8 +721,8 @@ public:
    * expert. Never on unless the env var is.
    */
   void l2Diff(remote_handle64 session, uint32_t h_gu, uint32_t h_dn,
-              const float *matBdata, const float *got, unsigned int M,
-              unsigned int K, unsigned int inter, unsigned int N_out) {
+              const float *matBdata, float *got, unsigned int M, unsigned int K,
+              unsigned int inter, unsigned int N_out) {
     std::vector<float> act(static_cast<size_t>(M) * K);
     std::memcpy(act.data(), matBdata, act.size() * sizeof(float));
 
@@ -837,6 +865,31 @@ public:
                                         std::nearbyint(-rmin / host_scale))))
           : 0;
 
+      // Flip count over the WHOLE block, not just worst_row. The previous
+      // round counted only the worst row and its result ("1 flip") was
+      // reported as if it described the call -- it did not. This is the
+      // number that can honestly be held against row_sq_err and the SNR.
+      uint32_t block_flips = 0;
+      for (uint32_t m = 0; m < M; ++m) {
+        const float s_m = act_scale_scratch_[m];
+        const int32_t z_m = act_zp_scratch_[m];
+        if (s_m == 0.0f)
+          continue;
+        const uint32_t rb_m = m / kTileRow, r_m = m % kTileRow;
+        for (uint32_t j = 0; j < inter; ++j) {
+          const uint32_t kt = j / kTileInner, c = j % kTileInner;
+          const size_t idx =
+            (static_cast<size_t>(rb_m) * n_ktiles + kt) * kActTileBytes +
+            r_m * kTileInner + c;
+          int32_t hb = static_cast<int32_t>(std::nearbyint(
+                         mid[static_cast<size_t>(m) * inter + j] / s_m)) +
+                       z_m;
+          hb = std::max(0, std::min(255, hb));
+          if (static_cast<int32_t>(ah[idx]) != hb)
+            ++block_flips;
+        }
+      }
+
       uint32_t flips = 0, total_flips = 0;
       int32_t max_flip = 0, max_total_flip = 0;
       for (uint32_t j = 0; j < inter; ++j) {
@@ -879,12 +932,15 @@ public:
         "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
         "max_abs_err=%g  worst_row=%zu row_sq_err=%g "
         "mid_range=[%.4f, %.4f] mid_span=%.4f  call_max_span=%.4f@row%zu  "
-        "bin_flips=%u/%u max_flip=%d  dev_scale=%.6g host_scale=%.6g "
-        "scale_diff=%.4f%%  total_flips=%u/%u max_total_flip=%d\n",
+        "bin_flips=%u/%u max_flip=%d  dev_scale=%.9g host_scale=%.9g "
+        "scale_diff=%.6f%%  total_flips=%u/%u max_total_flip=%d  "
+        "block_flips=%u/%u\n",
         M, K, inter, N_out, snr, max_abs_err, worst_row, worst_row_err, row_min,
         row_max, row_max - row_min, call_max_span, call_max_span_row, flips,
         inter, max_flip, dev_scale, host_scale, scale_diff_pct, total_flips,
-        inter, max_total_flip);
+        inter, max_total_flip, block_flips, static_cast<uint32_t>(M) * inter);
+      if (l2ShadowEnabled())
+        std::memcpy(got, ref.data(), ref.size() * sizeof(float));
       return;
     }
     std::fprintf(stderr,
@@ -892,6 +948,8 @@ public:
                  "max_abs_err=%g  call_max_span=%.4f@row%zu\n",
                  M, K, inter, N_out, snr, max_abs_err, call_max_span,
                  call_max_span_row);
+    if (l2ShadowEnabled())
+      std::memcpy(got, ref.data(), ref.size() * sizeof(float));
   }
 
 private:
