@@ -16,6 +16,7 @@
 
 #include <nntrainer_log.h>
 
+#include <cstring>
 #include <string>
 
 // remote_handle64, CDSP_DOMAIN_ID, remote_session_control -- Hexagon SDK,
@@ -59,6 +60,40 @@ HtpBackend::HtpBackend() {
 
   handle_ = static_cast<uint64_t>(h);
   enabled_ = true;
+
+  // Poll-mode QoS: the host half of the measured 90 -> 3,900 us transport
+  // spread (docs/htp_attention/34_fc_measured.md section4 item F; the
+  // control call itself is test/unittest/htp_rpc_bench.h's
+  // htp_set_latency_qos, ported here because this is the first production
+  // caller -- every 34_fc_measured.md transport number assumes this is on,
+  // and until now nothing in the model path turned it on). The DSP-side
+  // half (DCVS/apptype vote) already runs unconditionally in
+  // nntr_hvx_open's session setup; this is the other half of the same pair.
+  // Best effort: an SDK or device without the control just keeps the old
+  // interrupt-driven behavior, logged so a slow transport number is
+  // explainable rather than silently misread as the kernel being slow.
+  struct remote_rpc_control_latency lat;
+  std::memset(&lat, 0, sizeof(lat));
+  lat.enable = RPC_POLL_QOS;
+  lat.latency = 100;
+  int qos_err =
+    remote_handle64_control(h, DSPRPC_CONTROL_LATENCY, &lat, sizeof(lat));
+  if (qos_err == AEE_SUCCESS) {
+    qos_mode_ = 2;
+  } else {
+    std::memset(&lat, 0, sizeof(lat));
+    lat.enable = RPC_PM_QOS;
+    lat.latency = 100;
+    qos_err =
+      remote_handle64_control(h, DSPRPC_CONTROL_LATENCY, &lat, sizeof(lat));
+    qos_mode_ = (qos_err == AEE_SUCCESS) ? 1 : 0;
+  }
+  if (qos_mode_ == 0) {
+    ml_logw("HtpBackend: poll and PM latency QoS both rejected (err=%d); "
+            "transport will pay the interrupt-wake tail (34_fc_measured.md "
+            "section4 item F).",
+            qos_err);
+  }
 }
 
 HtpBackend::~HtpBackend() {

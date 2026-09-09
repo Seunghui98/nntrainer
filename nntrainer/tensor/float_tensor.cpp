@@ -776,7 +776,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   Tdatatype input_dtype = input[0]->getDataType();
 
   // Handle standard inputs
-  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QINT4) {
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QINT4 &&
+      input_dtype != Tdatatype::QS4CX) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -802,6 +803,23 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       for (unsigned int i = 0; i < input.size(); ++i) {
         o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
                           Ns[i]);
+      }
+    }
+  } else if (input_dtype == Tdatatype::QS4CX) {
+    // Same shared-activation grouping as the Q4_0 branch above (decode's
+    // top-K experts' gate_up projections); without this branch these
+    // weights fell through to the "standard inputs" loop at the top of
+    // this function, i.e. one dot() -- one FastRPC call -- per expert.
+    if (o->supports_gemm_qs4cx_batch_fp32() &&
+        (M > 1 || o->accelerates_q4_0_at_m1())) {
+      std::vector<float *> ascales;
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        ascales.push_back(input[i]->getScale<float>());
+      }
+      o->gemm_qs4cx_batch_fp32(mdatas, ascales, data, rdatas, M, Ns, K);
+    } else {
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        dot(*input[i], *output[i], trans, trans_in, beta);
       }
     }
   } else { // QINT4

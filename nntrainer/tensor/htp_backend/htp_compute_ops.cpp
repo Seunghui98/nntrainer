@@ -44,6 +44,7 @@
 
 #include <compute_ops.h>
 #include <cpu_ops_table.h>
+#include <htp_act_quant.h>
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
@@ -53,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <tuple>
@@ -82,6 +84,47 @@ enum {
   HTP_T_DRAIN,
   HTP_T_ACC_STRIDE,
   HTP_N_STAGES
+};
+
+/**
+ * @brief Slots mm_u8i4_layer_fused_timed fills.
+ *
+ * Restated for the same reason as HTP_T_* (the ARM side cannot include the
+ * DSP source). NOT the HTP_T_* layout: the fused call runs a second QUANT
+ * pass (the SwiGLU output's requant) and a SwiGLU stage the unfused call
+ * does not have, so it carries its own slot list and its own Bucket
+ * counter -- folding SwiGLU into an existing slot would put its time in a
+ * column named after something else.
+ */
+enum {
+  HTP_FU_T_DSP_TOTAL = 0,
+  HTP_FU_T_QUANT,
+  HTP_FU_T_SWIGLU,
+  HTP_FU_T_DEQUANT,
+  HTP_FU_T_ACC_READ,
+  HTP_FU_T_ACC_COPY,
+  HTP_FU_T_DRAIN,
+  HTP_FU_T_ACC_STRIDE,
+  HTP_FU_N_STAGES
+};
+
+/**
+ * @brief Slots mm_u8i4_gate_up_swiglu_timed fills, in order -- test/htp/
+ * nntr_hvx_mm_u8i4.c's GU_T_* enum restated (the ARM side cannot include
+ * that DSP source). NOT the same layout as HTP_FU_T_*: this call has no
+ * down-side accumulator at all, so there is no ACC_COPY slot -- reusing
+ * HTP_FU_T_*'s indices against this array would silently read DRAIN's
+ * value out of the slot ACC_STRIDE actually lives in.
+ */
+enum {
+  HTP_GU_T_DSP_TOTAL = 0,
+  HTP_GU_T_QUANT,
+  HTP_GU_T_SWIGLU,
+  HTP_GU_T_DEQUANT,
+  HTP_GU_T_ACC_READ,
+  HTP_GU_T_DRAIN,
+  HTP_GU_T_ACC_STRIDE,
+  HTP_GU_N_STAGES
 };
 
 /**
@@ -142,6 +185,48 @@ public:
     }
   }
 
+  /** Same buckets as addInvoke -- the fused call has its own K/N shape (the
+   * down matmul's output width, not gate_up's), so it lands in its own row
+   * and the two-dot path's numbers stay directly comparable across builds. */
+  void addInvokeFused(unsigned M, unsigned K, unsigned N, uint64_t host_us,
+                      const uint32_t *stage_us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
+    ++b.calls;
+    b.rows += M;
+    b.host_us += host_us;
+    if (stage_us != nullptr) {
+      b.dsp_us += stage_us[HTP_FU_T_DSP_TOTAL];
+      b.quant_us += stage_us[HTP_FU_T_QUANT];
+      b.swiglu_us += stage_us[HTP_FU_T_SWIGLU];
+      b.dequant_us += stage_us[HTP_FU_T_DEQUANT];
+      b.acc_us += stage_us[HTP_FU_T_ACC_READ] + stage_us[HTP_FU_T_ACC_COPY];
+      b.drain_us += stage_us[HTP_FU_T_DRAIN];
+    }
+  }
+
+  /** Same buckets again, this call's own (smaller) stage layout -- see
+   * HTP_GU_T_*'s doc comment for why it is not HTP_FU_T_*. Bucketed under
+   * (K, 2*inter, M==1) -- gate_up's own real shape -- not the down matmul's,
+   * so this row is directly comparable to what a plain (unfused) gate_up
+   * dot() would have shown for the same layer. */
+  void addInvokeGateUpSwiglu(unsigned M, unsigned K, unsigned N_gate_up,
+                             uint64_t host_us, const uint32_t *stage_us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Bucket &b = buckets_[std::make_tuple(K, N_gate_up, M == 1)];
+    ++b.calls;
+    b.rows += M;
+    b.host_us += host_us;
+    if (stage_us != nullptr) {
+      b.dsp_us += stage_us[HTP_GU_T_DSP_TOTAL];
+      b.quant_us += stage_us[HTP_GU_T_QUANT];
+      b.swiglu_us += stage_us[HTP_GU_T_SWIGLU];
+      b.dequant_us += stage_us[HTP_GU_T_DEQUANT];
+      b.acc_us += stage_us[HTP_GU_T_ACC_READ];
+      b.drain_us += stage_us[HTP_GU_T_DRAIN];
+    }
+  }
+
   ~HtpProfile() {
     if (level_ != 0)
       dump();
@@ -154,6 +239,7 @@ private:
     uint64_t host_us = 0;
     uint64_t dsp_us = 0;
     uint64_t quant_us = 0;
+    uint64_t swiglu_us = 0; /**< fused calls only; 0 elsewhere */
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
@@ -162,6 +248,12 @@ private:
   HtpProfile() {
     const char *env = std::getenv("NNTR_HTP_PROFILE");
     level_ = (env != nullptr) ? std::atoi(env) : 0;
+    // Captured at construction, not at static-destruction time in dump():
+    // HtpProfile::global() is always reached through a HtpBackend::global()
+    // call first (every accelerated entry point fetches the session handle
+    // before it ever touches the profile), so construction order is safe;
+    // destruction order is not something to lean on for a second singleton.
+    qos_mode_ = HtpBackend::global().qosMode();
   }
 
   static double ms(uint64_t us) { return static_cast<double>(us) / 1000.0; }
@@ -169,7 +261,12 @@ private:
   void dump() {
     // stderr, not the logger: this runs at static destruction, and the run
     // is driven from an adb shell where stderr is what the operator sees.
-    std::fprintf(stderr, "\n[HTP-PROFILE] level=%d\n", level_);
+    std::fprintf(
+      stderr,
+      "\n[HTP-PROFILE] level=%d qos_mode=%d (2=poll 1=PM "
+      "0=interrupt-driven -- every transport number below is only "
+      "comparable to 34_fc_measured.md's 326us/call at qos_mode=2)\n",
+      level_, qos_mode_);
 
     uint64_t invoke_us = 0;
     for (const auto &entry : buckets_)
@@ -215,10 +312,12 @@ private:
         const double host_per = static_cast<double>(b.host_us) / b.calls;
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
-                     "  [quant %.1f dequant %.1f acc %.1f drain %.1f]",
+                     "  [quant %.1f swiglu %.1f dequant %.1f acc %.1f "
+                     "drain %.1f]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per,
                      static_cast<double>(b.quant_us) / b.calls,
+                     static_cast<double>(b.swiglu_us) / b.calls,
                      static_cast<double>(b.dequant_us) / b.calls,
                      static_cast<double>(b.acc_us) / b.calls,
                      static_cast<double>(b.drain_us) / b.calls);
@@ -234,6 +333,7 @@ private:
   }
 
   int level_ = 0;
+  int qos_mode_ = 0;
   std::mutex mutex_;
   uint64_t reg_calls_ = 0;
   uint64_t reg_ion_calls_ = 0;
@@ -249,13 +349,28 @@ class HtpComputeOps : public CpuComputeOps {
 public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
 
-  // decode (M == 1) is the shape this kernel exists for, not an edge case
-  // to avoid: the M=1 padding tax is ~40us against 113us of DSP-only work
-  // (156us at M=64 -- 64x the rows for 1.38x the cost, same 64-row-wide
-  // accumulator either way), so the GEMV-instead-of-HMX alternative is
-  // already rejected -- see docs/htp_attention/34_fc_measured.md section5.1
-  // and 41_moe_ffn_e2e_and_perf_task.md sectionB3.
-  bool accelerates_q4_0_at_m1() const override { return true; }
+  // ponytail: decode-shaped (M == 1) calls are declined for the MoE FFN,
+  // not accelerated -- reversing 34_fc_measured.md section5.1's own
+  // conclusion for the isolated single-FC comparison it was measured on.
+  // That comparison is still correct in isolation (M=1 padding tax ~40us
+  // against 113us of DSP-only work, so one call is cheap) -- what it does
+  // not cover is 22 MoE layers' worth of M==1 calls stacked into one
+  // decode token. Device-measured on this branch: gate_up decode's DMA is
+  // fully exposed at M=1 (drain 419.2us for a 14.7MB weight group = 35
+  // GB/s, no different from one handle -- cross-matmul prefetch has
+  // nothing to hide behind at this width, unlike the FC benchmark's
+  // narrower weights), so the real per-layer cost is ~2.6ms/token, and
+  // 22 layers' worth is a ~57ms/token transport floor alone (17.5 TPS
+  // ceiling) against a CPU decode baseline measured at ~25.9 TPS on the
+  // same device. HTP cannot win decode until the call is fused across
+  // projections or the DMA-exposure problem above is fixed -- ceiling:
+  // revisit if 41_moe_ffn_e2e_and_perf_task.md's P1.3 (fused gate_up+
+  // swiglu+down, one call per layer) or P2 (u8 in/out, cuts payload 4x)
+  // lands, since either changes this arithmetic. Until then declining M=1
+  // costs nothing on the FC path this predicate was written for (single
+  // dot(), not a MoE stack) and saves the one MoE FFN caller from a
+  // documented loss.
+  bool accelerates_q4_0_at_m1() const override { return false; }
 
   // matAdata: Q4_0x4-repacked weight bytes, identity-cached across calls --
   // the same pointer for the lifetime of a loaded model (inference does not
@@ -268,6 +383,17 @@ public:
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const uint32_t handle = get_or_register(matAdata, session, K, N);
 
+    // ponytail: NOT invokeLayerU8In. Quantizing the activation on ARM/NEON
+    // moved that work off HVX (already vectorized, already writes straight
+    // into VTCM for HMX to read -- no DRAM detour ever existed for this
+    // step) onto ARM scalar/NEON code paying its own cost outside every
+    // number this file's profiler measures. Device-measured: DSP time did
+    // drop 19-26%, but wall-clock barely moved because the ARM-side
+    // quantize (300-420us unvectorized, ~200us with a magic-number round)
+    // ate the transport savings it was supposed to create. Reverted to
+    // the HVX-quantizes-into-VTCM path. invokeLayerU8In/htp_act_quant.*
+    // stay in the tree, unused, in case a caller that is not this one
+    // ever legitimately arrives with pre-quantized bytes already in hand.
     invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
   }
 
@@ -316,15 +442,15 @@ public:
     // a handful of KB, not a hidden cost.
     std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
     invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
-               out_cat.data(), M, n_total, K);
+                out_cat.data(), M, n_total, K);
 
     unsigned int col_offset = 0;
     for (size_t i = 0; i < n; ++i) {
       for (unsigned int row = 0; row < M; ++row) {
         std::memcpy(matCdata[i] + static_cast<size_t>(row) * N[i],
-                   out_cat.data() + static_cast<size_t>(row) * n_total +
-                     col_offset,
-                   N[i] * sizeof(float));
+                    out_cat.data() + static_cast<size_t>(row) * n_total +
+                      col_offset,
+                    N[i] * sizeof(float));
       }
       col_offset += N[i];
     }
@@ -348,10 +474,110 @@ public:
     const uint32_t handle =
       get_or_register_qs4cx(matAdata, matAscale, session, K, N);
 
+    // ponytail: see gemm_q4_0_accel_fp32's identical comment -- reverted
+    // from invokeLayerU8In for the same reason.
     invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
   }
 
+  // Same grouping as gemm_q4_0_batch_fp32, for QS4CX weights -- see the
+  // comment on the base declaration (compute_ops.h). Without this,
+  // FloatTensor::dot's vector overload had no accelerated path for QS4CX at
+  // all: every "grouped" decode call under --moe_dtype QS4CX silently fell
+  // through to one dotQs4cx() -- one FastRPC call -- per expert, the same
+  // shape of miss gemm_q4_0_batch_fp32's own commit fixed for Q4_0.
+  bool supports_gemm_qs4cx_batch_fp32() const override { return true; }
+
+  void gemm_qs4cx_batch_fp32(std::vector<void *> matAdata,
+                             std::vector<float *> matAscale, float *matBdata,
+                             std::vector<float *> matCdata, unsigned int M,
+                             std::vector<unsigned int> N,
+                             unsigned int K) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t n = matAdata.size();
+    std::vector<uint32_t> handles(n);
+    unsigned int n_total = 0;
+    for (size_t i = 0; i < n; ++i) {
+      handles[i] =
+        get_or_register_qs4cx(matAdata[i], matAscale[i], session, K, N[i]);
+      n_total += N[i];
+    }
+
+    // Same stage-then-scatter shape as gemm_q4_0_batch_fp32 -- see that
+    // function's comment for why: mm_u8i4_layer returns one contiguous
+    // block per handle, matCdata is one pointer per weight.
+    std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
+    invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
+                out_cat.data(), M, n_total, K);
+
+    unsigned int col_offset = 0;
+    for (size_t i = 0; i < n; ++i) {
+      for (unsigned int row = 0; row < M; ++row) {
+        std::memcpy(matCdata[i] + static_cast<size_t>(row) * N[i],
+                    out_cat.data() + static_cast<size_t>(row) * n_total +
+                      col_offset,
+                    N[i] * sizeof(float));
+      }
+      col_offset += N[i];
+    }
+  }
+
+  // The fused expert FFN (doc 43 §[L2]): one FastRPC call per expert per
+  // layer instead of two, with the M x 2I + M x I intermediates never
+  // leaving the DSP. The caller (Lfm2MoELayer) gates on M > 1 itself --
+  // decode's single token cannot amortize the fused call's 64-row pad
+  // tax, the same reasoning as accelerates_q4_0_at_m1() being false.
+  bool supports_gemm_qs4cx_fused_swiglu_fp32() const override { return true; }
+
+  void gemm_qs4cx_fused_swiglu_fp32(std::vector<void *> matAdata,
+                                    std::vector<float *> matAscale,
+                                    float *matBdata, float *matCdata,
+                                    unsigned int M, std::vector<unsigned int> N,
+                                    unsigned int K) override {
+    if (matAdata.size() != 2 || matAscale.size() != 2 || N.size() != 2) {
+      throw std::invalid_argument(
+        "gemm_qs4cx_fused_swiglu_fp32 needs exactly [gate_up, down]");
+    }
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const unsigned int inter = N[0] / 2;
+    const uint32_t h_gu =
+      get_or_register_qs4cx(matAdata[0], matAscale[0], session, K, N[0]);
+    const uint32_t h_dn =
+      get_or_register_qs4cx(matAdata[1], matAscale[1], session, inter, N[1]);
+    // ponytail: split-call path (invokeGateUpSwiglu + invokeLayerU8In), NOT
+    // invokeFused. The one-call fused kernel (still in the tree, dormant --
+    // see invokeFused's own comment) produced wrong output on this model's
+    // real weights; root cause never found despite passing its own
+    // synthetic-data unit test. This is the smaller-surface alternative
+    // doc 43 §7 describes: gate_up+SwiGLU+requant in one call (one weight,
+    // one VTCM region set), feeding the requantized u8 intermediate into
+    // the ALREADY-device-verified u8in path for down instead of
+    // reimplementing the down matmul. Verified stage-by-stage on device
+    // (unittest_hvx_mm_u8i4's GateUpSwiglu* tests) before being wired here.
+    invokeGateUpSwiglu(session, h_gu, matBdata, M, K, inter);
+    invokeLayerU8InRaw(session, &h_dn, 1, htp_act_m_pad(M), matCdata, M, N[1],
+                       inter);
+  }
+
 private:
+  /** @brief Grows @a buf to at least @a bytes, reusing it otherwise.
+   *
+   *  One buffer for activation, one for output, reused across every call
+   *  instead of one rpcmem alloc/free per matmul -- the buffers this
+   *  replaces (the tensor pool's plain heap pointers, passed straight
+   *  through) are pinned and mapped by the FastRPC driver on EVERY call
+   *  (htp_rpcmem.h's own doc comment; measured at ~155 MB/s vs ION's
+   *  44.6 GB/s, docs/htp_attention/34_fc_measured.md section4 item F). The
+   *  memcpy this adds is the trade: cheap relative to a per-call pin+map,
+   *  but that trade is exactly what NNTR_HTP_PROFILE's transport column is
+   *  for confirming on device -- do not assume the win without it. */
+  static void ensureCapacity(std::unique_ptr<HtpRpcBuffer> &buf, size_t bytes) {
+    if (!buf || buf->size() < bytes) {
+      buf = std::make_unique<HtpRpcBuffer>(bytes);
+    }
+  }
+
   /** @brief The one FastRPC layer call both accelerated entries make.
    *
    *  Under NNTR_HTP_PROFILE >= 2 it goes through mm_u8i4_layer_timed so the
@@ -359,22 +585,39 @@ private:
    *  difference between the two is the FastRPC transport. The production
    *  path (profile off) still calls the untimed entry, which is why the
    *  DSP probes cost nothing when nobody is measuring.
+   *
+   *  Not static any more: it now owns act_buf_/out_buf_, a pair of
+   *  rpcmem-backed scratch buffers reused across calls (ensureCapacity
+   *  above). invoke_mutex_ guards them -- required once they are shared
+   *  mutable state, and consistent with the single-owner assumption
+   *  test/htp/nntr_hvx_session.h already documents for the one HTP session
+   *  a process opens (one VTCM arena, one HMX lock).
    */
-  static void invokeLayer(remote_handle64 session, const uint32_t *handles,
-                          int num_handles, float *matBdata, float *matCdata,
-                          unsigned int M, unsigned int N, unsigned int K) {
+  void invokeLayer(remote_handle64 session, const uint32_t *handles,
+                   int num_handles, float *matBdata, float *matCdata,
+                   unsigned int M, unsigned int N, unsigned int K) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
 
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
+    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
+    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
+    float *out_cat = reinterpret_cast<float *>(out_buf_->data());
+    std::memcpy(act_f32, matBdata,
+                static_cast<size_t>(act_len) * sizeof(float));
+
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() == 0) {
-      const int err = nntr_hvx_mm_u8i4_layer(session, M, K, handles,
-                                             num_handles, matBdata, act_len,
-                                             matCdata, out_len);
+      const int err =
+        nntr_hvx_mm_u8i4_layer(session, M, K, handles, num_handles, act_f32,
+                               act_len, out_cat, out_len);
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer failed: err=" +
                                  std::to_string(err));
       }
+      std::memcpy(matCdata, out_cat,
+                  static_cast<size_t>(out_len) * sizeof(float));
       return;
     }
 
@@ -383,10 +626,10 @@ private:
     const uint64_t t0 = HtpProfile::nowUs();
     const int err =
       timed ? nntr_hvx_mm_u8i4_layer_timed(session, M, K, handles, num_handles,
-                                           matBdata, act_len, matCdata,
-                                           out_len, stage_us, HTP_N_STAGES)
+                                           act_f32, act_len, out_cat, out_len,
+                                           stage_us, HTP_N_STAGES)
             : nntr_hvx_mm_u8i4_layer(session, M, K, handles, num_handles,
-                                     matBdata, act_len, matCdata, out_len);
+                                     act_f32, act_len, out_cat, out_len);
     const uint64_t elapsed = HtpProfile::nowUs() - t0;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error(std::string(timed
@@ -394,6 +637,253 @@ private:
                                              : "nntr_hvx_mm_u8i4_layer") +
                                " failed: err=" + std::to_string(err));
     }
+    std::memcpy(matCdata, out_cat,
+                static_cast<size_t>(out_len) * sizeof(float));
+    profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
+  }
+
+  /** @brief Same call as invokeLayer, but the activation is quantized and
+   *  AH-tile-packed on the ARM side first (htp_act_quant.h) and sent as u8
+   *  instead of f32 -- see mm_u8i4_layer_u8in's IDL doc for what this buys.
+   *  Used by both accel entries, which the M > 1 gate means only ever run
+   *  at prefill shapes (accelerates_q4_0_at_m1() is false), matching this
+   *  path's scope: 41_moe_ffn_e2e_and_perf_task.md's P2. */
+  void invokeLayerU8In(remote_handle64 session, const uint32_t *handles,
+                       int num_handles, const float *matBdata, float *matCdata,
+                       unsigned int M, unsigned int N, unsigned int K) {
+    const uint32_t m_pad = htp_act_m_pad(M);
+    const size_t act_ah_bytes = static_cast<size_t>(m_pad) * K;
+    const int out_len = static_cast<int>(M) * static_cast<int>(N);
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    ensureCapacity(act_ah_buf_, act_ah_bytes);
+    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
+    uint8_t *act_ah = act_ah_buf_->data();
+    float *out_cat = reinterpret_cast<float *>(out_buf_->data());
+
+    if (act_scale_scratch_.size() < m_pad) {
+      act_scale_scratch_.resize(m_pad);
+      act_zp_scratch_.resize(m_pad);
+    }
+    htp_quant_pack_u8_ah(matBdata, M, K, act_ah, act_scale_scratch_.data(),
+                         act_zp_scratch_.data());
+
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() == 0) {
+      const int err = nntr_hvx_mm_u8i4_layer_u8in(
+        session, M, K, handles, num_handles, act_ah,
+        static_cast<int>(act_ah_bytes), act_scale_scratch_.data(),
+        static_cast<int>(m_pad), act_zp_scratch_.data(),
+        static_cast<int>(m_pad), out_cat, out_len);
+      if (err != AEE_SUCCESS) {
+        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_u8in failed: err=" +
+                                 std::to_string(err));
+      }
+      std::memcpy(matCdata, out_cat,
+                  static_cast<size_t>(out_len) * sizeof(float));
+      return;
+    }
+
+    uint32_t stage_us[HTP_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err =
+      timed
+        ? nntr_hvx_mm_u8i4_layer_u8in_timed(
+            session, M, K, handles, num_handles, act_ah,
+            static_cast<int>(act_ah_bytes), act_scale_scratch_.data(),
+            static_cast<int>(m_pad), act_zp_scratch_.data(),
+            static_cast<int>(m_pad), out_cat, out_len, stage_us, HTP_N_STAGES)
+        : nntr_hvx_mm_u8i4_layer_u8in(
+            session, M, K, handles, num_handles, act_ah,
+            static_cast<int>(act_ah_bytes), act_scale_scratch_.data(),
+            static_cast<int>(m_pad), act_zp_scratch_.data(),
+            static_cast<int>(m_pad), out_cat, out_len);
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_layer_u8in_timed"
+                          : "nntr_hvx_mm_u8i4_layer_u8in") +
+        " failed: err=" + std::to_string(err));
+    }
+    std::memcpy(matCdata, out_cat,
+                static_cast<size_t>(out_len) * sizeof(float));
+    profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
+  }
+
+  /** @brief The fused MoE expert FFN call: gate_up -> SwiGLU -> down in one
+   *  FastRPC round trip (doc 43 §[L2]). Same scratch-buffer reuse and
+   *  timed-entry split as invokeLayer; the SwiGLU stage gets its own
+   *  profile bucket via addInvokeFused. */
+  void invokeFused(remote_handle64 session, const uint32_t *handles,
+                   float *matBdata, float *matCdata, unsigned int M,
+                   unsigned int N, unsigned int K) {
+    const int act_len = static_cast<int>(M) * static_cast<int>(K);
+    const int out_len = static_cast<int>(M) * static_cast<int>(N);
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
+    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
+    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
+    float *out_f32 = reinterpret_cast<float *>(out_buf_->data());
+    std::memcpy(act_f32, matBdata,
+                static_cast<size_t>(act_len) * sizeof(float));
+
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() == 0) {
+      const int err = nntr_hvx_mm_u8i4_layer_fused(
+        session, M, K, handles, 2, act_f32, act_len, out_f32, out_len);
+      if (err != AEE_SUCCESS) {
+        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_fused failed: err=" +
+                                 std::to_string(err));
+      }
+      std::memcpy(matCdata, out_f32,
+                  static_cast<size_t>(out_len) * sizeof(float));
+      return;
+    }
+
+    uint32_t stage_us[HTP_FU_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err =
+      timed
+        ? nntr_hvx_mm_u8i4_layer_fused_timed(session, M, K, handles, 2, act_f32,
+                                             act_len, out_f32, out_len,
+                                             stage_us, HTP_FU_N_STAGES)
+        : nntr_hvx_mm_u8i4_layer_fused(session, M, K, handles, 2, act_f32,
+                                       act_len, out_f32, out_len);
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_layer_fused_timed"
+                          : "nntr_hvx_mm_u8i4_layer_fused") +
+        " failed: err=" + std::to_string(err));
+    }
+    std::memcpy(matCdata, out_f32,
+                static_cast<size_t>(out_len) * sizeof(float));
+    profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
+  }
+
+  /** @brief [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize
+   *  to u8 AH, ONE weight -- doc 43 §7's smaller-surface alternative to
+   *  invokeFused. Leaves its result in act_ah_buf_/act_scale_scratch_/
+   *  act_zp_scratch_ for invokeLayerU8InRaw (below) to consume immediately
+   *  after -- both run under gemm_qs4cx_fused_swiglu_fp32's call, so there
+   *  is no other caller between them to race with. */
+  void invokeGateUpSwiglu(remote_handle64 session, uint32_t handle_gate_up,
+                          const float *matBdata, unsigned int M, unsigned int K,
+                          unsigned int inter) {
+    const int act_len = static_cast<int>(M) * static_cast<int>(K);
+    const uint32_t m_pad = htp_act_m_pad(M);
+    const size_t out_ah_bytes = static_cast<size_t>(m_pad) * inter;
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
+    ensureCapacity(act_ah_buf_, out_ah_bytes);
+    if (act_scale_scratch_.size() < m_pad) {
+      act_scale_scratch_.resize(m_pad);
+      act_zp_scratch_.resize(m_pad);
+    }
+    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
+    uint8_t *out_ah = act_ah_buf_->data();
+    std::memcpy(act_f32, matBdata,
+                static_cast<size_t>(act_len) * sizeof(float));
+
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() == 0) {
+      const int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
+        session, M, K, handle_gate_up, act_f32, act_len, out_ah,
+        static_cast<int>(out_ah_bytes), act_scale_scratch_.data(),
+        static_cast<int>(m_pad), act_zp_scratch_.data(),
+        static_cast<int>(m_pad));
+      if (err != AEE_SUCCESS) {
+        throw std::runtime_error(
+          "nntr_hvx_mm_u8i4_gate_up_swiglu failed: err=" + std::to_string(err));
+      }
+      return;
+    }
+
+    uint32_t stage_us[HTP_GU_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err =
+      timed ? nntr_hvx_mm_u8i4_gate_up_swiglu_timed(
+                session, M, K, handle_gate_up, act_f32, act_len, out_ah,
+                static_cast<int>(out_ah_bytes), act_scale_scratch_.data(),
+                static_cast<int>(m_pad), act_zp_scratch_.data(),
+                static_cast<int>(m_pad), stage_us, HTP_GU_N_STAGES)
+            : nntr_hvx_mm_u8i4_gate_up_swiglu(
+                session, M, K, handle_gate_up, act_f32, act_len, out_ah,
+                static_cast<int>(out_ah_bytes), act_scale_scratch_.data(),
+                static_cast<int>(m_pad), act_zp_scratch_.data(),
+                static_cast<int>(m_pad));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_gate_up_swiglu_timed"
+                          : "nntr_hvx_mm_u8i4_gate_up_swiglu") +
+        " failed: err=" + std::to_string(err));
+    }
+    profile.addInvokeGateUpSwiglu(M, K, 2 * inter, elapsed,
+                                  timed ? stage_us : nullptr);
+  }
+
+  /** @brief Down matmul via the u8in path, fed act_ah/scale/zp that are
+   *  ALREADY quantized (by invokeGateUpSwiglu, just above) -- unlike
+   *  invokeLayerU8In, this does not call htp_quant_pack_u8_ah itself; there
+   *  is nothing f32 left to quantize, the DSP produced the bytes directly. */
+  void invokeLayerU8InRaw(remote_handle64 session, const uint32_t *handles,
+                          int num_handles, unsigned int m_pad_in,
+                          float *matCdata, unsigned int M, unsigned int N,
+                          unsigned int K) {
+    const size_t act_ah_bytes = static_cast<size_t>(m_pad_in) * K;
+    const int out_len = static_cast<int>(M) * static_cast<int>(N);
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
+    const uint8_t *act_ah = act_ah_buf_->data();
+    float *out_cat = reinterpret_cast<float *>(out_buf_->data());
+
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() == 0) {
+      const int err = nntr_hvx_mm_u8i4_layer_u8in(
+        session, M, K, handles, num_handles, act_ah,
+        static_cast<int>(act_ah_bytes), act_scale_scratch_.data(),
+        static_cast<int>(m_pad_in), act_zp_scratch_.data(),
+        static_cast<int>(m_pad_in), out_cat, out_len);
+      if (err != AEE_SUCCESS) {
+        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_u8in failed: err=" +
+                                 std::to_string(err));
+      }
+      std::memcpy(matCdata, out_cat,
+                  static_cast<size_t>(out_len) * sizeof(float));
+      return;
+    }
+
+    uint32_t stage_us[HTP_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err =
+      timed ? nntr_hvx_mm_u8i4_layer_u8in_timed(
+                session, M, K, handles, num_handles, act_ah,
+                static_cast<int>(act_ah_bytes), act_scale_scratch_.data(),
+                static_cast<int>(m_pad_in), act_zp_scratch_.data(),
+                static_cast<int>(m_pad_in), out_cat, out_len, stage_us,
+                HTP_N_STAGES)
+            : nntr_hvx_mm_u8i4_layer_u8in(
+                session, M, K, handles, num_handles, act_ah,
+                static_cast<int>(act_ah_bytes), act_scale_scratch_.data(),
+                static_cast<int>(m_pad_in), act_zp_scratch_.data(),
+                static_cast<int>(m_pad_in), out_cat, out_len);
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_layer_u8in_timed"
+                          : "nntr_hvx_mm_u8i4_layer_u8in") +
+        " failed: err=" + std::to_string(err));
+    }
+    std::memcpy(matCdata, out_cat,
+                static_cast<size_t>(out_len) * sizeof(float));
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
@@ -479,6 +969,21 @@ private:
 
   std::mutex handle_mutex_;
   std::unordered_map<const void *, uint32_t> handle_cache_;
+
+  // ION-backed activation/output scratch, reused across calls and grown on
+  // demand (ensureCapacity) -- see invokeLayer's comment. Guarded by the
+  // same mutex that serializes every call into the one HTP session.
+  std::mutex invoke_mutex_;
+  std::unique_ptr<HtpRpcBuffer> act_buf_;
+  std::unique_ptr<HtpRpcBuffer> out_buf_;
+
+  // invokeLayerU8In's scratch: the AH-packed activation (ION-backed, same
+  // reasoning as act_buf_/out_buf_) and the small per-row scale/zp arrays
+  // it produces alongside it (plain heap -- a few KB at most, not worth
+  // ION's pin/map bookkeeping).
+  std::unique_ptr<HtpRpcBuffer> act_ah_buf_;
+  std::vector<float> act_scale_scratch_;
+  std::vector<int32_t> act_zp_scratch_;
 };
 
 ComputeOps *get_htp_ops() {
