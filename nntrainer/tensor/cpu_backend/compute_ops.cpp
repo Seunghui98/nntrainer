@@ -195,6 +195,20 @@ void ComputeOps::gemm_qs4cx_accel_fp32(void *, float *, float *, float *,
                                        unsigned int) {
   NI(gemm_qs4cx_accel_fp32);
 }
+void ComputeOps::gemm_qs4cx_batch_fp32(std::vector<void *>,
+                                       std::vector<float *>, float *,
+                                       std::vector<float *>, unsigned int,
+                                       std::vector<unsigned int>,
+                                       unsigned int) {
+  NI(gemm_qs4cx_batch_fp32);
+}
+void ComputeOps::gemm_qs4cx_fused_swiglu_fp32(std::vector<void *>,
+                                              std::vector<float *>, float *,
+                                              float *, unsigned int,
+                                              std::vector<unsigned int>,
+                                              unsigned int) {
+  NI(gemm_qs4cx_fused_swiglu_fp32);
+}
 void ComputeOps::gemm_q4_K_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,
                                 unsigned int, float *, unsigned int) {

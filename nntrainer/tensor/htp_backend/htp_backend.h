@@ -63,6 +63,15 @@ public:
    */
   uint64_t handle() const { return handle_; }
 
+  /**
+   * @brief Which FastRPC latency QoS mode the constructor's control call
+   *        landed on: 2 = poll, 1 = PM, 0 = both rejected (interrupt-driven,
+   *        the ~3.9ms-tail path -- see htp_compute_ops.cpp's profile dump,
+   *        which prints this so a transport number is never read without
+   *        knowing which mode produced it).
+   */
+  int qosMode() const { return qos_mode_; }
+
   ~HtpBackend();
 
   HtpBackend(const HtpBackend &) = delete;
@@ -74,6 +83,7 @@ private:
   bool enabled_ = false;
   uint64_t handle_ = 0; ///< remote_handle64 from nntr_hvx_open; opaque here
                         ///< so this header does not need <remote.h>.
+  int qos_mode_ = 0;
 };
 
 } // namespace nntrainer

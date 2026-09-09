@@ -237,6 +237,37 @@ public:
                                      unsigned int M, unsigned int N,
                                      unsigned int K);
 
+  // Same grouping as gemm_q4_0_batch_fp32 (several weights sharing one
+  // activation, e.g. decode's top-K experts' gate_up projections), for
+  // QS4CX weights. Without this override, FloatTensor::dot's vector
+  // overload had no fast path for QS4CX at all and fell through to a
+  // per-weight loop of individual dotQs4cx() calls -- one FastRPC call per
+  // expert instead of one per call, same shape of miss as the Q4_0 batch
+  // override being written but the caller-side grouping shipping first
+  // (htp_compute_ops.cpp's gemm_q4_0_batch_fp32 comment).
+  virtual bool supports_gemm_qs4cx_batch_fp32() const { return false; }
+  virtual void
+  gemm_qs4cx_batch_fp32(std::vector<void *> matAdata,
+                        std::vector<float *> matAscale, float *matBdata,
+                        std::vector<float *> matCdata, unsigned int M,
+                        std::vector<unsigned int> N, unsigned int K);
+
+  // Fused MoE expert FFN (doc 43 §[L2]): ONE accelerator call computes
+  // gate_up @ act -> SwiGLU -> down @, the SwiGLU intermediate never
+  // leaving the accelerator. matAdata/matAscale/N carry exactly TWO QS4CX
+  // weights, [gate_up (K x 2I), down (I x N_out)] -- N[0] == 2 * down.K is
+  // the SwiGLU contract the impl must check. Callers gate on M > 1
+  // themselves (decode's single token cannot amortize the fused call's
+  // 64-row pad tax); without an override the caller keeps its two-dot +
+  // host-activation fallback.
+  virtual bool supports_gemm_qs4cx_fused_swiglu_fp32() const { return false; }
+  virtual void gemm_qs4cx_fused_swiglu_fp32(std::vector<void *> matAdata,
+                                            std::vector<float *> matAscale,
+                                            float *matBdata, float *matCdata,
+                                            unsigned int M,
+                                            std::vector<unsigned int> N,
+                                            unsigned int K);
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,
