@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "htp_act_quant.h"
 #include "htp_q4_0_convert.h"
 #include "int4_utils.h"
 #include "nntrainer_test_util.h"
@@ -647,6 +648,81 @@ TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_packed_accuracy) {
   // same weight with the same per-channel scheme -- the only difference is
   // the extra Q4_0 hop.
   EXPECT_LT(err_direct, err_hop);
+}
+
+/**
+ * @brief htp_quant_pack_u8_ah's own math, checked in isolation.
+ *
+ * This cannot compare against the real HVX path bit-for-bit -- that only
+ * exists on-device (nntr_hvx_mm_u8i4_from_f32 returns act_u8_ah/act_scale/
+ * act_zp for exactly that comparison; see docs/htp_attention's u8-boundary
+ * task for the device-side differential gate). What this test can check
+ * without a device: every invariant the DSP path's own contract states --
+ * per-row scale/zp bounds, the AH tile addressing formula, padding rows
+ * zeroed, and that dequantizing the packed bytes reproduces the input
+ * within one quantization step's error.
+ */
+TEST(nntrainer_cpu_backend_standalone, htp_quant_pack_u8_ah_accuracy) {
+  const uint32_t M = 37; // deliberately not a multiple of HTP_ACT_TILE_ROW
+  const uint32_t K = 128;
+
+  std::vector<float> x = generate_random_vector<float>(M * K);
+
+  const uint32_t m_pad = nntrainer::htp_act_m_pad(M);
+  ASSERT_EQ(m_pad, 64u);
+
+  std::vector<uint8_t> out_ah(static_cast<size_t>(m_pad) * K);
+  std::vector<float> act_scale(m_pad);
+  std::vector<int32_t> act_zp(m_pad);
+  nntrainer::htp_quant_pack_u8_ah(x.data(), M, K, out_ah.data(),
+                                  act_scale.data(), act_zp.data());
+
+  const uint32_t n_ktiles = K / nntrainer::HTP_ACT_TILE_INNER;
+  float max_abs_err = 0.0f;
+  for (uint32_t m = 0; m < M; ++m) {
+    ASSERT_GE(act_zp[m], 0) << "m=" << m;
+    ASSERT_LE(act_zp[m], 255) << "m=" << m;
+    ASSERT_GT(act_scale[m], 0.0f) << "m=" << m;
+
+    const uint32_t rb = m / nntrainer::HTP_ACT_TILE_ROW;
+    const uint32_t r = m % nntrainer::HTP_ACT_TILE_ROW;
+    for (uint32_t k = 0; k < K; ++k) {
+      const uint32_t kt = k / nntrainer::HTP_ACT_TILE_INNER;
+      const uint32_t c = k % nntrainer::HTP_ACT_TILE_INNER;
+      const size_t idx =
+        (static_cast<size_t>(rb) * n_ktiles + kt) *
+          nntrainer::HTP_ACT_TILE_BYTES +
+        static_cast<size_t>(r) * nntrainer::HTP_ACT_TILE_INNER + c;
+      const uint8_t q = out_ah[idx];
+      const float approx = act_scale[m] * (static_cast<float>(q) - act_zp[m]);
+      const float err = std::fabs(approx - x[static_cast<size_t>(m) * K + k]);
+      max_abs_err = std::max(max_abs_err, err);
+    }
+  }
+  std::cout << "htp_quant_pack_u8_ah: max_abs_err=" << max_abs_err << std::endl;
+  // One quantization step is scale (range/255); generate_random_vector's
+  // range makes this a loose smoke bound against a layout or rounding bug,
+  // not a tight accuracy contract -- same spirit as the qs4cx tests above.
+  EXPECT_LT(max_abs_err, 0.5f);
+
+  // Padding rows (M..m_pad) must be exactly zero -- the DSP dequant path
+  // never reads them, but a stray nonzero byte here would mean the tile
+  // addressing formula overlapped a real row into padding space.
+  for (uint32_t m = M; m < m_pad; ++m) {
+    EXPECT_FLOAT_EQ(act_scale[m], 1.0f) << "m=" << m;
+    EXPECT_EQ(act_zp[m], 0) << "m=" << m;
+    const uint32_t rb = m / nntrainer::HTP_ACT_TILE_ROW;
+    const uint32_t r = m % nntrainer::HTP_ACT_TILE_ROW;
+    for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+      const size_t base =
+        (static_cast<size_t>(rb) * n_ktiles + kt) *
+          nntrainer::HTP_ACT_TILE_BYTES +
+        static_cast<size_t>(r) * nntrainer::HTP_ACT_TILE_INNER;
+      for (uint32_t c = 0; c < nntrainer::HTP_ACT_TILE_INNER; ++c) {
+        EXPECT_EQ(out_ah[base + c], 0) << "m=" << m << " k=" << (kt * 32 + c);
+      }
+    }
+  }
 }
 
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
