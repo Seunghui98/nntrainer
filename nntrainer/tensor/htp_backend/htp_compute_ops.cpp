@@ -736,6 +736,48 @@ public:
         max_abs_err = std::fabs(d);
     }
     const double snr = (noise == 0.0) ? 999.0 : 10.0 * std::log10(sig / noise);
+
+    // Outlier-row hypothesis: hvx_quant_rows_u8_params sets ONE scale per
+    // row from that row's own min/max (the same scan the NaN bug poisoned
+    // -- doc 43 section 5). A real trained model's SwiGLU intermediate can
+    // have an outlier value fill_deterministic's bounded uniform fill never
+    // produces; if one lane dominates a row's range, the rest of that row's
+    // 255 levels spread thinner and the row's requant noise rises without
+    // ever going non-finite. `mid` is exactly that intermediate (pre-
+    // quantization, host f32), already computed above for the reference --
+    // this reuses it rather than adding a DSP round trip. Printed only for
+    // calls the aggregate SNR flags as suspect, so the common (mid-140s dB)
+    // case stays one line.
+    if (snr < 100.0) {
+      size_t worst_row = 0;
+      double worst_row_err = -1.0;
+      for (unsigned int m = 0; m < M; ++m) {
+        double row_err = 0.0;
+        for (unsigned int n = 0; n < N_out; ++n) {
+          const double d =
+            static_cast<double>(got[static_cast<size_t>(m) * N_out + n]) -
+            ref[static_cast<size_t>(m) * N_out + n];
+          row_err += d * d;
+        }
+        if (row_err > worst_row_err) {
+          worst_row_err = row_err;
+          worst_row = m;
+        }
+      }
+      float row_min = mid[worst_row * inter], row_max = row_min;
+      for (unsigned int j = 0; j < inter; ++j) {
+        const float v = mid[static_cast<size_t>(worst_row) * inter + j];
+        row_min = std::min(row_min, v);
+        row_max = std::max(row_max, v);
+      }
+      std::fprintf(stderr,
+                   "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
+                   "max_abs_err=%g  worst_row=%zu row_sq_err=%g "
+                   "mid_range=[%.4f, %.4f] mid_span=%.4f\n",
+                   M, K, inter, N_out, snr, max_abs_err, worst_row,
+                   worst_row_err, row_min, row_max, row_max - row_min);
+      return;
+    }
     std::fprintf(stderr,
                  "[L2-DIFF] M=%-4u K=%u inter=%u N=%u  snr=%8.2f dB  "
                  "max_abs_err=%g\n",
