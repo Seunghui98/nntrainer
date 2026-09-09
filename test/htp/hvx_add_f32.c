@@ -58,14 +58,22 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   // lifetime, instead of per call (doc15 §3/§4) -- every other entry point
   // in this skel reaches vtcm_base/vtcm_size/config_off through the
   // session rather than re-acquiring either.
-  // ponytail: this SDK checkout's hexkl_micro_hw_init takes two args, not
-  // the three-arg (+ hmx_fp16_rate) beta2 signature ref_08's docs describe
-  // -- a pre-existing SDK/doc mismatch unrelated to this session's work,
-  // found only because it blocked compiling the skel at all. Fixed
-  // mechanically to what this SDK's header actually declares; revisit if a
-  // newer hexkl_addon restores the three-arg form and something starts
-  // wanting hmx_fp16_rate.
+  // hexkl_micro_hw_init's arity is not stable across hexkl_addon drops: the
+  // beta2 header ref_08's docs describe takes three args (the third reports
+  // the HMX fp16 throughput rate), an older checkout this skel was first
+  // built against took two. The header carries no version macro to branch
+  // on, so this defaults to the three-arg form -- what hxkl-beta2 ships --
+  // and leaves -DNNTR_HEXKL_HW_INIT_2ARG as the escape hatch for the older
+  // one. Nothing here wants hmx_fp16_rate: this skel's HMX use is int8/int4
+  // only. If a future drop changes the arity again, this is the one line to
+  // touch.
+#ifdef NNTR_HEXKL_HW_INIT_2ARG
   int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size);
+#else
+  uint32_t hmx_fp16_rate = 0; /* unused: int8/int4 HMX only */
+  int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size, &hmx_fp16_rate);
+  (void)hmx_fp16_rate;
+#endif
   if (res != AEE_SUCCESS) {
     FARF(ERROR, "nntr_hvx_open: hexkl_micro_hw_init failed: 0x%08x", res);
     free(s);
