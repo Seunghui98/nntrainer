@@ -142,3 +142,70 @@ RMSNorm_det, gating, conv1d(state cache 포함), in_proj/out_proj. `conv_block_r
 2. ✅ **attention 실측** — §1/§2에 반영. 2 ms 추정은 7배 낙관이었고, 천장이 2.5× → 2.3×로 내려왔다.
 3. **Gate 0** — `unittest_hvx_mm_u8i4`의 `RegistryCapacity` (아래).
 4. **Gate 1** — `NNTR_M1_PROFILE` (아래).
+
+---
+
+## 8. Gate 0 결과 (2026-09-10, 기기) — **실패. 계획은 살지만 설계가 바뀐다**
+
+```
+U8I4_FIELD path=registry field=weights_resident value=516
+U8I4_FIELD path=registry field=gb_resident value=1.89373
+U8I4_FIELD path=registry field=stop_reason value=0x8000040d
+U8I4_FIELD path=registry field=register_ms_per_weight value=26.1813
+[  FAILED  ] HmxMmU8I4Layer.RegistryCapacity
+```
+
+### 8.1 필요량 대비 46%
+
+| | WH-bake 바이트 |
+|---|---:|
+| MoE 22 레이어 (32 experts × 2 weight) | 3.88 GB |
+| conv 18 | 0.15 GB |
+| dense FFN 2 | 0.04 GB |
+| attention 6 | 0.03 GB |
+| **합계** | **4.10 GB** |
+| **측정된 천장** | **1.89 GB (46%)** |
+
+MoE 레이어 하나가 176 MB이므로 **10.7 레이어**까지 들어간다. (기존 `HEXKL_MM_U8I4_MAX_WEIGHTS=512`가 8 레이어로 묶어둔 것은 슬롯 수 제한이었고, 진짜 제약은 메모리였다.)
+
+### 8.2 무엇이 막았는가 — 힙이 아니라 그 앞이다
+
+`hexkl_weight_u8i4_register`가 malloc 실패 시 반환하는 것은 `AEE_ENOMEMORY`(2 → `0x80000402`)다. 받은 것은 **`0x8000040d`(13)** — 즉 **우리 함수에 도달하기 전에 FastRPC 호출 자체가 실패했다.** DSP PD가 3.67 MB짜리 입력 시퀀스를 받을 메모리조차 없었다는 뜻이다. 한계는 PD의 메모리 전체이지 `malloc` 힙만이 아니다.
+
+### 8.3 더 큰 문제: 지금 설계는 weight를 두 벌 갖는다
+
+현재 경로: ARM이 Q4_0 weight를 모델 파일에서 로드해 메모리에 유지 → FastRPC로 RM 레이아웃을 보냄 → DSP가 VTCM에서 bake → **DSP가 malloc해서 복사**.
+
+즉 **ARM에 Q4_0 원본 ~4.3 GB + DSP에 WH 바이트 4.1 GB = 8.4 GB**가 weight만으로 필요하다. 지금도 peak RSS가 8.28 GB다. **DSP 한계를 푼다 해도 물리 메모리가 안 된다.**
+
+### 8.4 그래서 설계 변경: weight는 한 벌, ION에, 한 번 bake
+
+```
+지금:  [파일] → ARM Q4_0 (4.3 GB) → RPC 복사 → DSP bake → DSP malloc (4.1 GB)
+목표:  [파일] → ION 아레나 (4.1 GB, bake된 WH 바이트) ← DSP가 매핑해서 직접 읽음
+                                                     ← ARM은 안 만짐
+```
+
+- WH-bake 결과는 결정적 바이트다 (43 §7 L1에서 FNV-1a로 확인). **한 번 구워 파일에 저장**하고, 다음 로드는 그 파일을 ION으로 mmap하면 된다.
+- `hexkl_dma_ring`은 `src`를 평범한 포인터로 받아 물리 DMA를 건다. ION이 DSP 주소공간에 매핑되어 있으면 그대로 동작한다 — 커널 변경 없음.
+- ARM 쪽 Q4_0 사본은 bake 후 해제(또는 애초에 QS4CX로 로드).
+
+**이것은 P4(등록 bake 캐시)와 같은 작업이다.** P4는 "기동 34초 → 3초"의 편의 항목이었는데, **이제 계획이 성립하기 위한 전제**가 되었다. Phase D에서 앞으로 당긴다.
+
+### 8.5 남은 미지수 — Gate 0b
+
+1.89 GB가 **PD 메모리 한계**인지 **DSP 가상주소공간 한계**인지 아직 모른다. ION 매핑은 전자는 우회하지만 후자는 우회하지 못한다 (Hexagon 사용자 PD의 VA가 32비트면 4 GB가 상한이고, 4.10 GB는 그 위다).
+
+**Gate 0b**: ION 아레나를 점점 크게 할당해 DSP에 매핑하고 DSP가 읽을 수 있는지 확인. 코드 ≈100줄, 실행 1회.
+
+| Gate 0b 결과 | 계획 |
+|---|---|
+| ≥4.1 GB 매핑 가능 | 계획 그대로, §8.4 설계로 진행 |
+| 2–4 GB | **MoE weight를 int4보다 작게** (실험적) 또는 **레이어 그룹 단위로 ION 재매핑** (레이어당 재매핑 비용 측정 필요) |
+| <2 GB (VA 한계가 진짜 원인) | **이 모델은 이 기기에서 전부 상주 불가.** MoE FFN만 최적화(doc 44 §16, 1.2×)로 후퇴하거나 더 작은 모델 |
+
+### 8.6 계획에 미치는 영향
+
+- **Phase A(MoE 상주 커널)는 영향 없음** — 지금도 8~10 레이어가 들어가고, 인터페이스 설계(§3.1)는 그대로다. 착수 가능.
+- **Phase D 앞에 P4 + ION 아레나가 들어간다.** 순서: Gate 0b → Phase A → (Gate 1이 정하는) B/C → **P4+ION** → Phase D.
+- 천장 추정(§2, 1.7~2.3×)은 변하지 않는다. 달성 확률은 Gate 0b에 달렸다.
