@@ -305,3 +305,159 @@ activation을 **레이어당 한 번** u8로 양자화해두면:
 필요한 것: `hvx_quant_rows_u8_rm`(행-major u8로 양자화)와 `hvx_pack_ah_from_u8_rows`(행 인덱스로 골라 AH 타일로 재배치). 예상 quant 5.50 → ≈1.5, staging −1.8.
 
 **mm 잔차 13.69**(실측 mm은 8.87)는 별도로 열어둔다 — 4.8 ms가 어느 단계에도 안 잡힌다. 프로브를 하나 더 넣기 전에는 추측하지 않는다.
+
+## 13. A-5 4차: quantize-once (2026-09-10) — 47.9 → **42.7 ms**
+
+기기 실행. 텍스트 정상(473토큰 요약), prefill 2931 ms / 151.484 TPS(지금까지 최고),
+decode 31.4056 TPS, registration 1534.1 ms.
+
+```
+K=2048 N=2048 M>1 calls=1 rows=444 host= 42.7 ms dsp=40432 transport=2291
+  [quant 5537 swiglu 1926 dequant 6005 acc 2794 drain 5466 scatter 8066
+   | mm<=10638 (24.9% of host)]
+layer calls total : 42.7 ms
+```
+
+`prefill − registration − layer`는 1354로, 12.1의 2004에서 정상 범위(1345–1408)로
+돌아왔다. 그 660 ms는 역시 우리 코드가 아니었다.
+
+### 13.1 예측은 맞았고 이유는 틀렸다
+
+측정 전에 적어둔 예측은 `quant 5.50 → ≈1.5`, `layer calls total ≈43`이었다.
+총합은 42.7로 왔지만 **quant는 5503 → 5537로 움직이지 않았다.**
+
+| 단계 | 3차 | 4차 | Δ |
+|---|---:|---:|---:|
+| quant | 5503 | 5537 | **+0.03** |
+| scatter(+staging) | 9170 | 8066 | −1.10 |
+| mm 잔차 | 13688 | 10638 | −3.05 |
+| dequant | 6141 | 6005 | −0.14 |
+| drain | 5124 | 5466 | +0.34 |
+| acc | 2792 | 2794 | 0 |
+| swiglu | 1934 | 1926 | 0 |
+| **layer calls total** | **47.9** | **42.7** | **−5.2** |
+
+−5.2 ms는 예측한 자리에서 오지 않았다. 이건 그냥 넘길 결과가 아니다 — 문서 44
+§11.5의 "세는 논증은 믿지 마라"가 정확히 이 모양이다. **합이 맞았다는 사실이 각
+항이 맞았다는 뜻은 아니다.**
+
+읽을 수 있는 가설은 두 개뿐이고, 지금 프로파일로는 **어느 쪽도 확정할 수 없다**:
+
+1. quant 버킷이 실제로는 세 가지를 담고 있었다 — 레이어 전체 activation 양자화,
+   블록별 `hvx_gather_ah_u8` + scale/zp 슬라이스, SwiGLU 출력의 블록별 재양자화.
+   재구조화가 첫 번째를 5.5 → 1.5로 줄였더라도 두 번째가 새로 들어왔으므로
+   **버킷 합은 그대로일 수 있다.**
+2. mm 잔차가 −3.05 움직인 것은 잔차이기 때문이다 — 이름 없는 시간이 전부 여기
+   모인다. 3차의 mm 13688은 실측 mm 8870 대비 +4.8이었고, 그 미설명분이 줄었다.
+
+1번이 맞다면 재구조화는 성공했고 비용이 이름만 바꿔 앉은 것이다. 2번이 맞다면
+재구조화는 quant에 영향이 없었고 이득은 다른 데서 왔다. **버킷 하나로는 답이 안
+나온다** — ACC_READ와 SCATTER를 한 칸에 넣었다가 104.8 ms를 놓쳤던 것과 같은 실수다.
+
+### 13.2 그래서 버킷을 쪼갰다 (코드 완료, 미측정)
+
+`HEXKL_PROBE_QUANT` 하나를 셋으로:
+
+| 슬롯 | 재는 것 |
+|---|---|
+| `HEXKL_PROBE_QUANT` | 레이어당 1회 activation 양자화 (`hvx_quant_rows_u8_params` + `hvx_quant_pack_u8_ah`) |
+| `HEXKL_PROBE_GATHER` | `hvx_gather_ah_u8` + 블록별 scale/zp 슬라이스 |
+| `HEXKL_PROBE_REQUANT` | SwiGLU 출력의 블록별 양자화 (재구조화가 손대지 않은 부분) |
+
+동시에 **`scatter`에서 `stage`를 떼어냈다.** 지금까지 `scatter_us`는 라우팅
+곱셈+누적과 FastRPC 버퍼 staging 복사를 같이 담고 있었는데, 13.3의 변경이 건드리는
+건 정확히 후자뿐이라 붙어 있으면 효과를 읽을 수 없다.
+
+`MOE_T_GATHER`/`MOE_T_REQUANT`가 붙어 `MOE_N_STAGES`가 9 → 11이 됐다. 즉
+**skel을 다시 빌드해야 한다** — `./test/htp/build.sh`. 안 하면 `0x8000040E`
+(EBADPARM)로 죽는다. `build_android.sh`는 skel을 빌드하지 않는다.
+
+### 13.3 staging 복사를 DMA로 (코드 완료, 미측정)
+
+`scatter 8066` 안에는 staging memcpy가 약 3.6 ms 들어 있다(3.6 MB in + 3.6 MB out,
+uncached rpcmem ↔ cached heap). 스칼라 코어가 uncached DDR을 읽는 건 이 하드웨어가
+가진 가장 느린 동작이고, **대량 이동용 엔진이 바로 옆에 놀고 있다.**
+
+`moe_dma_copy()`가 `hexkl_dma_ring_push2d`로 옮긴다. 두 지점 다 DMA가 비어 있다:
+activation 복사는 전문가 루프 **전**(0번 전문가의 gate_up만 in-flight),
+출력 복사는 루프 **후**(아무것도 없음). `hexkl_dma_ring_drain()`이 pending 전부를
+기다리는 제약과 충돌하지 않는 유일한 두 자리다.
+
+### 13.4 fused 40.1까지 남은 +2.6 ms
+
+| | fused 40.1 | 배칭 42.7 | Δ |
+|---|---:|---:|---:|
+| **transport** | 16.95 | **2.29** | **−14.7** |
+| scatter + staging | ~2.1 | 8.07 | +6.0 |
+| drain | 3.31 | 5.47 | +2.2 |
+| quant | 3.57 | 5.54 | +2.0 |
+| mm 잔차 | 8.87 | 10.64 | +1.8 |
+
+**설계가 약속한 것(transport −14.7)은 그대로 왔다.** 다 못 챙긴 이유는 ARM에서
+DSP로 옮긴 일(gather·scatter·staging)이 DSP에서 더 비싸기 때문이다. DSP는 HMX
+행렬곱에서 빠른 것이지 대량 메모리 이동에서 빠른 게 아니다 — 이게 이 단계에서
+배운 것이고, 남은 항목들(13.3의 DMA, A-6의 dequant)은 전부 같은 성질이다.
+
+`drain 5.47`은 설계가 예측한 0.51의 10배다. 전문가 간 weight DMA 파이프라인이
+**숨지 않고 있다.** 원인 후보는 (a) 앞 전문가의 계산이 다음 weight를 끌어올 만큼
+길지 않다, (b) `drain()`이 pending 전부를 기다리므로 필요 없는 대기까지 한다.
+13.3이 activation/출력 복사를 같은 링에 얹으므로 **이 숫자를 (b) 관점에서 다시
+봐야 한다** — 다음 측정에서 drain이 오르면 (b)가 원인이라는 증거다.
+
+## 14. 인계 (2026-09-10) — 다음 세션이 여기서 시작한다
+
+### 14.1 지금 상태
+
+| | |
+|---|---|
+| 브랜치 | `claude/lfm2-moe-ffn-hexkl-2ivn5v` |
+| 기기 최고 기록 | **42.7 ms** (§13). 이겨야 할 fused 경로는 **40.1 ms** |
+| 정확도 | V1 비트 동일(`bad_elems=0 of 409600`), 실모델 텍스트 473토큰 정상 |
+| 커밋됐지만 **기기에서 안 잰 것** | §13.2 프로브 분할, §13.3 staging DMA |
+
+**커밋됐지만 안 잰 것이 두 개 있다는 게 이 인계의 핵심이다.** 둘 중 프로브 분할은
+동작을 바꾸지 않는 측정 전용이고, DMA만 기능 변경이다 — 그래서 한 번의 기기 실행이
+"DMA가 먹혔나"와 "quant 5537의 정체가 뭔가"를 동시에 답한다.
+
+### 14.2 다음 세션의 첫 세 줄
+
+1. `./test/htp/build.sh` — **skel을 반드시 다시 빌드한다.** `MOE_N_STAGES`가
+   9 → 11로 늘었다. 안 하면 `nntr_hvx_mm_u8i4_moe_layer_timed failed:
+   err=-2147482610` (0x8000040E, EBADPARM). 이 사이클을 이미 한 번 잃었다.
+2. `./build_android.sh --htp` (skel은 안 만든다)
+3. `NNTR_HTP_PROFILE=2`로 모델 실행 → `layer calls total`과 새 칼럼
+   `[quant … gather … requant … stage …]`을 본다.
+
+### 14.3 그 측정이 답하는 것
+
+| 관측 | 해석 | 다음 |
+|---|---|---|
+| `quant ≈1.5`, `gather ≈2.5`, `requant ≈1.5` | §13.1 가설 1. 재구조화는 먹혔고 비용이 gather로 이름만 옮겼다 | gather를 줄인다 — 지금은 행마다 `k_tiles`번 32바이트 복사다. 행 인덱스로 DMA 2D descriptor를 쓰거나, 아예 gather 없이 전문가별 행을 양자화 단계에서 바로 AH에 배치 |
+| `quant ≈5.5`, `gather ≈0` | 가설 2. 재구조화가 quant에 영향이 없었다 | `hvx_quant_pack_u8_ah` 자체가 병목 — 내부 프로브 필요 |
+| `stage`가 3.6 → ≈0.5 | §13.3 DMA 성공 | scatter 본체 ~4.5 ms가 다음 표적 |
+| `stage`는 줄었는데 `drain`이 올랐다 | §13.4의 (b) — `drain()`이 pending 전부를 기다린다 | 링을 분리하거나 `wait_idx`로 필요한 것만 기다린다 |
+
+### 14.4 남은 Phase A 항목 (우선순위)
+
+- **A-6 / dequant 6.0 ms.** 1.75 G elem/s인데 이론은 25.6 G/s — 15배. 아직 프로브
+  안 넣었다. 문서 44 §16의 P2.
+- **mm 잔차.** 10638인데 실측 mm은 ~8870. §13.2의 분할이 일부를 흡수할 수 있다.
+- **drain 5.47 vs 설계 0.51.** §13.4.
+- **V2**: `NNTR_L2_DIFF`를 배치 호출까지 확장(§7의 V1/V3는 끝, V2만 남음).
+- **§15.3 실험**: `nntr_config.json`의 `moe_htp_layers`를 `"2"` → `"5"`. 코드 변경
+  없음. HTP 레이어의 추가 gather 비용이 HTP 고유인지 registration 여파인지 가른다.
+- **P4 / ION arena** (문서 45 §8.4): WH 바이트를 파일로 한 번 굽고 ION에 mmap.
+  전체 모델 상주(메모리)와 prefill에서 registration 1.5 s 제거, 둘 다에 필요.
+
+그 뒤는 문서 45: Gate 1(M1 블록별 CPU 분해) → Phase B(conv) → C(attention)
+→ D(레이어 오케스트레이션) → E(decode).
+
+### 14.5 바뀌지 않는 규칙
+
+- **기기에서 재기 전에는 "확인했다"고 쓰지 않는다.** 이 문서에서 §13.2·§13.3이
+  "코드 완료, 미측정"인 이유다.
+- 한 버킷이 두 가지를 담으면 진단이 불가능하다. ACC_READ+SCATTER에서 104.8 ms를
+  놓쳤고, QUANT에서 §13.1을 놓쳤다. 세 번은 없어야 한다.
+- 세는 논증(문서 44 §11.5)은 못 믿는다. 지배하는 건 메모리 접근 패턴과 대기다.
+- decode < 30 TPS면 온도 게이트 — transport/host/벽시계는 비교 불가, DSP 내부
+  단계만 유효하다.

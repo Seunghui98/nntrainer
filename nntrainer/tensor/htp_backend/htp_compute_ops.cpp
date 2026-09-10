@@ -143,6 +143,8 @@ enum {
   HTP_MOE_T_ACC_READ,
   HTP_MOE_T_DRAIN,
   HTP_MOE_T_SCATTER,
+  HTP_MOE_T_GATHER,
+  HTP_MOE_T_REQUANT,
   HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
   HTP_MOE_N_STAGES
@@ -272,7 +274,10 @@ public:
       b.swiglu_us += stage_us[HTP_MOE_T_SWIGLU];
       b.dequant_us += stage_us[HTP_MOE_T_DEQUANT];
       b.acc_us += stage_us[HTP_MOE_T_ACC_READ];
-      b.scatter_us += stage_us[HTP_MOE_T_SCATTER] + stage_us[HTP_MOE_T_STAGE];
+      b.scatter_us += stage_us[HTP_MOE_T_SCATTER];
+      b.stage_us += stage_us[HTP_MOE_T_STAGE];
+      b.gather_us += stage_us[HTP_MOE_T_GATHER];
+      b.requant_us += stage_us[HTP_MOE_T_REQUANT];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
   }
@@ -307,6 +312,16 @@ private:
         no other call type does, so they get their own column rather than
         being folded into one that means something else. */
     uint64_t scatter_us = 0;
+    /** MoE layer call only, and separate from scatter_us for the same
+        reason scatter_us is separate from acc_us: these are the copies to
+        and from the FastRPC buffers, they are the one thing the DMA change
+        touches, and merged into scatter there is no reading of the profile
+        that says whether it worked. */
+    uint64_t stage_us = 0;
+    /** MoE layer call only. quant_us used to hold all three; see
+        hexkl_probe.h's HEXKL_PROBE_GATHER for why they split. */
+    uint64_t gather_us = 0;
+    uint64_t requant_us = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
@@ -383,6 +398,9 @@ private:
         const double dequant_per = static_cast<double>(b.dequant_us) / b.calls;
         const double acc_per = static_cast<double>(b.acc_us) / b.calls;
         const double drain_per = static_cast<double>(b.drain_us) / b.calls;
+        const double stage_per = static_cast<double>(b.stage_us) / b.calls;
+        const double gather_per = static_cast<double>(b.gather_us) / b.calls;
+        const double requant_per = static_cast<double>(b.requant_us) / b.calls;
         // What the accelerator actually exists for, by subtraction: the DSP
         // clock minus every stage that is a format change or a wait. Nothing
         // on the DSP times the HMX issue loop directly, and adding a probe
@@ -393,15 +411,19 @@ private:
         /* mm is the residual, so every named stage has to be subtracted --
            scatter included, or the MoE layer call's scatter time would be
            reported as matmul. */
-        const double mm_per = dsp_per - (quant_per + swiglu_per + dequant_per +
-                                         acc_per + drain_per + scatter_per);
+        const double mm_per =
+          dsp_per - (quant_per + swiglu_per + dequant_per + acc_per +
+                     drain_per + scatter_per + stage_per + gather_per +
+                     requant_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
-                     "  [quant %.1f swiglu %.1f dequant %.1f acc %.1f "
-                     "drain %.1f scatter %.1f | mm<=%.1f (%.1f%% of host)]",
+                     "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
+                     "dequant %.1f acc %.1f drain %.1f scatter %.1f "
+                     "stage %.1f | mm<=%.1f (%.1f%% of host)]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
-                     host_per - dsp_per, quant_per, swiglu_per, dequant_per,
-                     acc_per, drain_per, scatter_per, mm_per,
+                     host_per - dsp_per, quant_per, gather_per, requant_per,
+                     swiglu_per, dequant_per, acc_per, drain_per, scatter_per,
+                     stage_per, mm_per,
                      host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0);
       }
       std::fprintf(stderr, "\n");
