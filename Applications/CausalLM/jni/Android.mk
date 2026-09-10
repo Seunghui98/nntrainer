@@ -34,6 +34,10 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2_moe \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend
+# htp_backend is here for one header: swiglu_det.h, the deterministic SwiGLU
+# the MoE layer shares with the DSP. It is header-only and builds on any
+# target, so this costs nothing on a non-HTP build.
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the

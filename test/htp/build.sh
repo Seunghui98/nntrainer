@@ -55,6 +55,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c"
     -Wall -Werror \
     -I generated \
     -I "$HEXKL_ROOT/include" \
+    -I "$BACKEND" \
     -I "$BACKEND/hvx" \
     -I "$BACKEND/hmx" \
     -I "$HEXAGON_SDK_ROOT/rtos/qurt/compute${HEX_ARCH}/include/qurt" \

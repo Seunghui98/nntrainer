@@ -462,13 +462,45 @@ A1은 양쪽이 같은 스펙을 돌려야 성립하므로 ARM 구현이 필요�
 
 세지 않고 확인했다 (§11.5의 규칙 그대로 — 이건 소스의 성질이 아니라 컴파일러의 성질이다): aarch64 gcc 13과 clang 18, `-O3` / `-ffp-contract=fast` / `-ffast-math` / `-Ofast` 네 설정 전부에서 fmla 0개, 그리고 게이트 테스트와 같은 8192개 입력에서 NEON과 스칼라가 **비트 동일**(qemu-aarch64 실행 — 에뮬레이션이지 이 기기가 아니다). 기기 확인은 `SwigluDetNeon.MatchesScalar`가 한다.
 
-### 12.6 다음
+### 12.6 게이트 통과 (2026-09-10, 기기)
 
-여전히 배선하지 않는다. 다음 실행이 **`bad_exp=0`과 `SWIGLU_DET_NEON_FIELD bad=0`을 둘 다** 주면 DSP == 스칼라, NEON == 스칼라 ⇒ **DSP == NEON**이 추이적으로 성립하고, 그것이 fused 경로가 실제로 필요로 하는 성질이다. 그때 배선한다:
+```
+SWIGLU_DET_FIELD      bad_exp=0 bad_recip=0 bad_out=0 of 8192
+SWIGLU_DET_NEON_FIELD bad=0 of 8192
+```
 
-1. `hvx_swiglu_f32.c`를 det판으로 전환
-2. `lfm2_moe_layer.cpp`의 `nntrainer::swiglu` 호출 3곳을 `swiglu_det`으로
-3. `kFusedSwigluEnabled = true`
-4. `NNTR_L2_DIFF=1`로 확인 — **텍스트가 아니라 `total_flips`가 판정 기준이다.** 32 호출 전부 0이어야 하고, 지금은 5개 호출에서 1이다
+DSP == 스칼라, NEON == 스칼라 ⇒ **DSP == NEON**, 실기기에서. A1의 전제와 구현이 모두 확인됐다. 술어 수정(`< 0` → `<= 0`)이 정확히 그 5개를 잡았고 다른 것은 건드리지 않았다.
 
-한 번에 한 변수만 움직인다. 그것이 L2를 결국 닫은 방식이다.
+### 12.7 배선 — 그리고 SwiGLU가 셋이었다는 사실
+
+배선하며 드러난 것: 이 코드베이스에는 **서로 다른 SwiGLU 구현이 셋** 돌고 있었다.
+
+| 위치 | 구현 | 쓰이는 곳 |
+|---|---|---|
+| `neon_impl.cpp` `nntrainer::swiglu` | `exp_ps`(5차) + `vdivq_f32` | 모델의 실제 ARM 경로 |
+| `htp_compute_ops.cpp:745` | `std::exp` (스칼라) | `NNTR_L2_DIFF`의 레퍼런스 |
+| `hvx_swiglu_f32.c` | `hvx_exp_sf`(qf32, 7차) + NR 역수 | fused DSP 경로 |
+
+**`total_flips`가 잘못된 것을 재고 있었다.** l2Diff는 fused DSP를 `std::exp` 레퍼런스와 비교했는데, 모델이 실제로 쓰는 것은 `exp_ps`다. 0이 아닌 값이 나와도 "fused가 모델의 실제 경로와 어긋났다"인지 "둘 다 libm과 어긋났다"인지 구분되지 않았다.
+
+배선한 곳 네 군데:
+
+| 파일 | 변경 |
+|---|---|
+| `hvx/hvx_swiglu_f32.c` | `hvx_swiglu_det_sf`로 전환. qf32 역수와 `exp_top` 클램프 삭제(det판이 자체 클램프를 가짐). 스칼라 tail도 `expf` → `swiglu_det_one` — tail만 다른 근사를 쓰면 그 열에서 발산이 되살아난다 |
+| `htp_compute_ops.cpp` | l2Diff 레퍼런스 → `swiglu_det_one`. 이제 `total_flips == 0`이 정확히 필요한 성질이다 |
+| `lfm2_moe_layer.cpp` | `nntrainer::swiglu` 3곳 → `swiglu_det`. **`neon::swiglu` 자체는 건드리지 않는다** — 모든 모델이 쓰고 그 자체는 문제가 없다 |
+| `jni/Android.mk`, `test/htp/build.sh` | 공용 헤더 하나를 위한 include 경로 |
+
+`kFusedSwigluEnabled`는 **아직 `false`**다.
+
+### 12.8 두 단계로 재는 이유
+
+이번 push는 기본 실행에서 딱 하나를 바꾼다: **모델의 ARM SwiGLU 스펙.** fused는 꺼져 있으니 DSP 변경은 잠자고, l2Diff는 env-gated라 잠잔다.
+
+**단계 A (지금 잴 것)** — fused off, 그냥 실행. 텍스트가 여전히 정상 3문장 요약이어야 한다. 이것이 격리하는 질문: *모델이 `exp_ps` 대신 det SwiGLU를 견디는가?* det는 `exp_ps`와 ≤1 ULP 다르고, 22 레이어 greedy decoding에서 그 정도가 토큰을 바꿀 수 있다는 것이 바로 이 조사 전체의 교훈이다. 그러니 가정하지 않고 잰다.
+
+- 정상이면 → 단계 B
+- 깨지면 → 모델이 그만큼 민감하다는 뜻이고, 그 자체가 답이다. A1은 fused를 살리지 못하고 되돌린다
+
+**단계 B** — `kFusedSwigluEnabled = true`, `NNTR_L2_DIFF=1`. **판정은 텍스트가 아니라 `total_flips`다**: 32 호출 전부 0이어야 한다(지금은 5개에서 1). 텍스트는 그 다음 확인이지 기준이 아니다 — 텍스트가 우연히 맞을 수도 있고, 그때 우리는 아무것도 배우지 못한다.

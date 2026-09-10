@@ -48,6 +48,7 @@
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
+#include <swiglu_det.h>
 
 #include <chrono>
 #include <cmath>
@@ -735,14 +736,19 @@ public:
       return;
     }
 
-    // Same formula the unit tests' reference uses, and the same one
-    // Lfm2MoELayer's two-dot path runs through nntrainer::swiglu.
+    // [A1] swiglu_det, the same specification Lfm2MoELayer's two-dot path
+    // and the DSP's hvx_swiglu_det.h both run. This used std::exp, which
+    // made total_flips measure the wrong thing: a nonzero count could mean
+    // either that the fused kernel disagreed with the host path the model
+    // actually uses, or merely that both disagreed with libm. Against this
+    // reference, total_flips == 0 is exactly the property the fused path
+    // needs, and anything else is a real divergence.
     std::vector<float> mid(static_cast<size_t>(M) * inter);
     for (unsigned int m = 0; m < M; ++m) {
       for (unsigned int j = 0; j < inter; ++j) {
         const float g = gu_out[static_cast<size_t>(m) * 2 * inter + j];
         const float u = gu_out[static_cast<size_t>(m) * 2 * inter + inter + j];
-        mid[static_cast<size_t>(m) * inter + j] = g / (1.0f + std::exp(-g)) * u;
+        mid[static_cast<size_t>(m) * inter + j] = swiglu_det_one(g, u);
       }
     }
 
