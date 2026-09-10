@@ -193,7 +193,7 @@ interface nntr_hvx : remote_handle64 {
    // scalar reference, so a failure has to say WHERE.
    // Every length must match and be a multiple of 32.
    AEEResult swiglu_det_f32(in sequence<float> gate, in sequence<float> up,
-                            rout sequence<float> out,
+                            rout sequence<float> res,
                             rout sequence<float> exp_out,
                             rout sequence<float> recip_out);
 
