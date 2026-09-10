@@ -269,6 +269,44 @@ interface nntr_hvx : remote_handle64 {
                                 rout sequence<float> attn_out,
                                 rout sequence<uint32> stage_us);
 
+   // [doc 46] A whole MoE FFN layer -- every expert, the token gather, the
+   // routing multiply and the scatter-add -- in one call, replacing the 64
+   // (32 experts x gate_up_swiglu + layer_u8in) it costs today.
+   //
+   // row_index holds the token row each (expert, slot) pair works on,
+   // grouped by expert in expert order; row_count says how many belong to
+   // each, and row_weight the routing weight for each. act_f32 is M x K and
+   // out_f32 is M x N_out, which the DSP zeroes and accumulates into --
+   // experts share token rows.
+   //
+   // act and out are sequences here because that is what today's model
+   // hands over. The kernel underneath takes plain pointers, so the Phase D
+   // entry point that leaves the residual stream on the DSP is a second
+   // wrapper over the same code, not a rewrite (doc 45 section 3.1).
+   AEEResult mm_u8i4_moe_layer(in uint32 M, in uint32 K, in uint32 inter,
+                               in uint32 N_out,
+                               in sequence<uint32> h_gate_up,
+                               in sequence<uint32> h_down,
+                               in sequence<uint32> row_index,
+                               in sequence<uint32> row_count,
+                               in sequence<float> row_weight,
+                               in sequence<float> act_f32,
+                               rout sequence<float> out_f32);
+
+   // Same, plus the DSP-internal per-stage microseconds:
+   // [total, quant, swiglu, dequant, acc_read, drain, scatter, acc_stride].
+   // DEBUG ONLY.
+   AEEResult mm_u8i4_moe_layer_timed(in uint32 M, in uint32 K, in uint32 inter,
+                                     in uint32 N_out,
+                                     in sequence<uint32> h_gate_up,
+                                     in sequence<uint32> h_down,
+                                     in sequence<uint32> row_index,
+                                     in sequence<uint32> row_count,
+                                     in sequence<float> row_weight,
+                                     in sequence<float> act_f32,
+                                     rout sequence<float> out_f32,
+                                     rout sequence<uint32> stage_us);
+
    // [doc 45 Gate 0b] Two memory probes. Gate 0 stopped weight registration
    // at 1.89 GB of the 4.10 the whole-model plan needs, with an error that
    // came from before the registration function ran -- so the PD was out of
