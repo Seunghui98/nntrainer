@@ -432,3 +432,43 @@ HEXKL_ROOT=~/workspace/hxkl-beta2/hexkl_addon ./test/htp/build.sh
 ```
 
 `unittest_hvx_softmax`의 `HvxSwigluDet.MatchesScalarBitExact` 결과와 `SWIGLU_DET_FIELD bad_exp=.. bad_recip=.. bad_out=..` 줄이 답이다. 기기 스로틀과 무관한 정확도 테스트라 지금 상태에서도 유효하다.
+
+### 12.4 게이트 결과 (2026-09-10, 기기)
+
+```
+SWIGLU_DET_FIELD bad_exp=5 bad_recip=0 bad_out=0 of 8192
+```
+
+**전제는 통과했다.** `hvx_recip_det_sf`는 Vsf 곱셈 3회 + 뺄셈 3회 + 곱셈 3회의 9단 체인인데 8192개가 전부 비트 일치했다. Vsf가 IEEE 정확 반올림이 아니었다면 불가능한 결과다. §12.1의 두 해석 중 **1번이 맞다** — `hvx_exp_f32.h`의 문장은 "f32는 매 단계 반올림한다"는 평범한 관찰이었다.
+
+`bad_exp=5`는 산술 포맷 차이가 아니라 **HVX 쪽 술어 하나의 오프바이원**이었다. 헤더의 스펙과 스칼라 레퍼런스는 `k + exp_field(p) <= 0`인데 HVX 코드만 `Q6_Q_vcmp_gt_VwVw(zero, sum)`, 즉 `< 0`으로 짜여 있었다. 호스트에서 재현:
+
+| exp 인자 | k | p_exp | k+p_exp | ref (`<=0`) | HVX (`<0`) |
+|---:|---:|---:|---:|---|---|
+| −87 | −126 | 127 | 1 | 1.64581e-38 | 1.64581e-38 |
+| **−88** | −127 | 127 | **0** | **0** | **3.54261e-40** |
+
+`k+p_exp == 0`이면 비트 덧셈 결과의 지수 필드가 0이라 참값(6.05e-39)의 1/17짜리 쓰레기가 나온다 — 가드가 발동하는 게 맞고, **레퍼런스가 맞고 HVX가 틀렸다.** 테스트 입력 중 exp 인자가 정확히 −88이 되는 것은 `i=64..67`(클램프)과 `i=68`(g=88, 클램프 없이 딱 −88) — 정확히 5개.
+
+`bad_recip=0`/`bad_out=0`인 이유도 같은 사실에서 나온다: `1 + 3.5e-40`은 f32에서 정확히 `1.0f`라 그 차이가 역수 단계에서 흡수된다. 즉 이 버그는 지금은 무해하지만, 다른 입력 분포에서는 그렇지 않다.
+
+### 12.5 ARM 절반, 그리고 실제 위험했던 것
+
+A1은 양쪽이 같은 스펙을 돌려야 성립하므로 ARM 구현이 필요하다. `nntrainer::neon::swiglu`는 **건드리지 않는다** — 모든 모델이 쓰는 공용 API라 blast radius가 넓고, 그 자체로는 아무 문제가 없다. 대신 `nntrainer/tensor/htp_backend/swiglu_det.h`에 스펙의 호스트 구현을 두고, 테스트도 자기 사본을 버리고 이 헤더를 쓰게 했다. **사본이 세 벌이면 드리프트가 난다 — §12.4의 버그가 바로 그것이다.**
+
+진짜 위험은 다른 데 있었다. **`#pragma clang fp contract(off)`는 이 커널을 보호하지 못한다.** `vmulq_f32`/`vaddq_f32`는 곱셈과 덧셈이 `arm_neon.h` 안에 텍스트로 쓰여 있어서 블록 스코프 프래그마가 덮지 못한다. aarch64 `-O3 -ffp-contract=fast`로 빌드하면 프래그마가 있으나 없으나 **fmla 12개가 똑같이** 나온다. 그리고 `Applications/CausalLM/jni/Android.mk:41`은 **`-ffast-math`**로 빌드한다 — 가정이 아니라 실제 설정이다.
+
+작동하는 것은 각 결과를 벡터 레지스터에 묶는 빈 asm(`__asm__("" : "+w"(r))`)이다. 곱셈에만 걸었을 때 `-ffast-math`에서 fmla 하나가 살아남았는데, `y*(2 − d·y)`가 `2y − d·y·y`로 분배되기 때문이었다. 그래서 f32 곱셈·덧셈·뺄셈 **전부**를 감쌌다.
+
+세지 않고 확인했다 (§11.5의 규칙 그대로 — 이건 소스의 성질이 아니라 컴파일러의 성질이다): aarch64 gcc 13과 clang 18, `-O3` / `-ffp-contract=fast` / `-ffast-math` / `-Ofast` 네 설정 전부에서 fmla 0개, 그리고 게이트 테스트와 같은 8192개 입력에서 NEON과 스칼라가 **비트 동일**(qemu-aarch64 실행 — 에뮬레이션이지 이 기기가 아니다). 기기 확인은 `SwigluDetNeon.MatchesScalar`가 한다.
+
+### 12.6 다음
+
+여전히 배선하지 않는다. 다음 실행이 **`bad_exp=0`과 `SWIGLU_DET_NEON_FIELD bad=0`을 둘 다** 주면 DSP == 스칼라, NEON == 스칼라 ⇒ **DSP == NEON**이 추이적으로 성립하고, 그것이 fused 경로가 실제로 필요로 하는 성질이다. 그때 배선한다:
+
+1. `hvx_swiglu_f32.c`를 det판으로 전환
+2. `lfm2_moe_layer.cpp`의 `nntrainer::swiglu` 호출 3곳을 `swiglu_det`으로
+3. `kFusedSwigluEnabled = true`
+4. `NNTR_L2_DIFF=1`로 확인 — **텍스트가 아니라 `total_flips`가 판정 기준이다.** 32 호출 전부 0이어야 하고, 지금은 5개 호출에서 1이다
+
+한 번에 한 변수만 움직인다. 그것이 L2를 결국 닫은 방식이다.
