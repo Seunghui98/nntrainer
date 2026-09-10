@@ -268,6 +268,34 @@ public:
                                             std::vector<unsigned int> N,
                                             unsigned int K);
 
+  // A whole MoE FFN layer -- routing, every expert, and the scatter-add --
+  // in one accelerator call (doc 46). Where gemm_qs4cx_fused_swiglu_fp32
+  // above is one expert and the caller loops, this takes the routing table
+  // and does the looping on the accelerator, so the token gather, the
+  // routing multiply and the scatter-add stop crossing the boundary too.
+  //
+  // gate_up[e] is K x 2*inter and down[e] is inter x N_out. row_index holds
+  // the token row each (expert, slot) works on, grouped by expert in expert
+  // order; row_count says how many belong to each and must sum to
+  // row_index's size; row_weight is the routing weight per entry. out is
+  // M x N_out, zeroed by the implementation and accumulated into, because
+  // experts share token rows.
+  //
+  // By const reference, unlike the vector-by-value overloads above: a
+  // prefill layer's row_index is one entry per token per expert -- 1776 for
+  // this model -- and copying that per layer is the kind of cost this call
+  // exists to remove.
+  virtual bool supports_gemm_qs4cx_moe_layer_fp32() const { return false; }
+  virtual void gemm_qs4cx_moe_layer_fp32(
+    const std::vector<void *> &gate_up_data,
+    const std::vector<float *> &gate_up_scale,
+    const std::vector<void *> &down_data,
+    const std::vector<float *> &down_scale,
+    const std::vector<unsigned int> &row_index,
+    const std::vector<unsigned int> &row_count,
+    const std::vector<float> &row_weight, const float *act, float *out,
+    unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out);
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,

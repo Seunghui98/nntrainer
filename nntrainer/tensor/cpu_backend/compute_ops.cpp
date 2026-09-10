@@ -209,6 +209,15 @@ void ComputeOps::gemm_qs4cx_fused_swiglu_fp32(std::vector<void *>,
                                               unsigned int) {
   NI(gemm_qs4cx_fused_swiglu_fp32);
 }
+
+void ComputeOps::gemm_qs4cx_moe_layer_fp32(
+  const std::vector<void *> &, const std::vector<float *> &,
+  const std::vector<void *> &, const std::vector<float *> &,
+  const std::vector<unsigned int> &, const std::vector<unsigned int> &,
+  const std::vector<float> &, const float *, float *, unsigned int,
+  unsigned int, unsigned int, unsigned int) {
+  NI(gemm_qs4cx_moe_layer_fp32);
+}
 void ComputeOps::gemm_q4_K_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,
                                 unsigned int, float *, unsigned int) {
