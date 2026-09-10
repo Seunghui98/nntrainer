@@ -399,7 +399,7 @@ Phase A에서 세 번 틀린 뒤라 추측하지 않는다. **구현과 함께 �
 | 파일 | 내용 |
 |---|---|
 | `hvx/hvx_swiglu_det.h` | 결정적 exp/역수/SwiGLU. **plain Vsf만** — FMA 없음, qf32 없음, 나눗셈 없음. 상수와 **연산 순서**가 계약의 일부 |
-| `test/htp/nntr_hvx.idl` | `swiglu_det_f32(gate, up, rout out, rout exp_out, rout recip_out)` — 중간값 둘을 같이 반환 |
+| `test/htp/nntr_hvx.idl` | `swiglu_det_f32(gate, up, rout res, rout exp_out, rout recip_out)` — 중간값 둘을 같이 반환 |
 | `test/htp/nntr_hvx_softmax.c` | skel 엔트리. `exp_f32`가 softmax에서 분리된 것과 같은 이유 |
 | `test/unittest/unittest_hvx_softmax.cpp` | `HvxSwigluDet.MatchesScalarBitExact` — 스칼라 레퍼런스와 **비트 비교**, 단계별 카운트 |
 
