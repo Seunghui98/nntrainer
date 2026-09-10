@@ -109,7 +109,7 @@ fused가 두 번 dot보다 25% 빠른 건 맞지만 둘 다 CPU보다 느리다.
 | A1 + P1 + P2 | ≈23 | ≈21 (CPU와 공유되는 비용이면) | ≈44 | 비슷 — **못 이김** |
 | A1 + P1 + P2 | ≈23 | ≈3 (P1이 같이 걷어내는 HTP 고유 비용이면) | ≈26 | **1.5× 빠름** |
 
-두 줄 중 어느 쪽인지는 **P3 하나로 결정**된다. 그래서 순서는 **A1 (정확도 선행조건, 작음) → P3 (측정, 거의 공짜) → P1 (큰 작업, P3 결과로 가치 확정)**. P1을 P3 전에 시작하는 건 결과가 판정을 못 바꾸는 큰 작업을 먼저 하는 것이라 권하지 않는다.
+두 줄 중 어느 쪽인지는 **P3 하나로 결정**된다. (§8의 커널 내부 항목 D1/DQ1/Q1까지 넣은 갱신 추정은 §8.4 — 프로파일 ≈23이 아니라 **≈16.6**까지 내려간다.) 그래서 순서는 **A1 (정확도 선행조건, 작음) → P3 (측정, 거의 공짜) → P1 (큰 작업, P3 결과로 가치 확정)**. P1을 P3 전에 시작하는 건 결과가 판정을 못 바꾸는 큰 작업을 먼저 하는 것이라 권하지 않는다.
 
 ---
 
@@ -122,3 +122,110 @@ fused가 두 번 dot보다 25% 빠른 건 맞지만 둘 다 CPU보다 느리다.
 | `NNTR_L2_DIFF=1` | `HtpComputeOps::l2Diff` | split-call vs 레퍼런스(두 번 `mm_u8i4_layer` + 호스트 SwiGLU)를 실제 weight/activation으로 expert마다 SNR, worst row, `call_max_span`, `bin_flips`/`total_flips`/`block_flips`, `scale_diff` |
 | `NNTR_L2_SHADOW=1` | 같은 함수 | fused 커널을 전부 실행하되 모델에는 레퍼런스 값을 넘김 — 값 vs 부수효과 판별 |
 | `NNTR_M0_PROFILE=1` | `Lfm2MoELayer` | 레이어 벽시계 (P3의 출발점) |
+
+
+---
+
+## 7. 코드에서 확인된 병목의 원인 (2026-09-10, 소스 읽음)
+
+§1의 숫자만으로는 "왜 느린가"까지는 안 나온다. 커널을 읽어 다섯 가지를 확정했다. 전부 `nntrainer/tensor/htp_backend/` 기준.
+
+### 7.1 drain — weight DMA가 HMX와 **전혀 겹치지 않는다**
+
+`hmx/hexkl_mm_u8i4_dma.c:800-803` (gate_up_swiglu_run), 같은 패턴이 `:302`, `:336`, `:420`, `:552` (layer_run / u8in / fused):
+
+```c
+hexkl_dma_ring_push2d(vtcm_base + w_off, h_gu->wh_bytes, ...);  // weight 3.67 MB 전체
+hexkl_dma_ring_drain();                                          // 다 올 때까지 블로킹
+// ... 그 다음에야 HMX 루프 시작
+```
+
+weight 3.67 MB를 VTCM으로 **전부 받고 나서** 첫 HMX를 발행한다. 그 111.9 µs 동안 HMX는 논다. gate_up의 mm이 185 µs, DMA가 112 µs이므로 겹치면 **완전히 숨는다** (down: mm 91 vs DMA 48, 역시 숨음). 링(`hexkl_dma_ring`)은 이미 descriptor 여러 개를 outstanding으로 잡을 수 있다 — 쓰지 않고 있을 뿐이다.
+
+weight 타일 배치는 `w_off + (kt*n1_tiles + nt)*512` — k-major. nt 루프가 바깥이므로 N-타일 하나의 k-타일 64개는 stride `n1_tiles*512`로 흩어져 있고, 2D DMA 한 descriptor로 모을 수 있다 (64 rows × 512 B = 32 KB/N-tile, 112개). 깊이 2–4의 프리페치면 충분하다.
+
+### 7.2 quant — 실제 HVX 일은 ~5 µs, 나머지 ~90 µs는 오버헤드
+
+`hvx/hvx_quant_u8.c`. 호출 하나(gate_up 입력 64×2048)에 드는 것:
+
+| 항목 | 줄 | 비용 추정 |
+|---|---|---|
+| `hvx_worker_pool_run` ×2 (params, pack) | `:120`, `:265` | 디스패치당 ~25 µs (7.4 참조) |
+| `memset(out_ah, 0, m_pad*k)` | `:228` | 128 KB. 유효 행은 바로 덮어쓰이므로 **패딩 행 9개(18 KB)만** 지우면 된다 |
+| `malloc` ×2 + `free` ×2 (vinv, vz) | `:252-253` | 호출마다 |
+| 실제 min/max 스캔 + pack | | 113K floats / 32 lanes ≈ 3.5K + 14K vector ops ≈ **5 µs (5 워커)** |
+
+측정 98.5 µs = 입력 quant(~50) + 출력 requant(~50). 출력 requant는 `out_ah`가 **FastRPC 출력 버퍼(ION, uncached DDR)** 라서 memset도 pack의 흩어진 store도 모두 uncached 쓰기다 — VTCM에 staging 후 DMA 한 번이 맞다.
+
+### 7.3 dequant — 단일 스레드, N-타일마다 112번 호출, 행마다 스칼라 splat
+
+`hmx/hexkl_mm_u8i4_dma.c:849` → `hvx/hvx_dequant_i32.c` `hvx_dequant_acc_tile_to_f32`. **pool을 쓰지 않는다.** 블록당 112번 호출되고, 호출마다 64행 × (act_scale splat + act_zp splat + load + 5 ops + store). 64×112 = 7168 row-tile × ~10 ops ≈ 72K ops ≈ **72 µs 단일 스레드** — 측정 100.5와 맞는다.
+
+블록 하나의 accumulator 전체(64×3584 i32 = 917 KB)는 VTCM에 들어간다 (현재 사용 5.6 MB / 8 MB). `result_off`를 타일마다 전진시켜 112 타일을 다 읽어둔 뒤 **pool로 행 분할 한 번**에 dequant 하면 7.2K vector ops / 5 워커 ≈ 2 µs + 디스패치 1회. 행별 splat(vs/vz 64개씩)도 블록당 한 번만 만들면 된다.
+
+### 7.4 worker pool — 잠자는 워커를 futex로 깨우는 비용이 일보다 크다
+
+`hvx/hvx_worker_pool.c:72` `qurt_futex_wait` / `:191` `qurt_futex_wake`. 디스패치마다 워커 5개가 커널 스케줄러를 거쳐 깨어난다 — 수 µs~수십 µs. 호출당 디스패치 5회(입력 quant 2, swiglu 1, 출력 requant 2) × ~25 µs ≈ **125 µs = DSP 시간 612 µs의 20%**. 4 µs짜리 일을 5개 코어에 나누는 게 단일 스레드 18 µs보다 느리다.
+
+swiglu 56.6 µs도 같은 구조다: 115K elements × ~30 ops ≈ 108 µs 단일 → 22 µs (5 워커) + 디스패치 ~30 = 52. 수학은 실재하고 오버헤드가 절반이다.
+
+### 7.5 FastRPC — 64번 왕복, 활성화를 f32로 32번 재전송
+
+§1·§4 P1. expert별 450 KB f32 in + 114 KB u8 out + 114 KB in + 450 KB out ≈ 1.1 MB × 32 = 36 MB/layer. 32 experts가 받는 행은 같은 444×2048 활성화의 순열이므로 u8로 한 번(0.9 MB)이면 된다.
+
+---
+
+## 8. 최적화 계획
+
+### 8.1 원칙
+
+- **측정 가능한 순서로.** Phase A는 API를 안 바꾸고 커널 내부만 고치므로 **지금 동작하는 two-dot 경로(L2 off)에서 바로 잰다.** 정확도 리스크 0.
+- **A1이 P1 앞.** 배칭은 SwiGLU가 DSP에 있어야만 가능하고, DSP SwiGLU는 A1 없이는 문장을 깨뜨린다.
+- **P3이 P1 앞.** §5. P1은 큰 작업이고, ARM ≈21 ms의 정체가 P1의 가치를 정한다.
+- 한 번에 하나, 43 §6.3의 accept/reject 그대로: 생성 텍스트 일치 + 노린 단계가 예측만큼 움직였는가 + bracketed CPU control.
+
+### 8.2 항목
+
+| # | 항목 | 무엇을 | 근거 | 기대 (ms/layer) | 리스크 |
+|---|---|---|---|---|---|
+| **D1** | drain 파이프라이닝 | N-타일 열 단위 2D DMA descriptor(32 KB) 깊이 2–4 프리페치, 첫 타일 도착 즉시 HMX 발행. `hexkl_dma_ring`의 outstanding 기능 사용. 4개 call site 공통 | 7.1 | 5.13 → **≈0.5 (−4.6)** | DMA 완료 폴링이 HMX 발행 루프에 끼어드는 비용 — 타일당 1 µs vs 1.65 µs라 여유 있음 |
+| **DQ1** | dequant 블록화 | 112 타일 acc를 VTCM에 모두 읽은 뒤 pool 행 분할 1회. 행별 vs/vz splat 블록당 1회 생성 | 7.3 | 4.90 → **≈1.2 (−3.7)** | VTCM +917 KB (5.6 → 6.5 MB, config 영역 아래) |
+| **Q1** | quant 오버헤드 제거 | params+pack을 **한 디스패치**로 융합, `malloc` → pool ctx의 고정 VTCM scratch, memset은 패딩 행만, 출력 requant는 VTCM staging → DMA 1회 | 7.2 | 3.15 → **≈1.2 (−2.0)** | 없음 |
+| **W1** | pool 하이브리드 대기 | 워커가 `futex_wait` 전에 N µs spin (`pause`). FastRPC 호출 중엔 DSP가 전용이라 spin 비용 없음; 호출 사이엔 futex로 떨어져 전력 보존. 작은 job은 인라인 임계값 | 7.4 | swiglu 1.81 → ≈1.0 (−0.8); Q1/DQ1의 디스패치 비용도 여기서 사라짐 | spin 시간 튜닝 필요 |
+| **A1** | 비트 동일 SwiGLU | §3.3. `exp_ps` 다항식 + NR 역수를 순수 IEEE f32로 NEON/HVX 동일 구현, 기기 gtest `memcmp` | 43 §7 | flip 5/32 → **0** | ARM 경로 ≤1 ULP 변화 (허용 범위 확인됨) |
+| **P3** | ARM ≈21 ms 실측 | `NNTR_M0_PROFILE` 확장: 라우터 softmax/top-k, 토큰 gather, expert별 텐서 뷰 생성, dispatch, scatter-add 분리 타이머 | §5 | **판정** | 없음 |
+| **P1** | MoE 배칭 | IDL `mm_u8i4_moe_layer(handles[64], row_index[], row_counts[], act_ah, act_scale, act_zp, routing_w, out_f32)`. DSP 안에서 expert 루프: gather(u8 memcpy 113 KB) → gate_up HMX → dequant → SwiGLU → requant → down HMX → dequant → ×routing_w → scatter-add. expert e+1의 weight를 e의 계산 뒤에 프리페치 | 7.5 | transport 14.76 → ≈2.0, staging 1.4 → 0.3, 입력 quant 32× → 1×, HMX config 상각 → **≈ −15** | **VTCM 예산**: gate_up W 3.67 + down W 1.84 + act 0.9 + gate/up/acc scratch ≈1.5 = 7.9 MB — 8 MB에 빠듯. 2-region ping-pong(gate_up 계산 중 down W 프리페치, down 계산 중 다음 gate_up W 프리페치) 또는 gate_up W를 N 절반씩 스트리밍 |
+| P4 | 등록 bake 캐시 | §4 | | 1.8 s → ≈0.1 s /layer | 전체 모델 실행의 전제 |
+
+### 8.3 실행 순서
+
+```
+Phase A  (커널 내부, two-dot 경로에서 측정, 정확도 리스크 0)
+  W1 → Q1 → DQ1 → D1        각각 한 번씩 프로파일, 노린 컬럼이 움직였는지 확인
+                              42.9 → ≈31.8
+
+Phase B  (정확도)
+  A1                         기기 gtest memcmp == 0 → kFusedSwigluEnabled=true → 텍스트 일치
+
+Phase C  (판정)
+  P3                         ARM ≈21이 HTP 고유인지 CPU 공유인지
+
+Phase D  (P3이 "HTP 고유"라고 답했을 때만)
+  P1                         31.8 → ≈16.6, ARM ≈21 → ≈3
+  P4                         전체 모델 기동
+```
+
+W1을 먼저 하는 이유: Q1/DQ1/swiglu 셋 다 디스패치 비용을 안고 있어서, W1 하나가 셋의 측정 기준선을 바꾼다. W1 없이 Q1을 재면 Q1의 효과를 과소평가한다.
+
+### 8.4 갱신된 도달 추정
+
+| 단계 | transport | mm | drain | dequant | quant | acc | swiglu | staging | **프로파일** | ARM | **벽시계** | vs CPU 38 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 지금 | 14.76 | 8.83 | 5.13 | 4.90 | 3.15 | 2.95 | 1.81 | 1.4 | **42.9** | ≈21 | ≈64 | 1.7× 느림 |
+| Phase A | 14.76 | 8.83 | 0.5 | 1.2 | 1.2 | 2.95 | 1.0 | 1.4 | **≈31.8** | ≈21 | ≈53 | 1.4× 느림 |
+| + P1 | 2.0 | 8.3 | 0.5 | 1.2 | 0.4 | 2.95 | 1.0 | 0.3 | **≈16.6** | ≈3 (HTP 고유일 때) | **≈20** | **1.9× 빠름** |
+| + P1 | | | | | | | | | ≈16.6 | ≈21 (CPU 공유일 때) | ≈38 | 동률 |
+
+§0의 `mm`-only 천장 8.83에 대해 ≈16.6은 1.9배 — acc(벤더 2.95)와 drain 잔여를 빼면 남는 오버헤드는 ≈4 ms다. 그 이상은 커널이 아니라 라우팅 구조(M 자체)의 문제다.
+
+**모든 기대값은 소스와 §1 측정에서 유도한 추정이며, 기기에서 잰 것이 아니다.** Phase A의 각 항목이 끝날 때마다 §1 표를 갱신한다.
