@@ -229,3 +229,38 @@ W1을 먼저 하는 이유: Q1/DQ1/swiglu 셋 다 디스패치 비용을 안고 
 §0의 `mm`-only 천장 8.83에 대해 ≈16.6은 1.9배 — acc(벤더 2.95)와 drain 잔여를 빼면 남는 오버헤드는 ≈4 ms다. 그 이상은 커널이 아니라 라우팅 구조(M 자체)의 문제다.
 
 **모든 기대값은 소스와 §1 측정에서 유도한 추정이며, 기기에서 잰 것이 아니다.** Phase A의 각 항목이 끝날 때마다 §1 표를 갱신한다.
+
+---
+
+## 9. Phase A, 구현됨 (2026-09-10) — **미측정**
+
+§8.3의 Phase A 네 항목이 브랜치에 들어갔다. **기기에서 빌드된 적도 측정된 적도 없다.** 각 커밋은 stub 헤더(`hexagon_types` / `hvx_hexagon_protos` / `hexkl_micro` / `qurt` / `HAP_perf`)를 상대로 gcc 문법·타입 검사만 통과했다 — 호출 지점 배선 실수는 잡지만 그 이상은 아니다.
+
+| # | 커밋 | 실제로 한 것 | 계획과 다른 점 |
+|---|---|---|---|
+| W1 | `0506834` | 워커가 `qurt_futex_wait` 전에 최대 400 µs spin (`HAP_perf` qtimer로 예산 측정, 64 pause마다 확인) | 계획대로. `hvx_worker_pool_run`의 무조건 `futex_wake`는 남겨둠 — 없애려면 sleeper 카운트가 필요하고, 그건 상수의 ponytail 주석에 업그레이드 경로로 적어둠 |
+| Q1 | `950119c` | params+pack 한 디스패치. **분할 축을 k-타일 → 4행 그룹으로** 바꾼 것이 융합을 가능하게 함(행의 scale/zp는 그 행에만 의존 → 배리어 불필요). malloc 2개 제거(축이 바뀌어 행별 벡터가 지역변수가 됨), memset은 `[m_valid, m_pad)`만, `k % 32` 가드 추가 | 계획엔 없던 **읽기 지역성 개선**이 따라옴: 예전엔 params가 전 행을 훑고 pack이 다시 훑어 2×512 KB 콜드 리드였는데, 이제 한 행의 두 패스가 연속 |
+| DQ1 | `035b12d` | `act_scale[m]`/`act_zp[m]` splat을 타일 루프 밖으로. 행 블록당 1회(`hvx_dequant_prepare_rows`), 예전엔 타일마다 = 블록당 14,336회 | **계획의 배칭 버전은 안 함.** 112개 acc 타일을 VTCM에 모아 한 디스패치로 dequant하려면 ~917 KB가 필요한데 `fused_run`의 6-region 레이아웃이 못 내주고, 커널 3개의 HMX 발행 루프를 뜯어야 함. 그 가치는 W1이 디스패치 비용을 깎은 뒤의 프로파일이 정할 문제 |
+| D1 | `7b125c2` | weight DMA를 **activation quant보다 먼저 발행**하고 뒤에서 대기. quant는 weight가 필요 없으므로 `min(quant, dma)`만큼 공짜로 겹침 | **계획의 청크 파이프라인은 안 함.** descriptor 하나만 기다리는 프리미티브가 필요한데, 그게 안전한지는 `dmlink`가 체인 끝까지 가서 멈춘 DMA 엔진을 깨우는지에 달림. `hexkl_dma_ring_drain()`의 주석("engine idle after drain -- the next push must dmstart")은 저자가 **안 깨운다**고 결론냈음을 뜻하고, 그러면 순진한 wait-one은 간헐적 행이나 조용한 stale weight가 된다. 매뉴얼과 기기가 필요한 질문이지 여기서 추측할 것이 아님 |
+
+**D1의 남은 절반, 다음 사람을 위해:** weight는 k-major(`tile = kt*n_col_tiles + nt`)라 **열 구간도 2D descriptor 하나**로 표현된다 — src/dst stride `n_col_tiles*512`, row size `(c1-c0)*512`, rows `k_tiles`. 따라서 **push+drain만으로 만든 G-way 청크 프롤로그**가 이미 전송의 1/G만 노출시킨다. per-descriptor 대기는 그 너머로 갈 때만 필요하다.
+
+**손대지 않은 것:** `fused_run`(휴면 중이고, gate_up drain이 down weight 프리페치도 겸하고 있어 같은 재배치가 다른 변경이 됨), `hexkl_mm_u8i8_dma.c`의 D1(ring reset이 quant 뒤에 있어 그것도 옮겨야 하고, MoE 경로가 아님).
+
+### 9.1 측정 방법
+
+**`kFusedSwigluEnabled`를 `true`로 두고 재는 것을 권한다** — §1·§2의 모든 숫자가 그 구성에서 나왔으므로 컬럼이 직접 비교된다. 문장이 깨지는 것은 이 측정에 상관없다(성능만 본다). 출하 경로 숫자는 A1 이후 `false`로 따로 재면 된다.
+
+한 번의 실행으로 네 항목의 귀속이 갈린다 — 각각이 움직여야 할 컬럼이 다르기 때문:
+
+| 항목 | 움직여야 할 컬럼 | §1 기준 | 예상 |
+|---|---|---|---|
+| W1 | `quant` `swiglu` `dequant` 전부 (디스패치 비용) | — | 셋 다 내려감 |
+| Q1 | `quant` | 3.15 ms | ≈1.2 |
+| DQ1 | `dequant` | 4.90 ms | ≈2.9 |
+| D1 | `drain` | 5.13 ms | ≈3.5 (quant가 가려주는 만큼만) |
+| — | `mm` `acc` | 8.83 / 2.95 | **안 움직여야 정상** |
+
+`mm`이나 `acc`가 움직였다면 무언가 잘못된 것이다 — 넷 중 어느 것도 HMX 발행이나 accumulator 읽기를 건드리지 않았다.
+
+기대 합계: 프로파일 42.9 → **≈33**. §8.4의 Phase A 예측(≈31.8)보다 조금 높은데, DQ1과 D1이 계획의 절반씩만 들어갔기 때문이다.
