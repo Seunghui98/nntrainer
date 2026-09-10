@@ -143,6 +143,7 @@ enum {
   HTP_MOE_T_ACC_READ,
   HTP_MOE_T_DRAIN,
   HTP_MOE_T_SCATTER,
+  HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
   HTP_MOE_N_STAGES
 };
@@ -254,10 +255,10 @@ public:
    *  were the same row. `rows` stays M, the tokens the layer saw, not the
    *  expert-slot count, so it means the same thing it always did.
    *
-   *  The scatter slot goes into acc_us: it is the same kind of work the
-   *  accumulator-copy bucket already held (moving a result block into its
-   *  destination), and giving it a column of its own would change the
-   *  profile's format for one call type. */
+   *  The scatter and the FastRPC-buffer staging go into their own field,
+   *  not into acc_us. Folding them in looked tidy and cost a measurement:
+   *  the first run of this call put 104.8 ms in a bucket ACC_READ and the
+   *  scatter shared, and the profile could not say which. */
   void addInvokeMoeLayer(unsigned M, unsigned K, unsigned N_out,
                          uint64_t host_us, const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -270,7 +271,8 @@ public:
       b.quant_us += stage_us[HTP_MOE_T_QUANT];
       b.swiglu_us += stage_us[HTP_MOE_T_SWIGLU];
       b.dequant_us += stage_us[HTP_MOE_T_DEQUANT];
-      b.acc_us += stage_us[HTP_MOE_T_ACC_READ] + stage_us[HTP_MOE_T_SCATTER];
+      b.acc_us += stage_us[HTP_MOE_T_ACC_READ];
+      b.scatter_us += stage_us[HTP_MOE_T_SCATTER] + stage_us[HTP_MOE_T_STAGE];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
   }
@@ -300,6 +302,11 @@ private:
     uint64_t dsp_us = 0;
     uint64_t quant_us = 0;
     uint64_t swiglu_us = 0; /**< fused calls only; 0 elsewhere */
+    /** MoE layer call only: the routing multiply and scatter-add, plus
+        copying the FastRPC buffers to and from cached heap. Both are work
+        no other call type does, so they get their own column rather than
+        being folded into one that means something else. */
+    uint64_t scatter_us = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
@@ -372,6 +379,7 @@ private:
         const double host_per = static_cast<double>(b.host_us) / b.calls;
         const double quant_per = static_cast<double>(b.quant_us) / b.calls;
         const double swiglu_per = static_cast<double>(b.swiglu_us) / b.calls;
+        const double scatter_per = static_cast<double>(b.scatter_us) / b.calls;
         const double dequant_per = static_cast<double>(b.dequant_us) / b.calls;
         const double acc_per = static_cast<double>(b.acc_us) / b.calls;
         const double drain_per = static_cast<double>(b.drain_us) / b.calls;
@@ -382,15 +390,18 @@ private:
         // honest number, and it is the one to compare against the layer's
         // MAC count. It also absorbs whatever the probes do not name, so
         // treat it as an upper bound on the matmul, not an exact figure.
+        /* mm is the residual, so every named stage has to be subtracted --
+           scatter included, or the MoE layer call's scatter time would be
+           reported as matmul. */
         const double mm_per = dsp_per - (quant_per + swiglu_per + dequant_per +
-                                         acc_per + drain_per);
+                                         acc_per + drain_per + scatter_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f swiglu %.1f dequant %.1f acc %.1f "
-                     "drain %.1f | mm<=%.1f (%.1f%% of host)]",
+                     "drain %.1f scatter %.1f | mm<=%.1f (%.1f%% of host)]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per, quant_per, swiglu_per, dequant_per,
-                     acc_per, drain_per, mm_per,
+                     acc_per, drain_per, scatter_per, mm_per,
                      host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0);
       }
       std::fprintf(stderr, "\n");
