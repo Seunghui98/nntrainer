@@ -13,16 +13,23 @@ while [[ $# -gt 0 ]]; do
             USE_BUILD_CACHE=1
             shift
             ;;
+        --profile)
+            USE_PROFILE=1
+            shift
+            ;;
         --htp)
             USE_HTP=1
             shift
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--cache] [--htp]"
+            echo "Usage: $0 [--cache] [--htp] [--profile]"
             echo "  --cache  Reuse existing nntrainer builddir if available"
             echo "  --htp    Build with Hexagon HTP acceleration enabled"
             echo "           (-Denable-htp=true). Requires HEXAGON_SDK_ROOT."
+            echo "  --profile  Build nntrainer with -Denable-profile=true and the"
+            echo "           app with -DPROFILE, so nntrainer_causallm prints"
+            echo "           per-layer-type time totals after the run (doc 45 Gate 1)."
             exit 1
             ;;
     esac
@@ -132,6 +139,11 @@ log_info "Working directory: $(pwd)"
 log_step "1/4" "Build nntrainer for Android"
 
 PACKAGE_ANDROID_ARGS=()
+: "${USE_PROFILE:=0}"
+if [ "$USE_PROFILE" -eq 1 ]; then
+    log_info "Profiling enabled: -Denable-profile=true, app built with -DPROFILE"
+    PACKAGE_ANDROID_ARGS+=("-Denable-profile=true")
+fi
 if [ "$USE_HTP" -eq 1 ]; then
     : "${HEXAGON_SDK_ROOT:?set HEXAGON_SDK_ROOT to a Hexagon SDK checkout (--htp requires it)}"
     log_info "HTP acceleration enabled: HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT"
@@ -213,7 +225,7 @@ rm -rf libs obj
 
 log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_quantize, nntr_safetensors_info)..."
 # We explicitly set paths to ensure outputs are predictable
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
+if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk CAUSALLM_PROFILE=$USE_PROFILE causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
     log_success "Build completed successfully"
 else
     log_error "Build failed"
