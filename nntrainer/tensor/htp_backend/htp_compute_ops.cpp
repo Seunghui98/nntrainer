@@ -130,6 +130,24 @@ enum {
 };
 
 /**
+ * @brief Slots mm_u8i4_moe_layer_timed fills, in order -- test/htp/
+ * nntr_hvx_mm_u8i4.c's MOE_T_* restated, for the same reason HTP_GU_T_* is.
+ * One slot none of the others have: the routing multiply and scatter-add,
+ * which live on the ARM side until this call takes them.
+ */
+enum {
+  HTP_MOE_T_DSP_TOTAL = 0,
+  HTP_MOE_T_QUANT,
+  HTP_MOE_T_SWIGLU,
+  HTP_MOE_T_DEQUANT,
+  HTP_MOE_T_ACC_READ,
+  HTP_MOE_T_DRAIN,
+  HTP_MOE_T_SCATTER,
+  HTP_MOE_T_ACC_STRIDE,
+  HTP_MOE_N_STAGES
+};
+
+/**
  * @brief Per-stage timing for the HTP path. Off unless NNTR_HTP_PROFILE is set.
  *
  * NNTR_HTP_PROFILE=1 times the three host-side stages a weight goes through:
@@ -226,6 +244,34 @@ public:
       b.dequant_us += stage_us[HTP_GU_T_DEQUANT];
       b.acc_us += stage_us[HTP_GU_T_ACC_READ];
       b.drain_us += stage_us[HTP_GU_T_DRAIN];
+    }
+  }
+
+  /** One call now covers a whole layer, so this bucket's `calls` is 1 where
+   *  the split-call path's was 64. Bucketed under (K, N_out) -- the layer's
+   *  own shape -- which is deliberately NOT either of the two shapes the
+   *  path it replaces reported, so a profile cannot be read as if the two
+   *  were the same row. `rows` stays M, the tokens the layer saw, not the
+   *  expert-slot count, so it means the same thing it always did.
+   *
+   *  The scatter slot goes into acc_us: it is the same kind of work the
+   *  accumulator-copy bucket already held (moving a result block into its
+   *  destination), and giving it a column of its own would change the
+   *  profile's format for one call type. */
+  void addInvokeMoeLayer(unsigned M, unsigned K, unsigned N_out,
+                         uint64_t host_us, const uint32_t *stage_us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1)];
+    ++b.calls;
+    b.rows += M;
+    b.host_us += host_us;
+    if (stage_us != nullptr) {
+      b.dsp_us += stage_us[HTP_MOE_T_DSP_TOTAL];
+      b.quant_us += stage_us[HTP_MOE_T_QUANT];
+      b.swiglu_us += stage_us[HTP_MOE_T_SWIGLU];
+      b.dequant_us += stage_us[HTP_MOE_T_DEQUANT];
+      b.acc_us += stage_us[HTP_MOE_T_ACC_READ] + stage_us[HTP_MOE_T_SCATTER];
+      b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
   }
 
@@ -664,6 +710,43 @@ public:
   // leaving the DSP. The caller (Lfm2MoELayer) gates on M > 1 itself --
   // decode's single token cannot amortize the fused call's 64-row pad
   // tax, the same reasoning as accelerates_q4_0_at_m1() being false.
+  // [doc 46] The whole layer in one call. supports_* stays behind the
+  // caller's own M > 1 gate for the same reason the fused one does: a
+  // single decode token cannot amortize the 64-row pad tax.
+  bool supports_gemm_qs4cx_moe_layer_fp32() const override { return true; }
+
+  void gemm_qs4cx_moe_layer_fp32(const std::vector<void *> &gate_up_data,
+                                 const std::vector<float *> &gate_up_scale,
+                                 const std::vector<void *> &down_data,
+                                 const std::vector<float *> &down_scale,
+                                 const std::vector<unsigned int> &row_index,
+                                 const std::vector<unsigned int> &row_count,
+                                 const std::vector<float> &row_weight,
+                                 const float *act, float *out, unsigned int M,
+                                 unsigned int K, unsigned int inter,
+                                 unsigned int N_out) override {
+    const size_t n_experts = gate_up_data.size();
+    if (n_experts == 0 || gate_up_scale.size() != n_experts ||
+        down_data.size() != n_experts || down_scale.size() != n_experts ||
+        row_count.size() != n_experts ||
+        row_weight.size() != row_index.size()) {
+      throw std::invalid_argument(
+        "gemm_qs4cx_moe_layer_fp32: per-expert arrays disagree");
+    }
+
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    std::vector<uint32_t> h_gu(n_experts), h_dn(n_experts);
+    for (size_t e = 0; e < n_experts; ++e) {
+      h_gu[e] = get_or_register_qs4cx(gate_up_data[e], gate_up_scale[e],
+                                      session, K, 2 * inter);
+      h_dn[e] = get_or_register_qs4cx(down_data[e], down_scale[e], session,
+                                      inter, N_out);
+    }
+    invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
+                   out, M, K, inter, N_out);
+  }
+
   bool supports_gemm_qs4cx_fused_swiglu_fp32() const override { return true; }
 
   void gemm_qs4cx_fused_swiglu_fp32(std::vector<void *> matAdata,
@@ -1160,6 +1243,67 @@ private:
     stagedMemcpy(matCdata, out_f32,
                  static_cast<size_t>(out_len) * sizeof(float));
     profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
+  }
+
+  /** @brief [doc 46] One call for the whole layer.
+   *
+   *  The activation goes over once instead of once per expert, and the
+   *  output comes back once: with 32 experts at top-4 the old path shipped
+   *  the same token rows four times each in both directions. The routing
+   *  table rides along as three small arrays -- 1776 uint32 + 1776 float +
+   *  32 uint32 for this model, about 14 KB against the 3.6 MB activation.
+   */
+  void invokeMoeLayer(remote_handle64 session,
+                      const std::vector<uint32_t> &h_gu,
+                      const std::vector<uint32_t> &h_dn,
+                      const std::vector<unsigned int> &row_index,
+                      const std::vector<unsigned int> &row_count,
+                      const std::vector<float> &row_weight, const float *act,
+                      float *out, unsigned int M, unsigned int K,
+                      unsigned int inter, unsigned int N_out) {
+    const int act_len = static_cast<int>(M) * static_cast<int>(K);
+    const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
+    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
+    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
+    float *out_f32 = reinterpret_cast<float *>(out_buf_->data());
+    stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
+
+    HtpProfile &profile = HtpProfile::global();
+    uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
+    const int err = timed
+                      ? nntr_hvx_mm_u8i4_moe_layer_timed(
+                          session, M, K, inter, N_out, h_gu.data(),
+                          static_cast<int>(h_gu.size()), h_dn.data(),
+                          static_cast<int>(h_dn.size()), row_index.data(),
+                          static_cast<int>(row_index.size()), row_count.data(),
+                          static_cast<int>(row_count.size()), row_weight.data(),
+                          static_cast<int>(row_weight.size()), act_f32, act_len,
+                          out_f32, out_len, stage_us, HTP_MOE_N_STAGES)
+                      : nntr_hvx_mm_u8i4_moe_layer(
+                          session, M, K, inter, N_out, h_gu.data(),
+                          static_cast<int>(h_gu.size()), h_dn.data(),
+                          static_cast<int>(h_dn.size()), row_index.data(),
+                          static_cast<int>(row_index.size()), row_count.data(),
+                          static_cast<int>(row_count.size()), row_weight.data(),
+                          static_cast<int>(row_weight.size()), act_f32, act_len,
+                          out_f32, out_len);
+    const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_moe_layer_timed"
+                          : "nntr_hvx_mm_u8i4_moe_layer") +
+        " failed: err=" + std::to_string(err));
+    }
+    stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
+    if (profile.level()) {
+      profile.addInvokeMoeLayer(M, K, N_out, elapsed,
+                                timed ? stage_us : nullptr);
+    }
   }
 
   /** @brief [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize
