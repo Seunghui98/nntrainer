@@ -248,24 +248,13 @@ LOCAL_SRC_FILES := ../quantize.cpp \
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3 \
-    $(LOCAL_PATH)/../models/bert \
-    $(LOCAL_PATH)/../models/deberta_v2 \
-    $(LOCAL_PATH)/../models/gemma4 \
-    $(LOCAL_PATH)/../models/xlm_roberta \
-    $(LOCAL_PATH)/../models/lfm2 \
-    $(LOCAL_PATH)/../models/lfm2_moe \
+# CAUSALLM_COMMON_INCLUDES rather than a copy of it. This module builds the
+# same model sources as causallm_core, so the copy that used to be here had
+# to be kept in step with it by hand -- and was not: it had already lost
+# timm_vit and third_party, and adding one path to the shared list left this
+# module unable to compile lfm2_moe_layer.cpp. The shared list is a superset
+# of what was here, so this only adds paths.
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 
