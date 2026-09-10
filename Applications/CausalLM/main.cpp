@@ -23,6 +23,10 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#ifdef PROFILE
+#include <profiler.h>
+#endif
 #include <optional>
 #include <string>
 #include <vector>
@@ -455,6 +459,15 @@ int main(int argc, char *argv[]) {
 
 #ifdef PROFILE
     start_peak_tracker();
+    // [doc 45 Gate 1] nntrainer's own per-node timers (network_graph.cpp's
+    // PROFILE_TIME_START around each forward) aggregate by layer TYPE, so
+    // the report after the run says how the CPU's prefill splits across
+    // fully_connected, causal_conv1d, mha_core, lfm2_moe, rms_norm and the
+    // rest -- the "other 47%" the whole-model plan has to place. The
+    // listener only prints if something subscribes it; nothing did.
+    auto profile_listener =
+      std::make_shared<nntrainer::profile::GenericProfileListener>();
+    PROFILE_BEGIN(profile_listener);
 #endif
 #if defined(_WIN32)
     model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
@@ -464,6 +477,9 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef PROFILE
     stop_and_print_peak();
+    std::cout << "[PROFILE] per-layer-type totals over the whole run "
+                 "(prefill + decode; decode is total_tokens==1 per call)\n";
+    PROFILE_END(profile_listener);
 #endif
     auto finish_time = std::chrono::high_resolution_clock::now();
     auto e2e_duration = std::chrono::duration_cast<std::chrono::milliseconds>(

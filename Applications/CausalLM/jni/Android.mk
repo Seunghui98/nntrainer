@@ -44,6 +44,12 @@ CAUSALLM_COMMON_INCLUDES := \
 # prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
 CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
+# build_android.sh --profile: nntrainer is configured with -Denable-profile
+# (which defines PROFILE for the library) and the app needs the same define
+# for main.cpp's PROFILE_BEGIN/PROFILE_END to compile to anything.
+ifeq ($(CAUSALLM_PROFILE),1)
+CAUSALLM_COMMON_CFLAGS += -DPROFILE=1
+endif
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
 # paths and the -march/FP16 cflags the prebuilts were built with.

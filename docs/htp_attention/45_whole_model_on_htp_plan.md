@@ -19,7 +19,7 @@
 
 ## 1. 모델 구조와 레이어당 필요한 DSP 연산
 
-LFM2.5-8B-A1B: hidden 2048, 24 레이어 (dense FFN 2 + MoE 22), 레이어 타입은 conv/attention 혼합. **실제 `layer_types` 분포와 attention 차원은 config.json 확인 필요** (§7). 이하 18 conv + 6 attention으로 가정하고 표시.
+LFM2.5-8B-A1B, 실제 config.json (2026-09-10 확인): hidden 2048, 24 레이어 = **18 conv + 6 full_attention** (attention은 layer 2, 6, 10, 14, 18, 21), dense FFN 2 (intermediate **7168**) + MoE 22 (1792 × 32 experts, top-4), attention 32 heads / **8 kv heads (GQA 4) / head_dim 64**, conv L=3, max_seq_len 1024. FC weight는 **Q4_0**(HTP 경로는 `htp_qs4cx_from_q4_0x4`로 즉석 변환 — 상주 설계에서는 QS4CX로 재양자화해 한 번만), MoE는 QS4CX.
 
 | 블록 | 연산 | DSP 커널 상태 | 신규 작업 |
 |---|---|---|---|
@@ -33,7 +33,7 @@ LFM2.5-8B-A1B: hidden 2048, 24 레이어 (dense FFN 2 + MoE 22), 레이어 타�
 | **attention (×6?)** | wq/wk/wv/wo FC | 있음 | QS4CX 재양자화 |
 | | q_norm/k_norm (head_dim RMS) | 없음 | RMSNorm 변형 |
 | | RoPE | **없음** | HVX, ~80줄 |
-| | attention core (GQA, causal) | **`attn_forward` 있음**, 호스트 모델 대비 검증됨, `FusedForwardPerLayerCost` 측정됨 | **모델 통합 없음.** `mha_core.cpp`에 dispatch 없음. KV cache를 DSP에 (`attn_kv_append` 있음) |
+| | attention core (GQA, causal) | **`attn_forward` 있음.** 실측(Qwen3-0.6B 형상, 8 kv × gqa 2 × 128 — LFM2와 토큰당 MAC 동일): 128-tok 청크 prefill **4.7 ms/layer @kv512, 6.0 @kv1024**, decode 0.56–0.74 ms/layer. **정확도 게이트가 합성 데이터 고정 허용치(I4에서 rel_err 1.83 통과)** — L2를 통과시킨 것과 같은 종류 | **모델 통합 없음.** `mha_core.cpp`에 dispatch 없음. KV cache를 DSP에 (`attn_kv_append` 있음). **실모델 차분 게이트 필수** |
 | **dense FFN (×2)** | gate_up→SwiGLU→down | `mm_u8i4_gate_up_swiglu` + `_u8in` 있음 (= expert 1개) | — |
 | **MoE FFN (×22)** | 라우팅 + 32 expert | 44 P1 — **미구현** | **DSP 상주 activation을 읽고 쓰는 인터페이스로 설계** (§3) |
 | 외곽 | embedding, lm_head | CPU 유지 | prefill의 lm_head는 마지막 토큰만 |
@@ -52,20 +52,20 @@ LFM2.5-8B-A1B: hidden 2048, 24 레이어 (dense FFN 2 + MoE 22), 레이어 타�
 | MoE FFN (상주, P1+P2) | 3.2 G × … | 8.9 | quant 0.9 + dequant 1.0 + acc 2.8 + drain 0.5 | swiglu 1.9 | **≈16** |
 | MoE FFN (상주, P1만) | | 8.9 | 0.9 + 5.7 + 2.8 + 0.5 | 1.9 | ≈20.6 |
 | conv 블록 | 7.5 G | 2.9 | ≈1.3 | conv1d+gating 0.3 | **≈4.5** |
-| attention 블록 | 2.3 G + attn | 0.9 | ≈1.0 | attn_forward ≈2 (ref_14: 128-tok 청크 Q·Kᵀ 43–65×) | **≈4** |
+| attention 블록 | 2.3 G + attn | 0.9 | ≈1.0 | attn_forward **8–16** (실측 4.7 ms/128-tok 청크 @kv512; 444 tok = 4청크, 청크당 고정비 ≈3.4 ms가 한 호출로 합쳐지면 하한) | **≈10–18** |
 | norm + residual | | | | 0.2 | 0.2 |
 
-레이어 평균 (18 conv, 6 attn, 22 MoE, 2 dense): 연산자 블록 ≈4.4 + FFN ≈15 + 0.2 ≈ **19.6 ms** × 24 = **470 ms**.
-+ 레이어당 FastRPC 1회 0.4 × 24 = 10 + 입출력 transport 1회 + embedding/lm_head(CPU) ≈ 40 → **prefill ≈ 520 ms**.
+레이어 평균 (18 conv, 6 attn, 22 MoE, 2 dense): 연산자 블록 (18×4.5 + 6×14)/24 ≈ **6.9** + FFN ≈15 + 0.2 ≈ **22 ms** × 24 = **530 ms**.
++ 레이어당 FastRPC 1회 0.4 × 24 = 10 + 입출력 transport 1회 + embedding/lm_head(CPU) ≈ 40 → **prefill ≈ 580 ms**. (첫 추정 520은 attention core를 2 ms로 잡은 것 — 실측 반영해 정정.)
 
 | | prefill | vs CPU ≈1320 ms |
 |---|---:|---:|
-| 전부 달성 | ≈520 | **2.5×** |
-| P2 실패 (dequant 그대로) | ≈620 | 2.1× |
-| P2 실패 + drain 파이프라인 실패 | ≈700 | 1.9× |
+| 전부 달성 | ≈580 | **2.3×** |
+| P2 실패 (dequant 그대로) | ≈680 | 1.9× |
+| P2 실패 + drain 파이프라인 실패 | ≈760 | 1.7× |
 | **44 §16 (MoE FFN만)** | ≈1150 | 1.15× |
 
-**2~2.5×가 이 계획의 도달 범위다.** 44 §16.5의 1.2×와의 차이 전부가 "값이 DSP에 머문다"에서 나온다.
+**1.7~2.3×가 이 계획의 도달 범위다.** 44 §16.5의 1.2×와의 차이 전부가 "값이 DSP에 머문다"에서 나온다.
 
 ---
 
@@ -136,8 +136,9 @@ RMSNorm_det, gating, conv1d(state cache 포함), in_proj/out_proj. `conv_block_r
 
 ---
 
-## 7. 시작 전에 필요한 것 세 가지 (모두 기기·파일 확인, 코드 0)
+## 7. 시작 전 확인 — 상태
 
-1. **실제 config.json**: `layer_types`(24개), `num_attention_heads`, `num_key_value_heads`, `head_dim`, `intermediate_size`(dense FFN), `conv_L_cache`, `conv_dim`. §1/§2의 "18+6" 가정을 실측으로.
-2. **`FusedForwardPerLayerCost`의 실측** — 이미 `/tmp/hvx_attn_device_run.log`에 있음 (`ATTN_FIELD` 줄). §2의 attention 2 ms를 실측으로.
-3. **Gate 0**.
+1. ✅ **실제 config.json** — §1에 반영. 18+6 가정이 맞았다.
+2. ✅ **attention 실측** — §1/§2에 반영. 2 ms 추정은 7배 낙관이었고, 천장이 2.5× → 2.3×로 내려왔다.
+3. **Gate 0** — `unittest_hvx_mm_u8i4`의 `RegistryCapacity` (아래).
+4. **Gate 1** — `NNTR_M1_PROFILE` (아래).
