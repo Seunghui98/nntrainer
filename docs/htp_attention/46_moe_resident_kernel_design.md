@@ -150,3 +150,21 @@ V1이 비트 동일할 수 있는 이유: 같은 양자화기, 같은 `swiglu_de
 | A-6 | P2 dequant 프로브 (같은 커널 안에서) | 1 |
 
 **A-1의 첫 줄을 쓰기 전에 이 문서의 §3 산술이 맞아야 한다.** 위 표의 합 6.37 MB는 `hexkl_mm_u8i4_moe_layout()`이 런타임에 다시 계산하고 `vtcm_size`와 비교해 `AEE_ENOMEMORY`를 반환한다 — L2 1차가 죽은 자리에 이번엔 검사가 있다.
+
+---
+
+## 9. V1 결과 (2026-09-10, 기기)
+
+```
+U8I4_FIELD path=moe_layer field=bad_elems value=0 of 409600
+[       OK ] HmxMmU8I4Layer.MoeLayerMatchesTwoCallReference (937 ms)
+[  PASSED  ] 21 tests.
+```
+
+**배칭 커널이 기존 64호출 경로와 비트 동일하다.** M=200, 4 experts (70/0/64/33행 — 2블록·빈 expert·블록 경계·행 중복), 실제 HMX/HVX 위에서 409,600개 전부 일치.
+
+§7의 V1 게이트 통과. A-4(모델 배선)로 간다.
+
+기기 없이 먼저 확인했던 것들이 그대로 성립했다: 호스트 구조 검사(worst_rel=0), VTCM 6.37 MB, skel 시그니처, 인자 검증 9종. **기기가 새로 확인해준 것은 하나 — 실물 HMX/HVX 산술에서도 두 경로가 같은 비트를 낸다는 것.**
+
+`RegistryCapacity`는 report-only로 바꿨다. 1.89 GB라는 답이 이미 나왔고 설계가 ION으로 옮겨갔으므로(45 §8–9), 폐기하기로 한 경로에 ≥4.3 GB를 단언하면 매 실행 빨간불이 되고 진짜 실패를 흘려보내게 된다.
