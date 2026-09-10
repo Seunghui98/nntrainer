@@ -631,7 +631,15 @@ fused 출력이 레퍼런스(두 번 `mm_u8i4_layer` + 호스트 `swiglu_det`)�
 
 ### 14.3 근본 원인: D1과 u8in의 충돌
 
-D1은 weight DMA를 activation quant 뒤에 숨긴다. fused down은 u8in이라 quant가 없다 → 숨길 곳이 없다. **down drain 50.3 µs = 1.84 MB / 34 GB/s = 54 µs, 전체 DMA 시간.** 구조적이다. gate_up의 65.4는 fused 커널이 첫 64행 블록의 quant 뒤에만 drain해서 M이 클수록 덜 숨기는 것으로 절반이 설명되고, 나머지와 dequant +18.9는 이 실행의 `NNTR_L2_DIFF`(expert마다 FastRPC 3회 추가, 같은 VTCM·같은 전역 DMA 링) 오염 가능성이 있어 **깨끗한 실행으로 확정한다.**
+D1은 weight DMA를 activation quant 뒤에 숨긴다. fused down은 u8in이라 quant가 없다 → 숨길 곳이 없다. **down drain 50.3 µs = 1.84 MB / 34 GB/s = 54 µs, 전체 DMA 시간.** 구조적이다. gate_up의 65.4는 fused 커널이 첫 64행 블록의 quant 뒤에만 drain해서 M이 클수록 덜 숨기는 것으로 설명된다.
+
+**확정 (깨끗한 실행, `NNTR_L2_DIFF` 없음, 같은 온도):** `layer calls total` **40.1 ms**, gate_up drain **56.5**, down drain **47.0**, gate_up dequant **107.9**. l2Diff 오염은 레이어당 ≈1.0 ms였고 나머지는 전부 구조적이다.
+
+| 레이어당 drain | 두 번 dot+D1 | fused+D1 | 이론상 전체 DMA |
+|---|---:|---:|---:|
+| | **1.16 ms** (78% 숨김) | **3.31 ms** (36% 숨김) | 5.18 ms |
+
+fused의 순이득은 **43.1 → 40.1 = −3.0 ms**이고, 여기에 swiglu 1.9 ms가 미계측 ARM에서 계측 DSP 컬럼으로 옮겨온 것이라 벽시계 이득은 ≈−4.9 ms다. **노출된 2.15 ms를 파이프라이닝으로 되찾으면 −5.2 ms**가 된다. dequant +11.9(96.0 → 107.9)는 남은 미설명 항목 — fused가 VTCM에 더 많이 상주시키므로 dequant가 다른 메모리를 건드리는 것으로 의심되나 프로브 전까지는 가설이다. P2에서 같이 본다.
 
 ### 14.4 −13은 이중 계산이었다
 
