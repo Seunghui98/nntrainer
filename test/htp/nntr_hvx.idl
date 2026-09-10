@@ -183,6 +183,20 @@ interface nntr_hvx : remote_handle64 {
    // tail.
    AEEResult exp_f32(in sequence<float> x, rout sequence<float> y);
 
+   // [A1] The deterministic SwiGLU (hvx_swiglu_det.h), with its two
+   // intermediates alongside the result. Same reason exp_f32 is broken out
+   // of softmax: the thing under test is whether HVX's plain Vsf arithmetic
+   // rounds exactly the way ARM's f32 does, and only an unreduced,
+   // unquantized output can answer that. exp_out and recip_out are what
+   // separate "the two arithmetics differ" from "they agree and something
+   // downstream does not" -- the whole point is bit identity against a
+   // scalar reference, so a failure has to say WHERE.
+   // Every length must match and be a multiple of 32.
+   AEEResult swiglu_det_f32(in sequence<float> gate, in sequence<float> up,
+                            rout sequence<float> out,
+                            rout sequence<float> exp_out,
+                            rout sequence<float> recip_out);
+
    AEEResult softmax_f32(in uint32 M, in uint32 K, in uint32 m_first,
                          in float scale, in sequence<float> x,
                          rout sequence<float> y);

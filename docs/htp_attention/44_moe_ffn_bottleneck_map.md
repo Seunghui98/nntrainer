@@ -374,3 +374,61 @@ Q1·DQ1과 동일하게 **이벤트를 세고 시간이 따라온다고 가정�
 | **P4 (등록 캐시)** | DSP WH bake를 **아예 안 하는 것**. 1.8 s/layer가 0.1로 — 없애는 것이지 빠르게 하는 것이 아님 | **안전** |
 | P2 (dequant 튜닝) | DQ1과 같은 함정. 프로브로 **어디서 시간이 가는지 먼저 재기 전엔 금지** | 보류 |
 | A1 (비트 동일 SwiGLU) | 성능 항목이 아니라 정확도 항목. 기준 무관 | 유효 |
+
+
+---
+
+## 12. A1 — 결정적 SwiGLU, **전제 검증까지 포함** (2026-09-10, 미측정)
+
+§3.3의 "양쪽이 비트 단위로 같은 알고리즘을 돌리게 한다"를 구현했다. 다만 **아직 어느 경로에도 연결하지 않았다** — 이 접근 전체가 기대는 전제 하나가 검증되지 않았기 때문이다.
+
+### 12.1 전제
+
+`hvx_exp_f32.h`의 주석:
+
+> "on real HVX hardware, chained Vsf multiply-adds lose precision that qf32 retains"
+
+이 문장은 두 가지로 읽힌다.
+1. **"f32는 매 연산마다 반올림하고 확장 포맷은 안 한다"** — 당연한 관찰. 그렇다면 Vsf는 IEEE이고 비트 동일이 가능하다.
+2. **"Vsf는 IEEE 정확 반올림이 아니다"** — 그렇다면 이 하드웨어에서 비트 동일은 **원리적으로 불가능**하고 A1 전체가 죽는다.
+
+Phase A에서 세 번 틀린 뒤라 추측하지 않는다. **구현과 함께 이 전제를 직접 재는 테스트를 넣었다.**
+
+### 12.2 들어간 것
+
+| 파일 | 내용 |
+|---|---|
+| `hvx/hvx_swiglu_det.h` | 결정적 exp/역수/SwiGLU. **plain Vsf만** — FMA 없음, qf32 없음, 나눗셈 없음. 상수와 **연산 순서**가 계약의 일부 |
+| `test/htp/nntr_hvx.idl` | `swiglu_det_f32(gate, up, rout out, rout exp_out, rout recip_out)` — 중간값 둘을 같이 반환 |
+| `test/htp/nntr_hvx_softmax.c` | skel 엔트리. `exp_f32`가 softmax에서 분리된 것과 같은 이유 |
+| `test/unittest/unittest_hvx_softmax.cpp` | `HvxSwigluDet.MatchesScalarBitExact` — 스칼라 레퍼런스와 **비트 비교**, 단계별 카운트 |
+
+알고리즘 요약 (전문은 헤더 주석):
+- exp: `x`를 [−88, 85]로 클램프 → `k = rne(x·log2e)` → `r = (x − k·ln2_hi) − k·ln2_lo` → 7차 Horner (`Σ rⁿ/n!`) → 지수 필드에 `k` 주입 → underflow 가드
+- 역수: 매직 시드 `0x7EF311C2 − bits(d)` + Newton-Raphson 3회, 전부 plain f32
+- SwiGLU: `(g · recip(1 + exp(−g))) · u`
+
+정확도는 타협이 아니다: `|r| ≤ ln2/2`라 7차 절단 오차는 `r⁸/8! ≤ 5.2e-9`(f32 eps 1.2e-7보다 훨씬 작음), NR 3회는 시드의 ~6%를 ~1.7e-10로 만든다. 둘 다 마지막 비트 아래다.
+
+스칼라 레퍼런스는 매 연산을 `volatile`을 거쳐 저장한다 — 컴파일러가 곱셈과 덧셈을 FMA로 합치면 DSP가 두 번 반올림하는 곳에서 한 번만 반올림하게 되고, 그 불일치는 하드웨어가 아니라 컴파일러의 것이 된다.
+
+### 12.3 아직 연결하지 않은 이유
+
+Vsf가 IEEE가 아니라면 `hvx_exp_det_sf`는 지금의 qf32판 `hvx_exp_sf`보다 **덜 정확하다.** fused 경로가 휴면 중이라 사용자 영향은 없지만, 검증 전에 더 나쁜 구현을 넣어두는 것은 희망에 거는 것이다. **테스트가 게이트다.**
+
+- 통과하면 → `hvx_swiglu_f32.c`를 det판으로 전환하고, ARM `nntrainer::neon::swiglu`도 같은 스펙으로 다시 쓴다(그때 CPU 경로가 ≤1 ULP 바뀌므로 별도 텍스트 검증 필요)
+- 실패하면 → 단계별 카운트가 exp인지 역수인지 마지막 곱인지 말해준다. exp/역수가 둘 다 틀리면 Vsf가 IEEE가 아니라는 뜻이고, **A1은 이 하드웨어에서 불가능**하다. 그 경우 fused 경로는 영구히 포기하거나, 정확도 기준 자체를 재검토해야 한다
+
+### 12.4 돌리는 법
+
+skel과 gtest 둘 다 재빌드가 필요하다 (새 IDL 엔트리).
+
+```bash
+source ~/workspace/Hexagon_SDK/6.4.0.2/setup_sdk_env.source
+cd ~/workspace/nntrainer
+bash nntrainer/tensor/htp_backend/generate_stub.sh      # 새 엔트리 반영
+HEXKL_ROOT=~/workspace/hxkl-beta2/hexkl_addon ./test/htp/build.sh
+./test/htp/run_u8i4_layer_on_device.sh                  # skel push + gtest 빌드/실행
+```
+
+`unittest_hvx_softmax`의 `HvxSwigluDet.MatchesScalarBitExact` 결과와 `SWIGLU_DET_FIELD bad_exp=.. bad_recip=.. bad_out=..` 줄이 답이다. 기기 스로틀과 무관한 정확도 테스트라 지금 상태에서도 유효하다.
