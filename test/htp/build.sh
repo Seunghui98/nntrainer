@@ -23,7 +23,24 @@ HEXKL_LIB="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_A
 if [ ! -f "$HEXKL_LIB" ]; then
     echo "Error: HexKL static library not found:" >&2
     echo "  $HEXKL_LIB" >&2
-    echo "HexKL provides v79 only for lib/6.1.1.0 and newer." >&2
+    # Say which of the three parts of that path is actually wrong. The old
+    # message here named the version policy no matter what was missing,
+    # which points at the wrong thing when HEXKL_ROOT is simply not where
+    # this script guesses -- the common case, since the default below is one
+    # developer's download directory and run_u8i4_layer_on_device.sh
+    # overrides it while a direct ./build.sh does not.
+    if [ ! -d "$HEXKL_ROOT" ]; then
+        echo "HEXKL_ROOT does not exist: $HEXKL_ROOT" >&2
+        echo "Pass the real one, e.g." >&2
+        echo "  HEXKL_ROOT=~/workspace/hxkl-beta2/hexkl_addon HEXKL_SDK_VER=6.4.0.2 ./build.sh" >&2
+    elif [ ! -d "$HEXKL_ROOT/lib/$HEXKL_SDK_VER" ]; then
+        echo "HEXKL_SDK_VER=$HEXKL_SDK_VER is not under $HEXKL_ROOT/lib. Available:" >&2
+        ls -1 "$HEXKL_ROOT/lib" 2>/dev/null | sed 's/^/  /' >&2
+    else
+        echo "That version exists but has no ${HEXKL_TOOLS_VARIANT}_${HEX_ARCH} build. Available:" >&2
+        ls -1 "$HEXKL_ROOT/lib/$HEXKL_SDK_VER" 2>/dev/null | sed 's/^/  /' >&2
+        echo "HexKL provides v79 only for lib/6.1.1.0 and newer." >&2
+    fi
     exit 1
 fi
 
