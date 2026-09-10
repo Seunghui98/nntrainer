@@ -603,3 +603,42 @@ DSP == 스칼라, NEON == 스칼라 ⇒ **DSP == NEON**, 실기기에서. A1의 
 ### 13.6 다음 한 걸음
 
 Phase 0 단계 A의 출력(fused off, `swiglu 0.0`, 텍스트). 그 다음 단계 B. 그 사이에 P3 계측 코드를 쓴다 — 기기가 필요 없는 작업이라 병렬로 간다.
+
+---
+
+## 14. A1 닫힘, 그리고 fused가 −13이 아니라 −2인 이유 (2026-09-10, 단계 B)
+
+### 14.1 결과
+
+```
+[L2-DIFF] ... snr=999.00 dB max_abs_err=0   × 32/32
+```
+
+fused 출력이 레퍼런스(두 번 `mm_u8i4_layer` + 호스트 `swiglu_det`)와 **완전히 같다.** flip 0이 아니라 값 자체가 같다. 텍스트는 단계 A와 동일한 473-token 요약. `kFusedSwigluEnabled = true`로 커밋. **L2 정확도 문제는 여기서 끝난다** — 근본 원인(두 근사의 u8 경계 flip)과 해법(양쪽이 같은 스펙을 비트 동일하게)이 실기기에서 닫혔다.
+
+### 14.2 장부 (µs/call, 단계 B − 단계 A, 둘 다 식은 기기)
+
+| | gate_up | down | 레이어당 |
+|---|---:|---:|---:|
+| transport | −106.6 | −64.6 | **−5.5 ms** |
+| quant | +28.1 (requant) | −69.1 (u8in) | −1.3 |
+| swiglu | +60.0 | 0 | +1.9 (미계측 ARM → 계측 DSP로 이동) |
+| dequant | +18.9 | +3.4 | +0.7 |
+| **drain** | **+33.0** | **+46.5** | **+2.5** |
+| mm, acc | −0.7 | −10.6 | −0.4 |
+| staging | | | −1.3 |
+| 합 | | | ≈ −3 (측정: 43.1 → 41.1) |
+
+### 14.3 근본 원인: D1과 u8in의 충돌
+
+D1은 weight DMA를 activation quant 뒤에 숨긴다. fused down은 u8in이라 quant가 없다 → 숨길 곳이 없다. **down drain 50.3 µs = 1.84 MB / 34 GB/s = 54 µs, 전체 DMA 시간.** 구조적이다. gate_up의 65.4는 fused 커널이 첫 64행 블록의 quant 뒤에만 drain해서 M이 클수록 덜 숨기는 것으로 절반이 설명되고, 나머지와 dequant +18.9는 이 실행의 `NNTR_L2_DIFF`(expert마다 FastRPC 3회 추가, 같은 VTCM·같은 전역 DMA 링) 오염 가능성이 있어 **깨끗한 실행으로 확정한다.**
+
+### 14.4 −13은 이중 계산이었다
+
+43 §1의 55.6(두 번 dot)은 D1 이전 값이다. D1이 두 번 dot에서 같은 DMA-숨기기 이득을 먼저 가져갔으므로(55.6 → 43.1), fused가 그 위에 얹는 이득은 작다. fused가 나쁜 게 아니라 기대치가 D1의 이득을 두 번 셌다.
+
+### 14.5 해법 — P1의 설계 요구사항으로 흡수
+
+호출 간 prefetch(IDL 힌트, VTCM 5.5 MB 동시 상주)로 drain −3.4 ms를 따로 회복할 수 있지만, P1이 만들어지면 버려지는 부분집합이다. **P1으로 간다.** 이번 발견은 P1의 하드 요구사항이다: *expert e의 mm 동안 e+1의 gate_up·down weight를 당겨야 하며, 그러지 않으면 레이어당 5.1 ms가 그대로 노출된다.* P1 후 프로파일 예상: 41.1 − 3.4(drain) − 12(transport) − 2.7(quant) − 0.9(staging) ≈ **22 ms/layer**.
+
+**부수 발견**: 같은 `hvx_quant_rows_u8` 함수가 VTCM 입력(fused requant, M×1792)에서 28.1 µs, uncached DDR 입력(두 번 dot down quant, 같은 크기)에서 69.1 µs. 2.5배. Q1이 깨진 축과 같다. P1에서 activation을 DSP에 올려 VTCM에서 양자화하면 gate_up의 83.5도 같은 비율로 떨어진다 — §13.1의 quant 0.7 추정을 뒷받침한다.
