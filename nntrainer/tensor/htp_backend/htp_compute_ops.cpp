@@ -1305,10 +1305,26 @@ private:
                           out_f32, out_len);
     const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
     if (err != AEE_SUCCESS) {
+      // 0x8000040E is AEE_EBADPARM, and every length this call passes is
+      // derived from the same shapes the kernel checks against -- so by far
+      // the likeliest cause is that libnntr_hvx_skel.so on the device is
+      // older than this binary and the two disagree on how many stage_us
+      // slots there are. build_android.sh does not rebuild the skel; only
+      // test/htp/build.sh does, and forgetting that has cost three
+      // measurement cycles.
+      std::string hint;
+      if (static_cast<unsigned>(err) == 0x8000040Eu) {
+        hint =
+          " (AEE_EBADPARM -- if the shapes are right, rebuild the DSP skel: "
+          "test/htp/build.sh, then push libnntr_hvx_skel.so. This binary "
+          "expects " +
+          std::to_string(static_cast<int>(HTP_MOE_N_STAGES)) +
+          " stage_us slots.)";
+      }
       throw std::runtime_error(
         std::string(timed ? "nntr_hvx_mm_u8i4_moe_layer_timed"
                           : "nntr_hvx_mm_u8i4_moe_layer") +
-        " failed: err=" + std::to_string(err));
+        " failed: err=" + std::to_string(err) + hint);
     }
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
     if (profile.level()) {

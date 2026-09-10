@@ -151,6 +151,15 @@ if [ "$USE_HTP" -eq 1 ]; then
     # name for if missing -- see that script's own header comment for why
     # this is a manual step rather than a meson custom_target.
     bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
+
+    # The DSP skel is NOT built here and never was; test/htp/build.sh builds
+    # it and the caller pushes it. That is easy to forget, and forgetting it
+    # produces AEE_EBADPARM at the first call whose IDL changed rather than
+    # anything that names the skel -- three measurement cycles so far. Say so
+    # while the build is running, when there is still time to act on it.
+    log_info "reminder: this does NOT rebuild libnntr_hvx_skel.so."
+    log_info "  if the IDL changed:  HEXKL_ROOT=... ./test/htp/build.sh"
+    log_info "  then push test/htp/build/libnntr_hvx_skel.so to the device"
     # hexkl-lib-subdir already defaults to armv8_android26 (meson_options.txt),
     # matching the device recipe in docs/htp_attention/40_moe_ffn_htp_task.md
     # section6.2 -- only the SDK root (the trap: this must be the SDK-bundled
