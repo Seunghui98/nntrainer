@@ -145,6 +145,7 @@ enum {
   HTP_MOE_T_SCATTER,
   HTP_MOE_T_GATHER,
   HTP_MOE_T_REQUANT,
+  HTP_MOE_T_BLOCKS,
   HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
   HTP_MOE_N_STAGES
@@ -278,6 +279,7 @@ public:
       b.stage_us += stage_us[HTP_MOE_T_STAGE];
       b.gather_us += stage_us[HTP_MOE_T_GATHER];
       b.requant_us += stage_us[HTP_MOE_T_REQUANT];
+      b.blocks += stage_us[HTP_MOE_T_BLOCKS];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
   }
@@ -322,6 +324,11 @@ private:
         hexkl_probe.h's HEXKL_PROBE_GATHER for why they split. */
     uint64_t gather_us = 0;
     uint64_t requant_us = 0;
+    /** NOT microseconds: 64-row HMX blocks issued, summed over experts and
+        calls. Printed as a count beside the times because the matmul scales
+        with it -- 1776 routed rows can cost 32 blocks or 48 depending only
+        on how the router spread them. */
+    uint64_t blocks = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
@@ -419,12 +426,13 @@ private:
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
                      "dequant %.1f acc %.1f drain %.1f scatter %.1f "
-                     "stage %.1f | mm<=%.1f (%.1f%% of host)]",
+                     "stage %.1f | mm<=%.1f (%.1f%% of host) blocks=%llu]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per, quant_per, gather_per, requant_per,
                      swiglu_per, dequant_per, acc_per, drain_per, scatter_per,
                      stage_per, mm_per,
-                     host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0);
+                     host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
+                     (unsigned long long)b.blocks);
       }
       std::fprintf(stderr, "\n");
     }
