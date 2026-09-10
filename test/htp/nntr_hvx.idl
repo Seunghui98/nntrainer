@@ -268,4 +268,27 @@ interface nntr_hvx : remote_handle64 {
                                 in sequence<float> sink, in sequence<float> q,
                                 rout sequence<float> attn_out,
                                 rout sequence<uint32> stage_us);
+
+   // [doc 45 Gate 0b] Two memory probes. Gate 0 stopped weight registration
+   // at 1.89 GB of the 4.10 the whole-model plan needs, with an error that
+   // came from before the registration function ran -- so the PD was out of
+   // memory generally, not out of malloc heap. These separate the two
+   // limits that could be responsible, because ION-backed weights get past
+   // one of them and not the other. DEBUG ONLY.
+
+   // Allocates chunk_mb-sized blocks on the DSP and touches one byte per 4 KB
+   // page of each (so they are committed, not just reserved) until an
+   // allocation fails, then frees them all. Reports how many succeeded and
+   // the sum of the touched bytes so nothing can be optimised away. Carries
+   // no large payload, unlike weight_register_u8i4, so it measures the PD's
+   // own allocatable memory rather than that plus a 3.67 MB input buffer.
+   AEEResult mem_probe_dsp_heap(in uint32 chunk_mb, in uint32 max_chunks,
+                                rout sequence<uint32> chunks_ok,
+                                rout sequence<uint64> touched_sum);
+
+   // Touches one byte per 4 KB page of a host-provided buffer. Called with
+   // rpcmem/ION memory, this is what proves the DSP can actually reach an
+   // ION mapping of a given size -- the design section 8.4 depends on.
+   AEEResult mem_probe_touch(in sequence<uint8> buf,
+                             rout sequence<uint64> touched_sum);
 };
