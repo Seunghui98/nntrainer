@@ -48,6 +48,7 @@
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
+#include <htp_weight_cache.h>
 #include <swiglu_det.h>
 
 #include <chrono>
