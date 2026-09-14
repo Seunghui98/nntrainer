@@ -55,6 +55,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -150,6 +151,8 @@ enum {
   HTP_MOE_T_MM,
   HTP_MOE_T_DMA_KB,
   HTP_MOE_T_DMA_FIRST,
+  HTP_MOE_T_DRAIN_DN,
+  HTP_MOE_T_PUSH,
   HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
   HTP_MOE_N_STAGES
@@ -287,6 +290,8 @@ public:
       b.mm_us += stage_us[HTP_MOE_T_MM];
       b.dma_kb += stage_us[HTP_MOE_T_DMA_KB];
       b.dma_first_us += stage_us[HTP_MOE_T_DMA_FIRST];
+      b.drain_dn_us += stage_us[HTP_MOE_T_DRAIN_DN];
+      b.push_us += stage_us[HTP_MOE_T_PUSH];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
   }
@@ -343,6 +348,11 @@ private:
     uint64_t mm_us = 0;
     uint64_t dma_kb = 0;
     uint64_t dma_first_us = 0;
+    /** The down drain apart from gate_up's, and the push itself. One bucket
+        held both drains and the push sat unnamed in the residual; see
+        hexkl_probe.h for why that left the 4.9 ms unreadable. */
+    uint64_t drain_dn_us = 0;
+    uint64_t push_us = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
@@ -423,6 +433,9 @@ private:
         const double gather_per = static_cast<double>(b.gather_us) / b.calls;
         const double requant_per = static_cast<double>(b.requant_us) / b.calls;
         const double mm_meas_per = static_cast<double>(b.mm_us) / b.calls;
+        const double drain_dn_per =
+          static_cast<double>(b.drain_dn_us) / b.calls;
+        const double push_per = static_cast<double>(b.push_us) / b.calls;
         // What the accelerator actually exists for, by subtraction: the DSP
         // clock minus every stage that is a format change or a wait. Nothing
         // on the DSP times the HMX issue loop directly, and adding a probe
@@ -434,19 +447,20 @@ private:
            scatter included, or the MoE layer call's scatter time would be
            reported as matmul. */
         const double mm_per =
-          dsp_per -
-          (quant_per + swiglu_per + dequant_per + acc_per + drain_per +
-           scatter_per + stage_per + gather_per + requant_per + mm_meas_per);
+          dsp_per - (quant_per + swiglu_per + dequant_per + acc_per +
+                     drain_per + scatter_per + stage_per + gather_per +
+                     requant_per + mm_meas_per + drain_dn_per + push_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
-                     "dequant %.1f acc %.1f drain %.1f scatter %.1f "
+                     "dequant %.1f acc %.1f drain %.1f+%.1f push %.1f "
+                     "scatter %.1f "
                      "stage %.1f mm %.1f | rest<=%.1f (%.1f%% of host) "
                      "blocks=%llu]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per, quant_per, gather_per, requant_per,
-                     swiglu_per, dequant_per, acc_per, drain_per, scatter_per,
-                     stage_per, mm_meas_per, mm_per,
+                     swiglu_per, dequant_per, acc_per, drain_per, drain_dn_per,
+                     push_per, scatter_per, stage_per, mm_meas_per, mm_per,
                      host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
                      (unsigned long long)b.blocks);
       }
@@ -1349,25 +1363,46 @@ private:
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
     const bool timed = profile.level() >= 2;
-    const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
-    const int err = timed
-                      ? nntr_hvx_mm_u8i4_moe_layer_timed(
-                          session, M, K, inter, N_out, h_gu.data(),
-                          static_cast<int>(h_gu.size()), h_dn.data(),
-                          static_cast<int>(h_dn.size()), row_index.data(),
-                          static_cast<int>(row_index.size()), row_count.data(),
-                          static_cast<int>(row_count.size()), row_weight.data(),
-                          static_cast<int>(row_weight.size()), act_f32, act_len,
-                          out_f32, out_len, stage_us, HTP_MOE_N_STAGES)
-                      : nntr_hvx_mm_u8i4_moe_layer(
-                          session, M, K, inter, N_out, h_gu.data(),
-                          static_cast<int>(h_gu.size()), h_dn.data(),
-                          static_cast<int>(h_dn.size()), row_index.data(),
-                          static_cast<int>(row_index.size()), row_count.data(),
-                          static_cast<int>(row_count.size()), row_weight.data(),
-                          static_cast<int>(row_weight.size()), act_f32, act_len,
-                          out_f32, out_len);
-    const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
+    // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
+    // keeps the fastest. Two runs with no functional change between them
+    // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
+    // compute-bound stage identical, the DDR-touching ones all moving
+    // together, so the device's memory system, not the code. Several of the
+    // changes on the list are worth 2 ms, which that noise floor swallows.
+    // Repeating inside one call puts the comparison at the same temperature
+    // and the same contention, and the output is unchanged because the
+    // input is.
+    const int reps = (profile.level() >= 3) ? 5 : 1;
+    uint64_t best_elapsed = UINT64_MAX;
+    int err = AEE_SUCCESS;
+    for (int rep = 0; rep < reps && err == AEE_SUCCESS; ++rep) {
+      uint32_t rep_stage[HTP_MOE_N_STAGES] = {0};
+      const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
+      err = timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
+                      session, M, K, inter, N_out, h_gu.data(),
+                      static_cast<int>(h_gu.size()), h_dn.data(),
+                      static_cast<int>(h_dn.size()), row_index.data(),
+                      static_cast<int>(row_index.size()), row_count.data(),
+                      static_cast<int>(row_count.size()), row_weight.data(),
+                      static_cast<int>(row_weight.size()), act_f32, act_len,
+                      out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
+                  : nntr_hvx_mm_u8i4_moe_layer(
+                      session, M, K, inter, N_out, h_gu.data(),
+                      static_cast<int>(h_gu.size()), h_dn.data(),
+                      static_cast<int>(h_dn.size()), row_index.data(),
+                      static_cast<int>(row_index.size()), row_count.data(),
+                      static_cast<int>(row_count.size()), row_weight.data(),
+                      static_cast<int>(row_weight.size()), act_f32, act_len,
+                      out_f32, out_len);
+      const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
+      // Fastest wins, stages and all, so the breakdown describes one real call
+      // rather than a mix of a fast one and a slow one.
+      if (err == AEE_SUCCESS && elapsed < best_elapsed) {
+        best_elapsed = elapsed;
+        std::memcpy(stage_us, rep_stage, sizeof(stage_us));
+      }
+    }
+    const uint64_t elapsed = (best_elapsed == UINT64_MAX) ? 0 : best_elapsed;
     if (err != AEE_SUCCESS) {
       // 0x8000040E is AEE_EBADPARM, and every length this call passes is
       // derived from the same shapes the kernel checks against -- so by far
