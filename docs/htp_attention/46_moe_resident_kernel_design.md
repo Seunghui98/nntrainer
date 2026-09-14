@@ -1492,3 +1492,89 @@ activation을 캐싱하면 입력이 바뀔 때 틀린 답이 나온다. 그래�
 - **blocks=43** — 라우팅이 정한다. prefill 청크를 키우는 것 외에 커널 레버 없음
 - **decode** — 문서 43 §7에서 대역폭 바운드로 닫혔다. 토큰당 484 MB를 읽는 구조를
   바꿔야 하고 커널 밖이다
+
+## 32. B1a 폐기 → 변환된 모델 + ION 아레나 (2026-09-14, 설계)
+
+### 32.1 왜 폐기하나
+
+B1a는 "런타임 사이드 캐시"였다: 첫 실행이 굽고 weight마다 파일을 쓰고, 다음 실행이
+해시로 찾아 읽는다. 1개 레이어에서는 동작했다(prefill 128.8 → 160.8 TPS). 그러나:
+
+| 문제 | |
+|---|---|
+| **디스크 중복** | 레이어당 178 MB. **22개면 +3.9 GB**, 모델 4.3 GB 옆에. 안 확장된다 |
+| 여전히 복사 | 파일 → ION(583 ms) → FastRPC → DSP malloc+memcpy. 등록 975 ms |
+| 첫 실행 | 전액 지불 + 178 MB 쓰기 |
+| 부가 복잡도 | weight마다 해시·버전·atomic write·용량 검사 |
+
+지적이 맞았다: **weight는 상수이므로 "캐시"가 아니라 "변환된 모델"이어야 한다.**
+양자화처럼 한 번 만드는 산출물이고, 로드는 읽어서 매핑하는 것뿐이어야 한다.
+
+### 32.2 왜 PC에서 못 굽나
+
+`hexkl_micro_hmx_rm_to_wh_i4`는 `libhexkl_micro.a`(hexagon_toolv19_v79) 안에만 있다.
+WH 타일 레이아웃을 아는 코드가 ARM/x86에 없다. 따라서 변환은 **기기에서 1회** 돈다 —
+`weight_bake_export`가 정확히 그 도구다. 호스트 구현(레이아웃 역산)은 가능하지만 독점
+레이아웃이고 SDK 버전마다 깨질 수 있어 뒤로 둔다.
+
+### 32.3 설계
+
+```
+지금:  [.bin QS4CX] → ARM 변환 → FastRPC 7.3MB × 64 → DSP bake → DSP malloc 복사
+                     547 ms       (bake 포함) 1134 ms          → 등록 1662 ms
+
+목표:  [.bin] + [model.htp: WH·scale·colsum·bias 전부, 인덱스 포함]
+              → ARM: rpcmem_alloc(≤2GB 조각) + 파일 읽기 + rpcmem_to_fd
+              → DSP: HAP_mmap(fd) 한 번 → 아레나 VA
+              → weight마다 IDL 호출 하나(K, N, 조각, 오프셋 4개) — 페이로드 0
+              → 슬롯이 아레나 안을 가리킨다. malloc 없음, memcpy 없음, bake 없음
+              → 커널 변경 없음: hexkl_dma_ring은 포인터를 받을 뿐이다
+```
+
+`model.htp`는 **캐시가 아니다**: 해시 없음, 첫 실행 페널티 없음, weight별 파일 없음.
+헤더에 모델 식별자 + 포맷 버전만 둔다 — 다른 체크포인트의 사이드카를 거절하는 건
+신뢰 경계의 입력 검증이지 캐시 로직이 아니다.
+
+`.bin` 자체에 넣는 것(사용자 제안의 문자 그대로)은 `nntr_quantize` 출력 포맷과
+로더를 바꾸는 일이라 **사이드카를 먼저** 하고 그 다음 접는다. 런타임 이득은 같다.
+
+### 32.4 미증명 — Gate 0c
+
+**"DSP가 ARM ION 버퍼를 영구 매핑하고 거기서 DMA로 VTCM에 끌어온다"**는 이 트리에서
+한 번도 안 해봤다. `rpcmem_to_fd`도 `HAP_mmap`도 없다(§31 확인). Gate 0b는 *할당
+크기*만 증명했다. llama.cpp가 `HAP_mmap`으로 같은 하드웨어에서 하고 있으므로 될
+가능성이 높지만, **될 것 같다는 이유로 설계 전체를 얹지 않는다.**
+
+프로브: `rpcmem_alloc` → `rpcmem_to_fd` → IDL `arena_map(fd, bytes)` → DSP `HAP_mmap`
+→ 3.5 MB를 VTCM으로 DMA → 시간 → 27–33 GB/s와 비교. `HAP_munmap`도. 모델 경로
+변경 없음, `mem_probe_dsp_heap`과 같은 종류다.
+
+### 32.5 순서
+
+| # | 항목 | 내용 | 없애는 것 | 의존 |
+|---|---|---|---|---|
+| **A0** | **Gate 0c** | §32.4 프로브. **통과 못 하면 A1–A4 전부 재설계** | — | — |
+| **A1** | 변환 모드 | `nntrainer_causallm --convert-htp <dir>`: 로드 → MoE weight마다 register(bake) → `weight_bake_export` → `model.htp`에 append, 인덱스 기록. 기기에서 1회 | — | — |
+| **A2** | 아레나 로드 | `model.htp` 있으면: ION 조각 할당(≤2 GB) → 읽기 → `arena_map` → weight마다 `weight_register_arena(K,N,chunk,off×4)`. 슬롯은 아레나 포인터 | 등록 1662 → **≈0.2 s** (파일 읽기 178 MB) | A0 |
+| **A3** | 삭제 | `HtpWeightCache`, `register_baked`, `NNTR_HTP_WEIGHT_CACHE`, 그 호스트 체크. `weight_bake_export`는 A1이 쓴다 | 코드 −400줄 | A2 |
+| **A4** | **22개 전부 HTP** | `moe_htp_layers` 확장. 아레나 3.9 GB, ION 조각 2개(Gate 0b: 총 6 GB OK) | ARM MoE 21개분 ≈670 ms | A2 |
+| A5 | ARM 사본 해제 | 아레나에 있는 weight의 QS4CX Tensor 사본을 안 만든다 — 8.4 GB RSS의 절반 | 메모리 −3.9 GB | A4, 로더 작업 |
+
+**A4 뒤 prefill 예상**: 2761 − 975(등록) + 200 − 670(CPU MoE → HTP 22×27) + 594 ≈
+**1900 ms → 234 TPS**, CPU 279 대비 아직 0.84×. §18.2 그대로 — 나머지 1755 ms의
+절반(conv·attention)이 문서 45 Phase B/C다.
+
+### 32.6 커널 항목 — 그대로, 측정 대기
+
+| | 항목 | 지금 | 목표 | 상태 |
+|---|---|---:|---:|---|
+| L1 | 블록 복사 DMA | 1697 | ≈200 | 코드 완료 |
+| L2 | down 청크 | 1659 | ≈500 | 코드 완료 |
+| — | `alloc` 프로브 (24 ms 회귀) | rest 23888 | — | 코드 완료. **아레나로 가면 weight가 DSP 힙을 안 쓰므로 힙 단편화 가설은 구조적으로 사라진다** — 그래도 잰다 |
+| L3 | dequant→SwiGLU 융합 | 3264 | ≈1800 | |
+| L4 | quant | 1816 | ≈1200 | |
+| L5 | scatter+requant | 2556 | ≈1800 | |
+| 바닥 | mm 8086 + acc 2788 | 10.9 ms | — | HMX + 벤더 |
+
+대기 중인 빌드는 이걸 잰다. **`NNTR_HTP_WEIGHT_CACHE` 없이** 돌린다 — 캐시 칼럼은
+이제 의미가 없다.
