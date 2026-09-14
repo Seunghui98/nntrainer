@@ -1611,3 +1611,35 @@ gate_up 하나치)에 패턴을 쓰고 `rpcmem_to_fd`로 fd를 얻어 넘긴다.
 | `dma_gbs` ≪ 27 | 매핑은 되는데 느리다. 아레나는 되지만 weight 스트리밍 예산을 다시 계산해야 한다 |
 | `err=EUNSUPPORTED` | SDK에 `HAP_mem.h`가 없다. 다른 매핑 API를 찾거나 A 재설계 |
 | `mapped=no` / `checksum_ok=no` | **Gate 0c 실패.** §32.5 전체 재설계 |
+
+### 32.8 Gate 0c 1차 (2026-09-14, 기기) — `HAP_mmap`이 null, fd가 붙어있지 않았다
+
+```
+U8I4_FIELD path=arena field=rpcmem_to_fd value=yes
+U8I4_FIELD path=arena field=fd           value=14
+U8I4_FIELD path=arena field=err          value=0x80000402   ← AEE_ENOMEMORY
+```
+
+`0x80000402`는 내가 `HAP_mmap` 실패에 붙인 코드다. 읽히는 것:
+
+| | |
+|---|---|
+| `HAP_mem.h` | **있다** (없었으면 `EUNSUPPORTED`) |
+| `HAP_mmap` 링크 | **된다** (빌드 통과) |
+| `rpcmem_to_fd` | **있다**, fd 14를 줬다 |
+| `HAP_mmap(NULL, bytes, RW, 0, fd, 0)` | **null 반환** |
+
+**호스트 fd 번호는 FastRPC 세션에 붙기 전까지 DSP에게 의미가 없다.** rpcmem 버퍼가
+IDL `sequence`로 넘어갈 때는 프레임워크가 그 호출 동안만 매핑해준다 — 프로파일의
+"ION은 pinned+mapped per call이 아니다"가 그 얘기고, **호출이 끝나면 사라진다.**
+영구 매핑에는 `fastrpc_mmap`이 필요하고, 1차 프로브에 그게 없었다.
+
+**2차 (코드 완료, 미측정):**
+1. ARM이 `fastrpc_mmap(CDSP, fd, buf, 0, bytes, FASTRPC_MAP_FD)`로 먼저 붙인다.
+   dlsym으로 찾는다 — 없는 libcdsprpc.so는 링크 에러가 아니라 보고할 사실이다
+2. DSP가 **null과 MAP_FAILED를 구분해서 보고**한다(`res[6]`). null은 "이 fd를
+   모른다"(= 안 붙었다), MAP_FAILED는 "알지만 거절했다" — 1차는 이 둘을 못 갈랐다
+3. 끝나면 `fastrpc_munmap`
+
+이건 **가설 하나짜리 변경**이다: 빠진 게 attach라면 통과하고, 아니면 `hap_mmap`
+필드가 null인지 failed인지로 다음 후보가 갈린다.
