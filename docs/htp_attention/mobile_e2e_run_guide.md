@@ -18,7 +18,7 @@ verification").
 | `[HTP] Let the M4_0 accel gates opt in at M == 1` | decode(M=1)에서 HTP 커널을 타도록 게이트 수정 (오타: 커밋 제목의 "M4_0"은 "Q4_0"의 오타입니다) |
 | `[CausalLM] Give the LFM2 MoE prefill workspace the input's ComputeOps` | prefill 워크스페이스 텐서에 ComputeOps 컨텍스트 상속 (안 하면 조용히 CPU로 폴백) |
 | `[CausalLM] Add engine + a layer-id HTP subset to the LFM2 MoE FFN` | `moe_engine` / `moe_htp_layers` config 키로 레이어 단위 HTP on/off |
-| `[Android] Add --htp to CausalLM's build script; fix its NDK detection` | `build_android.sh --htp` 플래그, NDK 하드코딩 버그 수정 |
+| `[Android] Add --htp to CausalLM's build script; fix its NDK detection` | NDK 하드코딩 버그 수정. **`--htp` 플래그는 이 브랜치에 없다** — 아래 주의 참고 |
 | `[test] Add LFM2-MoE's missing Q4_0 differential test, fix stale comments` | tiny 모델 Q4_0 골든 테스트 추가 |
 
 호스트에서 확인된 것: 전체 meson 테스트 45/45 통과, tiny fixture로
@@ -175,13 +175,14 @@ HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT bash \
   nntrainer/tensor/htp_backend/generate_stub.sh
 
 cd Applications/CausalLM
-./build_android.sh --htp
+./build_android.sh
 ```
 
 `--htp`는 자동으로:
 1. `HEXAGON_SDK_ROOT` 없으면 이름을 대며 즉시 에러
 2. `generate_stub.sh` 재실행 (멱등이라 두 번 해도 무해)
-3. `./tools/package_android.sh -Denable-htp=true -Dhexkl-sdk-root=$HEXAGON_SDK_ROOT/addons/hexkl_addon` 호출
+3. `./tools/package_android.sh` 호출 — **인자 없이**. `-Denable-htp`는 여기서
+   넘어가지 않는다.
 
 빌드 후 확인:
 
@@ -190,9 +191,29 @@ readelf -d builddir/jni/arm64-v8a/libnntrainer.so | grep NEEDED
 #   libcdsprpc.so 와 libsdkl.so 가 리스트에 있어야 함
 ```
 
-기존 `builddir`가 `-Denable-htp` 옵션 없이 만들어진 거면 `meson configure`로는
-못 주워서 지워야 합니다 — `build_android.sh`는 매번 `builddir`를 지우고
-다시 만드므로 (`--cache` 안 쓰면) 신경 안 써도 됩니다.
+**주의 — 이 단락은 반대로 적혀 있었습니다.** `build_android.sh`는 `builddir`를
+매번 지우지 **않습니다**. `--clean`일 때만 지웁니다. 그래서 실제 동작은:
+
+| | `builddir` 상태 | 결과 |
+|---|---|---|
+| `./build_android.sh` | 있음 | `meson configure` + `--wipe` → **기존 옵션 보존, HTP 유지** ✓ |
+| `./build_android.sh` | 없음 | `-Denable-htp` 없이 새로 생성 → **HTP 꺼짐** |
+| `./build_android.sh --clean` | 무관 | 지우고 새로 생성 → **HTP 꺼짐** |
+| `./build_android.sh --cache` | 있음 | nntrainer 재빌드 자체를 건너뜀 (ARM 쪽 변경이 안 들어감) |
+
+즉 **`--clean`을 쓰면 HTP가 조용히 꺼집니다.** `-Denable-htp`는
+`package_android.sh`에 인자로 넘어가지 않고 `builddir`에만 저장되어 있습니다.
+한 번 꺼지면 위의 `readelf`에 `libsdkl.so`가 안 나오고, 실행은 되지만 전부 CPU로
+떨어집니다 — 실패가 아니라 조용한 성능 회귀로 보입니다.
+
+처음 만들 때나 다시 켤 때:
+
+```bash
+rm -rf builddir
+./tools/package_android.sh -Denable-htp=true \
+  -Dhexkl-sdk-root=$HOME/Downloads/hexkl_addon
+meson configure builddir | grep -i htp    # enable-htp true 확인
+```
 
 ---
 

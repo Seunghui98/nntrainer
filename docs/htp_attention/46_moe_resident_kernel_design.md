@@ -424,7 +424,14 @@ DSP로 옮긴 일(gather·scatter·staging)이 DSP에서 더 비싸기 때문이
 1. `./test/htp/build.sh` — **skel을 반드시 다시 빌드한다.** `MOE_N_STAGES`가
    9 → 12로 늘었다. 안 하면 `nntr_hvx_mm_u8i4_moe_layer_timed failed:
    err=-2147482610` (0x8000040E, EBADPARM). 이 사이클을 이미 한 번 잃었다.
-2. `./build_android.sh --htp` (skel은 안 만든다)
+2. `./build_android.sh` — **`--htp` 플래그는 없다.** 인자 파서가 모르는 옵션에
+   `exit 1`을 하므로 그대로 치면 빌드가 시작도 안 된다(이 문서가 한 번 틀리게
+   적었다). HTP는 플래그가 아니라 **`builddir`에 이미 박혀 있는 meson 옵션**이다:
+   `package_android.sh`는 `builddir`가 있으면 `meson configure` + `--wipe`로
+   기존 옵션을 보존하고, 없으면 `-Denable-htp` 없이 새로 만든다. 따라서
+   **`--clean`을 쓰면 안 된다** — builddir가 지워지고 HTP가 조용히 꺼진다.
+   확인: `meson configure builddir | grep -i htp` 가 `enable-htp true`여야 한다.
+   (skel은 이 스크립트가 안 만든다 — 1번이 만든다.)
 3. `NNTR_HTP_PROFILE=2`로 모델 실행 → `layer calls total`과 새 칼럼
    `[quant … gather … requant … stage …]`을 본다.
 
