@@ -1643,3 +1643,36 @@ IDL `sequence`로 넘어갈 때는 프레임워크가 그 호출 동안만 매�
 
 이건 **가설 하나짜리 변경**이다: 빠진 게 attach라면 통과하고, 아니면 `hap_mmap`
 필드가 null인지 failed인지로 다음 후보가 갈린다.
+
+### 32.9 Gate 0c 2차 — attach는 됐다, `HAP_mmap`이 MAP_FAILED
+
+```
+fastrpc_mmap    = yes      fastrpc_mmap_rc   = 0x00000000   ← attach 성공
+attached        = yes      fastrpc_munmap_rc = 0x00000000
+hap_mmap        = failed   ← null 아님. DSP가 fd를 알고서 거절했다
+err             = 0x80000402
+```
+
+1차의 가설(attach 누락)이 맞았고 고쳤다. 이제 실패가 **null → MAP_FAILED**로 바뀌었다 —
+1차에 둘을 구분해두지 않았으면 이 진전을 못 봤을 것이다.
+
+**원인: `flags = 0`.** POSIX `mmap`은 `MAP_SHARED`나 `MAP_PRIVATE` 중 **정확히 하나**를
+요구하고 0은 `EINVAL`이다. 매크로 누락으로 빌드가 깨지는 걸 피하려고 숫자를 쓴 결정이
+여기서 비용을 냈다 — prot은 맞게 찍었는데 flags를 안 찍었다.
+
+**3차 (코드 완료·미측정):** 값을 하나 더 찍지 않고 **가능한 조합을 전부 시도하고 어느
+것이 통과했는지 보고한다.** 기기 실행 한 번으로 끝난다.
+
+| # | prot | flags | |
+|---|---|---|---|
+| 1 | rw | shared | 가장 유력 |
+| 2 | r | shared | 읽기만으로 충분하다면 |
+| 3 | rw | private | |
+| 4 | r | private | |
+| 5 | rw | 0 | 2차가 쓴 것. 통과하면 진단이 틀린 것이므로 남겨둔다 |
+
+`res[6]` = 통과한 번호(0이면 전부 실패), `res[7]` = 조합당 2비트로 null(1)/MAP_FAILED(2).
+
+**이 프로브가 세 번 만에 여기까지 온 방식이 요점이다.** 매번 하나씩 좁혔고, 각
+단계에서 "무엇이 실패했나"가 아니라 **"어떻게 실패했나"**를 남겨둔 덕에 다음 가설이
+나왔다. 1차: 헤더·심볼 존재 확인. 2차: attach가 원인. 3차: flags.
