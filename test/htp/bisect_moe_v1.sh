@@ -59,4 +59,4 @@ adb push "$HERE/build/libnntr_hvx_skel.so" \
 adb shell "cd $DEVICE_TMP && chmod +x unittest_hvx_mm_u8i4 && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
   ./unittest_hvx_mm_u8i4 --gtest_filter='*MoeLayerMatchesTwoCall*'" \
-  | grep -E "bad_elems|first at|OK \]|FAILED \]"
+  | grep -E "U8I4_FIELD|first at|OK \]|FAILED \]"
