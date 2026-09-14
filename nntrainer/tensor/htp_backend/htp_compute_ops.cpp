@@ -53,9 +53,9 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -151,6 +151,7 @@ enum {
   HTP_MOE_T_MM,
   HTP_MOE_T_DMA_KB,
   HTP_MOE_T_DMA_FIRST,
+  HTP_MOE_T_DMA_FIRST_KB,
   HTP_MOE_T_DRAIN_DN,
   HTP_MOE_T_PUSH,
   HTP_MOE_T_STAGE,
@@ -291,6 +292,7 @@ public:
       b.dma_kb += stage_us[HTP_MOE_T_DMA_KB];
       b.dma_first_us += stage_us[HTP_MOE_T_DMA_FIRST];
       b.drain_dn_us += stage_us[HTP_MOE_T_DRAIN_DN];
+      b.dma_first_kb += stage_us[HTP_MOE_T_DMA_FIRST_KB];
       b.push_us += stage_us[HTP_MOE_T_PUSH];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
@@ -352,6 +354,7 @@ private:
         held both drains and the push sat unnamed in the residual; see
         hexkl_probe.h for why that left the 4.9 ms unreadable. */
     uint64_t drain_dn_us = 0;
+    uint64_t dma_first_kb = 0;
     uint64_t push_us = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
@@ -465,21 +468,22 @@ private:
                      (unsigned long long)b.blocks);
       }
       if (level_ >= 2 && b.calls != 0 && b.dma_first_us != 0) {
-        // The first weight drain waits on one gate_up transfer with an empty
-        // ring, so it times a transfer instead of a pipeline. Its size is
-        // fixed by the shapes: (K/32) * (2*inter/32) * 512 bytes, which is
-        // 3584 KB for LFM2's 2048/1792. Reported as a rate because that is
-        // the number the plan turns on -- the 176 MB of expert weights a
-        // layer streams need about 12.8 GB/s to stay hidden behind the
-        // matmul, and the staging copies already show ~18 GB/s DDR to DDR.
+        // The first weight wait happens with an empty ring, so it times a
+        // transfer rather than a pipeline. The size it covers is reported
+        // alongside rather than derived from the shapes: since the weight
+        // started arriving in chunks that wait covers one chunk, and
+        // dividing its time by the whole weight claimed 114.7 GB/s for a
+        // link that does about 33.
         const double first_us = static_cast<double>(b.dma_first_us) / b.calls;
+        const double first_kb = static_cast<double>(b.dma_first_kb) / b.calls;
         const double kb = static_cast<double>(b.dma_kb) / b.calls;
         const double dsp_us = static_cast<double>(b.dsp_us) / b.calls;
         std::fprintf(stderr,
                      "\n[HTP-PROFILE]     weight DMA: %.0f KB/call, first "
-                     "3584 KB took %.0f us = %.1f GB/s; averaged over the "
+                     "%.0f KB took %.0f us = %.1f GB/s; averaged over the "
                      "call %.1f GB/s",
-                     kb, first_us, first_us > 0.0 ? 3670.016 / first_us : 0.0,
+                     kb, first_kb, first_us,
+                     first_us > 0.0 ? first_kb * 1.024 / first_us : 0.0,
                      dsp_us > 0.0 ? kb * 1.024 / dsp_us : 0.0);
       }
       std::fprintf(stderr, "\n");
