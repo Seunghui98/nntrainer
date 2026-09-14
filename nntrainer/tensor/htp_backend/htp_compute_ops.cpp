@@ -146,6 +146,9 @@ enum {
   HTP_MOE_T_GATHER,
   HTP_MOE_T_REQUANT,
   HTP_MOE_T_BLOCKS,
+  HTP_MOE_T_MM,
+  HTP_MOE_T_DMA_KB,
+  HTP_MOE_T_DMA_FIRST,
   HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
   HTP_MOE_N_STAGES
@@ -280,6 +283,9 @@ public:
       b.gather_us += stage_us[HTP_MOE_T_GATHER];
       b.requant_us += stage_us[HTP_MOE_T_REQUANT];
       b.blocks += stage_us[HTP_MOE_T_BLOCKS];
+      b.mm_us += stage_us[HTP_MOE_T_MM];
+      b.dma_kb += stage_us[HTP_MOE_T_DMA_KB];
+      b.dma_first_us += stage_us[HTP_MOE_T_DMA_FIRST];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
   }
@@ -329,6 +335,13 @@ private:
         with it -- 1776 routed rows can cost 32 blocks or 48 depending only
         on how the router spread them. */
     uint64_t blocks = 0;
+    /** MoE layer call only. mm_us is the HMX issue loop measured rather
+        than left as the subtraction residual; what the residual still holds
+        after subtracting it is the honest "unnamed" figure. dma_kb and
+        dma_first_us together give the DDR-to-VTCM weight rate. */
+    uint64_t mm_us = 0;
+    uint64_t dma_kb = 0;
+    uint64_t dma_first_us = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
@@ -408,6 +421,7 @@ private:
         const double stage_per = static_cast<double>(b.stage_us) / b.calls;
         const double gather_per = static_cast<double>(b.gather_us) / b.calls;
         const double requant_per = static_cast<double>(b.requant_us) / b.calls;
+        const double mm_meas_per = static_cast<double>(b.mm_us) / b.calls;
         // What the accelerator actually exists for, by subtraction: the DSP
         // clock minus every stage that is a format change or a wait. Nothing
         // on the DSP times the HMX issue loop directly, and adding a probe
@@ -421,18 +435,37 @@ private:
         const double mm_per =
           dsp_per - (quant_per + swiglu_per + dequant_per + acc_per +
                      drain_per + scatter_per + stage_per + gather_per +
-                     requant_per);
+                     requant_per + mm_meas_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
                      "dequant %.1f acc %.1f drain %.1f scatter %.1f "
-                     "stage %.1f | mm<=%.1f (%.1f%% of host) blocks=%llu]",
+                     "stage %.1f mm %.1f | rest<=%.1f (%.1f%% of host) "
+                     "blocks=%llu]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per, quant_per, gather_per, requant_per,
                      swiglu_per, dequant_per, acc_per, drain_per, scatter_per,
-                     stage_per, mm_per,
+                     stage_per, mm_meas_per, mm_per,
                      host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
                      (unsigned long long)b.blocks);
+      }
+      if (level_ >= 2 && b.calls != 0 && b.dma_first_us != 0) {
+        // The first weight drain waits on one gate_up transfer with an empty
+        // ring, so it times a transfer instead of a pipeline. Its size is
+        // fixed by the shapes: (K/32) * (2*inter/32) * 512 bytes, which is
+        // 3584 KB for LFM2's 2048/1792. Reported as a rate because that is
+        // the number the plan turns on -- the 176 MB of expert weights a
+        // layer streams need about 12.8 GB/s to stay hidden behind the
+        // matmul, and the staging copies already show ~18 GB/s DDR to DDR.
+        const double first_us = static_cast<double>(b.dma_first_us) / b.calls;
+        const double kb = static_cast<double>(b.dma_kb) / b.calls;
+        const double dsp_us = static_cast<double>(b.dsp_us) / b.calls;
+        std::fprintf(stderr,
+                     "\n[HTP-PROFILE]     weight DMA: %.0f KB/call, first "
+                     "3584 KB took %.0f us = %.1f GB/s; averaged over the "
+                     "call %.1f GB/s",
+                     kb, first_us, first_us > 0.0 ? 3670.016 / first_us : 0.0,
+                     dsp_us > 0.0 ? kb * 1.024 / dsp_us : 0.0);
       }
       std::fprintf(stderr, "\n");
     }
