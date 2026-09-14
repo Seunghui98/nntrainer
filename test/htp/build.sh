@@ -15,8 +15,22 @@ set -eu
 : "${DEFAULT_HEXAGON_TOOLS_ROOT:?source setup_sdk_env.source first}"
 
 HEX_ARCH="${HEX_ARCH:-v79}"
-HEXKL_ROOT="${HEXKL_ROOT:-$HOME/Downloads/hexkl_addon}"
-HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.1}"
+# Unset HEXKL_ROOT picks the first install that is actually there. The two
+# candidates are the beta2 drop the device script (run_u8i4_layer_on_device.sh)
+# defaults to and the older unpack-in-Downloads location; a stale default cost a
+# bisect step, because this script failing is easy to miss when the caller does
+# not stop on it.
+if [ -z "${HEXKL_ROOT:-}" ]; then
+    HEXKL_ROOT="$HOME/workspace/hxkl-beta2/hexkl_addon"
+    if [ ! -d "$HEXKL_ROOT" ] && [ -d "$HOME/Downloads/hexkl_addon" ]; then
+        HEXKL_ROOT="$HOME/Downloads/hexkl_addon"
+    fi
+fi
+# Likewise the SDK version: fall back to the newest one this install ships.
+if [ -z "${HEXKL_SDK_VER:-}" ]; then
+    HEXKL_SDK_VER="$(ls -1 "$HEXKL_ROOT/lib" 2>/dev/null | sort -V | tail -1 || true)"
+    HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.2}"
+fi
 HEXKL_TOOLS_VARIANT="${HEXKL_TOOLS_VARIANT:-toolv19}"
 HEXKL_LIB="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_ARCH}/libhexkl_micro.a"
 
