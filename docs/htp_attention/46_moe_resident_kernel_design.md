@@ -1410,3 +1410,85 @@ NNTR_HTP_WEIGHT_CACHE=/data/local/tmp/whcache NNTR_HTP_PROFILE=2 <run>   # 히�
 `registration total`이 1662 → 300 근처로 떨어져야 하고, 그게 **prefill TPS를
 128.8 → 213으로 올리는 유일한 이미-구현된 레버**다. 텍스트도 봐야 한다 — 캐시가
 틀린 바이트를 먹였으면 거기서만 드러난다.
+
+## 30. B1a 측정 (2026-09-14, 기기) — prefill **160.8 TPS**, 하지만 레이어가 회귀했다
+
+```
+1회차(캐시 씀): prefill 98.9 TPS,  registration 2234.7,  layer 32.9
+2회차(히트)   : prefill 160.8 TPS, registration  974.8,  layer 47.9
+직전 베이스라인: prefill 128.8 TPS, registration 1662.4,  layer 27.0
+```
+
+### 30.1 캐시는 동작한다
+
+| | 베이스라인 | 히트 | |
+|---|---:|---:|---|
+| convert to registry | 510.9 | **0.0** | ARM 변환 건너뜀 |
+| register FastRPC | 1134.1 | **392.1** | DSP bake 건너뜀 (19.55 → 6.13 ms/weight) |
+| alloc + other | 17.5 | **582.7** | **캐시 파일 178 MB를 0.31 GB/s로 fread** |
+| registration total | 1662.4 | **974.8** | |
+
+`974.8 = 392 + 583`으로 완전히 설명된다. **prefill 160.8 TPS는 최고 기록**(+25%)이지만
+예상 213에는 못 미쳤고, 이유가 둘이다.
+
+### 30.2 무엇을 캐싱하는가 (한 번 더 못 박는다)
+
+**weight다. activation이 아니다.** 두 텐서가 다른 레이아웃, 다른 경로를 탄다:
+
+| | **WH** | **AH** |
+|---|---|---|
+| 대상 | weight (`w_i4_rm`) | activation (`act_f32`) |
+| 변환 | `hexkl_micro_hmx_rm_to_wh_i4` | `hvx_quant_rows_u8_params` + `_pack_u8_ah_mapped` |
+| 언제 | `weight_register` — 모델 로드 1회 | `layer_run` — **호출마다** |
+| 캐시 | ✅ | ❌ |
+
+activation을 캐싱하면 입력이 바뀔 때 틀린 답이 나온다. 그래서 안 한다 — `quant 1816`과
+`gather 1697`이 매 호출 지불하는 그 비용이다.
+
+### 30.3 회귀 둘 — 원인 확정과 미확정
+
+**① `rpcmem/ION buffer : 0/64`** — 캐시 경로에서 `HtpRpcBuffer` 대신 `std::vector`를
+썼다. 3.5 MB 페이로드가 일반 힙에서 넘어가 FastRPC가 호출마다 pin+map했다. **내 누락.**
+
+**② `layer calls total` 27.0 → 47.9, 전부 `rest`(1019 → 23888)에** — 커널 코드는
+같고 이름 붙은 단계도 전부 같다(mm 8086, quant 1816, acc 2788...). **DSP에 이름 없는
+24 ms가 생겼다.** `rest`에 있는 건 `layer_run` 자신의 malloc/free(호출당 12.8 MB)와
+셋업뿐이다. 캐시 경로가 DSP 힙을 다르게 남겼을 가능성이 높지만 **추측하지 않는다.**
+
+### 30.4 R3 (코드 완료·미측정)
+
+1. **캐시를 ION 버퍼로 직접 읽는다** — `load`가 벡터가 아니라 caller의 버퍼를 받는다.
+   복사 두 번(fread→vector, FastRPC pin+copy)이 한 번(read→ION, zero-copy)이 된다.
+   호스트 체크에 **short buffer 거절**을 추가했다: 이 용량 검사가 잘못 잡은 rpcmem
+   할당과 오버런 사이에 서 있는 유일한 것이다.
+2. **`HEXKL_PROBE_ALLOC`** — `layer_run`의 malloc/free를 잰다. ②가 여기 있으면
+   숫자가 말해준다. `MOE_N_STAGES` 18 → **19**.
+
+## 31. 남은 최적화 — 전체 목록
+
+### 31.1 prefill TPS를 움직이는 것 (prefill 2761 ms 기준)
+
+| # | 항목 | 지금 | 목표 | 상태 |
+|---|---|---:|---:|---|
+| **P1** | **`rest` 24 ms 회귀** | layer 47.9 | 27.0 복귀 | **R3-2 프로브 대기** |
+| **P2** | 캐시 파일 읽기 | 583 ms | ≈150 | **R3-1 완료, 미측정** |
+| **P3** | **22개 MoE 레이어 전부 HTP** | 21개 CPU | | `moe_htp_layers` 확장. registration이 싸진 지금 처음 가능 |
+| **P4** | FastRPC 등록 | 392 ms | ≈0 | 문서 45 §8.4 ION 아레나 — 파일을 mmap해 DSP가 직접 읽고, 등록은 핸들만 |
+| P5 | 나머지 ARM 1755 ms | | | conv 18 + attn 6 → 문서 45 Phase B/C |
+
+### 31.2 레이어 시간을 줄이는 것 (DSP 24.7 ms 기준, 회귀 제외)
+
+| # | 항목 | 지금 | 목표 | 근거 |
+|---|---|---:|---:|---|
+| **L1** | 블록 복사 DMA | 1697 | ≈200 | R2b 완료·미측정 |
+| **L2** | down 청크 | 1659 | ≈500 | R2b 완료·미측정 |
+| **L3** | A3 dequant→SwiGLU 융합 | 1358+1906 | ≈1800 | 블록당 1.8 MB VTCM 왕복 제거 |
+| **L4** | quant 1816 | | ≈1200 | 슬롯 2752개를 f32에서 읽는다. 소스 행 재사용이 캐시에 안 남는 듯 |
+| L5 | scatter+requant 2556 | | ≈1800 | 이미 풀. f32 왕복만 남음 |
+| **바닥** | **mm 8086 + acc 2788 = 10.9 ms** | | — | HMX + 벤더 코드 |
+
+### 31.3 못 고치는 것
+
+- **blocks=43** — 라우팅이 정한다. prefill 청크를 키우는 것 외에 커널 레버 없음
+- **decode** — 문서 43 §7에서 대역폭 바운드로 닫혔다. 토큰당 484 MB를 읽는 구조를
+  바꿔야 하고 커널 밖이다
