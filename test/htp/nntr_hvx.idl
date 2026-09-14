@@ -334,6 +334,23 @@ interface nntr_hvx : remote_handle64 {
    // limits that could be responsible, because ION-backed weights get past
    // one of them and not the other. DEBUG ONLY.
 
+   // [doc 46 section 32.4, Gate 0c] Maps a host rpcmem buffer into the DSP
+   // once and DMAs out of it, which is the one step of the arena design
+   // this tree has never done: neither rpcmem_to_fd nor HAP_mmap appears
+   // anywhere, and Gate 0b measured how much ION could be allocated, not
+   // whether the DSP can reach it. If this fails the arena is not
+   // available and the plan that rests on it has to change.
+   //
+   // fd comes from rpcmem_to_fd on the host. dma_bytes of the mapping are
+   // pulled into VTCM and timed, so the rate can be compared against the
+   // 27-33 GB/s the weight path already measures from DSP heap.
+   //
+   // res: [mapped(0/1), map_us, dma_us, dma_bytes, checksum, unmap_ok]
+   // checksum is a sum over the DMA'd bytes so nothing can be optimised
+   // away and a mapping that reads as zeros is visible. DEBUG ONLY.
+   AEEResult arena_probe(in int32 fd, in uint32 bytes, in uint32 dma_bytes,
+                         rout sequence<uint32> res);
+
    // Allocates chunk_mb-sized blocks on the DSP and touches one byte per 4 KB
    // page of each (so they are committed, not just reserved) until an
    // allocation fails, then frees them all. Reports how many succeeded and
