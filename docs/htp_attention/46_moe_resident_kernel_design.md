@@ -837,12 +837,11 @@ OLMoE, DeepSeek-V2-Lite와 함께, 256–4096 토큰, Snapdragon 8 Elite Gen 5.
 초록·검색 스니펫·llama.cpp 소스에서 확인된 것만이다. "500 TPS"와 "16×16×16"은 확인
 못 했다 — 접근 가능한 텍스트엔 비율(2.25–27.57× TTFT)만 있다.
 
-### 21.1 이 논문이 아닌 것
+### 21.1 이 논문이 아닌 것 (그리고 §21.1의 첫 판은 틀렸다)
 
-llama.cpp Hexagon 커널 논문이 아니다. llama.cpp의 HTP 백엔드(`ggml-hexagon/htp/
-matmul-ops.c`)는 **HVX 전용**이고 HMX를 행렬곱에 안 쓴다 — 32행 타일, 행별 q8
-activation 양자화, DMA로 VTCM에 프리페치(`n_prefetch` 깊이), `MUL_MAT_ID_NX`로
-전문가 여러 개를 한 op에, 그래프 전체를 FastRPC 한 번에. 16×16×16 구조는 없다.
+llama.cpp Hexagon 커널 논문은 아니다. 그러나 **"llama.cpp의 HTP는 HVX 전용이고
+HMX를 행렬곱에 안 쓴다"고 쓴 첫 판은 틀렸다.** 그건 웹 요약을 옮긴 것이고 소스를
+읽지 않았다. 실제로 읽으니 `matmul-ops.c`에 HMX가 141군데 나온다. 정정은 §22.
 
 ### 21.2 EStream의 네 가지와 우리 위치
 
@@ -876,3 +875,91 @@ activation 양자화, DMA로 VTCM에 프리페치(`n_prefetch` 깊이), `MUL_MAT
 없음. 우리 커널 층(HMX·DMA 링·결정적 SwiGLU)은 이미 그쪽이 말하는 "QNN 아래"에 있다.
 그쪽 영역에 닿으려면 A(아레나) → C(라우팅+레이어 간 상주) → D(패딩). 그리고 그쪽
 비율의 절반은 베이스라인 쪽 사정이다.
+
+
+## 22. llama.cpp HTP의 HMX 경로 — 소스 확인 (2026-09-14)
+
+`ggml/src/ggml-hexagon/htp/` 를 직접 받아 읽었다. **fp16 HMX 경로가 있다.**
+
+### 22.1 그쪽 구조
+
+`matmul-ops.h`:
+
+```c
+#define HTP_MM_HMX_TILE_N_COLS 32
+#define HTP_MM_HMX_TILE_N_ROWS 32
+#define HTP_MM_HMX_TILE_SIZE   (32 * 32 * sizeof(__fp16)) // 2048 bytes
+#define HTP_MM_HMX_TILE_N_ELMS 1024
+#define HTP_MM_HMX_MIN_NROWS   4
+#define HTP_MM_HMX_COST_W_DEQUANT 3 // 양자화 weight 로딩/디퀀트 비용 패널티
+#define HTP_MM_HMX_COST_A_CONVERT 2 // activation 로딩/변환 비용 패널티
+enum { ..., HTP_MM_KERNEL_HMX_2D, HTP_MM_KERNEL_HMX_F16_BATCHED,
+       HTP_MM_KERNEL_HVX_F16_F16_VTCM, ... HTP_MM_KERNEL_HVX_QUANT_ROW, ... };
+```
+
+**HMX는 fp16×fp16→fp16이다.** 양자화 weight(Q4_0/Q4_1/IQ4_NL/MXFP4/Q8_0)는
+DDR에서는 양자화된 채로 오고 **VTCM에서 타일 단위로 fp16으로 풀린다**
+(`dequantize_tiled_weight_chunk_to_fp16_tiles`, 타입별
+`dequantize_tiled_worker_loop_*`). 그 디퀀트는 HVX 작업이고 **비동기 큐로 HMX와
+겹친다** (`hmx-queue.c`, `hmx_matmul_job_t job_slots[2]` 더블 버퍼,
+`hmx_queue_push` / `hmx_queue_pop`).
+
+꼬리 처리도 있다:
+```c
+const uint32_t n_rows_padded = hex_align_up(n_rows, HTP_MM_HMX_TILE_N_ROWS);
+const uint32_t n_rows_tiled  = (n_rows / HTP_MM_HMX_TILE_N_ROWS) * HTP_MM_HMX_TILE_N_ROWS;
+```
+
+### 22.2 우리와의 대조
+
+| | llama.cpp | 우리 |
+|---|---|---|
+| HMX 모드 | **fp16 × fp16 → fp16** | **u8 × i4 → i32** |
+| 타일 | 32×32 fp16 (2048 B) | acc 64×32 i32, weight 타일 512 B |
+| weight | 양자화된 채 DDR→VTCM, **타일마다 fp16 디퀀트** | int4 그대로 HMX에 |
+| activation | f32→f16 **변환만** | **u8 양자화** (scale/zp/colsum) |
+| 디퀀트 위치 | **입력측**(weight), HVX, HMX와 비동기 중첩 | **출력측**(i32→f32), 직렬 |
+| 커널 선택 | **solver + 비용 모델** | 고정 |
+| 꼬리 | `n_rows_tiled` / 나머지 분리 | 없음 — 64로 패딩 |
+
+### 22.3 우리에게 옮길 수 있는 것
+
+**① 비동기 HMX 작업 큐 — 가장 직접적이고, 이미 우리 A2다.**
+`hmx-queue.c`가 동작하는 참조 설계다. 우리 `dequant 5314 + swiglu 1927 + requant
+1254 = 8.5 ms`가 원리상 `mm 13722` 뒤에 숨을 수 있다. 지금은 전부 직렬이고 워커
+3개가 논다(§17 A2). **이건 그냥 한다.**
+
+**② 꼬리 분리.** `blocks=43`의 패딩 낭비(mm의 ~35%, §16.1)를 겨냥. 우리 타일이
+64행이라 그쪽 32행보다 낭비가 크다 — 70행 전문가가 우리는 128슬롯(55%), 32행
+타일이면 96슬롯(73%). 꼬리를 HVX로 빼려면 u8·i4 HVX dot이 필요한데 **우리 트리에
+없다**(§21.4 D).
+
+**③ 커널 선택 solver.** M이 작으면 HVX, 크면 HMX. 우리 decode(M=1)가 정확히
+그 경우다 — 지금은 `M > 1` 게이트로 CPU에 떨어진다.
+
+### 22.4 fp16 HMX로 갈아타는 건? — 아마 아니다
+
+솔깃하다: activation u8 양자화가 사라지면 `quant 610 + requant 1254 + dequant
+5314 = 7.2 ms`가 **구조적으로** 없어진다. 그리고 우리는 이미 자산이 있다 —
+문서 14가 `hexkl_micro_hmx_mm_f16`을 기기에서 검증했고 prefill 43–65×,
+**fp16 누산 정확도 max rel err 3e-4 @ K=1024**(누산기가 naive fp16 반올림보다
+정밀하다).
+
+그런데 산수가 반대로 간다:
+
+- **int8 HMX는 fp16 HMX보다 빠르다** (같은 실리콘에서 보통 2–4×). 7.2 ms를 아끼려고
+  `mm 13.7`을 2배로 만들면 순손실이다.
+- **VTCM이 안 맞는다.** gate_up이 int4로 3.5 MiB인데 fp16이면 14 MiB. 아레나
+  6.37 MB에 안 들어간다 → llama.cpp처럼 **타일 단위 디퀀트**가 강제된다. 큰 재설계.
+- **V1 비트 동일성이 깨진다.** 지금 경로와 수치가 달라지므로 검증을 다시 세워야 한다.
+
+**결정은 R0이 한다.** `HEXKL_PROBE_MM`이 int8 HMX의 실제 발행 속도를 처음 알려주고,
+그 값이 있어야 "fp16으로 바꾸면 mm이 얼마나 느려지나"를 계산할 수 있다. 지금은
+추측이다 — 그래서 여기서 멈춘다.
+
+### 22.5 §21.5 수정
+
+§21.5는 "우리 커널 층은 이미 그쪽이 말하는 QNN 아래에 있다"고 했고 그건 맞다.
+다만 **llama.cpp도 거기 있다** — 첫 판이 쓴 "HVX 전용"은 틀렸다. 순서(A 아레나 →
+C 라우팅 → D 패딩)는 그대로고, 여기에 **①(HMX/HVX 비동기 중첩)이 A2로 이미 있었다**는
+것이 확인됐을 뿐이다.
