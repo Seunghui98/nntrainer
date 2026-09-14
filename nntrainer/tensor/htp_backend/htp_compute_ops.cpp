@@ -294,6 +294,7 @@ public:
       b.dma_first_us += stage_us[HTP_MOE_T_DMA_FIRST];
       b.drain_dn_us += stage_us[HTP_MOE_T_DRAIN_DN];
       b.dma_first_kb += stage_us[HTP_MOE_T_DMA_FIRST_KB];
+      b.alloc_us += stage_us[HTP_MOE_T_ALLOC];
       b.push_us += stage_us[HTP_MOE_T_PUSH];
       b.drain_us += stage_us[HTP_MOE_T_DRAIN];
     }
@@ -356,6 +357,10 @@ private:
         hexkl_probe.h for why that left the 4.9 ms unreadable. */
     uint64_t drain_dn_us = 0;
     uint64_t dma_first_kb = 0;
+    /** The layer call's own malloc and free -- about 12.8 MB a call. Was
+        unnamed in the residual, which read 1019 us on the bake path and
+        23888 on the weight-cache path with the kernel unchanged. */
+    uint64_t alloc_us = 0;
     uint64_t push_us = 0;
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
@@ -440,6 +445,7 @@ private:
         const double drain_dn_per =
           static_cast<double>(b.drain_dn_us) / b.calls;
         const double push_per = static_cast<double>(b.push_us) / b.calls;
+        const double alloc_per = static_cast<double>(b.alloc_us) / b.calls;
         // What the accelerator actually exists for, by subtraction: the DSP
         // clock minus every stage that is a format change or a wait. Nothing
         // on the DSP times the HMX issue loop directly, and adding a probe
