@@ -38,6 +38,26 @@ interface nntr_hvx : remote_handle64 {
                                   in sequence<float> bias,
                                   rout uint32 w_handle);
 
+   // [doc 46 section 20] The same registration with the RM->WH bake already
+   // done. That bake is the expensive half -- about 25 ms a weight, 1597 ms
+   // across this model's 64 -- and its output is deterministic, so a run
+   // that paid for it can hand the bytes to the next one through a cache
+   // file. wh_bytes is (K/32)*(N/32)*512, which is also half the wire
+   // payload weight_register_u8i4 carries: WH packs two int4 per byte where
+   // w_i4_rm spends a whole int8 on each.
+   AEEResult weight_register_u8i4_baked(in uint32 K, in uint32 N,
+                                        in sequence<uint8> wh_src,
+                                        in sequence<float> w_scale,
+                                        in sequence<int32> colsum_w,
+                                        in sequence<float> bias,
+                                        rout uint32 w_handle);
+
+   // Copies a registered weight's baked WH bytes back out so the host can
+   // write the cache the call above reads. wh_out must be exactly
+   // (K/32)*(N/32)*512 bytes for that weight's shape.
+   AEEResult weight_bake_export(in uint32 w_handle,
+                                rout sequence<uint8> wh_out);
+
    AEEResult weight_release_u8i4(in uint32 w_handle);
 
    // Runs matmuls against several registered weights that share ONE

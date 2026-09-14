@@ -433,9 +433,9 @@ private:
            scatter included, or the MoE layer call's scatter time would be
            reported as matmul. */
         const double mm_per =
-          dsp_per - (quant_per + swiglu_per + dequant_per + acc_per +
-                     drain_per + scatter_per + stage_per + gather_per +
-                     requant_per + mm_meas_per);
+          dsp_per -
+          (quant_per + swiglu_per + dequant_per + acc_per + drain_per +
+           scatter_per + stage_per + gather_per + requant_per + mm_meas_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
@@ -1560,6 +1560,26 @@ private:
       return it->second;
 
     const uint64_t t_begin = HtpProfile::nowUs();
+
+    // A hit skips both halves of registration: the conversion below and the
+    // DSP's RM->WH bake, which together are 33 ms of the 36 this call costs
+    // when cold. The source bytes are hashed rather than the converted
+    // ones so the conversion is what the hit avoids -- see
+    // htp_weight_cache.h. Off unless NNTR_HTP_WEIGHT_CACHE is set.
+    const HtpWeightCache &wc = HtpWeightCache::global();
+    const size_t src_bytes = static_cast<size_t>(N) * ((K + 1u) / 2u);
+    uint64_t src_hash = 0;
+    std::string cache_path;
+    if (wc.enabled()) {
+      src_hash = htpWeightHash(matAdata, src_bytes);
+      src_hash ^= htpWeightHash(matAscale, sizeof(float) * N);
+      cache_path = wc.path(K, N, src_hash);
+      const uint32_t handle = registerFromCache(wc, cache_path, session, K, N,
+                                                src_hash, matAdata, t_begin);
+      if (handle != kNoHandle)
+        return handle;
+    }
+
     HtpRpcBuffer q_w4_i8(static_cast<size_t>(K) * N);
     std::vector<float> w_scale(N);
     std::vector<int32_t> colsum_w(N);
@@ -1569,8 +1589,73 @@ private:
                           w_scale.data(), colsum_w.data());
     const uint64_t convert_us = HtpProfile::nowUs() - t_convert;
 
-    return register_locked(matAdata, session, K, N, q_w4_i8, w_scale, colsum_w,
-                           t_begin, convert_us);
+    const uint32_t handle = register_locked(
+      matAdata, session, K, N, q_w4_i8, w_scale, colsum_w, t_begin, convert_us);
+    if (wc.enabled())
+      exportToCache(wc, cache_path, session, K, N, src_hash, handle, w_scale,
+                    colsum_w);
+    return handle;
+  }
+
+  /** @brief Sentinel for "the cache did not have it"; a real handle is a
+   *  table slot index, and 0 is a valid one. */
+  static constexpr uint32_t kNoHandle = 0xFFFFFFFFu;
+
+  /**
+   * @brief Registers this weight from its cache file if one is readable.
+   *
+   * @return the handle, or kNoHandle on any miss -- a missing file, a shape
+   *         or hash mismatch, a short read, or a DSP-side rejection. Every
+   *         one of those is recoverable by baking normally, so none of them
+   *         throws.
+   * @note   Call with handle_mutex_ already held.
+   */
+  uint32_t registerFromCache(const HtpWeightCache &wc, const std::string &path,
+                             remote_handle64 session, uint32_t K, uint32_t N,
+                             uint64_t src_hash, void *key, uint64_t t_begin) {
+    std::vector<uint8_t> wh;
+    std::vector<float> w_scale, bias;
+    std::vector<int32_t> colsum_w;
+    // load() re-checks the header against K, N, the byte counts and the
+    // source hash, so a file left over from another weight or another
+    // quantization of this one is a miss, not a wrong matmul.
+    if (!wc.load(path, K, N, src_hash, wh, w_scale, colsum_w, bias))
+      return kNoHandle;
+
+    uint32_t handle = 0;
+    const uint64_t t_rpc = HtpProfile::nowUs();
+    const int err = nntr_hvx_weight_register_u8i4_baked(
+      session, K, N, wh.data(), static_cast<int>(wh.size()), w_scale.data(),
+      static_cast<int>(N), colsum_w.data(), static_cast<int>(N), bias.data(),
+      static_cast<int>(N), &handle);
+    const uint64_t rpc_us = HtpProfile::nowUs() - t_rpc;
+    if (err != AEE_SUCCESS)
+      return kNoHandle;
+
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() != 0)
+      profile.addRegister(HtpProfile::nowUs() - t_begin, /*convert_us=*/0,
+                          rpc_us, /*ion=*/false);
+    handle_cache_.emplace(key, handle);
+    return handle;
+  }
+
+  /** @brief Reads the freshly baked bytes back off the DSP and writes them
+   *  to the cache, so the next run skips the bake. Best effort: a failure
+   *  here costs the next run its cache, nothing more.
+   *  @note Call with handle_mutex_ already held. */
+  void exportToCache(const HtpWeightCache &wc, const std::string &path,
+                     remote_handle64 session, uint32_t K, uint32_t N,
+                     uint64_t src_hash, uint32_t handle,
+                     const std::vector<float> &w_scale,
+                     const std::vector<int32_t> &colsum_w) {
+    std::vector<uint8_t> wh(HtpWeightCache::whBytes(K, N));
+    if (nntr_hvx_weight_bake_export(session, handle, wh.data(),
+                                    static_cast<int>(wh.size())) != AEE_SUCCESS)
+      return;
+    const std::vector<float> bias(N, 0.0f);
+    wc.store(path, K, N, src_hash, wh.data(), w_scale.data(), colsum_w.data(),
+             bias.data());
   }
 
   /** @brief Register a converted weight and cache its handle.

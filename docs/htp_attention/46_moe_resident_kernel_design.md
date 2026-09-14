@@ -742,3 +742,87 @@ weight는 **DDR→VTCM**이라 경로가 다르다. A4가 확정한다. 게이�
 잘못 읽게 된다. `12 KB over 4 experts (want 12)` 통과.
 
 `MOE_N_STAGES` 12 → **15**. `./test/htp/build.sh` 필수.
+
+## 20. B1a — 구운 WH 바이트 캐시 (2026-09-14, 코드 완료·미측정)
+
+§18.2가 registration 2297 ms를 제거했다고 **가정**한 표를 냈다. 이건 그 가정을
+실제로 만드는 작업이다.
+
+### 20.1 먼저: 1597 ms는 마샬링이 아니다
+
+프로파일이 `register FastRPC 1597.0 ms (24.95 ms/weight)`로 부르는 것을 처음엔
+7.34 MB 전송 비용으로 읽었다. **아니다** — FastRPC 호출은 동기라 저 시간에
+**DSP의 RM→WH bake가 포함**된다. `hexkl_weight_u8i4_register`의 주석과 문서 43
+§2가 이미 그렇게 적고 있었다: gate_up 하나가 **7168개의 독립 512바이트 타일**
+재배치이고 weight당 34–48 ms.
+
+**그래서 ION으로 옮기는 것만으로는 안 줄어든다.** 줄이려면 bake를 다시 하지
+않아야 하고, bake 결과는 결정적이므로(43 §7 FNV-1a) **파일에 캐시할 수 있다.**
+
+| | 지금 | 캐시 히트 |
+|---|---:|---:|
+| convert to registry | 8.54 ms | **0** (scale·colsum이 파일에 있다) |
+| register FastRPC | 24.95 ms | bake 없음, 페이로드 절반 |
+| 와이어 페이로드 | 7.34 MB (int4를 int8 컨테이너에) | **3.5 MB** (WH는 바이트당 int4 2개) |
+
+### 20.2 무엇을 만들었나
+
+**DSP** (`hexkl_mm_u8i4_dma.c`) — 기존 register를 셋으로 쪼갰다:
+`hexkl_weight_u8i4_check`(모양·바이트수), `_free_slot`, `_fill_slot`(할당+복사).
+그 위에 두 진입점:
+
+- `hexkl_weight_u8i4_register_baked(...)` — bake 없이 슬롯에 복사만. VTCM도
+  워커풀도 안 받는다. `wh_len`을 **검증한다** — 이 바이트는 파일에서 왔고, 길이가
+  틀리면 크래시가 아니라 **조용히 틀린 행렬곱**이 된다.
+- `hexkl_weight_u8i4_export(...)` — 구운 바이트를 도로 읽어낸다.
+
+**IDL/skel** — `weight_register_u8i4_baked`, `weight_bake_export`.
+
+**ARM** (`htp_weight_cache.h`, 신규) — 디렉터리 하나짜리 캐시.
+`NNTR_HTP_WEIGHT_CACHE`가 가리키지 않으면 **꺼져 있다** (캐시 파일이 어디 쌓일지는
+운영자가 정할 일이지 코드가 만들어낼 기본값이 아니다).
+
+파일: 헤더(magic·version·K·N·wh_len·**소스 해시**) + WH + w_scale + colsum + bias.
+임시 파일에 쓰고 rename한다.
+
+**소스** 바이트를 해시하는 것이 핵심이다 — 그래야 히트가 bake뿐 아니라
+`htp_qs4cx_from_packed`까지 건너뛴다. 그리고 그게 stale 파일을 "조용히 틀린 결과"가
+아니라 "미스"로 만든다.
+
+### 20.3 왜 이게 §8.4의 ION 아레나가 아닌가
+
+문서 45 §8.4의 최종형은 **파일 → ION mmap → DSP가 직접 읽음**이고, 그쪽의 추가
+이득은 *메모리*다(ARM 사본 + DSP 사본 → 한 벌, Gate 0의 1.89 GB 벽). B1a는 그
+작업의 **부분집합**이다 — 파일 포맷과 "이미 구운 것을 등록하는 경로"는 아레나에도
+그대로 필요하다. 지금 기기 없이 테스트 가능하고 2297 ms를 오늘 걷어낸다.
+**B1a는 B1 전체가 아니다.** 22층 상주는 여전히 아레나가 필요하다.
+
+### 20.4 측정 방법 — R0을 오염시키지 않는다
+
+캐시가 기본 꺼짐인 이유가 이것이기도 하다. **같은 빌드로 두 번 돌린다:**
+
+```bash
+# 1) R0 게이트 — 캐시 없음. §19.3 표대로 읽는다.
+NNTR_HTP_PROFILE=2 <run>
+
+# 2) B1a — 캐시 켬. 첫 실행은 굽고 쓴다(= 1번과 같은 시간), 두 번째부터 히트.
+mkdir -p /data/local/tmp/whcache
+NNTR_HTP_WEIGHT_CACHE=/data/local/tmp/whcache NNTR_HTP_PROFILE=2 <run>   # 씀
+NNTR_HTP_WEIGHT_CACHE=/data/local/tmp/whcache NNTR_HTP_PROFILE=2 <run>   # 읽음
+```
+
+3번째 실행에서 `convert to registry`가 **0에 가깝고** `registration total`이
+2297에서 크게 떨어져야 한다. 안 떨어지면 히트를 못 한 것이고, 그때 볼 것은 캐시
+디렉터리에 `wh_2048x3584_*.bin`이 생겼는지다.
+
+**텍스트가 정상이어야 한다** — 캐시가 틀린 바이트를 먹였다면 거기서 드러난다.
+
+### 20.5 검증
+
+`test/htp/host/weight_cache_host_check.cpp` — 라운드트립 바이트 동일, 그리고
+거절들: 소스 해시 불일치, K 불일치, N 불일치, 파일 없음, **잘린 파일**. 전부
+통과. 거절 쪽이 본체다 — 이 바이트는 DSP가 곱하는 weight가 된다.
+
+Q4_0 경로(`get_or_register`)는 캐시를 안 탄다. ponytail: 이 모델의 MoE weight는
+QS4CX로 가고(문서 44 §70), Q4_0 소스의 해시 범위를 확정하려면 그 포맷을 한 번 더
+파야 한다. 올리려면 `get_or_register`에 같은 (ptr, len) 쌍을 넘기면 된다.
