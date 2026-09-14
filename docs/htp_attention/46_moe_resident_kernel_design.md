@@ -826,3 +826,53 @@ NNTR_HTP_WEIGHT_CACHE=/data/local/tmp/whcache NNTR_HTP_PROFILE=2 <run>   # 읽�
 Q4_0 경로(`get_or_register`)는 캐시를 안 탄다. ponytail: 이 모델의 MoE weight는
 QS4CX로 가고(문서 44 §70), Q4_0 소스의 해시 범위를 확정하려면 그 포맷을 한 번 더
 파야 한다. 올리려면 `get_or_register`에 같은 (ptr, len) 쌍을 넘기면 된다.
+
+## 21. 외부 비교 — EStream (arXiv 2609.06551), 2026-09-14
+
+**"EStream: Fast and Memory-Efficient MoE Prefill through Expert Virtualization on
+Mobile NPUs"** (Zhang, Zheng, Wu, Huang, Wu). 평가 모델에 **LFM2.5**가 들어 있다 —
+OLMoE, DeepSeek-V2-Lite와 함께, 256–4096 토큰, Snapdragon 8 Elite Gen 5.
+
+이 세션의 샌드박스에서 arxiv와 모든 미러가 차단되어 **본문 표는 못 읽었다.** 아래는
+초록·검색 스니펫·llama.cpp 소스에서 확인된 것만이다. "500 TPS"와 "16×16×16"은 확인
+못 했다 — 접근 가능한 텍스트엔 비율(2.25–27.57× TTFT)만 있다.
+
+### 21.1 이 논문이 아닌 것
+
+llama.cpp Hexagon 커널 논문이 아니다. llama.cpp의 HTP 백엔드(`ggml-hexagon/htp/
+matmul-ops.c`)는 **HVX 전용**이고 HMX를 행렬곱에 안 쓴다 — 32행 타일, 행별 q8
+activation 양자화, DMA로 VTCM에 프리페치(`n_prefetch` 깊이), `MUL_MAT_ID_NX`로
+전문가 여러 개를 한 op에, 그래프 전체를 FastRPC 한 번에. 16×16×16 구조는 없다.
+
+### 21.2 EStream의 네 가지와 우리 위치
+
+| EStream | 우리 | 차이 |
+|---|---|---|
+| **컴파일된 expert 그래프 하나**, 호출 시 토큰·weight 주소 바인딩. 패딩 없음, CPU 폴백 없음, 전부 NPU | 레이어당 FastRPC 1회, `row_index/row_count/row_weight`로 전문가 루프 전체를 DSP에서 (§2). 라우팅은 ARM | **패딩**: 우리는 HMX 64행 타일 → blocks=43, 활용 64.5% (§16.1). 그쪽은 (HVX면) 임의 M. **라우팅**: 그쪽은 NPU |
+| **Expert virtualization**: expert 풀은 UFS, 고정 크기 NPU 아레나로 그룹 단위 페이징, 로딩을 계산 뒤에 숨김. 메모리는 모델이 아니라 아레나 크기 | 문서 45 §8.4 ION 아레나 = **같은 설계**, 한 단계 안쪽(DDR→VTCM)만 구현됨(`hexkl_dma_ring`). B1a는 그 부분집합 | 그쪽은 UFS→DDR 계층이 하나 더 있고 **자동**이다. 우리 Gate 0(1.89 GB 벽)과 RSS 8.4 GB가 정확히 이게 없어서 생긴 문제 |
+| **하드웨어 인지 설정 알고리즘** — UFS·NPU 파이프라인 크기를 자동으로, 로딩-계산 중첩 최대화 | 손으로 고름 | R0의 `DMA_FIRST`(GB/s)가 그 알고리즘의 입력값이다 |
+| QNN 그래프 **아래**: 스칼라 제어 스레드 + DMA/HVX/HMX 동시 스케줄 + 소프트웨어 VTCM | **같은 층이다** — HexKL micro API | 여기선 차이 없음 |
+
+### 21.3 그쪽 숫자를 읽을 때 주의
+
+속도 비율은 "각 설정에서 **완주한** 비-오프로딩 베이스라인 중 가장 빠른 것" 대비다.
+7B–16B MoE를 폰에서 돌리면 베이스라인 다수가 메모리로 죽거나 CPU다 — 27.57×의
+윗단은 그 효과다. 우리 CPU 기준선 279 TPS(§18.2)도 같은 종류의 숫자다. **절대값
+없이는 우리와 직접 비교가 안 된다.**
+
+### 21.4 적용 가능한 것, 순서대로
+
+| | 무엇 | 우리 코드에서 | 의존 |
+|---|---|---|---|
+| **A** | 아레나 + 그룹 페이징 | 문서 45 §8.4 그대로. B1a의 파일 포맷 위에 mmap + 오프셋 등록. 등록 0, 메모리 한 벌 | B1a |
+| **B** | 로딩 완전 은닉 (drain 5.0 → ≈0) | 전문가 1개가 아니라 **그룹**을 프리페치. VTCM 8.3 MB에 전문가 2개(5.25 MiB)가 안 들어가므로 그룹은 DDR 아레나에, VTCM은 전문가 단위 스테이징 — 즉 지금 구조에서 **노출 5 ms의 원인이 대역폭인지 순서인지**가 먼저 (R0) | A, R0 |
+| **C** | 라우팅을 NPU로 | router dot + top-k(ARM 2.1 ms)와 row_index 전송 제거. 레이어 간 activation 상주(문서 45 Phase D)의 전제 | — |
+| **D** | 패딩 없는 expert 계산 | 두 길: (i) 64행 꽉 찬 타일은 HMX, **꼬리 블록만 HVX** — u8·i4 HVX dot 커널이 필요한데 **우리 트리에 없다**(확인). llama.cpp의 `tiled_vec_dot_q4_0_32x1/32x2`가 참고 설계. (ii) 전문가들의 꼬리를 한 타일에 묶기 — weight가 달라 HMX로는 불가 | 상한 = mm의 ~35% (43 → 28블록 상당, ≈4.8 ms) |
+| E | 설정 자동화 | (DMA GB/s, HMX 속도, VTCM)으로 프리페치 깊이 결정. 나중 | R0 |
+
+### 21.5 결론
+
+**논문은 문서 45의 방향을 대체하지 않고 확인한다** — 상주 아레나, 전부 NPU, CPU 폴백
+없음. 우리 커널 층(HMX·DMA 링·결정적 SwiGLU)은 이미 그쪽이 말하는 "QNN 아래"에 있다.
+그쪽 영역에 닿으려면 A(아레나) → C(라우팅+레이어 간 상주) → D(패딩). 그리고 그쪽
+비율의 절반은 베이스라인 쪽 사정이다.
