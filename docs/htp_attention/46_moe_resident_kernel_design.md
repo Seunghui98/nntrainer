@@ -1553,7 +1553,7 @@ WH 타일 레이아웃을 아는 코드가 ARM/x86에 없다. 따라서 변환�
 
 | # | 항목 | 내용 | 없애는 것 | 의존 |
 |---|---|---|---|---|
-| **A0** | **Gate 0c** | §32.4 프로브. **통과 못 하면 A1–A4 전부 재설계** | — | — |
+| **A0** | **Gate 0c** | **통과 (§32.11)** | — | — |
 | **A1** | 변환 모드 | `nntrainer_causallm --convert-htp <dir>`: 로드 → MoE weight마다 register(bake) → `weight_bake_export` → `model.htp`에 append, 인덱스 기록. 기기에서 1회 | — | — |
 | **A2** | 아레나 로드 | `model.htp` 있으면: ION 조각 할당(≤2 GB) → 읽기 → `arena_map` → weight마다 `weight_register_arena(K,N,chunk,off×4)`. 슬롯은 아레나 포인터 | 등록 1662 → **≈0.2 s** (파일 읽기 178 MB) | A0 |
 | **A3** | 삭제 | `HtpWeightCache`, `register_baked`, `NNTR_HTP_WEIGHT_CACHE`, 그 호스트 체크. `weight_bake_export`는 A1이 쓴다 | 코드 −400줄 | A2 |
@@ -1721,6 +1721,29 @@ fastrpc_mmap_rc     = 0x0         attached = yes
 호출이 함수에 도달하지 못했다 — `0x8000040d`(`AEE_EBADSTATE`)로 멈춘 PD의 전송 오류.
 테스트는 cap에서 멈춘 경우에만 release를 assert하도록 바꿨다.
 
+### 32.11 Gate 0c 4차 (2026-09-14, 기기) — **통과**
+
+```
+map_domain=3  map_flag=2  fastrpc_mmap_rc=0x0
+hap_mmap_accepted=mmap_get  hap_mmap_get_rc=0x0  hap_mmap_get_paddr_lo=0xfee00000
+map_us=1   dma_us=35 (1 MiB)   dma_gbs=29.96   checksum_ok=yes   unmapped=yes
+```
+
+| 확인된 것 | 숫자 | 뜻 |
+|---|---|---|
+| 호스트 rpcmem 버퍼가 DSP 주소공간에 붙는다 | `paddr=0xfee00000` | `fastrpc_mmap(FASTRPC_MAP_FD=2)` + `HAP_mmap_get` |
+| 매핑 비용 | 1 µs | 세션당 한 번, 무시 |
+| 아레나 → VTCM DMA | **29.96 GB/s** | DSP 힙 가중치(27–33)와 동일. 아레나라서 느려지는 것 없음 |
+| 데이터 | `checksum_ok` | attach 전에 cached ION에 쓴 패턴이 그대로 읽힘 |
+
+네 번 걸린 이유는 전부 **헤더 대신 숫자를 쓴 상수**였다: `HAP_mmap` flags(2차),
+`HAP_mmap_get` 시그니처(4차 전반), `fastrpc_mmap` flag `0`=`FASTRPC_MAP_STATIC`(3차).
+헤더가 있으면 헤더를 쓴다.
+
+**프로브가 증명한 순서**: cached ION → 쓰기 → attach → DSP 읽기.
+§34의 설계는 **uncached ION → attach → 쓰기 → DSP 읽기**를 쓴다. 그 순서는 아직
+미증명이다 (§34.6 #1).
+
 ## 33. V1이 깨졌다 → 해결 (2026-09-14, 기기) — 원인은 레퍼런스의 FMA
 
 `run_u8i4_layer_on_device.sh`가 드디어 제대로 빌드된 실행에서:
@@ -1840,3 +1863,130 @@ adb shell "cd /data/local/tmp/htp_u8i4_layer_test && LD_LIBRARY_PATH=. ADSP_LIBR
 같은 토큰을 고르게 한다. **정확성 게이트는 텍스트가 아니라 V1이다.**
 
 → `run_u8i4_layer_on_device.sh`를 커널 변경마다 돌린다. 1초짜리 필터가 있다.
+
+## 34. 아레나 구현 설계 — 인계 (2026-09-14)
+
+A1·A2·A3를 하나로 합친다. 별도의 변환 모드도, 캐시 파일을 DSP 힙으로 다시 복사하는
+경로도 없다. **DSP 힙에 가중치를 상주시키는 경로 자체를 없앤다.**
+
+### 34.1 한 줄
+
+> `NNTR_HTP_WEIGHT_CACHE` 디렉터리가 변환된 모델이다. 호스트는 그 파일들을 **uncached
+> rpcmem 아레나**에 읽어 넣고, 아레나를 세션당 한 번 DSP에 매핑하고, 가중치는
+> **아레나 오프셋**으로 등록한다. 파일이 없는 가중치는 그 자리에서 bake → export →
+> 파일 기록 → 아레나에 기록 → 아레나로 등록 → **힙 사본 즉시 해제**.
+
+결과: DSP 힙에는 어느 순간에도 bake 중인 가중치 하나만 있다. 1.89 GB 천장(Gate 0)이
+모든 경로에서 사라지고, A4(22개 레이어 전부 HTP)는 설정 한 줄이 된다.
+
+### 34.2 데이터 흐름
+
+```
+get_or_register_qs4cx(ptr, scale, K, N)
+  │ pointer cache hit → handle
+  │ ensureArena()          ← 프로세스당 한 번: 디렉터리의 파일 전부 → 아레나, 매핑
+  │ hash = FNV(src bytes) ^ FNV(scale)
+  ├─ arena_index[path(K,N,hash)] 있음  →  register_arena(chunk.dsp_id, off)  → handle   [hit: RPC 1회, ~0.1 ms]
+  └─ 없음:
+       convert(QS4CX→int8 RM) → register(bake, DSP 힙) = hh
+       export(hh) → wh bytes (host)
+       store(file)                                      ← 다음 실행이 hit
+       place(wh.size) → (chunk, off); memcpy(arena+off, wh)   ← uncached라 flush 불필요
+       register_arena(...) = ah;  release(hh)          ← 힙 비움
+       handle = ah
+```
+
+### 34.3 이미 커밋된 것 (`[htp] WIP: arena registration, DSP side and host headers`)
+
+**DSP** (`test/htp/nntr_hvx.idl`, `nntr_hvx_mm_u8i4.c`, `nntr_hvx_session.h`,
+`hvx_add_f32.c`, `hmx/hexkl_mm_u8i4_dma.[ch]`) — skel은 단독으로 빌드된다:
+
+| 호출 | 시그니처(호스트 스텁) | 계약 |
+|---|---|---|
+| `nntr_hvx_arena_attach` | `(h, int32 fd, uint32 bytes, uint32 *arena)` | `HAP_mmap_get(fd)`. 최대 `NNTR_HVX_MAX_ARENAS=8`. 실패: `AEE_ENOMEMORY`(자리 없음) 또는 HAP rc |
+| `nntr_hvx_arena_detach` | `(h, uint32 arena)` | 그 아레나를 빌리는 슬롯이 하나라도 살아있으면 **`AEE_EBADSTATE`** |
+| `nntr_hvx_weight_register_u8i4_arena` | `(h, K, N, arena, wh_off, w_scale, N, colsum_w, N, bias, N, uint32 *w_handle)` | `wh_off + (K/32)(N/32)·512 ≤ bytes` (DSP가 검사), `wh_off % 512 == 0`. 슬롯은 `borrowed=1`, release가 free하지 않음 |
+| `nntr_hvx_close` | — | 슬롯 해제 후 모든 아레나 `HAP_mmap_put` |
+| ~~`weight_register_u8i4_baked`~~ | **삭제됨** | baked bytes가 돌아오는 길은 아레나뿐 |
+| `nntr_hvx_weight_bake_export` | 유지 | miss 경로가 파일과 아레나를 채우는 데 쓴다 |
+
+**호스트 헤더**:
+
+| 파일 | 추가/변경 |
+|---|---|
+| `htp_rpcmem.h` | `HtpRpcMemApi::get().mmap(domain, fd, addr, offset, len, flags)`, `.munmap(domain, fd, addr, len)` (dlsym, 없을 수 있음). `HtpRpcBuffer(bytes, flags)`; `HTP_RPC_FLAGS_UNCACHED = 0`; `.fd()` |
+| `htp_weight_cache.h` | 파일 형식 그대로. `load()` 삭제 → `listFiles()`, `readHeader(FILE*, hdr&)`, `readPayload(FILE*, hdr, uint8_t *wh, vec&, vec&, vec&)` (payload를 **호출자 포인터** = 아레나로 직접 읽는다). `store()`, `path()`, `whBytes()`, `htpWeightHash()` 유지 |
+| `run_u8i4_layer_on_device.sh`, `bisect_moe_v1.sh` | `generate_stub.sh` 매번 실행 (IDL 변경 → 두 스텁) |
+
+### 34.4 남은 것 — `htp_compute_ops.cpp` 포팅 (이 파일 하나가 빌드를 막고 있다)
+
+지울 것: `registerFromCache`, `exportToCache`, 그리고 `get_or_register_qs4cx` 안의
+`wc.load`/`register_u8i4_baked` 호출.
+
+넣을 것 (모두 `HtpComputeOps`의 private, `handle_mutex_` 아래):
+
+```cpp
+struct ArenaChunk { std::unique_ptr<HtpRpcBuffer> buf; uint32_t dsp_id; size_t used; };
+struct ArenaEntry { uint32_t chunk, off; std::vector<float> w_scale, bias; std::vector<int32_t> colsum; };
+std::vector<ArenaChunk> arena_chunks_;
+std::unordered_map<std::string, ArenaEntry> arena_index_;   // key = wc.path(K,N,hash) — 이미 유일
+enum { ARENA_UNTRIED, ARENA_ON, ARENA_OFF } arena_state_ = ARENA_UNTRIED;
+```
+
+`ensureArena(session)` — 첫 호출에서 한 번:
+1. `!wc.enabled() || !api.to_fd || !api.mmap` → `ARENA_OFF`, 끝. (힙 경로가 그대로 남아 있어 동작은 한다 — 천장만 돌아온다.)
+2. `files = wc.listFiles()`; 각 파일: `fopen` → `readHeader` 실패면 skip → `place(hdr.wh_len)` → `readPayload(f, hdr, chunk.data()+off, ...)` 실패면 index에 넣지 않음(바이트는 버려짐, `used`는 그대로) → `arena_index_[path] = entry`.
+3. `ARENA_ON`. 파일이 0개여도 ON — chunk는 첫 miss에서 만든다.
+4. 로드 시간과 GB/s를 프로파일 줄로 찍는다 (§34.6 #3).
+
+`place(bytes) → (chunk, off)`: `off = align_up(chunk.used, 4096)`; 안 들어가면 `newChunk(need)`:
+`size = clamp(align_up(need, 64 MiB), 256 MiB, 1 GiB)`; 초기 로드에서 `need` = 아직 못 넣은 파일들의 합, miss에서 `need` = `wh_len`.
+`newChunk`: `HtpRpcBuffer(size, HTP_RPC_FLAGS_UNCACHED)` → `!isIon()` 이면 `ARENA_OFF` →
+`fd = buf.fd()` → `api.mmap(CDSP_DOMAIN_ID, fd, data, 0, size, FASTRPC_MAP_FD)` (둘 다
+`<remote.h>` 이름으로, 숫자 금지) → `nntr_hvx_arena_attach(session, fd, size, &dsp_id)`.
+어느 단계든 실패 → `ARENA_OFF`, 호출자는 힙 경로.
+
+`get_or_register_qs4cx`는 §34.2 그대로. 세부:
+- `register_locked`는 지금처럼 `handle_cache_`에 힙 핸들을 넣는다. 아레나로 바꾼 뒤 **덮어쓴다** (`handle_cache_[ptr] = ah`).
+- miss에서 `export`·`store`·`place`·`register_arena` 중 하나라도 실패하면 **힙 핸들을 그대로 돌려준다** — 지금과 같은 동작, 천장만 있다.
+- hit: `profile.addRegister(total, /*convert_us=*/0, rpc_us, /*ion=*/true)`.
+- `get_or_register_q4_0x4`(Q4_0 경로)는 같은 꼬리를 태울 수 있으면 태우고, 아니면 힙 그대로 둔다. MoE는 qs4cx 경로다.
+
+해제: 호스트에서 `fastrpc_munmap`은 **하지 않는다** — `ponytail:` DSP `close()`가
+`HAP_mmap_put`을 하고, ION은 프로세스 종료 시 커널이 회수한다. `HtpBackend`와 ops
+싱글톤의 소멸 순서가 정해져 있지 않아 close 뒤에 munmap을 부르면 죽은 세션을 만진다.
+
+### 34.5 테스트 — 반드시 둘 (`test/unittest/unittest_hvx_mm_u8i4.cpp`)
+
+1. **`ArenaMapAndDma`에 케이스 추가** (`path=arena_uncached`): `rpcmem_alloc(25, 0 /*UNCACHED*/, …)` → `fastrpc_mmap(FASTRPC_MAP_FD)` → **그 다음** 패턴 쓰기 → `arena_probe` → `checksum_ok=yes`. §34.2가 실제로 하는 순서 그대로다. 이게 `no`면 §34 전체가 틀린 것이고, 그 땐 "cached + attach 전 쓰기"(증명됨)로 후퇴: 초기 로드는 그대로 가능하고 miss는 파일만 쓰고 힙에 남긴다.
+2. **`MoeLayerFromArenaMatchesHeap`**: expert 4개의 gate_up/down을 bake로 등록(힙) → 각각 `bake_export` → uncached 아레나 하나에 4096 정렬로 memcpy → `fastrpc_mmap` → `arena_attach` → `register_arena` ×8 → 같은 입력으로 `moe_layer`를 힙 핸들/아레나 핸들로 각각 실행 → **`memcmp == 0`** (같은 바이트, 같은 커널이므로 1 ULP도 허용 안 함). 이어서 핸들이 살아있는 채 `arena_detach` → `AEE_EBADSTATE` 확인 → release ×8 → `arena_detach` → `AEE_SUCCESS`.
+
+두 번째가 §33이 요구하는 "runnable check"다. 첫 번째는 gate다.
+
+### 34.6 미증명·위험 — 각각 어떻게 답하는지
+
+| # | 항목 | 답하는 방법 |
+|---|---|---|
+| 1 | **uncached ION + 매핑 후 쓰기**를 DSP DMA가 본다 | §34.5 #1. 프로브는 cached·매핑 전만 증명했다 |
+| 2 | `rpcmem_alloc(…, flags=0)`이 ION을 준다(`isIon`) | 같은 테스트의 `alloc` 필드 |
+| 3 | 파일 읽기 속도. B1a에서 ION으로 읽을 때 **0.31 GB/s** (178 MB에 583 ms). 3.9 GB면 12 s+ | `ensureArena`가 찍는 로드 GB/s. 느리면: 파일을 `mmap`해서 memcpy, 또는 파일 하나로 합치기 |
+| 4 | 해시 비용: FNV-1a 바이트 루프, weight당 ~1.8 MB, 1408개 | 프로파일 `register` 총합. 느리면 ops seam에 텐서 이름을 태워 이름으로 키잉 (`ponytail`) |
+| 5 | uncached 1 GiB 청크 ×4의 RSS | A5가 ARM QS4CX 사본을 떨어뜨리기 전까진 +3.9 GB. 측정 |
+| 6 | `FASTRPC_MAP_FD`는 DSP 캐시 유지도 사용자 책임 | 같은 오프셋에 **다시 쓰는 일이 없다**(bump allocator)면 DSP에 stale line이 생길 길이 없다. 재기록을 넣게 되면 이 전제가 깨진다 |
+| 7 | `HEXKL_MM_U8I4_MAX_WEIGHTS = 2048` ≥ 22×64 = 1408 | 충분. 22개 넘는 모델이면 상수 |
+
+### 34.7 그 다음 (A4, A5)
+
+- **A4**: §34.5 둘 다 통과하고 실제 모델이 layer 2에서 아레나로 도는 것을 보면
+  `moe_htp_layers`를 22개 전부로. 첫 실행은 전부 miss(bake+export, 레이어당 ~1.6 s,
+  총 ~35 s, 힙은 한 개씩) — 이게 변환이다. 두 번째 실행부터 hit. §32.5 예상 234 TPS.
+- **A5**: 아레나에 있는 weight의 ARM QS4CX 사본을 안 만든다. 로더 작업, 별도.
+
+### 34.8 다음 세션 프롬프트
+
+> `docs/htp_attention/46_moe_resident_kernel_design.md` §34를 읽고 `htp_compute_ops.cpp`
+> 포팅(§34.4)과 테스트 둘(§34.5)을 구현해줘. WIP 커밋(`[htp] WIP: arena registration`)
+> 위에서 시작하고, 그 커밋이 지운 심볼(`register_u8i4_baked`, `HtpWeightCache::load`,
+> `registerFromCache`, `exportToCache`)이 더 이상 참조되지 않게. 상수는 `<remote.h>`
+> 이름으로만. 다 되면 `./test/htp/run_u8i4_layer_on_device.sh` 명령과 §34.6 #1의
+> 두 가지 결과 각각에서 뭘 할지 알려줘. 기기 확인 전엔 "확인했다"고 하지 마.
