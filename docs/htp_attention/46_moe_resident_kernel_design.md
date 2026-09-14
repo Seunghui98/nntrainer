@@ -1578,3 +1578,36 @@ WH 타일 레이아웃을 아는 코드가 ARM/x86에 없다. 따라서 변환�
 
 대기 중인 빌드는 이걸 잰다. **`NNTR_HTP_WEIGHT_CACHE` 없이** 돌린다 — 캐시 칼럼은
 이제 의미가 없다.
+
+### 32.7 A0 / Gate 0c — 구현 완료, 측정 대기
+
+`arena_probe(fd, bytes, dma_bytes, res[6])`. 호스트가 `rpcmem_alloc` 한 3.5 MB(=
+gate_up 하나치)에 패턴을 쓰고 `rpcmem_to_fd`로 fd를 얻어 넘긴다. DSP는 `HAP_mmap`
+으로 한 번 매핑하고, 1 MB를 VTCM으로 DMA 하고, 체크섬을 내고, `HAP_munmap` 한다.
+
+`res = [mapped, map_us, dma_us, dma_bytes, checksum, unmap_ok]`
+
+**방어 셋:**
+
+1. **`HAP_mem.h`가 이 트리 첫 사용**이라 `__has_include`로 감쌌다. 없는 SDK면
+   `AEE_EUNSUPPORTED`를 돌려준다 — **컴파일이 안 되는 프로브는 "아니오"라고 답하는
+   프로브보다 나쁘다.**
+2. **`HAP_mmap` / `HAP_munmap`을 쓴다** (`HAP_mmap_get`/`_put`이 아니라). 전자가 더
+   오래됐고 널리 있다. 링크가 이 심볼에서 깨지면 후자 쌍으로 바꾸면 되고 나머지는
+   그대로 — 코드 주석에 적어뒀다. `prot`은 매크로 대신 숫자로 썼다(누락된 매크로가
+   빌드를 깨는 걸 막기 위해).
+3. **체크섬을 검사한다.** 매핑이 성공하고 0으로 읽히면 "아주 좋은 대역폭"처럼 보인다.
+   호스트가 쓴 패턴과 대조하는 것만이 유일한 assert다 — 나머지는 §8의 두 프로브처럼
+   **보고만 한다**(못 하는 기기는 계획에 대한 사실이지 깨진 빌드가 아니다).
+
+`rpcmem_to_fd`는 `HtpRpcMemApi`에 선택적으로 dlsym 된다. 없는 libcdsprpc.so면
+`HtpRpcBuffer::fd()`가 −1을 주고 테스트는 skip 한다.
+
+**판정:**
+
+| 관측 | 결론 |
+|---|---|
+| `mapped=yes`, `checksum_ok=yes`, `dma_gbs` ≈ 27–33 | **통과.** A1–A4 그대로 진행 |
+| `dma_gbs` ≪ 27 | 매핑은 되는데 느리다. 아레나는 되지만 weight 스트리밍 예산을 다시 계산해야 한다 |
+| `err=EUNSUPPORTED` | SDK에 `HAP_mem.h`가 없다. 다른 매핑 API를 찾거나 A 재설계 |
+| `mapped=no` / `checksum_ok=no` | **Gate 0c 실패.** §32.5 전체 재설계 |
