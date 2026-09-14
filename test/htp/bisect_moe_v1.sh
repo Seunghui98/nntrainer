@@ -18,12 +18,19 @@
 # Prints one line: bad_elems=N of 409600. Zero is a pass.
 set -euo pipefail
 
-: "${HEXAGON_SDK_ROOT:?source setup_sdk_env.source first}"
+# Same defaults as run_u8i4_layer_on_device.sh, so this needs no sourcing.
+: "${HEXAGON_SDK_ROOT:=$HOME/workspace/Hexagon_SDK/6.4.0.2}"
+: "${DEFAULT_HEXAGON_TOOLS_ROOT:=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.04}"
 : "${HEXKL_ROOT:=$HOME/workspace/hxkl-beta2/hexkl_addon}"
 : "${HEXKL_SDK_VER:=6.4.0.2}"
 : "${ANDROID_NDK:=$HOME/workspace/android-ndk-r26d}"
 : "${DEVICE_TMP:=/data/local/tmp/htp_u8i4_layer_test}"
-export HEXKL_ROOT HEXKL_SDK_VER HEXAGON_SDK_ROOT ANDROID_NDK
+export HEXKL_ROOT HEXKL_SDK_VER HEXAGON_SDK_ROOT DEFAULT_HEXAGON_TOOLS_ROOT ANDROID_NDK
+
+for v in HEXAGON_SDK_ROOT DEFAULT_HEXAGON_TOOLS_ROOT HEXKL_ROOT ANDROID_NDK; do
+  [ -d "${!v}" ] || { echo "$v does not exist: ${!v}" >&2; exit 1; }
+done
+adb get-state >/dev/null 2>&1 || { echo "no device -- check adb devices" >&2; exit 1; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
