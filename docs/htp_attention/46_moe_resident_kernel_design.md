@@ -1676,3 +1676,70 @@ err             = 0x80000402
 **이 프로브가 세 번 만에 여기까지 온 방식이 요점이다.** 매번 하나씩 좁혔고, 각
 단계에서 "무엇이 실패했나"가 아니라 **"어떻게 실패했나"**를 남겨둔 덕에 다음 가설이
 나왔다. 1차: 헤더·심볼 존재 확인. 2차: attach가 원인. 3차: flags.
+
+## 33. V1이 깨졌다 (2026-09-14, 기기) — 1 ULP, 4.9%
+
+`run_u8i4_layer_on_device.sh`가 드디어 제대로 빌드된 실행에서:
+
+```
+[ FAILED ] HmxMmU8I4Layer.MoeLayerMatchesTwoCallReference (918 ms)
+U8I4_FIELD path=moe_layer field=bad_elems value=20097 of 409600   (4.9%)
+  first at 0 (row 0 col 0): got 0x1.9e697ep+12  want 0x1.9e698p+12
+```
+
+**`0x9E697E` vs `0x9E6980` = 정확히 1 ULP.** 이게 진단의 전부다:
+
+- **DMA 경쟁이 아니다.** 미완료 전송을 읽었다면 쓰레기 값이 나온다. R2-1 청크 스트리밍을
+  제일 의심했는데 **틀렸다**
+- **부동소수점 연산 순서/입력이 미세하게 다르다.** 4.9%가 마지막 비트에서만 갈린다
+
+### 33.1 배제한 것
+
+| 후보 | 배제 근거 |
+|---|---|
+| quantize-once가 scale/zp를 바꿨나 (§12.3의 내 단언) | `quant_rows_worker`가 행마다 독립. **단언이 맞았다** — 검증함 |
+| acc 타일 스테이징 간격 8192가 작나 | `TILE_N = 64×32 = 2048` int32 = 정확히 8192 B. `hexkl_acc_layout_get`이 `base + 63*stride + 31 < TILE_N`를 전 원소 검사하므로 넘칠 수 없다 |
+| `dq_tiles_ctx` 초기화자 순서 | 필드 순서와 일치 확인 |
+| 배치가 gate/up 경계를 가로지를 때 | `split` 판정이 타일마다 c0로 갈라 정확 |
+| `res_f32` 별칭 | 배치 여부와 무관하게 같은 패턴 |
+| acc 레이아웃 캐시 | 세션당 1회, 첫 호출자가 정한다 — 전과 동일 |
+
+### 33.2 정적 분석으로 못 찾는다 — bisect한다
+
+읽어서 나올 버그가 아니다. 기능 변경 커밋이 여섯이고, 한 테스트만 돌리면 1초다.
+
+| | 커밋 | 무엇 |
+|---|---|---|
+| 1 | `00208b7` | quantize-once (이 이후 V1을 **기기에서 안 쟀다** — 여기가 이미 깨졌을 수 있다) |
+| 2 | `caad187` | staging DMA |
+| 3 | **`da0ab81`** | **R1: 풀 dequant + gather k-타일 분할** |
+| 4 | **`3bc2a1d`** | **R2: gather 제거(슬롯 팩) + gate_up 청크** |
+| 5 | **`d8f3d3c`** | **R2b: 블록 DMA + down 청크** |
+| 6 | `2acee32` | R3 (등록 경로만 — 커널 무관) |
+
+이분 탐색: **3번(`da0ab81`)부터** 본다. 통과하면 4~5, 실패하면 1~2.
+
+```bash
+git checkout <sha>
+source $HEXAGON_SDK_ROOT/setup_sdk_env.source
+HEXKL_SDK_VER=6.4.0.2 ./test/htp/build.sh
+(cd test/jni && $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. \
+   NDK_APPLICATION_MK=./Application.mk APP_BUILD_SCRIPT=./Android.mk \
+   NNTRAINER_ROOT=$PWD/../.. HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT \
+   unittest_hvx_mm_u8i4)
+adb push test/htp/build/libnntr_hvx_skel.so test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4 \
+   /data/local/tmp/htp_u8i4_layer_test/
+adb shell "cd /data/local/tmp/htp_u8i4_layer_test && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. \
+   ./unittest_hvx_mm_u8i4 --gtest_filter='*MoeLayerMatchesTwoCall*'" | grep bad_elems
+```
+
+### 33.3 교훈
+
+**V1은 §13 이후 기기에서 한 번도 안 돌았다.** 그 사이 커널이 여섯 번 바뀌었고
+매번 "호스트 체크 비트 동일"로 넘어갔다. 호스트 스텁은 HMX도 HVX도 진짜 DMA도
+모델링하지 않는다 — **§7이 V1을 만든 이유가 정확히 그것인데, 그 뒤로 안 썼다.**
+
+모델 텍스트가 정상이었던 것도 이걸 못 잡았다: 1 ULP 차이는 473토큰 생성에서
+같은 토큰을 고르게 한다. **정확성 게이트는 텍스트가 아니라 V1이다.**
+
+→ `run_u8i4_layer_on_device.sh`를 커널 변경마다 돌린다. 1초짜리 필터가 있다.
