@@ -1080,3 +1080,90 @@ CPU 31.8 대비 2.1×.** §18.2의 1.53×보다 올라간 이유는 mm이 13.7�
 
 **텍스트 본문.** 6회째 못 봤다. 다음 실행은 생성 앞 5줄을 같이 붙인다. B1a 캐시
 실행에서는 필수 — 틀린 바이트를 먹였는지 거기서만 드러난다.
+
+## 25. R1 구현 (2026-09-14, 코드 완료·미측정)
+
+§24의 계획 네 항목. 기능 변경은 둘(R1-b, R1-c)이고 **둘 다 비트 동일**이라 호스트
+체크가 `mismatches=0 of 2368`로 확인한다. 나머지 둘은 측정 전용.
+
+### 25.1 24.1 — 같은 실행 안에서 5회 (`NNTR_HTP_PROFILE=3`)
+
+§23.2에서 **기능 변경 0인데 DSP가 4.5 ms 움직였다.** A1(−2.3 예상)·A3(−2)가 그
+잡음에 묻힌다. `invokeMoeLayer`가 같은 입력으로 5회 부르고 **가장 빠른 회차의
+`elapsed`와 stage 배열을 통째로** 채택한다. 출력은 입력이 같으므로 안 바뀐다.
+level 2 이하에서는 1회 — 기존 동작 그대로.
+
+### 25.2 R1-a — drain 쪼개기 + push 계측 (측정 전용)
+
+`HEXKL_PROBE_DRAIN`이 전문가당 두 번의 drain을 다 담고 있었다. gate_up은 전문가
+하나 앞서 push되고 down은 gate_up 행렬곱 하나 앞서 push되므로 **숨을 수 있는 양이
+다르다.** 쪼갠다: `DRAIN`(gate_up) / `DRAIN_DN`(down). 그리고 `push2d` 자체를
+`HEXKL_PROBE_PUSH`로 잰다 — dmlink 체인에 얹는 호출이 블록하는지가 §23.3의 (b)다.
+
+프로파일: `drain 4912` → **`drain A+B push C`**.
+
+### 25.3 R1-b — 누산 타일을 모아 풀로 dequant
+
+바뀐 것: n-타일 루프가 `L.acc_tiles`개씩 끊어 돌고, 각 `acc_read`는 자기 슬롯에
+쌓인다. 배치가 끝나면 `hvx_dequant_acc_tiles_to_f32`가 **타일 단위로 워커풀에
+쪼개** 한 번에 처리한다.
+
+| | 전 | 후 |
+|---|---|---|
+| dequant 실행 | 타일마다 1회, **호출 스레드만** | 배치마다 1회, **풀 전체** |
+| 블록당 풀 fork | 0 (dequant는 풀을 안 썼다) | 2 |
+| 블록당 dequant 호출 | 176 | 2 |
+
+VTCM: `result_off`가 8 KB → `acc_tiles × 8 KB`. LFM2에서 112타일 = 896 KiB,
+아레나 **6.37 → 7.23 MiB**. 안 맞으면 `fits`가 자동으로 줄이고 1이면 예전 동작과
+같다 — 거절하지 않는다.
+
+gate/up 경계를 배치가 가로지를 수 있어 목적지를 `dst_a`/`dst_b` + `split`로 받는다.
+down은 목적지가 하나라 `split = N_out`, `dst_b = NULL`.
+
+**ponytail**: 이건 *풀 활용*이지 *HMX/HVX 중첩*이 아니다. 진짜 중첩(워커가 타일 nt를
+dequant하는 동안 메인이 nt+1을 발행)은 `hvx_worker_pool_run`이 fork-join이라 비동기
+dispatch가 필요하고, 검증된 프리미티브를 건드리는 별개 작업이다. llama.cpp의
+`hmx-queue.c`가 그 참조 설계(§22.3 ①). 상한은 dequant 4705 → mm 8395 뒤에 완전히
+숨는 것이고, 이번 변경의 상한은 4705/워커수다.
+
+### 25.4 R1-c — gather를 inner 타일로 쪼갬
+
+3.6 MB를 3271 µs에 옮겼다 = **1.1 GB/s.** 순수 복사치고 말이 안 된다. 원인은
+볼륨이 아니라 패턴이었다: 행별로 쪼개니 워커마다 2048바이트 간격으로 32바이트씩
+쓴다 — 블록의 128 KB가 **4096개의 흩어진 store**로 나간다.
+
+inner 타일로 쪼개면 타일당 목적지가 **연속 2048바이트 한 덩어리**이고, 유닛 수가
+항상 `kt_n`(=64)이라 **한 행짜리 꼬리 블록에서도 워커 4개가 다 일한다** (전에는
+`n_rows`가 유닛이라 워커 셋이 놀았다).
+
+`memset`도 고쳤다: 전엔 128 KB 전부를 호출 스레드가 밀었는데, 덮어쓸 행은 밀 필요가
+없다. 이제 `n_rows` 이후만 민다.
+
+### 25.5 슬롯
+
+`MOE_N_STAGES` 15 → **17** (DRAIN_DN, PUSH). skel 재빌드 + **ARM 스텁 재생성**
+둘 다 필요하다(§14.2의 0번).
+
+### 25.6 측정
+
+```bash
+bash nntrainer/tensor/htp_backend/generate_stub.sh
+HEXKL_SDK_VER=6.4.0.2 ./test/htp/build.sh
+./build_android.sh && ./Applications/CausalLM/install_android.sh
+adb push test/htp/build/libnntr_hvx_skel.so "$DEVICE_DIR/"
+NNTR_HTP_PROFILE=3 NNTR_M0_PROFILE=1 <run>
+```
+
+볼 것:
+
+| | 기대 | 아니면 |
+|---|---|---|
+| `dequant` | 4705 → **≈1500** | 풀이 VTCM 포트에서 막힌다 — 중첩(§25.3 ponytail)이 유일한 길 |
+| `gather` | 3271 → **≈1200** | 병목이 destination store가 아니라 scattered source read다 |
+| `drain A+B` | 합 4912의 분해 | A가 대부분이면 gate_up prefetch 거리가 부족, B면 down |
+| `push` | ≈0 | 크면 §23.3 (b) — `push2d`가 블록한다 |
+| 반복 5회 | stage가 안정 | `NNTR_HTP_PROFILE=3`이 안 먹었거나 첫 회차가 항상 느리다 |
+
+**텍스트 본문 앞 5줄** — 7회째 미확인이다. R1-b/R1-c가 비트 동일이라 호스트에서는
+증명됐지만 기기에서는 아니다.
