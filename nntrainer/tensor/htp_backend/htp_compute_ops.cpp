@@ -151,6 +151,7 @@ enum {
   HTP_MOE_T_MM,
   HTP_MOE_T_DMA_KB,
   HTP_MOE_T_DMA_FIRST,
+  HTP_MOE_T_ALLOC, /**< the layer call's own malloc and free */
   HTP_MOE_T_DMA_FIRST_KB,
   HTP_MOE_T_DRAIN_DN,
   HTP_MOE_T_PUSH,
@@ -450,21 +451,22 @@ private:
            scatter included, or the MoE layer call's scatter time would be
            reported as matmul. */
         const double mm_per =
-          dsp_per - (quant_per + swiglu_per + dequant_per + acc_per +
-                     drain_per + scatter_per + stage_per + gather_per +
-                     requant_per + mm_meas_per + drain_dn_per + push_per);
+          dsp_per -
+          (quant_per + swiglu_per + dequant_per + acc_per + drain_per +
+           scatter_per + stage_per + gather_per + requant_per + mm_meas_per +
+           drain_dn_per + push_per + alloc_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
                      "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
                      "dequant %.1f acc %.1f drain %.1f+%.1f push %.1f "
-                     "scatter %.1f "
+                     "scatter %.1f alloc %.1f "
                      "stage %.1f mm %.1f | rest<=%.1f (%.1f%% of host) "
                      "blocks=%llu]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per, quant_per, gather_per, requant_per,
                      swiglu_per, dequant_per, acc_per, drain_per, drain_dn_per,
-                     push_per, scatter_per, stage_per, mm_meas_per, mm_per,
-                     host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
+                     push_per, scatter_per, alloc_per, stage_per, mm_meas_per,
+                     mm_per, host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
                      (unsigned long long)b.blocks);
       }
       if (level_ >= 2 && b.calls != 0 && b.dma_first_us != 0) {
@@ -1653,13 +1655,19 @@ private:
   uint32_t registerFromCache(const HtpWeightCache &wc, const std::string &path,
                              remote_handle64 session, uint32_t K, uint32_t N,
                              uint64_t src_hash, void *key, uint64_t t_begin) {
-    std::vector<uint8_t> wh;
+    // rpcmem/ION, not a vector: this is the buffer FastRPC ships to the
+    // DSP, and on the bake path the equivalent buffer was ION too. The
+    // first run of this code used a plain vector and the profile duly
+    // reported 0/64 weights on ION, meaning every 3.5 MB payload was
+    // pinned and mapped per call.
+    HtpRpcBuffer wh(HtpWeightCache::whBytes(K, N));
     std::vector<float> w_scale, bias;
     std::vector<int32_t> colsum_w;
     // load() re-checks the header against K, N, the byte counts and the
     // source hash, so a file left over from another weight or another
     // quantization of this one is a miss, not a wrong matmul.
-    if (!wc.load(path, K, N, src_hash, wh, w_scale, colsum_w, bias))
+    if (!wc.load(path, K, N, src_hash, wh.data(),
+                 static_cast<uint32_t>(wh.size()), w_scale, colsum_w, bias))
       return kNoHandle;
 
     uint32_t handle = 0;
@@ -1675,7 +1683,7 @@ private:
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0)
       profile.addRegister(HtpProfile::nowUs() - t_begin, /*convert_us=*/0,
-                          rpc_us, /*ion=*/false);
+                          rpc_us, wh.isIon());
     handle_cache_.emplace(key, handle);
     return handle;
   }

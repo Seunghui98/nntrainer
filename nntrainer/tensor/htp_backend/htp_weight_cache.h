@@ -20,6 +20,12 @@
  * the process writes files, and where those files go is the operator's
  * call, not a default this code should invent.
  *
+ * The WH bytes are read straight into the caller's buffer rather than a
+ * vector it would then have to copy: that buffer is rpcmem/ION, so FastRPC
+ * hands it to the DSP without a copy of its own, and the alternative was
+ * paying for two. Reading the cache was 583 ms of a 975 ms registration --
+ * 178 MB at 0.31 GB/s -- so the copies are not a rounding error.
+ *
  * The file records a hash of the SOURCE weight bytes. That is what lets a
  * hit skip htp_qs4cx_from_packed as well as the bake -- the scale and
  * colsum arrays come out of the file too -- and it is what makes a stale
@@ -96,7 +102,7 @@ public:
    *         and leave the caller to bake normally.
    */
   bool load(const std::string &file, uint32_t K, uint32_t N, uint64_t src_hash,
-            std::vector<uint8_t> &wh, std::vector<float> &w_scale,
+            uint8_t *wh, uint32_t wh_cap, std::vector<float> &w_scale,
             std::vector<int32_t> &colsum_w, std::vector<float> &bias) const {
     std::FILE *f = std::fopen(file.c_str(), "rb");
     if (f == nullptr)
@@ -106,13 +112,13 @@ public:
     bool ok = std::fread(&h, sizeof(h), 1, f) == 1 &&
               std::memcmp(h.magic, kMagic, sizeof(h.magic)) == 0 &&
               h.version == kVersion && h.K == K && h.N == N &&
-              h.src_hash == src_hash && h.wh_len == whBytes(K, N);
+              h.src_hash == src_hash && h.wh_len == whBytes(K, N) &&
+              h.wh_len <= wh_cap;
     if (ok) {
-      wh.resize(h.wh_len);
       w_scale.resize(N);
       colsum_w.resize(N);
       bias.resize(N);
-      ok = std::fread(wh.data(), 1, h.wh_len, f) == h.wh_len &&
+      ok = std::fread(wh, 1, h.wh_len, f) == h.wh_len &&
            std::fread(w_scale.data(), sizeof(float), N, f) == N &&
            std::fread(colsum_w.data(), sizeof(int32_t), N, f) == N &&
            std::fread(bias.data(), sizeof(float), N, f) == N;

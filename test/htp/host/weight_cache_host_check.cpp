@@ -57,24 +57,36 @@ int main() {
   wc.store(path, K, N, hash, wh.data(), w_scale.data(), colsum.data(),
            bias.data());
 
-  std::vector<uint8_t> r_wh;
+  std::vector<uint8_t> r_wh(wh_len);
   std::vector<float> r_scale, r_bias;
   std::vector<int32_t> r_colsum;
-  check("round trip loads",
-        wc.load(path, K, N, hash, r_wh, r_scale, r_colsum, r_bias));
+  check("round trip loads", wc.load(path, K, N, hash, r_wh.data(), wh_len,
+                                    r_scale, r_colsum, r_bias));
   check("round trip is byte-identical",
         r_wh == wh && r_scale == w_scale && r_colsum == colsum &&
           r_bias == bias);
+  /* A buffer smaller than the file's payload must be a miss, not a
+     truncated read into it: this capacity is the only thing standing
+     between a mis-sized rpcmem allocation and an overrun. */
+  {
+    std::vector<uint8_t> small(wh_len - 1);
+    check("short buffer rejected",
+          !wc.load(path, K, N, hash, small.data(), wh_len - 1, r_scale,
+                   r_colsum, r_bias));
+  }
 
   // Every one of these must be a miss, not a load of the wrong bytes.
   check("wrong source hash rejected",
-        !wc.load(path, K, N, hash ^ 1ull, r_wh, r_scale, r_colsum, r_bias));
+        !wc.load(path, K, N, hash ^ 1ull, r_wh.data(), wh_len, r_scale,
+                 r_colsum, r_bias));
   check("wrong K rejected",
-        !wc.load(path, K * 2, N, hash, r_wh, r_scale, r_colsum, r_bias));
+        !wc.load(path, K * 2, N, hash, r_wh.data(), wh_len, r_scale,
+                 r_colsum, r_bias));
   check("wrong N rejected",
-        !wc.load(path, K, N * 2, hash, r_wh, r_scale, r_colsum, r_bias));
+        !wc.load(path, K, N * 2, hash, r_wh.data(), wh_len, r_scale,
+                 r_colsum, r_bias));
   check("missing file rejected",
-        !wc.load(wc.path(K, N, hash + 1), K, N, hash + 1, r_wh, r_scale,
+        !wc.load(wc.path(K, N, hash + 1), K, N, hash + 1, r_wh.data(), wh_len, r_scale,
                  r_colsum, r_bias));
 
   // A run killed mid-write must not leave something that loads. store()
@@ -102,7 +114,8 @@ int main() {
     std::fwrite(whole.data(), 1, whole.size() / 2, o);
     std::fclose(o);
     check("truncated file rejected",
-          !wc.load(cut, K, N, hash, r_wh, r_scale, r_colsum, r_bias));
+          !wc.load(cut, K, N, hash, r_wh.data(), wh_len, r_scale,
+                 r_colsum, r_bias));
   }
 
   std::printf(failures == 0 ? "\nWEIGHT CACHE CHECKS PASS\n"
