@@ -421,6 +421,13 @@ DSP로 옮긴 일(gather·scatter·staging)이 DSP에서 더 비싸기 때문이
 
 ### 14.2 다음 세션의 첫 세 줄
 
+0. **IDL이 바뀌었으면 `bash nntrainer/tensor/htp_backend/generate_stub.sh` 먼저.**
+   생성물이 **두 벌**이다 — `test/htp/generated/`(skel, `build.sh`가 만듦)와
+   `nntrainer/tensor/htp_backend/generated/`(ARM 클라이언트, `generate_stub.sh`가
+   만듦). `build.sh`만 돌리면 **skel은 새것, ARM 스텁은 옛것**이 되고, ARM 빌드가
+   새 심볼에서 깨진다. 그걸 못 보고 옛 바이너리로 돌리면 EBADPARM이다 —
+   2026-09-14에 이렇게 한 사이클을 잃었다. meson이 이제 IDL보다 낡은 스텁을
+   거부한다.
 1. `./test/htp/build.sh` — **skel을 반드시 다시 빌드한다.** `MOE_N_STAGES`가
    9 → 15로 늘었다. 안 하면 `nntr_hvx_mm_u8i4_moe_layer_timed failed:
    err=-2147482610` (0x8000040E, EBADPARM). 이 사이클을 이미 한 번 잃었다.
