@@ -88,3 +88,8 @@ SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c"
     -o build/libnntr_hvx_skel.so
 
 echo "built: $SCRIPT_DIR/build/libnntr_hvx_skel.so ($HEX_ARCH, hexkl $HEXKL_SDK_VER)"
+echo "NOTE: this is the DSP skel only. If nntr_hvx.idl changed, the ARM client"
+echo "      stub needs regenerating too, or the build fails on the new symbols"
+echo "      (or worse, an old client meets this skel and the call returns"
+echo "      EBADPARM):"
+echo "        bash $REPO_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
