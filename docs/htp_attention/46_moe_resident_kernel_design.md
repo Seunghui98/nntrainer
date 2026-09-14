@@ -1677,6 +1677,50 @@ err             = 0x80000402
 단계에서 "무엇이 실패했나"가 아니라 **"어떻게 실패했나"**를 남겨둔 덕에 다음 가설이
 나왔다. 1차: 헤더·심볼 존재 확인. 2차: attach가 원인. 3차: flags.
 
+### 32.10 Gate 0c 3차 (2026-09-14, 기기) — 전부 MAP_FAILED, 그리고 `HAP_mmap_get`도 거부
+
+```
+hap_mmap_accepted   = none        hap_mmap_fail_mask = 0x2aa   ← 5조합 전부 MAP_FAILED, null은 0
+hap_mmap_get_rc     = 0x80000448  hap_mmap_get_paddr_lo = 0x0  ← 4차 전반부: getter도 거부
+fastrpc_mmap_rc     = 0x0         attached = yes
+```
+
+`0x2aa` = 조합당 2비트가 전부 `2`(MAP_FAILED). 3차의 flags 가설은 **틀렸다** — 어떤 flags를
+줘도 같은 답이다. 프로브의 판독("MAP_FAILED = 알고서 거절")은 맞았는데, 그 다음 추론이
+한 단계 더 필요했다: DSP가 fd를 "안다"는 것과 그 fd가 **`HAP_mmap`으로 매핑할 수 있게
+태그돼 있다**는 것은 다르다.
+
+4차 전반부에서 `HAP_mmap_get`(fd, &va, &paddr)을 먼저 시도하게 했고, 시그니처를
+`(fd, void**, int* size)`로 잘못 짚어 빌드가 멈췄다 — 헤더는 `uint64 *paddr`다. 고쳐서
+돌리니 **getter도 `0x80000448`** 로 거부. 즉 DSP 쪽 호출은 둘 다 아니고, 문제는 **호스트가
+붙이는 방식**이다.
+
+**원인: attach flag `0`.** 테스트가 `kMapFd = 0`을 `FASTRPC_MAP_FD`라고 주석 달고 넘겼는데,
+`remote.h`의 `enum fastrpc_map_flags`에서 **0은 `FASTRPC_MAP_STATIC`** — 버퍼를 *호출
+인자로 넘길 때* 드라이버가 만드는 고정 원격 주소 매핑이고, fd에 태그되지 않는다.
+`FASTRPC_MAP_FD`는 **2**이고, 그 주석이 정확히 "DSP에서 `HAP_mmap_get()`/`HAP_mmap_put()`
+으로 주소를 얻는다"이다. 2차에서 `flags=0`이 틀렸던 것과 같은 종류의 실수를 **다른
+함수에서 한 번 더** 했다 — 매크로 대신 숫자를 쓴 곳마다.
+
+**4차 (코드 완료·미측정):** 테스트가 이미 `<remote.h>`를 include하므로 `CDSP_DOMAIN_ID`와
+`FASTRPC_MAP_FD`를 그대로 쓰고, 보낸 값을 `map_domain`/`map_flag`로 찍는다. DSP 쪽은
+`HAP_mmap_get` 우선, 5조합 폴백 유지. IDL 무변경.
+
+| 결과 | 뜻 |
+|---|---|
+| `hap_mmap_accepted=mmap_get`, `paddr_lo≠0`, `checksum_ok=yes` | **Gate 0c 통과** → A1 |
+| `mmap_get` 통과, `checksum_ok=no` | 매핑은 됐는데 CPU 캐시가 안 내려감. `FASTRPC_MAP_FD`는 캐시 유지가 사용자 책임 — 패턴을 attach *전에* 쓰므로 attach 시 dma_buf map이 내려줄 것으로 봤다. 아니면 `rpcmem_sync_cache` 또는 uncached alloc |
+| `hap_mmap_get_rc` 여전히 `0x80000448` | `FASTRPC_MAP_FD_DELAYED`(3) 시도. 그것도 아니면 이 SDK/커널 조합이 fd 태그 매핑을 지원하지 않는 것 — §32.5 재설계 |
+
+**남는 교훈**: 숫자로 쓴 상수는 세 곳(`HAP_mmap` flags, `fastrpc_mmap` flags, 그리고
+2차의 prot) 모두에서 비용을 냈다. 헤더가 있으면 헤더를 쓴다. 헤더가 없어서 빌드가 깨지는
+것이 틀린 숫자로 기기 사이클을 태우는 것보다 싸다.
+
+**RegistryCapacity 부수 결과**: `released=0 of 516`, `first_release_err=0x27`. `0x27`은
+`hexkl_weight_u8i4_release`가 돌려줄 수 있는 두 값(0, `0x8000040e`) 어느 쪽도 아니므로
+호출이 함수에 도달하지 못했다 — `0x8000040d`(`AEE_EBADSTATE`)로 멈춘 PD의 전송 오류.
+테스트는 cap에서 멈춘 경우에만 release를 assert하도록 바꿨다.
+
 ## 33. V1이 깨졌다 → 해결 (2026-09-14, 기기) — 원인은 레퍼런스의 FMA
 
 `run_u8i4_layer_on_device.sh`가 드디어 제대로 빌드된 실행에서:
