@@ -4,27 +4,28 @@
  *
  * @file   htp_weight_cache.h
  * @date   14 Sep 2026
- * @brief  On-disk cache of baked WH weight bytes, to skip the DSP bake
+ * @brief  The converted model: one file per baked WH weight, read into the
+ *         DSP-mapped arena
  * @see    https://github.com/nntrainer/nntrainer
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * Registration costs 2297 ms for this model's 64 weights (doc 46 section
- * 20), and the larger half of that is the RM->WH bake on the DSP -- about
- * 25 ms a weight, 7168 independent tile rearrangements for a gate_up. The
- * bake is deterministic (doc 43 section 7 checked it with FNV-1a), so a run
- * that has paid for it can write the bytes out and every later run reads
- * them instead, through weight_register_u8i4_baked.
+ * Registration costs 2297 ms for one layer's 64 weights (doc 46 section
+ * 20), most of it the RM->WH bake on the DSP -- about 25 ms a weight -- and
+ * the baked bytes then sit on DSP heap, which tops out at 1.89 GB against
+ * the 3.9 the whole model needs (doc 45 Gate 0). The bake is deterministic
+ * (doc 43 section 7), so a run that pays it writes the bytes out, and every
+ * later run reads them into an rpcmem arena the DSP maps once and DMAs
+ * from at the same rate as its own heap (doc 46 Gate 0c). Nothing is
+ * copied to the DSP and nothing lives on its heap.
  *
- * Off unless NNTR_HTP_WEIGHT_CACHE names a directory. A cache is a place
- * the process writes files, and where those files go is the operator's
- * call, not a default this code should invent.
- *
- * The WH bytes are read straight into the caller's buffer rather than a
- * vector it would then have to copy: that buffer is rpcmem/ION, so FastRPC
- * hands it to the DSP without a copy of its own, and the alternative was
- * paying for two. Reading the cache was 583 ms of a 975 ms registration --
- * 178 MB at 0.31 GB/s -- so the copies are not a rounding error.
+ * The directory named by NNTR_HTP_WEIGHT_CACHE is that converted model. Off
+ * when unset: where a process writes files is the operator's call. One
+ * model per directory -- everything in it is loaded into the arena, so a
+ * second model's files there cost memory for nothing. Conversion is not a
+ * separate mode: a weight with no file is baked, exported, written, and
+ * placed in the arena in the same call, so a first run converts what it
+ * touches and later runs find it.
  *
  * The file records a hash of the SOURCE weight bytes. That is what lets a
  * hit skip htp_qs4cx_from_packed as well as the bake -- the scale and
@@ -43,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <string>
 #include <vector>
 
@@ -94,37 +96,48 @@ public:
     return dir_ + buf;
   }
 
-  /**
-   * @brief Reads a cached bake, if one matching this exact weight exists.
-   *
-   * @return true with all four vectors filled; false for any mismatch,
-   *         short read, or missing file -- all of which are ordinary misses
-   *         and leave the caller to bake normally.
-   */
-  bool load(const std::string &file, uint32_t K, uint32_t N, uint64_t src_hash,
-            uint8_t *wh, uint32_t wh_cap, std::vector<float> &w_scale,
-            std::vector<int32_t> &colsum_w, std::vector<float> &bias) const {
-    std::FILE *f = std::fopen(file.c_str(), "rb");
-    if (f == nullptr)
-      return false;
+  /** @brief Every weight file in the directory, in readdir order. The
+   *  arena is sized and filled from this list, so the order is only a
+   *  placement order. */
+  std::vector<std::string> listFiles() const {
+    std::vector<std::string> out;
+    DIR *d = ::opendir(dir_.c_str());
+    if (d == nullptr)
+      return out;
+    while (dirent *e = ::readdir(d)) {
+      const std::string name = e->d_name;
+      if (name.size() > 7 && name.compare(0, 3, "wh_") == 0 &&
+          name.compare(name.size() - 4, 4, ".bin") == 0)
+        out.push_back(dir_ + "/" + name);
+    }
+    ::closedir(d);
+    return out;
+  }
 
-    HtpWeightCacheHeader h{};
-    bool ok = std::fread(&h, sizeof(h), 1, f) == 1 &&
-              std::memcmp(h.magic, kMagic, sizeof(h.magic)) == 0 &&
-              h.version == kVersion && h.K == K && h.N == N &&
-              h.src_hash == src_hash && h.wh_len == whBytes(K, N) &&
-              h.wh_len <= wh_cap;
-    if (ok) {
-      w_scale.resize(N);
-      colsum_w.resize(N);
-      bias.resize(N);
-      ok = std::fread(wh, 1, h.wh_len, f) == h.wh_len &&
+  /** @brief Reads and validates one file's header. false for anything
+   *  short, foreign, or from another version -- an ordinary miss. */
+  bool readHeader(std::FILE *f, HtpWeightCacheHeader &h) const {
+    return std::fread(&h, sizeof(h), 1, f) == 1 &&
+           std::memcmp(h.magic, kMagic, sizeof(h.magic)) == 0 &&
+           h.version == kVersion && h.wh_len == whBytes(h.K, h.N);
+  }
+
+  /**
+   * @brief Reads the payload that follows a header straight into @a wh --
+   *        the arena, so the bytes are never held anywhere else -- and the
+   *        three N-sized arrays into vectors.
+   */
+  bool readPayload(std::FILE *f, const HtpWeightCacheHeader &h, uint8_t *wh,
+                   std::vector<float> &w_scale, std::vector<int32_t> &colsum_w,
+                   std::vector<float> &bias) const {
+    const uint32_t N = h.N;
+    w_scale.resize(N);
+    colsum_w.resize(N);
+    bias.resize(N);
+    return std::fread(wh, 1, h.wh_len, f) == h.wh_len &&
            std::fread(w_scale.data(), sizeof(float), N, f) == N &&
            std::fread(colsum_w.data(), sizeof(int32_t), N, f) == N &&
            std::fread(bias.data(), sizeof(float), N, f) == N;
-    }
-    std::fclose(f);
-    return ok;
   }
 
   /**

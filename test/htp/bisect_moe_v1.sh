@@ -45,6 +45,9 @@ echo "==> $(git log --oneline -1)"
 echo "==> skel"
 HEXKL_ROOT="$HEXKL_ROOT" HEXKL_SDK_VER="$HEXKL_SDK_VER" bash "$HERE/build.sh"
 
+echo "==> arm stub"
+bash "$ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
+
 echo "==> arm test"
 ( cd "$ROOT/test/jni" && "$ANDROID_NDK/ndk-build" \
     NDK_PROJECT_PATH=. NDK_APPLICATION_MK=./Application.mk \

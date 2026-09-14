@@ -38,25 +38,37 @@ interface nntr_hvx : remote_handle64 {
                                   in sequence<float> bias,
                                   rout uint32 w_handle);
 
-   // [doc 46 section 20] The same registration with the RM->WH bake already
-   // done. That bake is the expensive half -- about 25 ms a weight, 1597 ms
-   // across this model's 64 -- and its output is deterministic, so a run
-   // that paid for it can hand the bytes to the next one through a cache
-   // file. wh_bytes is (K/32)*(N/32)*512, which is also half the wire
-   // payload weight_register_u8i4 carries: WH packs two int4 per byte where
-   // w_i4_rm spends a whole int8 on each.
-   AEEResult weight_register_u8i4_baked(in uint32 K, in uint32 N,
-                                        in sequence<uint8> wh_src,
-                                        in sequence<float> w_scale,
-                                        in sequence<int32> colsum_w,
-                                        in sequence<float> bias,
-                                        rout uint32 w_handle);
-
    // Copies a registered weight's baked WH bytes back out so the host can
    // write the cache the call above reads. wh_out must be exactly
    // (K/32)*(N/32)*512 bytes for that weight's shape.
    AEEResult weight_bake_export(in uint32 w_handle,
                                 rout sequence<uint8> wh_out);
+
+   // [doc 46 section 32] The arena: a host rpcmem buffer the DSP maps once
+   // with HAP_mmap_get and then reads weights straight out of, at the same
+   // ~30 GB/s the DMA gets from DSP heap (Gate 0c, section 32.11). fd comes
+   // from rpcmem_to_fd, attached on the host with fastrpc_mmap and
+   // FASTRPC_MAP_FD -- not 0, which is FASTRPC_MAP_STATIC and is not tagged
+   // with the fd; that was attempts 1-3. Up to NNTR_HVX_MAX_ARENAS at a
+   // time; close() puts back whatever is still attached.
+   AEEResult arena_attach(in int32 fd, in uint32 bytes, rout uint32 arena);
+
+   // Refused (AEE_EBADSTATE) while any registered weight still points into
+   // it, since releasing the mapping under a live handle would turn the
+   // next matmul into a read of unmapped memory.
+   AEEResult arena_detach(in uint32 arena);
+
+   // Registers a weight whose WH bytes already sit in an arena at wh_off,
+   // borrowing them in place: no copy, no DSP heap, which is what lifts the
+   // 1.89 GB ceiling Gate 0 hit. The host owns the bytes and keeps them
+   // unchanged while the handle lives. wh_off must be tile-aligned (512)
+   // and the (K/32)*(N/32)*512 bytes must lie inside the arena.
+   AEEResult weight_register_u8i4_arena(in uint32 K, in uint32 N,
+                                        in uint32 arena, in uint32 wh_off,
+                                        in sequence<float> w_scale,
+                                        in sequence<int32> colsum_w,
+                                        in sequence<float> bias,
+                                        rout uint32 w_handle);
 
    AEEResult weight_release_u8i4(in uint32 w_handle);
 

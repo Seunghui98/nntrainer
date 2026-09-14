@@ -174,6 +174,7 @@ int nntr_hvx_close(remote_handle64 handle) {
       hexkl_weight_u8i8_release(&s->weights_u8i8, i);
     }
   }
+  nntr_hvx_arenas_put_all(s);
   hvx_worker_pool_destroy(s->quant_pool);
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {
