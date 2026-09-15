@@ -330,3 +330,51 @@ DMA 속도 판별은 다음부터 **분리한다**: 아레나 프로브에 청�
 비동기), `unittest_hvx_mm_u8i4` MoE 테스트, 그리고 **여러 번** 돌려서 같은 텍스트가
 나오는지 — 순서 오류는 확률적으로 나타난다. 호스트 체크는 통과하지만 스텁 submit이
 즉시 실행이라 **겹침 자체는 기기에서만 검증된다.**
+
+### 11.1 결과 (2026-09-15, 기기) — **376 TPS**, dequant는 숨었고 scatter는 안 숨었다
+
+```
+prefill 1180 ms 376.3 TPS (직전 1230 / 361)    decode 15.55 TPS (15.22)    텍스트 동일
+M>1  host 19931 dsp 17548 transport 2383
+     [quant 1443 gather 140 requant 1166 dequant 865 acc 2961 drain 213+49
+      push 47 scatter 1056 alloc 120 stage 373 mm 8865 | rest 251]
+M==1 host 1913 dsp 1348  [dequant 22.5 (87) drain 167+7 mm 770]
+```
+
+| | 예측 | 실측 | |
+|---|---:|---:|---|
+| dequant 3263 → ≈900 | | **865** | ✓ 에필로그가 HMX 뒤로 숨었다 |
+| scatter 1034 → ≈100 | | **1056** | ✗ 대기를 **블록 머리**에 뒀다 — 앞에 있는 건 3 us짜리 활성화 대기뿐이라 숨을 데가 없었다. 첫 gate_up 배치 발행(47 us) **뒤**로 옮겼다(커밋). 기대 ≈100 |
+| mm 그대로 | | 8865 | ✓ HMX 발행은 워커와 VTCM을 안 다툰다 |
+| rest | 94 | 251 | 블록당 submit 7회의 깨우기 비용. 무시 |
+| 콜 22.2 → ≈19 | | **19.9** | scatter 수정 후 ≈19.0 |
+
+## 12. 남은 것 — 콜 19.9 ms의 구성과 레버
+
+```
+HMX        mm 8.86 + acc 2.96          = 11.8  (59%)   45.6 블록 × 252 us. 패딩 4.6 ms 포함, 구조 비용
+transport                                2.38  (12%)
+quant      1.44 (DDR 13 MB: f32 읽기 ×2 + AH 6 MB 쓰기)
+requant    1.17 (down HMX가 mid 전체를 필요로 해 못 숨김)
+scatter    1.06 → ≈0.1 (위 수정)
+dequant    0.86 (블록당 마지막 배치의 노출)
+stage/drain/gather/alloc/rest ≈ 1.1
+```
+
+| # | 레버 | 기대 | 비용 |
+|---|---|---:|---|
+| 1 | scatter 대기 위치 (커밋됨) | −0.9 | 0 |
+| 2 | **C: 활성화를 ARM에서 u8로** — act 3.6 MB → 0.9 MB + scale/zp. DSP quant는 u8 gather만 남고 transport 바이트가 반 | quant −1.3, transport −0.9, stage −0.2 → **−2.4** | 중: ARM NEON row-quant + u8in 엔트리. `hvx_quant_rows_u8_params`와 같은 min/max 규칙이면 되고 비트동일은 불필요(DSP 양자화를 대체하는 것이지 병행이 아님). 텍스트로 확인 |
+| 3 | requant의 스캔을 융합 에필로그에 — 워커별 행 min/max 부분합 → 대기 시 리듀스. 팩만 남음 | −0.5 | 중 |
+| 4 | dequant 잔여 — 마지막 배치를 작게(16,16,16,8 → 이미 그렇다) | ≈0 | — |
+| — | HMX 11.8 | 못 줄임 | 64행 타일 구조. HexKL이 32행 타일을 안 줌 |
+| — | transport 잔여 ≈1.5 (C 후) | FastRPC 고정 + out 3.6 MB invalidate | residual을 DSP에 두는 문서 45 Phase D |
+
+1+2+3 후 콜 ≈ **16.2 ms** = HMX 11.8 + transport 1.5 + requant 0.6 + 기타 2.3. 레이어
+16.2 + 1 + 2.1–5 = 19–22 ms vs CPU 31.8 → **1.4–1.7×**. 여기가 이 커널의 실질적 바닥이다.
+
+**전체 prefill로 보면 벽은 이제 ARM이다:** 1180 = HTP 콜 438 (37%) + ARM 742 (63%).
+콜을 16.2로 내려도 1100 ms(≈404 TPS)이고, 콜이 0이어도 742 ms(≈600 TPS)다. 742 안의
+MoE 몫(router/topk/staging, 레이어당 2.1–5 ms로만 알고 **안 쟀다**)은
+`NNTR_M0_PROFILE=1`로 22줄 찍으면 닫힌다 — 코드 0줄. 나머지(conv 18층 · attn 6층 ·
+norm)는 문서 45(HTP로)다.
