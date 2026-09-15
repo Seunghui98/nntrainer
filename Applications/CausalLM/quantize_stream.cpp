@@ -9,6 +9,7 @@
  */
 
 #include <cpu_backend.h>
+#include <htp_wh_layout.h>
 
 #include <algorithm>
 #include <cctype>
@@ -373,6 +374,8 @@ DType parseDType(const std::string &value) {
     return DType::Q6_K;
   if (dtype == "QS4CX")
     return DType::QS4CX;
+  if (dtype == "QS4CX_WH")
+    return DType::QS4CX_WH;
   throw std::invalid_argument("Unsupported dtype: " + value +
                               " (supported: FP32, Q4_0, Q4_K, Q6_K, QS4CX)");
 }
@@ -389,6 +392,8 @@ const char *dtypeName(DType dtype) {
     return "Q6_K";
   case DType::QS4CX:
     return "QS4CX";
+  case DType::QS4CX_WH:
+    return "QS4CX_WH";
   default:
     throw std::invalid_argument("Unknown dtype");
   }
@@ -460,6 +465,13 @@ size_t quantizedSize(DType dtype, size_t rows, size_t columns, bool repack,
     // channel -- the layout layer_devel.h's QS4CX save branch writes, with
     // every nibble first and every scale after (see writeQuantized).
     return checkedMultiply(rows, qs4cxRowBytes(columns) + sizeof(float), name);
+  case DType::QS4CX_WH:
+    // The same nibbles rearranged into HMX weight tiles, which is the same
+    // byte count -- a 32x32 tile is 512 bytes either way -- plus a second f32
+    // per output channel for the column sum the matmul needs and cannot
+    // cheaply recompute from packed nibbles.
+    return checkedMultiply(rows, qs4cxRowBytes(columns) + 2 * sizeof(float),
+                           name);
   default:
     break;
   }
@@ -532,6 +544,13 @@ public:
       throw std::invalid_argument(
         "Q4_K embedding is not supported by the CausalLM embedding layer");
     }
+    // An embedding is a lookup, not a matmul against the HMX unit, so there
+    // is nothing for a weight-tile layout to be right for.
+    if (dtype == DType::QS4CX_WH) {
+      throw std::invalid_argument(
+        "QS4CX_WH is a weight layout for the HTP matmul and cannot be used "
+        "for an embedding");
+    }
     quantizedSize(dtype, rows, columns, false, name);
     if (dry_run_) {
       expected_input_bytes_ += source_bytes;
@@ -577,6 +596,20 @@ public:
       return;
     }
 
+    // A WH tile spans 32 inputs and 32 outputs and the tiles come out
+    // k-major, so a weight written in row blocks would need its output
+    // reordered afterwards. Every weight this dtype is for fits the buffer
+    // (the largest is 29 MB against 64), so the blocked path is refused
+    // rather than built.
+    // ponytail: the fix if a model ever needs it is to hold the whole WH
+    // image -- K*N/2 bytes, 3.5 MB for the largest -- and fill it block by
+    // block, not to change the tile order.
+    if (dtype == DType::QS4CX_WH && source_bytes > MAX_TENSOR_BUFFER_BYTES) {
+      throw std::invalid_argument(
+        name + " is " + std::to_string(source_bytes) + " bytes, over the " +
+        std::to_string(MAX_TENSOR_BUFFER_BYTES) +
+        " QS4CX_WH can write in one pass. Quantize this tensor as QS4CX.");
+    }
     if (source_bytes <= MAX_TENSOR_BUFFER_BYTES) {
       std::vector<float> source(tensorElements(input_size, output_size, name));
       readFloats(source, name);
@@ -739,6 +772,54 @@ private:
         /*is_nxk=*/true);
       writeBytes(nibbles.data(), nibbles.size(), name);
       return;
+    } else if (dtype == DType::QS4CX_WH) {
+      // Same quantizer, then a repack. Going through quant_qs4cx_f32 rather
+      // than quantizing straight into tiles keeps this bit-identical to the
+      // QS4CX path above: the values and scales are the ones the device has
+      // been running, and only where the nibbles sit changes.
+      std::vector<char> nibbles(
+        checkedMultiply(rows, qs4cxRowBytes(columns), name));
+      const size_t scale_begin = pending_scales_.size();
+      pending_scales_.resize(scale_begin + rows);
+      nntrainer::quant_qs4cx_f32(
+        rows, columns, const_cast<float *>(source.data()), nibbles.data(),
+        pending_scales_.data() + scale_begin,
+        /*is_nxk=*/true);
+
+      // Unpack to one sign-extended int8 per value in K x N row-major, which
+      // is what whPack takes and what htp_qs4cx_from_packed builds at load
+      // time today -- same nibble convention: q + 8 stored unsigned, even k
+      // in the low half. The column sums come out of the same pass, because
+      // recomputing them from packed nibbles at load costs about 20 seconds
+      // across this model.
+      const size_t K = columns, N = rows;
+      std::vector<int8_t> rm(checkedMultiply(K, N, name));
+      const size_t colsum_begin = pending_colsums_.size();
+      pending_colsums_.resize(colsum_begin + N, 0.0f);
+      const size_t stride = qs4cxRowBytes(columns);
+      for (size_t n = 0; n < N; ++n) {
+        const uint8_t *row =
+          reinterpret_cast<const uint8_t *>(nibbles.data()) + n * stride;
+        int32_t sum = 0;
+        for (size_t k = 0; k < K; ++k) {
+          const uint8_t byte = row[k >> 1];
+          const uint8_t nibble = (k & 1u) ? (byte >> 4) : (byte & 0x0Fu);
+          const int8_t q =
+            static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
+          rm[k * N + n] = q;
+          sum += q;
+        }
+        // Held as float so it travels beside the scales in one array and
+        // lands in the file as the f32 the loader reads; the values are
+        // small integers and exact.
+        pending_colsums_[colsum_begin + n] = static_cast<float>(sum);
+      }
+
+      std::vector<uint8_t> wh(nntrainer::whBytes(K, N));
+      nntrainer::whPack(rm.data(), static_cast<uint32_t>(K),
+                        static_cast<uint32_t>(N), wh.data());
+      writeBytes(reinterpret_cast<const char *>(wh.data()), wh.size(), name);
+      return;
     }
 
     if (written != output_size) {
@@ -757,12 +838,23 @@ private:
    * once they have written a tensor's last chunk.
    */
   void flushQs4cxScales(DType dtype, const std::string &name) {
-    if (dtype != DType::QS4CX || pending_scales_.empty())
+    if (dtype != DType::QS4CX && dtype != DType::QS4CX_WH)
+      return;
+    if (pending_scales_.empty())
       return;
     writeBytes(pending_scales_.data(),
                checkedMultiply(pending_scales_.size(), sizeof(float), name),
                name);
     pending_scales_.clear();
+    // Column sums follow the scales, so the tensor reads back as
+    // [nibbles][scale per output channel][colsum per output channel] --
+    // which is QS4CX_WH_Tensor::size(). Empty for plain QS4CX.
+    if (!pending_colsums_.empty()) {
+      writeBytes(pending_colsums_.data(),
+                 checkedMultiply(pending_colsums_.size(), sizeof(float), name),
+                 name);
+      pending_colsums_.clear();
+    }
   }
 
   void writeBlockedTransposed(size_t input_size, size_t output_size,
@@ -829,6 +921,8 @@ private:
   size_t source_bytes_ = 0;
   bool dry_run_ = false;
   size_t expected_input_bytes_ = 0;
+  /** QS4CX_WH per-output-channel column sums awaiting flushQs4cxScales() */
+  std::vector<float> pending_colsums_;
   /** QS4CX per-channel scales awaiting flushQs4cxScales() */
   std::vector<float> pending_scales_;
 };
@@ -1208,7 +1302,13 @@ void printUsage(const char *program) {
     << "  -h, --help            Show this help\n\n"
     << "Architectures: Qwen3MoeForCausalLM, Gemma4ForCausalLM, "
        "Gemma4ForConditionalGeneration\n"
-    << "Supported dtypes: FP32, Q4_0, Q4_K, Q6_K\n"
+    << "Supported dtypes: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH\n"
+    << "QS4CX_WH is QS4CX pre-arranged into HMX weight tiles: it loads "
+       "without\n"
+    << "the on-device conversion that costs 48% of prefill, and no CPU "
+       "kernel can\n"
+    << "read it, so a model using it runs its MoE experts on the HTP or "
+       "not at all.\n"
     << "Gemma4 MoE FC/expert weights currently support FP32 or Q4_0.\n";
 }
 

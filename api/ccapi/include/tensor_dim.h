@@ -61,6 +61,10 @@ public:
     Q6_K,   /** q6 k quantized */
     Q4_0,   /** Q4_0 k quantized */
     QS4CX,  /** QS4CX quantized */
+    QS4CX_WH, /** QS4CX whose nibbles are in the HMX WH tile layout, with a
+                  per-output-channel column sum after the scales. Built
+                  offline (htp_wh_layout.h); the HTP backend registers it
+                  without converting, and no CPU kernel can read it. */
     UINT4,  /** quantized unsigned int 4*/
     UINT8,  /** unsigned int 8 bit */
     UINT16, /** unsigned int 16 bit */

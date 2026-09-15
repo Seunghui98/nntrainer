@@ -214,10 +214,12 @@ public:
    */
   void pack() override;
 
-private:
+protected:
   /**
-   * @brief copy a buffer to @a this, the caller has to ensure that @a this is
-   * initialized otherwise undefined behavior
+   * @brief copy a buffer to @a this -- protected rather than private because
+   * QS4CX_WH_Tensor has the same buffer layout below its extra column sums
+   * and fills itself the same way. The caller has to ensure that @a this is
+   * initialized, otherwise undefined behavior
    *
    * @param buf buffer to copy from
    */
@@ -235,6 +237,79 @@ private:
   bool isValid() const override { return true; }
 
   std::unique_ptr<uint8_t[]> packed_data = nullptr;
+};
+
+/**
+ * @class   QS4CX_WH_Tensor
+ * @brief   QS4CX whose nibbles are already in the HMX WH tile layout.
+ *
+ * Same values, same per-output-channel scales, same number of nibble bytes --
+ * a WH tile is 32x32 i4 in 512 bytes, so the packing costs nothing over
+ * row-major. Two things differ:
+ *
+ *  - the nibbles are arranged as htp_wh_layout.h describes, which is what the
+ *    HTP backend registers directly instead of converting and baking on the
+ *    DSP (doc 46 section 35);
+ *  - a per-output-channel column sum follows the scales, because the matmul
+ *    needs it to correct for the activation zero point and recomputing it
+ *    from the packed nibbles costs about 20 seconds across this model.
+ *
+ * So the only layout difference is the extra N floats, which is why getData
+ * and getScale are inherited unchanged. Nothing on the CPU can read this
+ * tensor: the layout is the accelerator's, and a CPU kernel handed one would
+ * compute a wrong answer rather than fail, so loading a model with these
+ * weights commits it to the HTP path.
+ */
+class QS4CX_WH_Tensor : public QS4CX_Tensor {
+public:
+  /** @brief Basic constructor */
+  QS4CX_WH_Tensor(std::string name_ = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_Tensor(name_, fm) {}
+
+  /**
+   * @brief Construct a new QS4CX_WH_Tensor
+   *
+   * Allocation is deferred out of the base constructor and done here.
+   * QS4CX_Tensor::allocate() sizes the buffer with size(), and a virtual call
+   * from a base constructor runs the BASE override -- which would quietly
+   * allocate N floats too few and leave every column sum reading past the end.
+   */
+  QS4CX_WH_Tensor(const TensorDim &d, bool alloc_now,
+                  Initializer init = Initializer::NONE, std::string name = "") :
+    QS4CX_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+
+  /** @brief Construct from a buffer */
+  QS4CX_WH_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    QS4CX_WH_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() != 0 && buf != nullptr)
+      copy_qs4cx(buf);
+  }
+
+  /** @brief Copy constructor from TensorBase */
+  QS4CX_WH_Tensor(TensorBase &rhs) : QS4CX_Tensor(rhs) {}
+
+  /**
+   * @copydoc Tensor::size()
+   * @note The nibble half matches QS4CX exactly; the extra N floats are the
+   *       column sums.
+   */
+  size_t size() const override {
+    return QS4CX_Tensor::size() + width() * sizeof(float);
+  }
+
+  /**
+   * @copydoc Tensor::getMemoryBytes()
+   */
+  size_t getMemoryBytes() const override { return size() * sizeof(uint8_t); }
+
+  /**
+   * @brief  Get the Data Type String object
+   * @return std::string of tensor data type (QS4CX_WH)
+   */
+  std::string getStringDataType() const override { return "QS4CX_WH"; }
 };
 
 } // namespace nntrainer
