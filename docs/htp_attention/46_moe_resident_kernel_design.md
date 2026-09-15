@@ -2591,3 +2591,66 @@ PD가 앞쪽 ~256 MiB 사용
 3840은 **모델이 없는** 프로세스의 값이다. 앱은 activation staging용 rpcmem 버퍼도
 같은 주소공간을 쓴다(`alloc` 스테이지). 3756 MiB(가중치 + 꼬리 낭비)를 쓰고 나면
 ~260 MiB가 남는 셈인데, 그게 충분한지는 **돌려봐야 안다.**
+
+## 42. 처음으로 끝까지 돌았다 (2026-09-15, 기기) — prefill 188 TPS / decode 9.85 TPS
+
+```
+weights registered : 1408/1408, 1408/1408 on ION, convert 0.0 ms
+arena              : 256 MiB x 15 = 3840 MiB, RSS 4323 -> 759 MB
+prefill            : 444 tokens,  2362 ms, 187.98 TPS
+generation         : 512 tokens, 51964 ms,   9.85 TPS
+peak memory        : 5330 MB
+```
+
+요약 텍스트 정상. §36의 벽 두 개(메모리, decode 라우팅)와 §41의 정렬 낭비가 다 넘어갔다.
+
+### 42.1 시간이 실제로 어디 있나 (54.3 s 기준)
+
+| # | 항목 | ms | % |
+|---|---|---|---|
+| 1 | **ARM decode — 계측 없음** | 22629 | **41.6** |
+| 2 | DSP `gather` @ decode | 8956 | 16.5 |
+| 3 | DSP `mm`(잔차 = weight DMA 대기) @ decode | 8471 | 15.6 |
+| 4 | FastRPC transport @ decode | 6288 | 11.6 |
+| 5 | DSP `acc` @ decode | 2934 | 5.4 |
+| 6 | decode 나머지 DSP | ~2600 | 4.8 |
+| 7 | ARM prefill | 1013 | 1.9 |
+| 8 | 등록 (1회성) | 728 | 1.3 |
+| 9 | DSP prefill 전체 | 621 | 1.1 |
+
+**prefill은 전체의 1.1%다.** §16~§29에서 37.2 → 27.0 ms로 깎던 그 경로는 이제 측정
+가능한 상한이 사라졌다. 남은 건 전부 decode다.
+
+### 42.2 `gather`가 이상하다 — 가장 확실한 건수
+
+decode 한 콜의 gather는 **795 us**인데, 실어 나르는 건 4행 × 2048 float = 32 KB다.
+prefill은 444행/콜에 2930 us = **6.6 us/행**. 비례하면 decode는 26 us여야 한다.
+
+```
+795 us 측정 − 26 us 비례분 = 769 us/call 이 M과 무관한 고정비
+769 us × 22 layer × 512 token = 8.7 s
+```
+
+M에 비례하지 않는 무언가(전체 expert 순회, M 패드 전체 clear, uncached 읽기)가
+있다는 뜻이다. **아직 원인은 안 봤다.**
+
+### 42.3 decode는 weight 대역폭에 묶여 있다
+
+콜당 weight DMA 21504 KB = top-4 expert × 5.25 MB. × 22 layer = **462 MB/token**.
+보고된 속도는 10.8 GB/s인데 Gate 0c가 uncached로 잰 값은 **38.8 GB/s**였다. 이 차이가
+`mm` 잔차 8.5 s의 대부분이다. 30 GB/s만 나와도 15.4 ms/token이 되어 이론 상한이
+65 TPS로 올라간다.
+
+### 42.4 남은 최적화 — 순위
+
+| | 항목 | 기대 | 비용 | 근거 |
+|---|---|---|---|---|
+| **A** | **ARM decode 계측** | 측정 22.6 s | 아주 작음 | 41.6%인데 아무것도 모른다. `NNTR_M0_PROFILE`이 `tokens>1`에 걸려 decode에서 침묵한다 |
+| **B** | `gather` 고정비 제거 | ~8.7 s | 중 | §42.2 |
+| **C** | prebound invoke | ~2.3 s | 중 | 콜마다 핸들 64개 + 벡터 3개를 매번 보낸다. 레이어당 불변인데. transport 558 us vs 문서 34의 326 기준 |
+| **D** | decode DMA 10.8 → 30 GB/s | ~5 s | 큼 | §42.3. expert 4개라 링 깊이가 안 나오는 것으로 의심 |
+| **E** | `acc`가 M을 존중 | ~2.9 s | 중 | 1행인데 64 패드행의 acc를 읽어 온다 |
+| **F** | prefill `alloc` 3036 us 호이스트 | ~67 ms | 작음 | 콜당 VTCM 할당 |
+| **G** | 로드 시점 등록 | 피크 −1.4 GB | 중 | 지금은 첫 forward에 등록해서 풀과 아레나가 동시에 최대다 |
+
+A가 먼저다 — 가장 큰 블록인데 유일하게 숫자가 없다. §33.3과 CLAUDE.md의 같은 교훈.
