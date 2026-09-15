@@ -2422,3 +2422,60 @@ RSS가 3.9 GB 근처면 §37의 페이지 반납이 애초에 안 먹은 것이�
 잡는 쪽으로 가야 한다), 1 GB 근처면 반납은 됐고 벽은 확실히 DSP 쪽이다.
 
 **한 번 돌리면 둘 다 답이 나온다.**
+
+## 39. 벽의 정체 (2026-09-15, 기기) — DSP 주소공간이다. 그리고 madvise는 먹었다
+
+§38.4의 계측이 두 질문을 한 번에 답했다.
+
+```
+[HTP] arena chunk 0: 1024 MiB, dsp_id=0, mapped total 1024 MiB, RSS 4325 -> 4325 MB
+[HTP] arena chunk 1: 1024 MiB, dsp_id=1, mapped total 2048 MiB, RSS 3305 -> 3305 MB
+[HTP] arena chunk 2: 1024 MiB, dsp_id=2, mapped total 3072 MiB, RSS 2292 -> 2292 MB
+
+FATAL: cannot register a 2048x3584 weight (3 MiB).
+       fastrpc_mmap failed: err=1 -- the host buffer exists, so this is the
+       DSP side ... mapped=3072 MiB in 3 chunks, RSS=1266 MB
+```
+
+### 39.1 madvise는 정확히 작동한다
+
+RSS가 청크마다 **1020 MB씩** 떨어진다: 4325 → 3305 → 2292 → 1266. 아레나는
+dma-buf라 RSS에 안 잡히므로 저건 순수하게 ARM 풀이 반납된 양이고,
+4325 − 3072 = 1253 ≈ 1266으로 산술이 맞는다. §37의 페이지 반납은 **의도대로
+동작한다.** 그리고 그게 벽의 원인이 아니라는 것도 같이 증명됐다.
+
+### 39.2 벽은 `fastrpc_mmap`이다
+
+`rpcmem_alloc`은 **성공했다** — 호스트에 4번째 1 GiB ION 버퍼가 있다. 거부한 건
+그걸 DSP에 붙이는 단계다. §36.2의 "피크 7.8 GB라서 ION이 거부"는 완전히 틀린
+진단이었고, 호스트 메모리를 더 줄이는 방향은 전부 헛수고다.
+
+읽는 그대로: CDSP user PD의 주소공간이 **32비트(4 GB)**이고, 매핑 3 GiB + PD 자신
+(skel, heap, VTCM 창)이 나머지를 먹었다. 모델은 3.61 GiB가 필요하다.
+
+### 39.3 그래도 아직 천장의 *값*은 모른다
+
+1 GiB 단위로 물어봤기 때문에 3.00에서 멈춘 것뿐이다. 진짜 천장은 [3.00, 4.00) 어딘가고,
+그 값이 계획을 가른다:
+
+| 천장 | 뜻 |
+|---|---|
+| ≥ 3.61 GiB | 청크만 잘게 쪼개면 **그냥 들어간다** |
+| 3.0 ~ 3.6 GiB | 17% 부족. 레이어 일부만 상주시키거나 PD를 나눠야 한다 |
+| = 3.00 GiB 정확히 | 1 GiB 경계가 우연이 아니라 드라이버 제약 |
+
+### 39.4 측정 (2026-09-15, 코드 완료·미측정)
+
+`newChunk`가 거부당하면 **요청을 반으로 줄여 다시 시도한다**(64 MiB까지).
+`chunk_cap_`이 거부된 크기를 기억해서 다음 weight에서 큰 걸 또 묻지 않는다.
+DSP의 `NNTR_HVX_MAX_ARENAS`는 8 → **32**(세 워드짜리 구조체 테이블이라 슬롯은 공짜다).
+
+그러면 아레나가 천장까지 **꽉 채워지고, 멈춘 지점이 곧 천장의 측정값이다.**
+다른 방법이 없다 — DSP 주소공간의 남은 크기를 물어보는 API가 없다.
+
+기대 출력:
+```
+[HTP] arena: 1024 MiB refused, retrying at 512 MiB (fastrpc_mmap ... err=1)
+[HTP] arena chunk 3: 512 MiB, ..., mapped total 3584 MiB, ...
+```
+1408/1408이 뜨면 천장 ≥ 3.61 GiB고 벽은 끝난다. 아니면 멈춘 `mapped total`이 답이다.
