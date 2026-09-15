@@ -175,6 +175,7 @@ int nntr_hvx_close(remote_handle64 handle) {
     }
   }
   nntr_hvx_arenas_put_all(s);
+  hexkl_moe_scratch_free(&s->moe_scratch);
   hvx_worker_pool_destroy(s->quant_pool);
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {
