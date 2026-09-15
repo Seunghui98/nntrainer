@@ -40,6 +40,11 @@ verification").
 | SDK 번들형: `$HEXAGON_SDK_ROOT/addons/hexkl_addon` | `lib/<arch>/libsdkl.so` (flat) | `--htp` 빌드 (`-Dhexkl-sdk-root=`) |
 | 독립 베타 드롭 (예: `hxkl-beta2/hexkl_addon`) | `lib/<ver>/<arch>/libhexkl_micro.a` (버전 포함) | `test/htp/build.sh` / DSP skel |
 
+`-Dhexagon-sdk-root`를 같이 넘기세요. 안 넘기면 meson이 addon 경로에서 **두 단계 위**를
+Hexagon SDK로 씁니다 — `Hexagon_SDK/<ver>/addons/hexkl_addon` 배치에서만 맞고, 독립 beta2
+드롭에서는 체크아웃의 부모 디렉터리를 가리켜 `incs/ 없음`으로 멈춥니다.
+`build_android.sh`는 `HEXKL_ROOT`가 있으면 그걸 쓰고 둘 다 알아서 넘깁니다.
+
 `-Dhexkl-sdk-root`에 독립 베타 드롭을 넣으면 조용히 실패합니다(버전 세그먼트
 불일치). 반드시 SDK 번들형을 사용하세요.
 
@@ -211,7 +216,8 @@ readelf -d builddir/jni/arm64-v8a/libnntrainer.so | grep NEEDED
 ```bash
 rm -rf builddir
 ./tools/package_android.sh -Denable-htp=true \
-  -Dhexkl-sdk-root=$HOME/Downloads/hexkl_addon
+  -Dhexkl-sdk-root=$HEXKL_ROOT \
+  -Dhexagon-sdk-root=$HEXAGON_SDK_ROOT
 meson configure builddir | grep -i htp    # enable-htp true 확인
 ```
 
