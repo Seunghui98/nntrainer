@@ -937,6 +937,7 @@ LOCAL_SRC_FILES := \
 	 ../htp/generated/nntr_hvx_stub.c
 
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
+	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend \
 	 $(HEXAGON_SDK_ROOT)/incs \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
 	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
