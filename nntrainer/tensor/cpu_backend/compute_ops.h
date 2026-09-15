@@ -303,6 +303,23 @@ public:
     unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
     bool weights_wh);
 
+  // Registers one K x N expert weight with the accelerator ahead of its
+  // first use, so a model's load pays that cost rather than its first
+  // prefill: for the 1408 weights of LFM2-8B-A1B it is 747 ms, 31% of the
+  // measured prefill (doc 46 section 50.2 P6). The same call at forward time
+  // then finds the weight already registered. A backend with nothing to
+  // register returns false and the caller moves on.
+  virtual bool register_qs4cx_weight(void *data, const float *scale,
+                                     unsigned int K, unsigned int N,
+                                     bool weights_wh) {
+    (void)data;
+    (void)scale;
+    (void)K;
+    (void)N;
+    (void)weights_wh;
+    return false;
+  }
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,

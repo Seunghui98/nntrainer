@@ -864,6 +864,20 @@ public:
                    out, M, K, inter, N_out);
   }
 
+  /** Same registration the layer call above does on first use, keyed by
+   *  the same data pointer, so the forward-time call is a cache hit. */
+  bool register_qs4cx_weight(void *data, const float *scale, unsigned int K,
+                             unsigned int N, bool weights_wh) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    if (weights_wh) {
+      get_or_register_wh(data, scale, session, K, N);
+    } else {
+      get_or_register_qs4cx(data, scale, session, K, N);
+    }
+    return true;
+  }
+
   bool supports_gemm_qs4cx_fused_swiglu_fp32() const override { return true; }
 
   void gemm_qs4cx_fused_swiglu_fp32(std::vector<void *> matAdata,

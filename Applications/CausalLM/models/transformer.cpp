@@ -374,11 +374,28 @@ void Transformer::repack_weight() {
           l.getType() != "shared_fully_connected" && l.getType() != "lfm2_moe")
         return;
 
+      // An accelerator-dispatched MoE layer registers its expert weights
+      // here, at load, instead of on the first token: the layer's ComputeOps
+      // is only non-null when nntr_config.json routed it to an engine, and
+      // a backend that has nothing to register says so and is skipped. The
+      // expert weight tensors are [K, N] as the kernel sees them; the router
+      // gate and expert bias are FP32 and never reach this branch.
+      auto *ops = l.getType() == "lfm2_moe" ? context.getComputeOps() : nullptr;
+
       auto weights = context.getWeights();
       for (auto &w : weights) {
-        if (w->getVariableRef().getDataType() ==
-            ml::train::TensorDim::DataType::QS4CX) {
-          w->getVariableRef().pack();
+        auto &t = w->getVariableRef();
+        const auto dtype = t.getDataType();
+        if (dtype == ml::train::TensorDim::DataType::QS4CX) {
+          t.pack();
+        }
+        if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
+                    dtype == ml::train::TensorDim::DataType::QS4CX_WH)) {
+          ops->register_qs4cx_weight(
+            t.getData<char>(), t.getScale<float>(),
+            static_cast<unsigned int>(t.height()),
+            static_cast<unsigned int>(t.width()),
+            dtype == ml::train::TensorDim::DataType::QS4CX_WH);
         }
       }
     };
