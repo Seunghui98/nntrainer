@@ -442,6 +442,73 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_rowwise_gemv) {
 }
 
 /**
+ * @brief The lm_head's two paths agree
+ *
+ * A tied model stores one canonical Q4_0 weight so the embedding lookup can
+ * address a token's row, which leaves the lm_head on the per-row vec_dot at
+ * 2.9 GB/s against 22 for a repacked FC (doc 46 sections 44 and 45).
+ * TieWordEmbedding fixes that by keeping a blocked twin and calling the same
+ * gemm_q4_0 the fully_connected layers use.
+ *
+ * This is that substitution, on the shape of the real lm_head's inner
+ * dimension: repack the canonical rows with nrow = vocabulary and k =
+ * hidden, then check gemm_q4_0 against gemv_q4_0_rowwise_range on the same
+ * bytes. Nothing downstream would catch a disagreement -- the layer has no
+ * fallback to compare against at runtime, and wrong logits read as
+ * plausible-but-wrong text, not as a failure.
+ */
+TEST(nntrainer_cpu_backend_standalone, q4_0_blocked_lmhead_matches_rowwise) {
+  nntrainer::init_backend();
+
+  // vocab % 4 and hidden % 32, which is what the layer checks before it
+  // builds the twin; hidden is the model's real 2048.
+  const unsigned int vocab = 512;
+  const unsigned int hidden = 2048;
+  std::vector<float> weight = generate_random_vector<float>(vocab * hidden);
+  std::vector<float> activation = generate_random_vector<float>(hidden);
+
+  const size_t weight_size =
+    static_cast<size_t>(vocab) * hidden / QK4_0 * sizeof(block_q4_0_testonly);
+  std::vector<char> canonical(weight_size);
+  nntrainer::quantize_q4_0(weight.data(), canonical.data(), vocab, hidden,
+                           nullptr);
+
+  // The row-wise path, as the layer ran it before.
+  std::vector<char> q8_activation(nntrainer::q4_0_gemv_activation_size(hidden));
+  nntrainer::quantize_q4_0_gemv_activation(hidden, activation.data(),
+                                           q8_activation.data());
+  std::vector<float> want(vocab, 0.0f);
+  nntrainer::gemv_q4_0_rowwise_range(0, vocab, hidden, q8_activation.data(),
+                                     canonical.data(), want.data());
+
+  // The blocked path. Same argument order the layer uses: nrow is the
+  // vocabulary, k is the hidden size, and nothing is transposed because the
+  // tied weight is already [vocab, hidden].
+  std::vector<char> blocked(weight_size);
+  nntrainer::repack_q4_0(blocked.data(), canonical.data(), weight_size, vocab,
+                         hidden);
+  std::vector<float> got(vocab, 0.0f);
+  nntrainer::gemm_q4_0<float>(1, vocab, hidden, activation.data(), hidden,
+                              blocked.data(), vocab, got.data(), vocab);
+
+  // Both quantize the activation to Q8_0 and reduce in int32, so they differ
+  // only in the order the per-block f32 scales accumulate.
+  size_t bad = 0;
+  for (unsigned int v = 0; v < vocab; ++v) {
+    const float tol = 1.0e-3f * std::max(1.0f, std::fabs(want[v]));
+    if (std::fabs(got[v] - want[v]) > tol) {
+      if (bad < 4)
+        ADD_FAILURE() << "logit " << v << ": blocked " << got[v]
+                      << " vs rowwise " << want[v];
+      ++bad;
+    }
+  }
+  EXPECT_EQ(bad, 0u) << bad << " of " << vocab << " logits disagree -- the "
+                     << "repack argument order or the gemm leading "
+                     << "dimensions are wrong";
+}
+
+/**
  * @brief Test quantize -> repack -> unpack -> dequantize pipeline.
  *
  * Verifies that unpack_q4_0 correctly reverses the repack_q4_0 operation

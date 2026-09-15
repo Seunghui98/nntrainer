@@ -298,6 +298,54 @@ void TieWordEmbedding::incremental_forwarding_embedding(
   }
 }
 
+/**
+ * @brief Builds the blocked twin of the tied weight, or leaves it empty.
+ *
+ * repack_q4_0 reads exactly what the tied weight already is -- nrow rows of
+ * k canonical Q4_0 values -- so nrow is the vocabulary and k the hidden
+ * size, and there is no transpose. It refuses a shape it cannot interleave
+ * (nrow % 4, k % 8), and block counts differ per ISA, so the size is taken
+ * from the weight rather than computed: a block_q4_0x4 holds four
+ * block_q4_0 and the total is unchanged.
+ *
+ * Every failure here leaves lmhead_blocked_ empty and the caller on the
+ * row-wise path, which is slow but right. This runs once per process.
+ */
+void TieWordEmbedding::buildLmheadBlocked(const nntrainer::Tensor &weight,
+                                          unsigned int vocab_size,
+                                          unsigned int hidden_size) {
+  // The interleave's own preconditions (nntr_repack_q4_0_to_q4_0_4_bl
+  // returns -1 rather than throwing, and the ggml wrapper drops that).
+  if (vocab_size % 4 != 0 || hidden_size % 8 != 0 || hidden_size % 32 != 0) {
+    ml_logw("lm_head %ux%u cannot be interleaved; staying on the per-row "
+            "Q4_0 path",
+            vocab_size, hidden_size);
+    return;
+  }
+
+  const size_t bytes = weight.bytes();
+  void *src =
+    const_cast<void *>(static_cast<const void *>(weight.getData<uint8_t>()));
+  if (src == nullptr || bytes == 0)
+    return;
+
+  try {
+    lmhead_blocked_.resize(bytes);
+  } catch (const std::bad_alloc &) {
+    // 75 MB for this model. Worth reporting, not worth failing a load over.
+    ml_logw("lm_head: no room for a %zu byte blocked weight; staying on the "
+            "per-row Q4_0 path",
+            bytes);
+    lmhead_blocked_.clear();
+    return;
+  }
+
+  nntrainer::repack_q4_0(lmhead_blocked_.data(), src, bytes, vocab_size,
+                         hidden_size);
+  ml_logd("lm_head: blocked %ux%u Q4_0 weight, %zu bytes", vocab_size,
+          hidden_size, bytes);
+}
+
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
@@ -369,25 +417,43 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
           : input_step.clone(nntrainer::TensorDim::DataType::FP32);
       const float *input_data = input_fp32.getData<float>();
       float *logits = hidden_step.getData<float>();
-      std::vector<char> quantized_activation(
-        nntrainer::q4_0_gemv_activation_size(hidden_size));
-      nntrainer::quantize_q4_0_gemv_activation(hidden_size, input_data,
-                                               quantized_activation.data());
 
-      auto &tm = nntrainer::ThreadManager::Global();
-      constexpr size_t chunks_per_thread = 4;
-      const size_t num_chunks = std::max<size_t>(
-        1, std::min(static_cast<size_t>(vocab_size),
-                    static_cast<size_t>(tm.getComputeThreadCount()) *
-                      chunks_per_thread));
+      // The blocked twin, built once. See lmhead_blocked_'s comment for why
+      // a tied weight arrives unrepacked and what that costs.
+      if (!lmhead_blocked_tried_) {
+        lmhead_blocked_tried_ = true;
+        buildLmheadBlocked(weight, vocab_size, hidden_size);
+      }
 
-      tm.parallel_for(0, num_chunks, [&](size_t chunk) {
-        const size_t row_begin = chunk * vocab_size / num_chunks;
-        const size_t row_end = (chunk + 1) * vocab_size / num_chunks;
-        nntrainer::gemv_q4_0_rowwise_range(row_begin, row_end, hidden_size,
-                                           quantized_activation.data(),
-                                           weight_data, logits);
-      });
+      if (!lmhead_blocked_.empty()) {
+        // Same call the fully_connected layers make (float_tensor.cpp's
+        // Q4_0 branch): A is 1 x K, B is the blocked N x K weight, C is
+        // 1 x N. The tied weight is already [vocab, hidden], which is the
+        // [N, K] this wants, so nothing is transposed anywhere.
+        nntrainer::gemm_q4_0<float>(1, vocab_size, hidden_size, input_data,
+                                    hidden_size, lmhead_blocked_.data(),
+                                    vocab_size, logits, vocab_size);
+      } else {
+        std::vector<char> quantized_activation(
+          nntrainer::q4_0_gemv_activation_size(hidden_size));
+        nntrainer::quantize_q4_0_gemv_activation(hidden_size, input_data,
+                                                 quantized_activation.data());
+
+        auto &tm = nntrainer::ThreadManager::Global();
+        constexpr size_t chunks_per_thread = 4;
+        const size_t num_chunks = std::max<size_t>(
+          1, std::min(static_cast<size_t>(vocab_size),
+                      static_cast<size_t>(tm.getComputeThreadCount()) *
+                        chunks_per_thread));
+
+        tm.parallel_for(0, num_chunks, [&](size_t chunk) {
+          const size_t row_begin = chunk * vocab_size / num_chunks;
+          const size_t row_end = (chunk + 1) * vocab_size / num_chunks;
+          nntrainer::gemv_q4_0_rowwise_range(row_begin, row_end, hidden_size,
+                                             quantized_activation.data(),
+                                             weight_data, logits);
+        });
+      }
     } else {
       input_step.dot(weight, hidden_step, false, true);
     }

@@ -2817,3 +2817,54 @@ repack된 FC @ 4     :  7.1 MB / 320 us  = 22  GB/s
 `NNTR_NUM_THREADS=8`은 순손해라 채택하지 않는다. FC 과분할(작은 M에서 청크 수를
 작업량에 맞춰 줄이기)은 **별개 건으로 남긴다** — 지금 기본값 4는 두 병폐의 우연한
 타협점이지 최적점이 아니다.
+
+## 46. lm_head repack 구현 (2026-09-15) — 호스트 통과, 기기 미측정
+
+§45.3대로 스레드는 건드리지 않고 레이아웃만 고쳤다.
+
+### 46.1 전치는 필요 없었다
+
+§44.3에서 "묶인 가중치는 `[vocab, hidden]`인데 FC는 `[hidden, vocab]`을 기대하니
+전치가 함정"이라고 썼는데, 코드를 읽으니 **아니다.**
+
+- `nntr_repack_q4_0_to_q4_0_4_bl(dst, ib, src, size, nrow, k)`는 **정규 Q4_0 행
+  `nrow`개, 각 `k`개**를 읽는다 — 묶인 가중치가 이미 그 모양이다.
+- `gemm_q4_0(M, N, K, A, lda, B, ldb, C, ldc)`의 B는 "offline-quantized
+  **transposed** weight" = `[N, K]`. 역시 그 모양이다.
+
+그래서 `nrow = vocab`, `k = hidden`으로 그냥 넣으면 된다. 유일한 위험이라 적었던
+것이 없어졌다 — **읽기 전에 설계를 쓰면 없는 함정을 발명한다.**
+
+### 46.2 변경
+
+| 파일 | 변경 |
+|---|---|
+| `tie_word_embedding.h` | `lmhead_blocked_` (`std::vector<char>`), `lmhead_blocked_tried_`, `buildLmheadBlocked()` |
+| `tie_word_embedding.cpp` | Q4_0 분기가 첫 호출에 twin을 만들고 `gemm_q4_0`을 탄다. 비면 기존 행 단위 경로 그대로 |
+
+정규 사본은 **그대로 둔다** — 임베딩 룩업이 쓴다. twin은 같은 크기다
+(`block_q4_0x4`가 `block_q4_0` 4개). 이 모델에서 +75 MB.
+
+폴백을 남기는 경우: Q4_0이 아닌 dtype, `vocab % 4` 또는 `hidden % 32`가 안 맞는
+모양(`nntr_repack_q4_0_to_q4_0_4_bl`이 던지지 않고 -1을 돌려주는데 ggml 래퍼가 그걸
+버린다), `bad_alloc`. 셋 다 느리지만 **맞는** 경로로 간다.
+
+### 46.3 검사
+
+`q4_0_blocked_lmhead_matches_rowwise` (호스트 gtest). vocab 512 × hidden 2048에서
+`gemv_q4_0_rowwise_range`와 `repack_q4_0` + `gemm_q4_0`이 같은 로짓을 내는지 본다.
+
+**이 검사가 실제로 잡는지 확인했다** — repack의 `nrow`/`k`를 바꿔 넣고 돌려서
+실패하는 것을 봤다(`FAILED`), 되돌리고 다시 통과. 런타임에는 비교할 상대가 없고
+틀린 로짓은 실패가 아니라 **그럴듯한 오답 텍스트**로 나오므로, 이 검사 말고는
+잡을 곳이 없다.
+
+호스트: 전체 빌드 통과, `unittest_nntrainer_cpu_backend` 60/60 통과.
+
+### 46.4 기대와 미확인
+
+13.17 s -> **~1.75 s** (75.5 MB를 22 GB/s로), decode 10.1 -> 약 **13 TPS**.
+재양자화 불필요, `.bin` 형식 그대로, 스레드 설정 그대로.
+
+**기기 미측정.** 특히 22 GB/s는 `layer0_conv_in_proj`에서 유도한 값이고 7 MB짜리
+가중치의 속도다 — 75 MB에서 같은 속도가 나온다는 보장은 없다.
