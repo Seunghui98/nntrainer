@@ -1887,23 +1887,16 @@ private:
     return total;
   }
 
-  bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
-    static constexpr size_t kGrain = size_t(64) << 20;
-    static constexpr size_t kMin = size_t(256) << 20;
-
-    size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
-    size = std::min(std::max(size, kMin), kArenaChunkMax);
-    if (size < bytes) {
-      arena_fail_ = "a weight is larger than a whole chunk";
-      return false; // not this model
-    }
-    // Four calls can refuse a chunk and they mean four different things:
-    // rpcmem_alloc is the host's ION heap, fastrpc_mmap is the DSP's address
-    // space, arena_attach is the DSP's own arena table. The first run to hit
-    // the wall could not tell them apart and cost a device round guessing,
-    // so each one now says which it was.
-    arena_fail_.clear();
-
+  /**
+   * @brief Attaches one arena chunk of exactly @a size bytes.
+   *
+   * @return true on success. On failure arena_fail_ says which of the four
+   *         calls refused and with what, because they mean four unrelated
+   *         things: rpcmem_alloc is the host's ION heap, fastrpc_mmap is the
+   *         DSP's address space, arena_attach is the DSP's own arena table.
+   */
+  bool tryChunk(remote_handle64 session, size_t size) {
+    const unsigned long long rss_before = rssKb();
     // Uncached, because the DSP maps this once and the host keeps writing
     // into it afterwards -- with an uncached CPU mapping those writes reach
     // DDR with no flush to remember. The host never reads it back, so the
@@ -1911,7 +1904,6 @@ private:
     // BEFORE attaching and used a cached buffer, so this ordering is the
     // one thing section 34 rests on that the probe did not show; the
     // ArenaUncachedWriteAfterMap test is what answers it.
-    const unsigned long long rss_before = rssKb();
     auto buf = std::make_unique<HtpRpcBuffer>(size, HTP_RPC_FLAGS_UNCACHED);
     if (!buf->isIon()) {
       arena_fail_ = "rpcmem_alloc(" + std::to_string(size >> 20) +
@@ -1934,7 +1926,8 @@ private:
       api.mmap(CDSP_DOMAIN_ID, fd, buf->data(), 0, size, FASTRPC_MAP_FD);
     if (merr != 0) {
       arena_fail_ =
-        "fastrpc_mmap failed: err=" + std::to_string(merr) +
+        "fastrpc_mmap(" + std::to_string(size >> 20) +
+        " MiB) failed: err=" + std::to_string(merr) +
         " -- the host buffer exists, so this is the DSP side (its address "
         "space or the driver's mapping table), not host memory";
       return false;
@@ -1947,10 +1940,10 @@ private:
       // Hex as well as decimal: AEEStdErr offsets every code by 0x80000400
       // under __hexagon__, so 0x8000040d is the one that reads as a plain
       // AEE_EBADSTATE and a decimal print hides that.
-      char err[64];
-      std::snprintf(err, sizeof(err), "%d (0x%08x)", aerr,
-                    static_cast<unsigned>(aerr));
-      arena_fail_ = "nntr_hvx_arena_attach failed: err=" + std::string(err) +
+      char err[80];
+      std::snprintf(err, sizeof(err), "%zu MiB) failed: err=%d (0x%08x)",
+                    size >> 20, aerr, static_cast<unsigned>(aerr));
+      arena_fail_ = "nntr_hvx_arena_attach(" + std::string(err) +
                     " -- mapped, but the DSP refused it; NNTR_HVX_MAX_ARENAS "
                     "or HAP_mmap_get";
       if (api.munmap != nullptr)
@@ -1965,6 +1958,49 @@ private:
                   arenaBytes() >> 20, rss_before >> 10, rssKb() >> 10);
     }
     return true;
+  }
+
+  /**
+   * @brief Adds a chunk, halving the request until one is accepted.
+   *
+   * The DSP refused a fourth 1 GiB mapping after three were accepted (doc 46
+   * section 39), so this ceiling is measured in whole GiB and the last GiB
+   * before it is left on the floor. Halving turns a ceiling that happens to
+   * fall between two chunk sizes into one the arena can fill up to, and the
+   * size the run settles on is itself the measurement -- there is no other
+   * way to learn where the DSP's address space actually ends.
+   *
+   * chunk_cap_ remembers what was refused, so a size known not to fit is not
+   * asked for again on the next weight. A failure to map is not free: the
+   * host buffer is allocated and released each time.
+   */
+  bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
+    static constexpr size_t kGrain = size_t(64) << 20;
+    /** Below this a chunk holds too few weights to be worth an arena slot,
+     *  and the DSP's table is not unbounded. */
+    static constexpr size_t kFloor = size_t(64) << 20;
+
+    size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
+    size = std::min(std::max(size, kGrain), chunk_cap_);
+    if (size < bytes) {
+      arena_fail_ = "a weight is larger than a whole chunk";
+      return false; // not this model
+    }
+
+    while (true) {
+      arena_fail_.clear();
+      if (tryChunk(session, size))
+        return true;
+      const size_t half = size / 2;
+      if (half < kFloor || half < bytes)
+        return false; // arena_fail_ holds the last refusal, which is the one
+      if (HtpProfile::global().level() != 0) {
+        std::printf("[HTP] arena: %zu MiB refused, retrying at %zu MiB (%s)\n",
+                    size >> 20, half >> 20, arena_fail_.c_str());
+      }
+      size = half;
+      chunk_cap_ = size;
+    }
   }
 
   /** @brief Registers a weight whose bytes are already in the arena.
@@ -2043,6 +2079,8 @@ private:
   ArenaState arena_state_ = ARENA_UNTRIED;
   /** Why the last newChunk refused, in words, for the throw that follows. */
   std::string arena_fail_;
+  /** Largest chunk still worth asking for; only ever shrinks. */
+  size_t chunk_cap_ = kArenaChunkMax;
 
   // Deliberately never fastrpc_munmap'd: the DSP's close() puts every arena
   // back, and the kernel reclaims the ION buffers at process exit. The
