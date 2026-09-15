@@ -2127,6 +2127,32 @@ byte(r,c) = (c/8)*128 + r*4 + (c%4)        nibble = (c/4)%2
 **A1-a는 탈락.** ARM 변환이 **157 MB/s**다. 3.9 GB면 실행마다 **25초**. 로드 경로에
 못 넣는다 — 오프라인이어야 하는 이유가 측정으로 확인됐다.
 
+### 35.3b 확정 (2026-09-15, 기기) — 오프라인 패커가 DSP bake와 바이트 단위로 같다
+
+```
+closed_form_bad_bytes    = 0 of 3670016   ← 2048x3584, whPackReference vs weight_bake_export
+dsp_closed_form_bad_slots= 0 of 1024
+dsp_nonsquare_tiles_bad  = 0 of 8         ← 64x128, 타일 순서까지
+closed_form_bad_slots    = 0 of 1024      ← 라이브러리 = 전치, whSlot(c,r)
+host_pack_mbps           = 423.7          ← 3.9 GB에 9초, 양자화 1회
+```
+
+**최종 레이아웃** (`whSlot` / `whPackReference`):
+
+```
+slot(r,c) = (r/8)*256 + c*8 + (r%4)*2 + ((r/4)%2)
+byte(r,c) = (r/8)*128 + c*4 + (r%4)        nibble = (r/4)%2
+타일 순서 = kt * (N/32) + nt
+```
+
+한 바이트가 **같은 열에서 4칸 떨어진 두 행**을 담는다 — 바이트당 k 값 2개. 축약 연산이
+원하는 모양이다.
+
+**두 라운드를 태운 실수**: 표를 검증 대상(DSP micro)이 아니라 라이브러리(sdkl_cpu)에서
+뽑았다. 32×32 **정사각**은 인자 순서(`(n_col,n_inner)` vs `(rows,cols)`)와 전치를
+똑같이 가려준다. 대칭인 shape로 비대칭 가정을 검증할 수 없다 — 같은 교훈을 두 가지
+다른 방식으로 배웠다.
+
 ### 35.4 표가 나온 뒤
 
 **닫힌 형태를 먼저 찾는다.** HMX 타일 레이아웃은 규칙적인 게 보통이고, 다섯 줄짜리
