@@ -247,3 +247,18 @@ NNTR_HTP_PROFILE=2 <run>
   안 움직였고 `first ... 0 us`로 알아챘다.
 - `--profile` 빌드는 prefill을 83% 왜곡한다(문서 46 §43.4). TPS는 일반 빌드에서.
 - 1회 실행이다. DSP ±4 ms 변동 위에서 0.2 ms 차이는 의미가 없다.
+
+## 10. 다음 라운드 (코드 완료·기기 미측정) — G + A
+
+| 커밋 | 변경 | 프로파일에서 읽을 것 | 기대 |
+|---|---|---|---|
+| `772a321` **G** | `hvx_quant_pack_u8_ah_mapped`의 6 MB memset을 패딩 블록만(MoE는 0 B)으로 | prefill `quant` | 1646 → ≈1200 |
+| **A** | gate/up 타일을 **짝**으로 발행하고(`moe_push_gate_up_chunks`, 청크도 짝으로), 에필로그가 dequant 두 벡터에 바로 `hvx_swiglu_det_sf`를 적용해 h=silu(g)·u만 쓴다 (`hvx_dequant_swiglu_acc_tiles_to_f32`). gate/up f32는 VTCM에 존재하지 않는다. 별도 SwiGLU 패스 삭제 | prefill `swiglu` → **0**, `dequant` 1363 → ≈1600 (융합분 흡수), **합 −1.8 ms**. decode `swiglu` 24 → 0 | 콜 22.6 → ≈20.3 |
+
+비트동일: 이전 경로는 dequant가 g·u를 VTCM에 f32로 쓰고 SwiGLU가 읽었다. 융합은 같은
+intrinsic 순서로 g·u를 레지스터에 만들고 같은 `hvx_swiglu_det_sf`를 부른다 — 바이트가
+같아야 하고, `swiglu_det.h`의 ARM 패리티 게이트도 그대로다. 기기 확인은 (1) 생성 텍스트가
+이전 실행과 **동일**한지, (2) `unittest_hvx_mm_u8i4`의 MoE 테스트(`run_u8i4_layer_on_device.sh`).
+
+주의: `DMA_FIRST_KB`가 이제 짝 청크(gate 16타일 + up 16타일 = 1 MB)를 세므로 `first N KB`의
+N은 그대로 1024다.
