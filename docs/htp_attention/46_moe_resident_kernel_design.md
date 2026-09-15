@@ -3349,3 +3349,20 @@ WH 모델 실행(§49.5 Run A)의 `M>1` 행도 같이 — P2가 아레나 경로
 4. **P3a → P3** — 융합 후 파이프라인. 여기서 1.4–1.6×
 5. P4 / P5 — 측정이 정하는 대로
 6. decode(§49)는 P4의 HVX GEMV를 재사용한다 — prefill 꼬리 블록에서 먼저 검증된 커널로
+
+### 50.6 P1·P6 구현 (2026-09-15, 코드 완료·기기 미측정)
+
+- **P1** (`fdf2c97`): 커널의 malloc 13개를 세션 스크래치(`hexkl_moe_scratch`,
+  `nntr_hvx_session.moe_scratch`) 한 블록에서 128 B 정렬로 잘라 쓴다. 커지기만 하고
+  `close()`에서 푼다. 호스트 체크 통과. **기대: prefill `alloc` 3064 → ≈0.**
+  `nntr_hvx_mm_u8i4.c`가 바뀌었으니 **skel 재빌드.**
+- **P6**: `Transformer::repack_weight()`의 레이어 순회가 `lfm2_moe` 레이어의
+  QS4CX/QS4CX_WH 가중치를 `ComputeOps::register_qs4cx_weight`로 로드 시점에 등록한다.
+  같은 포인터 키(`handle_cache_`)라 첫 forward의 등록은 캐시 히트. 이 호스트엔 meson이
+  없어 `transformer.cpp`는 **컴파일 안 됨** (`htp_compute_ops.cpp`는 타입체크 통과).
+  **기대: `[HTP-PROFILE] registration total`은 그대로 ≈747, prefill 벽시계 2449 →
+  ≈1700 ms (≈260 TPS), `--profile` 노드 표의 HTP 레이어 값에서 등록이 빠진다.**
+  피크 메모리도 같이 읽는다 (§42.4 G가 −1.4 GB를 기대했다).
+
+이 둘 + §49.2의 순서 교정이 들어간 실행에서 읽을 것: `M>1` 행의 `alloc`, `gather`,
+`drain`, `first ... GB/s`; `M==1` 행의 같은 네 값; prefill/decode TPS; 텍스트 앞 3줄.
