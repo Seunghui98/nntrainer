@@ -2223,6 +2223,11 @@ nntr_quantize_stream <fixture> --config <old.json> --moe_dtype QS4CX_WH # MoE dt
 old.json의 `QS4CX`로 조용히 양자화됐다 — 실패가 아니라 "된 것처럼 보이는" 종류다.
 이제 플래그가 이긴다. (`--config`로 나머지를 물려받고 하나만 바꾸는 게 원래 쓰임새다.)
 
+**`moe_htp_layers`는 비워야 한다.** CPU 폴백이 없으므로 HTP로 안 가는 MoE 레이어는
+`FloatTensor::dot()`에서 던진다. QS4CX 모델에서 하던 "레이어 하나만 켜서 확인"이
+QS4CX_WH에서는 성립하지 않는다 — `moe_engine: "htp"` 와 **모든** MoE 레이어(빈 문자열)가
+같이 필요하다. `float_tensor.cpp`가 그 경우 둘 중 뭘 바꾸라고 이름을 대며 던진다.
+
 **CPU 폴백이 없다.** 배치가 가속기 것이라 CPU 커널이 이 텐서를 받으면 실패가 아니라
 틀린 답을 낸다. `QS4CX_WH`로 양자화한 모델은 MoE expert를 HTP에서 돌리거나 못 돌린다.
 
