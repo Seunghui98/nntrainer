@@ -2943,3 +2943,124 @@ layer5_ffn_down:forward(lfm2_moe)   <- CPU
 - HTP가 더 느리면 -> §47.2의 (a)(b)가 회귀의 원인이고, 고치기 전까지 decode는
   CPU에 두는 것이 맞다
 - 비슷하거나 빠르면 -> §42의 10.1 TPS는 온도였고, 식은 기기에서 다시 재야 한다
+
+## 48. 세션 인계 (2026-09-15) — §36~§47 한 장 요약
+
+### 48.1 시작과 끝
+
+| | 세션 시작 | 세션 끝 |
+|---|---|---|
+| 등록 | 1170/1408에서 `arena is full` 사망 | **1408/1408**, 0.09 ms/weight, 전부 ION |
+| decode | `FloatTensor::dot` throw로 불가 | **512 토큰 생성, 텍스트 정상** |
+| prefill | 도달 못 함 | 186.8 TPS |
+| decode TPS | — | 10.1 TPS |
+| 피크 메모리 | — | 5.33 GB (RSS 4.44 GB) |
+
+**LFM2.5-8B-A1B가 QS4CX_WH로 기기에서 처음 끝까지 돌았다.**
+
+### 48.2 넘은 벽 다섯 개 — 각각 틀린 진단을 하나씩 거쳤다
+
+| # | 증상 | **내 첫 진단 (틀림)** | 진짜 원인 | 수정 |
+|---|---|---|---|---|
+| 1 | 1170에서 OOM | 피크 7.8 GB라 ION이 거부 | **틀림.** 호스트 RAM 무관 | `madvise(MADV_DONTNEED)` — RSS 4325→759 MB 확인. 원인은 아니었지만 유지 |
+| 2 | 1170에서 여전히 OOM | (계측 부족) | `fastrpc_mmap` 실패 = **DSP 주소공간** | 네 호출을 이름으로 구분 + RSS 보고 |
+| 3 | 3.00 GiB 천장 | 3 GiB가 하드 한계 | **틀림. 3.75 GiB다.** 1 GiB 청크가 정렬로 768 MiB를 버림 | `kArenaChunkMax` 1 GiB → **256 MiB** |
+| 4 | ARM 22.6 s 미지 | 비-MoE 가중치가 고루 대역폭에 묶임 | **틀림. lm_head 한 노드가 13.2 s (24.4%)** | `--profile` 빌드로 측정 |
+| 5 | lm_head 25.7 ms | **FP32라 537 MB를 읽음** | **틀림. Q4_0인데 repack이 안 됨** (2.9 GB/s vs 22) | blocked twin (+75 MB) |
+
+**다섯 번 중 네 번 첫 진단이 틀렸다.** 매번 고친 것은 추론이 아니라 계측이었다.
+§33.2, §41, §44에 같은 문장이 세 번 적혀 있다 — **숫자에 맞는 가설이 곧 원인이 아니다.**
+
+### 48.3 커밋 (`claude/lfm2-moe-ffn-hexkl-2ivn5v`)
+
+```
+d2054cf  모델 2벌 저장 제거: 페이지 반납 + 캐시 삭제 (§37)
+da6a090  아레나 벽의 이름과 RSS 계측 (§38)
+d2418d9  거부되면 청크를 반으로 줄여 재시도 (§39)
+e7bb330  DSP heap이 별도 예산인지 프로브 (§40)
+2b867dc  아레나 청크 256 MiB — 천장은 정렬 낭비였다 (§41)
+49a8014  doc: 첫 end-to-end, 시간 분해 (§42)
+88e62e3  doc: ARM 쪽은 한 레이어 (§43, 원인 진단은 틀림)
+fda0e12  doc: §43 정정 — repack 없는 Q4_0 (§44)
+c44877d  doc: 원인이 둘, 스레드는 답이 아니다 (§45)
+6cfcc30  lm_head에 blocked Q4_0 twin (§46)   ← 유일한 미측정 코드 변경
+e7ae879  doc: decode FFN이 CPU보다 느린 이유와 공정 비교법 (§47)
+```
+
+코드가 바뀐 것: `d2054cf`, `da6a090`, `d2418d9`, `e7bb330`, `2b867dc`, `6cfcc30`.
+나머지는 문서뿐.
+
+### 48.4 기기로 확인된 것 / 안 된 것
+
+**확인됨 (기기):**
+- 1408/1408 등록, 0.09 ms/weight, convert 0.0 ms, 전부 ION
+- 아레나 256 MiB × 15 = 3840 MiB, `fastrpc_mmap` 천장 3840 MiB (깨끗한 프로세스)
+- DSP heap은 매핑과 **같은** 4 GB 주소공간 (3840 매핑 + 182 heap + PD ≈ 4096)
+- `madvise` 동작 (RSS 청크당 −1020 MB)
+- decode M==1 라우팅 동작, **출력 텍스트 정상**
+- 레이어 TYPE별 시간 분해 (§42.1, §43)
+- `NNTR_NUM_THREADS=8`은 **순손해** (lm_head −5.6 s, FC +6.7 s)
+
+**확인 안 됨:**
+- **§46 lm_head twin** — 호스트 gtest만 통과. 기기 미측정. 기대 13.17 s → ~1.75 s
+- 22 GB/s 목표치는 7 MB짜리 `conv_in_proj`에서 유도 — 75 MB에서 같으리란 보장 없음
+- §47의 CPU vs HTP FFN 비교 — **아직 안 돌림**
+
+### 48.5 열린 질문 — 순위
+
+| | 항목 | 기대 | 상태 |
+|---|---|---:|---|
+| **1** | **§47 통제 실험**: 한 실행에서 CPU/HTP FFN 나란히 | 방향 결정 | 레시피 준비됨 |
+| **2** | §46 lm_head twin 기기 확인 | ~11 s | 코드 완료 |
+| 3 | `gather` 고정비 769 us/call (§47.2a) | ~8.7 s | 미착수 |
+| 4 | 64행 패드 누산기 5.8 MB/layer/token (§47.2b) | ? | 미착수 |
+| 5 | decode DMA 10.8 → 30 GB/s (§42.4 D) | ~5 s | 미착수 |
+| 6 | prebound invoke — 콜마다 핸들 64개 재전송 (§42.4 C) | ~2.3 s | 미착수 |
+| 7 | FC 과분할 (작은 M에서 청크 수 줄이기) (§45.1) | ? | 미착수 |
+| 8 | 등록을 로드 시점으로 | 피크 −1.4 GB, **속도 아님** | 미착수 |
+
+**1번이 3·4·5·6의 의미를 정한다.** HTP decode가 CPU보다 느린 게 확인되면
+그것들은 "최적화"가 아니라 **회귀 복구**이고, 그전까지는 decode를 CPU에 두는 편이
+맞을 수 있다.
+
+### 48.6 측정 명령 모음
+
+```bash
+# 일반 실행 (TPS를 읽을 때 — --profile 빌드는 prefill을 83% 왜곡한다, §43.4)
+cd Applications/CausalLM && ./build_android.sh --htp
+NNTR_HTP_PROFILE=0 <run>          # NNTR_NUM_THREADS는 주지 않는다 (§45)
+
+# HTP 단계 분해
+NNTR_HTP_PROFILE=2 <run>
+
+# 레이어 TYPE별 분해 (ARM 쪽)
+./build_android.sh --htp --profile
+
+# 기기 유닛테스트
+HEXKL_SDK_VER=6.4.0.2 ./test/htp/build.sh
+(cd test/jni && $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. \
+   NDK_APPLICATION_MK=./Application.mk APP_BUILD_SCRIPT=./Android.mk \
+   NNTRAINER_ROOT=$PWD/../.. HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT unittest_hvx_mm_u8i4)
+adb push test/htp/build/libnntr_hvx_skel.so \
+         test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4 \
+         /data/local/tmp/htp_u8i4_layer_test/
+adb shell "cd /data/local/tmp/htp_u8i4_layer_test && LD_LIBRARY_PATH=. \
+  ADSP_LIBRARY_PATH=. ./unittest_hvx_mm_u8i4 --gtest_filter='*<Name>*'"
+
+# 호스트
+meson build -Denable-transformer=true && ninja -C build
+./build/test/unittest/unittest_nntrainer_cpu_backend
+bash test/htp/host/run_host_checks.sh
+bash tools/htp_syntax_check.sh        # Hexagon SDK 없이 htp_compute_ops.cpp 타입체크
+```
+
+### 48.7 함정 모음 — 다시 밟지 말 것
+
+- **skel을 안 다시 빌드하면** `AEE_EBADPARM (0x8000040E)`. `build_android.sh`는
+  skel을 안 만든다. `test/htp/build.sh`만 만든다. 세 번 당했다
+- **`--profile` 빌드로 TPS를 읽지 말 것** — prefill 83% 왜곡 (§43.4)
+- **QS4CX_WH는 CPU 폴백이 없다.** `moe_htp_layers`는 비워야 하고, 레이아웃이
+  틀리면 실패가 아니라 **그럴듯한 오답 텍스트**로 나온다
+- **정사각 프로브는 전치와 인자 순서를 동시에 가린다** (§35.3b, 기기 2라운드 낭비)
+- **`avg`가 아니라 `min`** — 프로파일 avg는 등록이 들어간 첫 prefill 콜에 오염된다
+- **호스트 스텁은 HMX도 HVX도 진짜 DMA도 모델링하지 않는다** (§33.3)
