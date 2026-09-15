@@ -26,6 +26,8 @@
 #include <layer_devel.h>
 #include <layer_impl.h>
 
+#include <vector>
+
 namespace causallm {
 
 /**
@@ -160,6 +162,29 @@ private:
   std::array<unsigned int, 4> weight_idx; /**< indices of the weights */
   bool skip_prefill = false;
 
+  /**
+   * @brief The lm_head's weight in the blocked Q4_0 layout, built once.
+   *
+   * A tied model stores ONE weight and quantize_stream writes it with
+   * repack=false, because an embedding lookup has to address a token's row
+   * directly. That leaves the lm_head -- the same bytes read as a matmul --
+   * on the per-row vec_dot path while every other Q4_0 matmul in the model
+   * gets the 4-row interleaved one. Measured in the same run: 2.9 GB/s here
+   * against 22 GB/s for a repacked FC, 24.4% of a 54 s generation (doc 46
+   * sections 44 and 45).
+   *
+   * So keep both. The canonical weight stays exactly as it is for the
+   * lookup, and this is its blocked twin, the same size (a block_q4_0x4 is
+   * four block_q4_0), built on the first lm_head call because that is the
+   * first point at which the weight is certainly loaded.
+   *
+   * Empty means no repack: a dtype other than Q4_0, or a shape the
+   * interleave does not divide. Both fall back to the row-wise path, which
+   * stays correct.
+   */
+  std::vector<char> lmhead_blocked_;
+  bool lmhead_blocked_tried_ = false;
+
   WIN_EXPORT void finalize_embedding(nntrainer::InitLayerContext &context);
   WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context);
   WIN_EXPORT void
@@ -170,6 +195,9 @@ private:
   incremental_forwarding_lmhead(nntrainer::RunLayerContext &context,
                                 unsigned int from, unsigned int to,
                                 bool training);
+  WIN_EXPORT void buildLmheadBlocked(const nntrainer::Tensor &weight,
+                                     unsigned int vocab_size,
+                                     unsigned int hidden_size);
 };
 } // namespace causallm
 
