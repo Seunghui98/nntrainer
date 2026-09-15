@@ -2655,7 +2655,7 @@ M에 비례하지 않는 무언가(전체 expert 순회, M 패드 전체 clear, 
 
 A가 먼저다 — 가장 큰 블록인데 유일하게 숫자가 없다. §33.3과 CLAUDE.md의 같은 교훈.
 
-## 43. ARM 쪽의 정체 — lm_head가 FP32였다 (2026-09-15, 기기)
+## 43. ARM 쪽의 정체 — lm_head (2026-09-15, 기기) — **43.1의 원인 진단은 §44에서 정정됨**
 
 `--profile` 빌드가 §42.4 A를 답했다. 그리고 §42.4의 내 예측("비-MoE 가중치가 ARM
 대역폭에 골고루 묶여 있다")은 **틀렸다.** 한 레이어가 거의 전부다.
@@ -2717,3 +2717,56 @@ H가 가장 크고 가장 싸다. §42.4에서 A를 먼저 하자고 한 이유�
 prefill 4360 ms (101.8 TPS) vs 평소 2377 ms (186.8 TPS). 노드마다 타이머가 붙어서
 **prefill이 83% 느려진다.** decode는 10.32 vs 10.09로 거의 안 움직인다(노드당 호출이
 짧아 상대 비용이 작다). **TPS 숫자는 `--profile` 없는 빌드에서만 읽는다.**
+
+## 44. §43.1 정정 — FP32가 아니라 repack이 안 된 Q4_0이다 (2026-09-15)
+
+§43.1은 "lm_head가 FP32라 537 MB를 읽는다"고 썼다. **틀렸다.** 사용자의
+`nntr_config.json`에 `"lmhead_dtype": "Q4_0"`, `"embedding_dtype": "Q4_0"`이
+분명히 있다. 산술이 맞아떨어진 것(537 MB / 25.7 ms = 20.9 GB/s)은 우연이었다 —
+**§33.2와 §41에서 두 번 겪은 그 실패를 세 번째로 반복했다: 숫자에 맞는 가설이
+곧 원인이 아니다.**
+
+### 44.1 진짜 원인 — 같은 실행 안에 8.4배 차이가 있다
+
+Q4_0 75.5 MB를 25.7 ms에 읽으면 **2.9 GB/s**다. ARM DDR이 아니다. 같은 실행,
+같은 dtype의 다른 노드와 비교하면:
+
+| 노드 | 바이트 | 시간 | 속도 |
+|---|---:|---:|---:|
+| `layer0_conv_in_proj` (repack된 FC) | ~7.1 MB | 320 us | **24.5 GB/s** |
+| `output_of_causallm` (lm_head) | 75.5 MB | 25664 us | **2.9 GB/s** |
+
+**8.4배.** 커널 dtype이 아니라 **레이아웃**이다.
+
+### 44.2 왜 repack이 안 되어 있나 — 묶인 가중치라서다
+
+- `quantize_stream.cpp:1091` — `tied_embeddings`면 `output_of_causallm`을 **안 쓴다**.
+  lm_head는 `embedding0` 하나를 공유한다.
+- `writeEmbedding`은 `quantizedSize(dtype, rows, columns, /*repack=*/false, ...)`
+  (`:555`)로 **정규(canonical) Q4_0 행**을 쓴다. 임베딩 룩업이 토큰 하나를 바로
+  주소로 잡아야 하므로 그래야 한다. `writeFc`는 `repack=true`로 x4/x8 블록 레이아웃을 쓴다.
+- 그래서 `tie_word_embedding.cpp`의 Q4_0 분기는 **행마다**
+  `nntr_vec_dot_q4_0_q8_0`를 도는 `__ggml_gemv_q4_0_rowwise_range`를 쓴다
+  (`ggml_interface.cpp`). 다른 FC가 전부 타는 블록 GEMV가 아니다.
+- `Transformer::repack_weight()`는 **QS4CX만** 판다(`transformer.cpp:378`). Q4_0
+  repack은 양자화 시점에 끝나 있고, 이 가중치는 일부러 안 된 채로 왔다.
+
+즉 **의도된 트레이드오프의 대가가 안 보이는 곳에 있었다**: 룩업을 위해 정규 레이아웃을
+지켰고, 그 대가를 lm_head가 토큰마다 21 ms씩 낸다.
+
+### 44.3 고치는 법 — repack된 사본 하나
+
+정규 사본은 룩업용으로 그대로 두고, lm_head용 **repack된 복제본**을 로드 시 한 번
+만든다. `repack_q4_0(dst, src, size, N, K)`가 이미 있다.
+
+- 메모리 **+75 MB** (피크 5.3 GB 대비 1.4%)
+- 25.7 ms -> ~3-4 ms, **~11 s = 전체의 20%**, decode 10.3 -> 약 13 TPS
+- **.bin 형식 변경 없음, 재양자화 없음.** 한 레이어 안에서 끝난다
+- 주의: 묶인 가중치는 `[vocab, hidden]`인데 FC는 `[hidden, vocab]`을 기대한다.
+  repack할 때 전치가 필요하고, **그게 이 작업의 유일한 함정이다**
+
+### 44.4 남은 숙제
+
+`fully_connected` 4.8 s(8.8%)는 아직 안 봤다. 노드별로는
+`layer*_conv_in_proj`가 ~290 us로 제일 크고 24.5 GB/s가 나오므로 이미 대역폭이다.
+줄이려면 HTP로 옮겨야 하는데 DSP 주소공간이 3840/4096 MiB 찼다(§41).
