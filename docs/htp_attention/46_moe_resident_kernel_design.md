@@ -2206,6 +2206,23 @@ colsum 4N뿐이고, 그래서 `QS4CX_WH_Tensor`는 `size()`에 4N을 더하는 �
 - 아레나가 없는 기기 — WH 가중치는 등록할 다른 길이 없다(힙 경로는 입력을 bake하는데, 이미 배치된 바이트를 또 재배치한다). `get_or_register_wh`가 던진다.
 - `quantize.cpp`(비스트리밍)는 `QS4CX_WH`를 모른다 → "Unsupported data type"으로 실패한다. 8B 모델은 어차피 스트리밍 쪽이다.
 
+**호스트에서 끝까지 한 번 돌려봤다** (445 KB짜리 LFM2-MoE 픽스처, layer 2개 중 MoE 1개,
+expert 2개):
+
+```bash
+nntr_quantize_stream <fixture> --config <old.json>                      # MoE dtype: QS4CX
+nntr_quantize_stream <fixture> --config <old.json> --moe_dtype QS4CX_WH # MoE dtype: QS4CX_WH
+```
+
+둘 다 완료되고 출력 `.bin`이 **정확히 1536바이트** 차이난다 = expert 2개 ×
+(gate_up 4·128 + down 4·64) = colsum 배열의 합. 출력 `nntr_config.json`의
+`moe_layer_dtype`도 각각 맞게 찍힌다.
+
+같은 실행에서 **`--config`가 명시적 플래그를 덮어쓰고 있던 것**을 찾아 고쳤다. 인자를
+먼저 파싱한 뒤 config가 무조건 덮어쓰는 구조라 `--config old.json --moe_dtype QS4CX_WH`가
+old.json의 `QS4CX`로 조용히 양자화됐다 — 실패가 아니라 "된 것처럼 보이는" 종류다.
+이제 플래그가 이긴다. (`--config`로 나머지를 물려받고 하나만 바꾸는 게 원래 쓰임새다.)
+
 **CPU 폴백이 없다.** 배치가 가속기 것이라 CPU 커널이 이 텐서를 받으면 실패가 아니라
 틀린 답을 낸다. `QS4CX_WH`로 양자화한 모델은 MoE expert를 HTP에서 돌리거나 못 돌린다.
 
