@@ -1918,7 +1918,7 @@ get_or_register_qs4cx(ptr, scale, K, N)
 | `htp_weight_cache.h` | 파일 형식 그대로. `load()` 삭제 → `listFiles()`, `readHeader(FILE*, hdr&)`, `readPayload(FILE*, hdr, uint8_t *wh, vec&, vec&, vec&)` (payload를 **호출자 포인터** = 아레나로 직접 읽는다). `store()`, `path()`, `whBytes()`, `htpWeightHash()` 유지 |
 | `run_u8i4_layer_on_device.sh`, `bisect_moe_v1.sh` | `generate_stub.sh` 매번 실행 (IDL 변경 → 두 스텁) |
 
-### 34.4 남은 것 — `htp_compute_ops.cpp` 포팅 (이 파일 하나가 빌드를 막고 있다)
+### 34.4 `htp_compute_ops.cpp` 포팅 — **구현 완료·미측정**
 
 지울 것: `registerFromCache`, `exportToCache`, 그리고 `get_or_register_qs4cx` 안의
 `wc.load`/`register_u8i4_baked` 호출.
@@ -1956,12 +1956,28 @@ enum { ARENA_UNTRIED, ARENA_ON, ARENA_OFF } arena_state_ = ARENA_UNTRIED;
 `HAP_mmap_put`을 하고, ION은 프로세스 종료 시 커널이 회수한다. `HtpBackend`와 ops
 싱글톤의 소멸 순서가 정해져 있지 않아 close 뒤에 munmap을 부르면 죽은 세션을 만진다.
 
-### 34.5 테스트 — 반드시 둘 (`test/unittest/unittest_hvx_mm_u8i4.cpp`)
+### 34.5 테스트 — **구현 완료·미측정** (`test/unittest/unittest_hvx_mm_u8i4.cpp`)
 
-1. **`ArenaMapAndDma`에 케이스 추가** (`path=arena_uncached`): `rpcmem_alloc(25, 0 /*UNCACHED*/, …)` → `fastrpc_mmap(FASTRPC_MAP_FD)` → **그 다음** 패턴 쓰기 → `arena_probe` → `checksum_ok=yes`. §34.2가 실제로 하는 순서 그대로다. 이게 `no`면 §34 전체가 틀린 것이고, 그 땐 "cached + attach 전 쓰기"(증명됨)로 후퇴: 초기 로드는 그대로 가능하고 miss는 파일만 쓰고 힙에 남긴다.
-2. **`MoeLayerFromArenaMatchesHeap`**: expert 4개의 gate_up/down을 bake로 등록(힙) → 각각 `bake_export` → uncached 아레나 하나에 4096 정렬로 memcpy → `fastrpc_mmap` → `arena_attach` → `register_arena` ×8 → 같은 입력으로 `moe_layer`를 힙 핸들/아레나 핸들로 각각 실행 → **`memcmp == 0`** (같은 바이트, 같은 커널이므로 1 ULP도 허용 안 함). 이어서 핸들이 살아있는 채 `arena_detach` → `AEE_EBADSTATE` 확인 → release ×8 → `arena_detach` → `AEE_SUCCESS`.
+1. **`ArenaUncachedWriteAfterMap`** (`path=arena_uncached`): `rpcmem_alloc(25, 0 /*UNCACHED*/, …)` → `fastrpc_mmap(FASTRPC_MAP_FD)` → **그 다음** 패턴 쓰기 → `arena_probe` → `checksum_ok=yes`. §34.2가 실제로 하는 순서 그대로다. 이게 `no`면 §34 전체가 틀린 것이고, 그 땐 "cached + attach 전 쓰기"(증명됨)로 후퇴: 초기 로드는 그대로 가능하고 miss는 파일만 쓰고 힙에 남긴다.
+2. **`MoeLayerFromArenaMatchesHeap`** (`path=arena_moe`): expert 4개의 gate_up/down을 bake로 등록(힙) → 각각 `bake_export` → uncached 아레나 하나에 4096 정렬로 memcpy → `fastrpc_mmap` → `arena_attach` → `register_arena` ×8 → 같은 입력으로 `moe_layer`를 힙 핸들/아레나 핸들로 각각 실행 → **`memcmp == 0`** (같은 바이트, 같은 커널이므로 1 ULP도 허용 안 함). 이어서 핸들이 살아있는 채 `arena_detach` → `AEE_EBADSTATE` 확인 → release ×8 → `arena_detach` → `AEE_SUCCESS`.
 
 두 번째가 §33이 요구하는 "runnable check"다. 첫 번째는 gate다.
+
+#### 구현된 것 (커밋 `[htp] Register MoE weights out of a DSP-mapped arena`)
+
+| | |
+|---|---|
+| `ensureArena(session)` | 첫 호출 1회. `wc.enabled() && to_fd && fastrpc_mmap` 아니면 `ARENA_OFF`(힙 경로 그대로). 헤더를 **먼저 전부 읽어** 총량을 구한 뒤 청크를 잡는다 — 그래야 256 MB씩 늘리다 8개 한도에 걸리지 않는다. 로드 GB/s를 찍는다 |
+| `place(bytes, want)` | 4 KB 정렬 bump. `want`는 "뒤에 더 올 양"이라 청크가 한 weight가 아니라 실행 전체에 맞게 잡힌다 |
+| `newChunk` | `clamp(align_up(want, 64 MiB), 256 MiB, 1 GiB)` uncached ION → `fastrpc_mmap(CDSP_DOMAIN_ID, fd, …, FASTRPC_MAP_FD)` → `arena_attach`. 어디서 실패하든 `false` → 호출자는 힙 |
+| `registerFromArena` | `e.K/e.N`이 요청 shape와 다르면 거부 — 다른 모델의 파일이 섞인 디렉터리를 막는다. `t_begin=0`이면 프로파일에 안 센다(miss에서 `register_locked`가 이미 셌으므로 중복 방지) |
+| `moveToArena` | `bake_export`를 **아레나로 직접** → 그 바이트에서 파일 기록 → `register_arena`. 실패하면 `kNoHandle`, 호출자는 힙 핸들 유지 |
+| `get_or_register_qs4cx` | hit → `register_arena` 1회. miss → convert·bake·export·store·place·register_arena·**힙 release**, `handle_cache_` 덮어쓰기 |
+
+`fastrpc_munmap`은 호스트에서 안 부른다 (`ponytail` 주석): DSP `close()`가 `HAP_mmap_put`
+하고 ION은 프로세스 종료 시 커널이 회수한다. 싱글톤 소멸 순서가 고정이 아니라 닫힌 세션을
+만질 수 있다. 모델을 load/unload 반복하는 프로세스면 모델당 아레나 하나가 샌다 — 고치려면
+`HtpBackend`가 세션을 닫기 **전에** 도는 shutdown 훅이 필요하다.
 
 ### 34.6 미증명·위험 — 각각 어떻게 답하는지
 
