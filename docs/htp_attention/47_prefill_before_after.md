@@ -262,3 +262,32 @@ intrinsic 순서로 g·u를 레지스터에 만들고 같은 `hvx_swiglu_det_sf`
 
 주의: `DMA_FIRST_KB`가 이제 짝 청크(gate 16타일 + up 16타일 = 1 MB)를 세므로 `first N KB`의
 N은 그대로 1024다.
+
+### 10.1 결과 (2026-09-15, 기기) — 361 TPS, 그리고 A는 빗나갔다
+
+```
+prefill 1230 ms 360.98 TPS (직전 1257 / 353.2)    decode 15.22 TPS (14.87)    텍스트 동일
+M>1  host 22158 dsp 19792 transport 2366
+     [quant 1443 gather 111 requant 1161 swiglu 0 dequant 3263 acc 2959
+      drain 215+49 push 47 scatter 1034 alloc 121 stage 370 mm 8925]
+     first 1024 KB took 48 us = 21.6 GB/s
+M==1 host 1959 dsp 1405 transport 554  [drain 165+7 mm 781 dequant 87 swiglu 0]
+     first 1024 KB took 58 us = 18.2 GB/s
+```
+
+| | 예측 | 실측 | |
+|---|---:|---:|---|
+| A: swiglu 2055 → 0, dequant 1363 → ≈1600 | 합 −1.8 ms | **dequant 3263**, 합 −0.15 | **틀렸다.** SwiGLU는 VTCM 왕복이 아니라 HVX 계산(벡터당 ≈30 op, 계산 바닥 0.8 ms)이었고, 문서 46 §23.2에 그렇게 적혀 있었다. 메커니즘을 재지 않고 예측했다 |
+| G: quant 1646 → ≈1200 | −0.4 | 1443, −0.2 | 반 |
+| alloc 323 → ≈0 | | 121 | = 첫 콜 한 번의 성장 2.7 ms / 22. 나머지 콜은 0 |
+| 버스 투표: first KB 30+ | | 21.6 / 18.2 (+10~20%) | **판정 불가** — 짝 청크(8 KB 행)와 같은 실행. 두 변경을 한 숫자에 겹쳤다 |
+
+콜 22.6 → 22.2. A가 남긴 것은 시간이 아니라 **자리**다: `up` 917 KB가 비었고 SwiGLU가 풀
+에필로그 안으로 들어갔다 — 둘 다 B(HVX를 HMX 뒤로)의 선행 조건이고, 빗나간 1.8 ms는
+거기서 dequant 3.26 전체와 함께 숨는다.
+
+지금 콜 = HMX 11.9 + HVX 직렬 6.9 (dequant 3.26, quant 1.44, requant 1.16, scatter 1.03)
++ transport 2.37 + 기타 1.0. 남은 레버는 B, 그 다음 transport.
+
+DMA 속도 판별은 다음부터 **분리한다**: 아레나 프로브에 청크 모양의 2D 전송을 추가해
+고립 상태에서 선형 vs 스트라이드를 재고, 투표는 별도 skel로 켜고 끈다.
