@@ -3064,3 +3064,196 @@ bash tools/htp_syntax_check.sh        # Hexagon SDK 없이 htp_compute_ops.cpp �
 - **정사각 프로브는 전치와 인자 순서를 동시에 가린다** (§35.3b, 기기 2라운드 낭비)
 - **`avg`가 아니라 `min`** — 프로파일 avg는 등록이 들어간 첫 prefill 콜에 오염된다
 - **호스트 스텁은 HMX도 HVX도 진짜 DMA도 모델링하지 않는다** (§33.3)
+
+## 49. decode FFN이 CPU에 지는 이유 — 두 용의자의 정체, 산술적 천장, 레시피의 결함 (2026-09-15, 코드 완료·기기 미측정)
+
+§47은 용의자 둘을 세웠다. 커널을 읽으니 **둘 다 이름이 틀렸고**, §47.3의 통제 실험은
+**그대로 돌리면 decode에서 CPU 대 CPU를 잰다.** 순서대로.
+
+### 49.1 (b) "64행 패드의 누산기 5.8 MB" — 트래픽이 아니라 **HMX 발행 고정비**다
+
+prefill(§29, 43 블록)에서 블록당 비용을 뽑아 decode(4 블록)에 곱하면 그대로 나온다:
+
+| 단계 | prefill §29 | /블록 | /타일 | ×4 블록 = decode 예측 | decode 실측 §47.1 |
+|---|---:|---:|---:|---:|---:|
+| `mm` | 8082 us / 43 | 188 us | 10752 타일 → **17.5 ns** | **752** | **752.0** |
+| `acc` | 2784 us / 43 | 64.7 us | 176 acc_read → **368 ns** | **259** | **260.5** |
+
+소수점까지 맞는다. `mm`과 `acc`는 **M이 아니라 블록 수에 비례**하고, 블록당 비용은
+64행 타일을 채우든 1행만 쓰든 같다. §47.2(b)가 짚은 5.8 MB는 acc_read가 *옮기는*
+바이트지 시간의 원인이 아니다 — 시간은 타일 발행 횟수다.
+
+**결론 하나: decode 한 콜의 HMX 바닥 = 4 × (188 + 65) ≈ 1010 us.** 가중치 21.5 MB를
+1.01 ms에 소비하는 셈이니 **HMX의 유효 가중치 소비율은 21 GB/s** — Gate 0c의 DMA
+38.8 GB/s보다 낮다. 즉 decode에서는 **DMA가 아니라 HMX가 병목**이고, DMA가 공짜여도
+DSP는 1.0 ms 아래로 못 간다. 64행 타일을 쓰는 한 그렇다.
+
+### 49.2 (a) "gather 769 us 고정비" — gather가 아니라 **in-order DMA 대기**다
+
+`hexkl_dma_ring.c:128`: *"Descriptors are dmlinked, so they retire in push order and
+waiting on one implies every earlier one."* 그리고 커널(수정 전)의 expert당 순서:
+
+```
+push down[e]  (2 청크, 1.75 MB)                      ← §29.3 R2b에서 추가
+push act 블록 (128 KB) ; wait(act)   ← GATHER로 계측  ← §29.3 R2b에서 추가
+wait gu_idx[0..3]                    ← DRAIN으로 계측  ← 이미 끝나 있어 ≈0
+```
+
+act의 wait가 그 앞에 줄 선 **gate_up[e] 잔여 + down[e] 전부**를 같이 기다린다. R2b가
+블록 복사를 DMA로 바꾸면서(§29.3 #1) 그 대기가 DRAIN에서 GATHER로 **자리만 옮긴 것**이다.
+§26.4가 "청크 스트리밍으로 gate_up drain 3513 → 1039"라고 기록한 이득도 block 0에서는
+이 대기가 도로 삼킨다 — block 0의 첫 HMX는 5.25 MB가 전부 도착해야 시작한다.
+
+prefill로 교차검증: gather 2930 us / 32 expert = **92 us/expert** ≈ down 1.75 MB +
+gate_up 잔여의 전송 시간. decode 795 us / 4 = 199 us/expert — expert 0은 5.25 MB 전부,
+나머지는 gate_up이 앞 expert의 down 단계(≈120 us) 뒤에 부분적으로 숨는다. 이 모델로
+역산하면 **부하 중 DMA 속도 ≈ 18–20 GB/s**이지 38.8이 아니다. 단, 이건 오염된 버킷에서
+역산한 값이고 **직접 읽은 수치는 아직 없다** — 아래 수정이 그걸 읽게 만든다.
+
+**수정 (커밋):** act 블록 DMA를 그 expert의 가중치 push **앞**으로 옮겼다.
+- expert 0의 block 0: 루프 전, gate_up[0] push 앞
+- expert e+1의 block 0: expert e의 마지막 block에서 gate_up mm이 끝난 직후,
+  gate_up[e+1] prefetch **앞** (그 시점에 act 슬롯은 죽어 있다 — down은 mid를 읽는다)
+- down[e] push는 block 0의 act wait **뒤**로
+- block 1 이상은 제자리에서 push (앞에 줄 선 건 자기 expert의 down뿐이고 그건 이미 끝났다)
+
+push 횟수는 그대로다(링 예산 불변). 호스트 체크 `run_host_checks.sh` ALL CHECKS PASS —
+단 스텁 DMA는 즉시 완료라 **순서의 효과는 기기에서만 보인다** (§33.3).
+
+**기기에서 반증 가능한 예측 (decode, M==1 행):**
+
+| 항목 | 지금 | 수정 후 예측 | 아니면 |
+|---|---:|---:|---|
+| `gather` | 795 | **≤ 20** (4 × 128 KB) | 진단이 틀렸다. 되돌린다 |
+| `drain` + `drain_dn` | ≈0 (확인 요망) | 노출된 가중치 대기 전부. 60–250 | |
+| `first N KB took` | 0 또는 무의미 | **1 MB 청크의 유휴 전송** = decode 중 실제 DMA 속도 | 이 숫자가 §49.3의 갈림길이다 |
+| `dsp` | 2046 | **1.3–1.5 ms** (HMX 1010 + 노출 DMA 60–250 + 나머지 ≈230) | |
+| host | 2604 | 1.85–2.05 ms | |
+
+decode MoE 22층: 57 → **41–45 ms/token.** 그래도 CPU 1.29 ms/layer(28 ms)에 진다.
+§46 lm_head twin(−22 ms)과 합치면 99 → ~64 ms/token ≈ **15.6 TPS**.
+
+### 49.3 산술 — 지금 커널로는 decode에서 CPU를 못 이긴다, DMA가 무한대여도
+
+```
+CPU  (§47.1)  : 1.29 ms/layer, 22 MB @ ~17 GB/s, transport 0
+HTP  지금      : transport 558 + DSP ≥ max(DMA, HMX 1010 + 기타 230) ≥ 1.8 ms
+HTP  DMA=∞    : 558 + 1240 = 1.8 ms  → 1.4× 느림
+```
+
+이기려면 `transport + DSP < 1.29 ms`. 둘 다 움직여야 한다:
+
+| 레버 | 지금 | 목표 | 어떻게 | 확신 |
+|---|---:|---:|---|---|
+| **L1. M ≤ 64 전용 HVX GEMV** | HMX 1010 | DMA 뒤로 숨김 (≈0 노출) | VTCM의 WH 타일을 HVX `vrmpy`로 직접 읽는다. 활성화 1행, 64행 패드 없음, acc_read 없음. HVX 로드 128 B/cycle → 21.5 MB ≈ 150 us/스레드, 워커 4개면 DMA보다 빠르다. u8×i4 int32 합은 순서 무관 **정확**하므로 HMX 경로와 int32 누산기 **비트 동일** 검사가 가능하다 | ●●○ |
+| **L2. transport 558** | 558 | ≤ 300 (doc 34 기준 326) | 먼저 정체를 잰다(§49.5 Run B). 호출당 wake/DVFS면 세션 상주 워커 + `dspqueue`(SDK 제공, ARM↔DSP 저지연 큐) 로, 마샬링이면 prebound(§42.4 C). qos_mode=2 폴링과 DSP TURBO 투표(`hvx_add_f32.c:143`)는 **이미 들어가 있다** | ●○○ |
+| L3. DDR 대역폭 투표 | ? | DMA_FIRST ↑ | `HAP_power.h`의 bus-bw 투표(`HAP_power_set_mips_bw` 계열 — 필드명은 헤더 확인). decode는 ARM이 놀아 DDR DVFS가 내려갔을 가능성 — DMA_FIRST가 prefill(27–33)보다 낮게 나오면 이게 후보 | 측정 후 |
+
+**갈림길 — §49.5 Run A/B의 두 숫자가 정한다:**
+
+```
+DMA_FIRST(decode) ≥ 30 GB/s 이고 transport(PROFILE=3) ≤ 300
+   → L1으로 DSP ≈ 0.6 ms, host ≈ 0.9 ms < 1.29  →  HTP가 1.4× 이긴다. L1을 만든다.
+DMA_FIRST(decode) ≈ 20 GB/s (CPU의 17과 같은 DDR 상태)
+   → L1 해도 DSP ≈ 1.1 ms, host ≥ 1.4 ms > 1.29  →  이 op 하나로는 못 이긴다.
+     남는 길: L3로 DDR을 올리거나, transport를 레이어 전체에 상각(문서 45)하거나,
+     decode만 CPU — 단 QS4CX_WH엔 CPU 커널이 없다(§35.5). WH 타일을 읽는 CPU dot
+     (Q4_0 dot + 타일 순열)을 만들면 된다. 커널 하나 값이다.
+```
+
+### 49.4 §47.3 레시피의 결함 — QS4CX는 decode에서 HTP로 **안 간다**
+
+`lfm2_moe_layer.cpp` `tryMoeLayerOnAccelerator`:
+
+```cpp
+if (total_tokens <= 1 && !weights_wh) return false;   // §37.3의 게이트
+```
+
+비-WH QS4CX는 M==1이면 무조건 `computeGroupedDecodeExperts`(CPU)로 떨어진다.
+§47.3대로 `moe_htp_layers "2,4,6,8,10,12"`를 주면 **prefill만** 나란히 돌고 decode는
+22층 전부 CPU다 — `layer2_ffn_down` min과 `layer3_ffn_down` min이 같게 나오고, 그걸
+"HTP ≈ CPU"로 읽었을 것이다.
+
+**수정 (커밋):** `NNTR_MOE_HTP_DECODE=1`이면 그 게이트를 넘긴다. 측정용 스위치이고
+기본값은 그대로다. 주의 하나: QS4CX 레이어의 HTP 가중치는 DSP heap(cached, 27–33 GB/s,
+§32.11)이지 ION 아레나(38.8, §34.5)가 아니라 **HTP 쪽이 ~15% 불리한 비교**다. 방향을
+정하는 데는 충분하다.
+
+### 49.5 실행 순서와 명령 — 이 순서대로, 각 실행에서 읽을 것
+
+**0. 빌드.** 커널이 바뀌었으니 **skel부터** (§48.7 첫 줄, 세 번 당한 그것):
+
+```bash
+HEXKL_SDK_VER=6.4.0.2 ./test/htp/build.sh
+adb push test/htp/build/libnntr_hvx_skel.so /data/local/tmp/nntrainer/causallm/
+cd Applications/CausalLM && ./build_android.sh --htp             # Run A, B용 (TPS 읽기 가능)
+./install_android.sh --model=<WH 모델>
+```
+
+**Run A — 예측 반증 (WH 모델, 프로덕션 경로).** §49.2 표를 확인한다.
+
+```bash
+NNTR_HTP_PROFILE=2 <run>     # NNTR_NUM_THREADS 주지 않는다 (§45)
+```
+읽을 것: `[HTP-PROFILE]` **`M==1` 행 전체**(gather / drain / drain_dn / mm / acc / dsp /
+transport), 그 밑의 `weight DMA: ... first N KB took ... GB/s` 줄, decode TPS, 생성 텍스트
+앞 3줄. `output_of_causallm`은 이 빌드에선 안 보인다 — Run C에서 본다.
+
+**Run B — transport의 정체 (같은 바이너리, 코드 0줄).**
+
+```bash
+NNTR_HTP_PROFILE=3 <run>     # 레이어 콜을 같은 입력으로 5회, 최소값 보고 (§24.1)
+```
+Run A와 `M==1` 행의 `transport`와 `dsp`, `first ... GB/s`를 비교한다.
+- transport가 558 → ≤ 350으로 떨어지면: 호출 사이의 wake/클록 램프다 → L2는 상주 워커
+- 안 떨어지면: 마샬링/고정비다 → L2는 prebound + 인자 축소
+- `first ... GB/s`가 A보다 오르면: DDR/버스 DVFS다 → L3 후보
+
+**Run C — 통제 실험 (QS4CX 모델, `--profile` 빌드, TPS는 읽지 않는다 §43.4).**
+
+```bash
+# 1) 모델 — WH가 아니어야 CPU 폴백이 있다
+nntr_quantize_stream <fp32_dir> -o <qs4cx_dir> \
+  --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 --moe_dtype QS4CX --isa ARM
+
+# 2) <qs4cx_dir>/nntr_config.json 에 추가
+#    "moe_engine": "htp",
+#    "moe_htp_layers": "2,4,6,8,10,12"     ← 6개 = 1.0 GB, DSP heap 천장 1.89 GB 안 (§37.4)
+
+# 3) --profile 빌드 + 실행
+cd Applications/CausalLM && ./build_android.sh --htp --profile
+./install_android.sh --model=<qs4cx 모델>
+NNTR_MOE_HTP_DECODE=1 NNTR_HTP_PROFILE=2 <run>
+```
+읽을 것 — **`min`**, 노드별 표에서:
+```
+layer2_ffn_down   ← HTP   layer3_ffn_down   ← CPU
+layer4_ffn_down   ← HTP   layer5_ffn_down   ← CPU      (같은 shape, 같은 온도, 같은 토큰)
+output_of_causallm         ← §46 twin: 25664 → ~3400 us 기대. 텍스트 정상 여부와 함께
+```
+같은 실행의 `[HTP-PROFILE] M==1` 행도 함께 — `calls`가 6 × 512 근처여야 스위치가 먹은
+것이다. **`NNTR_MOE_HTP_DECODE` 없이 한 번 더 돌리면** `M==1` 행이 사라지고 짝수 레이어
+min이 홀수와 같아진다 — 그게 §49.4의 결함을 기기에서 확인하는 대조군이다.
+
+decode 판정: `layer2_ffn_down.min` (HTP) 대 `layer3_ffn_down.min` (CPU). §49.3의 예측은
+**HTP 1.85–2.05 ms 대 CPU ≈ 1.3 ms.** 비율이 이보다 나쁘면 §49.2 수정이 안 먹은 것이고,
+좋으면 §47.1의 CPU 1.29 추정이 후했던 것이다 — 어느 쪽이든 Run A의 `M==1` 행으로 가른다.
+
+**돌려보낼 것:** Run A/B의 `[HTP-PROFILE]` 블록 전체, Run C의 노드별 표에서 위 5줄과
+TYPE 합계 표, 세 실행의 TPS 두 줄과 텍스트 앞 3줄.
+
+### 49.6 순위 — §48.5를 이 산술로 다시 매긴다
+
+| | 항목 | 기대 | 상태 |
+|---|---|---:|---|
+| **1** | **Run A/B/C** — §49.2 예측 반증 + DMA_FIRST(decode) + transport 정체 | 방향 결정 | 코드 완료 |
+| 2 | §46 lm_head twin 기기 확인 (Run C에 포함) | ~22 ms/token | 코드 완료 |
+| 3 | **L1 HVX GEMV (M ≤ 64)** — DMA_FIRST ≥ 30이면 | DSP 1.3 → ~0.6 ms | 미착수, 커널 1개 |
+| 4 | **L2 transport** — Run B 결과대로 | 558 → ≤ 300 | 미착수 |
+| 5 | L3 DDR 투표 — DMA_FIRST(decode) ≪ prefill이면 | ? | 미착수 |
+| — | ~~§47.2(a) gather 고정비~~ | §49.2로 흡수 | — |
+| — | ~~§47.2(b) acc가 M 존중 (§42.4 E)~~ | 불가 — acc_read는 타일 단위, 시간은 발행 횟수. L1이 답 | — |
+| — | ~~§42.4 D decode DMA 10.8 → 30~~ | 10.8은 KB/DSP시간이지 DMA 속도가 아니었다. DMA_FIRST로 대체 | — |
+
+**HMX는 M ≤ 64에서 구조적으로 21 GB/s짜리 소비자다.** decode를 HTP에서 이기는 유일한
+커널 쪽 답은 HMX를 안 쓰는 것(L1)이고, 그게 충분한지는 DMA_FIRST(decode) 한 숫자가 정한다.
