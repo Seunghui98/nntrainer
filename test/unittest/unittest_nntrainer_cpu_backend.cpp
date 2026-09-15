@@ -10,6 +10,7 @@
 
 #include "htp_act_quant.h"
 #include "htp_q4_0_convert.h"
+#include "htp_wh_layout.h"
 #include "int4_utils.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
@@ -559,6 +560,89 @@ TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_q4_0x4_accuracy) {
   // sign bug, not a tight accuracy contract.
   EXPECT_LT(max_abs_err, 0.5f);
   EXPECT_LT(mean_abs_err, 0.1f);
+}
+
+/**
+ * @brief The offline WH packer sees the same values the load path does
+ *
+ * quantize_stream's QS4CX_WH branch unpacks quant_qs4cx_f32's nibbles itself
+ * -- q + 8 stored unsigned, even k in the low half -- and sums them per
+ * output channel before calling whPack. htp_qs4cx_from_packed does the same
+ * unpacking at load time and is device-verified, so it is the reference: if
+ * the two disagree, a model quantized to QS4CX_WH holds different weights
+ * than the same model quantized to QS4CX, and nothing downstream would say
+ * so. whPack itself is checked against the DSP's own bake by
+ * unittest_hvx_mm_u8i4's WhPackReferenceMatchesDspBake.
+ */
+TEST(nntrainer_cpu_backend_standalone, wh_pack_unpacks_like_the_load_path) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 64, N = 96; // not square, both multiples of 32
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  const size_t nibble_bytes = static_cast<size_t>(N) * ((K + 1) / 2);
+  std::vector<uint8_t> qs4cx(nibble_bytes + N * sizeof(float));
+  float *scales = reinterpret_cast<float *>(qs4cx.data() + nibble_bytes);
+  nntrainer::quant_qs4cx_f32(N, K, weight.data(), qs4cx.data(), scales, true);
+
+  std::vector<int8_t> want_rm(static_cast<size_t>(K) * N);
+  std::vector<float> want_scale(N);
+  std::vector<int32_t> want_colsum(N);
+  nntrainer::htp_qs4cx_from_packed(qs4cx.data(), scales, K, N, want_rm.data(),
+                                   want_scale.data(), want_colsum.data());
+
+  // The quantizer's own unpack, character for character with what it writes.
+  std::vector<int8_t> rm(static_cast<size_t>(K) * N);
+  std::vector<int32_t> colsum(N, 0);
+  const size_t stride = (K + 1) / 2;
+  for (size_t n = 0; n < N; ++n) {
+    const uint8_t *row = qs4cx.data() + n * stride;
+    int32_t sum = 0;
+    for (size_t k = 0; k < K; ++k) {
+      const uint8_t byte = row[k >> 1];
+      const uint8_t nibble = (k & 1u) ? (byte >> 4) : (byte & 0x0Fu);
+      const int8_t q = static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
+      rm[k * N + n] = q;
+      sum += q;
+    }
+    colsum[n] = sum;
+  }
+  EXPECT_EQ(rm, want_rm);
+  EXPECT_EQ(colsum, want_colsum);
+
+  // A column sum is at most K values in [-8, 7], so f32 carries it exactly --
+  // which is what lets it travel in the file beside the scales.
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_EQ(static_cast<int32_t>(static_cast<float>(colsum[n])), colsum[n]);
+  }
+
+  // And the packing is reversible: every value lands where whSlot says, so
+  // reading it back gives the weight again.
+  std::vector<uint8_t> wh(nntrainer::whBytes(K, N));
+  nntrainer::whPack(rm.data(), K, N, wh.data());
+  EXPECT_EQ(wh.size(), nibble_bytes);
+
+  const unsigned int n_tiles = N / nntrainer::WH_TILE;
+  size_t bad = 0;
+  for (unsigned int kt = 0; kt < K / nntrainer::WH_TILE; ++kt) {
+    for (unsigned int nt = 0; nt < n_tiles; ++nt) {
+      const uint8_t *tile =
+        wh.data() +
+        (static_cast<size_t>(kt) * n_tiles + nt) * nntrainer::WH_TILE_BYTES;
+      for (unsigned int r = 0; r < nntrainer::WH_TILE; ++r) {
+        for (unsigned int c = 0; c < nntrainer::WH_TILE; ++c) {
+          const unsigned int sl = nntrainer::whSlot(r, c);
+          const uint8_t nib = (tile[sl / 2] >> (4 * (sl % 2))) & 0x0Fu;
+          const int8_t got =
+            static_cast<int8_t>(nib > 7 ? (int)nib - 16 : (int)nib);
+          if (got != rm[static_cast<size_t>(kt * nntrainer::WH_TILE + r) * N +
+                        nt * nntrainer::WH_TILE + c])
+            ++bad;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(bad, 0u) << "whPack and whSlot disagree about where values go";
 }
 
 /**

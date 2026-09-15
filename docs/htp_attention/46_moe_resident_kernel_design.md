@@ -2175,17 +2175,39 @@ W1이 정공법이고 모델 파일 하나로 끝나지만, colsum 배관이 ops
 **colsum은 파일에 있어야 한다.** WH 바이트에서 다시 계산할 수는 있지만(출력 채널별 int4
 합) weight당 3.5 MB 스캔이라 1408개면 20초다. 4N바이트를 쓰는 게 맞다.
 
-### 35.5 이러면 지워지는 것
+### 35.5 W1 구현 (2026-09-15) — 호스트 빌드 통과, 기기 미측정
 
-| | 이유 |
+**`.bin` 안의 새 dtype `QS4CX_WH`.** 파일 배치:
+
+```
+[WH 니블  K*N/2]  [scale  4N]  [colsum  4N]
+```
+
+니블 수는 QS4CX와 **정확히 같다**(32×32 타일이 어느 배치든 512바이트). 늘어난 건
+colsum 4N뿐이고, 그래서 `QS4CX_WH_Tensor`는 `size()`에 4N을 더하는 것 말고는
+`QS4CX_Tensor` 그대로다 — `getData`/`getScale`이 그대로 상속된다.
+
+| 파일 | 변경 |
 |---|---|
-| `HtpWeightCache` 전부 (해시·경로·store·listFiles) | 파일이 모델 옆에 있고 이름이 정해짐 |
-| `moveToArena`, `weight_bake_export`, DSP bake 경로 | 구울 게 없다 |
-| `htp_qs4cx_from_packed` 런타임 호출 | 변환기가 이미 했다 |
-| miss/hit 분기, `handle_cache_` 덮어쓰기 | 항상 hit |
-| `hexkl_weight_u8i4_check`의 VTCM 상한 | bake 스크래치용이었다 |
+| `api/ccapi/include/tensor_dim.h` | `DataType::QS4CX_WH` |
+| `nntrainer/tensor/tensor_dim.cpp`, `utils/base_properties.h` | 크기·이름 문자열 |
+| `nntrainer/tensor/qs4cx_tensor.h` | `QS4CX_WH_Tensor`. **생성자에서 직접 할당한다** — `QS4CX_Tensor::allocate()`가 `size()`를 부르는데 기반 생성자에서의 가상 호출은 기반 버전으로 가고, 그러면 N float만큼 조용히 작게 잡힌다 |
+| `nntrainer/tensor/tensor.cpp` | 디스패치 4곳 |
+| `nntrainer/tensor/htp_wh_layout.h` | `htp_backend/`에서 **옮겨왔다**. 그 디렉터리는 HTP를 켰을 때만 include 경로에 들어가는데, 양자화기는 HTP 없이 PC에서 돈다 |
+| `quantize_stream.cpp` | `QS4CX_WH` 파싱·크기·쓰기. `quant_qs4cx_f32`를 **그대로 거쳐서** 언팩 → `whPack` → 니블 기록, scale/colsum은 flush에서. 값과 scale이 지금 기기가 돌리는 것과 비트 단위로 같고 니블 자리만 바뀐다 |
+| `compute_ops.h/.cpp` | `gemm_qs4cx_moe_layer_fp32`에 `bool weights_wh`. colsum 포인터가 아니라 플래그인 이유는 colsum이 scale 바로 뒤에 있고 피호출자가 N을 이미 알기 때문 |
+| `lfm2_moe_layer.cpp` | expert weight dtype으로 플래그를 정한다. **전부 같아야** 한다 — 호출당 플래그가 하나라 섞이면 절반을 틀린 배치로 읽는다 |
+| `htp_compute_ops.cpp` | `get_or_register_wh()`: 변환 없음, bake 없음, 캐시 파일 없음. 아레나에 memcpy → `register_arena` |
 
-남는 것: `ensureArena`(파일 → 아레나) + `register_arena`. 첫 실행 변환 지연도 없다.
+**제약 두 가지를 명시적으로 거부한다**(조용히 틀리는 것보다 낫다):
+
+- 블록 전송 경로 — WH 타일은 입력 32개와 출력 32개에 걸치고 타일이 k-major로 나오므로 행 블록으로 쓰면 출력을 나중에 재정렬해야 한다. 이 dtype이 쓰이는 weight는 전부 버퍼 안에 들어간다(최대 29 MB / 64 MB). `ponytail`: 필요해지면 WH 이미지 전체(최대 3.5 MB)를 들고 블록마다 채운다.
+- embedding — 룩업이지 HMX matmul이 아니다.
+- 아레나가 없는 기기 — WH 가중치는 등록할 다른 길이 없다(힙 경로는 입력을 bake하는데, 이미 배치된 바이트를 또 재배치한다). `get_or_register_wh`가 던진다.
+- `quantize.cpp`(비스트리밍)는 `QS4CX_WH`를 모른다 → "Unsupported data type"으로 실패한다. 8B 모델은 어차피 스트리밍 쪽이다.
+
+**CPU 폴백이 없다.** 배치가 가속기 것이라 CPU 커널이 이 텐서를 받으면 실패가 아니라
+틀린 답을 낸다. `QS4CX_WH`로 양자화한 모델은 MoE expert를 HTP에서 돌리거나 못 돌린다.
 
 ### 35.6 위험
 

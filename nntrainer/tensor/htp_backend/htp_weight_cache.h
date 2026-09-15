@@ -48,6 +48,8 @@
 #include <string>
 #include <vector>
 
+#include <htp_wh_layout.h>
+
 namespace nntrainer {
 
 /** @brief FNV-1a over a byte range. Not a security hash -- it identifies
@@ -177,12 +179,10 @@ public:
     }
   }
 
-  /** @brief WH byte count for a shape: one 512-byte tile per (k,n) tile
-   *  pair, HEXKL_HMX_INT8_BLOCK_N_INNER by _N_COL, both 32. Written in tile
-   *  form rather than the K*N/2 it reduces to, because that is the form the
-   *  DSP checks it against and the two must not drift. */
+  /** @brief WH byte count for a shape. Forwards to htp_wh_layout.h so the
+   *  file format and the packer cannot drift apart. */
   static uint32_t whBytes(uint32_t K, uint32_t N) {
-    return (K / 32u) * (N / 32u) * 512u;
+    return static_cast<uint32_t>(nntrainer::whBytes(K, N));
   }
 
 private:

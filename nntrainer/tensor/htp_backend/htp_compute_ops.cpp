@@ -49,6 +49,7 @@
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
 #include <htp_weight_cache.h>
+#include <htp_wh_layout.h>
 #include <swiglu_det.h>
 
 #include <algorithm>
@@ -829,7 +830,7 @@ public:
                                  const std::vector<float> &row_weight,
                                  const float *act, float *out, unsigned int M,
                                  unsigned int K, unsigned int inter,
-                                 unsigned int N_out) override {
+                                 unsigned int N_out, bool weights_wh) override {
     const size_t n_experts = gate_up_data.size();
     if (n_experts == 0 || gate_up_scale.size() != n_experts ||
         down_data.size() != n_experts || down_scale.size() != n_experts ||
@@ -843,10 +844,17 @@ public:
       static_cast<remote_handle64>(HtpBackend::global().handle());
     std::vector<uint32_t> h_gu(n_experts), h_dn(n_experts);
     for (size_t e = 0; e < n_experts; ++e) {
-      h_gu[e] = get_or_register_qs4cx(gate_up_data[e], gate_up_scale[e],
-                                      session, K, 2 * inter);
-      h_dn[e] = get_or_register_qs4cx(down_data[e], down_scale[e], session,
-                                      inter, N_out);
+      if (weights_wh) {
+        h_gu[e] = get_or_register_wh(gate_up_data[e], gate_up_scale[e], session,
+                                     K, 2 * inter);
+        h_dn[e] = get_or_register_wh(down_data[e], down_scale[e], session,
+                                     inter, N_out);
+      } else {
+        h_gu[e] = get_or_register_qs4cx(gate_up_data[e], gate_up_scale[e],
+                                        session, K, 2 * inter);
+        h_dn[e] = get_or_register_qs4cx(down_data[e], down_scale[e], session,
+                                        inter, N_out);
+      }
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
                    out, M, K, inter, N_out);
@@ -1601,6 +1609,79 @@ private:
 
     return register_locked(matAdata, session, K, N, q_w4_i8, w_scale, colsum_w,
                            t_begin, convert_us);
+  }
+
+  /**
+   * @brief Registers a weight the offline quantizer already put in WH
+   *        layout, by copying it into the arena as-is.
+   *
+   * No conversion, no DSP bake, no cache file: the bytes on disk are the
+   * bytes the matmul reads (doc 46 section 35), and the DSP borrows them out
+   * of the arena rather than keeping a heap copy. This is the whole of what
+   * registration costs for a QS4CX_WH model.
+   *
+   * @param matAdata  whBytes(K, N) of WH nibbles
+   * @param matAscale N scales, with N column sums immediately after them --
+   *                  QS4CX_WH_Tensor's layout, which is why no separate
+   *                  pointer is passed
+   */
+  uint32_t get_or_register_wh(void *matAdata, const float *matAscale,
+                              remote_handle64 session, uint32_t K, uint32_t N) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = handle_cache_.find(matAdata);
+    if (it != handle_cache_.end())
+      return it->second;
+
+    const uint64_t t_begin = HtpProfile::nowUs();
+    // There is no other way to register these. The DSP-heap path bakes its
+    // input, which would rearrange bytes that are already arranged, so a
+    // model quantized to QS4CX_WH needs the arena and saying so plainly
+    // beats computing a wrong answer quietly.
+    if (!ensureArena(session)) {
+      throw std::runtime_error(
+        "QS4CX_WH weights need the DSP arena, which this device did not "
+        "provide (no rpcmem_to_fd or no fastrpc_mmap). Quantize the model as "
+        "QS4CX to use the conversion path instead.");
+    }
+
+    const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
+    uint32_t chunk = 0, off = 0;
+    if (!place(session, wh_len, wh_len, &chunk, &off)) {
+      throw std::runtime_error("HTP arena is full; cannot register a " +
+                               std::to_string(K) + "x" + std::to_string(N) +
+                               " weight");
+    }
+    std::memcpy(arena_chunks_[chunk].buf->data() + off, matAdata, wh_len);
+
+    ArenaEntry e;
+    e.chunk = chunk;
+    e.off = off;
+    e.K = K;
+    e.N = N;
+    e.w_scale.assign(matAscale, matAscale + N);
+    e.colsum_w.resize(N);
+    e.bias.assign(N, 0.0f); // FC weights carry no bias tensor
+    // The column sums are the N floats after the scales, written there by
+    // the quantizer. They are whole numbers small enough to be exact in
+    // f32 -- a sum of at most K values in [-8, 7] -- so this conversion is
+    // lossless, and the registry wants int32.
+    const float *colsum_f = matAscale + N;
+    for (uint32_t i = 0; i < N; ++i) {
+      e.colsum_w[i] = static_cast<int32_t>(colsum_f[i]);
+    }
+
+    const uint32_t handle = registerFromArena(session, e, K, N, t_begin);
+    if (handle == kNoHandle) {
+      throw std::runtime_error("weight_register_u8i4_arena rejected a " +
+                               std::to_string(K) + "x" + std::to_string(N) +
+                               " WH weight");
+    }
+    // Not put in arena_index_: that index exists to find a weight by its
+    // cache path, and these weights have none -- handle_cache_ already
+    // answers the only question asked about them, which is whether this
+    // pointer was registered before.
+    handle_cache_.emplace(matAdata, handle);
+    return handle;
   }
 
   uint32_t get_or_register_qs4cx(void *matAdata, const float *matAscale,

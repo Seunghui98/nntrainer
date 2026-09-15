@@ -285,6 +285,12 @@ public:
   // prefill layer's row_index is one entry per token per expert -- 1776 for
   // this model -- and copying that per layer is the kind of cost this call
   // exists to remove.
+  //
+  // weights_wh says the nibbles are already in the HMX weight-tile layout
+  // (htp_wh_layout.h) with a per-output-channel column sum after the scales,
+  // so the implementation registers them as they are instead of converting
+  // and baking. It is a flag rather than a colsum pointer because the sums
+  // sit immediately after the scales and the callee already knows N.
   virtual bool supports_gemm_qs4cx_moe_layer_fp32() const { return false; }
   virtual void gemm_qs4cx_moe_layer_fp32(
     const std::vector<void *> &gate_up_data,
@@ -294,7 +300,8 @@ public:
     const std::vector<unsigned int> &row_index,
     const std::vector<unsigned int> &row_count,
     const std::vector<float> &row_weight, const float *act, float *out,
-    unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out);
+    unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
+    bool weights_wh);
 
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
