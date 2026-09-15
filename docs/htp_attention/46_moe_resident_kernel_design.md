@@ -2868,3 +2868,78 @@ repack된 FC @ 4     :  7.1 MB / 320 us  = 22  GB/s
 
 **기기 미측정.** 특히 22 GB/s는 `layer0_conv_in_proj`에서 유도한 값이고 7 MB짜리
 가중치의 속도다 — 75 MB에서 같은 속도가 나온다는 보장은 없다.
+
+## 47. decode의 FFN이 CPU보다 느리다 (2026-09-15) — 분해와 통제 실험
+
+§42의 전체 TPS는 온도·모델·lm_head가 뒤섞여 비교가 안 된다. FFN만 떼어 본다.
+
+### 47.1 지금 아는 것 — decode 한 레이어 호출 (PROFILE=2)
+
+```
+host 2604.4 us   dsp 2046.2 (78.6%)   transport 558.2
+ [gather 795.0  mm(잔차) 752.0  acc 260.5  dequant 80.5  quant 59.6
+  requant 41.7  swiglu 23.7  alloc 9.6  scatter 6.8  stage 4.6 ...]
+weight DMA 21504 KB/call  (top-4 expert x 5.25 MB)
+```
+
+Gate 0c가 아레나 DMA를 **38.8 GB/s**(uncached)로 쟀다. 22.0 MB면 **567 us**다.
+측정 DSP는 2046 us — **1479 us (72%)가 가중치 스트리밍이 아니다.**
+
+§29의 CPU decode(22층 전부 CPU, 35.18 TPS)에서 유도하면 레이어당 ~1.29 ms,
+같은 22 MB에 **~17 GB/s**. HTP는 host 기준 **8.5 GB/s**. 가속기가 CPU의 절반이다.
+
+### 47.2 용의자 둘 — 둘 다 M에 비례하지 않는다
+
+**(a) `gather` 고정비.** prefill은 444행/콜에 2930 us = **6.6 us/행**. decode는
+**4행인데 795 us**. 비례분 26 us를 빼면 **769 us가 M과 무관한 고정비**다.
+769 x 22 x 512 = **8.7 s**.
+
+**(b) 64행 패드의 누산기 트래픽.** HMX 타일이 64행이라 M=1도 64행을 쓴다.
+
+```
+gate_up 누산기 64 x 3584 x 4B = 917 KB
+down    누산기 64 x 2048 x 4B = 524 KB
+expert당 1.44 MB x 4 expert   = 5.8 MB / layer / token
+실제로 필요한 출력            = 2048 float = 8 KB
+```
+
+가중치 22 MB에 **누산기 5.8 MB가 얹힌다(+26%)**. `acc 260.5 us`가 그 일부고,
+`mm` 잔차에도 들어가 있다. 27.8 MB / 2046 us = 13.6 GB/s — 그래도 38.8과 멀다.
+
+둘을 다 없애면 567(DMA) + 실제 스테이지 ~200 + 마른 transport ~350 = **~1.1 ms/layer**,
+토큰당 MoE 57.3 -> **24 ms**. §46의 lm_head까지 합치면 99 -> ~44 ms = **약 23 TPS**.
+
+### 47.3 통제 실험 — 한 실행 안에서 CPU와 HTP를 나란히
+
+QS4CX(비-WH) 모델은 **CPU 폴백이 살아 있다.** `moe_htp_layers`로 일부 레이어만
+HTP에 주면, **같은 프로세스·같은 온도·같은 토큰 스트림**에서 두 경로가 나란히 돈다.
+`--profile`의 노드별 표가 그대로 답이 된다.
+
+```bash
+# 1) QS4CX 모델 (WH 아님 -- CPU 폴백이 있어야 한다)
+nntr_quantize_stream <fp32> -o <dir> \
+  --fc_dtype Q4_0 --embd_dtype Q4_0 --moe_dtype QS4CX --isa ARM
+
+# 2) nntr_config.json
+#    "moe_engine": "htp"
+#    "moe_htp_layers": "2,4,6,8,10,12"      <- 6개만. 나머지 16개는 CPU
+#
+#    6개인 이유: QS4CX는 캐시 삭제(§37.4) 후 DSP heap 경로만 남았고 천장이
+#    1.89 GB다. 6 x 168 MB = 1.0 GB로 안전하다. 11개면 1.85 GB로 벽에 붙는다.
+
+# 3) --profile 빌드로 실행
+```
+
+읽을 것 — **avg가 아니라 `min`**이다(avg는 등록이 들어간 첫 prefill 콜에 오염된다):
+
+```
+layer2_ffn_down:forward(lfm2_moe)   <- HTP
+layer3_ffn_down:forward(lfm2_moe)   <- CPU   (바로 옆 레이어, 같은 shape)
+layer4_ffn_down:forward(lfm2_moe)   <- HTP
+layer5_ffn_down:forward(lfm2_moe)   <- CPU
+```
+
+**이게 온도·모델·lm_head를 전부 상수로 만든 유일한 비교다.** 결과가
+- HTP가 더 느리면 -> §47.2의 (a)(b)가 회귀의 원인이고, 고치기 전까지 decode는
+  CPU에 두는 것이 맞다
+- 비슷하거나 빠르면 -> §42의 10.1 TPS는 온도였고, 식은 기기에서 다시 재야 한다
