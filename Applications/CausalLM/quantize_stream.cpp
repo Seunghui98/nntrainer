@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1333,12 +1334,18 @@ int run(int argc, char **argv) {
   std::string target_isa = "DEFAULT";
   std::string output_bin;
   std::filesystem::path target_config;
+  // Which dtypes the command line actually asked for, so --config fills in
+  // the rest instead of overruling them. Without this,
+  // "--config old.json --moe_dtype QS4CX_WH" quietly quantizes to whatever
+  // old.json says and the run looks like it worked.
+  std::set<std::string> given;
 
   for (int index = 2; index < argc; ++index) {
     const std::string argument = argv[index];
     const auto requireValue = [&](const std::string &option) {
       if (index + 1 >= argc)
         throw std::invalid_argument("Missing value for " + option);
+      given.insert(option);
       return std::string(argv[++index]);
     };
 
@@ -1402,14 +1409,17 @@ int run(int argc, char **argv) {
 
   if (!target_config.empty()) {
     const json requested = readJson(target_config);
-    if (requested.contains("fc_layer_dtype"))
-      fc_dtype = requested["fc_layer_dtype"].get<std::string>();
-    if (requested.contains("embedding_dtype"))
-      embedding_dtype = requested["embedding_dtype"].get<std::string>();
-    if (requested.contains("lmhead_dtype"))
-      lmhead_dtype = requested["lmhead_dtype"].get<std::string>();
-    if (requested.contains("moe_layer_dtype"))
-      moe_dtype = requested["moe_layer_dtype"].get<std::string>();
+    // An explicit flag wins. The usual reason to pass both is to keep a
+    // model's existing dtypes and change one of them.
+    const auto take = [&](const char *key, const char *option,
+                          std::string &field) {
+      if (requested.contains(key) && given.count(option) == 0)
+        field = requested[key].get<std::string>();
+    };
+    take("fc_layer_dtype", "--fc_dtype", fc_dtype);
+    take("embedding_dtype", "--embd_dtype", embedding_dtype);
+    take("lmhead_dtype", "--lmhead_dtype", lmhead_dtype);
+    take("moe_layer_dtype", "--moe_dtype", moe_dtype);
     if (requested.contains("model_file_name") && output_bin.empty())
       output_bin = requested["model_file_name"].get<std::string>();
     if (requested.contains("moe_cache_size"))
