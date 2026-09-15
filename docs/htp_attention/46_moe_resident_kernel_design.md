@@ -2238,3 +2238,47 @@ QS4CX_WH에서는 성립하지 않는다 — `moe_engine: "htp"` 와 **모든** 
 | 레이아웃이 ISA별로 다를 수 있다 (`lib/`에 v69–v81이 따로 있다) | bin 헤더에 ISA/HexKL 버전, 로더가 거부. 더해서 세션 열 때 32×32 타일 하나를 DSP가 굽고 표와 대조 — 1 ms, 조용히 잘못 곱하는 것보다 훨씬 싸다 |
 | ~~파생 표를 저장소에 커밋해도 되는가~~ | 닫힌 형태가 나왔다(§35.3a). 데이터가 아니라 한 줄 식이라 대체로 비켜간다 |
 | ~~ARM 변환이 느리면 A1-a가 로드 경로로는 못 쓴다~~ | **확인됨: 157 MB/s = 3.9 GB에 25초.** A1-a 탈락, 오프라인만 남는다 |
+
+## 36. W1 첫 기기 실행 (2026-09-15) — 등록은 이겼고, 메모리 벽 두 개가 남았다
+
+QS4CX_WH 모델(LFM2.5-8B-A1B, MoE 22레이어 × 64 = 1408 weight)을 기기에서 로드하고
+prefill 첫 forward에 진입했다. profile (`NNTR_HTP_PROFILE=2`):
+
+```
+weights registered : 1170  (/1408 -- OOM 전까지)
+register FastRPC   : 105.5 ms  → 0.09 ms/weight
+convert to registry: 0.0 ms
+rpcmem/ION         : 1170/1170  (전부 아레나)
+FATAL: HTP arena is full; cannot register a 2048x3584 weight
+```
+
+### 36.1 이긴 것 — 등록 비용
+
+**목표였던 지표가 확인됐다.** 예전 경로는 weight당 QS4CX→WH bake(~25 ms) + DSP-heap
+복사였고, prefill의 48.2%였다. 이제 **0.09 ms/weight**, convert 0, 전부 ION 아레나.
+이게 §35 오프라인 WH 작업 전체의 근거였다.
+
+### 36.2 벽 1 — 이중 메모리 (A5, 이제 필수)
+
+ARM이 QS4CX_WH weight를 3.9 GB 상주시키고(로더가 .bin에서 텐서로 읽음),
+`get_or_register_wh`가 그걸 아레나로 **복사**한다. 피크 = 텐서 3.9 GB + 아레나 3.9 GB
+= 7.8 GB. 1170개(≈3 GiB 아레나) 등록 후 다음 1 GiB ION alloc이 거부됐다.
+
+청크 크기 문제가 아니다(778→1170으로 이미 1 GiB 청크 확인). **복사본이 문제다.**
+A5: 아레나로 옮긴 뒤 ARM 텐서 버퍼를 해제. 안전하게 하려면 한 번만 등록하고 핸들을
+저장한 뒤(포인터 키 캐시가 해제된 포인터를 다시 참조하면 안 됨) 재사용해야 한다 —
+레이어 상태 + prebound invoke가 필요하다. 로더 작업이고, 기기 없이 검증 불가라
+신중히 설계한다.
+
+### 36.3 벽 2 — decode 경로 (M==1)
+
+`tryMoeLayerOnAccelerator`는 `total_tokens > 1`에서만 돈다. decode(M==1)는 per-expert
+/grouped CPU 경로로 가고, 거기서 QS4CX_WH가 `FloatTensor::dot`의 명시적 throw에 걸린다
+(§35.5). WH 모델이 토큰을 생성하려면 decode도 HTP로 라우팅돼야 한다. A5와 한 묶음이다:
+등록 한 번, ARM 사본 해제 한 번, prefill/decode 모두 저장된 핸들로 실행.
+
+### 36.4 다음
+
+A5 + decode 라우팅을 하나로 설계한다: 레이어가 첫 등록에서 핸들을 받아 저장하고
+ARM expert 텐서를 해제, 이후 prefill/decode 둘 다 prebound invoke로 그 핸들을 쓴다.
+그때까지 prefill TPS 숫자는 못 읽는다(OOM이 먼저다). 등록 비용 자체는 위에서 확정.
