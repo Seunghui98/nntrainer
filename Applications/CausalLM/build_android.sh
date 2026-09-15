@@ -176,8 +176,30 @@ if [ "$USE_HTP" -eq 1 ]; then
         log_error "  set HEXKL_ROOT to the hexkl_addon directory"
         exit 1
     fi
+    # Two lib layouts. The SDK-bundled addon is lib/<arch>/libsdkl.so; the
+    # standalone beta2 drop puts a version between them,
+    # lib/<sdk_ver>/<arch>/libsdkl.so, which is what test/htp/build.sh already
+    # walks for libhexkl_micro.a. meson's default assumes the first, and
+    # getting it wrong stops at "C shared or static library 'sdkl' not found"
+    # without naming a path. Look for the file instead of assuming.
+    HEXKL_ARCH="${HEXKL_ARCH:-armv8_android26}"
+    if [ -f "$HEXKL_ADDON/lib/$HEXKL_ARCH/libsdkl.so" ]; then
+        HEXKL_LIB_SUBDIR="$HEXKL_ARCH"
+    else
+        ver="${HEXKL_SDK_VER:-$(ls -1 "$HEXKL_ADDON/lib" 2>/dev/null | sort -V | tail -1)}"
+        HEXKL_LIB_SUBDIR="$ver/$HEXKL_ARCH"
+    fi
+    if [ ! -f "$HEXKL_ADDON/lib/$HEXKL_LIB_SUBDIR/libsdkl.so" ]; then
+        log_error "No libsdkl.so under $HEXKL_ADDON/lib for $HEXKL_ARCH."
+        log_error "  looked at: lib/$HEXKL_ARCH and lib/<version>/$HEXKL_ARCH"
+        log_error "  available: $(ls -1 "$HEXKL_ADDON/lib" 2>/dev/null | tr '\n' ' ')"
+        log_error "  set HEXKL_SDK_VER, or HEXKL_ARCH for a different device"
+        exit 1
+    fi
+    log_info "HexKL: $HEXKL_ADDON/lib/$HEXKL_LIB_SUBDIR/libsdkl.so"
     PACKAGE_ANDROID_ARGS+=("-Denable-htp=true" \
         "-Dhexkl-sdk-root=$HEXKL_ADDON" \
+        "-Dhexkl-lib-subdir=$HEXKL_LIB_SUBDIR" \
         "-Dhexagon-sdk-root=$HEXAGON_SDK_ROOT")
 fi
 

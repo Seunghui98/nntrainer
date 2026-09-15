@@ -61,6 +61,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKEND="$REPO_ROOT/nntrainer/tensor/htp_backend"
+# $BACKEND/.. is nntrainer/tensor, where the headers shared with the host live
+# -- swiglu_det.h is the DSP's SwiGLU specification AND what the ARM side and
+# the offline quantizer compile against, so it cannot sit behind the HTP-only
+# include path.
 cd "$SCRIPT_DIR"
 
 mkdir -p generated build
@@ -89,6 +93,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c"
     -Wall -Werror \
     -I generated \
     -I "$HEXKL_ROOT/include" \
+    -I "$BACKEND/.." \
     -I "$BACKEND" \
     -I "$BACKEND/hvx" \
     -I "$BACKEND/hmx" \
