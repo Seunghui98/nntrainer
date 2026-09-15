@@ -3366,3 +3366,50 @@ WH 모델 실행(§49.5 Run A)의 `M>1` 행도 같이 — P2가 아레나 경로
 
 이 둘 + §49.2의 순서 교정이 들어간 실행에서 읽을 것: `M>1` 행의 `alloc`, `gather`,
 `drain`, `first ... GB/s`; `M==1` 행의 같은 네 값; prefill/decode TPS; 텍스트 앞 3줄.
+
+### 50.7 P1·P2·P6 기기 결과 (2026-09-15) — prefill **353 TPS**, 레이어가 CPU를 넘었다
+
+```
+prefill 444 tokens 1257 ms 353.2 TPS   (직전 2449 ms 181.3)     텍스트 정상
+decode  512 tokens 34437 ms 14.87 TPS  (직전 11.81)             peak 5326 MB (−4 MB)
+registration total 735.6 ms — 그대로 찍히지만 로드 단계로 갔다 (P6)
+M>1  host 22580 dsp 20279 transport 2301
+     [quant 1646 gather 126 requant 1186 swiglu 2055 dequant 1363 acc 2946
+      drain 225+58 push 22 scatter 1086 alloc 323 stage 382 mm 8779 | blocks=1004]
+     first 1024 KB took 58 us = 18.1 GB/s ; 콜 평균 8.3
+M==1 host 2020 dsp 1450 transport 570
+     [quant 54 gather 2.2 requant 42 swiglu 24 dequant 88 acc 258
+      drain 189+8 scatter 2.9 alloc 0.2 mm 768]
+     first 1024 KB took 64 us = 16.4 GB/s ; 콜 평균 15.2
+```
+
+| 예측 (§49.2, §50.6) | 실측 | |
+|---|---:|---|
+| decode gather 809 → ≤20 | **2.2** | §49.2 진단 확정. 769 us는 in-order DMA 대기였다 |
+| prefill gather 2965 → ≈200 | **126** | 〃 |
+| prefill drain ≈ 수백 | 225+58 | 가중치가 HMX 뒤로 숨는다 |
+| prefill alloc 3064 → ≈0 | **323** | 반만 — 레이어마다 n_slots가 달라 여러 번 자랐다. `n_slots_cap`으로 한 번만 (커밋) |
+| decode dsp 2060 → 1.3–1.5 ms | **1450** | |
+| prefill 벽시계 2449 → ≈1700 | **1257** | ARM 쪽도 1081 → 760 같이 줄었다 — 첫 forward에 섞여 있던 등록 부수효과로 보이나 **안 쟀다** |
+| `first KB` 20–50 GB/s | **16–18** | §49.3의 갈림길 숫자. 38.8이 아니다 |
+
+**prefill 레이어 = 22.6 + staging 1 + ARM 비-ffn 2.1–5 = 25.7–28.6 ms vs CPU 31.8 →
+1.11–1.24×.** 처음으로 레이어 단위에서 CPU를 넘었다. prefill 전체 353 vs CPU-전부 279(§18.2)
+= 1.27×. 남은 콜 22.6 = HMX 11.7 + HVX 직렬 7.3 + transport 2.3 + 기타 1.3 — 다음은 P3.
+
+**decode = 2.02 ms/layer vs CPU 1.29.** DSP 1450 = HMX 1026 + 노출 DMA 197 + HVX 210 +
+기타. 그리고 **DMA는 부하 중 16 GB/s다** (`first` 16.4, 콜 평균 15.2 — 둘이 일치). 이 속도면
+§49.3 두 번째 가지: HVX GEMV로 HMX를 치워도 21.5 MB / 16 GB/s = 1.3 ms ≥ CPU. **16의
+원인을 먼저 갈라야 한다:**
+
+| 가설 | 판별 | 코드 |
+|---|---|---|
+| (a) DDR/버스 DVFS — Gate 0c의 38.8은 고립 측정, decode는 SoC가 놀아 버스가 내려간다 | DSP에서 버스 대역폭 투표(`HAP_power_set_mips_bw`, 40 GB/s) 후 `first KB`가 30+로 오르면 확정 | **커밋** — `nntr_hvx_open`에 10줄, 세션 수명 동안 무조건 투표 (측정용 ponytail) |
+| (b) 가중치 청크의 2D 디스크립터(16 KB 행 × 64, 스트라이드 56 KB)가 선형보다 느리다 | (a)가 아니면. 유닛테스트에서 같은 아레나로 선형 vs 스트라이드 push2d 비교 | 미착수 |
+
+`HAP_power_mips_bw_payload`의 필드명(`set_bus_bw`, `bwBytePerSec`, `busbwUsagePercentage`)은
+SDK 헤더 기준으로 적었고 **이 트리엔 헤더가 없다** — skel 빌드가 첫 컴파일이다. 빌드가
+깨지면 `HAP_power.h`의 그 구조체 이름을 맞추면 된다.
+
+읽을 것 (다음 실행): `first 1024 KB took` 둘, decode `drain`, decode `dsp`, prefill `alloc`
+(≈0 기대), TPS 둘, 텍스트.
