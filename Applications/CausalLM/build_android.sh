@@ -162,9 +162,23 @@ if [ "$USE_HTP" -eq 1 ]; then
     log_info "  then push test/htp/build/libnntr_hvx_skel.so to the device"
     # hexkl-lib-subdir already defaults to armv8_android26 (meson_options.txt),
     # matching the device recipe in docs/htp_attention/40_moe_ffn_htp_task.md
-    # section6.2 -- only the SDK root (the trap: this must be the SDK-bundled
-    # hexkl_addon, not a standalone beta drop -- same section) needs passing.
-    PACKAGE_ANDROID_ARGS+=("-Denable-htp=true" "-Dhexkl-sdk-root=$HEXAGON_SDK_ROOT/addons/hexkl_addon")
+    # section6.2.
+    #
+    # HEXKL_ROOT wins where it is set, because the beta2 drop this project
+    # runs on unpacks to its own directory rather than into the SDK. meson
+    # derives the SDK root as two levels up from the addon, which is right
+    # only for the bundled layout, so pass it explicitly either way -- the
+    # derivation on a standalone drop lands on the parent of the checkout and
+    # stops at a missing incs/ that names neither variable.
+    HEXKL_ADDON="${HEXKL_ROOT:-$HEXAGON_SDK_ROOT/addons/hexkl_addon}"
+    if [ ! -d "$HEXKL_ADDON" ]; then
+        log_error "HexKL addon not found: $HEXKL_ADDON"
+        log_error "  set HEXKL_ROOT to the hexkl_addon directory"
+        exit 1
+    fi
+    PACKAGE_ANDROID_ARGS+=("-Denable-htp=true" \
+        "-Dhexkl-sdk-root=$HEXKL_ADDON" \
+        "-Dhexagon-sdk-root=$HEXAGON_SDK_ROOT")
 fi
 
 if [ "$USE_BUILD_CACHE" -eq 1 ] && [ -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then

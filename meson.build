@@ -283,10 +283,25 @@ if get_option('enable-htp')
     error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
   endif
   hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
-  # Derive the Hexagon SDK root from the addon path (two levels up).
   # remote.h and AEEStdErr.h live under <sdk_root>/incs/ and
   # <sdk_root>/incs/stddef/ respectively; sdkl.h is in the addon include/.
-  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  #
+  # Two levels up from the addon is the SDK only when the addon sits in
+  # Hexagon_SDK/<ver>/addons/hexkl_addon. The beta2 drop this project uses
+  # unpacks somewhere of its own, and the derivation then points at the
+  # parent of the checkout and fails on a missing incs/ with no hint about
+  # which path it meant. Keep the derivation as the default, since it is
+  # right for an SDK-resident addon, and take the explicit option first.
+  hexagon_sdk_root = get_option('hexagon-sdk-root')
+  if hexagon_sdk_root == ''
+    hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  endif
+  if not fs.is_dir(hexagon_sdk_root / 'incs')
+    error('No incs/ under Hexagon SDK root "' + hexagon_sdk_root +
+          '". Pass -Dhexagon-sdk-root=<path to Hexagon_SDK/<version>> ' +
+          '(it is derived as two levels up from hexkl-sdk-root, which only ' +
+          'holds when the addon lives in the SDK tree).')
+  endif
   hexkl_inc = include_directories(
     hexkl_root / 'include',
     hexagon_sdk_root / 'incs',
