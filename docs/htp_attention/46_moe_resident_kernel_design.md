@@ -2479,3 +2479,63 @@ DSP의 `NNTR_HVX_MAX_ARENAS`는 8 → **32**(세 워드짜리 구조체 테이�
 [HTP] arena chunk 3: 512 MiB, ..., mapped total 3584 MiB, ...
 ```
 1408/1408이 뜨면 천장 ≥ 3.61 GiB고 벽은 끝난다. 아니면 멈춘 `mapped total`이 답이다.
+
+## 40. 천장 = 3.00 GiB, 그리고 크기 문제가 아니다 (2026-09-15, 기기)
+
+§39의 반감 재시도가 답을 줬다. **1024 → 512 → 256 → 128 → 64 MiB, 전부 거부.**
+
+```
+[HTP] arena chunk 0..2: 1024 MiB씩, mapped total 3072 MiB
+[HTP] arena: 1024 MiB refused, retrying at 512 MiB (fastrpc_mmap err=1)
+[HTP] arena: 512 MiB refused ... 256 ... 128 ...
+FATAL: fastrpc_mmap(64 MiB) failed: err=1. mapped=3072 MiB in 3 chunks, RSS=1266 MB
+```
+
+### 40.1 무엇이 배제됐나
+
+- **크기 granularity 아님.** 64 MiB도 안 된다. 1 GiB 경계에서 멈춘 게 아니라 총량이
+  찬 것이다.
+- **개수 아님.** §38.1의 256 MiB 실행에서 매핑 **8개**가 성공했다(8 × 256 = 2 GiB,
+  거기서 멈춘 건 우리 `NNTR_HVX_MAX_ARENAS=8`이었다).
+- **호스트 메모리 아님.** `rpcmem_alloc`은 매번 성공했고 RSS는 1266 MB다.
+
+남는 결론: **`fastrpc_mmap`의 총 매핑 예산이 정확히 3.00 GiB**고, 우리는 unsigned PD에
+있다(`htp_backend.cpp:40`). 모델은 3.61 GiB가 필요하다 — **0.61 GiB (238 weight) 부족.**
+
+### 40.2 아직 안 써본 예산이 하나 있다 — DSP heap
+
+프로파일의 `rpcmem/ION buffer : 1170/1170`은 **heap 경로를 한 바이트도 안 썼다**는
+뜻이다. Gate 0이 잰 DSP heap 천장은 **1.89 GB**였고, 부족분은 0.61 GiB다.
+
+PD 주소공간 안에서 heap 영역과 mmap 영역이 **따로** 잡혀 있다면(흔한 배치다)
+mmap 예산이 다 차도 heap은 비어 있다. 그러면 고칠 것은 작다: 아레나가 거부하는
+마지막 238개를 heap에 등록한다. 같은 주소공간을 나눠 쓰는 거라면 heap도 똑같이
+거부하고, 그때는 PD를 나누거나(§40.4) 모델을 줄여야 한다.
+
+**이 하나로 작은 수정과 큰 수정이 갈린다.** 그리고 기기에 물어보는 API가 없다.
+
+### 40.3 프로브 (2026-09-15, 코드 완료·미측정)
+
+`unittest_hvx_mm_u8i4`의 `ArenaCeilingThenHeapHeadroom`:
+
+1. 256 MiB씩 `fastrpc_mmap` — 거부될 때까지. → `mmap_ceiling_mib` (천장의 정확한 값)
+2. **그 예산을 쥔 채로** `weight_register_u8i4`(heap 경로)를 2048×3584로 반복.
+   → `heap_weights`, `heap_mib`, `covers_overflow`
+
+게이트하지 않는다 — 맞다/틀리다가 있는 게 아니라 읽을 숫자가 있을 뿐이다.
+
+```
+U8I4_FIELD path=ceiling field=mmap_ceiling_mib value=...
+U8I4_FIELD path=ceiling field=heap_weights   value=...
+U8I4_FIELD path=ceiling field=covers_overflow value=yes|no
+```
+
+### 40.4 `covers_overflow=no`일 때의 선택지
+
+| | 방법 | 비용 | 조건 |
+|---|---|---|---|
+| A | signed PD (testsig) | 코드 0줄 | unsigned PD 제약이 원인 + 기기 root |
+| B | PD 2개, 레이어 반씩 | 큼 | 3 GiB가 **PD당** 한계일 때. `fastrpc_mmap`은 세션이 아니라 **도메인** 인자를 받으므로, 한 프로세스에서 PD 두 개를 얻을 수 있는지부터 확인해야 한다 (`&_session=N`) |
+| C | 일부만 상주 | — | CPU 폴백이 없어 **불가능** |
+
+A가 제일 싸지만 기기 권한에 달렸고, B는 전제부터 불확실하다. **그래서 §40.3을 먼저 돌린다.**
