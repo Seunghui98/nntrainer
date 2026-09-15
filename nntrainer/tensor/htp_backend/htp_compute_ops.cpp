@@ -1611,6 +1611,33 @@ private:
                            t_begin, convert_us);
   }
 
+  /* Declared here rather than beside arena_chunks_ at the bottom of the
+     class: registerFromArena takes an ArenaEntry by reference, and a
+     parameter type has to be complete where the function is declared, unlike
+     a member a function BODY refers to. Only an HTP build compiles this
+     file, so a host build cannot catch it. */
+  /** @brief One uncached ION buffer the DSP has mapped, filled front to
+   *  back. Never reused or rewritten: a weight placed here keeps its bytes
+   *  for the process lifetime, which is also why the DSP can borrow them
+   *  and why no cache line in either direction can go stale. */
+  struct ArenaChunk {
+    std::unique_ptr<HtpRpcBuffer> buf;
+    uint32_t dsp_id; /**< what nntr_hvx_arena_attach called it */
+    size_t used;     /**< bump pointer */
+  };
+
+  /** @brief Where one weight sits, and the three small arrays that are not
+   *  worth arena space (4 KB against 3.5 MB) and would need their own
+   *  alignment rules if they were. */
+  struct ArenaEntry {
+    uint32_t chunk;
+    uint32_t off;
+    uint32_t K, N;
+    std::vector<float> w_scale;
+    std::vector<int32_t> colsum_w;
+    std::vector<float> bias;
+  };
+
   /**
    * @brief Registers a weight the offline quantizer already put in WH
    *        layout, by copying it into the arena as-is.
@@ -2040,28 +2067,6 @@ private:
 
   std::mutex handle_mutex_;
   std::unordered_map<const void *, uint32_t> handle_cache_;
-
-  /** @brief One uncached ION buffer the DSP has mapped, filled front to
-   *  back. Never reused or rewritten: a weight placed here keeps its bytes
-   *  for the process lifetime, which is also why the DSP can borrow them
-   *  and why no cache line in either direction can go stale. */
-  struct ArenaChunk {
-    std::unique_ptr<HtpRpcBuffer> buf;
-    uint32_t dsp_id; /**< what nntr_hvx_arena_attach called it */
-    size_t used;     /**< bump pointer */
-  };
-
-  /** @brief Where one weight sits, and the three small arrays that are not
-   *  worth arena space (4 KB against 3.5 MB) and would need their own
-   *  alignment rules if they were. */
-  struct ArenaEntry {
-    uint32_t chunk;
-    uint32_t off;
-    uint32_t K, N;
-    std::vector<float> w_scale;
-    std::vector<int32_t> colsum_w;
-    std::vector<float> bias;
-  };
 
   std::vector<ArenaChunk> arena_chunks_;
   /** Keyed by the cache path, which already encodes shape and source hash,
