@@ -3257,3 +3257,95 @@ TYPE 합계 표, 세 실행의 TPS 두 줄과 텍스트 앞 3줄.
 
 **HMX는 M ≤ 64에서 구조적으로 21 GB/s짜리 소비자다.** decode를 HTP에서 이기는 유일한
 커널 쪽 답은 HMX를 안 쓰는 것(L1)이고, 그게 충분한지는 DMA_FIRST(decode) 한 숫자가 정한다.
+
+## 50. 목표를 prefill로 바꾸면 — 지금 어디에 서 있고, 무엇이 CPU를 넘기는가 (2026-09-15)
+
+§49는 decode를 놓고 셌다. 이 절은 **prefill에서 먼저 CPU를 이긴다**는 목표로 같은 숫자를
+다시 센다. decode와 달리 prefill은 **이미 거의 동률**이고, 레버는 다 커널 안에 있다.
+
+### 50.1 지금 위치 — 같은 범위로 맞춘 비교
+
+기준선은 §18.1 그대로, 같은 forward 안에서 잰 유일한 숫자다:
+`CPU MoE 레이어 = 31.805 ms (비-ffn 5.549 + ffn 26.256)`, 444 토큰.
+
+HTP 레이어 (§42 실행, 22층 전부 HTP, WH 아레나):
+
+```
+DSP  ≈ 621 ms / 22 = 28.2 ms   (§29의 24.7에서 alloc 3.0 + gather 1.1이 늘었다)
+  ≈ mm 8.1 + acc 2.8 + alloc 3.0 + gather 2.9 + quant 1.9 + swiglu 1.9
+    + drain ~1.5 + dequant 1.4 + scatter 1.4 + requant 1.2 + rest ~1 + stage 0.45
+transport 2.3 + ARM staging ~1.0 + ARM 비-ffn 2.1–5.0 (§18.1, 미측정 폭)
+= 레이어 33.6–36.5 ms  →  CPU 31.8 대비 0.87–0.95×
+```
+
+**prefill도 아직 진다. 다만 5–15%다.** HMX 바닥은 43블록 × 252 us = **10.9 ms**이고
+가중치 176 MB는 38.8 GB/s에서 4.5 ms — prefill도 DMA가 아니라 **HMX 바운드**다. 남은
+17 ms는 전부 HMX와 직렬로 도는 HVX 단계·대기·할당이고, 그게 레버다.
+
+### 50.2 prefill 레버 — 순위, 기대, 근거
+
+| # | 항목 | 지금 | 후 | 근거 | 비용 |
+|---|---|---:|---:|---|---|
+| **P1** | **`alloc` 3.0 ms 호이스트** — 콜당 12.8 MB malloc/free를 세션 스크래치로 | 3036 | ≈0 | `HEXKL_PROBE_ALLOC`이 직접 읽은 값 (§30.4 R3-2가 넣은 프로브). 추측 아님 | 작음 |
+| **P2** | **DMA 순서 교정** (§49.2, 커밋됨) | gather 2930 + drain ~1500 | ≈200 + ≈300 | prefill은 블록당 HMX 252 us가 덮개라 down 1.75 MB(45–90 us)와 다음 gate_up이 거의 다 숨는다 | 완료·미측정 |
+| **P3** | **HVX 단계를 HMX 뒤에 숨긴다** — 블록 b의 dequant→swiglu→requant / dequant→scatter를 풀에서 돌리는 동안 HMX는 b+1의 gate_up / b의 down을 발행 | dequant 1.4 + swiglu 1.9 + requant 1.2 + scatter 1.4 + quant 1.9 = **7.8** | ≈2 | §24.2 R1-b가 세운 것. HMX 발행은 호출 스레드 하나, 워커 4개는 그동안 논다. 이중버퍼: acc 배치 256 KB×2는 남는 1.7 MB에 들어간다; gate/up f32 1.8 MB×2는 **A3 융합(§27.1 #3)으로 up 버퍼를 먼저 없애야** 들어간다 | **큼** |
+| P3a | A3: dequant→SwiGLU 융합 — gate 타일 j와 up 타일 j를 붙여 발행하고 dequant가 silu(g)·u를 바로 쓴다 | swiglu 1.9 + f32 왕복 | ≈0.5 | P3의 선행. 단독으로도 −1.5 ms | 중 |
+| P4 | 꼬리 블록을 HVX GEMV로 (§49.3 L1과 같은 커널) | 43 − 32 = 11개 꼬리 블록 × 252 us | ×~100 us | m_blk가 작은 블록은 HMX 64행 발행이 낭비. decode L1과 커널 공유 | 커널 1개 |
+| P5 | transport 2.3 ms (act 3.6 MB in + out 3.6 MB rout, cached ION) | 2283 | ? | 먼저 정체: `PROFILE=3` 최소값과 비교. 캐시 유지보수면 act를 ARM에서 u8로 보내 0.9 MB(quant 1.9도 같이 ARM으로) | 측정 후 |
+| **P6** | **등록을 로드 시점으로** (§42.4 G) | prefill 벽시계 2362 중 **728 (31%)** | 0 | prefill TPS를 재는 방식의 문제: 첫 forward가 등록을 지불한다. **코드는 작고, TPS 188 → 272다.** 게다가 `--profile` 노드 표의 HTP 레이어 값을 등록 오염에서 풀어 CPU와 바로 비교하게 만든다 | 작음–중 |
+| P7 | 나머지 ARM 1013 ms (conv 18 · attn 6 · norm · router) | 43% | | 문서 45. FFN 밖 | 큼 |
+
+### 50.3 산술 — 어디서 CPU를 넘나
+
+| 단계 | DSP | 레이어 (transport 2.3 + staging 1 + 비-ffn 2.1–5.0) | vs CPU 31.8 |
+|---|---:|---:|---:|
+| 지금 | 28.2 | 33.6–36.5 | 0.87–0.95× |
+| + P1 + P2 | ≈ 21.5 | 26.9–29.8 | **1.07–1.18×** ← 처음 넘는다 |
+| + P3a | ≈ 20 | 25.4–28.3 | 1.12–1.25× |
+| + P3 | ≈ 14–15 | 19.4–23.3 | **1.36–1.64×** |
+| + P4 + P5 | ≈ 12.5–13.5 | 16.5–20.5 | 1.55–1.93× |
+| HMX 바닥 (숨길 것 0) | 10.9 | 14–17 | 1.9–2.3× |
+
+prefill TPS로 환산 (444 토큰, ARM 1013 고정, CPU 전부 = §18.2의 279 TPS):
+
+| | ms | TPS | vs CPU 279 |
+|---|---:|---:|---:|
+| 지금 (§42) | 2362 | 188 | 0.67× |
+| + P6 (등록 제외) | 1634 | 272 | 0.97× |
+| + P1 + P2 | 1487 | 299 | 1.07× |
+| + P3(+P3a) | 1330 | 334 | 1.20× |
+| + P4 + P5 | 1290 | 344 | 1.23× |
+| Amdahl 천장 (FFN 0) | 1013 | 438 | 1.57× |
+
+**레이어 단위로는 P1+P2에서 넘고, 전체 prefill TPS로는 P6이 없으면 무엇을 해도 CPU에
+진다** — 등록 728 ms가 레이어 22개 절감분(최대 ~380 ms)보다 크다. P6이 첫 번째다.
+
+### 50.4 prefill 측정 — decode보다 쉽다, 스위치가 필요 없다
+
+§47.3 레시피가 prefill에서는 그대로 맞는다(§49.4의 게이트는 M==1에만 걸린다). 다만
+`--profile` 노드 표의 HTP 레이어는 **prefill 콜이 하나뿐이라 min도 등록에 오염**된다.
+읽는 법:
+
+```bash
+# QS4CX 모델, config "moe_engine":"htp", "moe_htp_layers":"2,4,6,8,10,12"
+# --profile 빌드 (TPS는 읽지 않는다)
+NNTR_M0_PROFILE=1 NNTR_HTP_PROFILE=2 <run>
+```
+
+| 읽을 것 | 뜻 |
+|---|---|
+| `[M0-PROF] moe_layer[i] tokens=444 ... ffn=` — i 짝수(HTP) vs 홀수(CPU) | 같은 범위(레이어 벽시계)의 직접 비교. HTP 쪽 `ffn`에서 `[HTP-PROFILE] registration total / 6`을 뺀다 (P6 전까지) |
+| `[HTP-PROFILE] M>1 ... host=` | 등록 제외한 HTP 콜. `ffn − host` = ARM staging + 비-ffn, §18.1이 비워둔 폭을 닫는 숫자 |
+| `M>1` 행의 `gather / drain / alloc` | P2 예측: gather 2930 → ≈200; drain 합 ≤ 500. alloc 3036 그대로면 P1 착수 |
+| `layer2_ffn_down` vs `layer3_ffn_down` (노드 표) | 등록 오염 확인용. `[M0-PROF]`와 어긋나면 그 차이가 등록이다 |
+
+WH 모델 실행(§49.5 Run A)의 `M>1` 행도 같이 — P2가 아레나 경로에서도 같은지.
+
+### 50.5 순서
+
+1. **Run A/C (prefill 읽기)** — §50.4. P2 예측 반증 + `alloc` 확인 + M0 폭 닫기
+2. **P6** 등록을 로드로 — TPS 188 → 272, 측정 정리. 코드 작음
+3. **P1** alloc 호이스트 — 세션 스크래치. 코드 작음. 여기까지로 레이어 1.07–1.18×
+4. **P3a → P3** — 융합 후 파이프라인. 여기서 1.4–1.6×
+5. P4 / P5 — 측정이 정하는 대로
+6. decode(§49)는 P4의 HVX GEMV를 재사용한다 — prefill 꼬리 블록에서 먼저 검증된 커널로
