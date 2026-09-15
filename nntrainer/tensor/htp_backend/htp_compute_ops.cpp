@@ -1797,31 +1797,37 @@ private:
 
     const HtpWeightCache &wc = HtpWeightCache::global();
     const HtpRpcMemApi &api = HtpRpcMemApi::get();
-    // No converted model, no way to get an fd, or no way to attach one:
-    // each is a reason this device or this run does not get an arena, and
-    // none of them is an error.
-    if (!wc.enabled() || api.to_fd == nullptr || api.mmap == nullptr)
+    // The arena is a mapped host buffer, so all it needs is a way to get an
+    // fd and a way to attach one. A converted-model directory is a separate
+    // thing -- it only pre-fills the arena for the QS4CX conversion cache;
+    // QS4CX_WH weights come in through get_or_register_wh with no cache at
+    // all -- so it must NOT gate the arena, or a WH model with no
+    // NNTR_HTP_WEIGHT_CACHE set is refused an arena it does not need one for.
+    if (api.to_fd == nullptr || api.mmap == nullptr)
       return false;
 
     // Headers first, so the chunks can be sized to what is actually there
-    // rather than grown 256 MB at a time into the eight-arena limit.
+    // rather than grown 256 MB at a time into the eight-arena limit. Skipped
+    // wholesale when there is no cache directory.
     struct Pending {
       std::string path;
       HtpWeightCacheHeader hdr;
     };
     std::vector<Pending> pending;
     size_t total = 0;
-    for (const std::string &path : wc.listFiles()) {
-      std::FILE *f = std::fopen(path.c_str(), "rb");
-      if (f == nullptr)
-        continue;
-      Pending p{};
-      p.path = path;
-      if (wc.readHeader(f, p.hdr)) {
-        total += p.hdr.wh_len;
-        pending.push_back(p);
+    if (wc.enabled()) {
+      for (const std::string &path : wc.listFiles()) {
+        std::FILE *f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr)
+          continue;
+        Pending p{};
+        p.path = path;
+        if (wc.readHeader(f, p.hdr)) {
+          total += p.hdr.wh_len;
+          pending.push_back(p);
+        }
+        std::fclose(f);
       }
-      std::fclose(f);
     }
 
     const uint64_t t0 = HtpProfile::nowUs();
