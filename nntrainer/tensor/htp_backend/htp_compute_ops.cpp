@@ -1717,10 +1717,10 @@ private:
     const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
     uint32_t chunk = 0, off = 0;
     // want = kArenaChunkMax, not wh_len: these weights arrive one at a time
-    // with no total to size a chunk from, and this model needs 3.9 GB across
-    // at most NNTR_HVX_MAX_ARENAS. A per-weight hint makes 256 MiB chunks and
-    // hits the 8-arena limit at 2 GiB (778 of 1408 weights); a full-size hint
-    // fills each 1 GiB chunk by bump before making the next, so 3.9 GB is 4.
+    // with no total to size a chunk from, so every chunk is made full size
+    // and filled by bump before the next. 3696 MiB of weights is 15 chunks,
+    // against the 3840 MiB a clean process can map (doc 46 section 41) and
+    // NNTR_HVX_MAX_ARENAS slots.
     if (!place(session, wh_len, kArenaChunkMax, &chunk, &off)) {
       // Everything the next step needs, because getting it costs a device
       // round: which of the four calls refused, how much was mapped when it
@@ -1858,7 +1858,28 @@ private:
 
   /** @brief Allocates one uncached ION buffer and attaches it to the DSP.
    *  @note  Call with handle_mutex_ already held. */
-  static constexpr size_t kArenaChunkMax = size_t(1) << 30; // ION single-alloc
+  /**
+   * @brief Largest arena chunk to ask the DSP for.
+   *
+   * 256 MiB, and the size is the whole fix for the memory wall (doc 46
+   * section 41). A clean process maps 3840 MiB in 256 MiB steps; the model
+   * with 1 GiB chunks stopped at 3072 and was then refused at every size
+   * down to 64 MiB. A flat byte budget cannot produce both. A bump
+   * allocator that aligns each mapping to its own size can: 1 GiB chunks
+   * land at 1G, 2G, 3G and push the cursor to the 4 GB end of the PD's
+   * address space, so the 768 MiB below the first one is never reachable
+   * again. 256 MiB chunks waste none of it.
+   *
+   * The model needs 3696 MiB of weights. That leaves ~144 MiB of margin,
+   * which place() protects by scanning every chunk for room -- a 1.75 MiB
+   * down weight fits tails a 3.5 MiB gate_up cannot.
+   *
+   * ponytail: if a bigger model needs more, the next thing to take is the
+   * DSP heap, which answered AEE_ENOMEMORY after 182 MiB with 3840 mapped
+   * -- heap and mappings share the one 4 GB space, so there is no second
+   * budget to find, only this one to stop wasting.
+   */
+  static constexpr size_t kArenaChunkMax = size_t(256) << 20;
   /** @brief This process's resident set, in KB, or 0 if it cannot be read.
    *  The one number that says whether releaseArmSource actually gave the
    *  pages back -- MADV_DONTNEED never reports failure for a range it simply
