@@ -1722,9 +1722,19 @@ private:
     // hits the 8-arena limit at 2 GiB (778 of 1408 weights); a full-size hint
     // fills each 1 GiB chunk by bump before making the next, so 3.9 GB is 4.
     if (!place(session, wh_len, kArenaChunkMax, &chunk, &off)) {
-      throw std::runtime_error("HTP arena is full; cannot register a " +
-                               std::to_string(K) + "x" + std::to_string(N) +
-                               " weight");
+      // Everything the next step needs, because getting it costs a device
+      // round: which of the four calls refused, how much was mapped when it
+      // did, and this process's RSS -- which is how a run says whether
+      // releaseArmSource gave the ARM copies back. Host RAM and DSP address
+      // space fail the same way here and have nothing in common as fixes.
+      throw std::runtime_error(
+        "HTP arena: cannot register a " + std::to_string(K) + "x" +
+        std::to_string(N) + " weight (" + std::to_string(wh_len >> 20) +
+        " MiB). " +
+        (arena_fail_.empty() ? "no chunk was attempted" : arena_fail_) +
+        ". mapped=" + std::to_string(arenaBytes() >> 20) + " MiB in " +
+        std::to_string(arena_chunks_.size()) +
+        " chunks, RSS=" + std::to_string(rssKb() >> 10) + " MB");
     }
     std::memcpy(arena_chunks_[chunk].buf->data() + off, matAdata, wh_len);
 
@@ -1849,14 +1859,50 @@ private:
   /** @brief Allocates one uncached ION buffer and attaches it to the DSP.
    *  @note  Call with handle_mutex_ already held. */
   static constexpr size_t kArenaChunkMax = size_t(1) << 30; // ION single-alloc
+  /** @brief This process's resident set, in KB, or 0 if it cannot be read.
+   *  The one number that says whether releaseArmSource actually gave the
+   *  pages back -- MADV_DONTNEED never reports failure for a range it simply
+   *  did not reclaim. */
+  static unsigned long long rssKb() {
+#if defined(__linux__)
+    std::FILE *f = std::fopen("/proc/self/statm", "r");
+    if (f == nullptr)
+      return 0;
+    unsigned long long total = 0, resident = 0;
+    const int n = std::fscanf(f, "%llu %llu", &total, &resident);
+    std::fclose(f);
+    if (n != 2)
+      return 0;
+    return resident * 4u; // statm counts pages; 4 KB on every target here
+#else
+    return 0;
+#endif
+  }
+
+  /** @brief Total bytes the arena has mapped to the DSP so far. */
+  size_t arenaBytes() const {
+    size_t total = 0;
+    for (const ArenaChunk &c : arena_chunks_)
+      total += c.buf->size();
+    return total;
+  }
+
   bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
     static constexpr size_t kGrain = size_t(64) << 20;
     static constexpr size_t kMin = size_t(256) << 20;
 
     size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
     size = std::min(std::max(size, kMin), kArenaChunkMax);
-    if (size < bytes)
-      return false; // one weight larger than a whole chunk: not this model
+    if (size < bytes) {
+      arena_fail_ = "a weight is larger than a whole chunk";
+      return false; // not this model
+    }
+    // Four calls can refuse a chunk and they mean four different things:
+    // rpcmem_alloc is the host's ION heap, fastrpc_mmap is the DSP's address
+    // space, arena_attach is the DSP's own arena table. The first run to hit
+    // the wall could not tell them apart and cost a device round guessing,
+    // so each one now says which it was.
+    arena_fail_.clear();
 
     // Uncached, because the DSP maps this once and the host keeps writing
     // into it afterwards -- with an uncached CPU mapping those writes reach
@@ -1865,29 +1911,59 @@ private:
     // BEFORE attaching and used a cached buffer, so this ordering is the
     // one thing section 34 rests on that the probe did not show; the
     // ArenaUncachedWriteAfterMap test is what answers it.
+    const unsigned long long rss_before = rssKb();
     auto buf = std::make_unique<HtpRpcBuffer>(size, HTP_RPC_FLAGS_UNCACHED);
-    if (!buf->isIon())
+    if (!buf->isIon()) {
+      arena_fail_ = "rpcmem_alloc(" + std::to_string(size >> 20) +
+                    " MiB) failed -- the HOST ION heap is out, so the ARM "
+                    "copies are what to shrink";
       return false;
+    }
     const int fd = buf->fd();
-    if (fd < 0)
+    if (fd < 0) {
+      arena_fail_ = "rpcmem_to_fd returned no fd for an ION buffer";
       return false;
+    }
 
     const HtpRpcMemApi &api = HtpRpcMemApi::get();
     // FASTRPC_MAP_FD, not 0: 0 is FASTRPC_MAP_STATIC, which is the driver's
     // mapping for a buffer passed as a call argument and is not tagged with
     // the fd, so HAP_mmap_get on the DSP refuses it. Three device runs went
     // on that (doc 46 section 32.10).
-    if (api.mmap(CDSP_DOMAIN_ID, fd, buf->data(), 0, size, FASTRPC_MAP_FD) != 0)
+    const int merr =
+      api.mmap(CDSP_DOMAIN_ID, fd, buf->data(), 0, size, FASTRPC_MAP_FD);
+    if (merr != 0) {
+      arena_fail_ =
+        "fastrpc_mmap failed: err=" + std::to_string(merr) +
+        " -- the host buffer exists, so this is the DSP side (its address "
+        "space or the driver's mapping table), not host memory";
       return false;
+    }
 
     uint32_t dsp_id = 0;
-    if (nntr_hvx_arena_attach(session, fd, static_cast<uint32_t>(size),
-                              &dsp_id) != AEE_SUCCESS) {
+    const int aerr =
+      nntr_hvx_arena_attach(session, fd, static_cast<uint32_t>(size), &dsp_id);
+    if (aerr != AEE_SUCCESS) {
+      // Hex as well as decimal: AEEStdErr offsets every code by 0x80000400
+      // under __hexagon__, so 0x8000040d is the one that reads as a plain
+      // AEE_EBADSTATE and a decimal print hides that.
+      char err[64];
+      std::snprintf(err, sizeof(err), "%d (0x%08x)", aerr,
+                    static_cast<unsigned>(aerr));
+      arena_fail_ = "nntr_hvx_arena_attach failed: err=" + std::string(err) +
+                    " -- mapped, but the DSP refused it; NNTR_HVX_MAX_ARENAS "
+                    "or HAP_mmap_get";
       if (api.munmap != nullptr)
         api.munmap(CDSP_DOMAIN_ID, fd, buf->data(), size);
       return false;
     }
     arena_chunks_.push_back(ArenaChunk{std::move(buf), dsp_id, 0});
+    if (HtpProfile::global().level() != 0) {
+      std::printf("[HTP] arena chunk %zu: %zu MiB, dsp_id=%u, mapped total "
+                  "%zu MiB, RSS %llu -> %llu MB\n",
+                  arena_chunks_.size() - 1, size >> 20, dsp_id,
+                  arenaBytes() >> 20, rss_before >> 10, rssKb() >> 10);
+    }
     return true;
   }
 
@@ -1965,6 +2041,8 @@ private:
   std::vector<ArenaChunk> arena_chunks_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
+  /** Why the last newChunk refused, in words, for the throw that follows. */
+  std::string arena_fail_;
 
   // Deliberately never fastrpc_munmap'd: the DSP's close() puts every arena
   // back, and the kernel reclaims the ION buffers at process exit. The
