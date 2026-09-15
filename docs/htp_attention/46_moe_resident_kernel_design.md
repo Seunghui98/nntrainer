@@ -1956,7 +1956,7 @@ enum { ARENA_UNTRIED, ARENA_ON, ARENA_OFF } arena_state_ = ARENA_UNTRIED;
 `HAP_mmap_put`을 하고, ION은 프로세스 종료 시 커널이 회수한다. `HtpBackend`와 ops
 싱글톤의 소멸 순서가 정해져 있지 않아 close 뒤에 munmap을 부르면 죽은 세션을 만진다.
 
-### 34.5 테스트 — **구현 완료·미측정** (`test/unittest/unittest_hvx_mm_u8i4.cpp`)
+### 34.5 테스트 — **둘 다 통과 (2026-09-15, 기기)**
 
 1. **`ArenaUncachedWriteAfterMap`** (`path=arena_uncached`): `rpcmem_alloc(25, 0 /*UNCACHED*/, …)` → `fastrpc_mmap(FASTRPC_MAP_FD)` → **그 다음** 패턴 쓰기 → `arena_probe` → `checksum_ok=yes`. §34.2가 실제로 하는 순서 그대로다. 이게 `no`면 §34 전체가 틀린 것이고, 그 땐 "cached + attach 전 쓰기"(증명됨)로 후퇴: 초기 로드는 그대로 가능하고 miss는 파일만 쓰고 힙에 남긴다.
 2. **`MoeLayerFromArenaMatchesHeap`** (`path=arena_moe`): expert 4개의 gate_up/down을 bake로 등록(힙) → 각각 `bake_export` → uncached 아레나 하나에 4096 정렬로 memcpy → `fastrpc_mmap` → `arena_attach` → `register_arena` ×8 → 같은 입력으로 `moe_layer`를 힙 핸들/아레나 핸들로 각각 실행 → **`memcmp == 0`** (같은 바이트, 같은 커널이므로 1 ULP도 허용 안 함). 이어서 핸들이 살아있는 채 `arena_detach` → `AEE_EBADSTATE` 확인 → release ×8 → `arena_detach` → `AEE_SUCCESS`.
@@ -1979,12 +1979,31 @@ enum { ARENA_UNTRIED, ARENA_ON, ARENA_OFF } arena_state_ = ARENA_UNTRIED;
 만질 수 있다. 모델을 load/unload 반복하는 프로세스면 모델당 아레나 하나가 샌다 — 고치려면
 `HtpBackend`가 세션을 닫기 **전에** 도는 shutdown 훅이 필요하다.
 
+#### 결과 (2026-09-15, 기기)
+
+```
+arena_uncached: fastrpc_mmap_rc=0x0  hap_mmap_get_rc=0x0
+                dma_gbs=38.84  checksum_ok=yes
+arena_moe:      bad_elems=0 of 131072
+```
+
+| | 답 |
+|---|---|
+| **uncached + 매핑 후 쓰기를 DSP가 보는가** (§34.6 #1) | **본다.** §34의 유일한 미증명 전제가 해소됐다. 후퇴 계획은 불필요 |
+| **빌려온 가중치가 힙 사본과 같은가** | **비트 단위로 같다.** 131072개 전부 |
+| **아레나 → VTCM 대역폭** | **38.84 GB/s** |
+
+**예상 못 한 것: uncached가 cached보다 빠르다.** Gate 0c의 cached 아레나는 29.96 GB/s였고
+DSP 힙도 27–33이었다. uncached가 **+30%**다. DMA 읽기 쪽에서 캐시 코히런시 스누핑이
+사라진 것으로 읽히지만 **이 해석은 측정된 게 아니다** — 측정된 것은 숫자 두 개뿐이다.
+가중치 스트림이 레이어당 176 MB이므로 이 차이는 그대로 레이어 시간에 들어온다.
+
 ### 34.6 미증명·위험 — 각각 어떻게 답하는지
 
 | # | 항목 | 답하는 방법 |
 |---|---|---|
-| 1 | **uncached ION + 매핑 후 쓰기**를 DSP DMA가 본다 | §34.5 #1. 프로브는 cached·매핑 전만 증명했다 |
-| 2 | `rpcmem_alloc(…, flags=0)`이 ION을 준다(`isIon`) | 같은 테스트의 `alloc` 필드 |
+| 1 | ~~**uncached ION + 매핑 후 쓰기**를 DSP DMA가 본다~~ | **해결**. `checksum_ok=yes`, 게다가 38.84 GB/s로 cached보다 빠르다 |
+| 2 | ~~`rpcmem_alloc(…, flags=0)`이 ION을 준다~~ | **해결**. `alloc=ok`, `fd=14`, 매핑까지 성공 |
 | 3 | 파일 읽기 속도. B1a에서 ION으로 읽을 때 **0.31 GB/s** (178 MB에 583 ms). 3.9 GB면 12 s+ | `ensureArena`가 찍는 로드 GB/s. 느리면: 파일을 `mmap`해서 memcpy, 또는 파일 하나로 합치기 |
 | 4 | 해시 비용: FNV-1a 바이트 루프, weight당 ~1.8 MB, 1408개 | 프로파일 `register` 총합. 느리면 ops seam에 텐서 이름을 태워 이름으로 키잉 (`ponytail`) |
 | 5 | uncached 1 GiB 청크 ×4의 RSS | A5가 ARM QS4CX 사본을 떨어뜨리기 전까진 +3.9 GB. 측정 |
@@ -1993,8 +2012,8 @@ enum { ARENA_UNTRIED, ARENA_ON, ARENA_OFF } arena_state_ = ARENA_UNTRIED;
 
 ### 34.7 그 다음 (A4, A5)
 
-- **A4**: §34.5 둘 다 통과하고 실제 모델이 layer 2에서 아레나로 도는 것을 보면
-  `moe_htp_layers`를 22개 전부로. 첫 실행은 전부 miss(bake+export, 레이어당 ~1.6 s,
+- **A4**: §34.5는 통과했다. 실제 모델이 layer 2에서 아레나로 도는 것을 확인하면
+  `nntr_config.json`의 **`"moe_htp_layers": ""`** (빈 문자열 = 제한 없음, 헤더 주석대로). 첫 실행은 전부 miss(bake+export, 레이어당 ~1.6 s,
   총 ~35 s, 힙은 한 개씩) — 이게 변환이다. 두 번째 실행부터 hit. §32.5 예상 234 TPS.
 - **A5**: 아레나에 있는 weight의 ARM QS4CX 사본을 안 만든다. 로더 작업, 별도.
 
