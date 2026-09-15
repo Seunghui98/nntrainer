@@ -2035,3 +2035,80 @@ DSP 힙도 27–33이었다. uncached가 **+30%**다. DMA 읽기 쪽에서 캐�
 > `registerFromCache`, `exportToCache`)이 더 이상 참조되지 않게. 상수는 `<remote.h>`
 > 이름으로만. 다 되면 `./test/htp/run_u8i4_layer_on_device.sh` 명령과 §34.6 #1의
 > 두 가지 결과 각각에서 뭘 할지 알려줘. 기기 확인 전엔 "확인했다"고 하지 마.
+
+## 35. 런타임 변환을 없앤다 — 오프라인 WH (2026-09-15, 설계)
+
+§34는 **어디에** 가중치를 두느냐를 고쳤다(DSP 힙 → 호스트 아레나). 여전히 남은 것은
+**언제** WH로 굽느냐다: 지금은 첫 실행에 굽고 파일로 남긴다. 사용자 요구는 "캐싱 말고
+변환기가 처음부터 그 포맷으로 써라"이고, 이게 맞다 — 등록은 prefill의 48.2%이고
+그 전부가 이 변환이다.
+
+### 35.1 가능한 이유 — 벤더가 ARM 함수를 준다
+
+```c
+int sdkl_cpu_i4_rm_to_i4_wh(uint8_t* full_wt_tiled, int8_t* wt_old,
+                            size_t wt_rows, size_t wt_cols);   /* sdkl.h:1188 */
+```
+
+- 출력 크기 `((rows+31)/32)*((cols+31)/32)*512` = **`HtpWeightCache::whBytes`와 동일**
+- 입력 `int8_t` 하나에 i4 값 하나, sign-extended `[-8,+7]`, 행 우선 =
+  **`htp_qs4cx_from_packed`가 이미 만드는 버퍼**
+- `sdkl_npu_*`는 `domain`(CDSP 코어)을 받는데 이 함수는 **안 받는다** → ARM에서 돈다
+- `lib/6.4.0.2/`에 `armv8_android26`, `armv9_android26`, `armv8_qclinux` — `libsdkl.so`
+
+**x86 빌드는 없다.** 그래서 PC(x86) 양자화기가 직접 링크할 수는 없고, 갈림길이 생긴다.
+
+### 35.2 경로
+
+| | 변환 실행 위치 | 대가 |
+|---|---|---|
+| **A1-a** | ARM에서 벤더 함수 호출 (로드 시 또는 기기 변환 도구) | 폰/ARM 박스 필요. 로드 시라면 실행마다 비용 |
+| **A1-b** | 벤더 함수로 **니블 순열표를 한 번 뽑아** portable 코드로 심고 `quantize_stream.cpp`가 씀 | PC에서 변환 가능. 표가 ISA별로 다를 수 있음, 라이선스 판단 필요 |
+| B | 지금 인라인 변환을 명시적 1회 도구로 | 역공학·라이선스 판단 없음. PC 파이프라인에는 못 들어감 |
+
+**표가 뽑힌다는 근거**: 타일 하나 = 32×32 i4 = 1024 니블 = 512바이트 =
+`WEIGHT_TILE_BYTES_U8I4`. **정확히 일치한다 — 메타데이터가 들어갈 자리가 없다.**
+따라서 변환은 값을 바꾸지 않는 순수한 니블 bijection이다.
+
+### 35.3 1단계 — 구현 완료·미측정
+
+`libsdkl.so`는 `dlopen`한다(Android.mk 무변경, 없으면 skip). 실행 스크립트가
+`$HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/libsdkl.so`를 기기에 푸시한다.
+
+| 테스트 | 답하는 것 |
+|---|---|
+| `WhBakeMatchesSdklCpu` | ARM 함수 출력 == DSP bake 출력인가. 2048×3584(모델 최대 weight), `memcmp`. ARM 변환 시간·MB/s도 찍는다 |
+| `WhLayoutTable` | 32×32에서 한 원소만 7로 두고 1024번 호출 → `slot_of[1024]`. 모든 슬롯이 정확히 한 번 맞는지(= bijection) 검증하고 표를 32줄로 덤프. 이어서 64×64로 **타일 내부 순열이 타일마다 같은지**와 **타일 순서가 `kt*n_col_tiles+nt`인지** 확인 |
+
+1024번을 도는 이유: 위치 비트를 4비트 값에 욱여넣는 것보다 지루하고 확실하다.
+512바이트 변환 1024번은 밀리초다.
+
+### 35.4 표가 나온 뒤
+
+**닫힌 형태를 먼저 찾는다.** HMX 타일 레이아웃은 규칙적인 게 보통이고, 다섯 줄짜리
+인덱스 계산이 2 KB 데이터 블롭보다 낫다 — 그리고 서술된 알고리즘은 독점 라이브러리
+출력에서 파생한 데이터와 라이선스 성격이 다르다. 찾으면 `WhLayoutTable`은 표를 찍는
+대신 그 형태를 검증하는 테스트가 된다.
+
+그 다음: `quantize_stream.cpp`에 `QS4CX_WH` dtype(니블 WH 배치 + colsum 4N 추가),
+로드는 파일 → 아레나 → `register_arena`.
+
+### 35.5 이러면 지워지는 것
+
+| | 이유 |
+|---|---|
+| `HtpWeightCache` 전부 (해시·경로·store·listFiles) | 파일이 모델 옆에 있고 이름이 정해짐 |
+| `moveToArena`, `weight_bake_export`, DSP bake 경로 | 구울 게 없다 |
+| `htp_qs4cx_from_packed` 런타임 호출 | 변환기가 이미 했다 |
+| miss/hit 분기, `handle_cache_` 덮어쓰기 | 항상 hit |
+| `hexkl_weight_u8i4_check`의 VTCM 상한 | bake 스크래치용이었다 |
+
+남는 것: `ensureArena`(파일 → 아레나) + `register_arena`. 첫 실행 변환 지연도 없다.
+
+### 35.6 위험
+
+| | 완화 |
+|---|---|
+| 레이아웃이 ISA별로 다를 수 있다 (`lib/`에 v69–v81이 따로 있다) | bin 헤더에 ISA/HexKL 버전, 로더가 거부. 더해서 세션 열 때 32×32 타일 하나를 DSP가 굽고 표와 대조 — 1 ms, 조용히 잘못 곱하는 것보다 훨씬 싸다 |
+| 파생 표를 저장소에 커밋해도 되는가 | **내가 판단할 수 없다.** 닫힌 형태가 나오면 대체로 비켜간다. 아니면 A1-a |
+| ARM 변환이 느리면 A1-a가 로드 경로로는 못 쓴다 | `arm_convert_mbps`가 답한다 |
