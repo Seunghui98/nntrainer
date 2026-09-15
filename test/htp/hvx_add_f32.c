@@ -152,6 +152,24 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
       FARF(HIGH, "nntr_hvx_open: DCVS vote rejected (continuing)");
     }
+    /* The bus, separately from the core. The DCVS vote above raises the
+       DSP clock, and mm at 17.5 ns a tile says it holds; it says nothing
+       about DDR. The MoE layer's weight DMA measured 16-18 GB/s in situ
+       (doc 46 section 50.7) against 38.8 for the same arena in isolation,
+       and a decode token leaves the SoC mostly idle -- the bus is free to
+       clock down between 2 ms bursts. This asks for it at 40 GB/s, roughly
+       what the isolated probe reached. Same best-effort policy as above.
+       ponytail: an unconditional vote for the session's lifetime, which
+       is the measurement; if it is what moves DMA_FIRST, the product
+       shape is a vote around the layer call, or a lower figure. */
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_mips_bw;
+    req.mips_bw.set_bus_bw = 1;
+    req.mips_bw.bwBytePerSec = 40000000000ull;
+    req.mips_bw.busbwUsagePercentage = 100;
+    if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
+      FARF(HIGH, "nntr_hvx_open: bus bandwidth vote rejected (continuing)");
+    }
   }
 #endif
 
