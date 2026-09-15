@@ -1673,7 +1673,12 @@ private:
 
     const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
     uint32_t chunk = 0, off = 0;
-    if (!place(session, wh_len, wh_len, &chunk, &off)) {
+    // want = kArenaChunkMax, not wh_len: these weights arrive one at a time
+    // with no total to size a chunk from, and this model needs 3.9 GB across
+    // at most NNTR_HVX_MAX_ARENAS. A per-weight hint makes 256 MiB chunks and
+    // hits the 8-arena limit at 2 GiB (778 of 1408 weights); a full-size hint
+    // fills each 1 GiB chunk by bump before making the next, so 3.9 GB is 4.
+    if (!place(session, wh_len, kArenaChunkMax, &chunk, &off)) {
       throw std::runtime_error("HTP arena is full; cannot register a " +
                                std::to_string(K) + "x" + std::to_string(N) +
                                " weight");
@@ -1911,13 +1916,13 @@ private:
 
   /** @brief Allocates one uncached ION buffer and attaches it to the DSP.
    *  @note  Call with handle_mutex_ already held. */
+  static constexpr size_t kArenaChunkMax = size_t(1) << 30; // ION single-alloc
   bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
     static constexpr size_t kGrain = size_t(64) << 20;
     static constexpr size_t kMin = size_t(256) << 20;
-    static constexpr size_t kMax = size_t(1) << 30;
 
     size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
-    size = std::min(std::max(size, kMin), kMax);
+    size = std::min(std::max(size, kMin), kArenaChunkMax);
     if (size < bytes)
       return false; // one weight larger than a whole chunk: not this model
 
