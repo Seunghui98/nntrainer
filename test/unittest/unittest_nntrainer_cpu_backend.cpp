@@ -646,6 +646,53 @@ TEST(nntrainer_cpu_backend_standalone, wh_pack_unpacks_like_the_load_path) {
 }
 
 /**
+ * @brief whSourcePageRange never hands back a byte it was not given
+ *
+ * The HTP arena drops a weight's pages once the bytes are copied in, and
+ * every weight is a slice of ONE pool allocation shared with its neighbours.
+ * An off-by-one page here is not a crash, it is the neighbouring weight
+ * reading as zeros -- a silently wrong matmul. So the property under test is
+ * containment, checked on the shapes this model actually registers plus the
+ * degenerate ones.
+ */
+TEST(nntrainer_cpu_backend_standalone, wh_source_page_range_stays_inside) {
+  const size_t ps = 4096;
+  // A pool slice can start anywhere; 512 is the DSP's weight alignment and
+  // the smallest offset a real weight is likely to sit at.
+  const uintptr_t bases[] = {0x10000000u, 0x10000200u, 0x10000fffu};
+  const size_t lens[] = {
+    0u,       1u, ps - 1u, ps, ps + 1u,
+    1835008u, // 1792x2048 down, whBytes
+    3670016u  // 2048x3584 gate_up, the model's largest
+  };
+
+  for (uintptr_t base : bases) {
+    for (size_t len : lens) {
+      const void *src = reinterpret_cast<const void *>(base);
+      uintptr_t begin = 0;
+      size_t span = 0;
+      nntrainer::whSourcePageRange(src, len, ps, &begin, &span);
+      if (span == 0)
+        continue;
+      EXPECT_GE(begin, base) << "released below the weight";
+      EXPECT_LE(begin + span, base + len) << "released past the weight";
+      EXPECT_EQ(begin % ps, 0u) << "madvise needs a page-aligned start";
+      EXPECT_EQ(span % ps, 0u) << "madvise needs a whole number of pages";
+      // Whatever is dropped, at most one page at each end is not.
+      EXPECT_LE(len - span, 2u * ps) << "gave up more than the two end pages";
+    }
+  }
+
+  // A weight smaller than a page, or one that covers no whole page, releases
+  // nothing at all rather than guessing.
+  uintptr_t begin = 0;
+  size_t span = 0;
+  nntrainer::whSourcePageRange(reinterpret_cast<const void *>(0x10000200u),
+                               ps - 1u, ps, &begin, &span);
+  EXPECT_EQ(span, 0u);
+}
+
+/**
  * @brief htp_qs4cx_from_packed rearranges, it does not requantize
  *
  * A weight quantized once from FP32 straight into QS4CX and then handed to

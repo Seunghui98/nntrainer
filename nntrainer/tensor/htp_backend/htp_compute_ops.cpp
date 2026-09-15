@@ -48,7 +48,6 @@
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
-#include <htp_weight_cache.h>
 #include <htp_wh_layout.h>
 #include <swiglu_det.h>
 
@@ -67,6 +66,11 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <remote.h>
 
@@ -1639,6 +1643,45 @@ private:
   };
 
   /**
+   * @brief Hands the OS back the pages of a weight that is now in the arena.
+   *
+   * The arena copy doubles this model's 3.9 GB of expert weights, and the
+   * device refuses the fourth 1 GiB ION chunk long before the last layer
+   * registers (measured: 1170 of 1408 weights, doc 46 section 36.3). The ARM
+   * copy is dead the moment the memcpy above returns -- the matmul reads the
+   * arena -- so this drops it. MADV_DONTNEED rather than free() because every
+   * weight is a slice of ONE pool allocation that nobody may free piecemeal;
+   * see whSourcePageRange for why the range is rounded inward and why the
+   * pointer stays a valid handle_cache_ key afterwards.
+   *
+   * A read of these bytes after this point returns zeros, which would be a
+   * silently wrong matmul. Nothing reads them: the only other reader is the
+   * layer's per-expert CPU loop, and that path throws on a QS4CX_WH weight
+   * (FloatTensor::dot) rather than computing with zeros. Set
+   * NNTR_HTP_KEEP_ARM_WEIGHTS=1 to keep them anyway when bisecting a wrong
+   * answer -- the model then needs both copies resident.
+   */
+  void releaseArmSource(void *src, size_t len) {
+#if defined(__linux__)
+    static const bool keep =
+      std::getenv("NNTR_HTP_KEEP_ARM_WEIGHTS") != nullptr;
+    if (keep)
+      return;
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0)
+      return;
+    uintptr_t begin = 0;
+    size_t span = 0;
+    whSourcePageRange(src, len, static_cast<size_t>(ps), &begin, &span);
+    if (span != 0)
+      madvise(reinterpret_cast<void *>(begin), span, MADV_DONTNEED);
+#else
+    (void)src;
+    (void)len;
+#endif
+  }
+
+  /**
    * @brief Registers a weight the offline quantizer already put in WH
    *        layout, by copying it into the arena as-is.
    *
@@ -1708,10 +1751,12 @@ private:
                                std::to_string(K) + "x" + std::to_string(N) +
                                " WH weight");
     }
-    // Not put in arena_index_: that index exists to find a weight by its
-    // cache path, and these weights have none -- handle_cache_ already
-    // answers the only question asked about them, which is whether this
-    // pointer was registered before.
+    // Only now: e.w_scale and e.colsum_w are already copies, so the source
+    // buffer -- whose scales sit just past the nibbles -- has no reader left.
+    releaseArmSource(matAdata, wh_len);
+    // Still a usable key after releaseArmSource: the pages went, the mapping
+    // did not, so no later allocation can take this address and turn a miss
+    // into a hit on somebody else's weight.
     handle_cache_.emplace(matAdata, handle);
     return handle;
   }
@@ -1726,34 +1771,11 @@ private:
 
     const uint64_t t_begin = HtpProfile::nowUs();
 
-    // A hit skips all three of the expensive things: the QS4CX conversion,
-    // the DSP's RM->WH bake, and the DSP-heap copy the baked bytes used to
-    // live in. The weight is registered where it already sits, in a host
-    // buffer the DSP mapped once (doc 46 section 34).
-    const bool arena = ensureArena(session);
-    const HtpWeightCache &wc = HtpWeightCache::global();
-    std::string cache_path;
-    uint64_t src_hash = 0;
-    if (arena) {
-      // The SOURCE bytes are hashed, not the converted ones, so a hit
-      // avoids the conversion too -- scale and colsum come out of the file.
-      const size_t src_bytes = static_cast<size_t>(N) * ((K + 1u) / 2u);
-      src_hash = htpWeightHash(matAdata, src_bytes);
-      src_hash ^= htpWeightHash(matAscale, sizeof(float) * N);
-      cache_path = wc.path(K, N, src_hash);
-      auto ai = arena_index_.find(cache_path);
-      if (ai != arena_index_.end()) {
-        const uint32_t handle =
-          registerFromArena(session, ai->second, K, N, t_begin);
-        if (handle != kNoHandle) {
-          handle_cache_.emplace(matAdata, handle);
-          return handle;
-        }
-        // Fall through and bake. A weight the DSP would not take from the
-        // arena is not a reason to fail the model load.
-      }
-    }
-
+    // Convert on the host, bake on the DSP, keep the baked bytes on the DSP
+    // heap: the 1.89 GB ceiling Gate 0 measured, and the reason QS4CX_WH
+    // exists. A QS4CX model that fits under it still runs this way; one that
+    // does not has to be quantized as QS4CX_WH, which needs no conversion,
+    // no bake, and no DSP heap at all (doc 46 section 35).
     HtpRpcBuffer q_w4_i8(static_cast<size_t>(K) * N);
     std::vector<float> w_scale(N);
     std::vector<int32_t> colsum_w(N);
@@ -1763,24 +1785,8 @@ private:
                           w_scale.data(), colsum_w.data());
     const uint64_t convert_us = HtpProfile::nowUs() - t_convert;
 
-    const uint32_t heap_handle = register_locked(
-      matAdata, session, K, N, q_w4_i8, w_scale, colsum_w, t_begin, convert_us);
-    if (!arena)
-      return heap_handle;
-
-    // This is the conversion, and it happens inline rather than in a mode
-    // of its own: a run that finds no file bakes, writes one, and moves the
-    // result into the arena, so the next run finds it. The DSP-heap copy is
-    // released immediately, which is what keeps at most one weight there
-    // and lifts the 1.89 GB ceiling Gate 0 hit.
-    const uint32_t arena_handle = moveToArena(
-      session, wc, cache_path, src_hash, K, N, heap_handle, w_scale, colsum_w);
-    if (arena_handle == kNoHandle)
-      return heap_handle;
-
-    nntr_hvx_weight_release_u8i4(session, heap_handle);
-    handle_cache_[matAdata] = arena_handle;
-    return arena_handle;
+    return register_locked(matAdata, session, K, N, q_w4_i8, w_scale, colsum_w,
+                           t_begin, convert_us);
   }
 
   /** @brief Sentinel for "the cache did not have it"; a real handle is a
@@ -1788,101 +1794,27 @@ private:
   static constexpr uint32_t kNoHandle = 0xFFFFFFFFu;
 
   /**
-   * @brief Maps the arena and fills it from the converted model, once.
+   * @brief Decides, once, whether weights can be registered out of the arena.
+   *
+   * Nothing is mapped here: the first weight's place() makes the first chunk.
+   * All this answers is whether this device gives out the two calls an arena
+   * is made of -- an fd for a host buffer and a way to attach it.
    *
    * @return true if weights can be registered out of the arena. false means
-   *         the ordinary DSP-heap path, which still works -- it just has
-   *         the 1.89 GB ceiling Gate 0 measured.
+   *         the ordinary DSP-heap path, which still works for QS4CX -- it
+   *         just has the 1.89 GB ceiling Gate 0 measured -- and which
+   *         get_or_register_wh refuses, because WH bytes have no other home.
    * @note   Call with handle_mutex_ already held.
    */
   bool ensureArena(remote_handle64 session) {
+    (void)session;
     if (arena_state_ != ARENA_UNTRIED)
       return arena_state_ == ARENA_ON;
-    arena_state_ = ARENA_OFF;
 
-    const HtpWeightCache &wc = HtpWeightCache::global();
     const HtpRpcMemApi &api = HtpRpcMemApi::get();
-    // The arena is a mapped host buffer, so all it needs is a way to get an
-    // fd and a way to attach one. A converted-model directory is a separate
-    // thing -- it only pre-fills the arena for the QS4CX conversion cache;
-    // QS4CX_WH weights come in through get_or_register_wh with no cache at
-    // all -- so it must NOT gate the arena, or a WH model with no
-    // NNTR_HTP_WEIGHT_CACHE set is refused an arena it does not need one for.
-    if (api.to_fd == nullptr || api.mmap == nullptr)
-      return false;
-
-    // Headers first, so the chunks can be sized to what is actually there
-    // rather than grown 256 MB at a time into the eight-arena limit. Skipped
-    // wholesale when there is no cache directory.
-    struct Pending {
-      std::string path;
-      HtpWeightCacheHeader hdr;
-    };
-    std::vector<Pending> pending;
-    size_t total = 0;
-    if (wc.enabled()) {
-      for (const std::string &path : wc.listFiles()) {
-        std::FILE *f = std::fopen(path.c_str(), "rb");
-        if (f == nullptr)
-          continue;
-        Pending p{};
-        p.path = path;
-        if (wc.readHeader(f, p.hdr)) {
-          total += p.hdr.wh_len;
-          pending.push_back(p);
-        }
-        std::fclose(f);
-      }
-    }
-
-    const uint64_t t0 = HtpProfile::nowUs();
-    size_t loaded = 0, remaining = total;
-    for (const Pending &p : pending) {
-      uint32_t chunk = 0, off = 0;
-      if (!place(session, p.hdr.wh_len, remaining, &chunk, &off))
-        break; // out of arenas or out of ION; keep what is already placed
-      std::FILE *f = std::fopen(p.path.c_str(), "rb");
-      if (f == nullptr)
-        continue;
-      HtpWeightCacheHeader hdr{};
-      ArenaEntry e;
-      e.chunk = chunk;
-      e.off = off;
-      e.K = p.hdr.K;
-      e.N = p.hdr.N;
-      const bool ok =
-        wc.readHeader(f, hdr) && hdr.wh_len == p.hdr.wh_len &&
-        wc.readPayload(f, hdr, arena_chunks_[chunk].buf->data() + off,
-                       e.w_scale, e.colsum_w, e.bias);
-      std::fclose(f);
-      // A short or unreadable file leaves its bytes unused rather than
-      // reclaimed. Rewinding the bump pointer would mean tracking whether
-      // anything else was placed since, for a case that costs one weight's
-      // worth of a 1 GiB chunk.
-      if (ok) {
-        arena_index_.emplace(p.path, std::move(e));
-        loaded += p.hdr.wh_len;
-      }
-      remaining -= p.hdr.wh_len;
-    }
-
-    // Reading 3.9 GB is the one part of this whose cost is not yet measured
-    // (doc 46 section 34.6 item 3): the cache path read 178 MB at 0.31 GB/s,
-    // and if that rate holds here it is twelve seconds of model load.
-    const uint64_t us = HtpProfile::nowUs() - t0;
-    if (HtpProfile::global().level() != 0) {
-      std::printf("[HTP] arena: %zu weights, %.2f GB, %llu chunks, %.2f s "
-                  "(%.2f GB/s)\n",
-                  arena_index_.size(), loaded / 1e9,
-                  static_cast<unsigned long long>(arena_chunks_.size()),
-                  us / 1e6,
-                  us > 0 ? loaded / static_cast<double>(us) / 1e3 : 0.0);
-    }
-
-    // On even with nothing loaded: the first miss makes a chunk, and that
-    // is how an empty directory becomes a converted model.
-    arena_state_ = ARENA_ON;
-    return true;
+    arena_state_ =
+      (api.to_fd != nullptr && api.mmap != nullptr) ? ARENA_ON : ARENA_OFF;
+    return arena_state_ == ARENA_ON;
   }
 
   /**
@@ -1990,55 +1922,6 @@ private:
     return handle;
   }
 
-  /**
-   * @brief Exports a freshly baked weight, writes it to the converted
-   *        model, copies it into the arena and registers it there.
-   *
-   * @return the arena handle, or kNoHandle -- in which case the caller
-   *         keeps the DSP-heap one it already has. Best effort throughout:
-   *         none of these failures is worth failing a model load over.
-   * @note   Call with handle_mutex_ already held.
-   */
-  uint32_t moveToArena(remote_handle64 session, const HtpWeightCache &wc,
-                       const std::string &path, uint64_t src_hash, uint32_t K,
-                       uint32_t N, uint32_t heap_handle,
-                       const std::vector<float> &w_scale,
-                       const std::vector<int32_t> &colsum_w) {
-    const uint32_t wh_len = HtpWeightCache::whBytes(K, N);
-    uint32_t chunk = 0, off = 0;
-    if (!place(session, wh_len, wh_len, &chunk, &off))
-      return kNoHandle;
-
-    // Straight into the arena: the DSP writes the baked bytes where they
-    // will live, and the file is written from there. One copy, not two.
-    uint8_t *dst = arena_chunks_[chunk].buf->data() + off;
-    if (nntr_hvx_weight_bake_export(session, heap_handle, dst,
-                                    static_cast<int>(wh_len)) != AEE_SUCCESS)
-      return kNoHandle;
-
-    ArenaEntry e;
-    e.chunk = chunk;
-    e.off = off;
-    e.K = K;
-    e.N = N;
-    e.w_scale = w_scale;
-    // ponytail: store() reads those bytes back out of uncached memory, which
-    // is the slowest direction this design has. It is paid once per weight
-    // on the run that converts, and never again. If conversion turns out to
-    // be unbearable, export into a heap buffer, write the file from it and
-    // memcpy into the arena -- two copies, but no uncached reads.
-    e.colsum_w = colsum_w;
-    e.bias.assign(N, 0.0f); // FC weights carry no bias tensor
-    wc.store(path, K, N, src_hash, dst, e.w_scale.data(), e.colsum_w.data(),
-             e.bias.data());
-
-    const uint32_t handle = registerFromArena(session, e, K, N, /*t_begin=*/0);
-    if (handle == kNoHandle)
-      return kNoHandle;
-    arena_index_.emplace(path, std::move(e));
-    return handle;
-  }
-
   /** @brief Register a converted weight and cache its handle.
    *  @note  Call with handle_mutex_ already held.
    *  @param t_begin   caller's start timestamp, for the profile's
@@ -2080,9 +1963,6 @@ private:
   std::unordered_map<const void *, uint32_t> handle_cache_;
 
   std::vector<ArenaChunk> arena_chunks_;
-  /** Keyed by the cache path, which already encodes shape and source hash,
-   *  so two weights never collide and a hit is a hit on these exact bytes. */
-  std::unordered_map<std::string, ArenaEntry> arena_index_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
 

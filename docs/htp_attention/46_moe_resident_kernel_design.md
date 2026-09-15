@@ -750,7 +750,7 @@ weight는 **DDR→VTCM**이라 경로가 다르다. A4가 확정한다. 게이�
 
 `MOE_N_STAGES` 12 → **15**. `./test/htp/build.sh` 필수.
 
-## 20. B1a — 구운 WH 바이트 캐시 (2026-09-14, 코드 완료·미측정)
+## 20. B1a — 구운 WH 바이트 캐시 (2026-09-14, 코드 완료·미측정) — **폐기됨, §37.4**
 
 §18.2가 registration 2297 ms를 제거했다고 **가정**한 표를 냈다. 이건 그 가정을
 실제로 만드는 작업이다.
@@ -1864,7 +1864,7 @@ adb shell "cd /data/local/tmp/htp_u8i4_layer_test && LD_LIBRARY_PATH=. ADSP_LIBR
 
 → `run_u8i4_layer_on_device.sh`를 커널 변경마다 돌린다. 1초짜리 필터가 있다.
 
-## 34. 아레나 구현 설계 — 인계 (2026-09-14)
+## 34. 아레나 구현 설계 — 인계 (2026-09-14) — 아레나는 살아 있고, **캐시 부분은 폐기됨 (§37.4)**
 
 A1·A2·A3를 하나로 합친다. 별도의 변환 모드도, 캐시 파일을 DSP 힙으로 다시 복사하는
 경로도 없다. **DSP 힙에 가중치를 상주시키는 경로 자체를 없앤다.**
@@ -2282,3 +2282,80 @@ A5: 아레나로 옮긴 뒤 ARM 텐서 버퍼를 해제. 안전하게 하려면 
 A5 + decode 라우팅을 하나로 설계한다: 레이어가 첫 등록에서 핸들을 받아 저장하고
 ARM expert 텐서를 해제, 이후 prefill/decode 둘 다 prebound invoke로 그 핸들을 쓴다.
 그때까지 prefill TPS 숫자는 못 읽는다(OOM이 먼저다). 등록 비용 자체는 위에서 확정.
+
+## 37. A5 + decode 라우팅 + 캐시 삭제 (2026-09-15, 코드 완료·기기 미측정)
+
+§36.4가 예고한 변경인데, §36.2가 세웠던 설계는 **틀렸다**. 구현하면서 전제 하나가
+깨졌고, 그 덕에 더 작은 코드로 끝났다.
+
+### 37.1 깨진 전제 — weight는 하나씩 해제할 수 없다
+
+§36.2는 "아레나로 옮긴 뒤 ARM 텐서 버퍼를 해제"라고 썼다. 그게 안 된다.
+
+`TensorPool`은 weight 전체를 **한 덩어리**로 잡는다 — `MemoryPool::allocate()`가
+`aligned_alloc(page, 3.9 GB)` 한 번을 부르고, weight마다 그 안의 offset을 슬라이스로
+나눠준다(`memory_ptrs[i] = mem_pool + memory_offset[i]`). 그래서
+`QS4CX_Tensor::deallocate()`는 `data = nullptr`만 하고 **한 바이트도 반납하지 않는다**.
+개별 free는 애초에 불가능하다(이웃 weight가 같은 할당 안에 있다).
+
+그러면 남는 건 하나뿐이다: **페이지를 반납한다.** 복사 직후
+`madvise(MADV_DONTNEED)`. 물리 페이지는 즉시 OS로 가고, 매핑과 포인터는 그대로
+살아 있다.
+
+그 부수효과가 §36.2가 "신중히 설계한다"고 미뤄뒀던 위험을 **없앤다**:
+`handle_cache_`가 포인터를 키로 쓰는데, 해제된 주소가 재사용되면 거짓 히트 →
+조용히 틀린 출력이었다. 매핑이 안 없어지므로 그 주소를 다른 할당이 가져갈 수 없다.
+**레이어 상태도, prebound invoke도, 핸들 저장도 필요 없다.** 기존 포인터 캐시가
+그대로 맞다.
+
+### 37.2 구현
+
+- `whSourcePageRange(src, len, page_size, &begin, &span)` (`htp_wh_layout.h`) —
+  **안쪽으로** 자른다. weight의 첫/마지막 부분 페이지는 이웃과 공유하므로, 거기를
+  버리면 크래시가 아니라 이웃 weight가 0으로 읽히는 **조용히 틀린 행렬곱**이 된다.
+  양끝 최대 한 페이지씩 포기하고, 제일 작은 weight가 1.8 MB다.
+- `HtpComputeOps::releaseArmSource()` — `get_or_register_wh`의 memcpy와 등록이
+  끝난 뒤 호출. `NNTR_HTP_KEEP_ARM_WEIGHTS=1`이면 안 한다(틀린 답 이분할용).
+  `e.w_scale`/`e.colsum_w`가 이미 복사본이라 scale도 읽을 사람이 없다.
+- 피크가 두 벌(7.8 GB)에서 **한 벌 + 슬랙**으로 내려간다: weight i를 복사하는
+  시점에 상주 = (풀 3.9 GB − 이미 반납한 i개) + (아레나 i개) ≈ 3.9 GB.
+
+### 37.3 decode 라우팅
+
+`total_tokens > 1` 게이트를 호출부에서 `tryMoeLayerOnAccelerator` **안으로** 옮기고
+`&& !weights_wh`를 붙였다. 게이트의 원래 근거는 "M==1은 64행 패드를 상쇄 못 한다"인데,
+그건 **더 느린 쪽과 더 빠른 쪽 중 고르는** 판단이다. QS4CX_WH에는 고를 ARM 쪽이 없다
+(§35.5의 `FloatTensor::dot` throw). 거기서 게이트는 "느린 길" 대신 "throw"를 고른다.
+
+ponytail: decode가 레이어 커널로 가면 활성 expert마다 M=1을 64행으로 패딩한다.
+맞는 답이고 이 weight로는 유일한 선택지다. decode TPS가 문제가 되면 decode 전용 커널,
+또는 grouped-decode gather를 DSP로 옮기는 것이 업그레이드 경로다.
+
+### 37.4 캐시 삭제 — 모델 바이너리를 두 번 저장하지 않는다
+
+§20.2/§34의 `NNTR_HTP_WEIGHT_CACHE`는 **플래시에 모델을 한 벌 더 쓴다**(3.9 GB의
+`wh_*.bin`). QS4CX_WH에서는 `.bin` 자체가 이미 최종 포맷이라 그 디렉터리는 순수
+중복이다. §35.5b가 예고한 삭제를 했다:
+
+- 삭제: `htp_weight_cache.h`, `test/htp/host/weight_cache_host_check.cpp`,
+  `moveToArena`, `arena_index_`, `get_or_register_qs4cx`의 히트/미스 분기,
+  `ensureArena`의 캐시 적재 루프(이제 rpcmem API 유무만 본다).
+- 남김: IDL의 `weight_bake_export`. 런타임은 안 쓰지만 기기 테스트
+  (`WhPackReferenceMatchesDspBake`)가 WH 레이아웃을 그걸로 검증한다 — §35.3b의
+  그 검사는 계속 통과해야 한다.
+- 대가: 순수 QS4CX(비-WH) 모델은 아레나를 못 쓰고 DSP heap의 1.89 GB 천장으로
+  돌아간다. 그 천장을 넘는 모델은 QS4CX_WH로 양자화하면 된다 — 변환도 bake도
+  DSP heap도 없는 쪽이다.
+
+### 37.5 검증 상태
+
+호스트에서 확인한 것:
+- `wh_source_page_range_stays_inside` (신규, gtest) — 실제 등록 shape
+  (1792×2048, 2048×3584)과 경계값에서 **준 범위 밖으로 안 나간다**, 페이지 정렬,
+  양끝 손실 ≤ 2페이지. 통과.
+- `wh_pack_unpacks_like_the_load_path` 통과, `run_host_checks.sh` ALL CHECKS PASS,
+  `tools/htp_syntax_check.sh` 통과, 호스트 전체 빌드 통과.
+
+**기기에서 확인 안 된 것 — 전부:** madvise가 실제로 피크를 내리는지, 1408/1408이
+등록되는지, decode가 M==1로 도는지, 출력 텍스트가 맞는지, prefill/decode TPS.
+CPU 폴백이 없으므로 레이아웃이 어긋나면 실패가 아니라 **틀린 텍스트**로 나타난다.
