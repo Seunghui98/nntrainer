@@ -1985,6 +1985,9 @@ enum { ARENA_UNTRIED, ARENA_ON, ARENA_OFF } arena_state_ = ARENA_UNTRIED;
 arena_uncached: fastrpc_mmap_rc=0x0  hap_mmap_get_rc=0x0
                 dma_gbs=38.84  checksum_ok=yes
 arena_moe:      bad_elems=0 of 131072
+                detach_while_borrowed=0x8000040d (AEE_EBADSTATE)
+                released=8 of 8   first_release_err=none
+                detach_after_release=0x0
 ```
 
 | | 답 |
@@ -1992,6 +1995,13 @@ arena_moe:      bad_elems=0 of 131072
 | **uncached + 매핑 후 쓰기를 DSP가 보는가** (§34.6 #1) | **본다.** §34의 유일한 미증명 전제가 해소됐다. 후퇴 계획은 불필요 |
 | **빌려온 가중치가 힙 사본과 같은가** | **비트 단위로 같다.** 131072개 전부 |
 | **아레나 → VTCM 대역폭** | **38.84 GB/s** |
+| **빌린 슬롯이 살아있으면 detach가 막히는가** | **막힌다.** `AEE_EBADSTATE`. 해제 후엔 8/8 release 성공하고 detach도 성공 |
+
+한 라운드를 커널이 아니라 **테스트 상수**에 썼다: DSP는 `0x8000040d`를 돌려줬는데 테스트가
+`13`을 기대했다. `AEEStdErr.h`가 `__hexagon__`일 때만 모든 코드에 `0x80000400`을 더하고,
+`AEE_SUCCESS`만 양쪽 0이라 이 파일의 다른 모든 검사가 그것만 비교하고 있었다.
+`unittest_hvx_softmax.cpp`·`unittest_hvx_attn.cpp`에 `kDspOffset`이 이미 있었다 — 새로
+만들 게 아니라 찾았어야 했다.
 
 **예상 못 한 것: uncached가 cached보다 빠르다.** Gate 0c의 cached 아레나는 29.96 GB/s였고
 DSP 힙도 27–33이었다. uncached가 **+30%**다. DMA 읽기 쪽에서 캐시 코히런시 스누핑이
