@@ -801,3 +801,14 @@ claim된다(의존성 = 큐 순서, 유닛 안에서 spin 없음). `hvx_bg_job`�
 
 decode 16.7–17.0 TPS: O1은 decode 경로를 안 바꾼다(꼬리 없음). 같은 세션에서 O1 전에도
 16.2–20.1로 흔들렸으니 발열/편차로 본다. transport 570 vs 447은 그 쪽 징후.
+
+### 20.4 §20.1의 3번(acc_read 숨기기) — **닫힘**
+
+빌드 머신의 `hexkl_micro.h`(2026-09-16) `hexkl_micro_hmx_*` 목록: lock/unlock, config_size,
+setup_acc_read_{int32,f16}, acc_clear_{int32,f16}, acc_read_{int32,f16}, mm_{u8i8,u8i4,f16},
+ah_to_rm/rm_to_ah_f16, rm_to_wh_{i8,i4,f16}, copy_* 계열. accumulator를 고르는 인자도, 비동기
+읽기도 없다. HMX가 두 벌을 갖고 있더라도 이 API로는 못 쓴다. acc_read 2.8 ms/콜은 mm 8.5와
+함께 이 커널의 바닥(콜당 11.3 ms)이다.
+
+**FFN 범위 안에 남은 것:** O4·O3·첫 콜 워밍업·gather ≈ −0.9 ms/콜(−20 ms). 그 밖은 §20.1의
+10번(청크 파이프라인, −200~−300)뿐이며 이건 커널이 아니라 앱의 실행 순서 문제다.
