@@ -557,3 +557,46 @@ conv_out_proj(2048×2048)는 거기서도 졌다.
 +3.5 ms/token > prefill −94 ms는 512 토큰 생성에서 손해). T 레버는 "prefill 8 / decode 4"
 로 단계별로 바꿀 수 있을 때만 −90 ms이고, 그 전에 big 코어 4개에 고정하는 게 같은 값을
 공짜로 줄 수도 있다(미측정).
+
+## 16. prefill 레버 목록 v2 (2026-09-16, §15의 실측 반영) — 이것만 보면 된다
+
+기준: 비프로파일 1180 ms / 444 토큰 / 376 TPS. 구성(프로파일 표에서, ms):
+
+```
+HTP MoE 콜 22        438   (19.9/콜: HMX 11.8 구조비 + transport 2.4 + 에필로그 노출 ≈5.7)
+MoE ARM 쪽 22        262–276  ← 정체 미측정. 스레드 수에 안 움직였다(714→700)
+fully_connected     472–482  = conv_in_proj 152–212 + dense FFN(l0,l1) 66–98 + conv_out_proj 76–110 + attn q/k/v/o ≈140
+mha_core 6           88–116  (layer2가 34–55: 첫 콜?)
+lm_head twin 빌드     64–69  → 로드 시점으로 옮김 (b616248, 미측정)
+norm/mul/split/add   ≈70
+```
+
+코드에서 확인한 것 두 가지(`lfm2_moe_layer.cpp:762-824`): HTP 경로에서도 ①
+`output.setZero()` 3.6 MB를 하고(커널이 다시 zero-fill한다) ② prefill 워크스페이스
+Tensor 4개를 만든다 — `FloatTensor`의 `new float[n]{}`는 **zero-fill**이라 4–17 MB
+memset + page fault를 층마다 내고 안 쓴 채 버린다. 둘 다 `tryMoeLayerOnAccelerator`
+뒤로 옮기면 된다. 이것이 12 ms/층 전부인지는 M0가 말한다(staging memcpy는 아니다:
+`[HTP-PROFILE] arm staging memcpy` 총 20 ms/실행, prefill 몫 ≈10).
+
+| 순위 | 레버 | 기대 (ms) | 코드 | 상태·근거 |
+|---|---|---:|---|---|
+| 0 | **M0 측정**: `num_to_generate: 1` + `NNTR_M0_PROFILE=1 NNTR_HTP_PROFILE=2` | E의 크기를 정함 | 0 | 표 없이 E를 고르면 추측 |
+| 1 | **E0 lm_head twin을 로드로** | **−52** (프로파일 −64) | 커밋 b616248 | 앱 재빌드 후 `output_of_causallm` max가 2–5 ms면 확인 |
+| 2 | **E1 MoE ARM: setZero·워크스페이스를 가속 실패 뒤로** | −10 ~ −40 (memset·fault 몫) | 두 블록 이동 | 코드로 확정된 낭비. M0의 `setup`·`wksp`가 값을 준다 |
+| 3 | **E2 MoE ARM 나머지** (router dot·topk·`other`) | 12 ms/층 중 E1 뺀 만큼, 최대 **−200** | M0 결과에 따라 소~중 | attn 층 뒤(24 ms)와 conv 층 뒤(31–37)가 다른 이유도 여기서 |
+| 4 | **F1 conv_in_proj 18층을 HTP로** | −100 ~ −155 (ARM 152–212 → HTP ≈55: 36 계산 + 15 staging) | 큼: bake→아레나 144 MiB(in_proj 113 MB)→`engine=htp` 배선 | FC 가속 경로(문서 34)는 있다. decode는 CPU 유지 |
+| 5 | **O1 꼬리 블록을 HVX GEMV로** (§14) | −75 (3.4/콜) | 큼 — decode GEMV와 같은 커널 | HMX 13.6 블록의 252 us 고정비 제거. 비트동일 |
+| 6 | O2+O3+O4 (quant 분할·2블록 겹침·requant 스캔 융합) | −45 (2.1/콜) | 중 | §14 표 |
+| 7 | **T 스레드 8 (prefill만)** | −94 | 단계별 스레드 수 (작음) 또는 big 코어 고정 | §15.4: 전역 8은 decode +3.5 ms/token이라 불가 |
+| 8 | mha layer2 첫 콜 34–55 ms의 정체 | −20 ~ −40 | 아마 첫 콜 할당 → 로드로 | 나머지 5층은 8–15 |
+| 9 | A mha_core 6층을 HTP로 (`hexkl_attn_u8`) | −40 ~ −60 | 큼 (문서 45 Phase C) | 8 뒤에 |
+| 10 | F3 dense FFN l0/l1을 HTP로 (`gemm_qs4cx_fused_swiglu` 경로 있음) | −50 ~ −70 | 중 — 가중치 44 MB, F1과 아레나 경합(113+44 > 144) | F1과 택일 또는 아레나 재배치 |
+| 11 | N norm·multiply·split 융합 | −20 ~ −30 | 중 (그래프) | 낮음 |
+| 12 | K3 transport 2.4/콜 (residual을 DSP에) | −30 ~ −50 | 큼 (문서 45 Phase D) | |
+| — | F2 conv_out_proj·attn proj를 HTP로 | −130 | — | DSP 주소공간 없음 (§13.2) |
+| — | C 활성화 u8 (ARM) | −53 | — | **보류** (사용자) |
+| — | 청크 prefill로 ARM/DSP 겹치기 | ? | — | 패딩 +58%로 손해 가능성. 산술 뒤 |
+
+**순서:** 0 → 1·2(같은 빌드에서 측정) → 3 → 4 → 5·6 → 7·8. 1–3이 다 먹으면 1180 →
+≈900(≈490 TPS), 4까지 ≈770(≈575), 5·6까지 ≈650(≈680). 숫자는 기대이고 매 단계 측정으로
+갱신한다.
