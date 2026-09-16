@@ -812,3 +812,16 @@ ah_to_rm/rm_to_ah_f16, rm_to_wh_{i8,i4,f16}, copy_* 계열. accumulator를 고�
 
 **FFN 범위 안에 남은 것:** O4·O3·첫 콜 워밍업·gather ≈ −0.9 ms/콜(−20 ms). 그 밖은 §20.1의
 10번(청크 파이프라인, −200~−300)뿐이며 이건 커널이 아니라 앱의 실행 순서 문제다.
+
+## 22. 작은 것들 — O4 · gather · 첫 콜 워밍업 (코드 완료 · 기기 미측정)
+
+| | 무엇 | 기대 |
+|---|---|---:|
+| **O4** | requant의 스캔(행 min/max) 제거: 융합 SwiGLU 에필로그 워커가 자기 열의 행 극값을 벡터로 추적해 워커별 부분 배열(`hvx_dq_swiglu_job::rmin/rmax`)에 남기고, main이 배치를 retire할 때마다 접는다. 파라미터는 스캔이 부르던 같은 함수 `hvx_quant_row_params_from_minmax`로 계산 → **바이트 동일**. 블록당 pool_run 하나(스캔)가 사라진다 | −0.3~−0.45 ms/콜 |
+| **gather** | 같은 expert의 다음 블록 활성화 DMA를 그 블록 시작이 아니라 현재 블록의 gate_up이 A를 놓는 시점에 큐잉 — requant·down 뒤에 숨는다 | −0.2 ms/콜 |
+| **워밍업** | `Transformer::repack_weight`가 첫 lfm2_moe HTP 레이어의 등록 뒤 M=512, expert당 64행의 더미 콜 1회. 스크래치 성장·페이지 첫 접촉·FastRPC 버퍼 첫 접촉·DSP 첫 콜 준비가 로드로 간다 | 첫 prefill −10 ms |
+| O3 | **안 함**: requant를 비동기 잡으로 쪼개고 VTCM에 gate/mid 한 벌을 더 두는 데 비해 −8 ms. 풀 간섭(§21.1)을 다시 부를 구조 | — |
+
+합 ≈ −0.5~−0.65 ms/콜 + 10 ms → prefill **−20~−25 ms**, 924 → ≈900. 호스트 검사: 스캔 파라미터와
+접은 파라미터가 행마다 같음(디버그 대조), 참조 mismatch 0. 볼 것: `requant`(1248 → ≈900),
+`gather`(228 → ≈50), 텍스트 동일, 첫 prefill의 layer2 노드(프로파일 빌드면).
