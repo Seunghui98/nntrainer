@@ -188,14 +188,14 @@ decode도 강제로 NPU를 탄다 — 20 TPS(CPU 전용이던 때 35).
 ```mermaid
 flowchart LR
   subgraph ARM["ARM (CPU)"]
-    A1[RMSNorm 출력<br/>x: 444 × 2048 f32] --> A2[라우터<br/>x·W_gate → sigmoid+bias → top-4]
-    A2 --> A3[expert별 행 목록<br/>row_index / row_count / row_weight]
-    A3 --> A4[활성화 staging memcpy<br/>3.6 MB → rpcmem]
-    A4 --> A5[FastRPC 호출<br/>nntr_hvx_mm_u8i4_moe_layer]
-    A7[출력 memcpy<br/>rpcmem → Tensor 3.6 MB] --> A8[residual add]
+    A1["RMSNorm 출력<br/>x: 444 × 2048 f32"] --> A2["라우터<br/>x·W_gate → sigmoid+bias → top-4"]
+    A2 --> A3["expert별 행 목록<br/>row_index / row_count / row_weight"]
+    A3 --> A4["활성화 staging memcpy<br/>3.6 MB → rpcmem"]
+    A4 --> A5["FastRPC 호출<br/>nntr_hvx_mm_u8i4_moe_layer"]
+    A7["출력 memcpy<br/>rpcmem → Tensor 3.6 MB"] --> A8["residual add"]
   end
   subgraph DSP["DSP (HTP: HVX 4스레드 + HMX + VTCM 8 MiB)"]
-    D1[커널: 32 expert 전부<br/>한 콜에 처리] --> D2[out 3.6 MB]
+    D1["커널: 32 expert 전부<br/>한 콜에 처리"] --> D2["out 3.6 MB"]
   end
   A5 --> D1
   D2 --> A7
@@ -208,22 +208,23 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  S0[입력 f32 3.6 MB<br/>DMA로 힙에 복사] --> S1[행별 scan<br/>min/max → scale, zp]
-  S1 --> S2[pack: f32 → u8 AH 타일<br/>expert 순서(slot)로<br/>백그라운드 레인, 16행 유닛]
-  S2 --> E["expert e (활성 32개 순서대로)"]
-  subgraph E["expert e"]
+  S0["입력 f32 3.6 MB<br/>DMA로 힙에 복사"] --> S1["행별 scan<br/>min/max → scale, zp"]
+  S1 --> S2["pack: f32 → u8 AH 타일<br/>expert 순서(slot)로<br/>백그라운드 레인, 16행 유닛"]
+  S2 --> W1
+  S2 --> W2
+  subgraph EXP["expert e (활성 32개 순서대로)"]
     direction TB
-    W1[DMA: gate_up 3.5 MB<br/>쌍 청크 4개<br/>이전 expert의 down 중에 미리] --> H1
-    W2[DMA: 활성화 64행 블록 128 KB] --> H1
-    H1[HMX gate_up<br/>배치 = 16쌍 × 64 k타일<br/>acc → staging A/B 교대] --> P1
-    P1[워커 3개: dequant + SwiGLU 융합<br/>→ gate f32 VTCM<br/>다음 배치 HMX 뒤에 숨음] --> R1
-    R1[requant: gate f32 → mid u8<br/>동기, 숨길 곳 없음] --> H2
-    W3[DMA: down 1.75 MB<br/>gate_up 중에 미리] --> H2
-    H2[HMX down<br/>배치 32타일] --> P2
-    P2[워커: dequant → res f32] --> SC
-    SC[scatter: out[row] += w · res<br/>비동기, 다음 블록 뒤에 숨음]
+    W1["DMA: gate_up 3.5 MB<br/>쌍 청크 4개<br/>이전 expert의 down 중에 미리"] --> H1
+    W2["DMA: 활성화 64행 블록 128 KB"] --> H1
+    H1["HMX gate_up<br/>배치 = 16쌍 × 64 k타일<br/>acc → staging A/B 교대"] --> P1
+    P1["워커 3개: dequant + SwiGLU 융합<br/>→ gate f32 VTCM<br/>다음 배치 HMX 뒤에 숨음"] --> R1
+    R1["requant: gate f32 → mid u8<br/>동기, 숨길 곳 없음"] --> H2
+    W3["DMA: down 1.75 MB<br/>gate_up 중에 미리"] --> H2
+    H2["HMX down<br/>배치 32타일"] --> P2
+    P2["워커: dequant → res f32"] --> SC
+    SC["scatter: out(row) += w · res<br/>비동기, 다음 블록 뒤에 숨음"]
   end
-  E --> S9[out 3.6 MB<br/>DMA로 rpcmem에 복사]
+  SC --> S9["out 3.6 MB<br/>DMA로 rpcmem에 복사"]
 ```
 
 핵심은 **겹치기**다. HMX가 배치 j+1을 계산하는 동안 워커 스레드들이 배치 j의 에필로그를
