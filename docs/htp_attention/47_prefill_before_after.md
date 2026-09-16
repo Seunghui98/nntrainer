@@ -653,3 +653,21 @@ HTP, 코드 대)**. T: `ThreadManager::parallelize`가 `compute_workers_.size()+
 1–7 합 ≈ **−165 ~ −195 ms**: MoE 경로 458 → ≈270, 콜 19.9 → ≈14. 비프로파일 prefill ≈ 1180 − 147(E0·E1)
 − 180 ≈ **850 ms(≈520 TPS)**. FFN 층 자체로는 CPU 31.8 ms/층 대비 HTP 20.8 → 12.3, **1.5× → 2.6×**.
 순서: **1 → 2 → 3·4·5 → 6 → 7**. O1이 반이고 decode 커널을 겸하므로 먼저.
+
+## 19. O2 — 활성화 팩을 HMX 뒤로 (코드 완료 · 기기 미측정)
+
+**바꾼 것 셋.**
+1. `hvx_worker_pool`에 **백그라운드 레인**: `submit_bg(func, ctx, n_units, done)` /
+   `wait_bg(n)`. 워커는 run/submit 잡이 없을 때 유닛을 하나씩 CAS로 가져가고, 유닛 하나 뒤에
+   다시 포그라운드를 본다(포그라운드 submit이 기다리는 최대치 = 유닛 하나 ≈ 10 us). 기다리는
+   호출자도 유닛을 가져간다. 잡 필드는 **claim 뒤에** 읽어 이전 잡의 stale `bg_n`으로 들어온
+   워커도 제 잡을 본다(구조체 주석). 호스트 검사 `worker_pool_host_check.c`(pthread stub
+   `stub/qurt.h`)가 두 레인 동시·재사용(큰→작은→큰)·인라인 경로를 돈다.
+2. `hvx_quant_pack_u8_ah_block`: 64행 블록 하나의 mapped 팩. 기존 k-tile 분할 팩과 같은
+   `quant_pack_group4` 본체를 쓰므로 바이트 동일.
+3. 커널: 팩을 슬롯 블록 단위 bg 유닛으로 제출하고, **블록을 DMA 큐에 넣기 직전에만** 그
+   블록을 기다린다. expert 0의 gate_up 푸시를 scan 앞으로 옮겨 DMA_FIRST가 scan 뒤에 숨는다.
+
+**기대:** QUANT 1.44 → ≈0.45(scan) + 대기 잔여, DMA_FIRST ≈0. 콜당 −1.0~−1.3, prefill −22~−29.
+**볼 것:** `[HTP-PROFILE] M>1` 표의 quant·dma_first·dequant(bg 유닛이 에필로그를 지연시키면
+여기가 오른다)·host. 출력은 바이트 동일해야 한다(팩 산술 불변) — 텍스트 비교.
