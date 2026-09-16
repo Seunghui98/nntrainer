@@ -747,3 +747,33 @@ prefill 924 ms(8스레드) = HTP 콜 ≈400 + ARM ≈520.
 F1 conv_in_proj HTP(−100~−155) · F3 dense FFN HTP(−50~−70) · A mha HTP(−40~−60) · T 단계별 스레드(env로 대체) · C ARM u8 활성화(−53, 보류) · N 원소 융합(−20~−30) · decode의 ARM 몫(FC 8.9, lm_head 2.7, mha 2.4).
 
 **순서 제안:** prefill 2 → 3(헤더 확인 즉시) → 4·5·6·7 → 10. decode D1 프로브 → D2.
+
+## 21. O1 — 꼬리 블록을 HVX로 (코드 완료 · 기기 미측정)
+
+**설계 (커널 주석 `---- O1` 참조).** expert의 마지막 블록이 64행 뒤에 오는 ≤16행(`MOE_TAIL_MAX_ROWS`
+= `HVX_GEMM_U8I4_MAX_ROWS`)이면 HMX가 건너뛰고, 백그라운드 레인의 **게이트된 잡 3개**가 맡는다:
+gate/up 열 쌍 56유닛(각 유닛 = HVX GEMM 두 열 + 융합 dequant·SwiGLU) → requant 1유닛 → down
+64유닛(각 = GEMM 한 열 + dequant). 모든 꼬리의 잡은 **콜 시작에 expert 순서로** 큐에 넣고(팩 잡
+뒤), 꼬리의 행은 **그 expert의 마지막 HMX 블록과 같은 scatter 잡**으로 out에 더한다 — 토큰의
+기여가 expert 순서로 더해지는 건 그대로라 **출력 바이트 동일**.
+
+**HVX GEMM (`hvx_gemm_u8i4_wh.c`).** WH 타일의 128바이트 쿼터(k 8행)는 lane c에 열 c의 연속 k
+4개를 이미 들고 있어서(`htp_wh_layout.h`), 니블을 `<<4`·마스크로 16·w의 부호 바이트로 만들고
+활성화 4바이트를 splat해 `vrmpyacc`. 결과는 16배의 정확한 int32, `>>4`로 복원. HMX와 같은
+정수 합 → 같은 dequant → 비트동일. 열 하나(64 k타일)를 2D `l2fetch`로 미리 당긴다.
+
+**풀.** 백그라운드 레인이 단일 잡에서 **잡 큐(깊이 128)**로: 잡 k+1의 유닛은 잡 k 완료 뒤에만
+claim된다(의존성 = 큐 순서, 유닛 안에서 spin 없음). `hvx_bg_job`은 호출자 소유.
+호스트 검사(pthread): 두 레인 동시·재사용·**게이트 위반 0** 확인.
+
+**호스트 검사의 HMX 스텁을 실제 WH 니블 배치(2의 보수)로** 바꿨다. GEMM 스탠드인·참조·HMX
+스텁이 한 함수 `wh_value`를 쓰므로 세 쪽이 갈릴 수 없다. 라우팅 70/12/0/80/90 → HMX 블록 5
++ 꼬리 2(6행, 16행), 90의 26행 둘째 블록은 HMX 유지. 참조와 mismatch 0.
+
+**기대.** 콜당 HMX −13.6 × 252 us = −3.4 ms, 그중 HVX가 그늘에서 못 다 하는 몫이 SCATTER 열에
+노출된다. 꼬리 하나의 워커 시간 ≈ 1–1.5 ms(m=16), 콜당 ≈15–20 worker-ms vs 유휴 ≈23.
+**−2~−2.5 ms/콜 → prefill −45~−55.** `blocks=`가 1004 → ≈700으로 줄면 경로가 탄 것.
+
+**볼 것.** 비프로파일 `prefill:`/텍스트 동일 여부(바이트 동일이어야 한다 — 다르면 GEMM의 니블
+해석이나 tail 슬롯 오프셋 버그) → `[HTP-PROFILE] M>1`: `mm`·`acc`(줄어야), `scatter`(꼬리
+미완 노출), `dequant`(bg 간섭), `host`, `blocks`.
