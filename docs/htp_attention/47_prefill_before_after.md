@@ -710,3 +710,40 @@ E0 + E1 + O2가 한 빌드에 들어간 첫 비프로파일 수치. 8스레드�
 
 **500까지 −36 ms (8스레드 기준).** dequant 회복 −0.3/콜(16행 유닛, 미측정) + O1 −2~−2.5/콜.
 transport의 구조적 1.9 ms는 act/out 3.6 MB의 캐시 유지비로 보이며 바이트를 줄여야 움직인다(C 보류).
+
+## 20. 레버 목록 v3 (2026-09-16, O2 프로파일 기준) — prefill과 decode, 범위 표시
+
+기준 콜(prefill, us): mm 8900 · acc_read 2985 · transport 2360 · requant 1248 · dequant 1178 ·
+stage 369 · quant 354 · rest 249 · gather 228 · drain 208 · alloc 109 · push 47 · scatter 23 = host 18258.
+prefill 924 ms(8스레드) = HTP 콜 ≈400 + ARM ≈520.
+
+### 20.1 prefill, FFN 범위 안
+
+| # | 레버 | 콜당 | prefill | 코드 | 상태 |
+|---|---|---:|---:|---|---|
+| 1 | dequant 회복: 팩 유닛 16행 | −0.3 | −7 | 커밋 `1187884` | 미측정 |
+| 2 | **O1 꼬리 블록을 HVX로** (bg 레인 위) | −2~−2.5 | **−45~−55** | 큼 | 진행 중 |
+| 3 | **acc_read를 다음 타일 mm 뒤에** — HexKL에 2번째 accumulator가 있을 때만 | ≤ −2.98 | **≤ −65** | 중 | `hexkl_micro.h` 목록 대기 |
+| 4 | O4 requant 스캔을 융합 에필로그의 워커 부분합으로 | −0.5 | −11 | 중 | |
+| 5 | O3 2블록 expert: requant(b0) 뒤에 HMX gate_up(b1) — gate/mid ×2 | −0.35 | −8 | 중 | |
+| 6 | 첫 콜 워밍업: 로드 끝에 더미 콜 1회 (layer2의 +10 ms, alloc·drain 첫 몫) | 1회 | −10 | 소 | |
+| 7 | gather 228: 다음 블록의 act DMA를 현재 블록 down 중에 미리 | −0.2 | −4 | 소 | |
+| 8 | transport 첫 회분 0.47 (act 3.6 MB dirty writeback 추정) — staging을 non-temporal 저장으로 | −0.3? | −7? | 소 | 가설, 측정 필요 |
+| 9 | transport 구조적 1.9: 바이트를 줄여야 움직인다 — act u8(C, 보류) −0.9, out은 f32 유지 | −0.9 | −20 | 중 | **보류** |
+| 10 | **청크 prefill로 ARM/DSP 겹치기** — 444 토큰을 2청크, 청크1의 MoE(DSP) 동안 ARM이 청크2의 conv/attn. 계층 이동 없음, 겹침만 | — | **−200~−300** | 큼 (그래프 실행을 청크 파이프라인으로, FastRPC 비동기) | 패딩 +58%(45.6 → 72 블록, +3 ms/콜)가 대가. O1 뒤엔 그 대가가 작아진다. 산술: max(ARM 520, DSP 400+70) ≈ 650 ms → **≈680 TPS** |
+| — | mm 8900 | 못 줄임 | | | 64행 타일 구조 |
+
+### 20.2 decode, FFN 범위 안 (20.1 TPS = 50 ms/token, MoE ≈ 40 = 1.8 ms/콜: dsp 1.25–1.38 + transport 0.36–0.45)
+
+| # | 레버 | 토큰당 | 코드 | 비고 |
+|---|---|---:|---|---|
+| D1 | **DMA 처리량**: 21.5 MB/콜을 16 GB/s로 읽는다(1.34 ms ≈ dsp 전부). 고립 측정은 38.8. 다중 dmstart·descriptor 크기·bus vote를 아레나 프로브로 (문서 48 측정 C) | **−10~−15 ms** | 소~중 (프로브 먼저) | decode의 벽 1 |
+| D2 | **transport 0.4 ms × 22 = 9 ms/token (18%)**: FastRPC 콜당 비용. 레이어 22개를 한 콜로(다른 레이어가 CPU라 불가) 대신 **persistent DSP 워커 + 공유 메모리 큐(dspqueue)** | −6~−7 | 큼 | decode의 벽 2 |
+| D3 | M=1 GEMV(L1): HMX 64행 패딩(mm 767 + acc 260 = 1.03 ms) → HVX GEMV. O1과 같은 커널. DMA 벽(D1) 아래로는 못 내려간다 | −0~−5 (D1 뒤에 의미) | O1과 공유 | |
+| D4 | gather 108–132 us: 4 expert의 act 블록 DMA 대기 | −2 | 소 | D3에 흡수 |
+
+### 20.3 범위 밖 (기록만)
+
+F1 conv_in_proj HTP(−100~−155) · F3 dense FFN HTP(−50~−70) · A mha HTP(−40~−60) · T 단계별 스레드(env로 대체) · C ARM u8 활성화(−53, 보류) · N 원소 융합(−20~−30) · decode의 ARM 몫(FC 8.9, lm_head 2.7, mha 2.4).
+
+**순서 제안:** prefill 2 → 3(헤더 확인 즉시) → 4·5·6·7 → 10. decode D1 프로브 → D2.
