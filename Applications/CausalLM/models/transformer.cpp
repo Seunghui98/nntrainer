@@ -361,6 +361,16 @@ void Transformer::repack_weight() {
   }
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+      // The tied lm_head's blocked twin (tie_word_embedding.h) is built
+      // here, with every weight loaded, rather than on the first lm_head
+      // call inside the first prefill. forEachLayer hands out LayerNodes.
+      if (l.getType() == TieWordEmbedding::type) {
+        auto *tw = dynamic_cast<TieWordEmbedding *>(
+          static_cast<nntrainer::LayerNode &>(l).getLayer());
+        if (tw)
+          tw->prepareLmhead(context);
+        return;
+      }
       // repack FC and MoE FFN layers -- both can hold QS4CX weights.
       // FloatTensor::dotQs4cx only needs a weight packed when it falls
       // through to the CPU KleidiAI path (getPackedData()); the HTP path

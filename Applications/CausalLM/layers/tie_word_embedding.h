@@ -153,6 +153,20 @@ public:
 
   inline static const std::string type = "tie_word_embeddings";
 
+  /**
+   * @brief Builds the lm_head's blocked twin now, at load, instead of on
+   *        the first lm_head call.
+   *
+   * The first call is the tail of the first prefill, and the repack of a
+   * 75 MB weight there read 64 ms on the prefill's clock (doc 47 section
+   * 15). Called from Transformer::repack_weight, after every weight is
+   * loaded -- the one place that is certain, since this node's own read()
+   * reads nothing (the tied weight is the embedding's). A no-op for the
+   * embedding-mode node and for a non-Q4_0 weight; the forward's own
+   * build stays as the fallback for a caller that never repacks.
+   */
+  WIN_EXPORT void prepareLmhead(nntrainer::RunLayerContext &context);
+
 private:
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Unit, nntrainer::props::Scale>
