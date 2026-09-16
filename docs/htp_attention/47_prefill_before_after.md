@@ -378,3 +378,51 @@ stage/drain/gather/alloc/rest ≈ 1.1
 MoE 몫(router/topk/staging, 레이어당 2.1–5 ms로만 알고 **안 쟀다**)은
 `NNTR_M0_PROFILE=1`로 22줄 찍으면 닫힌다 — 코드 0줄. 나머지(conv 18층 · attn 6층 ·
 norm)는 문서 45(HTP로)다.
+
+## 13. prefill 레버 전체 목록 (2026-09-16) — 커널 밖까지
+
+prefill 1180 ms = HTP MoE 콜 438 (37%) + **ARM 742 (63%)**. 커널 안은 §12로 바닥에 가깝고
+(≈16 ms/콜, −80 ms), 남은 큰 덩어리는 ARM이다. ARM 742의 정체는 **안 쟀다** — 아래는
+shape에서 유도한 추정이고, 첫 항목이 그걸 재는 방법이다.
+
+### 13.1 ARM 742 ms의 추정 구성 (444 토큰)
+
+| | GFLOP | 근거 |
+|---|---:|---|
+| `conv_in_proj` 18층, [444×2048]×[2048×6144] | 201 | `lfm2_causallm.cpp:128`, unit = 3·CONV_DIM |
+| `conv_out_proj` 18층, 2048×2048 | 67 | |
+| attn q/o 6층 2048×2048, k/v 6층 2048×512 | 56 | GQA |
+| mha_core 6층 (444² × 2048) | ≈5 | 작지만 구현 속도는 미지 |
+| **FC GEMM 합** | **≈ 325** | ARM 4코어 KleidiAI int4 ≈ 400–600 GFLOPS → **540–810 ms** |
+| rms_norm ×44, multiply ×36, split, add, conv1d | — | 메모리 바운드, 3.6 MB × ~150회 ≈ 30–50 ms |
+| MoE ARM 쪽 ×22: router dot, topk, staging memcpy 7.2 MB, `setZero` 3.6 MB | — | 2.1–5 ms/층 (§18.1의 폭) ≈ 45–110 ms |
+| lm_head | — | prefill은 마지막 토큰만 (`tie_word_embedding.cpp:377`) ≈ 3 ms |
+
+**즉 ARM 742는 거의 전부 FC GEMM 계산이고, prefill의 ARM 쪽은 대역폭이 아니라 계산
+바운드다.** 같은 GEMM을 HMX가 하면: MoE 커널이 블록당 1.41 GFLOP를 252 us에 하니
+5.6 TFLOPS. 325 GFLOP = **58 ms** + 에필로그·transport.
+
+### 13.2 레버 — 기대 순
+
+| # | 레버 | 기대 (prefill ms) | 비용 | 막는 것 |
+|---|---|---:|---|---|
+| **M** | **측정 먼저 (코드 0)**: `nntr_config.json`에 `"num_to_generate": 1` + `--profile` 빌드 → TYPE 합계가 곧 prefill 분해 (decode 1토큰뿐). 같이 `NNTR_M0_PROFILE=1`로 MoE ARM 쪽 22줄 | 13.1의 추정을 실측으로 | 0 | — |
+| **T** | **prefill 스레드 수 (코드 0)**: `NNTR_NUM_THREADS=8`을 `num_to_generate: 1`로. §45는 decode(2 MB짜리 FC)에서 little 코어 과분할로 손해였지만, prefill GEMM은 계산 바운드라 little 코어가 보태는 쪽일 수 있다 | 600의 −20~30% = **−120~180** | 0 (효과 있으면 prefill/decode 다른 스레드 수, 작은 코드) | 측정 |
+| **F1** | **`conv_in_proj` 18층을 HTP로 (prefill만)** — FC 가속 경로(`gemm_q4_0_accel_fp32`, 문서 34)는 이미 있다. `fully_connected` 레이어에 `engine=htp`를 주고, 가중치를 로드 시 bake해 **아레나의 남은 144 MiB**에 넣는다(in_proj 113 MB). decode는 `accelerates_q4_0_at_m1() == false`가 CPU Q4_0으로 돌려보내므로 그대로 | ARM −370, HTP +45 → **−320** (1180 → ≈860, ≈520 TPS) | 큼: bake→`weight_bake_export`→아레나 배치→`register_arena` 조합, 레이어 engine 배선, act 3.6 MB/out 10.9 MB 스테이징 | 아레나 여유 144 MiB — in_proj만 들어간다 |
+| F2 | `conv_out_proj` + attn q/k/v/o (98 MB)를 HTP로 | −130 | F1 + 주소공간 | **DSP 주소공간이 없다** (3840 + heap 182 ≈ 4096, §40). `nntr_hvx_mem_probe_dsp_heap`으로 실제 여유를 재고, 없으면 MoE 아레나를 못 줄이니 불가 |
+| K1 | 커널 §12: scatter 위치(커밋됨) + requant 스캔 융합 | −20~30 | 소~중 | — |
+| K2 | C: 활성화 u8 (보류) | −53 | 중 | ARM 작업 추가 — 보류 결정 |
+| K3 | transport 2.4 × 22 | −50 (C 후 −30) | 큼 (문서 45 Phase D) | |
+| E | MoE ARM 쪽: staging memcpy(입력을 rpcmem 버퍼에 바로 쓰기), `setZero` 제거(커널이 zero-fill), topk 벡터화 | −30~60 | 소~중 | M0 측정 뒤 |
+| N | rms_norm·multiply·split 융합 | −20~30 | 중 (nntrainer 그래프) | 낮은 우선순위 |
+| A | mha_core 6층을 HTP로 (`hexkl_attn_u8` 커널이 있다) | ? (M이 정함) | 큼 | 문서 45 Phase C |
+
+### 13.3 순서
+
+1. **M + T** — 코드 0줄, 한 실행. 742의 구성과 스레드 효과가 나온다.
+2. **F1** — 가장 큰 단일 레버. 아레나 144 MiB 안에서 in_proj만.
+3. K1, E — 작은 것들.
+4. F2/A — 주소공간 답이 나온 뒤.
+
+F1까지 가면 prefill ≈ 860 ms(≈520 TPS), T가 먹으면 ≈ 700(≈630). 그 뒤는 F2/A인데
+주소공간이 정한다.
