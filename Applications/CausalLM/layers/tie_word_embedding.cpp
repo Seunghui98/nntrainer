@@ -311,6 +311,17 @@ void TieWordEmbedding::incremental_forwarding_embedding(
  * Every failure here leaves lmhead_blocked_ empty and the caller on the
  * row-wise path, which is slow but right. This runs once per process.
  */
+void TieWordEmbedding::prepareLmhead(nntrainer::RunLayerContext &context) {
+  if (mode_ != mode::lm_head || lmhead_blocked_tried_)
+    return;
+  const nntrainer::Tensor &weight =
+    context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+  if (weight.getDataType() != nntrainer::TensorDim::DataType::Q4_0)
+    return;
+  lmhead_blocked_tried_ = true;
+  buildLmheadBlocked(weight, weight.height(), weight.width());
+}
+
 void TieWordEmbedding::buildLmheadBlocked(const nntrainer::Tensor &weight,
                                           unsigned int vocab_size,
                                           unsigned int hidden_size) {

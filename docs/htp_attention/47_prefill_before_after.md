@@ -484,3 +484,49 @@ NNTR_HTP_PROFILE=3 <run> 2>&1 | tee decode_p3.log                         # tran
 | decode `PROFILE=3` `M==1` | `transport` | 565 → ≤300이면 wake/클록, 아니면 마샬링 |
 
 돌려보낼 것: 네 로그의 `[PROFILE]` 표 전체, `[M0-PROF]` 22줄, `[HTP-PROFILE]` 블록, `prefill:`/`generation:` 줄.
+
+## 15. `--profile` 노드 표 읽기 (2026-09-16, decode 512 실행) — 놀란 것 셋
+
+`num_to_generate: 512`, `--profile` 빌드. 표는 prefill 1회 + decode 512회 합이라 **노드의
+`max` = prefill 콜**, `sum − max` ≈ decode 512회. (`[M0-PROF]`는 이 실행엔 없다 —
+prefill-only 실행이 따로 필요하다.)
+
+### 15.1 prefill (nn_forward 1441 ms, 프로파일 빌드) — max 열 합계
+
+| | ms | 비고 |
+|---|---:|---|
+| `lfm2_moe` ×22 | **714** | HTP host ≈ 438 → **ARM 쪽 ≈ 276 = 12.5 ms/층** |
+| `fully_connected` | 482 | conv_in_proj 212, layer0/1 dense FFN 98, conv_out_proj 76, attention_out 46, wq 28, wk/wv 22 |
+| `mha_core` ×6 | 116 | layer2가 55 ms(첫 콜 효과?) — 빼면 61 |
+| `output_of_causallm` | 64 | **lm_head twin의 첫 콜 빌드**(75 MB repack). 1회성인데 prefill 안에서 |
+| norm·add·mul·split·conv1d·swiglu | ≈70 | |
+
+**놀란 것 ①: MoE 레이어의 ARM 쪽이 12.5 ms/층이다.** §13.1은 2.1–5로 잡았다. 22층이면
+276 ms — 프로파일 빌드 기준이지만 스케일해도 ≈225, FC 다음으로 큰 덩어리다. 무엇인지는
+`[M0-PROF]`(setup/router/topk/wksp/gather/ffn/route/scatter/other)가 말한다. 후보:
+`output.setZero()` 3.6 MB, 워크스페이스 Tensor 4개 생성, staging memcpy 7.2 MB, topk.
+**놀란 것 ②:** attention 층 뒤의 MoE(2·6·10·14·18·21)는 23–27 ms, conv 층 뒤의 MoE는
+30–42 ms. 같은 코드다. 라우팅 차이로는 10 ms가 안 나온다 — M0가 갈라야 한다.
+**놀란 것 ③:** lm_head twin이 첫 prefill에서 64 ms를 빌드한다. 로드 시점으로 옮겼다
+(`prepareLmhead`, `repack_weight`에서 호출 — 커밋). **prefill −52 ms(비프로파일 환산).**
+
+### 15.2 decode (토큰당, 512회 평균)
+
+| | ms/token | |
+|---|---:|---|
+| `lfm2_moe` 22층 | 45.1 | 콜 avg 2.05; HTP host 1.91 → ARM 쪽 0.14/층 |
+| `fully_connected` | 8.9 | 170 MB, 19 GB/s |
+| `output_of_causallm` | **4.3** | twin 확인: 25.7 → 4.3 (min 2.5). 75 MB → 17.6 GB/s |
+| `mha_core` 6층 | 3.2 | 530 us/층 — KV 2 MB 읽기에 비해 느리다 |
+| 나머지 노드 | 2.0 | |
+| **표 밖** (샘플링·토크나이저·argmax 65536) | **3.7** | 35146 − 33271 ms |
+| 합 | ≈ 67 | 15 TPS |
+
+문서 48 §2의 ②③이 실측됐다: lm_head 4.3(예상 3.4), ARM 나머지 = FC 8.9 + mha 3.2 +
+기타 2.0 + 표 밖 3.7 = **17.8**.
+
+### 15.3 이 표가 바꾼 순위
+
+prefill: **M0 측정(코드 0) → E(MoE ARM 쪽, ≈225 ms — 12.5 ms/층의 정체에 따라 소~중)
+→ F1(conv_in_proj, 212 ms)**. E가 F1과 같은 급으로 올라왔고 훨씬 싸다.
+decode: 표 밖 3.7 ms/token(샘플링/argmax)은 커널 밖의 공짜에 가까운 6%다.
