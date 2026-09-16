@@ -254,18 +254,237 @@ gu = gate_up 배치, ep = dequant+SwiGLU 에필로그, dn = down 배치. 숫자�
 합 6.92 MB. 가중치는 이중 버퍼가 아니다(10.5 MB는 안 들어간다) — 시간차로 같은 버퍼를 재사용한다.
 ```
 
-### 4.5 HMX 타일과 패딩
+### 4.5 콜 하나의 전체 단계 — ARM → FastRPC → DSP → ARM, 세부까지
+
+§4.1–4.3의 그림을 코드 순서대로 풀어 쓴 것이다. 코드 위치는 `lfm2_moe_layer.cpp`(L),
+`htp_compute_ops.cpp`(H), `htp_backend.cpp`(B), `test/htp/nntr_hvx_mm_u8i4.c`(S, skel),
+`hexkl_mm_u8i4_moe.c`(K), `hexkl_dma_ring.c`(D), `hvx_worker_pool.c`(W)의 행 번호다.
+
+**누가 무엇을 하나 (실행 단위)**
+
+| 단위 | 정체 |
+|---|---|
+| ARM forward 스레드 | 모델의 forward를 도는 스레드 하나. 라우터·top-k·staging·FastRPC 콜을 직렬로 한다 |
+| FastRPC | ARM ↔ CDSP 원격 호출. 콜마다 인자를 마샬링하고 DSP 스레드를 깨운다 |
+| DSP 스칼라 스레드 | 세션을 소유한 FastRPC 스레드. HMX 명령 발행, DMA 큐잉, 워커에 잡 제출을 모두 이 스레드가 한다 |
+| HMX | 행렬 유닛. 스칼라 스레드가 명령을 발행하면 돈다 |
+| HVX 워커 3개 | `hvx_worker_pool`. HVX 컨텍스트 4개 중 스칼라 스레드 것을 뺀 3개 (S: `hvx_add_f32.c:112`) |
+| DMA 엔진 | 사용자 DMA. 2D 디스크립터 256개짜리 링(D:95), `dmlink`로 이어져 **밀어 넣은 순서대로 끝난다** |
+
+#### A. 로드 때 한 번 (콜에 안 들어감)
+
+| # | 어디 | 무엇 | 위치 |
+|---|---|---|---|
+| A1 | ARM | `nntr_config.json`의 `moe_engine=htp`가 MoE 레이어 텐서에 `HtpComputeOps`를 붙인다 | `lfm2_moe_causallm.cpp:72–89`, `htp_context.cpp:44–68` |
+| A2 | ARM→DSP | FastRPC 세션 open: `remote_session_control(UNSIGNED_MODULE)` → `nntr_hvx_open("…&_dom=cdsp")` → QoS `DSPRPC_CONTROL_LATENCY{RPC_POLL_QOS, 100us}` (poll 모드, 실패 시 PM_QOS) | B:40–96 |
+| A3 | DSP | `nntr_hvx_open` 안에서: VTCM 확보(`hexkl_micro_hw_init`), HMX lock(세션 내내 유지), acc_read 설정, 워커 풀 3개 생성(스택 32 KB, 우선순위 상속), 전원 투표(COMPUTE 클래스, DCVS TURBO, 버스 40 GB/s) | `hvx_add_f32.c:52–173` |
+| A4 | ARM | **아레나**: `rpcmem_alloc(UNCACHED)` 256 MiB 청크 → `fastrpc_mmap(FASTRPC_MAP_FD)` → `nntr_hvx_arena_attach(fd)`. 거부되면 반으로 줄여 64 MiB까지. 모델 3696 MiB = 15청크 | H:1933–2039 |
+| A5 | ARM | expert 가중치 1408개(22층 × 32 × 2)를 아레나에 `memcpy` (WH 바이트 그대로, 변환 없음). scale N개, colsum N개, bias N개만 RPC로 등록(`weight_register_u8i4_arena`, 4 KB). ARM 원본 페이지는 `madvise(DONTNEED)`로 반납 | H:1712–1786, 2047–2070 |
+| A6 | DSP | 핸들 테이블에 `wh_bytes = arena_va + off`(빌려 씀, 복사 없음) + scale/colsum/bias 힙 복사 | `nntr_hvx_mm_u8i4.c:414–448`, `hexkl_mm_u8i4_dma.c:134–154` |
+| A7 | ARM→DSP | **워밍업** 콜 1회: M 512, expert당 64행, 0 활성화. 세션 스크래치를 prefill 크기로 키우고 페이지 첫 접촉 | `transformer.cpp:441–465` |
+
+#### B. 콜 하나 (prefill, 레이어 하나, 444 토큰)
+
+**B-1. ARM 쪽, 콜 전** (forward 스레드)
+
+| # | 무엇 | 버퍼 · 크기 | 위치 |
+|---|---|---|---|
+| 1 | 입력 뷰 reshape `[B,1,S,H] → [B·S,1,1,H]` | — | L:750–768 |
+| 2 | **라우터** `input.dot(gate_w)` — FP32라 CPU sgemm | logits 444 × 32 | L:774 |
+| 3 | **top-4**: sigmoid → +bias로 순위 → `partial_sort` → weight = sig / Σsig | `expert_assignments[e]` = (token, weight) 목록 | L:271–312 |
+| 4 | 가속 게이트: ops 있음, `supports_…` true, expert 0의 dtype이 WH면 decode도 통과 | — | L:455–506 |
+| 5 | expert별 데이터·scale 포인터 수집 (로드 때 등록한 그 포인터 = 핸들 캐시 키) | 32 × 4 포인터 | L:508–519 |
+| 6 | **라우팅 배열** 셋 만들기: `row_index[1776]`(expert 순서로 묶음), `row_count[32]`, `row_weight[1776]` | 힙 `std::vector`, ≈ 14 KB | L:524–538 |
+| 7 | `ops->gemm_qs4cx_moe_layer_fp32(…)` 진입 → expert 64개 핸들 조회 (`handle_cache_` 히트, 뮤텍스 64회) | `h_gu[32]`, `h_dn[32]` | H:828–865 |
+| 8 | `invoke_mutex_` 잠금, `act_buf_`/`out_buf_` 용량 확인 (grow-only, 프로세스 내내 재사용, **cached ION rpcmem**) | 3.6 MB × 2 | H:1398–1400, 1176–1191 |
+| 9 | **staging memcpy** 입력 텐서(힙) → `act_buf_`(ION) | 3.6 MB, ≈ 0.45 ms | H:1403 |
+
+**B-2. FastRPC 왕복**
+
+| # | 무엇 | 위치 |
+|---|---|---|
+| 10 | `nntr_hvx_mm_u8i4_moe_layer(session, M,K,inter,N_out, h_gu[32], h_dn[32], row_index[1776], row_count[32], row_weight[1776], act_f32[M·K], out_f32[M·N_out])` — **동기 블로킹** | H:1423–1438, IDL `nntr_hvx.idl:318–326` |
+| 11 | 마샬링(qaic 생성 stub, 저장소에 없음): `act_f32`/`out_f32`는 ION이라 드라이버가 SMMU 매핑을 유지(제로카피 + 캐시 유지), 나머지 다섯 시퀀스(≈ 14 KB)는 복사. DMA 핸들은 없다. ARM 쪽 명시적 flush/invalidate 없음 | `htp_rpcmem.h:16–23` |
+| 12 | DSP skel 진입 `nntr_hvx_mm_u8i4_moe_layer`: 길이 검사(`Σrow_count == row_indexLen` 등) → `hexkl_mm_u8i4_moe_layer_run(…)`. 세션 핸들에서 VTCM·config·풀·스크래치를 꺼내 넘긴다. **per-call 락·풀 생성·VTCM 확보 없음** | S:942–965 |
+| — | 왕복 고정비 + `act`/`out` 캐시 유지비 = **transport ≈ 2.1 ms** (host − dsp). 그중 ≈ 0.47 ms가 방금 쓴 3.6 MB의 dirty writeback | 문서 47 §22 |
+
+**B-3. DSP 커널 프롤로그** (스칼라 스레드, 아직 아무것도 안 뜸)
+
+| # | 무엇 | 위치 |
+|---|---|---|
+| 13 | VTCM 배치 계산 `hexkl_mm_u8i4_moe_layout` (§4.4 / §4.6 표) | K:490–571 |
+| 14 | expert 핸들 32쌍 전부 검증 (K, N 일치) — 출력이 반만 써지는 일이 없도록 **일 시작 전에** | K:597–613 |
+| 15 | `row_index[i] < M` 전부 검사 | K:624–628 |
+| 16 | acc 타일 배치 프로브 1회 (벤더 `acc_read`의 순열, `result_off`를 덮는다) | K:630–634 |
+| 17 | 힙 스크래치 `moe_scratch_reserve`: 상한 `n_rows + 32·63` 슬롯으로 잡아 22콜 내내 재할당 없음. 첫 prefill 이후 항상 no-op (**alloc** 열) | K:654–742 |
+
+**B-4. DSP 셋업** — 입력 복사, 첫 DMA, scan, pack
+
+| # | 단위 | 무엇 | 버퍼 · 크기 | 위치 |
+|---|---|---|---|---|
+| 18 | 스칼라 | 활성 expert 압축: `order[]`, `base_of[]`, `slot_of[]`(64 배수로 채움). 빈 expert는 건너뜀 | — | K:794–805 |
+| 19 | DMA | **입력 복사** `act_f32`(uncached rpcmem) → `act_c`(힙): 1 MiB 청크 2D 디스크립터로 밀고 drain (**stage** 열) | 3.47 MB | K:807–808, 445–453 |
+| 20 | 스칼라 | `memset(out_c, 0)` | 3.47 MB | K:809 |
+| 21 | DMA | **expert 0의 gate_up을 scan 전에 밀어 넣음**: 4청크 × (gate 열 묶음 + up 열 묶음) 2D 디스크립터 2개. 아레나(DDR) → VTCM `w_gu_off` | 3.5 MiB | K:823–827, 159–173 |
+| 22 | 워커 3 + 스칼라 | **행별 scan** `hvx_quant_rows_u8_params(act_c)` → 444행의 scale·zp (foreground 레인, 동기). 뒤에서 21번이 흐른다 (**quant** 열) | scale/zp 444 | K:831–832 |
+| 23 | 스칼라 | 슬롯 테이블: `slot_row[d]`, `slot_scale[d]`, `slot_zp[d]`. 패딩 슬롯은 0번 행 반복 | ≈ 2918 슬롯 | K:838–853 |
+| 24 | **백그라운드 레인** | **pack** `moe_pack_bg_worker`: 16행 유닛으로 `hvx_quant_pack_u8_ah_rows` → f32를 u8 AH 타일로, **expert 순서(slot)로 바로** 쓴다(따로 gather 없음). 유닛 ≈ 2.5 us, 워커가 에필로그 사이 빈틈에 집어간다 | `act_ah` 7.4 MB (상한) | K:861–872, 412–420 |
+| 25 | 스칼라 | expert 0 첫 블록의 pack 유닛만 대기 (`wait_bg … THROUGH(slot_of[0])`), 기다리는 동안 자기도 유닛을 집어간다 | — | K:922–923, W:355–377 |
+| 26 | DMA | expert 0 블록 0의 A 타일 64개 push (`act_ah` 힙 → VTCM `act_off`). 유일하게 gate_up 뒤에 줄 서는 곳 — 그 gate_up은 scan 동안 이미 끝났다 | 128 KB | K:932–933 |
+
+**B-5. expert 루프** (활성 32개, `order[]` 순) → **블록 루프** (64행씩, 콜당 45.6블록)
+
+| # | 단위 | 무엇 | 대기 · 열 | 위치 |
+|---|---|---|---|---|
+| 27 | 스칼라 | `dma_ring_wait(act_idx)` + 이 블록 64행의 scale/zp 복사 (**gather** 열: DMA 대기 + 64개 슬라이스가 전부) | act DMA | K:976–982 |
+| 28 | DMA | 블록 0에서만: **down[e]** 2청크(32 n타일씩, 56행) push → `w_dn_off`. 활성화 뒤, gate_up 행렬곱 앞 — 그 뒤에 숨는다 | — | K:994–1001 |
+| 29 | 스칼라 | 블록 0에서만: `dma_ring_wait(gu_idx[ci])` — 청크 ci 도착 대기 (**drain** 열; `i==0, ci==0`의 값이 `DMA_FIRST`) | gate_up 청크 | K:1022–1033 |
+| 30 | **HMX** | **gate_up 배치 ci** (16짝 = 32 열타일): 열마다 `acc_clear` → 64 × `mm_u8i4(act[kt], W[kt,col])` → `acc_read` → staging `ci&1`의 슬롯 j (8 KB). 32 clear + 2048 mm + 32 read ≈ 47 us (**mm** + **acc** 열) | — | K:1036–1057 |
+| 31 | 스칼라 | `pool_wait`: 풀이 돌리던 것을 회수 — ci==0이면 **이전 블록의 scatter**(**scatter** 열), 아니면 **에필로그 ci−1**(**dequant** 열). 배치 발행 47 us 뒤에 숨은 뒤라 보통 0 | 워커 | K:1064–1067 |
+| 32 | 워커 3 | **에필로그 ci** submit: `hvx_dq_swiglu_worker` — staging의 gate 타일 j와 up 타일 j를 같이 dequant(scale·colsum·bias)하고 `silu(g)·u`를 `gate_off`에 f32로 저장. up은 저장 안 함. ≈ 18 us | 다음 배치 뒤에 회수 | K:1068–1087 |
+| 33 | 스칼라 | 배치 4개 끝: 마지막 에필로그 대기 (**dequant** 열의 노출분 — 숨길 게 없다) | 워커 | K:1091–1093 |
+| 34 | DMA | **A 버퍼가 비는 순간 다음 것 push**: 같은 expert의 다음 블록이면 그 A 타일(pack 대기 후); 마지막 블록이면 **다음 expert의 A 타일 먼저, 그 뒤 gate_up 4청크**. 이것이 "시간차 재사용": e+1의 gate_up이 e의 requant·down 뒤에 흐른다 | pack (**quant**) | K:1095–1119 |
+| 35 | 워커 3 + 스칼라 | **requant** (동기): `gate_off` [64 × 1792] f32 → 행 min/max → scale/zp → u8 AH 56 k타일 `mid_off`. down이 mid 전부를 필요로 해서 숨길 곳 없음 (**requant** 열, 1.06 ms/콜) | — | K:1121–1132 |
+| 36 | 스칼라 | 블록 0에서만: `dma_ring_wait(dn_idx[ci])` (**drain_dn**) | down 청크 | K:1143–1147 |
+| 37 | **HMX** | **down 배치 ci** (32 열타일): 열마다 clear → 56 × `mm(mid[kt], Wdn[kt, nt0+j])` → `acc_read`. 32 clear + 1792 mm + 32 read | — | K:1148–1167 |
+| 38 | 스칼라 → 워커 3 | 이전 에필로그 회수(**dequant**) → `hvx_dq_tiles_worker` submit: dequant → `res_f32_off` [64 × 2048] f32 | — | K:1169–1192 |
+| 39 | 스칼라 | 배치 2개 끝: 마지막 dequant 대기 (**dequant**) | 워커 | K:1194–1196 |
+| 40 | 워커 3 | **scatter** submit(실행 아님): `out_c[row_index[r]] += row_weight[r] · res[r]` (행 범위로 분할; 한 토큰은 서로 다른 expert를 고르므로 블록 안에서는 충돌 없음). **다음 블록의 첫 배치가 회수**한다 — 블록 머리에서 기다리면 숨길 게 3 us뿐이라 1056 us가 노출됐었다 | 다음 블록 | K:1198–1225 |
+
+**B-6. DSP 에필로그**
+
+| # | 단위 | 무엇 | 위치 |
+|---|---|---|---|
+| 41 | 스칼라 | 마지막 블록의 scatter 대기 (**scatter**) | K:1230–1232 |
+| 42 | DMA | **출력 복사** `out_c`(힙) → `out_f32`(uncached rpcmem), 1 MiB 청크, drain (**stage** 열) | K:1234–1236 |
+| 43 | 스칼라 | `out:` — foreground 잡·백그라운드 잡(pack) 전부 회수. 스크래치는 세션에 남긴다. 반환 | K:1238–1246 |
+
+**B-7. ARM 쪽, 콜 후**
+
+| # | 무엇 | 위치 |
+|---|---|---|
+| 44 | FastRPC 반환. `out_buf_`(ION) → 출력 텐서(힙) **staging memcpy** 3.6 MB | H:1470 |
+| 45 | 프로파일 누적 (`[HTP-PROFILE]`의 host/dsp/stage 열) | H:1471–1474 |
+| 46 | 가속 성공이면 건너뛰는 것: `output.setZero()`, CPU용 워크스페이스 4개 할당, ARM 라우팅 곱·scatter (E1) | L:838–872 |
+| 47 | `output.reshape([B,1,S,H])`. residual add는 이 레이어 밖, 그래프의 다음 노드(`lfm2_causallm.cpp:185`) | L:892 |
+
+**세 장치가 같은 시간에 하는 일 (블록 하나, 정상 상태)**
 
 ```
-HMX 한 명령: A[64행 × 32k] u8  ×  W[32k × 32n] i4  →  acc[64 × 32] int32 (+=)
-한 블록(64행)의 gate_up = 64 k타일 × 112 n타일 = 7168 명령 ≈ 125 us, down = 56 × 64 = 3584 ≈ 63 us
-                                                         acc_read 176회 ≈ 65 us
-                                                         ─────────────────────
-                                                         블록 고정비 ≈ 252 us
-expert에 10행이 오든 64행이 오든 252 us. 1776행이 45.6블록(2918행)으로 → 39%가 패딩.
+스칼라+HMX │ gu b0 │ gu b1 │ gu b2 │ gu b3 │ (ep3 대기) │ requant │ dn b0 │ dn b1 │ (dq1 대기) │ 다음 블록 gu b0 …
+워커 3     │  (scatter 이전블록) │ ep0  │ ep1  │ ep2  │ ep3   │ requant │      │ dq0   │ dq1  │ scatter …
+DMA        │ down(e) 1.75 MB ─────────────────────────────│ act(e+1) 128 KB │ gate_up(e+1) 3.5 MB ──────────…
+bg 레인    │ pack 유닛 (워커가 빈틈마다 하나씩)
 ```
 
----
+노출되는 것만 프로파일 열에 남는다: 마지막 에필로그(**dequant** 0.85 ms/콜), **requant**(1.06),
+첫 expert의 첫 청크 대기(**drain** 0.16), 나머지는 0에 가깝다.
+
+### 4.6 타일링 — 어떤 크기를 어떻게 잘랐나
+
+숫자는 이 모델의 expert 하나(K 2048, inter 1792, N_out 2048) 기준이고, 출처는
+`hexkl_mm_u8i4_moe.c`의 layout 함수(490–571행)와 gate_up/down 루프(1014–1196행),
+가중치 배치는 `nntrainer/tensor/htp_wh_layout.h`, 활성화 배치는 `hvx_quant_u8.h`다.
+
+**HMX 명령 하나 = 타일 세 개.** `hexkl_micro_hmx_mm_u8i4(act_tile, w_tile)`는 아래
+세 타일을 곱해 accumulator에 더한다. 행 64는 하드웨어 고정이라 M이 10이어도 64를 낸다.
+
+| 타일 | 모양 | 형식 | 바이트 | 메모리 배치 |
+|---|---|---|---:|---|
+| A (활성화, "AH") | 64행 × 32 k | u8 | 2048 | 타일 안은 평범한 row-major. 타일은 (행블록, k타일) 순서로 2048 B 간격. VTCM 2048 B 정렬 |
+| W (가중치, "WH") | 32 k × 32 n | i4 | 512 | 타일 안 배치는 아래 공식. 타일은 k-major: `kt·(N/32) + nt` 번째가 512 B 간격 |
+| acc (결과) | 64행 × 32 n | int32 | 8192 | HMX 내부 accumulator. `acc_read`로 VTCM staging에 내려놓는다. 행 하나 = 32 int32 = HVX 벡터 하나 |
+
+WH 타일 안에서 원소 (r, c)가 놓이는 자리 (`htp_wh_layout.h:23`):
+
+```
+byte(r, c) = (r/8)·128 + c·4 + (r%4)        nibble = (r/4) % 2
+```
+
+한 바이트에 같은 열의 4행 떨어진 두 k값이 들어간다(축약에 맞춘 배치). 이 순열은
+기기의 `hexkl_micro_hmx_rm_to_wh_i4`를 램프 입력으로 읽어낸 것이고, 오프라인
+양자화기(`nntr_quantize_stream --moe_dtype QS4CX_WH`)가 미리 이 순서로 써 두기 때문에
+로드 때 DSP 변환이 없다. 유닛테스트 `WhPackReferenceMatchesDspBake`가 바이트 단위로 지킨다.
+
+**출력 타일 하나를 만드는 순서.** 출력 열타일 하나(64행 × 32열)는 K 방향 타일 수만큼
+명령을 누적한다:
+
+```
+acc_clear
+for kt in 0..k_tiles-1:  mm(A[kt], W[kt, nt])      ← gate_up 64번, down 56번
+acc_read → staging[j]  (8 KB)
+```
+
+**gate_up [2048 × 3584]: 64 k타일 × 112 n타일 = 7168 타일 (3.5 MiB).**
+
+```
+                n타일 →   0 ......... 55 | 56 ......... 111
+                          ←  gate 1792  → | ←   up 1792   →
+  k타일 ↓ 0     ┌──────────────────────┬──────────────────────┐
+          .     │  chunk0 │c1│c2│c3   │  chunk0 │c1│c2│c3   │   chunk c = gate 열 [16c, 16c+16)
+          .     │  16열   │16│16│ 8   │  16열   │16│16│ 8   │           + 마주보는 up 열 [56+16c, …)
+         63     └──────────────────────┴──────────────────────┘   DMA 2D 디스크립터 2개 (row = 16·512 B, stride 112·512 B, 64행)
+```
+
+- n타일 0–55가 gate, 56–111이 up. gate 열 j와 up 열 56+j가 **짝**이다: 에필로그가 둘을
+  같이 읽어 `silu(gate)·up`을 만들기 때문에 항상 짝으로 움직인다.
+- **배치 = 16짝 = 32타일** (`acc_tiles` 32의 절반). 56짝이라 배치 4개(16, 16, 16, 8짝).
+  배치 하나의 HMX 발행 = 32 acc_clear + 2048 mm + 32 acc_read ≈ 47 us.
+- **staging A/B**: 32타일 × 8 KB = 256 KB짜리 둘. 배치 ci는 `ci & 1`번 버퍼에 쓰고, 워커는
+  다른 버퍼의 이전 배치를 dequant+SwiGLU한다. 이것이 에필로그가 HMX 뒤에 숨는 구조다.
+- **DMA 청크 = 배치**: 가중치도 같은 16짝 단위로 4청크 밀어 넣어, 첫 청크가 도착하면
+  HMX가 시작한다. 청크 하나는 gate 열 묶음과 up 열 묶음 2D 디스크립터 두 개(행 = 16·512 B,
+  원본/목적지 stride = 112·512 B, 64행). 링은 순서대로 끝나므로 뒤쪽 인덱스만 기억한다.
+- 결과: `gate_off` [64 × 1792] f32 (448 KB). up은 저장되지 않는다.
+
+**requant: gate_off → mid.** 행별 min/max → scale·zp → u8 AH 타일. 56 k타일 × 2048 B
+= 112 KB. down의 A 입력이다. 동기(모든 mid가 있어야 down 시작).
+
+**down [1792 × 2048]: 56 k타일 × 64 n타일 = 3584 타일 (1.75 MiB).**
+
+```
+                n타일 →   0 ............ 31 | 32 ............ 63
+  k타일 ↓ 0     ┌────────────────────────┬────────────────────────┐
+          .     │        batch 0         │        batch 1         │   = DMA chunk 0 / 1
+         55     └────────────────────────┴────────────────────────┘   (row = 32·512 B, stride 64·512 B, 56행)
+```
+
+- 배치 = 32타일 → 2배치. 배치 하나 = 32 clear + 1792 mm + 32 acc_read.
+- 에필로그는 평범한 dequant → `res_f32` [64 × 2048] f32 (512 KB).
+- scatter가 `out[row] += w · res[r]`로 토큰 행에 더한다.
+
+**M 방향: 64행 블록.** expert e에 온 행들은 슬롯 테이블에서 64의 배수로 채워진다(패딩
+슬롯은 0번 행을 반복하고, 그 결과는 dequant되지 않는다). 블록마다 A 버퍼(128 KB)를
+새로 DMA하고 위 gate_up → requant → down을 한 번 돈다. 블록 고정비 ≈ 252 us:
+
+| 블록 하나 | 명령 | 시간 |
+|---|---:|---:|
+| gate_up mm | 112 × 64 = 7168 | ≈ 125 us |
+| down mm | 64 × 56 = 3584 | ≈ 63 us |
+| acc_read | 112 + 64 = 176 | ≈ 65 us |
+| 합 | 10752 mm + 176 read | ≈ 252 us |
+
+콜 하나 = 45.6 블록 → 490 K mm 명령. 1776행이 2918행(45.6 × 64)으로 계산되어 39%가
+패딩이다. 32 expert 중 평균 13.6개가 64를 넘어 두 번째 블록(대개 10–20행)을 만든다.
+
+**VTCM에서 한 블록이 차지하는 것 (전부 2048 B 정렬):**
+
+```
+offset    크기       내용
+0         128 KB     act_off     A 타일 64개 (64행 × 2048 k)
+128 KB    3.5 MiB    w_gu_off    gate_up WH 7168 타일  ← expert e+1이 덮어씀
+3.63 MiB  1.75 MiB   w_dn_off    down WH 3584 타일
+5.38 MiB  448 KB     gate_off    silu(gate)·up f32 [64 × 1792]
+5.81 MiB  112 KB     mid_off     requant된 A 타일 56개
+5.92 MiB  512 KB     result_off  staging A (256 KB) + B (256 KB)
+6.42 MiB  512 KB     res_f32_off down 결과 f32 [64 × 2048]
+합 ≈ 6.92 MiB                     (VTCM 8 MiB, 꼭대기에 HMX config 블록)
+```
+
+가중치는 이중 버퍼가 아니다(둘이면 10.5 MB). 대신 expert e의 down이 도는 동안 e+1의
+gate_up이 같은 A 버퍼로 들어오고, e+1의 gate_up이 도는 동안 e+1의 down이 B 버퍼로
+들어온다 — 시간차 재사용이다.
+
 
 ## 5. 적용한 최적화 — 무엇을, 왜, 얼마나
 
