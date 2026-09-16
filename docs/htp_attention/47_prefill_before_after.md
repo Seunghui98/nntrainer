@@ -600,3 +600,33 @@ memset + page fault를 층마다 내고 안 쓴 채 버린다. 둘 다 `tryMoeLa
 **순서:** 0 → 1·2(같은 빌드에서 측정) → 3 → 4 → 5·6 → 7·8. 1–3이 다 먹으면 1180 →
 ≈900(≈490 TPS), 4까지 ≈770(≈575), 5·6까지 ≈650(≈680). 숫자는 기대이고 매 단계 측정으로
 갱신한다.
+
+## 17. E0 + E1 결과 (2026-09-16, 기기, `--profile` 빌드, decode 512, 기본 4스레드)
+
+| | 이전 (§15.1) | E0+E1 | |
+|---|---:|---:|---|
+| prefill `nn_forward` | 1441 | **1294** | −147 |
+| `lfm2_moe` ×22 (max 합) | 714 | **458** | **−256**. HTP host 438이면 ARM 쪽 ≈ 20 = **0.9 ms/층** |
+| ├ attn 층 뒤 / conv 층 뒤 | 24 / 31–37 | 18–22 / 18–22 | 비대칭 소멸 — 페이지 폴트였다 |
+| ├ layer2 (첫 콜) | 39 | 30.6 | 첫 콜 +10은 남음 (스크래치 1회 성장 등) |
+| `output_of_causallm` 첫 콜 | 64 | **5.6** | E0 확인. avg 4.3, min 2.5 |
+| `fully_connected` | 472–482 | **580** | conv_in_proj 212 → 260. 아래 |
+| `mha_core` ×6 | 88–116 | 166 | layer2 58 |
+| decode ms/token | 65.8 | 65.5 | 손대지 않았다 |
+
+**E1이 12 ms/층의 거의 전부였다.** 4개 워크스페이스 Tensor의 zero-fill 할당(`new float[n]{}`)
++ 새 매핑의 페이지 폴트 + `setZero` 3.6 MB — 매 층 만들고 안 쓰고 버리던 것. §16이 −10~−40으로
+잡았는데 −256이 나왔다: memset 바이트가 아니라 **mmap/munmap + 페이지 폴트**가 값이었고,
+attention 층 뒤가 덜 느렸던 것도 그 직전 해제 패턴의 차이였을 것이다. 산술로 못 잡는 종류다.
+
+**이 실행은 CPU 쪽 잡음이 크다.** FC가 100 ms, mha가 50–80 ms 나빠졌고, 사소한 노드에 이상치가
+있다: `layer21_attention_norm` max 15 ms, `layer4_conv_mul_pre` 17.7, `layer23_conv_mul_post`
+10.7, `input` 19.5, `cache_k_l2` 8. 노름 하나가 15 ms면 코드가 아니라 **선점/코어 이동/열
+쓰로틀**이다. 잡음을 빼면 이 빌드의 prefill은 ≈ 1100 (프로파일 빌드)로 본다. 비프로파일
+`prefill:` TPS로 확정해야 한다.
+
+**구성 (이 실행, ms):** FC 580 (45%) · MoE HTP 458 (35%) · mha 166 · 원소 ≈85 · lm_head 6.
+MoE ARM 쪽은 끝났다. 다음은 FC이고, 순서는 **T(단계별 스레드 수, 코드 소) → F1(conv_in_proj
+HTP, 코드 대)**. T: `ThreadManager::parallelize`가 `compute_workers_.size()+1`로 나누므로
+런타임 상한(`active` 캡) 하나면 prefill 8 / decode 4가 된다 — 8스레드 prefill FC 472 vs
+4스레드 580(잡음 포함)/482.
