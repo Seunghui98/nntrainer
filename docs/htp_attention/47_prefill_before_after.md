@@ -530,3 +530,30 @@ prefill-only 실행이 따로 필요하다.)
 prefill: **M0 측정(코드 0) → E(MoE ARM 쪽, ≈225 ms — 12.5 ms/층의 정체에 따라 소~중)
 → F1(conv_in_proj, 212 ms)**. E가 F1과 같은 급으로 올라왔고 훨씬 싸다.
 decode: 표 밖 3.7 ms/token(샘플링/argmax)은 커널 밖의 공짜에 가까운 6%다.
+
+### 15.4 `NNTR_NUM_THREADS=8` vs 기본(=hardware_concurrency/2 = 4) — 같은 실행, 두 번째 표
+
+| | 4 스레드 | 8 스레드 | |
+|---|---:|---:|---|
+| prefill `nn_forward` | 1441 | **1347** | −94 ms (−6.5%) |
+| ├ `lfm2_moe` ×22 (max 합) | 714 | 700 | ARM 쪽이 스레드에 안 움직인다 → 단일 스레드 작업(memset/memcpy/topk) 가능성 ↑ |
+| ├ `fully_connected` | 482 | 472 | conv_in_proj 212→**152**, 그런데 conv_out_proj 76→110 |
+| ├ `mha_core` ×6 | 116 | 88 | |
+| ├ `output_of_causallm` 첫 콜 | 64 | 69 | 둘 다 twin-at-load 커밋 이전 |
+| decode ms/token ((총−prefill)/512) | 65.8 | **69.3** | +3.5 |
+| ├ `lfm2_moe` | 45.1 | 44.8 | HTP라 무관 |
+| ├ `fully_connected` | 8.9 | **16.4** | 아래 |
+| ├ `output_of_causallm` | 4.3 | 2.7 | 75 MB → 27 GB/s |
+| ├ `mha_core` | 3.2 | 2.4 | |
+
+**decode FC가 두 배가 된 이유는 표 안에 있다.** 같은 모양의 `conv_in_proj`(6 MB, 4스레드
+≈ 250 us)가 층마다 다르다: layer23 430 us, layer12 593, layer3 **1010**, layer0 **1558**
+(min은 전부 124–136). 호출당 일이 250 us인데 8개 스레드를 깨우고 — little 코어가
+끼면 — 제일 느린 코어가 꼬리를 잡는다. layer0(토큰의 첫 CPU 연산, 스레드가 다 자고 있다)
+과 layer3(attention 층 직후)이 가장 나쁘다. prefill은 행렬이 커서 8개가 이기지만
+conv_out_proj(2048×2048)는 거기서도 졌다.
+
+**결론:** 스레드 수는 prefill/decode 트레이드오프다. 전역 하나로 두면 **4 유지**(decode
++3.5 ms/token > prefill −94 ms는 512 토큰 생성에서 손해). T 레버는 "prefill 8 / decode 4"
+로 단계별로 바꿀 수 있을 때만 −90 ms이고, 그 전에 big 코어 4개에 고정하는 게 같은 값을
+공짜로 줄 수도 있다(미측정).
