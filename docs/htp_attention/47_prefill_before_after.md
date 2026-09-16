@@ -630,3 +630,26 @@ MoE ARM 쪽은 끝났다. 다음은 FC이고, 순서는 **T(단계별 스레드 
 HTP, 코드 대)**. T: `ThreadManager::parallelize`가 `compute_workers_.size()+1`로 나누므로
 런타임 상한(`active` 캡) 하나면 prefill 8 / decode 4가 된다 — 8스레드 prefill FC 472 vs
 4스레드 580(잡음 포함)/482.
+
+## 18. 범위 고정: FFN만 (2026-09-16) — 다른 레이어는 CPU 고정, 비교 실험 조건
+
+사용자 결정: FFN 외 레이어는 **CPU에 둔 채** FFN(HTP) vs FFN(CPU)를 비교한다. 그러므로 F1·F2·F3·A(다른
+레이어를 HTP로)와 T(스레드)는 제외. 남는 것은 MoE 경로 458 ms(HTP 콜 438 + ARM 20) 안의
+레버뿐이다. 콜 19.9 ms = HMX 11.8 (mm 8.86 + acc_read 2.96) + transport 2.4 + 에필로그 노출 ≈5.7.
+
+| 순위 | 레버 | 콜당 | prefill | 코드 | 비고 |
+|---|---|---:|---:|---|---|
+| 1 | **O1 꼬리 블록을 HVX GEMV로, HMX 그늘에서** (§14) | −3.4 | **−75** | 큼 | 13.6 블록 × 252 us 고정비. decode GEMV(L1)와 같은 커널 |
+| 2 | 첫 콜 +10 ms (layer2 30.6 vs 18–22) 정체 | 1회 | −10 | 측정 후 소 | `NNTR_HTP_PROFILE=2`의 첫 콜 stage 열이 말한다 |
+| 3 | O2 quant를 슬롯 단위로 나눠 HMX 조기 시작 | −1.3 | −29 | 중 | |
+| 4 | O4 requant 스캔을 융합 에필로그의 워커 부분합으로 | −0.5 | −11 | 중 | |
+| 5 | O3 2블록 expert의 requant 뒤에 HMX 겹침 | −0.35 | −8 | 중 | |
+| 6 | K3 transport 2.4 → ≈1.5: act/out을 rpcmem 텐서로 두어 staging 제거, 또는 residual을 DSP에 | −0.9 | −20 ~ −50 | 중~큼 | 문서 45 Phase D |
+| 7 | ARM 잔여 0.9 ms/층 (router dot·topk의 토큰별 vector 할당) | — | −10 | 소 | M0의 `topk`/`other`로 확인 뒤 |
+| ? | **acc_read 2.96 ms/콜을 다음 타일의 mm 뒤에 숨기기** | 최대 −2.96 | 최대 −65 | 확인 필요 | 우리가 쓰는 HexKL micro API는 clear/mm/acc_read뿐. 빌드 머신의 실제 `hexkl_micro.h`에 accumulator 뱅크 선택(두 번째 acc) 변형이 있는지 봐야 한다. 없으면 0 |
+| — | C 활성화 u8 (ARM) | −2.4 | −53 | 중 | **보류** |
+| — | HMX mm 8.86 | 못 줄임 | | | 64행 타일 구조, 5.6 TFLOPS 실효 |
+
+1–7 합 ≈ **−165 ~ −195 ms**: MoE 경로 458 → ≈270, 콜 19.9 → ≈14. 비프로파일 prefill ≈ 1180 − 147(E0·E1)
+− 180 ≈ **850 ms(≈520 TPS)**. FFN 층 자체로는 CPU 31.8 ms/층 대비 HTP 20.8 → 12.3, **1.5× → 2.6×**.
+순서: **1 → 2 → 3·4·5 → 6 → 7**. O1이 반이고 decode 커널을 겸하므로 먼저.
