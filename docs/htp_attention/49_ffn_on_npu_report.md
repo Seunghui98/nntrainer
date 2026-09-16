@@ -328,6 +328,38 @@ NNTR_M0_PROFILE=1 ...   # [M0-PROF] setup/router/topk/wksp/gather/ffn/route/scat
 호스트에서는 `test/htp/host/run_host_checks.sh`가 커널의 루프 구조와 워커 풀을 스칼라
 스탠드인으로 검사한다.
 
+### 6.1 CPU 기준선 다시 재기 (§1의 CPU 열을 8스레드·같은 날 값으로 바꾸는 절차)
+
+**1. 모델은 QS4CX_WH가 아니라 plain QS4CX여야 한다.** WH는 니블이 HMX 타일 순서라
+CPU `dot()`이 없고, `moe_engine=cpu`로 두면 첫 토큰에서 throw한다. 문서 48의 decode
+35 TPS를 잰 그 모델(`...-q40-qs4cx`)이면 된다. 기기에 없으면:
+
+```bash
+build/Applications/CausalLM/nntr_quantize_stream <fp32_dir> -o <qs4cx_dir> \
+  --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 --moe_dtype QS4CX --isa ARM
+```
+
+**2. `<qs4cx_dir>/nntr_config.json`**: `"moe_engine": "cpu"` (키를 지워도 기본이 cpu),
+`moe_htp_layers`는 지운다. 프롬프트와 `num_to_generate`(512)는 NPU 실행과 같게.
+바이너리는 지금 쓰는 `--htp` 빌드 그대로 (비프로파일 빌드). CPU 경로는 로드 때
+가중치를 pack만 하고 등록·워밍업은 건너뛴다.
+
+```bash
+./install_android.sh --model=<qs4cx_dir>
+# 3. TPS: 8스레드 3회, 4스레드(기본) 1회 -- 4스레드는 09-08의 1590 ms와 맞춰 보는 대조
+NNTR_NUM_THREADS=8 <run>      # ×3, prefill ms 최솟값
+<run>                         # ×1
+# 4. 같은 범위의 레이어 분해 (§2.1의 26.3 / 31.8을 대체할 값), 1회
+NNTR_NUM_THREADS=8 NNTR_M0_PROFILE=1 <run> 2>&1 | grep M0-PROF
+```
+
+**읽을 것**: `prefill:` 줄의 ms와 TPS(3회 최솟값), `generation:`의 decode TPS,
+`[M0-PROF] moe_layer[i] tokens=444 us=… ffn=…` 22줄 — `us`의 평균이 레이어(31.8 대응),
+`ffn`의 평균이 expert FFN 루프(26.3 대응). NPU 쪽 대응값은 §1에 이미 있다(18.4 / 15.2).
+
+**온도 게이트**: decode TPS가 30 아래면 스로틀 중이다(문서 44 §13.3). 그 실행의
+prefill은 버리고 식힌 뒤 다시. CPU-only는 등록이 없어 첫 prefill도 그대로 유효하다.
+
 ---
 
 ## 7. 남은 것
