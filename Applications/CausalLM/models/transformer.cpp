@@ -393,6 +393,10 @@ void Transformer::repack_weight() {
       auto *ops = l.getType() == "lfm2_moe" ? context.getComputeOps() : nullptr;
 
       auto weights = context.getWeights();
+      std::vector<void *> gu_data, dn_data;
+      std::vector<float *> gu_scale, dn_scale;
+      unsigned int gu_h = 0, gu_w = 0, dn_h = 0, dn_w = 0;
+      bool weights_wh = false;
       for (auto &w : weights) {
         auto &t = w->getVariableRef();
         const auto dtype = t.getDataType();
@@ -401,11 +405,62 @@ void Transformer::repack_weight() {
         }
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
                     dtype == ml::train::TensorDim::DataType::QS4CX_WH)) {
-          ops->register_qs4cx_weight(
-            t.getData<char>(), t.getScale<float>(),
-            static_cast<unsigned int>(t.height()),
-            static_cast<unsigned int>(t.width()),
-            dtype == ml::train::TensorDim::DataType::QS4CX_WH);
+          const auto h = static_cast<unsigned int>(t.height());
+          const auto wd = static_cast<unsigned int>(t.width());
+          weights_wh = dtype == ml::train::TensorDim::DataType::QS4CX_WH;
+          ops->register_qs4cx_weight(t.getData<char>(), t.getScale<float>(), h,
+                                     wd, weights_wh);
+          // The expert weights come in two shapes: gate_up is [K, 2*inter]
+          // and down [inter, N_out]. Sorted here for the warm-up below by
+          // the identity that tells them apart, gate_up.width == 2 *
+          // down.height, checked once both are seen.
+          if (gu_h == 0 || (h == gu_h && wd == gu_w)) {
+            if (gu_h == 0) {
+              gu_h = h;
+              gu_w = wd;
+            }
+            gu_data.push_back(t.getData<char>());
+            gu_scale.push_back(t.getScale<float>());
+          } else {
+            dn_h = h;
+            dn_w = wd;
+            dn_data.push_back(t.getData<char>());
+            dn_scale.push_back(t.getScale<float>());
+          }
+        }
+      }
+      // [doc 47 section 20.1, lever 6] One warm-up call through the layer
+      // kernel at load, so the first prefill does not pay the first call's
+      // costs -- the session scratch's growth to the prefill size, the
+      // first touch of every page of it and of the FastRPC buffers, the
+      // DSP's own first-call setup: read as +10 ms on the first MoE layer
+      // of the first prefill (doc 47 section 15). One layer's call is
+      // enough, since all of that is per session, not per layer. Zero
+      // input, output discarded. Skipped, harmlessly, when the shapes do
+      // not read as an expert pair.
+      static bool moe_warmed = false;
+      if (ops && !moe_warmed && l.getType() == "lfm2_moe" &&
+          ops->supports_gemm_qs4cx_moe_layer_fp32() && !gu_data.empty() &&
+          gu_data.size() == dn_data.size()) {
+        if (gu_w == 2 * dn_h && gu_h == dn_w) {
+          moe_warmed = true;
+          const unsigned int M = 512, K = gu_h, inter = dn_h, N_out = dn_w;
+          const unsigned int E = static_cast<unsigned int>(gu_data.size());
+          const unsigned int per = 64; // one 64-row block per expert
+          std::vector<unsigned int> row_index, row_count(E, per);
+          std::vector<float> row_weight;
+          for (unsigned int e = 0; e < E; ++e) {
+            for (unsigned int r = 0; r < per; ++r) {
+              row_index.push_back((e * per + r) % M);
+              row_weight.push_back(0.0f);
+            }
+          }
+          std::vector<float> act(static_cast<size_t>(M) * K, 0.0f);
+          std::vector<float> out(static_cast<size_t>(M) * N_out, 0.0f);
+          ops->gemm_qs4cx_moe_layer_fp32(
+            gu_data, gu_scale, dn_data, dn_scale, row_index, row_count,
+            row_weight, act.data(), out.data(), M, K, inter, N_out, weights_wh);
+          ml_logd("MoE HTP kernel warmed up at load (M=%u, %u experts)", M, E);
         }
       }
     };
