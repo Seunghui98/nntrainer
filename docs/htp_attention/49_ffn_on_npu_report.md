@@ -11,9 +11,10 @@
 **목표**: LFM2.5-8B-A1B(MoE)의 FFN(expert 행렬곱)을 Qualcomm HTP의 행렬 유닛(HMX)에서
 돌려 CPU보다 빠르게. 다른 레이어(conv, attention, norm, lm_head)는 CPU에 두고 비교한다.
 
-| | CPU (KleidiAI int4, 8스레드) | NPU (HexKL HMX) | 배율 |
+| | CPU (KleidiAI int4, 측정 당시 4스레드) | NPU (HexKL HMX) | 배율 |
 |---|---:|---:|---:|
-| **행렬곱만** (한 MoE 레이어 = expert 32개 × [M×2048×3584 → M×1792×2048], M 합 1776, 39 GFLOP, 크기는 §2.1) | 26.3 ms | **12.2 ms** | **2.2×** |
+| **expert FFN 루프** (한 MoE 레이어 = expert 32개 × [M×2048×3584 → SwiGLU → M×1792×2048], M 합 1776, 39 GFLOP, 크기는 §2.1. 라우터·gather·scatter 제외) | 26.3 ms | **15.2 ms** | **1.7×** |
+| ↳ 그중 순수 행렬 유닛 시간 | (KleidiAI GEMM 안에 양자화·f32 출력이 섞여 분리 불가) | HMX 명령 9.25 + acc_read 2.93 = **12.2 ms** | (2.2×, 범위가 다름) |
 | **MoE 레이어 전체** (라우터·양자화·전송 포함) | 31.8 ms | **18.4 ms** | **1.7×** |
 | **prefill 전체** (444 토큰, 24층) | 279 TPS (1590 ms) | **523 TPS (848 ms)** | **1.9×** |
 | **decode** (토큰 1개, MoE 레이어 하나) | 0.88 ms | 1.57 ms | **0.56×** (CPU가 빠름) |
@@ -34,7 +35,7 @@ CPU 8스레드가 예컨대 1400 ms(317 TPS)면 prefill 배율은 1.9×가 아�
 
 세 줄로 읽으면:
 
-1. **prefill(여러 토큰)에서는 NPU가 이긴다.** 행렬곱 자체는 2.2배, 레이어로는 1.7배, 전체
+1. **prefill(여러 토큰)에서는 NPU가 이긴다.** expert FFN 루프는 1.7배, 레이어도 1.7배, 전체
    prefill로는 1.9배. 처음 NPU 버전은 181 TPS로 CPU(279)보다 느렸고, 아래 §5의 최적화로
    523까지 올렸다.
 2. **decode(토큰 1개)에서는 아직 CPU가 이긴다.** 토큰 하나는 계산이 아니라 가중치 읽기
@@ -65,8 +66,20 @@ expert당 평균 55행. 이것이 행렬곱의 M이 되고, NPU에서는 이 M�
 
 ### 2.1 비교한 행렬곱의 크기
 
-§1의 "행렬곱만 26.3 vs 12.2 ms"는 아래 표의 **한 MoE 레이어 전체**(expert 32개, 1776행)다.
+§1의 "26.3 vs 15.2 ms"는 아래 표의 **한 MoE 레이어 전체**(expert 32개, 1776행)다.
 CPU와 NPU가 같은 행렬, 같은 행을 계산한다. 다른 것은 NPU가 M을 64행 블록으로 채운다는 점뿐.
+
+**둘 다 실측이고 추정이 아니다. 다만 같은 실행이 아니고, 타이머의 범위가 다르다:**
+
+| | CPU 26.3 ms | NPU 12.2 ms | NPU 15.2 ms (CPU와 같은 범위) |
+|---|---|---|---|
+| 무엇을 쟀나 | `NNTR_M0_PROFILE`의 `ffn` 타이머: 32 expert 각각 `gate_up.dot` → `swiglu_det` → `down.dot`의 합. KleidiAI int4 GEMM은 안에서 activation을 int8로 양자화하고 f32로 내놓으므로 양자화·dequant가 **안에 포함**된다 | `NNTR_HTP_PROFILE=2`의 `mm` + `acc` 열: HMX 명령 발행 시간 + accumulator 읽기. quant·requant·dequant·SwiGLU·DMA는 **제외** | host 17.5 − transport 2.08 − gather 0.14 − scatter 0.05 − push 0.05. DSP에서 도는 quant·HMX·acc·dequant·SwiGLU·requant·가중치 DMA 전부 |
+| 언제·어디 | 2026-09-10, CPU 레이어 4–7번 평균, 4스레드 (문서 44 §15.1) | 2026-09-16, 22 레이어 평균 (문서 47 §22.2) | 같은 실행 |
+| 행 | 1776 (444 × 4). 층마다 라우팅이 달라 expert별 M 분포는 다르지만 합은 같다 | 1776 → 패딩 2918 | |
+
+"행렬곱만 2.2배"는 CPU의 GEMM 커널(양자화 포함) 대 NPU의 순수 HMX 시간이라 NPU에 유리한
+비교다. 범위를 맞추면 **1.7배**이고, 이것이 레이어 배율 1.7과 같은 이유는 양쪽 다 라우터·
+gather·scatter가 작아서다.
 
 **expert 하나의 행렬** (모든 expert, 모든 MoE 층이 같은 모양)
 
@@ -86,7 +99,7 @@ M은 그 expert로 라우팅된 행 수다. prefill에서는 평균 55(1776/32)�
 | 행 (토큰 × top-4) | 1776 | 32 expert에 분산 |
 | 유효 FLOP | 1776 × 22.0 M = **39.1 GFLOP** | CPU 26.3 ms → 1.49 TFLOPS |
 | NPU가 실제 계산한 행 | 45.6 블록 × 64 = **2918** | 39%가 패딩 |
-| NPU가 실제 계산한 FLOP | 2918 × 22.0 M = 64.3 GFLOP | 12.2 ms → 5.3 TFLOPS 원시, 3.2 유효 |
+| NPU가 실제 계산한 FLOP | 2918 × 22.0 M = 64.3 GFLOP | HMX 12.2 ms → 5.3 TFLOPS 원시, 3.2 유효. 같은 범위 15.2 ms면 2.6 유효 |
 | HMX 명령 수 | 45.6 × (7168 + 3584) = 490 K | 명령 = 64×32×32 타일, 17.5 ns |
 | 가중치 읽기 | 32 × 5.25 MiB = **168 MiB** (176 MB) | CPU는 DDR→캐시, NPU는 DMA→VTCM (17.5 ms에 10 GB/s) |
 | 활성화 입력 | 444 × 2048 × 4 B = 3.6 MB f32 | ARM → DSP 전송 |
@@ -119,7 +132,7 @@ M은 그 expert로 라우팅된 행 수다. prefill에서는 평균 55(1776/32)�
 
 ### 3.1 하드웨어
 
-| | CPU (Cortex big.LITTLE, 8스레드) | HTP (HMX + HVX, VTCM 8 MiB) |
+| | CPU (Cortex big.LITTLE, 측정 당시 4스레드) | HTP (HMX + HVX, VTCM 8 MiB) |
 |---|---|---|
 | 행렬곱 유닛 | NEON i8mm, KleidiAI int4 커널 | **HMX**: 한 명령에 64행 × 32(k) × 32(n) u8×i4 타일 |
 | 실측 속도 | 39 GFLOP / 26.3 ms ≈ **1.5 TFLOPS** (에필로그 포함) | 유효 **3.2 TFLOPS**, 패딩 포함 5.3 (mm 17.5 ns/타일) |
@@ -128,7 +141,7 @@ M은 그 expert로 라우팅된 행 수다. prefill에서는 평균 55(1776/32)�
 | 결과 | f32 | int32 accumulator → 읽어내서(acc_read) f32로 되돌린다 |
 | 호출 비용 | 0 | FastRPC 콜당 ≈ 2 ms(prefill), 0.16–0.5 ms(decode) |
 
-### 3.2 그래서 왜 2.2배이고 왜 더 못 벌리나
+### 3.2 그래서 왜 1.7배이고 왜 더 못 벌리나
 
 HMX는 명목상 CPU보다 훨씬 빠르지만(5.3 vs 1.5 TFLOPS), 세 가지가 깎아 먹는다.
 
@@ -146,7 +159,8 @@ NPU 콜 17.5 ms (prefill, 한 레이어)
 - **acc_read**: HexKL micro API가 accumulator 하나만 노출한다. 읽는 동안 계산이 선다.
 - **전송**: NPU는 딴 칩이다. 활성화를 보내고 결과를 받는 데 콜당 2 ms.
 
-CPU는 이 셋이 없다. 그래서 "명목 3.5배"가 "실측 2.2배"가 된다. 레이어 전체로는 라우터와
+CPU는 이 셋이 없다. 그래서 "명목 3.5배"가 HMX 시간만 세면 2.2배, CPU와 같은 범위(양자화·
+SwiGLU·DMA 포함)로 세면 **1.7배**가 된다. 레이어 전체로는 라우터와
 양자화, ARM 쪽 준비가 더해져 1.7배.
 
 ### 3.3 decode는 왜 CPU가 이기나
