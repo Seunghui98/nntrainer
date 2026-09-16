@@ -426,3 +426,61 @@ shape에서 유도한 추정이고, 첫 항목이 그걸 재는 방법이다.
 
 F1까지 가면 prefill ≈ 860 ms(≈520 TPS), T가 먹으면 ≈ 700(≈630). 그 뒤는 F2/A인데
 주소공간이 정한다.
+
+## 14. HMX와 HVX를 동시에 — 콜 안의 유휴 시간 예산과 out-of-order 후보 (2026-09-16)
+
+§11의 파이프라인은 "에필로그를 다음 배치 뒤에"까지다. 두 유닛의 유휴를 세어 보면 더 있다.
+콜 19.9 ms 기준 (§11.1 실행):
+
+```
+HMX 바쁨   11.8 (mm 8.86 + acc 2.96)
+HMX 유휴    4.1 = quant 1.44 (루프 전) + requant 1.17 + 마지막 에필로그 0.86 + stage 0.37 + drain 0.26
+HVX 바쁨   ≈6.5 = 에필로그 3.3 + quant 1.44 + requant 1.17 + scatter 0.6
+HVX 유휴   ≈8.8 — HMX가 도는 11.8 중 에필로그 3 ms만 겹친다
+```
+
+**HVX가 8.8 ms 놀고 HMX가 4.1 ms 논다.** 의존이 없는 일을 그 구멍에 넣는 후보:
+
+| # | 후보 | HMX 임계경로에서 빠지는 것 | HVX 유휴에서 쓰는 것 | 비용 |
+|---|---|---:|---:|---|
+| **O1** | **꼬리 블록을 HVX GEMV로, HMX 그늘에서.** 45.6 블록 중 13.6개가 두 번째 블록(평균 10~20행)인데 HMX는 64행 값을 다 낸다(252 us). 이 블록들을 풀의 비동기 잡으로 보내고 HMX는 다음 expert로 넘어간다. 가중치는 VTCM이 아니라 **아레나(DDR)에서 직접** 읽는다 — VTCM의 A/B는 다음 expert가 곧 덮는다. DDR +75 MB/콜은 평균 9.6 GB/s인 prefill DMA에 여유가 있다. u8×i4 int32 합은 순서 무관이라 HMX 경로와 **비트동일** | **−3.4** (13.6 × 252 us) | +2.6 (블록당 ≈190 us: 5.5 MB 스트림 × (unpack + 행 수 vrmpy) / 3워커) | 큼 — 그런데 **decode의 L1(M=1 GEMV)과 같은 커널**이다. 한 번 만들어 둘 다 쓴다 |
+| O2 | quant를 expert 0의 슬롯부터 팩하고 HMX를 시작, 나머지 팩은 풀에서 HMX 그늘로 | −1.3 | +1.3 | 중 (`quant_pack_worker`의 분할을 kt에서 슬롯 범위로) |
+| O3 | 2블록 expert: requant(b0) 동안 HMX가 gu(b1) — h×2, mid×2 (+560 KB, 여유 1.4 MB 안) | −0.35 (13.6 블록만 해당) | 0 | 중 |
+| O4 | requant 스캔(행 min/max)을 융합 에필로그의 워커별 부분합으로 → 팩만 남음 | −0.5 | 0 | 중 |
+| O5 | expert 순서: 2블록 expert를 앞에 — O3의 겹침이 많아지진 않는다. 효과 없음 | 0 | | 안 함 |
+
+O1–O4 합 ≈ **−5.5 ms/콜 → 콜 19.9 → ≈14.4, prefill −120 ms.** HMX 바닥 11.8에 거의 닿는다
+(그 뒤는 transport와 stage뿐). O1이 절반이고 decode 커널을 겸하므로 먼저다.
+
+**커널 밖의 out-of-order — 청크 prefill.** 444 토큰을 반으로 갈라 DSP가 앞 반의 MoE(L)를
+도는 동안 ARM이 뒤 반의 conv(L+1)… 를 돌리면 ARM 742와 DSP 438이 겹친다. 그런데 MoE HMX는
+패딩 지배라 M을 반으로 줄이면 블록 수가 45.6 → 2×36 = 72로 **+58%** 늘어난다(expert마다
+패딩). 겹침으로 얻는 것보다 잃는 게 클 수 있어 **M 측정 뒤에 산술로 판단**한다. 적어 둔다.
+
+### 14.1 프로파일링 절차 (이번 라운드)
+
+```bash
+# ARM: --profile 빌드 (노드별 타이머). skel은 7527b15 그대로
+cd Applications/CausalLM && ./build_android.sh --htp --profile && ./install_android.sh --model=<모델>
+
+# 1) prefill 분해 — <model_dir>/nntr_config.json 의 "num_to_generate" 를 1 로
+NNTR_M0_PROFILE=1 NNTR_HTP_PROFILE=2 <run> 2>&1 | tee prefill_prof.log
+NNTR_NUM_THREADS=8 NNTR_HTP_PROFILE=2 <run> 2>&1 | tee prefill_t8.log      # 스레드 효과 (T)
+
+# 2) decode 분해 — num_to_generate 원래대로(512)
+NNTR_HTP_PROFILE=2 <run> 2>&1 | tee decode_prof.log
+NNTR_HTP_PROFILE=3 <run> 2>&1 | tee decode_p3.log                         # transport 정체 (측정 B)
+```
+
+읽는 것:
+
+| 블록 | 열 | 뜻 |
+|---|---|---|
+| `[PROFILE]` 표 (`key avg min max sum pct`) | `sum`, `pct` | 노드/TYPE별 합. `num_to_generate: 1`이면 decode 1토큰(≈65 ms)만 섞이므로 **sum ≈ prefill**. `fully_connected`·`mha_core`·`rms_norm`·`lfm2_moe`·`causal_conv1d`·`custom_multiply`를 본다 |
+| `[M0-PROF] moe_layer[i] tokens=444 us= setup= router= topk= wksp= gather= ffn= route= scatter= other=` × 22 | `ffn` vs 나머지 | `ffn` ≈ HTP host + staging; **나머지 합**이 §13.1의 "MoE ARM 쪽 2.1–5 ms" |
+| `[HTP-PROFILE] M>1` | `host`, `scatter` | 7527b15 반영 확인: scatter ≈100 |
+| `prefill:` 줄 | TPS | **`--profile` 빌드는 prefill을 83% 왜곡** — 두 실행 사이의 **비율**만 읽는다 (T의 효과) |
+| decode `[PROFILE]` | `output_of_causallm` avg, `fully_connected` sum/512, `mha_core` | 문서 48 §2 ②③의 실측 |
+| decode `PROFILE=3` `M==1` | `transport` | 565 → ≤300이면 wake/클록, 아니면 마샬링 |
+
+돌려보낼 것: 네 로그의 `[PROFILE]` 표 전체, `[M0-PROF]` 22줄, `[HTP-PROFILE]` 블록, `prefill:`/`generation:` 줄.
