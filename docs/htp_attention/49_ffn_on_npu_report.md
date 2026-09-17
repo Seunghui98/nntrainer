@@ -551,7 +551,11 @@ NNTR_M0_PROFILE=1 ...   # [M0-PROF] setup/router/topk/wksp/gather/ffn/route/scat
 
 **1. 모델은 QS4CX_WH가 아니라 plain QS4CX여야 한다.** WH는 니블이 HMX 타일 순서라
 CPU `dot()`이 없고, `moe_engine=cpu`로 두면 첫 토큰에서 throw한다. 문서 48의 decode
-35 TPS를 잰 그 모델(`...-q40-qs4cx`)이면 된다. 기기에 없으면:
+35 TPS를 잰 그 모델(`...-q40-qs4cx`)이면 된다. **QS4CX는 CPU용 int4 포맷이다** —
+KleidiAI가 읽는 그 포맷이고 `moe_engine=cpu`면 `FloatTensor::dotQs4cx`가 KleidiAI
+NEON 커널로 간다(`float_tensor.cpp:1099–1125`). NPU 전용은 QS4CX_WH뿐이다. 파일이
+엔진을 정하지 않고 `nntr_config.json`의 `moe_engine`이 정한다. Q4_0이 아니라 QS4CX를
+쓰는 이유는 WH와 **같은 int4 값**이라서다(WH는 니블 자리만 바꾼 것). 기기에 없으면:
 
 ```bash
 build/Applications/CausalLM/nntr_quantize_stream <fp32_dir> -o <qs4cx_dir> \
