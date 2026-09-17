@@ -367,6 +367,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
   }
+  // Transformer leaves tokenizer null when nntr_config.json has no
+  // "tokenizer_file" (or skip_tokenizer is set); run() cannot work without it.
+  if (!tokenizer) {
+    throw std::runtime_error(
+      "CausalLM::run: no tokenizer loaded. nntr_config.json needs a valid "
+      "\"tokenizer_file\" and skip_tokenizer must not be set.");
+  }
 
   struct StreamerEndGuard {
     BaseStreamer *streamer;
