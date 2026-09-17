@@ -492,6 +492,23 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
       "MAX_SEQ_LEN must be greater than or equal to INIT_SEQ_LEN");
   }
 
+  // The generation loop below writes ids_history[b * MAX_SEQ_LEN + idx] for
+  // idx up to input_len + NUM_TO_GENERATE, into a buffer of exactly
+  // BATCH_SIZE * MAX_SEQ_LEN (causal_lm.cpp's ctor), and walks the KV cache
+  // to the same position. Without this check a prompt that leaves no room
+  // for the requested generation runs off both and segfaults with nothing
+  // printed -- measured on a 1024-token prompt against max_seq_len 1024,
+  // which overruns from the very first generated token.
+  const size_t slots_needed =
+    static_cast<size_t>(input_len) + 1u + static_cast<size_t>(NUM_TO_GENERATE);
+  if (slots_needed > static_cast<size_t>(MAX_SEQ_LEN)) {
+    throw std::invalid_argument(
+      "prompt (" + std::to_string(input_len) + " tokens) + num_to_generate (" +
+      std::to_string(NUM_TO_GENERATE) + ") needs " +
+      std::to_string(slots_needed) + " slots but max_seq_len is " +
+      std::to_string(MAX_SEQ_LEN) + "; raise max_seq_len in nntr_config.json");
+  }
+
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
   // input slots. Idempotent: only the first call does work.
   allocateAndBindKVCache();
