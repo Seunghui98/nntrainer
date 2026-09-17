@@ -176,6 +176,29 @@ CPU는 이 셋이 없다. 그래서 "명목 4.6배"가 HMX 시간만 세면 2.8�
 CPU와 같은 범위(staging·FastRPC까지)로 세면 **2.0배**가 된다. 레이어 전체로는 CPU 쪽에
 workspace·gather·scatter 5.5 ms가 더 붙어 2.2배.
 
+### 3.2.1 배율의 사다리 — 행렬 유닛의 6.5배가 prefill의 1.6배가 되기까지
+
+"행렬곱 유닛은 몇 배인데 모델은 왜 그것밖에 안 빨라지나"에 대한 답. 각 단은 위 단에
+그 단에서만 생기는 비용을 더한 것이고, 전부 실측이다.
+
+| 단 | CPU (ms) | NPU (ms) | 배율 | 이 단에서 더해진 것 |
+|---|---:|---:|---:|---|
+| 행렬 명령 발행만 (`mm` 열, 패딩 포함 64.3 GFLOP) | — | 9.25 (6.95 TFLOPS) | ≈ 6.1× (CPU ffn 1.14 TFLOPS 기준) | HMX 명령 17.5 ns/타일의 순수 속도 |
+| + accumulator 읽기 (`acc`) | — | 12.2 (유효 3.2 TFLOPS) | **2.8×** | acc_read 2.9 ms (API에 두 번째 acc 없음) + 패딩 39%가 유효 FLOP에서 빠짐 |
+| + DSP 안 나머지 (quant·requant·dequant·SwiGLU·DMA 노출) | — | 15.2 | **2.3×** | 에필로그 노출 3.0 ms |
+| + staging memcpy + FastRPC (같은 `ffn` 범위) | 34.4 | 17.4 | **2.0×** | 전송 2.2 ms |
+| + 레이어의 나머지 ARM 일 (`us`) | 40.9 | 18.4 | **2.2×** | CPU 쪽만 wksp·gather·scatter 5.5 ms를 더 낸다 |
+| + MoE가 아닌 레이어 (prefill 전체) | 1329 | 848 | **1.6×** | conv·attention·norm·lm_head ≈ 430 ms가 양쪽 똑같이 |
+
+마지막 줄이 맞아떨어지는지 확인: CPU 1329 − 22 × 40.9 = **429 ms**, NPU 848 − 22 × 18.4 =
+**443 ms** — MoE 밖의 ARM 일이 양쪽에서 같은 크기다. prefill 차이 481 ms ≈ 22 × (40.9 − 18.4)
+= 495 ms. 즉 prefill 배율 1.6×는 MoE 레이어 배율 2.2×에 Amdahl(MoE 비중 CPU 68%, NPU 48%)을
+적용한 값이고, 새어 나간 시간은 없다.
+
+CPU 쪽 "행렬 명령만"은 비어 있다. ggml Q4_0 GEMM은 activation Q8 양자화와 f32 출력이 커널
+안에 있어 분리되지 않고, 별도 마이크로벤치를 돌리지 않았다. 잰다면 M=55, K=2048, N=3584의
+`ggml` GEMM 단독 시간이 되고, 위 표의 첫 줄만 채워질 뿐 아래 줄은 바뀌지 않는다.
+
 ### 3.3 decode는 왜 CPU가 이기나
 
 토큰 1개는 expert 4개의 가중치 21 MiB(≈ 22 MB, §2.1)를 읽어 88 MFLOP를 계산한다. 계산은 0에 가깝고
