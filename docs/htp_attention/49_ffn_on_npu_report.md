@@ -11,25 +11,26 @@
 **목표**: LFM2.5-8B-A1B(MoE)의 FFN(expert 행렬곱)을 Qualcomm HTP의 행렬 유닛(HMX)에서
 돌려 CPU보다 빠르게. 다른 레이어(conv, attention, norm, lm_head)는 CPU에 두고 비교한다.
 
-| | **CPU, 원본 흐름** (PR 4264: MoE Q4_0, ggml, 8스레드) | CPU, QS4CX (KleidiAI, 4스레드) | **NPU** (QS4CX_WH, HexKL HMX) | NPU vs 원본 CPU | NPU vs QS4CX CPU |
-|---|---:|---:|---:|---:|---:|
-| **expert FFN 루프** (한 MoE 레이어 = expert 32개 × [M×2048×3584 → SwiGLU → M×1792×2048], M 합 1776, 39 GFLOP, 크기는 §2.1. 라우터·gather·scatter 제외) | 34.4 ms | 26.3 ms | **15.2 ms** (DSP 내부) / **17.4 ms** (`M0` `ffn`: staging + FastRPC 포함) | **2.3× / 2.0×** | 1.7× |
-| ↳ 그중 순수 행렬 유닛 시간 | (GEMM 안에 양자화·f32 출력이 섞여 분리 불가) | (같음) | HMX 명령 9.25 + acc_read 2.93 = **12.2 ms** | (2.8×, 범위가 다름) | (2.2×) |
-| **MoE 레이어 전체** (라우터·양자화·전송 포함, 같은 `M0` 타이머) | 40.9 ms | 31.8 ms | **18.4 ms** | **2.2×** | 1.7× |
-| **prefill 전체** (444 토큰, 24층, 최솟값) | 334 TPS (1329 ms, 5회) | 279 TPS (1590 ms) | **523 TPS (848 ms, 3회)** | **1.6×** | 1.9× |
-| **decode** (토큰 1개, 512 생성) | **48 TPS** | 35 TPS | 20.8 TPS | **0.43×** (CPU가 빠름) | 0.59× |
+| | **CPU** (원본 흐름 = PR 4264: 전 레이어 Q4_0, MoE는 ggml Q4_0 GEMM, 8스레드) | **NPU** (MoE만 QS4CX_WH, HexKL HMX, 8스레드) | 배율 |
+|---|---:|---:|---:|
+| **expert FFN 루프** (한 MoE 레이어 = expert 32개 × [M×2048×3584 → SwiGLU → M×1792×2048], M 합 1776, 39 GFLOP, 크기는 §2.1. 라우터·gather·scatter 제외. 같은 `M0` `ffn` 타이머) | 34.4 ms | **17.4 ms** (그중 DSP 내부 15.2, 순수 HMX 12.2) | **2.0×** (DSP 내부만 세면 2.3×) |
+| **MoE 레이어 전체** (같은 `M0` `us` 타이머) | 40.9 ms | **18.4 ms** | **2.2×** |
+| **prefill 전체** (444 토큰, 24층, 최솟값) | 334 TPS (1329 ms, 5회) | **523 TPS (848 ms, 3회)** | **1.6×** |
+| **decode** (토큰 1개, 512 생성) | **48 TPS** (20.8 ms/token) | 20.8 TPS (48 ms/token) | **0.43×** (CPU가 빠름) |
 
-**세 열의 출처.** 원본 CPU 열과 NPU 열의 `M0` 값은 09-17에 8스레드로 새로 쟀고, QS4CX CPU 열만 예전 값이다.
+**출처.** 두 열 모두 2026-09-16/17, 같은 기기, 같은 프롬프트, `NNTR_NUM_THREADS=8`, 같은 `--htp` 바이너리,
+decode TPS로 열 게이트 확인. 전체 로그와 22줄 분해는 §6.1.1.
 
-| 열 | 모델 · 경로 | 어디서 | 언제·조건 |
-|---|---|---|---|
-| CPU 원본 흐름 | `lfm2.5-8b-a1b-q40`: 전 레이어 Q4_0, MoE expert는 ggml Q4_0 GEMM (PR 4264 그대로, `moe_engine` 없음) | §6.1.1: 5회 1847/1371/1470/1329/1351 ms, decode 47–49 TPS(열 정상). `NNTR_M0_PROFILE=1` 2회 × 22줄 평균 | **2026-09-17, 8스레드** |
-| CPU QS4CX | `…-q40-qs4cx`: MoE만 QS4CX, KleidiAI int4 | 레이어 31.8 = 문서 44 §15.1 P3(같은 forward의 CPU 레이어 4–7 평균). prefill 1590 = 문서 43 §7 M0 대조 2회(841/853 ms = 53%)를 문서 46 §18.2가 279 TPS로 환산. decode 35 = 문서 48 | 09-08 / 09-10 / 09-15, **4스레드**, 열 상태 불명 |
-| NPU | `…-q40-qs4cx-wh`: MoE만 QS4CX_WH, 아레나 | 레이어 18.4 = §6.1.1의 `NNTR_M0_PROFILE=1` 22줄 평균 (09-17; 문서 47 §22.2의 host 17.5 + ARM 0.9 추정과 일치). 비프로파일 3회 최솟값 848 ms (09-16) | 2026-09-16/17, 8스레드 |
+| 열 | 모델 · 경로 | 어디서 |
+|---|---|---|
+| CPU | `lfm2.5-8b-a1b-q40`: `nntr_quantize_stream --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 --isa ARM` (`--moe_dtype` 없음 → expert도 Q4_0), `nntr_config.json`에 `moe_engine` 없음 | 비프로파일 5회 1847/1371/1470/1329/1351 ms, decode 47–49 TPS. `NNTR_M0_PROFILE=1` 2회 × 22줄 평균 |
+| NPU | `lfm2.5-8b-a1b-q40-qs4cx-wh`: 같은 FP32에서 MoE만 `--moe_dtype QS4CX_WH`, `moe_engine: htp` | 비프로파일 3회 최솟값 848 ms (09-16). `NNTR_M0_PROFILE=1` 22줄 평균 (09-17): 레이어 18.40, `ffn` 17.44 — 문서 47 §22.2의 host 17.5 + ARM 0.9 추정과 일치 |
 
-NPU와 **같은 int4 값**으로 비교하려면 QS4CX 열이 맞고, **upstream CPU 구현 대비**를 말하려면
-원본 흐름 열이 맞다. 둘 다 둔다. QS4CX 열은 4스레드·다른 날 값이라 8스레드로 다시 재야
-닫힌다(§6.1의 남은 측정).
+두 모델은 MoE expert의 양자화 값이 다르다(Q4_0은 32개 블록마다 scale, QS4CX_WH는 채널당
+scale). 그래서 출력 텍스트도 다르다(CPU는 긴 `<think>` 뒤 잘림, NPU는 3문장 요약). 비교는
+"upstream CPU 구현 그대로" 대 "MoE를 NPU로"이고, 같은 int4 값끼리의 비교(QS4CX CPU, KleidiAI)는
+이전 문서(43·44·46·48: 4스레드, 26.3 / 31.8 ms, 279 / 35 TPS)에만 있고 여기서는 비교군에서
+뺐다.
 
 **원본 흐름 CPU 레이어의 분해** (`[M0-PROF]` 22줄 평균, us → ms):
 
@@ -38,23 +39,21 @@ NPU와 **같은 int4 값**으로 비교하려면 QS4CX 열이 맞고, **upstream
 | setup / router / topk | 0.04 / 0.75 / 0.11 | 같은 ARM 코드 |
 | wksp (CPU 워크스페이스 할당·zero-fill) | 1.68 | 없음 (E1로 건너뜀) |
 | gather (토큰 → expert 순서 복사) | 1.10 | DSP pack이 대신 (bg 레인, 숨음) |
-| **ffn** (Q4_0 GEMM gate_up → SwiGLU → GEMM down, 32 expert) | **34.4** | **17.4** = staging memcpy 0.9 + FastRPC 콜 16.5 (DSP 15.2 = HMX 12.2 + 노출 3.0, 전송 1.3~2.1) |
+| **ffn** (Q4_0 GEMM gate_up → SwiGLU → GEMM down, 32 expert) | **34.4** | **17.4** = staging memcpy 0.9 + FastRPC 콜 16.5 (DSP 내부 15.2 = HMX 12.2 + 노출 3.0, 나머지 전송) |
 | route (라우팅 가중치 곱) + scatter | 1.46 + 1.23 | DSP scatter 잡 (숨음) |
 | **레이어** | **40.9** (37.2–43.6, 2회 44줄) | **18.4** (16.5–19.5, 22줄) |
 
-ffn 34.4 ms = 39.1 GFLOP → **1.14 TFLOPS**, NPU `ffn` 17.4 ms → 2.24 TFLOPS. KleidiAI
-QS4CX(26.3 ms, 1.49 TFLOPS)보다 ggml Q4_0이 prefill에서 24% 느리다. 반대로 decode는 Q4_0 48 TPS가 QS4CX 35 TPS보다 빠른데,
-같은 날 값이 아니라(09-15 vs 09-17) 원인은 QS4CX를 다시 재야 갈린다.
+ffn 34.4 ms = 39.1 GFLOP → CPU **1.14 TFLOPS**; NPU `ffn` 17.4 ms → 2.24 TFLOPS, DSP 내부 15.2 →
+2.57, HMX만 12.2 → 3.2 (패딩 포함 5.3).
 
 세 줄로 읽으면:
 
-1. **prefill(여러 토큰)에서는 NPU가 이긴다.** 원본 CPU 흐름(Q4_0, 8스레드) 대비 expert FFN
-   루프 2.3배, 레이어 2.2배, prefill 전체 1.6배. 같은 int4 값인 QS4CX CPU(4스레드) 대비는
-   1.7 / 1.7 / 1.9배. 처음 NPU 버전은 181 TPS로 CPU보다 느렸고, 아래 §5의 최적화로 523까지 올렸다.
+1. **prefill(여러 토큰)에서는 NPU가 이긴다.** expert FFN 루프 2.0배, MoE 레이어 2.2배, prefill
+   전체 1.6배(MoE가 prefill의 45~66%라 Amdahl). 처음 NPU 버전은 181 TPS로 CPU(334)보다 느렸고,
+   아래 §5의 최적화로 523까지 올렸다.
 2. **decode(토큰 1개)에서는 아직 CPU가 이긴다.** 토큰 하나는 계산이 아니라 가중치 읽기
    (DDR 대역폭)가 전부라서, 누가 계산하느냐보다 누가 DDR을 빨리 읽느냐다. NPU 경로는
-   64행 단위 계산의 낭비와 콜당 전송 비용까지 얹혀 20 TPS — 원본 CPU 48 TPS의 0.42배,
-   QS4CX CPU 35 TPS의 0.56배다(문서 48).
+   64행 단위 계산의 낭비와 콜당 전송 비용까지 얹혀 20.8 TPS — CPU 48 TPS의 0.43배다(문서 48).
 3. **NPU 커널은 바닥에 닿았다.** 콜 17.5 ms 중 82%가 하드웨어 구조(HMX 타일, accumulator
    읽기)와 전송 바이트다. 다음 배수는 커널 안이 아니라 ARM과 DSP를 **동시에** 쓰는
    데서 온다(§7).
@@ -80,20 +79,20 @@ expert당 평균 55행. 이것이 행렬곱의 M이 되고, NPU에서는 이 M�
 
 ### 2.1 비교한 행렬곱의 크기
 
-§1의 "26.3 vs 15.2 ms"는 아래 표의 **한 MoE 레이어 전체**(expert 32개, 1776행)다.
-CPU와 NPU가 같은 행렬, 같은 행을 계산한다. 다른 것은 NPU가 M을 64행 블록으로 채운다는 점뿐.
+§1의 "34.4 vs 17.4 ms"는 아래 표의 **한 MoE 레이어 전체**(expert 32개, 1776행)다.
+CPU와 NPU가 같은 행렬, 같은 행 수를 계산한다. 다른 것은 NPU가 M을 64행 블록으로 채운다는 점,
+그리고 가중치의 양자화 값(Q4_0 vs QS4CX_WH)뿐이다.
 
-**둘 다 실측이고 추정이 아니다. 다만 같은 실행이 아니고, 타이머의 범위가 다르다:**
+**전부 실측이고, 타이머의 범위가 어디까지인지가 다르다:**
 
-| | CPU 26.3 ms | NPU 12.2 ms | NPU 15.2 ms (CPU와 같은 범위) |
-|---|---|---|---|
-| 무엇을 쟀나 | `NNTR_M0_PROFILE`의 `ffn` 타이머: 32 expert 각각 `gate_up.dot` → `swiglu_det` → `down.dot`의 합. KleidiAI int4 GEMM은 안에서 activation을 int8로 양자화하고 f32로 내놓으므로 양자화·dequant가 **안에 포함**된다 | `NNTR_HTP_PROFILE=2`의 `mm` + `acc` 열: HMX 명령 발행 시간 + accumulator 읽기. quant·requant·dequant·SwiGLU·DMA는 **제외** | host 17.5 − transport 2.08 − gather 0.14 − scatter 0.05 − push 0.05. DSP에서 도는 quant·HMX·acc·dequant·SwiGLU·requant·가중치 DMA 전부 |
-| 언제·어디 | 2026-09-10, CPU 레이어 4–7번 평균, 4스레드 (문서 44 §15.1) | 2026-09-16, 22 레이어 평균 (문서 47 §22.2) | 같은 실행 |
-| 행 | 1776 (444 × 4). 층마다 라우팅이 달라 expert별 M 분포는 다르지만 합은 같다 | 1776 → 패딩 2918 | |
+| | CPU 34.4 ms | NPU 17.4 ms (같은 범위) | NPU 15.2 ms (DSP 내부) | NPU 12.2 ms (HMX만) |
+|---|---|---|---|---|
+| 무엇을 쟀나 | `NNTR_M0_PROFILE`의 `ffn` 타이머: 32 expert 각각 `gate_up.dot` → `swiglu_det` → `down.dot`의 합. ggml Q4_0 GEMM은 안에서 activation을 Q8로 양자화하고 f32로 내놓으므로 양자화·dequant가 **안에 포함** | 같은 `ffn` 타이머: staging memcpy(3.6 MB × 2) + FastRPC 콜 전체 | `NNTR_HTP_PROFILE=2`의 host 17.5 − transport 2.08 − gather·scatter·push 0.24. DSP에서 도는 quant·HMX·acc·dequant·SwiGLU·requant·가중치 DMA 전부 | `mm` + `acc` 열: HMX 명령 발행 + accumulator 읽기. quant·requant·dequant·SwiGLU·DMA 제외 |
+| 언제 | 09-17, 22 레이어 × 2회 평균, 8스레드 | 09-17, 22 레이어 평균, 8스레드 | 09-16, 22콜 평균 (문서 47 §22.2) | 같은 실행 |
+| 행 | 1776 (444 × 4). 층마다 라우팅이 달라 expert별 M 분포는 다르지만 합은 같다 | 1776 → 패딩 2918 | | |
 
-"행렬곱만 2.2배"는 CPU의 GEMM 커널(양자화 포함) 대 NPU의 순수 HMX 시간이라 NPU에 유리한
-비교다. 범위를 맞추면 **1.7배**이고, 이것이 레이어 배율 1.7과 같은 이유는 양쪽 다 라우터·
-gather·scatter가 작아서다.
+배율은 범위에 따라 **2.0× / 2.3× / 2.8×**다. 문서에서 "행렬곱"이라고 하면 같은 범위인 2.0×를
+쓰고, HMX 자체의 속도를 말할 때만 2.8×를 쓴다.
 
 **expert 하나의 행렬** (모든 expert, 모든 MoE 층이 같은 모양)
 
@@ -111,7 +110,7 @@ M은 그 expert로 라우팅된 행 수다. prefill에서는 평균 55(1776/32)�
 | | 값 | 비고 |
 |---|---:|---|
 | 행 (토큰 × top-4) | 1776 | 32 expert에 분산 |
-| 유효 FLOP | 1776 × 22.0 M = **39.1 GFLOP** | CPU 26.3 ms → 1.49 TFLOPS |
+| 유효 FLOP | 1776 × 22.0 M = **39.1 GFLOP** | CPU 34.4 ms → 1.14 TFLOPS |
 | NPU가 실제 계산한 행 | 45.6 블록 × 64 = **2918** | 39%가 패딩 |
 | NPU가 실제 계산한 FLOP | 2918 × 22.0 M = 64.3 GFLOP | HMX 12.2 ms → 5.3 TFLOPS 원시, 3.2 유효. 같은 범위 15.2 ms면 2.6 유효 |
 | HMX 명령 수 | 45.6 × (7168 + 3584) = 490 K | 명령 = 64×32×32 타일, 17.5 ns |
@@ -146,18 +145,18 @@ M은 그 expert로 라우팅된 행 수다. prefill에서는 평균 55(1776/32)�
 
 ### 3.1 하드웨어
 
-| | CPU (Cortex big.LITTLE, 측정 당시 4스레드) | HTP (HMX + HVX, VTCM 8 MiB) |
+| | CPU (Cortex big.LITTLE, 8스레드) | HTP (HMX + HVX, VTCM 8 MiB) |
 |---|---|---|
-| 행렬곱 유닛 | NEON i8mm, KleidiAI int4 커널 | **HMX**: 한 명령에 64행 × 32(k) × 32(n) u8×i4 타일 |
-| 실측 속도 | 39 GFLOP / 26.3 ms ≈ **1.5 TFLOPS** (에필로그 포함) | 유효 **3.2 TFLOPS**, 패딩 포함 5.3 (mm 17.5 ns/타일) |
+| 행렬곱 유닛 | NEON dotprod, ggml Q4_0 GEMM (Q8 활성화 × Q4_0 가중치, 32개 블록 scale) | **HMX**: 한 명령에 64행 × 32(k) × 32(n) u8×i4 타일 |
+| 실측 속도 | 39 GFLOP / 34.4 ms ≈ **1.14 TFLOPS** (양자화·SwiGLU 포함) | HMX만 **3.2 TFLOPS** 유효 (패딩 포함 5.3, mm 17.5 ns/타일); 같은 범위로는 2.24 |
 | 가중치 읽기 | DDR 직접, 캐시 | DMA로 DDR → VTCM(온칩 8 MiB), 실측 10–16 GB/s (고립 38.8) |
 | 활성화 | f32 그대로 | **u8로 양자화**해야 HMX가 먹는다 (행별 scale/zp) |
 | 결과 | f32 | int32 accumulator → 읽어내서(acc_read) f32로 되돌린다 |
 | 호출 비용 | 0 | FastRPC 콜당 ≈ 2 ms(prefill), 0.16–0.5 ms(decode) |
 
-### 3.2 그래서 왜 1.7배이고 왜 더 못 벌리나
+### 3.2 그래서 왜 2.0~2.2배이고 왜 더 못 벌리나
 
-HMX는 명목상 CPU보다 훨씬 빠르지만(5.3 vs 1.5 TFLOPS), 세 가지가 깎아 먹는다.
+HMX는 명목상 CPU보다 훨씬 빠르지만(5.3 vs 1.14 TFLOPS = 4.6배), 세 가지가 깎아 먹는다.
 
 ```
 NPU 콜 17.5 ms (prefill, 한 레이어)
@@ -173,25 +172,25 @@ NPU 콜 17.5 ms (prefill, 한 레이어)
 - **acc_read**: HexKL micro API가 accumulator 하나만 노출한다. 읽는 동안 계산이 선다.
 - **전송**: NPU는 딴 칩이다. 활성화를 보내고 결과를 받는 데 콜당 2 ms.
 
-CPU는 이 셋이 없다. 그래서 "명목 3.5배"가 HMX 시간만 세면 2.2배, CPU와 같은 범위(양자화·
-SwiGLU·DMA 포함)로 세면 **1.7배**가 된다. 레이어 전체로는 라우터와
-양자화, ARM 쪽 준비가 더해져 1.7배.
+CPU는 이 셋이 없다. 그래서 "명목 4.6배"가 HMX 시간만 세면 2.8배, DSP 내부 전체로 2.3배,
+CPU와 같은 범위(staging·FastRPC까지)로 세면 **2.0배**가 된다. 레이어 전체로는 CPU 쪽에
+workspace·gather·scatter 5.5 ms가 더 붙어 2.2배.
 
 ### 3.3 decode는 왜 CPU가 이기나
 
 토큰 1개는 expert 4개의 가중치 21 MiB(≈ 22 MB, §2.1)를 읽어 88 MFLOP를 계산한다. 계산은 0에 가깝고
 **읽기가 전부**다.
 
-| | CPU | NPU |
+| | CPU (Q4_0, 8스레드) | NPU |
 |---|---:|---:|
-| 가중치 읽기 | 22 MB, 실측 0.88 ms (≈ 24 GB/s) | DMA 22 MB / 15.7 GB/s = 1.37 ms |
-| 계산 | 읽기에 묻힘 | HMX가 1행에 64행 타일 = 1.03 ms (읽기와 겹침) |
-| 호출 | 0 | +0.16–0.5 ms |
-| **레이어** | **0.88** | **1.57** |
+| 토큰 1개 (24층 전부) | **20.8 ms** (48 TPS) | **48 ms** (20.8 TPS) |
+| 그중 MoE 22층 | ≤ 20.8 (분해 미측정; `M0`는 prefill만 찍는다) | 22 × 1.57 = 34.5 |
+| MoE 레이어 하나 | ≤ 0.95 (상한) | 1.57 = DMA 22 MB / 15.7 GB/s 1.37 + 호출 0.2 (HMX 64행 타일 1.03은 읽기와 겹침) |
 
-NPU가 이기려면 DMA를 38 GB/s로(D1), 콜당 전송을 상주 워커로(D2), 64행 타일을 HVX
-GEMV로(D3) 셋 다 넘어야 한다(문서 48 §3). WH 가중치 포맷은 CPU 커널이 없어서 지금은
-decode도 강제로 NPU를 탄다 — 20 TPS(CPU 전용이던 때 35).
+CPU는 22 MB를 DDR에서 ≥ 24 GB/s로 읽으면 끝이다. NPU는 DMA가 15.7 GB/s에 머물고 콜마다
+0.2~0.5 ms를 더 낸다. 이기려면 DMA를 38 GB/s로(D1), 콜당 전송을 상주 워커로(D2), 64행
+타일을 HVX GEMV로(D3) 셋 다 넘어야 한다(문서 48 §3). WH 가중치 포맷은 CPU 커널이 없어서
+지금은 decode도 강제로 NPU를 탄다.
 
 ---
 
@@ -561,41 +560,39 @@ NNTR_M0_PROFILE=1 ...   # [M0-PROF] setup/router/topk/wksp/gather/ffn/route/scat
 호스트에서는 `test/htp/host/run_host_checks.sh`가 커널의 루프 구조와 워커 풀을 스칼라
 스탠드인으로 검사한다.
 
-### 6.1 CPU 기준선 다시 재기 (§1의 CPU 열을 8스레드·같은 날 값으로 바꾸는 절차)
+### 6.1 CPU 기준선 — 원본 흐름(PR 4264) 그대로
 
-**1. 모델은 QS4CX_WH가 아니라 plain QS4CX여야 한다.** WH는 니블이 HMX 타일 순서라
-CPU `dot()`이 없고, `moe_engine=cpu`로 두면 첫 토큰에서 throw한다. 문서 48의 decode
-35 TPS를 잰 그 모델(`...-q40-qs4cx`)이면 된다. **QS4CX는 CPU용 int4 포맷이다** —
-KleidiAI가 읽는 그 포맷이고 `moe_engine=cpu`면 `FloatTensor::dotQs4cx`가 KleidiAI
-NEON 커널로 간다(`float_tensor.cpp:1099–1125`). NPU 전용은 QS4CX_WH뿐이다. 파일이
-엔진을 정하지 않고 `nntr_config.json`의 `moe_engine`이 정한다. Q4_0이 아니라 QS4CX를
-쓰는 이유는 WH와 **같은 int4 값**이라서다(WH는 니블 자리만 바꾼 것). 기기에 없으면:
+비교군은 upstream이 LFM2 MoE를 돌리는 방식 그대로다: 전 레이어 Q4_0, MoE expert도 Q4_0
+(ggml GEMM), HTP 없음. 지금 쓰는 `--htp` 바이너리로 그냥 돌리면 된다 — `moe_engine`이 없으면
+MoE 레이어에 HTP ops가 붙지 않아 `tryMoeLayerOnAccelerator`가 바로 false를 돌려주고,
+expert는 `token_input.dot(gate_up_proj)` → ggml Q4_0 경로로 간다.
 
 ```bash
-build/Applications/CausalLM/nntr_quantize_stream <fp32_dir> -o <qs4cx_dir> \
-  --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 --moe_dtype QS4CX --isa ARM
+# 1. 양자화: --moe_dtype 없음 → expert도 Q4_0 (PR 4264의 nntr_quantize와 바이트 동일)
+build/Applications/CausalLM/nntr_quantize_stream <fp32_dir> -o <q40_dir> \
+  --fc_dtype Q4_0 --embd_dtype Q4_0 --lmhead_dtype Q4_0 --isa ARM
+ls <q40_dir>/*_ARM.bin        # 접미사 _ARM 확인 (x86 패킹이면 조용히 틀림)
+
+# 2. <q40_dir>/nntr_config.json: moe_engine / moe_htp_layers 키 없음. 프롬프트·num_to_generate(512)는 NPU와 같게
+./install_android.sh --model=<q40_dir>
+
+# 3. TPS: 8스레드 3회 이상, prefill ms 최솟값
+NNTR_NUM_THREADS=8 <run>
+# 4. 레이어 분해, 1회
+NNTR_NUM_THREADS=8 NNTR_M0_PROFILE=1 <run> 2>&1 | grep -E 'M0-PROF|prefill:|generation:'
 ```
 
-**2. `<qs4cx_dir>/nntr_config.json`**: `"moe_engine": "cpu"` (키를 지워도 기본이 cpu),
-`moe_htp_layers`는 지운다. 프롬프트와 `num_to_generate`(512)는 NPU 실행과 같게.
-바이너리는 지금 쓰는 `--htp` 빌드 그대로 (비프로파일 빌드). CPU 경로는 로드 때
-가중치를 pack만 하고 등록·워밍업은 건너뛴다.
+**읽을 것**: `prefill:` 줄의 ms와 TPS(최솟값), `generation:`의 decode TPS, `[M0-PROF]
+moe_layer[i] tokens=444 us=… ffn=…` 22줄 — `us` 평균이 MoE 레이어, `ffn` 평균이 expert FFN
+루프. NPU도 같은 두 명령(모델만 `…-q40-qs4cx-wh`)으로 잰다.
 
-```bash
-./install_android.sh --model=<qs4cx_dir>
-# 3. TPS: 8스레드 3회, 4스레드(기본) 1회 -- 4스레드는 09-08의 1590 ms와 맞춰 보는 대조
-NNTR_NUM_THREADS=8 <run>      # ×3, prefill ms 최솟값
-<run>                         # ×1
-# 4. 같은 범위의 레이어 분해 (§2.1의 26.3 / 31.8을 대체할 값), 1회
-NNTR_NUM_THREADS=8 NNTR_M0_PROFILE=1 <run> 2>&1 | grep M0-PROF
-```
+**온도 게이트**: decode TPS가 30 아래면 스로틀 중이다(문서 44 §13.3). 그 실행의 prefill은
+버리고 식힌 뒤 다시. CPU-only는 등록이 없어 첫 prefill도 유효하지만, 첫 실행은 페이지 폴트로
+느릴 수 있다(아래 실행 1).
 
-**읽을 것**: `prefill:` 줄의 ms와 TPS(3회 최솟값), `generation:`의 decode TPS,
-`[M0-PROF] moe_layer[i] tokens=444 us=… ffn=…` 22줄 — `us`의 평균이 레이어(31.8 대응),
-`ffn`의 평균이 expert FFN 루프(26.3 대응). NPU 쪽 대응값은 §1에 이미 있다(18.4 / 15.2).
-
-**온도 게이트**: decode TPS가 30 아래면 스로틀 중이다(문서 44 §13.3). 그 실행의
-prefill은 버리고 식힌 뒤 다시. CPU-only는 등록이 없어 첫 prefill도 그대로 유효하다.
+참고: MoE만 QS4CX로 양자화한 모델(`…-q40-qs4cx`)을 `moe_engine: cpu`로 돌리면 KleidiAI 경로가
+되고, 그것이 NPU와 같은 int4 값끼리의 비교다. 이전 문서의 CPU 값(26.3 / 31.8 ms, 279 / 35 TPS,
+4스레드)이 그 경로다. 이 문서의 비교군에서는 뺐다.
 
 #### 6.1.1 원본 흐름(Q4_0, PR 4264 방식)으로 잰 결과 — 2026-09-17
 
@@ -629,18 +626,11 @@ ARM 0.9 ≈ 18.4"가 같은 계측기로 확인됐다. `ffn` 17.4 = staging memc
 FastRPC 콜(host 17.5의 그날 값 대비 −1 ms 안쪽, 실행 간 변동 범위). 22층 합 405 ms = prefill
 903의 45%; 나머지 498 ms가 conv·attention·norm·lm_head(ARM).
 
-#### 6.1.2 남은 측정 (이것까지 하면 비교표가 닫힌다)
+#### 6.1.2 측정은 여기서 닫는다
 
-| # | 무엇 | 왜 | 명령 |
-|---|---|---|---|
-| 1 | **CPU QS4CX, 8스레드**: `…-q40-qs4cx` + `moe_engine: cpu`, 비프로파일 3회 + `NNTR_M0_PROFILE=1` 1회 | §1의 QS4CX 열(31.8 / 26.3 / 1590 / 35)이 전부 4스레드·다른 날 값. NPU와 같은 int4 값의 비교가 이 열이다. decode 35 vs Q4_0 48의 원인도 이걸로 갈린다 | 위 §6.1 그대로 |
-| ~~2~~ | ~~NPU `M0` 1회~~ | **완료 (09-17, 위)** — 18.40 / 17.44 ms | |
-| 3 | (선택) CPU Q4_0 4스레드 1회 | 09-08의 1590 ms와 같은 조건으로 맞춰 보는 대조. 스레드 효과의 크기 | `<run>` (env 없이) |
-
-1이 끝나면 §1의 표는 세 열 모두 같은 주, 같은 스레드 수, 같은 계측기가 된다. (09-17의 두 번째
-세션에서 1번 자리에 `…-q40`을 한 번 더 돌렸다 — 그 결과는 위 실행 4·5로 들어갔고, `…-q40-qs4cx`는
-아직이다.) 그 밖에
-커널 쪽에서 더 잴 것은 없다 — §3.2의 분해(17.5 ms의 82%가 바닥)가 이미 닫혀 있다.
+§1의 두 열은 같은 주(09-16/17), 같은 기기, 같은 프롬프트, 8스레드, 같은 `M0` 계측기다.
+커널 쪽에서 더 잴 것은 없다 — §3.2의 분해(17.5 ms의 82%가 바닥)가 닫혀 있다. 선택으로 남는
+것 하나: CPU Q4_0을 기본 4스레드로 1회 돌려 스레드 효과의 크기를 적어 두는 것(`<run>`, env 없이).
 
 ---
 
@@ -655,7 +645,7 @@ FastRPC 콜(host 17.5의 그날 값 대비 −1 ms 안쪽, 실행 간 변동 범
 실행기와 FastRPC 비동기화가 필요한 큰 작업이다(47 §20.1의 10번).
 
 **decode**: DMA 처리량(16 → 38 GB/s), 콜당 전송(0.4 ms × 22 = 9 ms/token), 64행 타일의
-세 벽을 다 넘어야 CPU(35 TPS)를 이긴다(문서 48). 하나만 넘으면 20대에 머문다.
+세 벽을 다 넘어야 CPU(48 TPS)를 이긴다(문서 48). 하나만 넘으면 20대에 머문다.
 
 ---
 
