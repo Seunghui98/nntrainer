@@ -201,6 +201,56 @@ CPU 쪽 "행렬 명령만"은 비어 있다. ggml Q4_0 GEMM은 activation Q8 양
 안에 있어 분리되지 않고, 별도 마이크로벤치를 돌리지 않았다. 잰다면 M=55, K=2048, N=3584의
 `ggml` GEMM 단독 시간이 되고, 위 표의 첫 줄만 채워질 뿐 아래 줄은 바뀌지 않는다.
 
+### 3.2.2 17.4 / 15.2 / 12.2 — 같은 콜을 어디까지 세느냐
+
+셋 다 같은 실행의 같은 콜이다. 바깥에서 안쪽으로 벗겨낸 세 경계다.
+
+```
+17.4  M0 ffn        staging memcpy(3.6 MB 넣고 3.6 MB 빼기) + FastRPC 콜 전체
+ └ 16.5  host       FastRPC 콜만 (ARM이 잰 왕복. 09-16 프로파일에서는 17.5)
+    ├ 2.1  transport  ← 빠짐. 콜 고정비 + act/out 버퍼 캐시 유지
+    └ 15.4  dsp      DSP가 실제로 일한 시간
+       ├ 0.24  gather·scatter·push  ← 빠짐. CPU M0에서는 ffn 밖의 딴 칸이라 범위를 맞춤
+       └ 15.2  ◀── "DSP 내부"
+            ├ 9.25  HMX 행렬곱 명령 발행
+            ├ 2.93  acc_read (accumulator → VTCM)
+            │    └ 12.2  ◀── "순수 HMX"
+            ├ 1.06  requant  (silu(gate)·up → u8)
+            ├ 0.85  dequant  (int32 → f32 중 숨기지 못한 몫)
+            └ 1.0   quant · stage · drain · alloc · rest
+```
+
+- **12.2 = 행렬 유닛이 돈 시간 + 결과를 읽어낸 시간.** 양자화·dequant·SwiGLU·DMA는 없다.
+  "행렬곱 자체가 몇 배냐"를 물을 때만 쓴다. **CPU에는 대응하는 칸이 없다**(아래).
+- **15.2 = DSP가 FFN을 계산하느라 쓴 시간 전부.** 전송은 계산이 아니라 칩 사이를 건너는
+  비용이라 빠진다.
+- **17.4 = CPU의 `ffn` 타이머와 정확히 같은 범위.** CPU 34.4와 나란히 놓을 수 있는 유일한
+  숫자이고, 표의 2.0×가 이 쌍이다.
+
+**CPU 34.4는 무엇을 포함하나 — quant·mm·dequant 전부 들어 있다.** 타이머가 감싸는 것은
+`token_input.dot(gate_up_proj)` → `swiglu_det` → `acti_out.dot(down_proj)` 세 줄인데
+(`lfm2_moe_layer.cpp:665–706`), 그 `dot`이 부르는 ggml Q4_0 GEMM
+(`__ggml_q4_0_4x8_q8_0_GEMM`, `ggml_interface_bs_threadpool.cpp:308–367`)이 안에서
+
+1. f32 활성화를 **q8_0으로 양자화**하고(`nntr_quantize_mat_q8_0_4x8`, 콜마다 `QA` 버퍼 할당),
+2. int8 × int4 내적을 돌리고,
+3. 블록 scale을 곱해 **f32로 내놓는다**.
+
+즉 NPU의 quant → HMX → acc_read → dequant가 CPU에서는 GEMM 커널 한 덩어리 안에 들어
+있다. 그래서 분리해서 "CPU의 순수 행렬곱 시간"을 뽑을 수 없고, 위 사다리의 첫 줄이 비어
+있다. 두 숫자를 같은 범위로 맞춘 것이 34.4 vs 17.4다.
+
+**gather · scatter · push는 왜 있나.** 셋 다 MoE라서 생기는 일이고, CPU도 같은 일을 한다 —
+다만 CPU는 `ffn` 밖의 별도 칸에서 **3.8 ms**를 내고, DSP는 대부분을 숨겨 **0.24 ms**만 노출한다.
+
+| | 무엇 | 왜 필요한가 | CPU (M0 칸) | DSP (프로파일 열) |
+|---|---|---|---|---|
+| **gather** | 이 64행 블록의 활성화 DMA가 도착하길 기다리고, 그 블록 64행의 scale/zp를 슬롯 테이블에서 꺼낸다 | HMX는 VTCM만 읽으므로 블록이 들어와 있어야 하고, dequant가 행별 scale을 필요로 한다. **이름은 옛 흔적**이다 — 예전엔 토큰 행을 expert 순서로 진짜 모으는 일이었고 레이어당 3.2 ms였는데(문서 46 §26.3), 지금은 pack이 처음부터 expert 순서로 쓰기 때문에 모으는 일 자체가 없다 | 1.10 ms (워크스페이스로 토큰 복사) | 0.14 ms (DMA 대기 + 64개 슬라이스) |
+| **scatter** | `out[row_index[r]] += row_weight[r] · res[r]` | expert 출력은 expert 슬롯 순서인데 결과는 토큰 행에 돌아가야 하고, 한 토큰이 expert 4개를 골랐으므로 **가중 합**을 해야 한다. §2의 `Σ w_e · y_e`가 이것이다 | 1.46 + 1.23 ms (route 곱 + add) | 0.05 ms (잡은 다음 블록 뒤에 숨고, 노출된 대기만 계산) |
+| **push** | DMA 디스크립터를 채우고 `dmstart`/`dmlink`로 거는 스칼라 작업 | 가중치 5.25 MB와 활성화 블록을 옮기려면 전송마다 디스크립터를 서술해야 한다. 전송 시간이 아니라 **거는 비용**이다 | 없음 (CPU는 DDR에서 직접 읽는다) | 0.05 ms |
+
+CPU가 이 셋에 3.8 ms를 쓰는 것이 레이어 배율(2.2×)이 `ffn` 배율(2.0×)보다 큰 이유다.
+
 ### 3.3 decode는 왜 CPU가 이기나
 
 토큰 1개는 expert 4개의 가중치 21 MiB(≈ 22 MB, §2.1)를 읽어 88 MFLOP를 계산한다. 계산은 0에 가깝고
