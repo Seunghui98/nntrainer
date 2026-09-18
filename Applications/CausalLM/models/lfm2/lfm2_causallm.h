@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,14 @@
 #include "causal_lm.h"
 
 namespace causallm {
+
+/**
+ * @brief Parse a comma-separated list of layer_ids, e.g. "0,1,3". Blank
+ *        entries (from "", or a trailing/doubled comma) are skipped rather
+ *        than throwing, so an empty *_htp_layers value stays "no
+ *        restriction".
+ */
+std::set<int> parseLayerIdList(const std::string &csv);
 
 /**
  * @brief Lfm2Transformer - model-specific attention variant and conv block
@@ -67,6 +76,18 @@ public:
   bool CONV_BIAS = false;
   bool USE_EMBEDDING = false;
   std::string EMBEDDING_BIN_PATH; /**< Path to standalone embedding bin file */
+
+  /** Engine of the attention projections (wq, wk, wv, attention_out) and,
+   *  separately, of the conv block's in_proj: "cpu" (default) or "htp".
+   *  Under "htp" only prefill leaves the CPU -- FloatTensor::dot declines
+   *  M == 1, so decode is unchanged. The *_HTP_LAYERS sets bound the switch
+   *  to those layer_ids; empty means every layer of that kind. Read from
+   *  nntr_config.json's attn_proj_engine / attn_proj_htp_layers and
+   *  conv_in_proj_engine / conv_in_proj_htp_layers (doc 50). */
+  std::string ATTN_PROJ_ENGINE = "cpu";
+  std::set<int> ATTN_PROJ_HTP_LAYERS;
+  std::string CONV_IN_PROJ_ENGINE = "cpu";
+  std::set<int> CONV_IN_PROJ_HTP_LAYERS;
 };
 
 /**

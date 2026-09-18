@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cpu_backend.h>
 #include <iostream>
+#include <sstream>
 
 #include <causal_conv1d_layer.h>
 #include <custom_multiply.h>
@@ -35,6 +36,27 @@ using ml::train::Tensor;
 
 namespace causallm {
 
+std::set<int> parseLayerIdList(const std::string &csv) {
+  std::set<int> ids;
+  std::stringstream ss(csv);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    if (!tok.empty())
+      ids.insert(std::stoi(tok));
+  }
+  return ids;
+}
+
+namespace {
+/** @brief The engine a projection of @a layer_id gets: @a engine when the
+ *  layer is in @a ids or @a ids is empty, "cpu" otherwise -- the same rule
+ *  Lfm2MoeCausalLM::createMoeLayer applies to moe_htp_layers. */
+std::string projEngine(const std::string &engine, const std::set<int> &ids,
+                       int layer_id) {
+  return (ids.empty() || ids.count(layer_id)) ? engine : "cpu";
+}
+} // namespace
+
 Lfm2CausalLM::Lfm2CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
   CausalLM(cfg, generation_cfg, nntr_cfg),
@@ -46,12 +68,18 @@ Tensor Lfm2Transformer::createAttention(const int layer_id, int seq_len,
                                         int n_heads, int head_dim, Tensor query,
                                         Tensor key, Tensor value) {
 
+  // The four projections' engine (doc 50). "htp" moves only their prefill
+  // matmul off the CPU: FloatTensor::dot declines M == 1, so decode still
+  // runs the CPU Q4_0 kernel on the same weight.
+  const std::string eng =
+    projEngine(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id);
+
   // Q layer
   LayerHandle wq(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", eng)}));
   Tensor q = wq(query);
 
   // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
@@ -67,7 +95,8 @@ Tensor Lfm2Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", eng)}));
   Tensor k = wk(key);
 
   // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
@@ -83,7 +112,8 @@ Tensor Lfm2Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", eng)}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Storage is owned by the host
@@ -108,7 +138,7 @@ Tensor Lfm2Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", eng)}));
   return wo(a);
 }
 
@@ -125,10 +155,14 @@ Tensor Lfm2Transformer::createConvBlock(const int layer_id, Tensor input) {
   Tensor normed = conv_norm(input);
 
   // Expand features: [B, 1, T, DIM] → [B, 1, T, 3*CONV_DIM]
-  LayerHandle conv_in_proj(
-    createLayer("fully_connected", {withKey("name", prefix + "_conv_in_proj"),
-                                    withKey("unit", 3 * CONV_DIM),
-                                    withKey("disable_bias", "true")}));
+  // Its engine follows conv_in_proj_engine (doc 50): the widest FC in the
+  // model, [T x 2048] x [2048 x 6144], and the one the round trip pays for.
+  LayerHandle conv_in_proj(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_conv_in_proj"), withKey("unit", 3 * CONV_DIM),
+     withKey("disable_bias", "true"),
+     withKey("engine", projEngine(CONV_IN_PROJ_ENGINE, CONV_IN_PROJ_HTP_LAYERS,
+                                  layer_id))}));
   Tensor proj_out = conv_in_proj(normed);
 
   // Split along width (axis=3): [B,1,T,3*CONV_DIM] → 3 × [B,1,T,CONV_DIM]
@@ -295,6 +329,16 @@ void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
     EMBEDDING_BIN_PATH = nntr_cfg.contains("embedding_bin_path")
                            ? nntr_cfg["embedding_bin_path"].get<std::string>()
                            : "";
+
+    // Projection engines (doc 50). Default "cpu" keeps every existing run
+    // as it is; the layer lists mirror moe_htp_layers.
+    ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));
+    ATTN_PROJ_HTP_LAYERS =
+      parseLayerIdList(nntr_cfg.value("attn_proj_htp_layers", std::string("")));
+    CONV_IN_PROJ_ENGINE =
+      nntr_cfg.value("conv_in_proj_engine", std::string("cpu"));
+    CONV_IN_PROJ_HTP_LAYERS = parseLayerIdList(
+      nntr_cfg.value("conv_in_proj_htp_layers", std::string("")));
   } catch (const std::exception &e) {
     throw std::runtime_error(
       std::string("Lfm2Transformer: config parsing error: ") + e.what());

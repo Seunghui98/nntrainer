@@ -17,28 +17,7 @@
 #include <llm_util.hpp>
 #include <model.h>
 
-#include <sstream>
-
 namespace causallm {
-
-namespace {
-/**
- * @brief Parse a comma-separated list of layer_ids, e.g. "0,1,3". Blank
- *        entries (from "", or a trailing/doubled comma) are skipped rather
- *        than throwing, so an empty moe_htp_layers value stays "no
- *        restriction" (see MOE_HTP_LAYERS's doc in the header).
- */
-std::set<int> parseLayerIdList(const std::string &csv) {
-  std::set<int> ids;
-  std::stringstream ss(csv);
-  std::string tok;
-  while (std::getline(ss, tok, ',')) {
-    if (!tok.empty())
-      ids.insert(std::stoi(tok));
-  }
-  return ids;
-}
-} // namespace
 
 void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
                                       json &nntr_cfg) {
