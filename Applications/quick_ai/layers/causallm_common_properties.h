@@ -89,6 +89,19 @@ public:
 };
 
 /**
+ * @brief OutQuant: "scale:offset" (QNN scaleOffsetEncoding convention,
+ * real = (q + offset) * scale). When set on rms_norm the layer emits a UINT8
+ * tensor -- the normalized row is quantized in the same pass that applies
+ * gamma, so an NPU graph input is produced without a separate quantize
+ * layer or a float round trip.
+ */
+class OutQuant : public nntrainer::Property<std::string> {
+public:
+  static constexpr const char *key = "out_quant";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
  * @brief RMS_NORM_GAMMA_INIT Initialization Enumeration Information
  *
  */

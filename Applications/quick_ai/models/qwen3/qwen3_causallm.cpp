@@ -101,6 +101,38 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
   return wo(a);
 }
 
+Tensor Qwen3Transformer::createAttentionCoreNPU(const int layer_id, int n_heads,
+                                                int head_dim, Tensor q,
+                                                Tensor k, Tensor v) {
+  LayerHandle q_norm(createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
+     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))}));
+  Tensor q_normed = q_norm(q);
+
+  LayerHandle k_norm(createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
+     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))}));
+  Tensor k_normed = k_norm(k);
+
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+
+  LayerHandle mha(createLayer(
+    "mha_core",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+     withKey("sliding_window", SLIDING_WINDOW),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+  return mha({q_normed, k_normed, v, cache_k, cache_v});
+}
+
 void Qwen3Transformer::registerCustomLayers() {
   ///
   auto &ct_engine = nntrainer::Engine::Global();

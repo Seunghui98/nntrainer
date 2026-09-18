@@ -35,6 +35,13 @@ public:
                          int head_dim, Tensor query, Tensor key,
                          Tensor value) override;
 
+  /**
+   * @brief NPU block attention core: Qwen3 applies per-head RMSNorm to q and
+   * k after the projection (which the NPU graph produced), before RoPE/MHA.
+   */
+  Tensor createAttentionCoreNPU(const int layer_id, int n_heads, int head_dim,
+                                Tensor q, Tensor k, Tensor v) override;
+
   void registerCustomLayers() override;
 };
 

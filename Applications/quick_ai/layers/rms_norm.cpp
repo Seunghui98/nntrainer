@@ -11,9 +11,12 @@
  *
  */
 
+#include <act_simd.h> // nntr_quantize_affine_i8 (shared with the W8A8 conv)
 #include <cmath>
 #include <cpu_backend.h>
 #include <iostream>
+#include <sstream>
+#include <vector>
 
 #include "rms_norm.h"
 
@@ -23,6 +26,26 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
+
+  // out_quant=scale:offset -> UINT8 output for an NPU (qnn_graph) consumer.
+  // Same string format as qnn_graph's input_quant_param value part.
+  if (!std::get<props::OutQuant>(rms_props).empty()) {
+    const std::string spec = std::get<props::OutQuant>(rms_props).get();
+    std::vector<std::string> tok;
+    std::string t;
+    std::istringstream iss(spec);
+    while (std::getline(iss, t, ':'))
+      tok.push_back(t);
+    NNTR_THROW_IF(tok.size() != 2, std::invalid_argument)
+      << "[rms_norm] out_quant must be scale:offset, got " << spec;
+    oq_scale = std::stof(tok[0]);
+    oq_offset = std::stoi(tok[1]);
+    NNTR_THROW_IF(oq_scale <= 0.f, std::invalid_argument)
+      << "[rms_norm] out_quant scale must be > 0";
+    out_quant = true;
+    for (auto &d : dim)
+      d.setDataType(nntrainer::TensorDim::DataType::UINT8);
+  }
   context.setOutputDimensions(dim);
 
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
@@ -76,6 +99,11 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor out_step =
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
+    if (out_quant) {
+      forwardQuantized(in_step, out_step, gamma, epsilon);
+      continue;
+    }
+
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       const auto &dim = in_step.getDim();
 #ifdef ENABLE_FP16
@@ -122,11 +150,74 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
+void RMSNormLayer::forwardQuantized(const nntrainer::Tensor &in_step,
+                                    nntrainer::Tensor &out_step,
+                                    const nntrainer::Tensor &gamma,
+                                    float epsilon) {
+  const auto &dim = in_step.getDim();
+  const size_t rows = dim.height();
+  const size_t W = dim.width();
+  const float *g = gamma.getData<float>();
+  uint8_t *out = out_step.getData<uint8_t>();
+
+  // QNN: real = (q + offset) * scale  ->  q = round(real / scale) - offset.
+  // nntr_quantize_affine_i8 computes round((x + off) * inv) - 128 as int8,
+  // so with off = -offset * scale the uint8 code is that int8 value + 128,
+  // i.e. the same byte with the sign bit flipped.
+  const float inv = 1.0f / oq_scale;
+  const float off = -(float)oq_offset * oq_scale;
+
+  // One FP32 row: sum of squares in FP32 (an FP16 row can overflow), then
+  // scale + gamma + quantize in a single streaming pass over the row.
+  static thread_local std::vector<float> rowf;
+  static thread_local std::vector<int8_t> rowq;
+  if (rowf.size() < W) {
+    rowf.resize(W);
+    rowq.resize(W);
+  }
+
+  auto quant_row = [&](const float *x, uint8_t *dst) {
+    float ss = 0.f;
+    for (size_t k = 0; k < W; ++k)
+      ss += x[k] * x[k];
+    const float r = 1.0f / std::sqrt(ss / (float)W + epsilon);
+    for (size_t k = 0; k < W; ++k)
+      rowf[k] = x[k] * r * g[k];
+    nntrainer::nntr_quantize_affine_i8(rowf.data(), rowq.data(), W, inv, off);
+    for (size_t k = 0; k < W; ++k)
+      dst[k] = (uint8_t)(rowq[k] ^ (int8_t)0x80);
+  };
+
+  if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    const float *x = in_step.getData<float>();
+    for (size_t h = 0; h < rows; ++h)
+      quant_row(x + h * W, out + h * W);
+#ifdef ENABLE_FP16
+  } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    const _FP16 *x = in_step.getData<_FP16>();
+    static thread_local std::vector<float> xin;
+    if (xin.size() < W)
+      xin.resize(W);
+    for (size_t h = 0; h < rows; ++h) {
+      for (size_t k = 0; k < W; ++k)
+        xin[k] = (float)x[h * W + k];
+      quant_row(xin.data(), out + h * W);
+    }
+#endif
+  } else {
+    throw std::invalid_argument(
+      "[rms_norm] out_quant supports FP32/FP16 input only");
+  }
+}
+
 void RMSNormLayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
   context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+  nntrainer::TensorDim od = input_dimensions[0];
+  if (out_quant)
+    od.setDataType(nntrainer::TensorDim::DataType::UINT8);
+  context.updateOutput(SINGLE_INOUT_IDX, od);
 }
 
 void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {

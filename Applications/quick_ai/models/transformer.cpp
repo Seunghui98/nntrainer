@@ -12,6 +12,7 @@
 
 #include <fstream>
 #include <mutex>
+#include <sstream>
 
 #include <app_context.h>
 #include <engine.h>
@@ -191,8 +192,170 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     cfg.contains("rms_norm_eps") ? cfg["rms_norm_eps"].get<float>() : 1e-5;
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
+  // NPU decoder offload manifest (see transformer.h)
+  NPU_GRAPH_DIR = nntr_cfg.value("npu_graph_dir", std::string());
+  npu_layers.clear();
+  if (!NPU_GRAPH_DIR.empty()) {
+    npu_manifest = LoadJsonFile(NPU_GRAPH_DIR + "/npu_graphs.json");
+    NNTR_THROW_IF(!npu_manifest.contains("layers"), std::invalid_argument)
+      << "npu_graphs.json has no \"layers\"";
+    // optional subset "0-3,10"; default = every layer in the manifest
+    const std::string sel = nntr_cfg.value("npu_layers", std::string());
+    std::set<int> wanted;
+    if (!sel.empty()) {
+      std::istringstream iss(sel);
+      std::string part;
+      while (std::getline(iss, part, ',')) {
+        const auto dash = part.find('-');
+        if (dash == std::string::npos) {
+          wanted.insert(std::stoi(part));
+        } else {
+          const int a = std::stoi(part.substr(0, dash));
+          const int b = std::stoi(part.substr(dash + 1));
+          for (int i = a; i <= b; ++i)
+            wanted.insert(i);
+        }
+      }
+    }
+    for (auto &kv : npu_manifest["layers"].items()) {
+      const int id = std::stoi(kv.key());
+      if (sel.empty() || wanted.count(id))
+        npu_layers.insert(id);
+    }
+    const auto &m = npu_manifest["model"];
+    NNTR_THROW_IF(m["hidden"].get<int>() != DIM ||
+                    m["q_units"].get<int>() != NUM_HEADS * HEAD_DIM ||
+                    m["kv_units"].get<int>() != NUM_KEY_VALUE_HEADS * HEAD_DIM,
+                  std::invalid_argument)
+      << "npu_graphs.json was built for another model (hidden/q/kv units "
+         "differ from config.json)";
+    std::cout << "[NPU] " << npu_layers.size() << " decoder layers from "
+              << NPU_GRAPH_DIR << " (act " << npuActDtype() << ")" << std::endl;
+  }
+
   return;
 };
+
+std::string Transformer::npuActDtype() const {
+  // MODEL_TENSOR_TYPE is "<weight>-<activation>", e.g. "FP16-FP16"
+  const auto dash = MODEL_TENSOR_TYPE.find('-');
+  const std::string act = dash == std::string::npos
+                            ? MODEL_TENSOR_TYPE
+                            : MODEL_TENSOR_TYPE.substr(dash + 1);
+  NNTR_THROW_IF(act != "FP16" && act != "FP32", std::invalid_argument)
+    << "NPU decoder offload needs FP16 or FP32 activations, got " << act;
+  return act;
+}
+
+namespace {
+
+std::string fmtFloat(double v) {
+  std::ostringstream ss;
+  ss.precision(9);
+  ss << v;
+  return ss.str();
+}
+
+/// "scale:offset" in qnn_graph / rms_norm out_quant format
+std::string quantSpec(const json &io) {
+  return fmtFloat(io["scale"].get<double>()) + ":" +
+         std::to_string(io["offset"].get<int>());
+}
+
+} // namespace
+
+std::vector<std::string>
+Transformer::npuGraphProps(int layer_id, const std::string &graph,
+                           const std::string &layer_name) const {
+  const auto &lyr = npu_manifest["layers"].at(std::to_string(layer_id));
+  const auto &buckets = lyr["graphs"].at(graph);
+  // IO names/dtypes/widths are identical across buckets; only M differs.
+  const json &g = buckets.begin().value();
+
+  std::string dims, dtypes, types, in_qp, out_qp;
+  for (const auto &o : g["outputs"]) {
+    if (!dims.empty()) {
+      dims += ",";
+      dtypes += ",";
+      types += ",";
+      out_qp += ",";
+    }
+    const int width = o["dim"].back().get<int>();
+    dims += "1:1:" + std::to_string(INIT_SEQ_LEN) + ":" + std::to_string(width);
+    const std::string dt = o["dtype"].get<std::string>();
+    dtypes += (dt == "FP") ? npuActDtype() : dt;
+    types += "OUT_TENSOR";
+    out_qp += o["name"].get<std::string>() + ":" + quantSpec(o);
+  }
+  for (const auto &i : g["inputs"]) {
+    if (!in_qp.empty())
+      in_qp += ",";
+    in_qp += i["name"].get<std::string>() + ":" + quantSpec(i);
+  }
+
+  return {withKey("name", layer_name),
+          withKey("engine", "qnn"),
+          withKey("path", NPU_GRAPH_DIR + "/" + lyr["bin"].get<std::string>()),
+          withKey("dim", dims),
+          withKey("tensor_dtype", dtypes),
+          withKey("tensor_type", types),
+          withKey("input_quant_param", in_qp),
+          withKey("output_quant_param", out_qp)};
+}
+
+Tensor Transformer::createAttentionCoreNPU(const int layer_id, int n_heads,
+                                           int head_dim, Tensor q, Tensor k,
+                                           Tensor v) {
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+
+  LayerHandle mha(createLayer(
+    "mha_core",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
+                                 ? SLIDING_WINDOW
+                                 : UINT_MAX),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+  return mha({q, k, v, cache_k, cache_v});
+}
+
+Tensor Transformer::createTransformerDecoderBlockNPU(const int layer_id,
+                                                     Tensor input) {
+  const std::string L = "layer" + std::to_string(layer_id);
+  const auto &lyr = npu_manifest["layers"].at(std::to_string(layer_id));
+  const json &attn_in = lyr["graphs"].at("attn_in").begin().value();
+  const json &x_in = attn_in["inputs"][0];
+
+  // attention norm; with a uint8 graph input the norm's epilogue quantizes
+  // (static scale/offset from the manifest) straight into the layer output
+  std::vector<std::string> norm_props = {
+    withKey("name", L + "_attention_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  if (x_in["dtype"].get<std::string>() == "UINT8")
+    norm_props.emplace_back(withKey("out_quant", quantSpec(x_in)));
+  LayerHandle attn_norm(createLayer("rms_norm", norm_props));
+  Tensor normed = attn_norm(input);
+
+  // graph A: fused q/k/v projection on HMX -> three float outputs
+  LayerHandle attn_in_graph(createLayer(
+    "qnn_graph", npuGraphProps(layer_id, "attn_in", L + "_attn_in")));
+  Tensor qkv = attn_in_graph(normed);
+  Tensor q = qkv.output(0);
+  Tensor k = qkv.output(1);
+  Tensor v = qkv.output(2);
+
+  // attention core stays on the CPU (dynamic sequence length, KV cache)
+  Tensor att = createAttentionCoreNPU(layer_id, NUM_HEADS, HEAD_DIM, q, k, v);
+
+  // graph B: o_proj + residual + ffn_norm + gate/up + SiLU*up + down +
+  // residual, one round trip; returns the block output directly
+  LayerHandle attn_out_ffn_graph(createLayer(
+    "qnn_graph", npuGraphProps(layer_id, "attn_out_ffn", L + "_attn_out_ffn")));
+  return attn_out_ffn_graph({att, input});
+}
 
 /**
  * @brief Build and compile the symbolic transformer graph.
@@ -306,6 +469,9 @@ void Transformer::run(const WSTR prompt, bool do_sample,
  */
 Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
                                                   Tensor input) {
+
+  if (npuEnabled(layer_id))
+    return createTransformerDecoderBlockNPU(layer_id, input);
 
   LayerHandle attn_norm(createLayer(
     "rms_norm",

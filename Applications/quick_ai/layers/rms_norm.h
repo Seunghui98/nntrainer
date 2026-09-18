@@ -113,9 +113,22 @@ public:
 private:
   std::array<unsigned int, 1> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
-             nntrainer::props::SkipPrefill>
+             nntrainer::props::SkipPrefill, props::OutQuant>
     rms_props;
   bool skip_prefill = false;
+
+  /** out_quant: emit UINT8 = clip(round(x / oq_scale) - oq_offset) */
+  bool out_quant = false;
+  float oq_scale = 1.0f;
+  int oq_offset = 0;
+
+  /**
+   * @brief Fused RMSNorm * gamma -> affine uint8 for rows [0, rows) of
+   * in_step into out_step (which is UINT8).
+   */
+  void forwardQuantized(const nntrainer::Tensor &in_step,
+                        nntrainer::Tensor &out_step,
+                        const nntrainer::Tensor &gamma, float epsilon);
 };
 
 } // namespace quick_ai

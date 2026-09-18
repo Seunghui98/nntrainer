@@ -37,6 +37,8 @@
 
 #include "model_base.h"
 
+#include <set>
+
 namespace quick_ai {
 
 /**
@@ -307,6 +309,58 @@ protected:
    * @brief register CustomLayers
    */
   virtual void registerCustomLayers();
+
+  // ── NPU (Hexagon HTP / HMX) decoder offload ─────────────────────────────
+  // nntr_config "npu_graph_dir" points at the output of
+  // Applications/quick_ai/tools/npu/build_decoder_graphs.py (npu_graphs.json +
+  // bin/layer<i>.bin). Every decoder layer present in the manifest (optionally
+  // narrowed by "npu_layers": "0-3,10") is built as
+  //
+  //   attention_norm(out_quant -> uint8)
+  //     -> qnn_graph layer<i>_attn_in            (fused q/k/v projection, HMX)
+  //     -> [q_norm/k_norm] -> mha_core (CPU)
+  //     -> qnn_graph layer<i>_attn_out_ffn       (o_proj + residual + ffn_norm
+  //                                               + gate/up + SiLU*up + down
+  //                                               + residual, HMX)
+  //
+  // i.e. two fastRPC round trips per layer instead of one per projection.
+
+  /**
+   * @brief Whether decoder layer @p layer_id runs its projections on the NPU.
+   */
+  bool npuEnabled(int layer_id) const { return npu_layers.count(layer_id) > 0; }
+
+  /**
+   * @brief Activation dtype string ("FP16"/"FP32") the NPU graphs' float IO
+   * must match, derived from MODEL_TENSOR_TYPE ("<weight>-<activation>").
+   */
+  std::string npuActDtype() const;
+
+  /**
+   * @brief qnn_graph layer properties for one graph of one layer, from the
+   * manifest: path, output dims/dtypes/types, static IO quant params.
+   */
+  std::vector<std::string> npuGraphProps(int layer_id, const std::string &graph,
+                                         const std::string &layer_name) const;
+
+  /**
+   * @brief NPU variant of createTransformerDecoderBlock (see above).
+   */
+  virtual Tensor createTransformerDecoderBlockNPU(const int layer_id,
+                                                  Tensor input);
+
+  /**
+   * @brief Attention core for the NPU block: KV-cache placeholders + mha_core
+   * on the already projected q/k/v. Models with per-head q/k norms (Qwen3)
+   * override this to insert them.
+   */
+  virtual Tensor createAttentionCoreNPU(const int layer_id, int n_heads,
+                                        int head_dim, Tensor q, Tensor k,
+                                        Tensor v);
+
+  std::string NPU_GRAPH_DIR; /**< nntr_config "npu_graph_dir" (empty = off) */
+  json npu_manifest;         /**< parsed <NPU_GRAPH_DIR>/npu_graphs.json */
+  std::set<int> npu_layers;  /**< decoder layers offloaded to the NPU */
 
   /** tokenizer */
   std::unique_ptr<tokenizers::Tokenizer> tokenizer;
