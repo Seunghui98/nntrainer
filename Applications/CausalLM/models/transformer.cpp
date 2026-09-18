@@ -391,6 +391,13 @@ void Transformer::repack_weight() {
       // expert weight tensors are [K, N] as the kernel sees them; the router
       // gate and expert bias are FP32 and never reach this branch.
       auto *ops = l.getType() == "lfm2_moe" ? context.getComputeOps() : nullptr;
+      // [doc 50] A fully_connected layer under engine=htp registers its
+      // Q4_0 weight here for the same reason: gemm_q4_0_accel_fp32's first
+      // call converts and registers it, and that first call is in the
+      // first prefill. A CPU-engine layer's ops answer false; nothing else
+      // changes for it. The weight is [K, N] as dot() reads it.
+      auto *fc_ops =
+        l.getType() == "lfm2_moe" ? nullptr : context.getComputeOps();
 
       auto weights = context.getWeights();
       std::vector<void *> gu_data, dn_data;
@@ -402,6 +409,29 @@ void Transformer::repack_weight() {
         const auto dtype = t.getDataType();
         if (dtype == ml::train::TensorDim::DataType::QS4CX) {
           t.pack();
+        }
+        if (fc_ops && dtype == ml::train::TensorDim::DataType::Q4_0) {
+          const auto K = static_cast<unsigned int>(t.height());
+          const auto N = static_cast<unsigned int>(t.width());
+          if (fc_ops->register_q4_0_weight(t.getData<char>(), K, N)) {
+            // One warm-up call per session, like the MoE one below: the
+            // first FC call otherwise grows the staging buffers to the
+            // prefill size and touches every page of them inside the
+            // first prefill. The first HTP-routed FC in graph order is a
+            // conv in_proj (the widest N) whenever those are routed, so
+            // one call at M=512 covers every later shape's buffers.
+            static bool fc_warmed = false;
+            if (!fc_warmed && fc_ops->supports_gemm_q4_0_accel_fp32()) {
+              fc_warmed = true;
+              const unsigned int M = 512;
+              std::vector<float> act(static_cast<size_t>(M) * K, 0.0f);
+              std::vector<float> out(static_cast<size_t>(M) * N, 0.0f);
+              fc_ops->gemm_q4_0_accel_fp32(t.getData<char>(), act.data(),
+                                           out.data(), M, N, K);
+              ml_logd("FC HTP kernel warmed up at load (M=%u, K=%u, N=%u)", M,
+                      K, N);
+            }
+          }
         }
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
                     dtype == ml::train::TensorDim::DataType::QS4CX_WH)) {
