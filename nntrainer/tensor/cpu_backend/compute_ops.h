@@ -320,6 +320,19 @@ public:
     return false;
   }
 
+  // The Q4_0 twin, for a fully_connected layer under engine=htp: its
+  // weight is otherwise converted and registered by the first dot() that
+  // reaches gemm_q4_0_accel_fp32, which is inside the first prefill (doc
+  // 50). Called from Transformer::repack_weight with the data pointer that
+  // dot() will pass, so the forward-time lookup is a cache hit.
+  virtual bool register_q4_0_weight(void *data, unsigned int K,
+                                    unsigned int N) {
+    (void)data;
+    (void)K;
+    (void)N;
+    return false;
+  }
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,

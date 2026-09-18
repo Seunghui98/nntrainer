@@ -878,6 +878,16 @@ public:
     return true;
   }
 
+  /** Same, for a Q4_0 FC weight: the conversion and registration that
+   *  gemm_q4_0_accel_fp32 would otherwise do on its first call. */
+  bool register_q4_0_weight(void *data, unsigned int K,
+                            unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    get_or_register(data, session, K, N);
+    return true;
+  }
+
   bool supports_gemm_qs4cx_fused_swiglu_fp32() const override { return true; }
 
   void gemm_qs4cx_fused_swiglu_fp32(std::vector<void *> matAdata,
