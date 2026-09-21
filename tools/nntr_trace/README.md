@@ -13,6 +13,8 @@ the viewer, and converters for the logs the HTP device tests already print.
 | `bundle.py` | Bakes one or more traces into the viewer so a single HTML file carries the data (mail, chat, an artifact link). |
 | `make_sample_trace.py` | Emits a synthetic `trace.json` in the target schema, durations scaled from the numbers measured in the HTP branch docs. `--pipelined` projects the doc-35 T2 overlap; `--with-warnings` adds a CPU fallback, dropped records and clock violations; `--tokens N` sets the decode length. |
 | `stage_us_to_trace.py` | Converts `FC_STAGE` / `ATTN_STAGE` marker logs from `unittest_hvx_fc` / `unittest_hvx_attn` into the schema, stage totals laid out back to back. |
+| `summarize.py` | The viewer's metrics from the command line (`--range`, `--fail-if` gates), held to the viewer's numbers by a test. |
+| `qnn_optrace_to_nntr.py` | Rebases a QAIRT HTP optrace (`*_chromeTrace_opTrace.json`) onto the schema as pid 3 so it opens beside ours. Written against a fixture: its docstring lists the field assumptions to verify on a real file. |
 | `test/run.sh` | Generates the samples, bundles them, runs `test/check.js` (headless Chromium) and the python unit tests. |
 
 ```bash
@@ -35,7 +37,21 @@ bash tools/nntr_trace/test/run.sh                         # before committing
   parallel compression unrolled over time. Counters (VTCM) draw their
   `metadata.budgets` line and hi-water mark.
 - **Navigation.** W/S zoom, A/D pan, `0` or double-click fit, drag to pan,
-  wheel to zoom at the cursor, click a process header to collapse it.
+  wheel to zoom at the cursor. The overview strip under the toolbar shows
+  DSP and host busy density with the viewport; drag it, click to center,
+  wheel to zoom. Click a process header to collapse it, double-click a
+  thread label to fold that thread to one row. Find: Enter / Shift+Enter
+  walk the matches in time order (`k / n` beside the box), `f` fits the
+  view to the current match, Esc clears. The view, selection, tab, range,
+  color mode and filter live in the URL hash, so a zoomed-in finding can be
+  shared as a link to the same bundled page.
+- **Compare.** `Compare:` loads a second trace (an embedded one or a file)
+  as B under A; `View:` shows A, B or both. The Compare tab puts the
+  wall-time buckets, parallel compression, idle and transport share side
+  by side with deltas, joins the kernels on `engine + op: name` (calls,
+  total, mean, cy/elem, Δ), and the layers on name + phase. A converted QNN
+  optrace loads the same way (pid 3); the Kernels tab's `QNN ref` column
+  shows ref_16's cycles/element for each kernel class.
 - **Range.** Drag in the ruler (or shift+drag) to select a time range, `m`
   to make the selected slice's span the range, `Esc` to clear; `Range:` also
   offers each prefill / decode phase. Every analysis tab is computed over
