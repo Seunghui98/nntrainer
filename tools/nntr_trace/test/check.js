@@ -108,6 +108,35 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   await page.evaluate(() => window.__nntr.tab('ker'));
   ok((await page.$$eval('#pane button', bs => bs.map(b => b.textContent))).join() === 'Copy,Download', 'W12 export buttons on the Kernels tab');
 
+  // W10: search navigation, thread/process collapsing, minimap
+  await page.evaluate(() => window.__nntr.setFilter('softmax'));
+  const hits = [];
+  for (let i = 0; i < 3; i++) { await page.evaluate(() => window.__nntr.gotoMatch(1)); hits.push(await page.evaluate(() => { const e = window.__nntr.selected(); return [e.ts, e._label, e.tid]; })); }
+  ok(hits.every(h => /softmax/.test(h[1])) && hits[0][0] <= hits[1][0] && hits[1][0] <= hits[2][0] && new Set(hits.map(h => h[0] + ':' + h[2])).size === 3, `W10 Enter x3 walks distinct softmax matches in ts order (${hits.map(h => h[0].toFixed(0) + '@' + h[2]).join(' ≤ ')})`);
+  ok(/3 \/ \d+/.test(await page.$eval('#search-count', e => e.textContent)), 'W10 search counter shows k / n: ' + await page.$eval('#search-count', e => e.textContent));
+  await page.evaluate(() => window.__nntr.fitMatch());
+  const fitOk = await page.evaluate(() => { const e = window.__nntr.selected(), v = window.__nntr.view(); return v.t0 < e.ts && v.t1 > e.ts + e.dur && (v.t1 - v.t0) < e.dur * 1.5; });
+  ok(fitOk, 'W10 f fits the view to the current match');
+  const rowsBefore = await page.evaluate(() => window.__nntr.model().rows.length);
+  await page.evaluate(() => { window.__nntr.collapsed.add('0:2'); window.__nntr.relayout(); });
+  const rowsAfter = await page.evaluate(() => window.__nntr.model().rows.length);
+  await page.evaluate(() => { window.__nntr.collapsed.delete('0:2'); window.__nntr.relayout(); });
+  ok(rowsAfter < rowsBefore && (await page.evaluate(() => window.__nntr.model().rows.length)) === rowsBefore, `W10 collapsing HTP hides its rows (${rowsBefore} -> ${rowsAfter}) and restores them`);
+  ok(await page.$eval('#mm', c => c.width > 100 && c.height > 10), 'W10 minimap canvas is drawn');
+  await page.evaluate(() => window.__nntr.setFilter(''));
+
+  // W11: state round-trips through the URL hash
+  await page.evaluate(() => { window.__nntr.setView(20000, 30000); window.__nntr.tab('ker'); window.__nntr.setFilter('dequant'); });
+  await page.waitForTimeout(350);
+  const hash = await page.evaluate(() => location.hash);
+  ok(/v=20000%2C30000|v=20000,30000/.test(hash) && /tab=ker/.test(hash) && /q=dequant/.test(hash), 'W11 hash carries view, tab and filter: ' + hash);
+  await page.goto('file://' + path.resolve(page_path) + hash);
+  await page.waitForFunction(() => window.__nntr && window.__nntr.model());
+  const back = await page.evaluate(() => ({ v: window.__nntr.view(), tab: document.querySelector('#tabs button[aria-selected="true"]').dataset.tab, q: document.querySelector('#search').value }));
+  ok(Math.abs(back.v.t0 - 20000) < 1 && Math.abs(back.v.t1 - 30000) < 1 && back.tab === 'ker' && back.q === 'dequant', `W11 reload restores view ${back.v.t0}-${back.v.t1}, tab ${back.tab}, filter ${back.q}`);
+  await page.goto('file://' + path.resolve(page_path));
+  await page.waitForFunction(() => window.__nntr && window.__nntr.model());
+
   // W0: every tab renders, range select works
   await use(asBuilt);
   for (const id of await page.$$eval('#tabs button', bs => bs.map(b => b.dataset.tab))) {
