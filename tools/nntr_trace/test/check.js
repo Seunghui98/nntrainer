@@ -86,6 +86,28 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   await use(asBuilt);
   ok(await page.$eval('#warn', e => e.hidden), 'no banner on the as-built sample');
 
+  // batch B: W5 pool tail, W6 TOPS, W4 transport fit, W8 tokens
+  const mjB = await page.evaluate(() => window.__nntr.metricsJSON());
+  const quant = mjB.pool_tail.find(g => /quant f32->u8 AH/.test(g.kind));
+  ok(quant && quant.few_units === true && quant.worst_tail > 1.1, `W5 pool tail flags the quant pool (min units ${quant && quant.min_units} < rule, worst tail ${quant && quant.worst_tail.toFixed(2)})`);
+  const bigK = mjB.pool_tail.filter(g => !g.few_units).length;
+  ok(mjB.pool_tail.length > 1, `W5 ${mjB.pool_tail.length} pool kinds, ${bigK} within the units rule`);
+  const hmxPre = mjB.kernels.find(k => /qkv_proj: micro-mm x32/.test(k.name)), hmxDec = mjB.kernels.find(k => /micro-mm \(M=2/.test(k.name));
+  ok(hmxPre && hmxDec && hmxPre.tops != null && hmxDec.tops != null && hmxPre.tops / hmxDec.tops > 5, `W6 prefill chunk TOPS ${hmxPre && hmxPre.tops.toFixed(3)} vs decode ${hmxDec && hmxDec.tops.toFixed(4)} (padding tax)`);
+  ok(mjB.hmx_peak_tops === null, 'W6 peak TOPS stays null until measured');
+  ok(mjB.transport.n > 50 && near(mjB.transport.fixed_us, 300, 45), `W4 transport fit: n ${mjB.transport.n}, fixed ${mjB.transport.fixed_us.toFixed(1)} µs (model 300), ${mjB.transport.us_per_mb.toFixed(1)} µs/MB (model 55)`);
+  const tk = mjB.tokens.filter(t => t.phase === 'decode');
+  const slope = (() => { const n = tk.length, mx = (n - 1) / 2, my = tk.reduce((s, t) => s + t.wall_us, 0) / n; return tk.reduce((s, t, i) => s + (i - mx) * (t.wall_us - my), 0) / tk.reduce((s, t, i) => s + (i - mx) ** 2, 0); })();
+  ok(tk.length === 8 && slope > 0, `W8 ${tk.length} decode tokens, wall grows ${slope.toFixed(1)} µs/token (kv growth over transport jitter)`);
+  ok(mjB.token_summary.ttft_us > 0 && mjB.token_summary.calls_per_token > 5, `W8 TTFT ${(mjB.token_summary.ttft_us / 1000).toFixed(1)} ms, ${mjB.token_summary.calls_per_token} calls/token`);
+  for (const id of ['xport', 'tok']) { await page.evaluate(id => window.__nntr.tab(id), id); ok((await page.$eval('#pane svg', e => e.tagName)) === 'svg', `tab ${id} draws its chart`); }
+  await page.evaluate(() => window.__nntr.tab('tok'));
+  await page.click('#tok-table tr.click[data-i="3"]'); // phases[3] = decode token 3
+  const v8 = await page.evaluate(() => { const v = window.__nntr.view(), t = window.__nntr.model().phases[3]; return Math.abs(v.t0 - t.ts) < 1e-6 && Math.abs(v.t1 - t.ts - t.dur) < 1e-6; });
+  ok(v8, 'W8 clicking a token row zooms to it');
+  await page.evaluate(() => window.__nntr.tab('ker'));
+  ok((await page.$$eval('#pane button', bs => bs.map(b => b.textContent))).join() === 'Copy,Download', 'W12 export buttons on the Kernels tab');
+
   // W0: every tab renders, range select works
   await use(asBuilt);
   for (const id of await page.$$eval('#tabs button', bs => bs.map(b => b.dataset.tab))) {
@@ -97,7 +119,8 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   const label = await page.$eval('#range-label', e => e.textContent);
   ok(/prefill/.test(label), 'range select -> prefill: ' + label);
 
-  // dump metrics JSON for the python cross-check (W12)
+  // dump metrics JSON for the python cross-check (W12): whole-trace range of the as-built sample
+  await use(asBuilt); await page.selectOption('#range-select', 'all'); await page.waitForTimeout(50);
   const mj = await page.evaluate(() => window.__nntr.metricsJSON());
   fs.mkdirSync(fixtures, { recursive: true });
   fs.writeFileSync(path.join(fixtures, 'viewer_metrics.json'), JSON.stringify(mj, null, 1));
