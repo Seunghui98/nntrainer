@@ -1,0 +1,25 @@
+=================[ LLM with NNTrainer ]===================
+prefill: 444 tokens, 834 ms, 532.374 TPS
+generation: 512 tokens, 33616 ms, 15.2308 TPS
+total: 34464 ms
+peak memory: 5328488 KB
+==========================================================
+[e2e time]: 49498 ms 
+
+[HTP-PROFILE] level=2 qos_mode=2 (2=poll 1=PM 0=interrupt-driven -- every transport number below is only comparable to 34_fc_measured.md's 326us/call at qos_mode=2)
+[HTP-PROFILE] weight registration (once per weight, so all of it lands in the first forward)
+[HTP-PROFILE]   weights registered : 1462
+[HTP-PROFILE]   convert to registry:        0.0 ms  (0.00 ms/weight)
+[HTP-PROFILE]   register FastRPC   :      132.6 ms  (0.09 ms/weight)
+[HTP-PROFILE]   alloc + other      :     1422.3 ms
+[HTP-PROFILE]   registration total :     1554.9 ms
+[HTP-PROFILE]   rpcmem/ION buffer  : 1462/1462 weights (the rest used plain heap -- pinned+mapped per call)
+[HTP-PROFILE] layer calls (M==1 is decode's shape)
+[HTP-PROFILE]   K=2048  N=2048  M>1     calls=23      rows=10280    host=    397.8 ms (17296.7 us/call)  dsp=14916.8 us/call (86.2%) transport= 2379.9 us/call  [quant 274.4 gather 126.6 requant 1060.0 swiglu 0.0 dequant 905.5 acc 2927.1 drain 171.1+60.7 push 57.1 scatter 53.4 alloc 107.3 stage 383.4 mm 8606.3 | rest<=183.9 (1.1% of host) blocks=1035]
+[HTP-PROFILE]     weight DMA: 164786 KB/call, first 1024 KB took 0 us = 4019.5 GB/s; averaged over the call 11.3 GB/s
+[HTP-PROFILE]   K=2048  N=2048  M==1    calls=11264   rows=11264    host=  24431.0 ms ( 2168.9 us/call)  dsp= 1354.5 us/call (62.5%) transport=  814.4 us/call  [quant 14.9 gather 139.1 requant 42.0 swiglu 0.0 dequant 13.1 acc 259.3 drain 105.8+8.1 push 2.5 scatter 0.9 alloc 0.2 stage 4.4 mm 747.7 | rest<=16.5 (0.8% of host) blocks=45056]
+[HTP-PROFILE]     weight DMA: 21504 KB/call, first 1024 KB took 0 us = 20190.0 GB/s; averaged over the call 16.3 GB/s
+[HTP-PROFILE]   K=2048  N=6144  M>1     calls=19      rows=8504     host=     75.7 ms ( 3984.8 us/call)  dsp= 3202.7 us/call (80.4%) transport=  782.1 us/call  [quant 357.3 gather 0.0 requant 0.0 swiglu 0.0 dequant 794.4 acc 501.1 drain 58.4+0.0 push 0.0 scatter 0.0 alloc 0.0 stage 0.0 mm 0.0 | rest<=1491.5 (37.4% of host) blocks=0]
+[HTP-PROFILE] layer calls total :    24904.5 ms
+[HTP-PROFILE] arm staging memcpy:       41.8 ms  (602.4 MB in+out, 15.1 GB/s) -- outside every host= above
+[HTP-PROFILE] HTP host time     :    26501.2 ms (registration + layer calls + staging)
