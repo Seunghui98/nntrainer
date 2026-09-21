@@ -361,6 +361,14 @@ function draw() {
     ctx.fillStyle = css('--ink-2'); ctx.fillText(ms ? (t / 1000).toFixed(step >= 1000 ? 0 : 2) + ' ms' : t.toFixed(0) + ' µs', x + 3, HDR / 2 - 2);
   }
   ctx.strokeStyle = css('--line'); ctx.beginPath(); ctx.moveTo(0, HDR - .5); ctx.lineTo(W, HDR - .5); ctx.stroke();
+  if (range && range.kind === 'selection') { // W2: selection band in the ruler with its duration, and edge lines down the tracks
+    const a = xOf(range.t0), b = xOf(range.t1), xa = Math.max(LABEL_W, a), xb = Math.min(W, b);
+    if (xb > xa) {
+      ctx.fillStyle = css('--accent'); ctx.globalAlpha = .25; ctx.fillRect(xa, 0, xb - xa, HDR - 1); ctx.globalAlpha = 1;
+      ctx.strokeStyle = css('--accent'); for (const x of [a, b]) if (x >= LABEL_W && x <= W) { ctx.beginPath(); ctx.moveTo(Math.round(x) + .5, 0); ctx.lineTo(Math.round(x) + .5, H); ctx.stroke(); }
+      ctx.fillStyle = css('--ink'); ctx.textAlign = 'center'; const s = fmt(range.t1 - range.t0); if (ctx.measureText(s).width < xb - xa - 4) ctx.fillText(s, (xa + xb) / 2, HDR / 2 - 2); ctx.textAlign = 'left';
+    }
+  }
   const q = filter.toLowerCase();
   for (const row of T.rows) {
     if (row.kind === 'proc') continue;
@@ -478,11 +486,28 @@ function zoom(f, at) { const span = Math.max(10, Math.min((T.tmax - T.tmin) * 1.
 function pan(f) { const d = (view.t1 - view.t0) * f; view.t0 += d; view.t1 += d; draw(); }
 function select(e) { selected = e; tab = 'sel'; renderPane(); draw(); }
 function setFilter(s) { filter = s; $('#search').value = s; draw(); }
-function setRange(r) { range = r; renderPane(); draw(); }
+function setRange(r) { range = r; syncRangeSelect(); renderPane(); draw(); }
+function syncRangeSelect() {
+  const s = $('#range-select'), opt = s.querySelector('option[value="sel"]');
+  if (range.kind === 'selection') {
+    const o = opt || document.createElement('option'); o.value = 'sel'; o.textContent = `Range: ${range.label === 'selection' ? 'selection' : range.label} (${fmt(range.t1 - range.t0)})`;
+    if (!opt) s.append(o); s.value = 'sel';
+  } else { if (opt) opt.remove(); s.value = range.kind === 'phase' ? String(range.index) : 'all'; }
+}
 let drag = null;
-cv.addEventListener('pointerdown', ev => { drag = { x: ev.clientX, t0: view.t0, t1: view.t1, moved: false }; cv.setPointerCapture(ev.pointerId); });
+cv.addEventListener('pointerdown', ev => {
+  const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  // W2: a drag in the ruler, or shift+drag anywhere, selects a time range
+  const selecting = mx >= LABEL_W && (my < HDR || ev.shiftKey);
+  drag = { x: ev.clientX, t0: view.t0, t1: view.t1, moved: false, select: selecting, ta: tOf(mx) };
+  cv.setPointerCapture(ev.pointerId);
+});
 cv.addEventListener('pointermove', ev => {
   const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  if (drag && drag.select) {
+    const tb = tOf(Math.max(LABEL_W, mx)); if (Math.abs(ev.clientX - drag.x) > 2) drag.moved = true;
+    range = { t0: Math.min(drag.ta, tb), t1: Math.max(drag.ta, tb), label: 'selection', kind: 'selection' }; draw(); return;
+  }
   if (drag) { const dx = ev.clientX - drag.x; if (Math.abs(dx) > 2) drag.moved = true; const k = (tl.clientWidth - LABEL_W) / (drag.t1 - drag.t0); view.t0 = drag.t0 - dx / k; view.t1 = drag.t1 - dx / k; draw(); return; }
   const e = hit(mx, my), tip = $('#tip'), row = rowAt(my);
   if (!e && row && row.kind === 'ctr' && mx >= LABEL_W) {
@@ -495,6 +520,10 @@ cv.addEventListener('pointermove', ev => {
   tip.hidden = false; tip.style.left = Math.min(window.innerWidth - 400, ev.clientX + 12) + 'px'; tip.style.top = (ev.clientY + 14) + 'px';
 });
 cv.addEventListener('pointerup', ev => {
+  if (drag && drag.select) {
+    if (drag.moved && range.t1 - range.t0 > 0) setRange(range); // commit the dragged selection
+    drag = null; return;
+  }
   if (drag && !drag.moved) {
     const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top, row = rowAt(my);
     if (row && row.kind === 'proc') { collapsed.has(row.key) ? collapsed.delete(row.key) : collapsed.add(row.key); relayout(); }
@@ -511,13 +540,15 @@ cv.addEventListener('wheel', ev => {
 cv.addEventListener('dblclick', fit);
 document.addEventListener('keydown', ev => {
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
-  const m = { w: () => zoom(0.7), s: () => zoom(1 / 0.7), a: () => pan(-0.1), d: () => pan(0.1), 0: fit };
+  const m = { w: () => zoom(0.7), s: () => zoom(1 / 0.7), a: () => pan(-0.1), d: () => pan(0.1), 0: fit,
+    m: () => { if (selected) setRange({ t0: selected.ts, t1: selected.ts + selected.dur, label: selected._label, kind: 'selection' }); },
+    Escape: () => { if (range.kind !== 'all') setRange({ t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' }); } };
   if (m[ev.key]) { ev.preventDefault(); m[ev.key](); }
 });
 $('#reset').onclick = fit;
 $('#search').oninput = ev => { filter = ev.target.value.trim(); draw(); };
 $('#color-select').onchange = ev => { colorBy = ev.target.value; draw(); renderPane(); };
-$('#range-select').onchange = ev => { const v = ev.target.value; setRange(v === 'all' ? { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' } : (e => ({ t0: e.ts, t1: e.ts + e.dur, label: e.name, kind: 'phase', index: +v }))(T.phases[+v])); };
+$('#range-select').onchange = ev => { const v = ev.target.value; if (v === 'sel') return; setRange(v === 'all' ? { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' } : (e => ({ t0: e.ts, t1: e.ts + e.dur, label: e.name, kind: 'phase', index: +v }))(T.phases[+v])); };
 $('#file').onchange = ev => { const f = ev.target.files[0]; if (!f) return; f.text().then(txt => { load(JSON.parse(txt), f.name); const o = document.createElement('option'); o.value = '__file'; o.textContent = f.name; $('#trace-select').append(o); $('#trace-select').value = '__file'; }); };
 window.addEventListener('resize', () => { if (T) { resize(); draw(); } });
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());

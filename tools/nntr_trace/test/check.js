@@ -57,6 +57,23 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   const vt = await page.evaluate(() => { const T = window.__nntr.model(), c = T.models[0].counters.find(c => c.name === 'VTCM (KB)'); return { budget: (T.md.budgets || {})[c.name], peak: Math.max(...c.pts.map(p => p[1])) }; });
   ok(vt.budget === 8192 && vt.peak < vt.budget, `VTCM hi-water ${vt.peak} KB under budget ${vt.budget} KB`);
 
+  // W2: `m` on a selected layer slice makes it the range; a ruler drag selects a range
+  await page.evaluate(() => { const T = window.__nntr.model(); window.__nntr.select(T.all.find(e => e.cat === 'host.layer' && e.name === 'layer0')); });
+  await page.keyboard.press('m');
+  let w2 = await page.evaluate(() => {
+    const T = window.__nntr.model(), e = T.all.find(x => x.cat === 'host.layer' && x.name === 'layer0');
+    const a = window.__nntr.metrics(), b = window.__nntr.metrics({ t0: e.ts, t1: e.ts + e.dur });
+    return { label: document.querySelector('#range-label').textContent, same: Math.abs(a.cpu - b.cpu) < 1e-6 && Math.abs(a.hmxOnly - b.hmxOnly) < 1e-6, sel: document.querySelector('#range-select').value };
+  });
+  ok(/^layer0/.test(w2.label) && w2.same && w2.sel === 'sel', `m -> range = layer0 (${w2.label})`);
+  await page.keyboard.press('Escape');
+  const cvb = await (await page.$('#cv')).boundingBox();
+  await page.mouse.move(cvb.x + 400, cvb.y + 10); await page.mouse.down(); await page.mouse.move(cvb.x + 700, cvb.y + 10, { steps: 4 }); await page.mouse.up();
+  w2 = await page.evaluate(() => ({ v: document.querySelector('#range-select').value, l: document.querySelector('#range-label').textContent }));
+  ok(w2.v === 'sel' && /selection/.test(w2.l), `ruler drag -> ${w2.l}`);
+  await page.keyboard.press('Escape');
+  ok((await page.$eval('#range-select', s => s.value)) === 'all', 'Escape clears the selection');
+
   // W0: every tab renders, range select works
   await use(asBuilt);
   for (const id of await page.$$eval('#tabs button', bs => bs.map(b => b.dataset.tab))) {
