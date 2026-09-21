@@ -21,6 +21,7 @@
 #include <tokenizers_cpp.h>
 #include <transformer.h>
 
+#include <dense_ffn_layer.h>
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
@@ -374,10 +375,16 @@ void Transformer::repack_weight() {
     unsigned int K, N;
   };
   std::vector<PendingFc> fc_pending;
+  struct PendingDense {
+    nntrainer::ComputeOps *ops;
+    void *up, *gate, *down;
+    unsigned int K, I, N;
+  };
+  std::vector<PendingDense> dense_pending;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&fc_pending](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-                       void *) {
+    fn = [&fc_pending, &dense_pending](
+           ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       // The tied lm_head's blocked twin (tie_word_embedding.h) is built
       // here, with every weight loaded, rather than on the first lm_head
       // call inside the first prefill. forEachLayer hands out LayerNodes.
@@ -397,6 +404,28 @@ void Transformer::repack_weight() {
       // requirement -- but a CPU-dispatched MoE layer (any layer_id not in
       // moe_htp_layers) throws "pack before run model" on its first token
       // without this, because lfm2_moe was missing from this filter.
+      // A dense_ffn layer's three Q4_0 weights are registered as one
+      // fused set (doc 51), after the walk like the FCs below -- not as
+      // three FC weights, which the loop below would otherwise do.
+      if (l.getType() == "dense_ffn") {
+        auto weights = context.getWeights();
+        if (weights.size() == 3 && context.getComputeOps()) {
+          auto &up = weights[0]->getVariableRef();
+          auto &gate = weights[1]->getVariableRef();
+          auto &down = weights[2]->getVariableRef();
+          if (up.getDataType() == ml::train::TensorDim::DataType::Q4_0 &&
+              gate.getDataType() == ml::train::TensorDim::DataType::Q4_0 &&
+              down.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+            dense_pending.push_back({context.getComputeOps(),
+                                     up.getData<char>(), gate.getData<char>(),
+                                     down.getData<char>(),
+                                     static_cast<unsigned int>(up.height()),
+                                     static_cast<unsigned int>(up.width()),
+                                     static_cast<unsigned int>(down.width())});
+          }
+        }
+        return;
+      }
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected" && l.getType() != "lfm2_moe")
         return;
@@ -515,6 +544,24 @@ void Transformer::repack_weight() {
       p.ops->gemm_q4_0_accel_fp32(p.data, act.data(), out.data(), M, p.N, p.K);
       ml_logd("FC HTP kernel warmed up at load (M=%u, K=%u, N=%u)", M, p.K,
               p.N);
+    }
+    // Same for the dense FFNs: the registration converts and packs three
+    // weights into I / w expert pairs, and the one warm-up call grows the
+    // MoE layer kernel's scratch to this shape's row count.
+    bool dense_warmed = false;
+    for (const auto &p : dense_pending) {
+      if (!p.ops->register_q4_0_dense_ffn(p.up, p.gate, p.down, p.K, p.I, p.N))
+        continue;
+      if (dense_warmed || !p.ops->supports_gemm_q4_0_dense_ffn_fp32())
+        continue;
+      dense_warmed = true;
+      const unsigned int M = 512;
+      std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
+      std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
+      p.ops->gemm_q4_0_dense_ffn_fp32(p.up, p.gate, p.down, act.data(),
+                                      out.data(), M, p.K, p.I, p.N);
+      ml_logd("dense FFN HTP kernel warmed up at load (M=%u, K=%u, I=%u, N=%u)",
+              M, p.K, p.I, p.N);
     }
     ml_logd("QS4CX weights repacked successfully");
   } catch (const std::exception &e) {
@@ -681,6 +728,16 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   const std::string eng =
     (FFN_HTP_LAYERS.empty() || FFN_HTP_LAYERS.count(layer_id)) ? FFN_ENGINE
                                                                : "cpu";
+  if (eng != "cpu") {
+    // One layer for the block, so the accelerator takes up, gate, SwiGLU
+    // and down in one call (doc 51). Same three weights in the file's
+    // order, so the model file loads unchanged.
+    LayerHandle ffn(
+      createLayer("dense_ffn",
+                  {withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
+                   withKey("unit", hidden_dim), withKey("engine", eng)}));
+    return ffn(input);
+  }
 
   LayerHandle ffn_up(createLayer(
     "fully_connected",
@@ -725,6 +782,8 @@ void Transformer::registerCustomLayers() {
       ct_engine.getRegisteredContext("cpu"));
 
     app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::DenseFfnLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormLayer>);
     app_context->registerFactory(

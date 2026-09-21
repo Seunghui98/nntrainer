@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #ifdef ENABLE_FP16
@@ -329,6 +330,41 @@ public:
                                     unsigned int N) {
     (void)data;
     (void)K;
+    (void)N;
+    return false;
+  }
+
+  // The dense SwiGLU FFN as ONE accelerator call (doc 51): up and gate
+  // [K x I] and down [I x N], all Q4_0x4 as loaded; act [M x K] f32 ->
+  // out [M x N] f32 = (silu(act . gate) * (act . up)) . down. The HTP
+  // answers it with its MoE layer kernel over column chunks of I, each
+  // chunk a whole "expert" whose down output is summed into out.
+  // register_q4_0_dense_ffn is the load-time twin, like the two above.
+  virtual bool supports_gemm_q4_0_dense_ffn_fp32() const { return false; }
+  virtual void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
+                                        const float *act, float *out,
+                                        unsigned int M, unsigned int K,
+                                        unsigned int I, unsigned int N) {
+    (void)up;
+    (void)gate;
+    (void)down;
+    (void)act;
+    (void)out;
+    (void)M;
+    (void)K;
+    (void)I;
+    (void)N;
+    throw std::runtime_error(
+      "ComputeOps::gemm_q4_0_dense_ffn_fp32 not implemented by this backend");
+  }
+  virtual bool register_q4_0_dense_ffn(void *up, void *gate, void *down,
+                                       unsigned int K, unsigned int I,
+                                       unsigned int N) {
+    (void)up;
+    (void)gate;
+    (void)down;
+    (void)K;
+    (void)I;
     (void)N;
     return false;
   }

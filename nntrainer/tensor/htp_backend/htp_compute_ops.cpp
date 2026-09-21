@@ -1793,50 +1793,180 @@ private:
         std::vector<float> ws(w_scale.begin() + c0, w_scale.begin() + c0 + n);
         std::vector<int32_t> cs(colsum_w.begin() + c0,
                                 colsum_w.begin() + c0 + n);
-        void *key = static_cast<char *>(matAdata) + c0;
-
-        // [doc 50 section 3.3] Into a mapped arena chunk's free room first:
-        // the 3840 MiB mapped hold 3696 of MoE weights, and the DSP heap
-        // gave the loaded app ~100 MiB before AEE_ENOMEMORY (42 slices),
-        // short of the 143 the FC weights need. Only room that is already
-        // mapped -- a new chunk would take the address space the heap
-        // registrations after this one need. The arena wants WH bytes:
-        // packed on the host into a cached buffer and copied in whole,
-        // since whPack's read-modify-write into the uncached chunk would
-        // crawl. A refusal leaves 2 MiB of the chunk unused, once.
-        uint32_t handle = kNoHandle;
-        const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, n));
-        uint32_t chunk = 0, off = 0;
-        if (ensureArena(session) && placeExisting(wh_len, &chunk, &off)) {
-          std::vector<uint8_t> wh(wh_len);
-          whPack(rm.data(), K, n, wh.data());
-          std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(),
-                      wh_len);
-          ArenaEntry e;
-          e.chunk = chunk;
-          e.off = off;
-          e.K = K;
-          e.N = n;
-          e.w_scale = ws;
-          e.colsum_w = cs;
-          e.bias.assign(n, 0.0f);
-          handle = registerFromArena(session, e, K, n, t_begin);
-          if (handle != kNoHandle)
-            handle_cache_.emplace(key, handle);
-        }
-        if (handle == kNoHandle) {
-          // The DSP heap, as the whole weight would have gone.
-          HtpRpcBuffer slice(static_cast<size_t>(K) * n);
-          std::memcpy(slice.data(), rm.data(), rm.size());
-          handle = register_locked(key, session, K, n, slice, ws, cs, t_begin,
-                                   convert_us);
-        }
-        fh.handles.push_back(handle);
+        fh.handles.push_back(registerRm(static_cast<char *>(matAdata) + c0,
+                                        session, rm.data(), K, n, ws, cs,
+                                        t_begin, convert_us));
         fh.cols.push_back(n);
         convert_us = 0; // counted once, on the first slice
       }
     }
     return fc_cache_.emplace(matAdata, std::move(fh)).first->second;
+  }
+
+  /** @brief Registers one row-major int8 [K x N] weight (values in [-8, 7],
+   *  the form htp_qs4cx_from_* produce) with its scales and column sums.
+   *
+   * [doc 50 section 3.3] Into a mapped arena chunk's free room first: the
+   * 3840 MiB mapped hold 3696 of MoE weights, and the DSP heap gave the
+   * loaded app ~100 MiB before AEE_ENOMEMORY. Only room that is already
+   * mapped -- a new chunk would take the address space the heap
+   * registrations after this one need. The arena wants WH bytes: packed
+   * on the host into a cached buffer and copied in whole, since whPack's
+   * read-modify-write into the uncached chunk would crawl. When no mapped
+   * room is left, the DSP heap, as a whole weight would have gone. A
+   * refusal by the DSP leaves the arena bytes unused, once.
+   * @param key what handle_cache_ files the handle under: an address inside
+   *            the weight this is a slice of, distinct per slice
+   * @note  Call with handle_mutex_ already held. */
+  uint32_t registerRm(void *key, remote_handle64 session, const int8_t *rm,
+                      uint32_t K, uint32_t N, std::vector<float> &ws,
+                      std::vector<int32_t> &cs, uint64_t t_begin,
+                      uint64_t convert_us) {
+    const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
+    uint32_t chunk = 0, off = 0;
+    if (ensureArena(session) && placeExisting(wh_len, &chunk, &off)) {
+      std::vector<uint8_t> wh(wh_len);
+      whPack(rm, K, N, wh.data());
+      std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(), wh_len);
+      ArenaEntry e;
+      e.chunk = chunk;
+      e.off = off;
+      e.K = K;
+      e.N = N;
+      e.w_scale = ws;
+      e.colsum_w = cs;
+      e.bias.assign(N, 0.0f);
+      const uint32_t handle = registerFromArena(session, e, K, N, t_begin);
+      if (handle != kNoHandle) {
+        handle_cache_.emplace(key, handle);
+        return handle;
+      }
+    }
+    HtpRpcBuffer buf(static_cast<size_t>(K) * N);
+    std::memcpy(buf.data(), rm, static_cast<size_t>(K) * N);
+    return register_locked(key, session, K, N, buf, ws, cs, t_begin,
+                           convert_us);
+  }
+
+  /** @brief The handles one dense FFN is registered as: chunk c of the
+   *  intermediate dimension is the expert pair (gate_up [K x 2w] with the
+   *  gate columns first, down [w x N]) of the MoE layer kernel. */
+  struct DenseHandles {
+    std::vector<uint32_t> h_gu, h_dn;
+    unsigned int w = 0; /**< columns of I per chunk */
+  };
+
+  /** @brief Columns of the intermediate dimension per chunk: the largest
+   *  divisor of I that is a multiple of 32 and at most 1792 -- this
+   *  model's expert width, so the MoE layer kernel lays VTCM out exactly
+   *  as it does for the experts (gate_up 3.5 MiB, down 1.75). 0 if none. */
+  static unsigned int denseChunkCols(unsigned int I) {
+    for (unsigned int w = std::min(I, 1792u); w >= 32u; w -= 32u) {
+      if (I % w == 0)
+        return w;
+    }
+    return 0;
+  }
+
+  /** @brief Converts and registers a dense FFN's three Q4_0x4 weights as
+   *  I / w expert pairs (doc 51). The gate_up chunk takes column slices of
+   *  gate and up, so its column sums are the full ones; the down chunk
+   *  takes a row slice, so its column sums are recomputed over those rows
+   *  -- the kernel's zero-point correction is per chunk. Cached by the up
+   *  weight's pointer. */
+  const DenseHandles &get_or_register_dense(void *up, void *gate, void *down,
+                                            remote_handle64 session, uint32_t K,
+                                            uint32_t I, uint32_t N) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = dense_cache_.find(up);
+    if (it != dense_cache_.end())
+      return it->second;
+
+    const unsigned int w = denseChunkCols(I);
+    if (w == 0) {
+      throw std::invalid_argument(
+        "gemm_q4_0_dense_ffn_fp32: intermediate size " + std::to_string(I) +
+        " has no chunk width that is a multiple of 32");
+    }
+    uint64_t t_begin = HtpProfile::nowUs();
+    std::vector<int8_t> up_rm(static_cast<size_t>(K) * I),
+      gate_rm(static_cast<size_t>(K) * I), down_rm(static_cast<size_t>(I) * N);
+    std::vector<float> up_s(I), gate_s(I), down_s(N);
+    std::vector<int32_t> up_c(I), gate_c(I), down_c(N);
+    htp_qs4cx_from_q4_0x4(up, K, I, up_rm.data(), up_s.data(), up_c.data());
+    htp_qs4cx_from_q4_0x4(gate, K, I, gate_rm.data(), gate_s.data(),
+                          gate_c.data());
+    htp_qs4cx_from_q4_0x4(down, I, N, down_rm.data(), down_s.data(),
+                          down_c.data());
+    uint64_t convert_us = HtpProfile::nowUs() - t_begin;
+
+    DenseHandles dh;
+    dh.w = w;
+    for (uint32_t c0 = 0; c0 < I; c0 += w) {
+      // gate_up chunk: [K x 2w], gate columns then up columns -- the pair
+      // layout hexkl_mm_u8i4_moe.c's epilogue reads (gate j with up w+j).
+      std::vector<int8_t> gu(static_cast<size_t>(K) * 2 * w);
+      for (uint32_t k = 0; k < K; ++k) {
+        std::memcpy(gu.data() + static_cast<size_t>(k) * 2 * w,
+                    gate_rm.data() + static_cast<size_t>(k) * I + c0, w);
+        std::memcpy(gu.data() + static_cast<size_t>(k) * 2 * w + w,
+                    up_rm.data() + static_cast<size_t>(k) * I + c0, w);
+      }
+      std::vector<float> gus(gate_s.begin() + c0, gate_s.begin() + c0 + w);
+      gus.insert(gus.end(), up_s.begin() + c0, up_s.begin() + c0 + w);
+      std::vector<int32_t> guc(gate_c.begin() + c0, gate_c.begin() + c0 + w);
+      guc.insert(guc.end(), up_c.begin() + c0, up_c.begin() + c0 + w);
+      if (c0 != 0)
+        t_begin = HtpProfile::nowUs();
+      dh.h_gu.push_back(registerRm(static_cast<char *>(gate) + c0, session,
+                                   gu.data(), K, 2 * w, gus, guc, t_begin,
+                                   convert_us));
+      convert_us = 0;
+
+      // down chunk: rows c0 .. c0 + w, contiguous in the row-major weight.
+      const int8_t *dn = down_rm.data() + static_cast<size_t>(c0) * N;
+      std::vector<int32_t> dnc(N, 0);
+      for (uint32_t r = 0; r < w; ++r) {
+        for (uint32_t n = 0; n < N; ++n)
+          dnc[n] += dn[static_cast<size_t>(r) * N + n];
+      }
+      std::vector<float> dns(down_s);
+      dh.h_dn.push_back(registerRm(static_cast<char *>(down) + c0, session, dn,
+                                   w, N, dns, dnc, HtpProfile::nowUs(), 0));
+    }
+    return dense_cache_.emplace(up, std::move(dh)).first->second;
+  }
+
+  bool supports_gemm_q4_0_dense_ffn_fp32() const override { return true; }
+
+  void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
+                                const float *act, float *out, unsigned int M,
+                                unsigned int K, unsigned int I,
+                                unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const DenseHandles &dh =
+      get_or_register_dense(up, gate, down, session, K, I, N);
+    // Every chunk is an "expert" that takes every row with weight 1: the
+    // kernel zero-fills out and scatter-adds each chunk's down result into
+    // it, which is exactly the sum over the intermediate dimension.
+    const size_t chunks = dh.h_gu.size();
+    std::vector<unsigned int> row_index(chunks * M), row_count(chunks, M);
+    std::vector<float> row_weight(chunks * M, 1.0f);
+    for (size_t c = 0; c < chunks; ++c) {
+      for (unsigned int r = 0; r < M; ++r)
+        row_index[c * M + r] = r;
+    }
+    invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
+                   act, out, M, K, dh.w, N);
+  }
+
+  bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
+                               unsigned int I, unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    get_or_register_dense(up, gate, down, session, K, I, N);
+    return true;
   }
 
   /* Declared here rather than beside arena_chunks_ at the bottom of the
@@ -2331,6 +2461,8 @@ private:
    *  Values are never erased or moved, so the references it hands out stay
    *  valid (std::unordered_map keeps node addresses across rehash). */
   std::unordered_map<const void *, FcHandles> fc_cache_;
+  /** Dense FFNs by their up weight's pointer; see get_or_register_dense. */
+  std::unordered_map<const void *, DenseHandles> dense_cache_;
 
   std::vector<ArenaChunk> arena_chunks_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
