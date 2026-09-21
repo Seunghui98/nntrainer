@@ -27,6 +27,39 @@ python3 tools/nntr_trace/bundle.py -o report.html --trace "run 1=trace_asbuilt.j
 bash tools/nntr_trace/test/run.sh                         # before committing
 ```
 
+## Capturing from a device run
+
+Two ways, both ending in the same viewer.
+
+**A. No rebuild.** Any HTP build already prints a per-shape summary at exit;
+that becomes one representative call per shape (averages, no timeline):
+
+```bash
+adb shell "cd /data/local/tmp/nntrainer/causallm && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. \
+  NNTR_NUM_THREADS=8 NNTR_HTP_PROFILE=2 ./nntrainer_causallm ./models/<model>" 2>&1 | tee run.log
+python3 tools/nntr_trace/htp_profile_to_trace.py run.log -o profile.json
+python3 tools/nntr_trace/bundle.py -o report.html --trace "run=profile.json"
+```
+
+**B. Per-call timeline.** Needs a build with the `HtpTrace` recorder
+(`nntrainer/tensor/htp_backend/htp_trace.{h,cpp}`, on the HTP branch).
+`NNTR_TRACE` names the output and implies profile level 2 so the timed
+FastRPC entries run:
+
+```bash
+adb shell "cd /data/local/tmp/nntrainer/causallm && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. \
+  NNTR_NUM_THREADS=8 NNTR_TRACE=/data/local/tmp/trace.json ./nntrainer_causallm ./models/<model>"
+adb pull /data/local/tmp/trace.json
+python3 tools/nntr_trace/bundle.py -o run.html --trace "run=trace.json"
+```
+
+Every FastRPC call gets a host wait span, its seam halves and a DSP entry
+holding that call's stage totals on their lanes, with prefill and each
+decode token marked as phases. Lane overlap (HMX ∥ HVX) reads 0 at this
+level: the stage totals are laid out sequentially inside a call, which the
+metadata states. Measuring real overlap needs the DSP-side ring of P3 in
+the plan document.
+
 ## Viewer
 
 - **Timeline.** One process per pid (host, HTP, later QNN), one row per
