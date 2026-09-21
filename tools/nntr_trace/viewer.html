@@ -266,10 +266,10 @@ function kernels(r, all = T.all, md = T.md) {
   const m = new Map(), mhz = md.dsp_clock_mhz || 1200;
   for (const e of all) {
     if (!e.args || !e.args.engine || !e.args.elems || !['dsp.hmx', 'dsp.hvx'].includes(e.cat) || !inRange(e, r)) continue;
-    const k = e.args.engine + '|' + e._label, row = m.get(k) || (m.set(k, { engine: e.args.engine, name: e._label, n: 0, us: 0, elems: 0, cyc: 0 }), m.get(k));
-    row.n++; row.us += e.dur; row.elems += e.args.elems; row.cyc += e.args.cycles || 0;
+    const k = e.args.engine + '|' + e._label, row = m.get(k) || (m.set(k, { engine: e.args.engine, name: e._label, n: 0, us: 0, elems: 0, cyc: 0, ops: 0 }), m.get(k));
+    row.n++; row.us += e.dur; row.elems += e.args.elems; row.cyc += e.args.cycles || 0; row.ops += opsOf(e) || 0;
   }
-  return [...m.values()].map(k => ({ ...k, cpe: (k.cyc || k.us * mhz) / k.elems })).sort((a, b) => b.us - a.us);
+  return [...m.values()].map(k => ({ ...k, cpe: (k.cyc || k.us * mhz) / k.elems, tops: k.ops ? k.ops / k.us / 1e6 : null })).sort((a, b) => b.us - a.us);
 }
 function layerRows(r, all = T.all) {
   return all.filter(e => e.cat === 'host.layer' && inRange(e, r)).map(e => ({ e, m: metrics({ t0: Math.max(e.ts, r.t0), t1: Math.min(e.ts + e.dur, r.t1) }, all) }));
@@ -281,11 +281,115 @@ function metricsJSON(r = range) {
     buckets: { cpu: m.cpu, rpc: m.rpc, hmx_only: m.hmxOnly, overlap: m.overlap, hvx_only: m.hvxOnly, dma_only: m.dmaOnly, dsp_idle: m.idle, load: m.load, other: m.other },
     compression: m.compression, idle_ratio: m.entry ? m.idle / m.entry : 0,
     engines: m.occ.map(o => ({ track: o.th.name, busy: o.busy })),
-    kernels: kernels(r).map(k => ({ engine: k.engine, name: k.name, calls: k.n, total_us: k.us, mean_us: k.us / k.n, elems: k.elems, cy_per_elem: k.cpe })),
+    kernels: kernels(r).map(k => ({ engine: k.engine, name: k.name, calls: k.n, total_us: k.us, mean_us: k.us / k.n, elems: k.elems, cy_per_elem: k.cpe, tops: k.tops })),
     layers: layerRows(r).map(({ e, m }) => ({ name: e.name, phase: e.args && e.args.phase || null, wall_us: e.dur, cpu: m.cpu, rpc: m.rpc, hmx_only: m.hmxOnly, overlap: m.overlap, hvx_only: m.hvxOnly, dma_only: m.dmaOnly, dsp_idle: m.idle })),
     warnings: (w => ({ items: w.list.map(x => x.id), fallbacks: w.fallbacks.length, fallback_us: w.fallbacks.reduce((s, e) => s + e.dur, 0), dropped: T.md.dropped || {}, clock_violations: (T.md.clock_sync || {}).violations || 0 }))(warnings()),
+    tokens: tokenRows().map(x => ({ name: x.name, phase: x.phase, token: x.token, wall_us: x.wall, calls: x.calls, bytes: x.bytes, transport_us: x.transport, dsp_us: x.dsp, cpu_us: x.cpu })),
+    token_summary: tokenSummary(tokenRows()),
+    transport: (t => ({ n: t.n, fixed_us: t.fixed_us, us_per_mb: t.us_per_mb, sigma_us: t.sigma, outliers: t.outliers.map(c => ({ name: c.name, bytes: c.bytes, us: c.us, residual: c.resid })) }))(transportCalls(r)),
+    pool_tail: poolTail(r).groups.map(g => ({ kind: g.kind, runs: g.runs, mean_tail: g.mean_tail, worst_tail: g.worst.tail, min_units: g.min_units, few_units: g.few_units })),
+    hmx_peak_tops: T.md.hmx_peak_tops ?? null,
   };
 }
+
+// ---------- batch B analyses (W4 transport, W5 pool tail, W6 utilization, W8 tokens) ----------
+// ops of a slice: explicit args.ops, else 2*M*K*N*n_handles on call-level slices (dsp.call, host.wait)
+function opsOf(e) {
+  const a = e.args || {};
+  if (a.ops) return a.ops;
+  if ((e.cat === 'dsp.call' || e.cat === 'host.wait') && a.M && a.K && a.N) return 2 * a.M * a.K * a.N * (a.n_handles || 1);
+  return null;
+}
+const topsOf = e => { const o = opsOf(e); return o ? o / e.dur / 1e6 : null; }; // ops per µs -> TOPS
+function poolTail(r, all = T.all, md = T.md) {
+  const units = new Map();
+  for (const e of all) if (e.cat === 'dsp.hvx' && e.args && e.args.pool != null) (units.get(e.args.pool) || units.set(e.args.pool, []).get(e.args.pool)).push(e);
+  const runs = [];
+  for (const e of all) {
+    if (!(e.cat === 'dsp.sync' && e.name.startsWith('pool_run ') && e.args && e.args.pool != null && inRange(e, r))) continue;
+    const u = units.get(e.args.pool) || []; if (!u.length) continue;
+    const durs = u.map(x => x.dur), max = Math.max(...durs), mean = durs.reduce((s, x) => s + x, 0) / durs.length;
+    runs.push({ e, kind: e.name.slice(9), units: u.length, n_units: e.args.n_units || u.length, max, mean, tail: max / mean, join_gap: e.dur - max });
+  }
+  const threads = md.hvx_threads || 6, groups = new Map();
+  for (const x of runs) {
+    const g = groups.get(x.kind) || groups.set(x.kind, { kind: x.kind, runs: 0, tail_sum: 0, worst: null, min_units: Infinity }).get(x.kind);
+    g.runs++; g.tail_sum += x.tail; g.min_units = Math.min(g.min_units, x.n_units); if (!g.worst || x.tail > g.worst.tail) g.worst = x;
+  }
+  return { runs, groups: [...groups.values()].map(g => ({ ...g, mean_tail: g.tail_sum / g.runs, few_units: g.min_units < threads * 4 })).sort((a, b) => b.worst.tail - a.worst.tail), rule: threads * 4 };
+}
+function transportCalls(r, all = T.all) {
+  const calls = [];
+  const byThread = new Map();
+  for (const e of all) if (e.cat === 'host.rpc') (byThread.get(e._th) || byThread.set(e._th, []).get(e._th)).push(e);
+  const waits = all.filter(e => e.cat === 'host.wait');
+  for (const evs of byThread.values()) {
+    let open = null;
+    for (const e of evs) {
+      if (e.name.startsWith('marshal ')) open = e;
+      else if (e.name.startsWith('return ') && open && e.name.slice(7) === open.name.slice(8)) {
+        const bytes = ((open.args || {}).bytes || 0) + ((e.args || {}).bytes || 0), us = open.dur + e.dur;
+        if (inRange(open, r) || inRange(e, r)) calls.push({ name: open.name.slice(8), marshal: open, ret: e, bytes, us, wait: waits.find(w => w.ts <= open.ts + EPS && w.ts + w.dur >= e.ts + e.dur - EPS) || null });
+        open = null;
+      }
+    }
+  }
+  const n = calls.length; let fixed = 0, slope = 0, sigma = 0;
+  if (n >= 2) {
+    const mx = calls.reduce((s, c) => s + c.bytes, 0) / n, my = calls.reduce((s, c) => s + c.us, 0) / n;
+    const sxx = calls.reduce((s, c) => s + (c.bytes - mx) ** 2, 0), sxy = calls.reduce((s, c) => s + (c.bytes - mx) * (c.us - my), 0);
+    slope = sxx > 0 ? sxy / sxx : 0; fixed = my - slope * mx;
+    for (const c of calls) c.resid = c.us - (fixed + slope * c.bytes);
+    sigma = Math.sqrt(calls.reduce((s, c) => s + c.resid ** 2, 0) / Math.max(1, n - 2));
+    for (const c of calls) c.outlier = sigma > 0 && Math.abs(c.resid) > 2 * sigma;
+  }
+  return { calls, n, fixed_us: fixed, us_per_mb: slope * 1e6, mb_per_s: slope > 0 ? 1 / slope : null, sigma, outliers: calls.filter(c => c.outlier).sort((a, b) => Math.abs(b.resid) - Math.abs(a.resid)) };
+}
+function tokenRows(all = T.all, phases = T.phases) {
+  return phases.map(p => {
+    const r = { t0: p.ts, t1: p.ts + p.dur }, m = metrics(r, all);
+    const waits = all.filter(e => e.cat === 'host.wait' && inRange(e, r));
+    const bytes = waits.reduce((s, e) => s + ((e.args || {}).bytes_in || 0) + ((e.args || {}).bytes_out || 0), 0);
+    return { e: p, name: p.name, phase: (p.args || {}).phase || null, token: (p.args || {}).token ?? null, wall: p.dur, calls: waits.length, bytes, transport: m.rpc, dsp: m.any, cpu: m.cpu, other: Math.max(0, p.dur - m.rpc - m.any - m.cpu) };
+  });
+}
+function tokenSummary(rows) {
+  const dec = rows.filter(x => x.phase === 'decode'), pre = rows.find(x => x.phase === 'prefill');
+  const med = a => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[(s.length - 1) >> 1]; };
+  return { ttft_us: pre ? pre.wall : null, median_token_us: med(dec.map(x => x.wall)), calls_per_token: dec.length ? dec.reduce((s, x) => s + x.calls, 0) / dec.length : null, tokens: dec.length };
+}
+// W12: table export
+function tableCSV(tbl) {
+  return [...tbl.querySelectorAll('tr')].map(tr => [...tr.children].map(td => '"' + td.innerText.trim().replace(/"/g, '""') + '"').join(',')).join('\n');
+}
+function exportButtons(getText, base) {
+  const d = document.createElement('div'); d.style.margin = '6px 0';
+  const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.onclick = fn; b.style.marginRight = '6px'; d.append(b); return b; };
+  mk('Copy', async () => { try { await navigator.clipboard.writeText(getText()); } catch (e) { const ta = document.createElement('textarea'); ta.value = getText(); document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove(); } });
+  mk('Download', () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([getText()], { type: 'text/plain' })); a.download = base; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); });
+  const note = document.createElement('span'); note.className = 'hint'; note.textContent = 'Download works from a local file; inside a sandboxed page use Copy.'; d.append(note);
+  return d;
+}
+function svgScatter(pts, opts) { // pts: {x, y, cls, title}; opts: {w,h,xlab,ylab,logx,line:[[x,y],[x,y]]}
+  const W = opts.w || 520, H = opts.h || 220, L = 56, B = 34, Tt = 10, R = 12;
+  const xs = pts.map(p => opts.logx ? Math.log10(Math.max(1, p.x)) : p.x), ys = pts.map(p => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = 0, y1 = Math.max(...ys) * 1.08 || 1;
+  const X = v => L + (v - x0) / ((x1 - x0) || 1) * (W - L - R), Y = v => Tt + (1 - (v - y0) / ((y1 - y0) || 1)) * (H - Tt - B);
+  const fx = v => opts.logx ? Math.pow(10, v) : v;
+  const ticks = n => { const o = []; for (let i = 0; i <= n; i++) o.push(i / n); return o; };
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" style="max-width:100%;height:auto;font:11px sans-serif" role="img" aria-label="${esc(opts.aria || '')}">`;
+  for (const f of ticks(4)) { const y = Y(y0 + f * (y1 - y0)); s += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="var(--grid)"/><text x="${L - 4}" y="${y + 4}" text-anchor="end" fill="var(--ink-2)">${fmtShort(y0 + f * (y1 - y0))}</text>`; }
+  for (const f of ticks(4)) { const xv = x0 + f * (x1 - x0), x = X(xv); s += `<text x="${x}" y="${H - 16}" text-anchor="middle" fill="var(--ink-2)">${opts.xfmt ? opts.xfmt(fx(xv)) : fmtShort(fx(xv))}</text>`; }
+  s += `<line x1="${L}" x2="${W - R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/>`;
+  if (opts.fit) { // y = fit(x) sampled across the axis (a straight line in bytes bends on a log axis)
+    const pts2 = []; for (let i = 0; i <= 40; i++) { const xv = x0 + (x1 - x0) * i / 40; pts2.push(X(xv).toFixed(1) + ',' + Y(Math.max(y0, Math.min(y1, opts.fit(fx(xv))))).toFixed(1)); }
+    s += `<polyline points="${pts2.join(' ')}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>`;
+  }
+  pts.forEach((p, i) => { s += `<circle cx="${X(xs[i])}" cy="${Y(p.y)}" r="${p.cls === 'out' ? 4.5 : 3}" fill="${p.cls === 'out' ? 'var(--critical)' : 'var(--accent)'}" fill-opacity="${p.cls === 'out' ? 1 : .55}" stroke="var(--bg)" stroke-width="1" data-i="${i}"><title>${esc(p.title || '')}</title></circle>`; });
+  s += `<text x="${(L + W - R) / 2}" y="${H - 3}" text-anchor="middle" fill="var(--ink-3)" font-size="10">${esc(opts.xlab || '')}</text>`;
+  return s + '</svg>';
+}
+const fmtShort = v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + 'k' : (Math.round(v * 10) / 10).toString();
 
 // ---------- warnings (W7) ----------
 function warnings(all = T.all, md = T.md) {
@@ -451,6 +555,11 @@ const TABS = [
     const a = e.args || {}, mhz = T.md.dsp_clock_mhz || 1200;
     const rows = [['Title', swatch(e) + esc(e._label)], ['Category', e.cat], ['Track', `${esc(e._th.name)} · pid ${e.pid} tid ${e.tid}`], ['Start', fmt(e.ts)], ['Wall Duration', fmt(e.dur)]];
     if (a.elems) rows.push(['cycles / element', (a.cycles ? a.cycles / a.elems : e.dur * mhz / a.elems).toFixed(3) + (a.cycles ? '' : ' (est. from ' + mhz + ' MHz)')]);
+    const ops = opsOf(e); // W6
+    if (ops) {
+      rows.push(['MACs', (ops / 2).toExponential(3)], ['TOPS', topsOf(e).toFixed(3)]);
+      const peak = T.md.hmx_peak_tops; rows.push(['% of HMX peak', peak ? pct(topsOf(e) / peak) : 'unknown: metadata.hmx_peak_tops is null (measure on device)']);
+    }
     const same = T.all.filter(x => x._label === e._label), tot = same.reduce((s, x) => s + x.dur, 0);
     rows.push(['Occurrences', `${same.length} · total ${fmt(tot)} · mean ${fmt(tot / same.length)}`]);
     pane.innerHTML = `<table>${rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table>` +
@@ -463,25 +572,75 @@ const TABS = [
       <tr><td></td><td>parallel compression</td><td class="n">${m.compression.toFixed(2)}×</td><td class="k">Σ(HMX+HVX+DMA busy) ÷ DSP wall · QNN optrace 4.1×</td></tr>
       <tr><td></td><td>idle inside DSP calls</td><td class="n">${pct(m.entry ? m.idle / m.entry : 0)}</td><td class="k">QNN 0.09 %</td></tr>
       ${(() => { const fb = warnings().fallbacks.filter(e => inRange(e, range)); const t = fb.reduce((s, e) => s + Math.min(e.ts + e.dur, range.t1) - Math.max(e.ts, range.t0), 0); return `<tr><td></td><td>CPU fallbacks</td><td class="n">${fb.length ? fb.length + ' · ' + fmt(t) : '0'}</td><td class="k">${fb.length ? '<span class="pill crit">ran on CPU, not HTP</span>' : 'every HTP op ran on the DSP'}</td></tr>`; })()}</table>`;
+    const x = exportButtons(() => JSON.stringify(metricsJSON(), null, 1), 'metrics.json'); x.firstChild.textContent = 'Copy metrics JSON'; pane.append(x);
   } },
   { id: 'eng', label: 'Engines', render(pane, m) {
-    pane.innerHTML = `<table><tr><th>track</th><th style="width:320px">busy</th><th class="n">%</th></tr>${m.occ.map(o => `<tr><td>${esc(o.th.name)}</td><td><span class="stack" style="max-width:320px;height:10px"><i style="width:${o.busy * 100}%;background:var(--${o.cat})"></i></span></td><td class="n">${pct(o.busy)}</td></tr>`).join('')}</table>`;
+    const pt = poolTail(range); // W5
+    pane.innerHTML = `<table><tr><th>track</th><th style="width:320px">busy</th><th class="n">%</th></tr>${m.occ.map(o => `<tr><td>${esc(o.th.name)}</td><td><span class="stack" style="max-width:320px;height:10px"><i style="width:${o.busy * 100}%;background:var(--${o.cat})"></i></span></td><td class="n">${pct(o.busy)}</td></tr>`).join('')}</table>` +
+      (pt.groups.length ? `<h4 style="margin:14px 0 4px">HVX pool tail (fork-join runs)</h4><table id="pool-table"><tr><th>pool run</th><th class="n">runs</th><th class="n">mean tail</th><th class="n">worst tail</th><th class="n">min units</th><th>units ≥ threads × 4 (${pt.rule})</th><th></th></tr>` +
+        pt.groups.map(g => `<tr class="click" data-pool="${g.worst.e.args.pool}"><td>${esc(g.kind)}</td><td class="n">${g.runs}</td><td class="n">${g.mean_tail.toFixed(2)}×</td><td class="n">${g.worst.tail.toFixed(2)}×</td><td class="n">${g.min_units}</td><td>${g.few_units ? '<span class="pill bad">too few units</span>' : 'ok'}</td><td>${g.worst.tail > 1.3 ? '<span class="pill bad">tail &gt; 1.3×</span>' : ''}</td></tr>`).join('') +
+        `</table><p class="hint">tail = slowest unit ÷ mean unit per pool_run; the join waits for the slowest. Doc 36 T6: keep units ≥ threads × 4 so the tail is absorbed. Click a row to select the worst run.</p>` : '');
+    for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { const run = pt.runs.find(x => String(x.e.args.pool) === tr.dataset.pool); if (run) { select(run.e); setView(run.e.ts - run.e.dur * .2, run.e.ts + run.e.dur * 1.2); } };
   } },
   { id: 'ker', label: 'Kernels', render(pane) {
     const ks = kernels(range);
-    pane.innerHTML = `<table><tr><th>engine</th><th>kernel (op: name)</th><th class="n">calls</th><th class="n">total</th><th class="n">mean</th><th class="n">elems</th><th class="n">cy/elem</th><th></th></tr>` +
-      ks.slice(0, 30).map(k => `<tr class="click" data-k="${esc(k.name)}"><td>${k.engine}</td><td>${esc(k.name)}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td>${k.cpe > 1 ? '<span class="pill crit">pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">outlier</span>' : ''}</td></tr>`).join('') +
-      `</table><p class="hint">cy/elem = Σcycles ÷ Σelems (args.cycles, else dur × ${T.md.dsp_clock_mhz || 1200} MHz). QNN optrace: HMX 0.01–0.06, HVX elementwise 0.07–0.10, softmax 0.24, pathological 1.52.</p>`;
+    pane.innerHTML = `<table id="ker-table"><tr><th>engine</th><th>kernel (op: name)</th><th class="n">calls</th><th class="n">total</th><th class="n">mean</th><th class="n">elems</th><th class="n">cy/elem</th><th class="n">TOPS</th><th></th></tr>` +
+      ks.slice(0, 40).map(k => `<tr class="click" data-k="${esc(k.name)}"><td>${k.engine}</td><td>${esc(k.name)}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td class="n">${k.tops != null ? k.tops.toFixed(3) : ''}</td><td>${k.cpe > 1 ? '<span class="pill crit">pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">outlier</span>' : ''}</td></tr>`).join('') +
+      `</table><p class="hint">cy/elem = Σcycles ÷ Σelems (args.cycles, else dur × ${T.md.dsp_clock_mhz || 1200} MHz). QNN optrace: HMX 0.01–0.06, HVX elementwise 0.07–0.10, softmax 0.24, pathological 1.52. TOPS = Σops ÷ Σdur for HMX rows${T.md.hmx_peak_tops ? ` (peak ${T.md.hmx_peak_tops})` : ' (peak unknown: metadata.hmx_peak_tops is null)'}.</p>`;
     for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { setFilter(tr.dataset.k.split(': ').pop()); };
+    pane.append(exportButtons(() => tableCSV(pane.querySelector('#ker-table')), 'kernels.csv'));
   } },
   { id: 'lay', label: 'Layers', render(pane) {
     const L = layerRows(range), mx = Math.max(1, ...L.map(x => x.e.dur));
-    pane.innerHTML = `<table><tr><th>layer</th><th>phase</th><th style="width:420px">CPU · RPC · HMX · HVX · DMA · idle</th><th class="n">wall</th></tr>` + L.slice(0, 60).map(({ e, m: lm }) =>
-      `<tr class="click" data-t0="${e.ts}" data-t1="${e.ts + e.dur}"><td>${esc(e.name)}</td><td class="k">${esc(e.args && e.args.phase || '')}</td><td>${stackHTML(buckets(lm), lm.wall, `width:${e.dur / mx * 100}%;min-width:30px;height:10px`)}</td><td class="n">${fmt(e.dur)}</td></tr>`).join('') +
+    pane.innerHTML = `<table id="lay-table"><tr><th>layer</th><th>phase</th><th style="width:420px">CPU · RPC · HMX · HVX · DMA · idle</th><th class="n">wall</th><th class="n">CPU</th><th class="n">RPC</th><th class="n">HMX</th><th class="n">HVX</th><th class="n">idle</th></tr>` + L.slice(0, 60).map(({ e, m: lm }) =>
+      `<tr class="click" data-t0="${e.ts}" data-t1="${e.ts + e.dur}"><td>${esc(e.name)}</td><td class="k">${esc(e.args && e.args.phase || '')}</td><td>${stackHTML(buckets(lm), lm.wall, `width:${e.dur / mx * 100}%;min-width:30px;height:10px`)}</td><td class="n">${fmt(e.dur)}</td><td class="n">${fmt(lm.cpu)}</td><td class="n">${fmt(lm.rpc)}</td><td class="n">${fmt(lm.hmxOnly + lm.overlap)}</td><td class="n">${fmt(lm.hvxOnly + lm.overlap)}</td><td class="n">${fmt(lm.idle)}</td></tr>`).join('') +
       '</table><p class="hint">Click a row to zoom the timeline to that layer.</p>';
     for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { setView(+tr.dataset.t0, +tr.dataset.t1); };
+    pane.append(exportButtons(() => tableCSV(pane.querySelector('#lay-table')), 'layers.csv'));
   } },
 ];
+TABS.push(
+  { id: 'xport', label: 'Transport', render(pane) { // W4
+    const t = transportCalls(range);
+    if (t.n < 2) { pane.innerHTML = '<span class="hint">No FastRPC seam pairs (marshal / return) in range.</span>'; return; }
+    const xmax = Math.max(...t.calls.map(c => c.bytes)), xmin = Math.min(...t.calls.map(c => c.bytes)), logx = xmax / Math.max(1, xmin) > 100;
+    const pts = t.calls.map(c => ({ x: c.bytes, y: c.us, cls: c.outlier ? 'out' : '', title: `${c.name}: ${fmtShort(c.bytes)} B, ${fmt(c.us)}${c.outlier ? ', residual ' + fmt(c.resid) : ''}` }));
+    const fit = x => t.fixed_us + t.us_per_mb * x / 1e6;
+    pane.innerHTML = `<p style="margin:0 0 6px"><b>${t.n} calls</b> · fixed <b>${fmt(t.fixed_us)}</b> + <b>${t.us_per_mb.toFixed(1)} µs/MB</b>${t.mb_per_s ? ` (≈ ${(t.mb_per_s).toFixed(0)} MB/s)` : ''} · σ ${fmt(t.sigma)} · ${t.outliers.length} outlier(s) beyond 2σ <span class="hint">· doc 34: 326 µs at M=1, 963 µs at M=1024</span></p>` +
+      svgScatter(pts, { w: 620, h: 240, logx, xlab: 'bytes in + out per call' + (logx ? ' (log)' : ''), xfmt: v => fmtShort(v) + 'B', fit, aria: 'FastRPC transport time against payload bytes with the least-squares fit' }) +
+      (t.outliers.length ? `<table id="xport-table" style="margin-top:8px"><tr><th>call</th><th class="n">bytes</th><th class="n">seam µs</th><th class="n">fit µs</th><th class="n">residual</th></tr>` + t.outliers.slice(0, 20).map((c, i) => `<tr class="click" data-i="${t.calls.indexOf(c)}"><td>${esc(c.name)}</td><td class="n">${c.bytes.toLocaleString()}</td><td class="n">${c.us.toFixed(1)}</td><td class="n">${(c.us - c.resid).toFixed(1)}</td><td class="n">${c.resid > 0 ? '+' : ''}${c.resid.toFixed(1)}</td></tr>`).join('') + '</table>' : '');
+    const pick = i => { const c = t.calls[i]; if (c && c.wait) { select(c.wait); setView(c.wait.ts - c.wait.dur * .3, c.wait.ts + c.wait.dur * 1.3); } };
+    for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => pick(+tr.dataset.i);
+    for (const c of pane.querySelectorAll('circle')) c.onclick = () => pick(+c.dataset.i);
+    if (t.outliers.length) pane.append(exportButtons(() => tableCSV(pane.querySelector('#xport-table')), 'transport_outliers.csv'));
+  } },
+  { id: 'tok', label: 'Tokens', render(pane) { // W8
+    const rows = tokenRows(), s = tokenSummary(rows);
+    if (!rows.length) { pane.innerHTML = '<span class="hint">No phase slices (host.phase) in this trace.</span>'; return; }
+    // charts show the decode tokens only: prefill is one bar two orders taller and is the TTFT number above
+    const dec = rows.filter(x => x.phase === 'decode'), bars = dec.length ? dec : rows;
+    const bw = Math.max(14, Math.min(40, 800 / bars.length)), L = 50, W = L + 8 + bars.length * bw, H = 150, B = 26, mx = Math.max(...bars.map(x => x.wall)) * 1.05;
+    const Y = v => 8 + (H - 8 - B) * (1 - v / mx);
+    let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" style="display:block;max-width:100%;height:auto;font:10px sans-serif" role="img" aria-label="Per-token wall time stacked by CPU, FastRPC transport, DSP busy and other">`;
+    for (const f of [0, .5, 1]) svg += `<line x1="${L}" x2="${W - 8}" y1="${Y(f * mx)}" y2="${Y(f * mx)}" stroke="var(--grid)"/><text x="${L - 4}" y="${Y(f * mx) + 3}" text-anchor="end" fill="var(--ink-2)">${(f * mx / 1000).toFixed(1)}ms</text>`;
+    bars.forEach((x, i) => {
+      const parts = [['cpu', x.cpu], ['rpc', x.transport], ['hvx', x.dsp], ['frame', x.other]]; let acc = 0; const bx = L + i * bw + 2, ri = rows.indexOf(x);
+      for (const [k, v] of parts) { if (v <= 0) continue; svg += `<rect x="${bx}" y="${Y(acc + v)}" width="${Math.max(1, bw - 4)}" height="${Y(acc) - Y(acc + v)}" fill="var(--${k})" data-i="${ri}"><title>${esc(x.name)}: ${k} ${fmt(v)}</title></rect>`; acc += v; }
+      svg += `<text x="${bx + (bw - 4) / 2}" y="${H - 12}" text-anchor="middle" fill="var(--ink-2)">${x.phase === 'prefill' ? 'P' : x.token ?? i}</text>`;
+    });
+    svg += '</svg>';
+    const cm = Math.max(1, ...bars.map(x => x.calls));
+    let svg2 = `<svg viewBox="0 0 ${W} 60" width="${W}" style="display:block;max-width:100%;height:auto;font:10px sans-serif" role="img" aria-label="FastRPC calls per token"><text x="${L - 4}" y="12" text-anchor="end" fill="var(--ink-2)">calls</text>`;
+    bars.forEach((x, i) => { const bx = L + i * bw + 2, h = 40 * x.calls / cm; svg2 += `<rect x="${bx}" y="${50 - h}" width="${Math.max(1, bw - 4)}" height="${h}" fill="var(--rpc)" data-i="${rows.indexOf(x)}"><title>${esc(x.name)}: ${x.calls} calls, ${fmtShort(x.bytes)} B</title></rect>`; });
+    svg2 += '</svg>';
+    pane.innerHTML = `<p style="margin:0 0 6px">TTFT (prefill) <b>${s.ttft_us != null ? fmt(s.ttft_us) : '-'}</b> · median <b>${s.median_token_us != null ? fmt(s.median_token_us) : '-'}</b> per token · <b>${s.calls_per_token != null ? s.calls_per_token.toFixed(0) : '-'}</b> FastRPC calls per token · ${s.tokens} decode tokens <span class="hint">· TTFT excludes tokenization until the app emits a tokenize span</span></p>` +
+      `<div class="legend" style="display:flex;gap:12px;font-size:11px;margin-bottom:4px"><span><span class="sw" style="background:var(--cpu)"></span>CPU</span><span><span class="sw" style="background:var(--rpc)"></span>FastRPC</span><span><span class="sw" style="background:var(--hvx)"></span>DSP busy</span><span><span class="sw" style="background:var(--frame)"></span>other</span></div>` + svg + svg2 +
+      `<table id="tok-table" style="margin-top:8px"><tr><th>phase</th><th class="n">wall</th><th class="n">calls</th><th class="n">bytes</th><th class="n">transport</th><th class="n">DSP busy</th><th class="n">CPU</th></tr>${rows.map((x, i) => `<tr class="click" data-i="${i}"><td>${esc(x.name)}</td><td class="n">${fmt(x.wall)}</td><td class="n">${x.calls}</td><td class="n">${x.bytes.toLocaleString()}</td><td class="n">${fmt(x.transport)}</td><td class="n">${fmt(x.dsp)}</td><td class="n">${fmt(x.cpu)}</td></tr>`).join('')}</table>`;
+    const go = i => { const x = rows[i]; setView(x.e.ts, x.e.ts + x.e.dur); };
+    for (const el of pane.querySelectorAll('rect,tr.click')) el.onclick = () => go(+el.dataset.i);
+    pane.append(exportButtons(() => tableCSV(pane.querySelector('#tok-table')), 'tokens.csv'));
+  } },
+);
 function renderTabs() {
   const tabs = $('#tabs'), st = $('#range-label');
   for (const b of tabs.querySelectorAll('button')) b.remove();
