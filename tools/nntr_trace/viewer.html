@@ -66,6 +66,9 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--chrome); }
 .pill { font-size: 11px; padding: 0 5px; border: 1px solid; border-radius: 2px; }
 .pill.bad { color: var(--serious); } .pill.crit { color: var(--critical); }
 .hint { color: var(--ink-3); font-size: 11px; }
+/* W10: minimap and search counter */
+.mm { display: block; width: 100%; height: 36px; background: var(--chrome); border-bottom: 1px solid var(--line); cursor: pointer; touch-action: none; }
+#search-count { color: var(--ink-3); font-size: 11px; min-width: 52px; font-variant-numeric: tabular-nums; }
 /* W7: warnings banner */
 .warn { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 4px 12px; background: #fff3cd; color: #5c4400; border-bottom: 1px solid #e0c56a; font-size: 12px; }
 .warn b { font-weight: 600; }
@@ -87,11 +90,12 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--chrome); }
     <option value="engine">Color: engine</option>
   </select>
   <select id="range-select" aria-label="Analysis range"></select>
-  <input type="text" id="search" placeholder="Find (name / op / layer)" aria-label="Find">
+  <input type="text" id="search" placeholder="Find (name / op / layer)" aria-label="Find"><span id="search-count"></span>
   <button id="reset" type="button" title="Fit (0)">Fit</button>
   <span class="hint">W/S zoom · A/D pan · drag pan · click select</span>
 </div>
 <div class="warn" id="warn" hidden></div>
+<canvas id="mm" class="mm" height="36" aria-label="Overview: busy density and the current viewport; drag to move, click to center"></canvas>
 <div class="tl" id="tl"><canvas id="cv"></canvas></div>
 <div class="panel" id="panel">
   <div class="tabs" role="tablist" id="tabs"><span class="st" id="range-label"></span></div>
@@ -539,6 +543,7 @@ function draw() {
     ctx.globalAlpha = 1;
   }
   drawGutter(W, H);
+  drawMinimap(); saveHash();
 }
 const matches = (e, q) => !q || e._label.toLowerCase().includes(q) || (e.args && Object.values(e.args).some(v => String(v).toLowerCase().includes(q)));
 
@@ -657,7 +662,7 @@ function renderPane() {
   renderTabs();
   const t = TABS.find(x => x.id === tab) || TABS[0]; tab = t.id;
   for (const b of document.querySelectorAll('#tabs button')) b.setAttribute('aria-selected', b.dataset.tab === tab);
-  t.render(pane, m);
+  t.render(pane, m); saveHash();
 }
 
 // ---------- interaction ----------
@@ -730,26 +735,127 @@ cv.addEventListener('wheel', ev => {
   ev.preventDefault(); const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left; if (mx < LABEL_W) return;
   zoom(Math.exp(ev.deltaY * 0.0015), tOf(mx));
 }, { passive: false });
-cv.addEventListener('dblclick', fit);
+cv.addEventListener('dblclick', ev => { // W10: double-click a thread label collapses that thread to one row; elsewhere, fit
+  const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, row = rowAt(ev.clientY - r.top);
+  if (mx < LABEL_W && row && row.kind === 'th') { collapsed.has(row.key) ? collapsed.delete(row.key) : collapsed.add(row.key); relayout(); }
+  else fit();
+});
 document.addEventListener('keydown', ev => {
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
-  const m = { w: () => zoom(0.7), s: () => zoom(1 / 0.7), a: () => pan(-0.1), d: () => pan(0.1), 0: fit,
+  const m = { w: () => zoom(0.7), s: () => zoom(1 / 0.7), a: () => pan(-0.1), d: () => pan(0.1), 0: fit, f: fitMatch,
     m: () => { if (selected) setRange({ t0: selected.ts, t1: selected.ts + selected.dur, label: selected._label, kind: 'selection' }); },
     Escape: () => { if (range.kind !== 'all') setRange({ t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' }); } };
   if (m[ev.key]) { ev.preventDefault(); m[ev.key](); }
 });
 $('#reset').onclick = fit;
-$('#search').oninput = ev => { filter = ev.target.value.trim(); draw(); };
+$('#search').oninput = ev => { filter = ev.target.value.trim(); matchIdx = -1; updateSearchCount(matchList()); draw(); };
 $('#color-select').onchange = ev => { colorBy = ev.target.value; draw(); renderPane(); };
 $('#range-select').onchange = ev => { const v = ev.target.value; if (v === 'sel') return; setRange(v === 'all' ? { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' } : (e => ({ t0: e.ts, t1: e.ts + e.dur, label: e.name, kind: 'phase', index: +v }))(T.phases[+v])); };
 $('#file').onchange = ev => { const f = ev.target.files[0]; if (!f) return; f.text().then(txt => { load(JSON.parse(txt), f.name); const o = document.createElement('option'); o.value = '__file'; o.textContent = f.name; $('#trace-select').append(o); $('#trace-select').value = '__file'; }); };
-window.addEventListener('resize', () => { if (T) { resize(); draw(); } });
+window.addEventListener('resize', () => { if (T) { mmCols = null; resize(); draw(); } });
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());
 new MutationObserver(() => draw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
+// ---------- W10: minimap, search navigation ----------
+const mm = $('#mm'), mctx = mm.getContext('2d');
+let mmCols = null; // per pixel column: [dsp busy fraction, host busy fraction], cached per width
+function minimapColumns(W) {
+  const cols = new Float32Array(W * 2), span = T.tmax - T.tmin || 1;
+  for (const m of T.models) for (const c of m.counters) {
+    if (c.kind !== 'heat') continue;
+    const k = c.name === 'units busy' ? 0 : 1, pts = c.pts, mx = Math.max(1, c.max);
+    for (let i = 0; i < pts.length; i++) {
+      if (!pts[i][1]) continue;
+      const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : T.tmax;
+      const a = Math.floor((t0 - T.tmin) / span * W), b = Math.min(W, Math.max(a + 1, Math.ceil((t1 - T.tmin) / span * W)));
+      const v = pts[i][1] / mx; for (let x = a; x < b; x++) if (v > cols[x * 2 + k]) cols[x * 2 + k] = v;
+    }
+  }
+  return cols;
+}
+function drawMinimap() {
+  if (!T) return;
+  const W = mm.clientWidth || 800, H = 36, dpr = window.devicePixelRatio || 1;
+  if (mm.width !== Math.round(W * dpr)) { mm.width = Math.round(W * dpr); mm.height = Math.round(H * dpr); mmCols = null; }
+  mctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!mmCols || mmCols.length !== W * 2) mmCols = minimapColumns(W);
+  mctx.fillStyle = css('--chrome'); mctx.fillRect(0, 0, W, H);
+  for (let x = 0; x < W; x++) {
+    const d = mmCols[x * 2], h = mmCols[x * 2 + 1];
+    if (d) { mctx.fillStyle = HEAT[Math.min(5, Math.round(d * 5))]; mctx.fillRect(x, 4, 1, 14 * d); }
+    if (h) { mctx.fillStyle = css('--cpu'); mctx.fillRect(x, 32 - 12 * h, 1, 12 * h); }
+  }
+  const span = T.tmax - T.tmin || 1, x0 = (view.t0 - T.tmin) / span * W, x1 = (view.t1 - T.tmin) / span * W;
+  mctx.fillStyle = css('--ovl'); mctx.fillRect(x0, 0, Math.max(2, x1 - x0), H);
+  mctx.strokeStyle = css('--accent'); mctx.lineWidth = 1; mctx.strokeRect(Math.round(x0) + .5, .5, Math.max(2, Math.round(x1 - x0)), H - 1);
+}
+let mmDrag = null;
+mm.addEventListener('pointerdown', ev => {
+  const r = mm.getBoundingClientRect(), x = ev.clientX - r.left, W = mm.clientWidth, span = T.tmax - T.tmin, t = T.tmin + x / W * span;
+  const inside = t >= view.t0 && t <= view.t1;
+  if (!inside) { const vs = view.t1 - view.t0; setView(t - vs / 2, t + vs / 2); }
+  mmDrag = { x: ev.clientX, t0: view.t0, t1: view.t1 }; mm.setPointerCapture(ev.pointerId);
+});
+mm.addEventListener('pointermove', ev => { if (!mmDrag) return; const d = (ev.clientX - mmDrag.x) / mm.clientWidth * (T.tmax - T.tmin); setView(mmDrag.t0 + d, mmDrag.t1 + d); });
+mm.addEventListener('pointerup', () => { mmDrag = null; });
+mm.addEventListener('wheel', ev => { ev.preventDefault(); const r = mm.getBoundingClientRect(); zoom(Math.exp(ev.deltaY * 0.0015), T.tmin + (ev.clientX - r.left) / mm.clientWidth * (T.tmax - T.tmin)); }, { passive: false });
+
+let matchIdx = -1;
+function matchList() { const q = filter.toLowerCase(); return q ? T.all.filter(e => matches(e, q)).sort((a, b) => a.ts - b.ts || a.pid - b.pid || a.tid - b.tid) : []; }
+function updateSearchCount(list) { $('#search-count').textContent = filter ? `${list.length ? matchIdx + 1 : 0} / ${list.length}` : ''; }
+function gotoMatch(step) {
+  const list = matchList(); if (!list.length) { matchIdx = -1; updateSearchCount(list); return; }
+  matchIdx = ((matchIdx + step) % list.length + list.length) % list.length;
+  const e = list[matchIdx]; selected = e; tab = 'sel';
+  if (e.ts < view.t0 || e.ts + e.dur > view.t1) { const vs = view.t1 - view.t0, c = e.ts + e.dur / 2; view = { t0: c - vs / 2, t1: c + vs / 2 }; }
+  updateSearchCount(list); renderPane(); draw();
+}
+function fitMatch() { const e = selected; if (!e) return; const pad = e.dur * 0.15; setView(e.ts - pad, e.ts + e.dur + pad); }
+$('#search').addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { ev.preventDefault(); gotoMatch(ev.shiftKey ? -1 : 1); }
+  else if (ev.key === 'Escape') { ev.preventDefault(); setFilter(''); matchIdx = -1; updateSearchCount([]); }
+});
+
+// ---------- W11: URL hash state ----------
+let hashTimer = null, applyingHash = false;
+function saveHash() {
+  if (!T || applyingHash) return;
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    const p = new URLSearchParams();
+    if (currentKey) p.set('t', currentKey);
+    p.set('v', `${Math.round(view.t0)},${Math.round(view.t1)}`);
+    if (selected) p.set('s', `${selected.pid}:${selected.tid}:${selected._i}`);
+    if (colorBy !== 'op') p.set('c', colorBy);
+    if (tab !== 'sel') p.set('tab', tab);
+    if (range && range.kind === 'phase') p.set('r', 'phase:' + range.index);
+    else if (range && range.kind === 'selection') p.set('r', `sel:${Math.round(range.t0)}:${Math.round(range.t1)}`);
+    if (filter) p.set('q', filter);
+    try { history.replaceState(null, '', '#' + p.toString()); } catch (e) { /* sandboxed page */ }
+  }, 200);
+}
+function applyHash() {
+  const h = location.hash.slice(1); if (!h) return;
+  const p = new URLSearchParams(h); applyingHash = true;
+  try {
+    const t = p.get('t'); if (t && t !== currentKey && EMB[t]) { $('#trace-select').value = t; load(EMB[t], t, true); }
+    if (p.get('c') && ['op', 'name', 'engine'].includes(p.get('c'))) { colorBy = p.get('c'); $('#color-select').value = colorBy; }
+    const v = p.get('v'); if (v) { const [a, b] = v.split(',').map(Number); if (b > a) view = { t0: a, t1: b }; }
+    const r = p.get('r');
+    if (r && r.startsWith('phase:') && T.phases[+r.slice(6)]) { const e = T.phases[+r.slice(6)]; range = { t0: e.ts, t1: e.ts + e.dur, label: e.name, kind: 'phase', index: +r.slice(6) }; }
+    else if (r && r.startsWith('sel:')) { const [, a, b] = r.split(':').map(Number); if (b > a) range = { t0: a, t1: b, label: 'selection', kind: 'selection' }; }
+    syncRangeSelect();
+    const s = p.get('s'); if (s) { const [pid, tid, i] = s.split(':').map(Number); const th = T.procs.find(x => x.pid === pid)?.threads.get(tid); if (th && th.ev[i]) selected = th.ev[i]; }
+    if (p.get('q')) { filter = p.get('q'); $('#search').value = filter; updateSearchCount(matchList()); }
+    if (p.get('tab')) tab = p.get('tab');
+  } finally { applyingHash = false; }
+  renderPane(); draw();
+}
+let currentKey = null;
+
 // ---------- load ----------
-function load(doc, label) {
-  buildT([parseEvents(doc, label)]); selected = null; filter = ''; $('#search').value = '';
+function load(doc, label, fromHash) {
+  buildT([parseEvents(doc, label)]); selected = null; filter = ''; $('#search').value = ''; currentKey = label; matchIdx = -1; mmCols = null; updateSearchCount([]); collapsed.clear();
   const md = T.md; $('#subtitle').textContent = [md.model, md.device].filter(Boolean).join(' · ') || label;
   $('#range-select').innerHTML = '<option value="all">Range: whole trace</option>' + T.phases.map((e, i) => `<option value="${i}">Range: ${esc(e.name)}</option>`).join('');
   range = { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' };
@@ -759,9 +865,10 @@ const EMB = JSON.parse($('#embedded-traces').textContent || '{}'), sel = $('#tra
 for (const k of Object.keys(EMB)) { const o = document.createElement('option'); o.value = k; o.textContent = k; sel.append(o); }
 sel.onchange = () => { if (EMB[sel.value]) load(EMB[sel.value], sel.value); };
 const first = Object.keys(EMB)[0];
-if (first) load(EMB[first], first); else { sel.hidden = true; $('#pane').innerHTML = '<span class="hint">Load a trace.json to begin.</span>'; }
+if (first) { load(EMB[first], first); applyHash(); } else { sel.hidden = true; $('#pane').innerHTML = '<span class="hint">Load a trace.json to begin.</span>'; }
+window.addEventListener('hashchange', () => { if (T) applyHash(); });
 
 // test / automation surface (VIEWER_PLAN.md W0)
-window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); }, counterAt };
+window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), selected: () => selected, view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); }, counterAt, gotoMatch, fitMatch, setFilter, collapsed, relayout, hash: () => location.hash };
 })();
 </script>
