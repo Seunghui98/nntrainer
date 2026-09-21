@@ -674,7 +674,12 @@ public:
                             unsigned int K) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const uint32_t handle = get_or_register(matAdata, session, K, N);
+    // One handle for a weight the layer kernel's VTCM double buffer holds,
+    // several column slices for a wider one (doc 50 section 3): the kernel
+    // takes them as one call either way, prefetching each slice behind the
+    // previous one's matmul, and copyOut puts the slices' output blocks
+    // back into the caller's [M x N].
+    const FcHandles &fh = get_or_register_fc(matAdata, session, K, N);
 
     // ponytail: NOT invokeLayerU8In. Quantizing the activation on ARM/NEON
     // moved that work off HVX (already vectorized, already writes straight
@@ -687,7 +692,8 @@ public:
     // the HVX-quantizes-into-VTCM path. invokeLayerU8In/htp_act_quant.*
     // stay in the tree, unused, in case a caller that is not this one
     // ever legitimately arrives with pre-quantized bytes already in hand.
-    invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
+    invokeLayer(session, fh.handles.data(), static_cast<int>(fh.handles.size()),
+                matBdata, matCdata, M, N, K, &fh.cols);
   }
 
   // Several Q4_0 weights that share ONE activation -- LFM2-MoE decode's
@@ -727,25 +733,20 @@ public:
       n_total += N[i];
     }
 
-    // mm_u8i4_layer returns one contiguous [M, sum(N)] block (doc order:
-    // "one contiguous M x handle[i].N block per handle in call order"), but
-    // matCdata is one pointer per weight -- stage into scratch, then scatter
-    // each weight's columns into its own output. M is small at this call's
-    // one real shape (decode, M==1), so this scratch and the extra copy are
-    // a handful of KB, not a hidden cost.
+    // mm_u8i4_layer writes one contiguous [M x N_i] block per handle, in
+    // call order (see copyOut), but matCdata is one pointer per weight --
+    // stage into scratch, then hand each weight its block. M is small at
+    // this call's one real shape (decode, M==1), so this scratch and the
+    // extra copy are a handful of KB, not a hidden cost.
     std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
     invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
                 out_cat.data(), M, n_total, K);
 
-    unsigned int col_offset = 0;
+    size_t off = 0;
     for (size_t i = 0; i < n; ++i) {
-      for (unsigned int row = 0; row < M; ++row) {
-        std::memcpy(matCdata[i] + static_cast<size_t>(row) * N[i],
-                    out_cat.data() + static_cast<size_t>(row) * n_total +
-                      col_offset,
-                    N[i] * sizeof(float));
-      }
-      col_offset += N[i];
+      const size_t block = static_cast<size_t>(M) * N[i];
+      std::memcpy(matCdata[i], out_cat.data() + off, block * sizeof(float));
+      off += block;
     }
   }
 
@@ -796,22 +797,18 @@ public:
       n_total += N[i];
     }
 
-    // Same stage-then-scatter shape as gemm_q4_0_batch_fp32 -- see that
+    // Same stage-then-hand-out shape as gemm_q4_0_batch_fp32 -- see that
     // function's comment for why: mm_u8i4_layer returns one contiguous
     // block per handle, matCdata is one pointer per weight.
     std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
     invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
                 out_cat.data(), M, n_total, K);
 
-    unsigned int col_offset = 0;
+    size_t off = 0;
     for (size_t i = 0; i < n; ++i) {
-      for (unsigned int row = 0; row < M; ++row) {
-        std::memcpy(matCdata[i] + static_cast<size_t>(row) * N[i],
-                    out_cat.data() + static_cast<size_t>(row) * n_total +
-                      col_offset,
-                    N[i] * sizeof(float));
-      }
-      col_offset += N[i];
+      const size_t block = static_cast<size_t>(M) * N[i];
+      std::memcpy(matCdata[i], out_cat.data() + off, block * sizeof(float));
+      off += block;
     }
   }
 
@@ -884,7 +881,7 @@ public:
                             unsigned int N) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    get_or_register(data, session, K, N);
+    get_or_register_fc(data, session, K, N);
     return true;
   }
 
@@ -1215,11 +1212,46 @@ private:
    *  test/htp/nntr_hvx_session.h already documents for the one HTP session
    *  a process opens (one VTCM arena, one HMX lock).
    */
+  /** @brief Copies the kernel's output back into the caller's [M x N].
+   *
+   * hexkl_mm_u8i4_layer_run writes one contiguous [M x N_i] block per
+   * handle, in call order (its out_off += M * h->N), not a row-major
+   * [M x sum(N_i)]. One handle is therefore the whole [M x N] and copies
+   * straight through; the slices of one weight (get_or_register_fc) are
+   * interleaved back, row by row, into their column ranges. */
+  static void copyOut(float *dst, const float *out_cat, unsigned int M,
+                      unsigned int N, const std::vector<unsigned int> *blocks) {
+    if (!blocks || blocks->size() < 2) {
+      stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float));
+      return;
+    }
+    size_t off = 0;
+    unsigned int c0 = 0;
+    for (unsigned int n : *blocks) {
+      for (unsigned int r = 0; r < M; ++r) {
+        stagedMemcpy(dst + static_cast<size_t>(r) * N + c0,
+                     out_cat + off + static_cast<size_t>(r) * n,
+                     static_cast<size_t>(n) * sizeof(float));
+      }
+      off += static_cast<size_t>(M) * n;
+      c0 += n;
+    }
+  }
+
+  /** @param blocks N of each handle in call order, when @a handles are the
+   *  slices of one weight and matCdata is its whole [M x N]; NULL when each
+   *  handle's output stays a block of its own (or there is only one). */
   void invokeLayer(remote_handle64 session, const uint32_t *handles,
                    int num_handles, float *matBdata, float *matCdata,
-                   unsigned int M, unsigned int N, unsigned int K) {
+                   unsigned int M, unsigned int N, unsigned int K,
+                   const std::vector<unsigned int> *blocks = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
+    const auto shape = [&]() {
+      return " (M=" + std::to_string(M) + " K=" + std::to_string(K) +
+             " N=" + std::to_string(N) +
+             " handles=" + std::to_string(num_handles) + ")";
+    };
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
@@ -1236,10 +1268,9 @@ private:
                                act_len, out_cat, out_len);
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer failed: err=" +
-                                 std::to_string(err));
+                                 std::to_string(err) + shape());
       }
-      stagedMemcpy(matCdata, out_cat,
-                   static_cast<size_t>(out_len) * sizeof(float));
+      copyOut(matCdata, out_cat, M, N, blocks);
       return;
     }
 
@@ -1257,10 +1288,9 @@ private:
       throw std::runtime_error(std::string(timed
                                              ? "nntr_hvx_mm_u8i4_layer_timed"
                                              : "nntr_hvx_mm_u8i4_layer") +
-                               " failed: err=" + std::to_string(err));
+                               " failed: err=" + std::to_string(err) + shape());
     }
-    stagedMemcpy(matCdata, out_cat,
-                 static_cast<size_t>(out_len) * sizeof(float));
+    copyOut(matCdata, out_cat, M, N, blocks);
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
@@ -1621,6 +1651,12 @@ private:
   uint32_t get_or_register(void *matAdata, remote_handle64 session, uint32_t K,
                            uint32_t N) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
+    return get_or_register_unlocked(matAdata, session, K, N);
+  }
+
+  /** @note Call with handle_mutex_ already held. */
+  uint32_t get_or_register_unlocked(void *matAdata, remote_handle64 session,
+                                    uint32_t K, uint32_t N) {
     auto it = handle_cache_.find(matAdata);
     if (it != handle_cache_.end())
       return it->second;
@@ -1637,6 +1673,77 @@ private:
 
     return register_locked(matAdata, session, K, N, q_w4_i8, w_scale, colsum_w,
                            t_begin, convert_us);
+  }
+
+  /** @brief The handles one FC weight is registered as, in column order. */
+  struct FcHandles {
+    std::vector<uint32_t> handles;
+    std::vector<unsigned int> cols; /**< N of each handle */
+  };
+
+  /** @brief Columns of a K-deep weight per registered handle.
+   *
+   * hexkl_mm_u8i4_layer_run lays VTCM out as the whole activation
+   * (m_pad x K) | the WIDEST handle's WH bytes twice (its double buffer) |
+   * a result tile, and returns AEE_ENOMEMORY when that exceeds the 8 MiB
+   * (doc 50 section 3: conv in_proj, 2048 x 6144 = 6 MiB, wanted 12). A
+   * 2 MiB slice keeps the double buffer at 4 MiB, which leaves the
+   * activation room up to m_pad ~ 1,900 rows at K = 2048.
+   * ponytail: the cap is the activation's ceiling, not the kernel's; a
+   * prompt past it needs the kernel to walk 64-row blocks the way
+   * hexkl_mm_u8i4_moe.c does. */
+  static unsigned int fcSliceCols(unsigned int K) {
+    constexpr unsigned int kSliceBytes = 2u << 20;
+    const unsigned int k_tiles = K / 32u;
+    const unsigned int n_tiles =
+      k_tiles == 0 ? 0 : (kSliceBytes / 512u) / k_tiles;
+    return n_tiles < 1u ? 32u : n_tiles * 32u;
+  }
+
+  /** @brief get_or_register for an FC weight of any width: one handle when
+   *  it fits fcSliceCols, else one per column slice, converted once and
+   *  registered slice by slice under keys inside the weight (its data
+   *  pointer plus the slice's first column -- distinct, and valid as long
+   *  as the weight is). Cached by the weight pointer like every handle. */
+  const FcHandles &get_or_register_fc(void *matAdata, remote_handle64 session,
+                                      uint32_t K, uint32_t N) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = fc_cache_.find(matAdata);
+    if (it != fc_cache_.end())
+      return it->second;
+
+    FcHandles fh;
+    const unsigned int cap = fcSliceCols(K);
+    if (N <= cap) {
+      fh.handles.push_back(get_or_register_unlocked(matAdata, session, K, N));
+      fh.cols.push_back(N);
+    } else {
+      std::vector<int8_t> full(static_cast<size_t>(K) * N);
+      std::vector<float> w_scale(N);
+      std::vector<int32_t> colsum_w(N);
+      const uint64_t t_convert = HtpProfile::nowUs();
+      htp_qs4cx_from_q4_0x4(matAdata, K, N, full.data(), w_scale.data(),
+                            colsum_w.data());
+      uint64_t convert_us = HtpProfile::nowUs() - t_convert;
+      for (uint32_t c0 = 0; c0 < N; c0 += cap) {
+        const uint32_t n = std::min<uint32_t>(cap, N - c0);
+        const uint64_t t_begin = HtpProfile::nowUs();
+        HtpRpcBuffer slice(static_cast<size_t>(K) * n);
+        for (uint32_t k = 0; k < K; ++k) {
+          std::memcpy(slice.data() + static_cast<size_t>(k) * n,
+                      full.data() + static_cast<size_t>(k) * N + c0, n);
+        }
+        std::vector<float> ws(w_scale.begin() + c0, w_scale.begin() + c0 + n);
+        std::vector<int32_t> cs(colsum_w.begin() + c0,
+                                colsum_w.begin() + c0 + n);
+        void *key = static_cast<char *>(matAdata) + c0;
+        fh.handles.push_back(register_locked(key, session, K, n, slice, ws, cs,
+                                             t_begin, convert_us));
+        fh.cols.push_back(n);
+        convert_us = 0; // counted once, on the first slice
+      }
+    }
+    return fc_cache_.emplace(matAdata, std::move(fh)).first->second;
   }
 
   /* Declared here rather than beside arena_chunks_ at the bottom of the
@@ -2118,6 +2225,10 @@ private:
 
   std::mutex handle_mutex_;
   std::unordered_map<const void *, uint32_t> handle_cache_;
+  /** FC weights by data pointer -> their handle(s); see get_or_register_fc.
+   *  Values are never erased or moved, so the references it hands out stay
+   *  valid (std::unordered_map keeps node addresses across rehash). */
+  std::unordered_map<const void *, FcHandles> fc_cache_;
 
   std::vector<ArenaChunk> arena_chunks_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };

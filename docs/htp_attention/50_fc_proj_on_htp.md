@@ -68,6 +68,42 @@ DSP 32비트 주소공간(46 §41): 아레나 3840 MiB 매핑(MoE 3696 사용), 
 in_proj를 아레나 슬랙(144 MiB)에 넣는 코드(§6)를 앞당긴다. `conv_out_proj`(36 MiB)까지는
 어느 쪽으로도 안 들어간다 — 47 F2 판정 그대로.
 
+### 3.1 첫 기기 실행 — VTCM이 먼저 막았다 (2026-09-21)
+
+```
+[!] FATAL ERROR: Failed to repack weights: nntr_hvx_mm_u8i4_layer_timed failed: err=-2147482622
+[HTP-PROFILE]   weights registered : 1   (convert 45.1 ms, register 39.9 ms)
+```
+
+`-2147482622 = 0x80000402 = AEE_ENOMEMORY`, 등록은 됐고(1개, 88.6 ms) **로드 워밍업 콜**에서
+났다 — 첫 prefill이 아니라 로드에서 잡힌 것이 워밍업의 값어치다. 힙이 아니라 **VTCM**이다:
+`hexkl_mm_u8i4_layer_run`(`hexkl_mm_u8i4_dma.c:361`)은 VTCM을
+
+```
+활성화 전체 (m_pad × K) | 가장 넓은 핸들의 WH 바이트 × 2 (더블버퍼) | result 타일 8 KB | config
+```
+
+로 잡는다. in_proj는 64 k타일 × 192 n타일 × 512 B = **6 MiB**, 두 벌이면 12 MiB > 8 MiB.
+등록 검사(`hexkl_weight_u8i4_check`)는 한 벌(6 ≤ 8)만 보므로 통과했다. q/o(2 MiB)와
+k/v(0.5 MiB)는 들어간다 — **막힌 건 in_proj뿐**이다. 문서 34의 FC 측정이 전부 K=1024,
+N≤2048(≤1 MiB)이었던 이유이기도 하다.
+
+**수정(호스트만, skel 무변경)**: `get_or_register_fc`가 `fcSliceCols(K)` = 2 MiB 조각(K=2048에서
+N=2048)보다 넓은 가중치를 열 방향으로 잘라 핸들 여러 개로 등록하고(변환은 한 번, 조각마다
+컬럼 복사·scale·colsum 슬라이스), `gemm_q4_0_accel_fp32`는 그 핸들들을 **한 콜**에 보낸다.
+커널은 핸들 i+1의 가중치를 핸들 i의 행렬곱 뒤에 프리페치하므로(34 §4 C) 조각 수만큼의
+DMA가 거의 숨는다. 활성화는 콜당 한 번만 양자화된다. 출력은 커널이 **핸들별 [M×N_i] 블록**으로
+쓰므로(`out_off += M·N`) `copyOut`이 행마다 제자리에 되돌린다 — 어차피 하던 out 복사와 같은
+바이트다.
+
+같은 사실이 드러낸 것 하나: `gemm_q4_0_batch_fp32`/`gemm_qs4cx_batch_fp32`는 출력을
+row-major(stride = ΣN)로 읽고 있었다. M=1(decode, 유일한 호출 형상)에서는 두 배치가 같아
+지금까지 맞았고, M>1이면 틀렸을 것이다. 블록 단위로 고쳤다 — decode 바이트는 안 바뀐다.
+
+**남는 천장**: 조각 2 MiB × 2 = 4 MiB를 빼면 활성화에 ≈4 MiB → K=2048에서 **m_pad ≈ 1,900행**.
+`max_seq_len 2048`에서 num_to_generate 512를 빼면 prefill 최대 1,536이라 닿지 않지만, 더 긴
+프롬프트는 FC 커널이 MoE 커널처럼 64행 블록을 돌아야 한다 (`fcSliceCols`의 ponytail).
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`
