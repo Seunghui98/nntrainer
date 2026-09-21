@@ -37,6 +37,26 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   ok(near(m.compression, 1.45, 0.05), `pipelined compression ${m.compression.toFixed(3)} ≈ 1.45`);
   ok(m.overlap > 0, 'pipelined has HMX∥HVX overlap');
 
+  // W1: units-busy strip. While an FC HMX chunk runs, as-built has at most HMX+DMA
+  // busy (2); the pipelined projection has HVX dequanting alongside (>= 3).
+  const busyDuringHmx = () => page.evaluate(() => {
+    const T = window.__nntr.model(), c = T.models[0].counters.find(c => c.kind === 'heat' && c.name === 'units busy');
+    let mx = 0;
+    for (const e of T.all) if (e.cat === 'dsp.hmx' && e.args && e.args.op === 'qkv_proj' && e.args.chunk > 0) {
+      for (let k = 0; k < 8; k++) mx = Math.max(mx, window.__nntr.counterAt(c, e.ts + e.dur * (k + .5) / 8));
+    }
+    return { mx, max: c.max };
+  });
+  await use(asBuilt); let b = await busyDuringHmx();
+  ok(b.mx <= 2, `as-built units busy during qkv HMX chunks ${b.mx} <= 2 (strip max ${b.max})`);
+  await use(pipelined); b = await busyDuringHmx();
+  ok(b.mx >= 3, `pipelined units busy during qkv HMX chunks ${b.mx} >= 3`);
+
+  // W13: VTCM counter carries a budget and its hi-water stays under it
+  await use(asBuilt);
+  const vt = await page.evaluate(() => { const T = window.__nntr.model(), c = T.models[0].counters.find(c => c.name === 'VTCM (KB)'); return { budget: (T.md.budgets || {})[c.name], peak: Math.max(...c.pts.map(p => p[1])) }; });
+  ok(vt.budget === 8192 && vt.peak < vt.budget, `VTCM hi-water ${vt.peak} KB under budget ${vt.budget} KB`);
+
   // W0: every tab renders, range select works
   await use(asBuilt);
   for (const id of await page.$$eval('#tabs button', bs => bs.map(b => b.dataset.tab))) {
