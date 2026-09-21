@@ -23,6 +23,7 @@
 #include <util_func.h>
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace causallm {
@@ -357,6 +358,39 @@ void TieWordEmbedding::buildLmheadBlocked(const nntrainer::Tensor &weight,
           hidden_size, bytes);
 }
 
+std::vector<unsigned int> TieWordEmbedding::ppl_targets_;
+double TieWordEmbedding::ppl_nll_ = 0.0;
+unsigned int TieWordEmbedding::ppl_count_ = 0;
+
+void TieWordEmbedding::setPplTargets(const std::vector<unsigned int> &ids) {
+  ppl_targets_ = ids;
+  ppl_nll_ = 0.0;
+  ppl_count_ = 0;
+}
+
+bool TieWordEmbedding::takePpl(double &nll_sum, unsigned int &count) {
+  if (ppl_targets_.empty())
+    return false;
+  nll_sum = ppl_nll_;
+  count = ppl_count_;
+  ppl_targets_.clear();
+  ppl_nll_ = 0.0;
+  ppl_count_ = 0;
+  return true;
+}
+
+/** -log softmax(logits)[target], in double. */
+static double nllOf(const float *logits, unsigned int vocab,
+                    unsigned int target) {
+  float mx = logits[0];
+  for (unsigned int v = 1; v < vocab; ++v)
+    mx = std::max(mx, logits[v]);
+  double sum = 0.0;
+  for (unsigned int v = 0; v < vocab; ++v)
+    sum += std::exp(static_cast<double>(logits[v]) - mx);
+  return std::log(sum) + mx - static_cast<double>(logits[target]);
+}
+
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
@@ -382,13 +416,10 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 
   unsigned int b_size = input_dim.batch();
 
-  for (unsigned int b = 0; b < b_size; ++b) {
-    nntrainer::Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim,
-      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
-    nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
-      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
-
+  // One input row's logits. A lambda so the NNTR_PPL pass below can run
+  // it over every prefill row, not only the last.
+  auto logits_of = [&](nntrainer::Tensor &input_step,
+                       nntrainer::Tensor &hidden_step) {
     ///@note Since tieword embedding shares the weight with embedding,
     /// the weight is transposed. Thus, the dot product should be consider
     /// this.
@@ -475,6 +506,35 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       nntrainer::Tensor &bias =
         context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
       hidden_step.add_i(bias);
+    }
+  };
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    nntrainer::Tensor input_step = input_.getSharedDataTensor(
+      input_step_dim,
+      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
+    nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+    logits_of(input_step, hidden_step);
+  }
+
+  // NNTR_PPL: every other prefill row through the same lambda into a
+  // scratch row, scored against the next prompt token. Row by row, so the
+  // bias and every weight type are handled exactly as the model's own
+  // row is; ~7 ms a row at this vocabulary, a few seconds a prompt.
+  if (is_prefill && !ppl_targets_.empty() && b_size == 1 && to > from + 1) {
+    const unsigned int rows = to - from - 1; /* rows that have a target */
+    const unsigned int vocab = hidden_dim.width();
+    nntrainer::Tensor scratch(hidden_step_dim);
+    for (unsigned int t = 0; t < rows; ++t) {
+      const size_t pos = static_cast<size_t>(from) + t + 1;
+      if (pos >= ppl_targets_.size())
+        break;
+      nntrainer::Tensor row = input_.getSharedDataTensor(
+        input_step_dim, static_cast<size_t>(t) * input_.width(), true);
+      logits_of(row, scratch);
+      ppl_nll_ += nllOf(scratch.getData<float>(), vocab, ppl_targets_[pos]);
+      ++ppl_count_;
     }
   }
 }
