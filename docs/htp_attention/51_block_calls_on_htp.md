@@ -247,3 +247,40 @@ IDL이 바뀌었으니 **세 가지를 다시 빌드**한다: `nntrainer/tensor/
 게이트(§2.5의 4): (1) 텍스트가 3문장 요약으로 정상인가 — 토큰은 바뀐다(양자화 지점 추가). (2) decode 불변.
 (3) `NNTR_HTP_PROFILE=2`의 `M>1 conv` 행: calls 19 (18 + 워밍업), host ≤ 5 ms/콜이 목표, SWIGLU 열이
 conv gate 시간. (4) prefill: 같은 날 A 대비 **−100 안팎**이면 §2.4의 산술대로.
+
+### 2.8 D 실행 — conv 콜 4.9 ms, 기대 4.8; prefill 732~741 (2026-09-22)
+
+config D(`conv_block_engine` + `dense_ffn_engine`), 8스레드, PROFILE=2, 2회:
+
+```
+prefill 741 / 732 ms  (599 / 607 TPS)   decode 20.64 / 20.96 TPS   등록 1496 = MoE 1408 + conv 72 + dense 16
+  M>1 conv    calls=19  rows=8504  blocks=134 (18×7 + 워밍업 8)
+              host 4902 / 4894   dsp 4333 / 4354 (88%)   transport 569 / 541
+              [mm 2120  acc 671  swiglu(=conv gate) 534  stage 240  quant 223  gather 200  requant 137  dequant 79  drain 0.7+77]
+  M>1 dense   host 10246 / 10367   transport 337 / 442
+  M>1 MoE     host 16858 / 17191   dsp 15012 / 14997   transport 1846 / 2194
+  M==1 MoE    host 1507 / 1501   transport 152 / 148          ← 불변
+```
+
+| | 기대 (§2.4) | 측정 |
+|---|---:|---:|
+| 콜 host | 4.8 | **4.9** |
+| HMX 타일 | 64.5K × 18.9 ns = 1.2 | mm 2.12 (114.7K 타일 × 18.5 ns — §2.4가 a·c·b·out 중 둘을 빠뜨렸다; 타일당은 천장) |
+| acc_read | 0.66 | 0.67 |
+| 원소 연산 | 0.5 | 0.53 (gate) + 0.14 (requant) |
+| 전송+스테이징 | 0.9 + 0.9 | 0.55 + 0.24 |
+| prefill | C 888~896 − 115 ≈ 775 | **732~741** |
+
+- **돈다, 산술대로.** 게이트 4개 통과: 3문장 요약 정상(토큰은 또 바뀜), decode 불변, calls 19, host < 5 ms.
+- 같은 날 C(888~896) 대비 **−150**, 오늘 A(921~1013) 대비 −180~−280, 09-16의 848 대비 −110. §2.4의
+  −115보다 큰 것은 C가 in_proj 콜 4.35 × 18 = 78을 이미 내고 있었고 그것까지 conv 콜에 흡수됐기 때문.
+- conv 콜 안에서 HMX가 노는 곳: gate 534 + requant 137 + dequant 꼬리 79 = **750 us/콜 (17%)** — 전부
+  동기 구간. 블록 간 파이프라인(다음 블록의 b 행렬곱·게이트·requant를 이번 블록의 out_proj 아래에; z·mid
+  2벌, VTCM +0.6 MiB)으로 숨길 수 있다 → 18콜 × 0.75 = **−13 ms**.
+- **MoE 콜의 transport가 이상하다**: 같은 커널·같은 크기 버퍼인 dense 콜이 337~442인데 MoE 콜은
+  1846~2194. 22콜 × ≈1.5 = **33 ms**가 설명 없이 나간다. 차이는 콜 길이(15 vs 10 ms)와 DMA량(165 vs
+  21 MB)뿐. 가설: `RPC_POLL_QOS`의 latency=100 us 이후 인터럽트 대기로 떨어지는 경로가 긴 콜에서
+  느리다. 실험: (a) 짧은 프롬프트(~200 토큰, MoE 콜 ≈7 ms)에서 transport가 dense 수준으로 떨어지는지,
+  (b) `htp_backend.cpp`의 latency를 10000으로.
+- 이제 prefill의 구성: HTP 콜 host 합 ≈ 481 (MoE 372 + conv 88 + dense 21) + 스테이징 memcpy ≈18 +
+  **ARM 잔여 ≈ 236** (attention 6층의 q/k/v/o·core, norm, router, lm_head). ARM 잔여가 다음 미지수.
