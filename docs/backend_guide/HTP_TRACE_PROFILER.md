@@ -237,3 +237,120 @@ not exist on `main`) and should land there first.
    unsigned PD? Per-thread is what cycles/packet needs.
 3. Where should the Android app write the file: `getFilesDir()` through the
    C API, or `/data/local/tmp` for `adb pull`? Both are one string.
+
+## 9. Detailed design (API sketches)
+
+The full write-up with diagrams is the design page linked from the PR; the
+interfaces are repeated here so they are reviewable in the tree.
+
+### 9.1 Host: `nntrainer/utils/trace_sink.h`
+
+```cpp
+namespace nntrainer::trace {
+enum class Cat : uint8_t { CPU, WAIT, RPC, LAYER, PHASE, LOAD, QNN, COUNTER };
+
+struct Rec {            // 32 bytes, POD, written in place into the ring
+  uint64_t t0_ns;       // CLOCK_MONOTONIC (QPC on Windows)
+  uint32_t dur_ns;
+  uint16_t name;        // intern id
+  uint8_t  cat;
+  uint8_t  flags;       // bit0 async begin, bit1 async end, bit2 fallback
+  uint32_t a[4];        // layer_id, M/K/N, bytes, task id, ...
+};
+
+class Sink {            // process-wide; rings are owned by threads
+public:
+  static Sink &global();
+  bool enabled() const noexcept;        // the one branch on the hot path
+  uint16_t intern(const char *name);    // registration time only
+  ThreadRing &ring();                   // thread_local, registers on first use
+  void counter(uint16_t name, int64_t v);
+  void flushToken();                    // DSP trace_flush + streamed append
+  void write(const std::string &path);
+};
+
+struct LayerToken { uint16_t layer; uint8_t engine; };
+extern thread_local LayerToken tl_layer;   // pushed in LayerNode::forwarding,
+                                           // copied into parallel_for jobs
+
+class Scope {           // RAII; if !enabled() the ctor returns immediately
+public:
+  Scope(Cat, uint16_t name, uint32_t a0 = 0, uint32_t a1 = 0,
+        uint32_t a2 = 0, uint32_t a3 = 0) noexcept;
+  ~Scope() noexcept;
+};
+}
+#define NNTR_TRACE_SCOPE(cat, str, ...) /* static intern + Scope; ((void)0) without TRACE */
+```
+
+Hook points: `incremental_inference` (PHASE), `LayerNode::forwarding` /
+`incremental_forwarding` (LAYER, pushes `tl_layer`),
+`ThreadManager::parallel_for` and `ParallelBatch::run` (CPU, inherit the
+token), `CacheLoader` load/unload (LOAD, async, id = task id), `SwapDevice`
+read/write, every `HtpComputeOps` override (WAIT, with the fallback flag),
+`QNNGraph::execute` (QNN). A `TraceProfileListener` subscribes to the existing
+`Profiler` so `PROFILE_TIME_*` sites also become spans.
+
+### 9.2 DSP: `htp_backend/hmx/hexkl_trace.h` (replaces `hexkl_probe`)
+
+```c
+enum hexkl_lane  { HL_MAIN = 0, HL_HMX, HL_HVX0 /* +i */, HL_DMA = 10, HL_CTR, HL_N };
+enum hexkl_kind  { HK_ENTRY = 1, HK_LAYER_RUN, HK_POOL_RUN, HK_QUANT, HK_HMX_CHUNK,
+                   HK_ACC_READ, HK_ACC_COPY, HK_DEQUANT, HK_SOFTMAX, HK_GATHER,
+                   HK_DMA_PUSH, HK_DMA_DRAIN, HK_VTCM_HIWATER, HK_FLUSH };
+enum hexkl_level { HT_OFF = 0, HT_STAGE, HT_TILE };
+
+typedef struct {               /* 24 bytes */
+  uint64_t t0;                 /* HAP_perf_get_qtimer_count(), 19.2 MHz */
+  uint32_t dur;
+  uint8_t lane, kind; uint16_t a3;
+  uint32_t a0, a1, a2;         /* chunk/tiles, elems, pcycles delta, ... */
+} hexkl_trace_rec;
+
+typedef struct { hexkl_trace_rec *buf; uint32_t cap, head, dropped; } hexkl_trace_ring;
+extern int hexkl_trace_level;                   /* takes hexkl_probe_on's place */
+extern hexkl_trace_ring hexkl_trace_rings[HL_N]; /* one per lane, static */
+
+#define HEXKL_TRACE_BEGIN(lvl, v) ...           /* qtimer + pcycles when level >= lvl */
+#define HEXKL_TRACE_END(lvl, v, lane, kind, a0, a1, a2, a3) ...
+void hexkl_trace_reset(int level);
+uint32_t hexkl_trace_copy_out(uint8_t *dst, uint32_t cap, uint32_t *dropped);
+```
+
+Each lane has exactly one writer thread: the FastRPC caller writes MAIN, HMX,
+DMA and CTR; pool worker `i` writes `HVX_i` (the `i` it already receives from
+`hvx_worker_pool_func`). No locks. `stage` level records per chunk (16 tiles)
+and per pool unit; `tile` level records at the current probe sites.
+
+### 9.3 IDL additions (`test/htp/nntr_hvx.idl`)
+
+```
+AEEResult trace_control(in uint32 level);
+AEEResult trace_ping(rout uint64 qtimer, rout uint64 pcycles);
+AEEResult trace_flush(rout sequence<uint8> recs, rout sequence<uint32> per_lane_count,
+                      rout uint32 dropped);
+```
+
+Production entry signatures do not change. Host wait spans and DSP entry
+records are paired by index (both sides count entries per session); the
+per-call clock check (`t_send <= map(t_entry)`, `map(t_exit) <= t_recv`)
+flags any pair that does not hold.
+
+### 9.4 Clock mapping
+
+`trace_ping` x8 at open, keep the sample with the smallest RTT:
+`offset_us = q / 19.2 - (t_send + t_recv) / 2`. The qtimer has a constant
+rate so only the offset is needed; every later call re-checks it. If the DSP
+qtimer turns out to be the host's `CNTVCT_EL0` (to verify on the target), the
+host can read that counter directly and the ping becomes a check only.
+
+### 9.5 Overhead budget
+
+| item | cost | against | verdict |
+|---|---|---|---|
+| host Scope, on | 2x clock_gettime + 32 B write, ~60-80 ns | layer forwarding >= 5 µs | < 1 % |
+| host Scope, off | one branch + static id load | - | 0 |
+| DSP `stage` record | 2x qtimer + 2x pcycles, ~0.1 µs | 15.6 µs HMX chunk | ~0.7 % |
+| DSP `tile` record | same, x1,536 per layer | equals today's `hexkl_probe` | debug only |
+| flush | 1 FastRPC (~330 µs) + ~72 KB | ~140 calls per token | ~0.7 % |
+| memory | host 2 MB per thread, DSP ~2.1 MB heap (not VTCM) | - | unallocated when off |
