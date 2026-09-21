@@ -165,9 +165,11 @@ def dsp_fc_call(tr, ts, layer, opname, M, K, N, weight_us, pipelined,
     hmx_start = max(hmx_end, dma_end)
     if not pipelined:
       hmx_start = max(hmx_start, deq_end)
+    # elems for an HMX chunk is its multiply-add count x2 = ops (VIEWER_PLAN W6)
     hmx_end = tr.x(PID_DSP, TID_HMX, "micro-mm x32 + acc_read", "dsp.hmx",
                    hmx_start, hmx_us, layer=layer, op=opname, chunk=c,
                    engine="HMX", elems=16 * 64 * 32 * (K // 32) * 2,
+                   ops=16 * 64 * 32 * K * 2,
                    tiles=16, M=M, K=K, N=N, n_handles=n_handles,
                    **{"class": "matmul"})
     if pipelined:
@@ -320,10 +322,12 @@ def decode_layer(tr, ts, li, kv, fallback):
                   op=op)
     d = tr.x(PID_DSP, TID_DMA, "weight tiles", "dsp.dma", t, 30, layer=layer,
              op=op, bytes=K * N, **{"class": "dma"})
+    # ops counts the useful work (M=1); the accumulator still runs 64 rows,
+    # which is exactly the padding tax the TOPS column should expose.
     t = tr.x(PID_DSP, TID_HMX, "micro-mm (M=2, 62 rows pad)", "dsp.hmx", d,
              FC_M1_KERNEL_US * 0.55, layer=layer, op=op, engine="HMX",
-             elems=K * N * 2, M=1, K=K, N=N, n_handles=n_handles,
-             **{"class": "matmul"})
+             elems=K * N * 2, ops=2 * K * N * n_handles, M=1, K=K, N=N,
+             n_handles=n_handles, **{"class": "matmul"})
     t = tr.x(PID_DSP, TID_HVX[0], "dequant (64-row pad)", "dsp.hvx", t,
              FC_M1_KERNEL_US * 0.3, layer=layer, op=op, engine="HVX",
              elems=64 * N, **{"class": "dequant"})
