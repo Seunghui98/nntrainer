@@ -108,7 +108,9 @@ const BUSY_CATS = [...LANES, 'host.cpu'];
 const PALETTE = ['rgb(138,113,152)','rgb(175,112,133)','rgb(127,135,225)','rgb(93,163,141)','rgb(115,138,126)','rgb(153,119,131)','rgb(93,155,213)','rgb(116,164,166)','rgb(202,134,113)','rgb(144,139,149)','rgb(155,130,150)','rgb(105,160,167)','rgb(106,151,204)','rgb(133,147,153)','rgb(120,131,206)','rgb(88,152,203)','rgb(131,134,195)','rgb(112,158,150)','rgb(90,153,138)','rgb(93,149,194)'];
 const hash = s => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h; };
 const FONT = '11px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
-const ROW = 17, HDR = 22, LABEL_W = 170, PROC_H = 18, CTR_H = 30;
+const ROW = 17, HDR = 22, LABEL_W = 170, PROC_H = 18, CTR_H = 30, HEAT_H = 14;
+// sequential blue ramp for the units-busy strips (light: steps 100..600 of the reference palette)
+const HEAT = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95'];
 
 // ---------- state ----------
 let T = null;                      // {models, rows, height, tmin (0), tmax, all, md, phases, flows}
@@ -168,7 +170,34 @@ function parseEvents(doc, name) {
   for (const p of plist) p.tlist = [...p.threads.values()].sort((a, b) => a.sort - b.sort);
   const all = plist.flatMap(p => p.tlist.flatMap(t => t.ev));
   const phases = all.filter(e => e.cat === 'host.phase').sort((a, b) => a.ts - b.ts);
-  return { name, procs: plist, tmin: 0, tmax: tmax - tmin, flows, counters: [...counters.values()], md: doc.metadata || {}, phases, all };
+  // W1: synthesized "units busy" strips, one per process, from a sweep over the
+  // engine lanes (DSP) or the CPU slices (host).
+  const heat = [];
+  for (const p of plist) {
+    const pev = p.tlist.flatMap(t => t.ev);
+    const lanes = pev.filter(e => LANES.includes(e.cat));
+    if (lanes.length) heat.push({ pid: p.pid, name: 'units busy', kind: 'heat', ...busySeries(lanes) });
+    else { const cpu = pev.filter(e => e.cat === 'host.cpu'); if (cpu.length) heat.push({ pid: p.pid, name: 'threads busy', kind: 'heat', ...busySeries(cpu) }); }
+  }
+  return { name, procs: plist, tmin: 0, tmax: tmax - tmin, flows, counters: [...heat, ...counters.values()], md: doc.metadata || {}, phases, all };
+}
+function busySeries(events) {
+  const edges = [];
+  for (const e of events) { edges.push([e.ts, 1]); edges.push([e.ts + e.dur, -1]); }
+  edges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const pts = []; let n = 0, max = 0;
+  for (let i = 0; i < edges.length; i++) {
+    n += edges[i][1];
+    if (i + 1 < edges.length && edges[i + 1][0] - edges[i][0] < EPS) continue; // same instant
+    if (!pts.length || pts[pts.length - 1][1] !== n) pts.push([edges[i][0], n]);
+    max = Math.max(max, n);
+  }
+  return { pts, max };
+}
+function counterAt(c, t) { // value of a counter at time t (step function), binary search
+  const pts = c.pts; let lo = 0, hi = pts.length - 1, ans = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (pts[mid][0] <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+  return ans < 0 ? 0 : pts[ans][1];
 }
 
 function layoutRows(models) {
@@ -178,11 +207,13 @@ function layoutRows(models) {
       const pkey = mi + ':' + p.pid, pc = collapsed.has(pkey);
       rows.push({ kind: 'proc', p, m, key: pkey, y, h: PROC_H, collapsed: pc }); y += PROC_H;
       if (pc) continue;
+      // heat strips first (read before the lanes), then threads, then the plain counters
+      for (const c of m.counters) if (c.pid === p.pid && c.kind === 'heat') { rows.push({ kind: 'ctr', c, m, y, h: HEAT_H }); c._y = y; y += HEAT_H; }
       for (const th of p.tlist) {
         const tkey = pkey + ':' + th.tid, depth = collapsed.has(tkey) ? 1 : th.depth;
         const h = ROW * depth + 3; rows.push({ kind: 'th', th, m, key: tkey, y, h, depth }); th._y = y; th._h = h; y += h;
       }
-      for (const c of m.counters) if (c.pid === p.pid) { rows.push({ kind: 'ctr', c, m, y, h: CTR_H }); c._y = y; y += CTR_H; }
+      for (const c of m.counters) if (c.pid === p.pid && c.kind !== 'heat') { rows.push({ kind: 'ctr', c, m, y, h: CTR_H }); c._y = y; y += CTR_H; }
     }
   });
   return { rows, height: y + 6 };
@@ -275,18 +306,42 @@ function drawGutter(W, H) {
   ctx.fillStyle = css('--chrome'); ctx.fillRect(0, HDR, LABEL_W - 1, H - HDR);
   for (const row of T.rows) {
     if (row.kind === 'proc') { ctx.fillStyle = css('--proc'); ctx.fillRect(0, row.y, W, row.h); ctx.fillStyle = css('--ink'); ctx.font = 'bold ' + FONT; ctx.fillText((row.collapsed ? '▸ ' : '▾ ') + (T.models.length > 1 ? row.m.name + ' · ' : '') + row.p.name + ' (pid ' + row.p.pid + ')', 6, row.y + row.h / 2); ctx.font = FONT; }
-    else if (row.kind === 'ctr') { ctx.fillStyle = css('--ink-2'); ctx.fillText(fitText(row.c.name, LABEL_W - 20), 14, row.y + row.h / 2); }
+    else if (row.kind === 'ctr') { ctx.fillStyle = css('--ink-2'); ctx.fillText(fitText(row.c.name + (row.c.kind === 'heat' ? ' (max ' + row.c.max + ')' : ''), LABEL_W - 20), 14, row.y + row.h / 2); }
     else { ctx.fillStyle = css('--ink-2'); ctx.fillText(fitText(row.th.name + ' (' + row.th.tid + ')', LABEL_W - 20), 14, row.y + row.h / 2); }
   }
   ctx.strokeStyle = css('--line'); ctx.beginPath(); ctx.moveTo(LABEL_W - .5, HDR); ctx.lineTo(LABEL_W - .5, H); ctx.stroke();
 }
 function drawCounter(row, W) {
-  const pts = row.c.pts, mx = Math.max(1, ...pts.map(p => p[1]));
-  ctx.fillStyle = PALETTE[hash(row.c.name) % PALETTE.length];
+  const c = row.c, pts = c.pts;
+  if (c.kind === 'heat') {
+    // W1: per pixel column, the max lane count over the runs it covers (runs narrower than 1 px are not lost)
+    const col = new Int16Array(W + 1), mx = Math.max(1, c.max);
+    for (let i = 0; i < pts.length; i++) {
+      const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : T.tmax; if (t1 < view.t0 || t0 > view.t1 || !pts[i][1]) continue;
+      const a = Math.max(LABEL_W, Math.floor(xOf(t0))), b = Math.min(W, Math.max(a + 1, Math.ceil(xOf(t1))));
+      for (let x = a; x < b; x++) if (pts[i][1] > col[x]) col[x] = pts[i][1];
+    }
+    for (let x = LABEL_W; x < W;) {
+      let e = x + 1; while (e < W && col[e] === col[x]) e++;
+      if (col[x]) { ctx.fillStyle = HEAT[Math.min(HEAT.length - 1, Math.round((col[x] / mx) * (HEAT.length - 1)))]; ctx.fillRect(x, row.y + 2, e - x, row.h - 4); }
+      x = e;
+    }
+    return;
+  }
+  // W13: plain counter with an optional budget line and the hi-water mark
+  const budget = (T.md.budgets || {})[c.name], peak = pts.reduce((m, p) => p[1] > m[1] ? p : m, [0, 0]);
+  const mx = Math.max(1, peak[1], budget || 0);
+  ctx.fillStyle = PALETTE[hash(c.name) % PALETTE.length];
   for (let i = 0; i < pts.length; i++) {
-    const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : view.t1; if (t1 < view.t0 || t0 > view.t1) continue;
+    const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : T.tmax; if (t1 < view.t0 || t0 > view.t1) continue;
     const x0 = Math.max(LABEL_W, xOf(t0)), x1 = Math.min(W, xOf(t1)), h = (row.h - 6) * pts[i][1] / mx;
     ctx.fillRect(x0, row.y + row.h - 3 - h, Math.max(1, x1 - x0), h);
+  }
+  if (budget) { const yb = Math.round(row.y + row.h - 3 - (row.h - 6) * budget / mx) + .5; ctx.strokeStyle = css('--critical'); ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(LABEL_W, yb); ctx.lineTo(W, yb); ctx.stroke(); ctx.setLineDash([]); }
+  if (peak[1] > 0) {
+    const xp = xOf(peak[0]); if (xp >= LABEL_W && xp <= W) { ctx.fillStyle = css('--ink'); ctx.fillRect(Math.round(xp) - 1, row.y + 2, 3, 3); }
+    ctx.fillStyle = css('--ink-2'); ctx.textAlign = 'right';
+    ctx.fillText('hi ' + peak[1].toLocaleString() + (budget ? ' / ' + budget.toLocaleString() : ''), W - 4, row.y + 8); ctx.textAlign = 'left';
   }
 }
 function draw() {
@@ -429,7 +484,12 @@ cv.addEventListener('pointerdown', ev => { drag = { x: ev.clientX, t0: view.t0, 
 cv.addEventListener('pointermove', ev => {
   const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
   if (drag) { const dx = ev.clientX - drag.x; if (Math.abs(dx) > 2) drag.moved = true; const k = (tl.clientWidth - LABEL_W) / (drag.t1 - drag.t0); view.t0 = drag.t0 - dx / k; view.t1 = drag.t1 - dx / k; draw(); return; }
-  const e = hit(mx, my), tip = $('#tip');
+  const e = hit(mx, my), tip = $('#tip'), row = rowAt(my);
+  if (!e && row && row.kind === 'ctr' && mx >= LABEL_W) {
+    const v = counterAt(row.c, tOf(mx));
+    tip.textContent = row.c.kind === 'heat' ? `${row.c.name}: ${v} / ${row.c.max}  @ ${fmt(tOf(mx))}` : `${row.c.name}: ${v.toLocaleString()}  @ ${fmt(tOf(mx))}`;
+    tip.hidden = false; tip.style.left = Math.min(window.innerWidth - 400, ev.clientX + 12) + 'px'; tip.style.top = (ev.clientY + 14) + 'px'; return;
+  }
   if (!e) { tip.hidden = true; return; }
   tip.textContent = `${e._label}\n${fmt(e.dur)}  @ ${fmt(e.ts)}\n${e._th.name}` + Object.entries(e.args || {}).slice(0, 8).map(([k, v]) => `\n${k}: ${v}`).join('');
   tip.hidden = false; tip.style.left = Math.min(window.innerWidth - 400, ev.clientX + 12) + 'px'; tip.style.top = (ev.clientY + 14) + 'px';
@@ -478,6 +538,6 @@ const first = Object.keys(EMB)[0];
 if (first) load(EMB[first], first); else { sel.hidden = true; $('#pane').innerHTML = '<span class="hint">Load a trace.json to begin.</span>'; }
 
 // test / automation surface (VIEWER_PLAN.md W0)
-window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); } };
+window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); }, counterAt };
 })();
 </script>
