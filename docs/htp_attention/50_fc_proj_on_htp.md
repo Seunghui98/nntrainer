@@ -104,6 +104,35 @@ row-major(stride = ΣN)로 읽고 있었다. M=1(decode, 유일한 호출 형상
 `max_seq_len 2048`에서 num_to_generate 512를 빼면 prefill 최대 1,536이라 닿지 않지만, 더 긴
 프롬프트는 FC 커널이 MoE 커널처럼 64행 블록을 돌아야 한다 (`fcSliceCols`의 ponytail).
 
+### 3.2 두 번째 실행 — 조각은 돌았고, 주소공간이 막았다 (2026-09-21)
+
+```
+[HTP-PROFILE]   K=2048  N=6144  M>1  calls=1  rows=512  host=3.9 ms  dsp=3617 us  transport=315 us
+                [quant 400  dequant 920  acc 552  | rest 1745 (mm; FC 경로는 mm 프로브가 없다)]
+...
+[HTP] arena chunk 13: 256 MiB, mapped total 3584 MiB
+[HTP] arena: 256 MiB refused ... 128 refused ... 64 refused
+[!] FATAL ERROR: ... cannot register a 2048x3584 weight (3 MiB) ... mapped=3584 MiB in 14 chunks
+```
+
+**조각 콜은 됐다.** M=512 워밍업이 host 3.9 ms(dsp 3.6 + transport 0.3)에 돌았다 — §2의 추정
+(계산 2.9 + 포장 3.3)보다 transport가 훨씬 싸다. M=444로 환산하면 콜 ≈3.4 + 스테이징 ≈1.1 →
+**≈4.5 ms**, ARM 9.8~11.8 대비 층당 −5~−7, 18층 **−95~−130 ms** 기대로 올라간다.
+
+**막은 것은 DSP 주소공간이다.** 아레나가 14청크(3584 MiB)에서 멈췄다 — 혼자 돌 때는 15청크
+3840까지 간다(46 §41). 그 사이 달라진 건 FC 가중치가 **그래프 순서로** DSP 힙에 등록된 것뿐이다:
+conv 층(in_proj 6 MiB, 힙)이 MoE 층(아레나 청크)과 번갈아 온다. 46 §41의 모델 — 청크 매핑은
+크기 정렬(256 MiB 경계)이고 힙과 같은 커서를 쓴다 — 대로면, 청크 사이에 힙이 자랄 때마다 힙
+끝에서 다음 256 MiB 경계까지가 버려진다. 등록된 힙 ≈100 MiB로 ≈400 MiB가 사라진 셈이다.
+
+**수정**: `repack_weight`가 FC 등록을 모아 두었다가 **레이어 순회가 끝난 뒤**, 즉 15청크가 전부
+매핑된 뒤에 한다. 그러면 46 §41이 잰 배치(3840 매핑 + 힙 182 MiB) 그대로이고, FC 143 + 스크래치
+12.8 = **156 < 182**. 여유 26 MiB. 힙 성장 단위가 그보다 굵으면 여기서도 `ENOMEMORY`가 날 수
+있다 — 그때는 in_proj를 아레나 슬랙(144 MiB)으로 (§6), 또는 `conv_in_proj_htp_layers`로 층을 줄인다.
+
+같이 고친 것: 조각 등록의 프로파일 시계가 변환 뒤에 시작해 `alloc + other`가 음수로 넘쳤다
+(`18446744073709464.0 ms`). 첫 조각의 시계를 변환 앞에서 시작한다.
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`

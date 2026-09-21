@@ -1721,13 +1721,16 @@ private:
       std::vector<int8_t> full(static_cast<size_t>(K) * N);
       std::vector<float> w_scale(N);
       std::vector<int32_t> colsum_w(N);
-      const uint64_t t_convert = HtpProfile::nowUs();
+      // The first slice's profile entry carries the conversion, so its
+      // clock starts before it; the later slices' start with their copy.
+      uint64_t t_begin = HtpProfile::nowUs();
       htp_qs4cx_from_q4_0x4(matAdata, K, N, full.data(), w_scale.data(),
                             colsum_w.data());
-      uint64_t convert_us = HtpProfile::nowUs() - t_convert;
+      uint64_t convert_us = HtpProfile::nowUs() - t_begin;
       for (uint32_t c0 = 0; c0 < N; c0 += cap) {
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
-        const uint64_t t_begin = HtpProfile::nowUs();
+        if (c0 != 0)
+          t_begin = HtpProfile::nowUs();
         HtpRpcBuffer slice(static_cast<size_t>(K) * n);
         for (uint32_t k = 0; k < K; ++k) {
           std::memcpy(slice.data() + static_cast<size_t>(k) * n,

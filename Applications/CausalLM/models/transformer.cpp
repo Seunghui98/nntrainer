@@ -359,8 +359,25 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+  // [doc 50 section 3.2] FC weights an accelerator will hold are collected
+  // here and registered AFTER the walk, once every MoE arena chunk is
+  // mapped. The DSP's 32-bit address space maps each 256 MiB chunk at a
+  // 256 MiB boundary (doc 46 section 41); a heap allocation between two
+  // chunk mappings -- which is where a registered FC weight lives --
+  // strands the space from the heap's end to the next boundary. Measured:
+  // registered in graph order (conv in_proj between the MoE layers) the
+  // arena stopped at 3584 MiB, 14 chunks, against the 3840 it reaches on
+  // its own.
+  struct PendingFc {
+    nntrainer::ComputeOps *ops;
+    void *data;
+    unsigned int K, N;
+  };
+  std::vector<PendingFc> fc_pending;
+
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+    fn = [&fc_pending](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+                       void *) {
       // The tied lm_head's blocked twin (tie_word_embedding.h) is built
       // here, with every weight loaded, rather than on the first lm_head
       // call inside the first prefill. forEachLayer hands out LayerNodes.
@@ -411,27 +428,9 @@ void Transformer::repack_weight() {
           t.pack();
         }
         if (fc_ops && dtype == ml::train::TensorDim::DataType::Q4_0) {
-          const auto K = static_cast<unsigned int>(t.height());
-          const auto N = static_cast<unsigned int>(t.width());
-          if (fc_ops->register_q4_0_weight(t.getData<char>(), K, N)) {
-            // One warm-up call per session, like the MoE one below: the
-            // first FC call otherwise grows the staging buffers to the
-            // prefill size and touches every page of them inside the
-            // first prefill. The first HTP-routed FC in graph order is a
-            // conv in_proj (the widest N) whenever those are routed, so
-            // one call at M=512 covers every later shape's buffers.
-            static bool fc_warmed = false;
-            if (!fc_warmed && fc_ops->supports_gemm_q4_0_accel_fp32()) {
-              fc_warmed = true;
-              const unsigned int M = 512;
-              std::vector<float> act(static_cast<size_t>(M) * K, 0.0f);
-              std::vector<float> out(static_cast<size_t>(M) * N, 0.0f);
-              fc_ops->gemm_q4_0_accel_fp32(t.getData<char>(), act.data(),
-                                           out.data(), M, N, K);
-              ml_logd("FC HTP kernel warmed up at load (M=%u, K=%u, N=%u)", M,
-                      K, N);
-            }
-          }
+          fc_pending.push_back({fc_ops, t.getData<char>(),
+                                static_cast<unsigned int>(t.height()),
+                                static_cast<unsigned int>(t.width())});
         }
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
                     dtype == ml::train::TensorDim::DataType::QS4CX_WH)) {
@@ -496,6 +495,27 @@ void Transformer::repack_weight() {
     };
   try {
     model->forEachLayer(fn, nullptr);
+    // The deferred FC registrations (see fc_pending above). A CPU-engine
+    // layer's ops answer false and cost nothing. One warm-up call per
+    // session after the first accelerated one, like the MoE one: the first
+    // FC call otherwise grows the staging buffers to the prefill size and
+    // touches every page of them inside the first prefill. In graph order
+    // that first weight is a conv in_proj (the widest N) whenever those are
+    // routed, so one call at M=512 covers every later shape's buffers.
+    bool fc_warmed = false;
+    for (const auto &p : fc_pending) {
+      if (!p.ops->register_q4_0_weight(p.data, p.K, p.N))
+        continue;
+      if (fc_warmed || !p.ops->supports_gemm_q4_0_accel_fp32())
+        continue;
+      fc_warmed = true;
+      const unsigned int M = 512;
+      std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
+      std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
+      p.ops->gemm_q4_0_accel_fp32(p.data, act.data(), out.data(), M, p.N, p.K);
+      ml_logd("FC HTP kernel warmed up at load (M=%u, K=%u, N=%u)", M, p.K,
+              p.N);
+    }
     ml_logd("QS4CX weights repacked successfully");
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to repack weights: " +
