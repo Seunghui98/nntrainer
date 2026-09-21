@@ -269,6 +269,36 @@ prefill 콜 82개 × 0.3~0.7 ms → **−40~−60 ms** (835 기준으로 in_proj
 ION 합계 ≈40 MB(이전 25). 이 세금은 in_proj 이전에도 있었다 — 3.6 MB 쌍의 553 us 중 ≈260이
 그것이니, MoE만 돌 때도 decode 콜당 ≈0.25 ms(22층 5 ms/token)는 돌아온다.
 
+### 3.7 크기 클래스 적용 — decode 복구, prefill은 FC가 손해라는 것이 남았다 (2026-09-21)
+
+전부 켠 채(등록 1528) 같은 명령:
+
+```
+prefill 943 ms 470.8 TPS   decode 20.48 TPS (직전 11.66)
+  M==1 MoE decode  host 1513 us  dsp 1353  transport  161   (직전 2985 / 1359 / 1626; 09-16: 1910 / 553)
+  N=512  (wk/wv)   host 1029     transport  456   (직전 2115 / 1470)
+  N=2048 M>1       host 8364     transport 1101   (직전 9302 / 2011)   ← MoE 23 + FC 30 합산
+  N=6144 (in_proj) host 4299     transport 1092   (직전 4762 / 1496)
+  N=7168 / K=7168  host 4164 / 3944                (직전 4250 / 4066)
+```
+
+**§3.6의 진단이 맞았다.** 형상이 불변인 MoE decode 콜의 transport가 1626 → **161 us**, 09-16의
+553보다도 낮다(3.6 MB 쌍 → 64 KiB 쌍). decode 11.7 → 20.5 TPS. prefill 콜 82개 전부 transport가
+0.4~1 ms씩 내려 prefill 996 → 943.
+
+**남은 것 둘:**
+
+1. **prefill 943은 여전히 in_proj만 켠 835보다 느리다.** HTP에 올린 FC의 host 합 ≈204 ms + 스테이징
+   ≈45 = **≈250 ms**인데, 그 FC들이 ARM에서 걸리던 시간은 §3.4 방식으로 역산하면 ≈115~210. 즉
+   **k/v·q/o·out_proj는 손해, dense는 본전~소폭 이득**. FC를 HTP로 보내는 건 여기서 닫는다 —
+   남기는 건 §3.6의 스테이징 수정(MoE만 돌려도 decode 콜 0.39 ms, prefill 콜 1.3 ms를 돌려준다)과
+   실측 표다.
+2. **ARM 쪽이 09-16보다 느리다.** decode 48.8 ms/token = MoE 33.3 + ARM 15.5인데 09-16은 48.1 = 42.0 +
+   ≈6. prefill도 HTP 콜 합을 빼면 ARM 잔여 ≈324 (in_proj만 켰을 때 366, 거기서 FC ≈115~210이 빠졌어야
+   한다). 발열이거나, `engine=htp`인 FC 레이어의 **decode CPU 경로**가 cpu 엔진의 것과 다른 것이다
+   (같은 `CpuComputeOps::gemm_q4_0_fp32`로 읽히지만 실측이 없다). **스위치 전부 끈 A 실행**이 가른다:
+   decode가 ≈25 TPS(1/(33.3+6))로 나오면 FC 스위치가 ARM decode를 늦춘 것이고, 20.5면 발열/환경이다.
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`
