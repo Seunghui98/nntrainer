@@ -1,0 +1,471 @@
+<title>nntr trace</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f4f4f1; --panel: #fcfcfb; --line: #dcdcd6; --line-soft: #ebebe6;
+  --ink: #17181a; --ink-2: #55564f; --ink-3: #8a8a82;
+  --accent: #1f5f8b; --accent-ink: #ffffff;
+  --cpu: #2a78d6; --hmx: #eb6834; --hvx: #1baf7a; --rpc: #eda100; --dma: #4a3aa7;
+  --sync: #b9b9b1; --frame: #c9c9c2; --load: #8a8a82;
+  --good: #0ca30c; --serious: #ec835a; --critical: #d03b3b;
+  --sel: #17181a; --grid: #e6e6e0; --tip-bg: #17181a; --tip-ink: #f4f4f1;
+  --ovl: rgba(31,95,139,.16);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141517; --panel: #1c1d20; --line: #33343a; --line-soft: #26272b;
+    --ink: #ececea; --ink-2: #b4b4ad; --ink-3: #7c7c75;
+    --accent: #6cb0e0; --accent-ink: #0f1a22;
+    --cpu: #3987e5; --hmx: #d95926; --hvx: #199e70; --rpc: #c98500; --dma: #9085e9;
+    --sync: #4c4d54; --frame: #5a5b62; --load: #7c7c75;
+    --sel: #ffffff; --grid: #26272b; --tip-bg: #ececea; --tip-ink: #141517;
+    --ovl: rgba(108,176,224,.2);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141517; --panel: #1c1d20; --line: #33343a; --line-soft: #26272b;
+  --ink: #ececea; --ink-2: #b4b4ad; --ink-3: #7c7c75;
+  --accent: #6cb0e0; --accent-ink: #0f1a22;
+  --cpu: #3987e5; --hmx: #d95926; --hvx: #199e70; --rpc: #c98500; --dma: #9085e9;
+  --sync: #4c4d54; --frame: #5a5b62; --load: #7c7c75;
+  --sel: #ffffff; --grid: #26272b; --tip-bg: #ececea; --tip-ink: #141517;
+  --ovl: rgba(108,176,224,.2);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.45 "IBM Plex Sans", system-ui, sans-serif; margin: 0; }
+.wrap { padding-block: 14px 40px; padding-inline: 16px; max-width: 1500px; margin: 0 auto; }
+h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-2); margin: 0 0 10px; }
+.mono, .num, td.n, .tag, .kv dd { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-bottom: 12px; }
+.top .sub { color: var(--ink-2); font-size: 13px; }
+.ctrls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
+select, input[type=text], button, label.file {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 9px; height: 30px;
+}
+button:hover, label.file:hover { border-color: var(--ink-3); cursor: pointer; }
+button:focus-visible, select:focus-visible, input:focus-visible, label.file:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+label.file { display: inline-flex; align-items: center; }
+label.file input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--ink-2); margin: 0 0 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.tl { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.tl canvas { display: block; width: 100%; touch-action: none; }
+#tip { position: fixed; pointer-events: none; background: var(--tip-bg); color: var(--tip-ink); font-size: 12px; padding: 7px 9px; border-radius: 6px; max-width: 360px; z-index: 5; box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+#tip b { font-weight: 600; }
+#tip .kv { margin: 4px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+#tip .kv dt { opacity: .7; } #tip .kv dd { margin: 0; }
+.hint { font-size: 12px; color: var(--ink-3); margin: 6px 0 0; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-top: 18px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.card.wide { grid-column: 1 / -1; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+.tile { padding: 10px 12px; border-left: 3px solid var(--line); }
+.tile .v { font-size: 22px; font-weight: 600; font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.tile .l { font-size: 12px; color: var(--ink-2); margin-top: 3px; }
+.bars { display: grid; grid-template-columns: max-content 1fr max-content; gap: 6px 10px; align-items: center; font-size: 12px; }
+.bars .bar { height: 12px; background: var(--line-soft); border-radius: 3px; position: relative; overflow: hidden; }
+.bars .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+.stack { display: flex; height: 18px; border-radius: 4px; overflow: hidden; gap: 2px; background: var(--line-soft); }
+.stack i { display: block; height: 100%; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+th { color: var(--ink-2); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; }
+td.n, th.n { text-align: right; }
+.tbl { overflow-x: auto; }
+.tag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; color: var(--accent-ink); }
+.pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); color: var(--ink-2); }
+.pill.bad { border-color: var(--serious); color: var(--serious); }
+.pill.crit { border-color: var(--critical); color: var(--critical); }
+tr.click { cursor: pointer; } tr.click:hover td { background: var(--line-soft); }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 12.5px; margin: 0; }
+.kv dt { color: var(--ink-2); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+.note { font-size: 12.5px; color: var(--ink-2); margin: 8px 0 0; max-width: 70ch; }
+.layers { display: grid; grid-template-columns: max-content 1fr max-content; gap: 5px 10px; align-items: center; font-size: 12px; }
+@media (max-width: 640px) { .ctrls { margin-left: 0; } .tile .v { font-size: 18px; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>nntr trace</h1>
+      <div class="sub" id="subtitle">host CPU + Hexagon HTP timeline, one file per run</div>
+    </div>
+    <div class="ctrls">
+      <select id="trace-select" aria-label="Trace"></select>
+      <label class="file">Open trace.json<input type="file" id="file" accept=".json,application/json"></label>
+      <select id="range-select" aria-label="Metric range"></select>
+      <input type="text" id="search" placeholder="filter: name / layer / op" aria-label="Filter events">
+      <button id="reset" type="button">Fit</button>
+    </div>
+  </div>
+
+  <div class="legend" id="legend"></div>
+  <div class="tl"><canvas id="cv"></canvas></div>
+  <p class="hint">Wheel: zoom at cursor · drag: pan · click: select · double-click: fit. Arrows are FastRPC flows from the host seam to the DSP entry. The same file opens in ui.perfetto.dev.</p>
+
+  <div class="grid2">
+    <div class="card wide">
+      <h2>Where the wall time goes <span id="range-label" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+      <div class="tiles" id="tiles"></div>
+      <div style="margin-top:12px" id="wall-stack"></div>
+    </div>
+    <div class="card">
+      <h2>Engine occupancy</h2>
+      <div class="bars" id="occ"></div>
+      <p class="note">Busy = union of that track's spans inside the range. Parallel compression = Σ(HMX + HVX + DMA busy) ÷ DSP wall; QNN's optrace reports 4.1× on the same block, one lane at a time gives 1.0×.</p>
+    </div>
+    <div class="card">
+      <h2>Selection</h2>
+      <dl class="kv" id="sel"><dt>—</dt><dd>click a span</dd></dl>
+    </div>
+    <div class="card wide">
+      <h2>Kernels by engine time (cycles / element)</h2>
+      <div class="tbl"><table id="ktable"></table></div>
+      <p class="note">cy/elem = Σ dur × DSP clock ÷ Σ elems, the metric the QNN optrace uses to find 20× outliers (its healthy HVX elementwise is 0.07–0.10, softmax 0.24, HMX 0.01–0.06). Rows over 0.5 are flagged. In the real tracer cycles come from the PMU, not the qtimer × clock estimate used here.</p>
+    </div>
+    <div class="card wide">
+      <h2>Per layer</h2>
+      <div class="layers" id="layers"></div>
+    </div>
+  </div>
+</div>
+<div id="tip" hidden></div>
+
+<script id="embedded-traces" type="application/json">{}</script>
+<script>
+(() => {
+'use strict';
+const $ = s => document.querySelector(s);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const CAT = {
+  'host.cpu': ['cpu', 'CPU'], 'host.rpc': ['rpc', 'FastRPC seam'], 'host.wait': ['wait', 'blocked on HTP'], 'host.layer': ['frame', 'layer frame'],
+  'host.phase': ['frame', 'phase'], 'host.load': ['load', 'weight load'],
+  'dsp.hmx': ['hmx', 'HMX'], 'dsp.hvx': ['hvx', 'HVX'], 'dsp.dma': ['dma', 'DMA'],
+  'dsp.sync': ['sync', 'sync / drain'], 'dsp.call': ['frame', 'DSP call frame'], 'dsp.entry': ['frame', 'DSP entry'],
+};
+const LEGEND = [['cpu', 'CPU (host)'], ['rpc', 'FastRPC transport'], ['hmx', 'HMX matrix'], ['hvx', 'HVX vector'], ['dma', 'DMA'], ['sync', 'sync / pool join'], ['wait', 'main blocked on HTP'], ['frame', 'frames (layer, call)']];
+$('#legend').innerHTML = LEGEND.map(([k, l]) => `<span><i style="${k === 'wait' ? 'border:1.5px solid var(--rpc);background:transparent' : 'background:var(--' + k + ')'}"></i>${l}</span>`).join('');
+
+// ---------- state ----------
+let T = null;            // parsed trace model
+let view = { t0: 0, t1: 1 };
+let hover = null, selected = null, filter = '';
+let range = null;        // metrics range {t0,t1,label}
+const cv = $('#cv'), ctx = cv.getContext('2d');
+const ROW = 20, HDR = 26, LABEL_W = 150, PROC_H = 22, CTR_H = 34;
+
+// ---------- parse ----------
+function parse(doc) {
+  const ev = doc.traceEvents || doc;
+  const procs = new Map(); // pid -> {name, sort, threads: Map}
+  const P = pid => procs.get(pid) || (procs.set(pid, { pid, name: 'pid ' + pid, sort: pid, threads: new Map() }), procs.get(pid));
+  const TH = (pid, tid) => { const p = P(pid); return p.threads.get(tid) || (p.threads.set(tid, { pid, tid, name: 'tid ' + tid, sort: tid, ev: [], depth: 1 }), p.threads.get(tid)); };
+  const flows = new Map(), counters = new Map();
+  let tmin = Infinity, tmax = -Infinity;
+  for (const e of ev) {
+    if (e.ph === 'M') {
+      if (e.name === 'process_name') P(e.pid).name = e.args.name;
+      else if (e.name === 'process_sort_index') P(e.pid).sort = e.args.sort_index;
+      else if (e.name === 'thread_name') TH(e.pid, e.tid).name = e.args.name;
+      else if (e.name === 'thread_sort_index') TH(e.pid, e.tid).sort = e.args.sort_index;
+    } else if (e.ph === 'X') {
+      TH(e.pid, e.tid).ev.push(e);
+      tmin = Math.min(tmin, e.ts); tmax = Math.max(tmax, e.ts + e.dur);
+    } else if (e.ph === 'B' || e.ph === 'E') {
+      // fold B/E pairs into X
+      const th = TH(e.pid, e.tid); th._st = th._st || [];
+      if (e.ph === 'B') th._st.push(e); else { const b = th._st.pop(); if (b) th.ev.push({ ...b, ph: 'X', dur: e.ts - b.ts }); }
+    } else if (e.ph === 's' || e.ph === 'f') {
+      const f = flows.get(e.id) || (flows.set(e.id, {}), flows.get(e.id));
+      f[e.ph] = e;
+    } else if (e.ph === 'C') {
+      const key = e.pid + ':' + e.name;
+      const c = counters.get(key) || (counters.set(key, { pid: e.pid, name: e.name, pts: [] }), counters.get(key));
+      const v = Object.values(e.args)[0]; c.pts.push([e.ts, +v]);
+    }
+  }
+  // depth assignment per thread (nested X spans)
+  for (const p of procs.values()) for (const th of p.threads.values()) {
+    th.ev.sort((a, b) => a.ts - b.ts || b.dur - a.dur);
+    const st = []; let maxd = 0;
+    for (const e of th.ev) {
+      while (st.length && st[st.length - 1].ts + st[st.length - 1].dur <= e.ts + 1e-6) st.pop();
+      e._d = st.length; maxd = Math.max(maxd, e._d); st.push(e);
+      e._cat = CAT[e.cat] ? CAT[e.cat][0] : 'sync';
+      e._th = th;
+    }
+    th.depth = maxd + 1;
+  }
+  for (const c of counters.values()) c.pts.sort((a, b) => a[0] - b[0]);
+  const plist = [...procs.values()].sort((a, b) => a.sort - b.sort);
+  for (const p of plist) p.tlist = [...p.threads.values()].sort((a, b) => a.sort - b.sort);
+  // rows layout
+  const rows = []; let y = HDR;
+  for (const p of plist) {
+    rows.push({ kind: 'proc', p, y, h: PROC_H }); y += PROC_H;
+    for (const th of p.tlist) { const h = ROW * th.depth + 4; rows.push({ kind: 'th', th, y, h }); th._y = y; th._h = h; y += h; }
+    for (const c of counters.values()) if (c.pid === p.pid) { rows.push({ kind: 'ctr', c, y, h: CTR_H }); c._y = y; y += CTR_H; }
+  }
+  const md = doc.metadata || {};
+  // phases for the range selector
+  const phases = [];
+  for (const p of plist) for (const th of p.tlist) for (const e of th.ev) if (e.cat === 'host.phase') phases.push(e);
+  phases.sort((a, b) => a.ts - b.ts);
+  return { procs: plist, rows, height: y + 8, tmin, tmax, flows: [...flows.values()].filter(f => f.s && f.f), counters: [...counters.values()], md, phases, all: plist.flatMap(p => p.tlist.flatMap(t => t.ev)) };
+}
+
+// ---------- interval math ----------
+function union(iv) { // iv: [[a,b],...] -> merged sorted
+  iv = iv.filter(x => x[1] > x[0]).sort((a, b) => a[0] - b[0]); const out = [];
+  for (const x of iv) { const l = out[out.length - 1]; if (l && x[0] <= l[1]) l[1] = Math.max(l[1], x[1]); else out.push([x[0], x[1]]); }
+  return out;
+}
+const len = iv => iv.reduce((s, x) => s + x[1] - x[0], 0);
+function inter(a, b) { const o = []; let i = 0, j = 0; while (i < a.length && j < b.length) { const lo = Math.max(a[i][0], b[j][0]), hi = Math.min(a[i][1], b[j][1]); if (hi > lo) o.push([lo, hi]); if (a[i][1] < b[j][1]) i++; else j++; } return o; }
+function minus(a, b) { const o = []; for (const [x0, x1] of a) { let c = x0; for (const [y0, y1] of b) { if (y1 <= c) continue; if (y0 >= x1) break; if (y0 > c) o.push([c, y0]); c = Math.max(c, y1); } if (c < x1) o.push([c, x1]); } return o; }
+const clip = (e, r) => [Math.max(e.ts, r.t0), Math.min(e.ts + e.dur, r.t1)];
+function spans(pred, r) { return union(T.all.filter(e => pred(e) && e.ts < r.t1 && e.ts + e.dur > r.t0).map(e => clip(e, r))); }
+
+// ---------- metrics ----------
+const fmt = us => us >= 1000 ? (us / 1000).toFixed(us >= 10000 ? 1 : 2) + ' ms' : us.toFixed(us < 10 ? 2 : 1) + ' µs';
+const pct = x => (x * 100).toFixed(1) + '%';
+function metrics(r) {
+  const wall = r.t1 - r.t0;
+  const hmx = spans(e => e.cat === 'dsp.hmx', r), hvx = spans(e => e.cat === 'dsp.hvx', r), dma = spans(e => e.cat === 'dsp.dma', r);
+  const dspEntry = spans(e => e.cat === 'dsp.entry', r);
+  const dspAny = union([...hmx, ...hvx, ...dma]);
+  const rpc = spans(e => e.cat === 'host.rpc', r); // seam only (marshal/return)
+  const cpu = spans(e => e.cat === 'host.cpu', r);
+  const load = spans(e => e.cat === 'host.load', r);
+  const overlap = inter(hmx, hvx);
+  const hmxOnly = minus(hmx, hvx), hvxOnly = minus(hvx, hmx);
+  const dmaOnly = minus(dma, union([...hmx, ...hvx]));
+  const dspIdle = minus(dspEntry, dspAny);
+  const busyUnits = len(hmx) + len(hvx) + len(dma);
+  const accounted = union([...cpu, ...rpc, ...dspAny, ...dspIdle, ...load]);
+  const other = wall - len(accounted);
+  // per-track occupancy
+  const occ = [];
+  for (const p of T.procs) for (const th of p.tlist) {
+    if (p.pid === T.procs[0].pid && !/main|worker/.test(th.name)) continue;
+    const s = spans(e => e._th === th && ['dsp.hmx', 'dsp.hvx', 'dsp.dma', 'host.cpu'].includes(e.cat), r);
+    if (['dsp.hmx', 'dsp.hvx', 'dsp.dma', 'host.cpu'].some(c => th.ev.some(e => e.cat === c))) occ.push({ th, busy: len(s) / wall, cat: th.ev.find(e => ['dsp.hmx', 'dsp.hvx', 'dsp.dma', 'host.cpu'].includes(e.cat))._cat });
+  }
+  return { wall, cpu: len(cpu), rpc: len(rpc), hmxOnly: len(hmxOnly), hvxOnly: len(hvxOnly), overlap: len(overlap), dmaOnly: len(dmaOnly), dspIdle: len(dspIdle), load: len(load), other: Math.max(0, other),
+    compression: len(dspAny) ? busyUnits / len(dspAny) : 0, dspWall: len(dspAny), hmxBusy: len(hmx), hvxBusy: len(hvx), occ, entry: len(dspEntry) };
+}
+function kernels(r) {
+  const m = new Map();
+  for (const e of T.all) {
+    if (!e.args || !e.args.engine || !e.args.elems || e.ts >= r.t1 || e.ts + e.dur <= r.t0) continue;
+    if (!['dsp.hmx', 'dsp.hvx'].includes(e.cat)) continue;
+    const k = e.args.engine + '|' + e.name;
+    const row = m.get(k) || (m.set(k, { engine: e.args.engine, name: e.name, n: 0, us: 0, elems: 0 }), m.get(k));
+    row.n++; row.us += e.dur; row.elems += e.args.elems;
+  }
+  const mhz = T.md.dsp_clock_mhz || 1200;
+  return [...m.values()].map(k => ({ ...k, cpe: k.us * mhz / k.elems })).sort((a, b) => b.us - a.us);
+}
+
+// ---------- render: summary ----------
+function renderSummary() {
+  const r = range, m = metrics(r);
+  $('#range-label').textContent = `— ${r.label}, ${fmt(m.wall)}`;
+  const tiles = [
+    ['wall', fmt(m.wall), 'range wall time', 'frame'],
+    ['DSP', pct(m.dspWall / m.wall), 'DSP busy (any unit)', 'hvx'],
+    ['CPU', pct(m.cpu / m.wall), 'host compute', 'cpu'],
+    ['transport', pct(m.rpc / m.wall), 'FastRPC seam', 'rpc'],
+    ['compression', m.compression.toFixed(2) + '×', 'parallel compression', 'hmx'],
+    ['idle', pct(m.entry ? m.dspIdle / m.entry : 0), 'idle inside DSP calls', 'sync'],
+  ];
+  $('#tiles').innerHTML = tiles.map(([k, v, l, c]) => `<div class="tile" style="border-color:var(--${c})"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+  const parts = [['cpu', 'CPU', m.cpu], ['rpc', 'FastRPC', m.rpc], ['hmx', 'HMX only', m.hmxOnly], ['hvx', 'HVX only', m.hvxOnly], ['dma', 'DMA only', m.dmaOnly], ['sync', 'DSP idle', m.dspIdle], ['load', 'load', m.load], ['frame', 'other', m.other]];
+  if (m.overlap) parts.splice(4, 0, ['ovl', 'HMX∥HVX', m.overlap]);
+  $('#wall-stack').innerHTML = `<div class="stack">${parts.filter(p => p[2] > 0).map(p => `<i title="${p[1]} ${fmt(p[2])}" style="width:${p[2] / m.wall * 100}%;background:${p[0] === 'ovl' ? 'repeating-linear-gradient(135deg,var(--hmx) 0 4px,var(--hvx) 4px 8px)' : 'var(--' + p[0] + ')'}"></i>`).join('')}</div>
+    <div class="legend" style="margin-top:8px">${parts.filter(p => p[2] > 0).map(p => `<span><i style="background:${p[0] === 'ovl' ? 'repeating-linear-gradient(135deg,var(--hmx) 0 3px,var(--hvx) 3px 6px)' : 'var(--' + p[0] + ')'}"></i>${p[1]} <span class="num">${pct(p[2] / m.wall)}</span></span>`).join('')}</div>`;
+  $('#occ').innerHTML = m.occ.map(o => `<span>${o.th.name}</span><div class="bar"><i style="width:${o.busy * 100}%;background:var(--${o.cat})"></i></div><span class="num">${pct(o.busy)}</span>`).join('');
+  const ks = kernels(r);
+  $('#ktable').innerHTML = `<tr><th>engine</th><th>kernel</th><th class="n">calls</th><th class="n">total</th><th class="n">mean</th><th class="n">elems</th><th class="n">cy/elem</th><th></th></tr>` +
+    ks.slice(0, 14).map(k => `<tr class="click" data-k="${k.engine}|${k.name}"><td><span class="tag" style="background:var(--${k.engine === 'HMX' ? 'hmx' : 'hvx'})">${k.engine}</span></td><td>${k.name}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td>${k.cpe > 1 ? '<span class="pill crit">▲ pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">▲ outlier</span>' : ''}</td></tr>`).join('');
+  for (const tr of $('#ktable').querySelectorAll('tr.click')) tr.onclick = () => { filter = tr.dataset.k.split('|')[1]; $('#search').value = filter; draw(); };
+  // per layer
+  const L = T.all.filter(e => e.cat === 'host.layer' && e.ts < r.t1 && e.ts + e.dur > r.t0);
+  const mx = Math.max(1, ...L.map(e => e.dur));
+  $('#layers').innerHTML = L.slice(0, 40).map(e => {
+    const lr = { t0: Math.max(e.ts, r.t0), t1: Math.min(e.ts + e.dur, r.t1) }, lm = metrics(lr);
+    const ps = [['cpu', lm.cpu], ['rpc', lm.rpc], ['hmx', lm.hmxOnly], ['ovl', lm.overlap], ['hvx', lm.hvxOnly], ['dma', lm.dmaOnly], ['sync', lm.dspIdle], ['frame', lm.other]];
+    return `<span>${e.name} <span class="num" style="color:var(--ink-3)">${e.args && e.args.phase || ''}</span></span><div class="stack" style="width:${e.dur / mx * 100}%;min-width:40px">${ps.filter(p => p[1] > 0).map(p => `<i title="${p[0]} ${fmt(p[1])}" style="width:${p[1] / lm.wall * 100}%;background:${p[0] === 'ovl' ? 'repeating-linear-gradient(135deg,var(--hmx) 0 4px,var(--hvx) 4px 8px)' : 'var(--' + p[0] + ')'}"></i>`).join('')}</div><span class="num">${fmt(e.dur)}</span>`;
+  }).join('');
+}
+function renderSel() {
+  const e = selected; if (!e) { $('#sel').innerHTML = '<dt>—</dt><dd>click a span</dd>'; return; }
+  const a = e.args || {}; const mhz = T.md.dsp_clock_mhz || 1200;
+  const rows = [['name', e.name], ['track', `${e._th.name} (pid ${e.pid}, tid ${e.tid})`], ['start', fmt(e.ts - T.tmin)], ['duration', fmt(e.dur)]];
+  if (a.elems) rows.push(['cy/elem (est.)', (e.dur * mhz / a.elems).toFixed(3)]);
+  for (const [k, v] of Object.entries(a)) rows.push([k, String(v)]);
+  $('#sel').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+}
+
+// ---------- render: timeline ----------
+function fit() { view = { t0: T.tmin, t1: T.tmax }; draw(); }
+function resize() {
+  const w = cv.clientWidth || 800, dpr = window.devicePixelRatio || 1;
+  cv.style.height = T.height + 'px';
+  cv.width = Math.round(w * dpr); cv.height = Math.round(T.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+function niceStep(span, px) { const target = span / (px / 90); const p = Math.pow(10, Math.floor(Math.log10(target))); for (const m of [1, 2, 5, 10]) if (m * p >= target) return m * p; return 10 * p; }
+function draw() {
+  if (!T) return;
+  const W = cv.clientWidth, H = T.height, pw = W - LABEL_W, span = view.t1 - view.t0, k = pw / span;
+  const X = t => LABEL_W + (t - view.t0) * k;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = css('--panel'); ctx.fillRect(0, 0, W, H);
+  ctx.font = '11px "IBM Plex Mono", monospace'; ctx.textBaseline = 'middle';
+  // range shade
+  if (range) { ctx.fillStyle = css('--ovl'); ctx.fillRect(Math.max(LABEL_W, X(range.t0)), HDR, Math.min(W, X(range.t1)) - Math.max(LABEL_W, X(range.t0)), H - HDR); }
+  // grid + axis
+  const step = niceStep(span, pw); const ms = span > 4000;
+  ctx.strokeStyle = css('--grid'); ctx.lineWidth = 1; ctx.fillStyle = css('--ink-3');
+  for (let t = Math.ceil(view.t0 / step) * step; t <= view.t1; t += step) {
+    const x = Math.round(X(t)) + .5; ctx.beginPath(); ctx.moveTo(x, HDR); ctx.lineTo(x, H); ctx.stroke();
+    const rel = t - T.tmin; ctx.fillText(ms ? (rel / 1000).toFixed(step >= 1000 ? 0 : 1) + ' ms' : rel.toFixed(0) + ' µs', x + 3, HDR / 2);
+  }
+  ctx.strokeStyle = css('--line'); ctx.beginPath(); ctx.moveTo(0, HDR + .5); ctx.lineTo(W, HDR + .5); ctx.stroke();
+  const q = filter.toLowerCase();
+  const matches = e => !q || e.name.toLowerCase().includes(q) || (e.args && Object.values(e.args).some(v => String(v).toLowerCase().includes(q)));
+  for (const row of T.rows) {
+    if (row.kind === 'proc') {
+      ctx.fillStyle = css('--line-soft'); ctx.fillRect(0, row.y, W, row.h);
+      ctx.fillStyle = css('--ink'); ctx.font = '600 12px "IBM Plex Sans", sans-serif'; ctx.fillText(row.p.name, 8, row.y + row.h / 2);
+      ctx.font = '11px "IBM Plex Mono", monospace'; continue;
+    }
+    if (row.kind === 'ctr') {
+      ctx.fillStyle = css('--ink-2'); ctx.fillText(row.c.name, 8, row.y + row.h / 2);
+      const pts = row.c.pts, mx = Math.max(1, ...pts.map(p => p[1]));
+      ctx.fillStyle = css('--dma'); ctx.globalAlpha = .45;
+      for (let i = 0; i < pts.length; i++) {
+        const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : view.t1; if (t1 < view.t0 || t0 > view.t1) continue;
+        const x0 = Math.max(LABEL_W, X(t0)), x1 = Math.min(W, X(t1)), h = (row.h - 8) * pts[i][1] / mx;
+        ctx.fillRect(x0, row.y + row.h - 4 - h, Math.max(1, x1 - x0), h);
+      }
+      ctx.globalAlpha = 1; ctx.strokeStyle = css('--line-soft'); ctx.beginPath(); ctx.moveTo(LABEL_W, row.y + row.h - .5); ctx.lineTo(W, row.y + row.h - .5); ctx.stroke();
+      continue;
+    }
+    const th = row.th;
+    ctx.fillStyle = css('--ink-2'); ctx.fillText(th.name, 8, row.y + row.h / 2);
+    ctx.strokeStyle = css('--line-soft'); ctx.beginPath(); ctx.moveTo(LABEL_W, row.y + row.h - .5); ctx.lineTo(W, row.y + row.h - .5); ctx.stroke();
+    for (const e of th.ev) {
+      if (e.ts > view.t1 || e.ts + e.dur < view.t0) continue;
+      const x0 = X(e.ts), x1 = X(e.ts + e.dur), w = x1 - x0; if (w < .35) continue;
+      const y = row.y + 2 + e._d * ROW, h = ROW - 3;
+      const xa = Math.max(LABEL_W, x0), xb = Math.min(W, x1);
+      const dim = q && !matches(e), frame = e._cat === 'frame';
+      ctx.globalAlpha = dim ? .18 : 1;
+      if (frame) { ctx.strokeStyle = css('--frame'); ctx.lineWidth = 1; ctx.strokeRect(xa + .5, y + .5, Math.max(1, xb - xa - 1), h - 1); }
+      else if (e._cat === 'wait') { ctx.globalAlpha = (dim ? .18 : 1) * .18; ctx.fillStyle = css('--rpc'); ctx.fillRect(xa, y, Math.max(1, xb - xa - 1), h); ctx.globalAlpha = dim ? .18 : 1; ctx.strokeStyle = css('--rpc'); ctx.lineWidth = 1; ctx.strokeRect(xa + .5, y + .5, Math.max(1, xb - xa - 1), h - 1); }
+      else { ctx.fillStyle = css('--' + e._cat); ctx.fillRect(xa, y, Math.max(1, xb - xa - (w > 3 ? 1 : 0)), h); }
+      if (e === selected) { ctx.strokeStyle = css('--sel'); ctx.lineWidth = 2; ctx.strokeRect(xa + 1, y + 1, Math.max(1, xb - xa - 2), h - 2); ctx.lineWidth = 1; }
+      if (xb - xa > 28) {
+        ctx.save(); ctx.beginPath(); ctx.rect(xa + 3, y, xb - xa - 6, h); ctx.clip();
+        ctx.fillStyle = (frame || e._cat === 'wait') ? css('--ink-2') : (e._cat === 'sync' || e._cat === 'rpc' || e._cat === 'hvx' ? '#101114' : '#fff');
+        ctx.fillText(e.name + (e.dur && xb - xa > 90 ? '  ' + fmt(e.dur) : ''), xa + 4, y + h / 2); ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+  // flows
+  if (k > 0.002) {
+    ctx.strokeStyle = css('--ink-3'); ctx.lineWidth = 1; ctx.globalAlpha = .7;
+    for (const f of T.flows) {
+      const a = f.s, b = f.f; if (b.ts < view.t0 || a.ts > view.t1) continue;
+      const ta = T.procs.find(p => p.pid === a.pid)?.threads.get(a.tid), tb = T.procs.find(p => p.pid === b.pid)?.threads.get(b.tid); if (!ta || !tb) continue;
+      const x0 = X(a.ts), y0 = ta._y + ROW / 2 + 2, x1 = X(b.ts), y1 = tb._y + ROW / 2 + 2;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + 20, y0, x1 - 20, y1, x1, y1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - 5, y1 - 3); ctx.lineTo(x1 - 5, y1 + 3); ctx.closePath(); ctx.fillStyle = css('--ink-3'); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  // label gutter cover
+  ctx.fillStyle = css('--panel'); ctx.fillRect(0, HDR + 1, LABEL_W - 1, 0);
+}
+
+// ---------- interaction ----------
+function hit(mx, my) {
+  if (!T || mx < LABEL_W) return null;
+  const k = (cv.clientWidth - LABEL_W) / (view.t1 - view.t0), t = view.t0 + (mx - LABEL_W) / k;
+  for (const row of T.rows) {
+    if (row.kind !== 'th' || my < row.y || my >= row.y + row.h) continue;
+    const d = Math.floor((my - row.y - 2) / ROW); let best = null;
+    for (const e of row.th.ev) if (e._d === d && e.ts <= t && e.ts + e.dur >= t) { if (!best || e.dur < best.dur) best = e; }
+    return best;
+  }
+  return null;
+}
+let drag = null;
+cv.addEventListener('pointerdown', ev => { drag = { x: ev.clientX, t0: view.t0, t1: view.t1, moved: false }; cv.setPointerCapture(ev.pointerId); });
+cv.addEventListener('pointermove', ev => {
+  const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  if (drag) {
+    const dx = ev.clientX - drag.x; if (Math.abs(dx) > 2) drag.moved = true;
+    const k = (cv.clientWidth - LABEL_W) / (drag.t1 - drag.t0); view.t0 = drag.t0 - dx / k; view.t1 = drag.t1 - dx / k; draw(); return;
+  }
+  const e = hit(mx, my); hover = e; const tip = $('#tip');
+  if (!e) { tip.hidden = true; return; }
+  const a = e.args || {}; const mhz = T.md.dsp_clock_mhz || 1200;
+  tip.innerHTML = `<b>${e.name}</b> · ${fmt(e.dur)}<dl class="kv"><dt>track</dt><dd>${e._th.name}</dd><dt>t</dt><dd>${fmt(e.ts - T.tmin)}</dd>${a.elems ? `<dt>cy/elem</dt><dd>${(e.dur * mhz / a.elems).toFixed(3)}</dd>` : ''}${Object.entries(a).slice(0, 6).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;
+  tip.hidden = false; tip.style.left = Math.min(window.innerWidth - 380, ev.clientX + 14) + 'px'; tip.style.top = (ev.clientY + 14) + 'px';
+});
+cv.addEventListener('pointerup', ev => {
+  if (drag && !drag.moved) { const r = cv.getBoundingClientRect(); selected = hit(ev.clientX - r.left, ev.clientY - r.top); renderSel(); draw(); }
+  drag = null;
+});
+cv.addEventListener('pointerleave', () => { $('#tip').hidden = true; });
+cv.addEventListener('wheel', ev => {
+  ev.preventDefault(); const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left; if (mx < LABEL_W) return;
+  const k = (cv.clientWidth - LABEL_W) / (view.t1 - view.t0), t = view.t0 + (mx - LABEL_W) / k;
+  const z = Math.exp(ev.deltaY * 0.0015); const span = Math.max(20, Math.min((T.tmax - T.tmin) * 1.2, (view.t1 - view.t0) * z));
+  const f = (t - view.t0) / (view.t1 - view.t0); view.t0 = t - f * span; view.t1 = view.t0 + span; draw();
+}, { passive: false });
+cv.addEventListener('dblclick', fit);
+$('#reset').onclick = fit;
+$('#search').oninput = ev => { filter = ev.target.value.trim(); draw(); };
+$('#range-select').onchange = ev => {
+  const v = ev.target.value; if (v === 'all') range = { t0: T.tmin, t1: T.tmax, label: 'whole trace' };
+  else { const e = T.phases[+v]; range = { t0: e.ts, t1: e.ts + e.dur, label: e.name }; }
+  renderSummary(); draw();
+};
+$('#file').onchange = ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  f.text().then(txt => { load(JSON.parse(txt), f.name); const o = document.createElement('option'); o.value = '__file'; o.textContent = f.name; $('#trace-select').append(o); $('#trace-select').value = '__file'; });
+};
+window.addEventListener('resize', () => { if (T) { resize(); draw(); } });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());
+new MutationObserver(() => draw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+// ---------- load ----------
+function load(doc, label) {
+  T = parse(doc); selected = null; filter = ''; $('#search').value = '';
+  const md = T.md; $('#subtitle').textContent = [md.model, md.device, md.tool].filter(Boolean).join(' · ') || label;
+  const rs = $('#range-select'); rs.innerHTML = '<option value="all">range: whole trace</option>' + T.phases.map((e, i) => `<option value="${i}">range: ${e.name}</option>`).join('');
+  range = { t0: T.tmin, t1: T.tmax, label: 'whole trace' };
+  resize(); fit(); renderSummary(); renderSel();
+}
+const EMB = JSON.parse($('#embedded-traces').textContent || '{}');
+const sel = $('#trace-select');
+for (const k of Object.keys(EMB)) { const o = document.createElement('option'); o.value = k; o.textContent = k; sel.append(o); }
+sel.onchange = () => { if (EMB[sel.value]) load(EMB[sel.value], sel.value); };
+const first = Object.keys(EMB)[0];
+if (first) load(EMB[first], first);
+else { sel.hidden = true; T = null; cv.style.height = '120px'; const c = cv.getContext('2d'); }
+})();
+</script>
