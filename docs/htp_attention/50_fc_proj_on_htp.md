@@ -245,6 +245,30 @@ prefill 945 ms 469.8 TPS   decode 11.6 TPS   등록 1528 (MoE 1408 + FC 120), �
    `<|im_end|>`로 정상 종료). 재양자화 층이 늘어난 결과이고, softmax 앞의 q/k/v가 가장 의심스럽다.
    **정확도 게이트 실패** — attn_proj는 QS4CX 오프라인 양자화(§6) 없이는 끄는 것이 맞다.
 
+### 3.6 transport의 정체 — 스테이징 버퍼 크기에 비례하는 콜당 캐시 유지비 (2026-09-21)
+
+§3.5의 "전부 켬"을 한 번 더 돌렸다: prefill 996, decode 11.66, MoE decode 콜 transport **1626 us**
+(직전 1633). 7 us 차이 — 발열이면 이렇게 같을 수 없다. 형상이 불변인 MoE decode 콜의 transport를
+설정별로 놓으면:
+
+| HTP에 올린 것 | 스테이징 act / out (가장 큰 형상에 맞춰 자란 크기) | decode transport | decode TPS |
+|---|---|---:|---:|
+| MoE만 (09-16) | 3.6 / 3.6 MB | 553 us | 20.8 |
+| + in_proj (out 10.9 MB) | 3.6 / 10.9 | 814 | 16.5 |
+| + dense (act·out 12.7 MB) | 12.7 / 12.7 | 1633, 1626 | 11.6, 11.7 |
+
+증가분 +7.3 MB → +261 us, +18.2 MB → +1080 us = **36~59 us/MB**, 캐시 플러시 속도다.
+메커니즘: `invokeLayer`·MoE 콜 전부가 `act_buf_`/`out_buf_` **한 쌍**을 공유하고 `ensureCapacity`가
+가장 큰 형상에 맞춰 키웠다. ARM 캐시드 ION 버퍼는 FastRPC 드라이버가 콜마다 clean/invalidate를
+하는데, 그 범위가 **넘긴 바이트가 아니라 dma-buf 전체**다. 8 KB를 쓰는 decode 콜이 25 MB를
+플러시했고, prefill의 82콜 전부가 같은 세금을 냈다(in_proj 콜 transport 782 → 1496).
+
+**수정**: 크기 클래스별 버퍼(`StagingPool`/`stage`, 64 KiB부터 2배씩). decode는 64 KiB 쌍, MoE
+prefill은 4 MiB, in_proj·dense는 16 MiB. 기대: decode transport 553 근처로 → **≈20 TPS 복구**,
+prefill 콜 82개 × 0.3~0.7 ms → **−40~−60 ms** (835 기준으로 in_proj·dense의 진짜 값이 그때 보인다).
+ION 합계 ≈40 MB(이전 25). 이 세금은 in_proj 이전에도 있었다 — 3.6 MB 쌍의 553 us 중 ≈260이
+그것이니, MoE만 돌 때도 decode 콜당 ≈0.25 ms(22층 5 ms/token)는 돌아온다.
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`

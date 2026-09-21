@@ -1228,6 +1228,29 @@ private:
     }
   }
 
+  /** @brief ION scratch by size class, one buffer per power of two from
+   *  64 KiB up, so a call stages through a buffer near its own size.
+   *
+   * One pair grown to the largest shape (ensureCapacity) made every call
+   * pay for that shape: the driver's cache maintenance on a cached ION
+   * buffer covers the whole dma-buf, not the bytes passed, so the MoE
+   * decode call's 8 KB rode a 3.6 MB pair at 553 us of transport, a
+   * 10.9 MB out buffer at 814 and a 12.7 MB pair at 1633 (doc 50 section
+   * 3.6: 36-59 us/MB, cache-flush speed), and prefill's calls paid the
+   * same. With classes, decode stays on the 64 KiB pair. */
+  struct StagingPool {
+    std::map<size_t, std::unique_ptr<HtpRpcBuffer>> by_class;
+  };
+  static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+    size_t cls = size_t(64) << 10;
+    while (cls < bytes)
+      cls <<= 1;
+    auto &slot = pool.by_class[cls];
+    if (!slot)
+      slot = std::make_unique<HtpRpcBuffer>(cls);
+    return *slot;
+  }
+
   /** @brief The one FastRPC layer call both accelerated entries make.
    *
    *  Under NNTR_HTP_PROFILE >= 2 it goes through mm_u8i4_layer_timed so the
@@ -1236,9 +1259,9 @@ private:
    *  path (profile off) still calls the untimed entry, which is why the
    *  DSP probes cost nothing when nobody is measuring.
    *
-   *  Not static any more: it now owns act_buf_/out_buf_, a pair of
-   *  rpcmem-backed scratch buffers reused across calls (ensureCapacity
-   *  above). invoke_mutex_ guards them -- required once they are shared
+   *  Not static any more: it now owns act_pool_/out_pool_, rpcmem-backed
+   *  scratch buffers by size class reused across calls (stage above).
+   *  invoke_mutex_ guards them -- required once they are shared
    *  mutable state, and consistent with the single-owner assumption
    *  test/htp/nntr_hvx_session.h already documents for the one HTP session
    *  a process opens (one VTCM arena, one HMX lock).
@@ -1285,10 +1308,10 @@ private:
     };
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
-    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
-    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
-    float *out_cat = reinterpret_cast<float *>(out_buf_->data());
+    float *act_f32 = reinterpret_cast<float *>(
+      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
+    float *out_cat = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
     stagedMemcpy(act_f32, matBdata,
                  static_cast<size_t>(act_len) * sizeof(float));
 
@@ -1340,9 +1363,9 @@ private:
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     ensureCapacity(act_ah_buf_, act_ah_bytes);
-    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
     uint8_t *act_ah = act_ah_buf_->data();
-    float *out_cat = reinterpret_cast<float *>(out_buf_->data());
+    float *out_cat = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
 
     if (act_scale_scratch_.size() < m_pad) {
       act_scale_scratch_.resize(m_pad);
@@ -1405,10 +1428,10 @@ private:
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
-    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
-    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
-    float *out_f32 = reinterpret_cast<float *>(out_buf_->data());
+    float *act_f32 = reinterpret_cast<float *>(
+      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
+    float *out_f32 = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
     stagedMemcpy(act_f32, matBdata,
                  static_cast<size_t>(act_len) * sizeof(float));
 
@@ -1467,10 +1490,10 @@ private:
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
-    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
-    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
-    float *out_f32 = reinterpret_cast<float *>(out_buf_->data());
+    float *act_f32 = reinterpret_cast<float *>(
+      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
+    float *out_f32 = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
     stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
@@ -1559,13 +1582,13 @@ private:
     const size_t out_ah_bytes = static_cast<size_t>(m_pad) * inter;
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    ensureCapacity(act_buf_, static_cast<size_t>(act_len) * sizeof(float));
     ensureCapacity(act_ah_buf_, out_ah_bytes);
     if (act_scale_scratch_.size() < m_pad) {
       act_scale_scratch_.resize(m_pad);
       act_zp_scratch_.resize(m_pad);
     }
-    float *act_f32 = reinterpret_cast<float *>(act_buf_->data());
+    float *act_f32 = reinterpret_cast<float *>(
+      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
     uint8_t *out_ah = act_ah_buf_->data();
     stagedMemcpy(act_f32, matBdata,
                  static_cast<size_t>(act_len) * sizeof(float));
@@ -1627,9 +1650,9 @@ private:
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    ensureCapacity(out_buf_, static_cast<size_t>(out_len) * sizeof(float));
     const uint8_t *act_ah = act_ah_buf_->data();
-    float *out_cat = reinterpret_cast<float *>(out_buf_->data());
+    float *out_cat = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() == 0) {
@@ -2325,15 +2348,15 @@ private:
   // per model. The fix is an explicit shutdown hook on HtpBackend that runs
   // before it closes the session, not a destructor here.
 
-  // ION-backed activation/output scratch, reused across calls and grown on
-  // demand (ensureCapacity) -- see invokeLayer's comment. Guarded by the
+  // ION-backed activation/output scratch, reused across calls, one buffer
+  // per size class (stage) -- see invokeLayer's comment. Guarded by the
   // same mutex that serializes every call into the one HTP session.
   std::mutex invoke_mutex_;
-  std::unique_ptr<HtpRpcBuffer> act_buf_;
-  std::unique_ptr<HtpRpcBuffer> out_buf_;
+  StagingPool act_pool_;
+  StagingPool out_pool_;
 
   // invokeLayerU8In's scratch: the AH-packed activation (ION-backed, same
-  // reasoning as act_buf_/out_buf_) and the small per-row scale/zp arrays
+  // reasoning as act_pool_/out_pool_) and the small per-row scale/zp arrays
   // it produces alongside it (plain heap -- a few KB at most, not worth
   // ION's pin/map bookkeeping).
   std::unique_ptr<HtpRpcBuffer> act_ah_buf_;
