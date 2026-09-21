@@ -74,6 +74,18 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   await page.keyboard.press('Escape');
   ok((await page.$eval('#range-select', s => s.value)) === 'all', 'Escape clears the selection');
 
+  // W7: the warnings sample shows three banner items; the plain sample none
+  const warn = names.find(n => /warnings/.test(n));
+  await use(warn);
+  let w7 = await page.evaluate(() => ({ hidden: document.querySelector('#warn').hidden, n: document.querySelectorAll('#warn > span').length, j: window.__nntr.metricsJSON().warnings }));
+  ok(!w7.hidden && w7.n === 3, `warnings banner lists ${w7.n} items on the warnings sample`);
+  ok(w7.j.fallbacks > 0 && w7.j.dropped.dsp === 137 && w7.j.clock_violations === 2, `metricsJSON.warnings: fallbacks ${w7.j.fallbacks}, dropped dsp ${w7.j.dropped.dsp}, clock ${w7.j.clock_violations}`);
+  await page.click('#warn a'); await page.waitForTimeout(50);
+  w7 = await page.evaluate(() => ({ f: document.querySelector('#search').value, sel: document.querySelector('#pane').innerText.includes('htp_disabled') }));
+  ok(w7.f === 'fallback' && w7.sel, 'banner "show" filters and selects the first fallback slice');
+  await use(asBuilt);
+  ok(await page.$eval('#warn', e => e.hidden), 'no banner on the as-built sample');
+
   // W0: every tab renders, range select works
   await use(asBuilt);
   for (const id of await page.$$eval('#tabs button', bs => bs.map(b => b.dataset.tab))) {
