@@ -214,7 +214,7 @@ public:
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                  const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 0)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -233,7 +233,7 @@ public:
   void addInvokeFused(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                       const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 0)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -255,7 +255,7 @@ public:
   void addInvokeGateUpSwiglu(unsigned M, unsigned K, unsigned N_gate_up,
                              uint64_t host_us, const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N_gate_up, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N_gate_up, M == 1, 0)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -280,10 +280,14 @@ public:
    *  not into acc_us. Folding them in looked tidy and cost a measurement:
    *  the first run of this call put 104.8 ms in a bucket ACC_READ and the
    *  scatter shared, and the profile could not say which. */
+  /** @param dense the dense FFN routed through the MoE layer kernel (doc
+   *  51), filed in its own row: same shapes as the MoE layer's, so the
+   *  key alone could not tell the two apart. */
   void addInvokeMoeLayer(unsigned M, unsigned K, unsigned N_out,
-                         uint64_t host_us, const uint32_t *stage_us) {
+                         uint64_t host_us, const uint32_t *stage_us,
+                         bool dense = false) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1, dense ? 1 : 0)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -431,12 +435,14 @@ private:
       const unsigned k = std::get<0>(entry.first);
       const unsigned n = std::get<1>(entry.first);
       const bool decode = std::get<2>(entry.first);
+      const bool dense = std::get<3>(entry.first) != 0;
       const Bucket &b = entry.second;
       std::fprintf(stderr,
-                   "[HTP-PROFILE]   K=%-5u N=%-5u %-7s calls=%-7llu "
+                   "[HTP-PROFILE]   K=%-5u N=%-5u %-9s calls=%-7llu "
                    "rows=%-8llu host=%9.1f ms (%7.1f us/call)",
-                   k, n, decode ? "M==1" : "M>1", (unsigned long long)b.calls,
-                   (unsigned long long)b.rows, ms(b.host_us),
+                   k, n, decode ? "M==1" : (dense ? "M>1 dense" : "M>1"),
+                   (unsigned long long)b.calls, (unsigned long long)b.rows,
+                   ms(b.host_us),
                    b.calls ? static_cast<double>(b.host_us) / b.calls : 0.0);
       if (level_ >= 2 && b.calls != 0) {
         const double dsp_per = static_cast<double>(b.dsp_us) / b.calls;
@@ -530,7 +536,9 @@ private:
   uint64_t staging_bytes_ = 0;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
-  std::map<std::tuple<unsigned, unsigned, bool>, Bucket> buckets_;
+  /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
+   *  through the MoE layer kernel (doc 51). */
+  std::map<std::tuple<unsigned, unsigned, bool, int>, Bucket> buckets_;
 };
 
 /**
@@ -1485,7 +1493,8 @@ private:
                       const std::vector<unsigned int> &row_count,
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
-                      unsigned int inter, unsigned int N_out) {
+                      unsigned int inter, unsigned int N_out,
+                      bool dense = false) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
@@ -1564,7 +1573,7 @@ private:
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
     if (profile.level()) {
       profile.addInvokeMoeLayer(M, K, N_out, elapsed,
-                                timed ? stage_us : nullptr);
+                                timed ? stage_us : nullptr, dense);
     }
   }
 
@@ -1958,7 +1967,7 @@ private:
         row_index[c * M + r] = r;
     }
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
-                   act, out, M, K, dh.w, N);
+                   act, out, M, K, dh.w, N, /*dense=*/true);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
