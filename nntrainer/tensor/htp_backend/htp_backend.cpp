@@ -16,6 +16,7 @@
 
 #include <nntrainer_log.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -72,10 +73,21 @@ HtpBackend::HtpBackend() {
   // Best effort: an SDK or device without the control just keeps the old
   // interrupt-driven behavior, logged so a slow transport number is
   // explainable rather than silently misread as the kernel being slow.
+  // NNTR_HTP_POLL_US: how long the host polls for the DSP's reply before
+  // falling back to the interrupt wait (doc 51 section 2.8: the MoE
+  // layer call's transport reads 1.85-2.2 ms against 0.34-0.44 for the
+  // dense call on the same kernel and buffers, and a call that outlives
+  // the poll window is the one difference left to test). Default 100 as
+  // before; 10000 is the SDK's ceiling.
   struct remote_rpc_control_latency lat;
   std::memset(&lat, 0, sizeof(lat));
   lat.enable = RPC_POLL_QOS;
   lat.latency = 100;
+  if (const char *poll_us = std::getenv("NNTR_HTP_POLL_US")) {
+    lat.latency = static_cast<uint32_t>(std::strtoul(poll_us, nullptr, 10));
+    ml_logi("HtpBackend: poll QoS latency %u us (NNTR_HTP_POLL_US)",
+            static_cast<unsigned>(lat.latency));
+  }
   int qos_err =
     remote_handle64_control(h, DSPRPC_CONTROL_LATENCY, &lat, sizeof(lat));
   if (qos_err == AEE_SUCCESS) {
