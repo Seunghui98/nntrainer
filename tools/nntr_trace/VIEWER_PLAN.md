@@ -4,6 +4,25 @@ Audience: the agent implementing this. Everything below is specific enough
 to start from without re-deriving the design; where a fact must be checked
 on the real data (QNN optrace field names), the item says so.
 
+## Status
+
+All four batches are implemented on this branch; `test/run.sh` is the
+gate. Deviations from the text below, so nobody chases them:
+
+- W0 acceptance numbers moved to 1.17 / 1.45 (the default sample now has
+  8 decode tokens; the 2-token P0 sample gave 1.22 / 1.62).
+- W5: the sample's 2-unit decode quant runs give a worst tail of 1.15, so
+  the check asserts `few_units` plus tail > 1.1; the 1.3 flag threshold in
+  the UI is unchanged.
+- W6: prefill-chunk vs decode TOPS ratio in the sample is ~10x, not > 50x
+  (decode `ops` counts useful work at M=1 against a 62 µs kernel).
+- W8: token wall is checked by regression slope, not strict monotonicity;
+  the transport jitter (±8 %) is larger than 2 % kv growth per token.
+- W9: written against `test/data/qnn_mini.json`, a hand-made fixture. The
+  converter's docstring lists what to verify on a real optrace.
+- W12: the metrics JSON also carries `token_summary`, `hmx_peak_tops` and
+  a per-kernel `tops`.
+
 ## 0. Ground rules
 
 - **Files.** `tools/nntr_trace/viewer.html` (single file, no build step, no
