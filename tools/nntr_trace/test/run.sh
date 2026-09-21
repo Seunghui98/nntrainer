@@ -12,10 +12,12 @@ mkdir -p "$FIX"
 python3 "$ROOT/make_sample_trace.py" -o "$FIX/trace_asbuilt.json"
 python3 "$ROOT/make_sample_trace.py" --pipelined -o "$FIX/trace_pipelined.json"
 python3 "$ROOT/make_sample_trace.py" --with-warnings -o "$FIX/trace_warnings.json"
+python3 "$ROOT/qnn_optrace_to_nntr.py" "$HERE/data/qnn_mini.json" -o "$FIX/qnn_mini_nntr.json" --ts-unit cycles
 python3 "$ROOT/bundle.py" -o "$FIX/bundle.html" \
   --trace "sample: as built=$FIX/trace_asbuilt.json" \
   --trace "sample: pipelined=$FIX/trace_pipelined.json" \
-  --trace "sample: warnings=$FIX/trace_warnings.json"
+  --trace "sample: warnings=$FIX/trace_warnings.json" \
+  --trace "qnn: mini fixture=$FIX/qnn_mini_nntr.json"
 
 NODE_PATH="${NODE_PATH:-$(npm root -g)}" node "$HERE/check.js" "$FIX/bundle.html" "$FIX"
 python3 -m unittest discover -s "$HERE" -p 'test_*.py'

@@ -1,0 +1,20 @@
+{
+ "_comment": "Hand-made stand-in for a QAIRT HTP optrace (chromeTrace_opTrace.json) following ref_16's description: tid 256 DMA, 512-519 HVX, 768 HMX, tid 1 zero-cost views; ts/dur in HTP cycles at 1.2 GHz. Replace with a slice of a real file once one is available and update qnn_optrace_to_nntr.py's docstring.",
+ "traceEvents": [
+  {"ph": "M", "pid": 0, "name": "process_name", "args": {"name": "HTP optrace"}},
+  {"ph": "M", "pid": 0, "tid": 768, "name": "thread_name", "args": {"name": "HMX"}},
+  {"ph": "M", "pid": 0, "tid": 512, "name": "thread_name", "args": {"name": "HVX0"}},
+  {"ph": "M", "pid": 0, "tid": 513, "name": "thread_name", "args": {"name": "HVX1"}},
+  {"ph": "M", "pid": 0, "tid": 256, "name": "thread_name", "args": {"name": "DMA"}},
+  {"ph": "X", "pid": 0, "tid": 256, "name": "weights_to_vtcm", "cat": "dma", "ts": 0, "dur": 12000, "args": {"shape": [1, 1, 1024, 256], "cycles": 12000}},
+  {"ph": "X", "pid": 0, "tid": 768, "name": "node_linear::q::ConvLayer_s1.opt", "cat": "hmx", "ts": 12000, "dur": 14650, "args": {"tile": [1, 8, 128, 256], "cycles": 14650}},
+  {"ph": "X", "pid": 0, "tid": 768, "name": "node_linear::q::ConvLayer_s1.opt", "cat": "hmx", "ts": 26650, "dur": 14650, "args": {"tile": [1, 8, 128, 256], "cycles": 14650}},
+  {"ph": "X", "pid": 0, "tid": 512, "name": "node_Softmax_124::q::Softmax_Crouton_Scratch", "cat": "hvx", "ts": 14000, "dur": 31657, "args": {"tile": [1, 8, 16, 1024], "cycles": 31657, "Cycles per Packet": 2.3}},
+  {"ph": "X", "pid": 0, "tid": 513, "name": "node_Softmax_124::q::Softmax_Crouton_Scratch", "cat": "hvx", "ts": 14000, "dur": 31657, "args": {"tile": [1, 8, 16, 1024], "cycles": 31657, "Cycles per Packet": 2.3}},
+  {"ph": "X", "pid": 0, "tid": 512, "name": "node_Transpose_115::q::Transpose_impl", "cat": "hvx", "ts": 46000, "dur": 184973, "args": {"tile": [1, 8, 32, 1024], "cycles": 184973, "Cycles per Packet": 7.9}},
+  {"ph": "X", "pid": 0, "tid": 513, "name": "node_mul_op::q::mul_op", "cat": "hvx", "ts": 46000, "dur": 399728, "args": {"tile": [1, 2, 1024, 128], "cycles": 399728}},
+  {"ph": "X", "pid": 0, "tid": 1, "name": "q::SlicePad_shape_inplace", "cat": "view", "ts": 12000, "dur": 5, "args": {}},
+  {"ph": "X", "pid": 0, "tid": 1, "name": "q::Reshape", "cat": "view", "ts": 12010, "dur": 5, "args": {}}
+ ],
+ "metadata": {"qairt": "2.47.0 (fixture)", "clock_mhz": 1200}
+}
