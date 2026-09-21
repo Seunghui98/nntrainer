@@ -284,3 +284,29 @@ prefill 741 / 732 ms  (599 / 607 TPS)   decode 20.64 / 20.96 TPS   등록 1496 =
   (b) `htp_backend.cpp`의 latency를 10000으로.
 - 이제 prefill의 구성: HTP 콜 host 합 ≈ 481 (MoE 372 + conv 88 + dense 21) + 스테이징 memcpy ≈18 +
   **ARM 잔여 ≈ 236** (attention 6층의 q/k/v/o·core, norm, router, lm_head). ARM 잔여가 다음 미지수.
+
+### 2.9 정확도 — 첫 DIFF는 커널을 증명했고, 텍스트는 지표가 아니다 (2026-09-22)
+
+D의 텍스트가 A보다 헐거워 보여 `NNTR_CONV_BLOCK_DIFF`(두 경로 다 돌려 층별 SNR)와 `_SHADOW`(모델엔
+CPU 경로 값)를 넣고 돌렸다:
+
+```
+DIFF   : 18층 중 16층 SNR 146~154 dB, 2층 80~86 dB (layer 3, 9);  state 전 층 정확히 동일 (999)
+SHADOW : 16층 147~156, 1층 80.6 (layer 17);  state 동일.  텍스트는 D와 다른 변형, decode 20.6
+```
+
+- **150 dB는 "같은 수를 두 번 계산했다"는 뜻이다.** 참조 경로가 진짜 CPU가 아니었다: 이 레이어의
+  `engine=htp`라 `dot()`이 in_proj·out_proj를 HTP FC 콜로 보냈고(프로파일에 `N=6144` 18콜, MoE 행
+  +18콜이 그 증거), 참조 = HTP FC 둘 + CPU 원소연산 = 융합 콜과 같은 양자화 지점. 그래서 이 비교가
+  증명한 것은 **커널이 맞다**는 것이다 — 두 경로의 차이는 dequant·gate의 f32 연산 순서뿐이고, g(state)는
+  비트 동일.
+- 80 dB짜리 층은 u8 경계 뒤집힘이다: z의 한 원소가 f32 반올림 차이로 양자화 경계를 넘으면 그 원소 오차가
+  행 범위의 1/255 → 콜 SNR 80. 실행마다 다른 층에서 나는 것도 그래서다(SHADOW는 하류 입력이 달라진다).
+- **텍스트는 정확도 지표가 아니다.** SHADOW는 150 dB(상대 1e-7) 차이의 값을 넣었는데도 토큰이 바뀌었다.
+  greedy 512 토큰은 반올림 잡음에도 갈라진다. 문서 50·51의 "텍스트 변형" 관찰 전부, 그리고 attn_proj·
+  conv_out_proj를 "정확도 위험"으로 뺀 판단도 같은 근거 위에 있었다 → 전부 재평가 대상.
+- 고침: compare 모드의 참조는 `nntrainer::gemm_q4_0`을 직접 부른다(A config의 FC 경로와 같은 함수).
+  다음 DIFF는 융합 콜 vs 진짜 CPU(ggml Q8_0 활성 양자화)의 SNR을 준다 — 양자화 지점 두 개(x→u8, z→u8)의
+  실제 비용. 기대는 30~45 dB.
+- 게이트로 남는 것: **로짓 기준**. 같은 프롬프트의 prefill 로짓(444×V)을 두 config에서 덤프해 위치별
+  argmax 일치율과 평균 KL을 본다. 텍스트 대신 이것으로 판정한다.
