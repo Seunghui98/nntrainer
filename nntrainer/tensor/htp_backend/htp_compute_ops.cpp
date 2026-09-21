@@ -1731,17 +1731,53 @@ private:
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
         if (c0 != 0)
           t_begin = HtpProfile::nowUs();
-        HtpRpcBuffer slice(static_cast<size_t>(K) * n);
+        std::vector<int8_t> rm(static_cast<size_t>(K) * n);
         for (uint32_t k = 0; k < K; ++k) {
-          std::memcpy(slice.data() + static_cast<size_t>(k) * n,
+          std::memcpy(rm.data() + static_cast<size_t>(k) * n,
                       full.data() + static_cast<size_t>(k) * N + c0, n);
         }
         std::vector<float> ws(w_scale.begin() + c0, w_scale.begin() + c0 + n);
         std::vector<int32_t> cs(colsum_w.begin() + c0,
                                 colsum_w.begin() + c0 + n);
         void *key = static_cast<char *>(matAdata) + c0;
-        fh.handles.push_back(register_locked(key, session, K, n, slice, ws, cs,
-                                             t_begin, convert_us));
+
+        // [doc 50 section 3.3] Into a mapped arena chunk's free room first:
+        // the 3840 MiB mapped hold 3696 of MoE weights, and the DSP heap
+        // gave the loaded app ~100 MiB before AEE_ENOMEMORY (42 slices),
+        // short of the 143 the FC weights need. Only room that is already
+        // mapped -- a new chunk would take the address space the heap
+        // registrations after this one need. The arena wants WH bytes:
+        // packed on the host into a cached buffer and copied in whole,
+        // since whPack's read-modify-write into the uncached chunk would
+        // crawl. A refusal leaves 2 MiB of the chunk unused, once.
+        uint32_t handle = kNoHandle;
+        const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, n));
+        uint32_t chunk = 0, off = 0;
+        if (ensureArena(session) && placeExisting(wh_len, &chunk, &off)) {
+          std::vector<uint8_t> wh(wh_len);
+          whPack(rm.data(), K, n, wh.data());
+          std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(),
+                      wh_len);
+          ArenaEntry e;
+          e.chunk = chunk;
+          e.off = off;
+          e.K = K;
+          e.N = n;
+          e.w_scale = ws;
+          e.colsum_w = cs;
+          e.bias.assign(n, 0.0f);
+          handle = registerFromArena(session, e, K, n, t_begin);
+          if (handle != kNoHandle)
+            handle_cache_.emplace(key, handle);
+        }
+        if (handle == kNoHandle) {
+          // The DSP heap, as the whole weight would have gone.
+          HtpRpcBuffer slice(static_cast<size_t>(K) * n);
+          std::memcpy(slice.data(), rm.data(), rm.size());
+          handle = register_locked(key, session, K, n, slice, ws, cs, t_begin,
+                                   convert_us);
+        }
+        fh.handles.push_back(handle);
         fh.cols.push_back(n);
         convert_us = 0; // counted once, on the first slice
       }
@@ -1970,6 +2006,20 @@ private:
    */
   bool place(remote_handle64 session, uint32_t bytes, size_t want,
              uint32_t *chunk, uint32_t *off) {
+    if (placeExisting(bytes, chunk, off))
+      return true;
+    if (!newChunk(session, bytes, want))
+      return false;
+    arena_chunks_.back().used = bytes;
+    *chunk = static_cast<uint32_t>(arena_chunks_.size() - 1);
+    *off = 0;
+    return true;
+  }
+
+  /** @brief place() without the new chunk: room in a mapped chunk or
+   *  nothing. What the FC slices use (get_or_register_fc), so that they
+   *  never map address space the remaining heap registrations need. */
+  bool placeExisting(uint32_t bytes, uint32_t *chunk, uint32_t *off) {
     for (size_t c = 0; c < arena_chunks_.size(); ++c) {
       // 4 KB rather than the 512 the DSP requires: a weight that starts on
       // a page boundary is one the DMA never splits across a page for
@@ -1982,12 +2032,7 @@ private:
         return true;
       }
     }
-    if (!newChunk(session, bytes, want))
-      return false;
-    arena_chunks_.back().used = bytes;
-    *chunk = static_cast<uint32_t>(arena_chunks_.size() - 1);
-    *off = 0;
-    return true;
+    return false;
   }
 
   /** @brief Allocates one uncached ION buffer and attaches it to the DSP.
