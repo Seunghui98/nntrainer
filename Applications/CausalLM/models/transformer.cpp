@@ -676,19 +676,24 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
  */
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
+  // FFN_ENGINE (doc 50): "htp" moves only the three FCs' prefill matmuls;
+  // decode (M == 1) stays on the CPU kernel, as does the SwiGLU between.
+  const std::string eng =
+    (FFN_HTP_LAYERS.empty() || FFN_HTP_LAYERS.count(layer_id)) ? FFN_ENGINE
+                                                               : "cpu";
 
   LayerHandle ffn_up(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", eng)}));
   Tensor up = ffn_up(input);
 
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", eng)}));
   Tensor gate = ffn_gate(input);
 
   /// @note nntrainer binary stores mlp weights in up, gate order.
@@ -705,7 +710,7 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", eng)}));
   return ffn_down(act);
 }
 

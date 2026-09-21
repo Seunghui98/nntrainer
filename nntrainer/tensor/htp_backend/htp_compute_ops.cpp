@@ -692,8 +692,39 @@ public:
     // the HVX-quantizes-into-VTCM path. invokeLayerU8In/htp_act_quant.*
     // stay in the tree, unused, in case a caller that is not this one
     // ever legitimately arrives with pre-quantized bytes already in hand.
-    invokeLayer(session, fh.handles.data(), static_cast<int>(fh.handles.size()),
-                matBdata, matCdata, M, N, K, &fh.cols);
+    //
+    // In row chunks when the activation would not fit VTCM beside the
+    // slice double buffer (fcMaxRows): the dense FFN's down projection is
+    // K = 7168, 3.1 MiB of u8 rows at M = 444 and 7 at M = 1024. Each
+    // chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms;
+    // one call covers every K = 2048 weight up to 1,920 rows.
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      invokeLayer(session, fh.handles.data(),
+                  static_cast<int>(fh.handles.size()),
+                  matBdata + static_cast<size_t>(m0) * K,
+                  matCdata + static_cast<size_t>(m0) * N, m, N, K, &fh.cols);
+    }
+  }
+
+  /** @brief Rows one layer call may carry at this K.
+   *
+   * hexkl_mm_u8i4_layer_run holds the whole activation (m_pad x K u8) in
+   * VTCM next to the widest handle's double buffer -- 2 x 2 MiB once
+   * fcSliceCols has sized the handles -- a result tile and the HMX config.
+   * Budgeted at 7.75 MiB of the 8 MiB VTCM, so 3.75 MiB of rows: 1,920 at
+   * K = 2048, 512 at K = 7168. Whole 64-row blocks, at least one.
+   * ponytail: 7.75 MiB stands in for the session's real vtcm_size less
+   * hexkl_micro_hmx_config_size(), which the host does not see; a kernel
+   * that walked 64-row blocks like hexkl_mm_u8i4_moe.c would need no cap. */
+  static unsigned int fcMaxRows(unsigned int K) {
+    constexpr size_t kVtcmBudget = (size_t(8) << 20) - (size_t(256) << 10);
+    constexpr size_t kSliceDouble = size_t(2) * (size_t(2) << 20);
+    unsigned int rows =
+      static_cast<unsigned int>((kVtcmBudget - kSliceDouble) / K);
+    rows -= rows % 64u;
+    return rows < 64u ? 64u : rows;
   }
 
   // Several Q4_0 weights that share ONE activation -- LFM2-MoE decode's

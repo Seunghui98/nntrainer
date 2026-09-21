@@ -14,6 +14,25 @@
 `conv_in_proj_htp_layers` / `attn_proj_htp_layers`는 `moe_htp_layers`와 같은 층 목록이다
 (빈 값 = 전부). 둘 다 기본값 `cpu`라 기존 config는 그대로 돈다.
 
+§3.4 뒤에 나머지 FC에도 같은 스위치를 달았다 (2026-09-21):
+
+| 스위치 | 대상 | 층 | 형상 (M=444) | GFLOP | WH 바이트 |
+|---|---|---:|---|---:|---:|
+| `"conv_out_proj_engine": "htp"` | `layerN_conv_out_proj` | 18 | ×[2048×2048] | 67 | 36 MiB |
+| `"dense_ffn_engine": "htp"` | `layerN_ffn_up/_ffn_gate/_ffn_down` | 2 | up·gate ×[2048×7168], down ×[7168×2048] | 52 | 42 MiB |
+
+각각 `*_htp_layers` 목록이 있다. dense FFN의 SwiGLU는 ARM에 남는다(up·gate 결과가 ARM으로 왔다가
+down으로 다시 간다 — 융합 경로 `gemm_qs4cx_fused_swiglu`는 QS4CX 가중치를 받으므로 Q4_0 파일에는
+안 맞는다). down은 K=7168이라 활성화 3.1 MiB가 VTCM에서 조각 더블버퍼(4 MiB)와 함께 빠듯하고
+M=1024면 7 MiB로 안 들어간다 → `fcMaxRows(K)`가 콜을 행 단위로 나눈다 (K=7168: 512행/콜, K=2048:
+1,920행/콜 — 이걸로 §3.1의 "m_pad ≈ 1,900 천장"도 사라진다. 콜 하나가 더 붙을 때마다 0.4 ms).
+
+**기대는 작다** (§3.4의 in_proj 교훈, ARM ≈2 TFLOPS 기준): out_proj 18층 ARM ≈75 vs HTP ≈72 →
+**≈0**; dense FFN 2층 ARM ≈65 vs HTP ≈32 → **−30**; q/k/v/o **−10~−30**. 합 **−40~−60 ms** 정도.
+켜는 이유는 실측으로 표를 채우기 위해서지 배수를 기대해서가 아니다. 메모리: 아레나 슬랙에 in_proj
+108 뒤 ≈36 남음 → out_proj 일부, 나머지(q/k/v/o 30 + dense 42 + out_proj 잔여)는 힙 ≈100 → **빠듯**.
+`ENOMEMORY`면 `*_htp_layers`로 그룹별 층 수를 줄인다.
+
 동작: `fully_connected`에 `engine=htp`가 붙으면 `FloatTensor::dot`(`float_tensor.cpp:1031`)이
 M>1에서 `gemm_q4_0_accel_fp32`(FastRPC 1콜, `mm_u8i4_layer`)로, M==1에서는 CPU Q4_0으로
 간다 (`accelerates_q4_0_at_m1()==false`). **decode는 안 바뀐다.** 가중치는 파일의 Q4_0x4

@@ -196,10 +196,12 @@ Tensor Lfm2Transformer::createConvBlock(const int layer_id, Tensor input) {
     createLayer("custom_multiply", {withKey("name", prefix + "_conv_mul_post"),
                                     withKey("inplace", "true")}));
   Tensor gated_out = out_mul({chunk_1, conv_out});
-  LayerHandle conv_out_proj(
-    createLayer("fully_connected",
-                {withKey("name", prefix + "_conv_out_proj"),
-                 withKey("unit", DIM), withKey("disable_bias", "true")}));
+  LayerHandle conv_out_proj(createLayer(
+    "fully_connected",
+    {withKey("name", prefix + "_conv_out_proj"), withKey("unit", DIM),
+     withKey("disable_bias", "true"),
+     withKey("engine", projEngine(CONV_OUT_PROJ_ENGINE,
+                                  CONV_OUT_PROJ_HTP_LAYERS, layer_id))}));
   Tensor proj_back = conv_out_proj(gated_out);
 
   // Conv residual connection
@@ -339,6 +341,13 @@ void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
       nntr_cfg.value("conv_in_proj_engine", std::string("cpu"));
     CONV_IN_PROJ_HTP_LAYERS = parseLayerIdList(
       nntr_cfg.value("conv_in_proj_htp_layers", std::string("")));
+    CONV_OUT_PROJ_ENGINE =
+      nntr_cfg.value("conv_out_proj_engine", std::string("cpu"));
+    CONV_OUT_PROJ_HTP_LAYERS = parseLayerIdList(
+      nntr_cfg.value("conv_out_proj_htp_layers", std::string("")));
+    FFN_ENGINE = nntr_cfg.value("dense_ffn_engine", std::string("cpu"));
+    FFN_HTP_LAYERS =
+      parseLayerIdList(nntr_cfg.value("dense_ffn_htp_layers", std::string("")));
   } catch (const std::exception &e) {
     throw std::runtime_error(
       std::string("Lfm2Transformer: config parsing error: ") + e.what());

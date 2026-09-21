@@ -88,6 +88,11 @@ public:
   std::set<int> ATTN_PROJ_HTP_LAYERS;
   std::string CONV_IN_PROJ_ENGINE = "cpu";
   std::set<int> CONV_IN_PROJ_HTP_LAYERS;
+  /** Same switch for the conv block's out_proj (conv_out_proj_engine /
+   *  conv_out_proj_htp_layers). The dense FFN's is Transformer::FFN_ENGINE,
+   *  read here from dense_ffn_engine / dense_ffn_htp_layers. */
+  std::string CONV_OUT_PROJ_ENGINE = "cpu";
+  std::set<int> CONV_OUT_PROJ_HTP_LAYERS;
 };
 
 /**

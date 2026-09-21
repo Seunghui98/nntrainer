@@ -39,6 +39,7 @@
 #include <map>
 #include <model.h>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <tensor_api.h>
 #include <utility>
@@ -374,6 +375,12 @@ protected:
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
+  /** Engine of createMlp's three FCs (ffn_up, ffn_gate, ffn_down): "cpu"
+   *  (default) or "htp", bounded to FFN_HTP_LAYERS when that set is not
+   *  empty. A model that wants them accelerated sets these before
+   *  constructModel (LFM2: dense_ffn_engine / dense_ffn_htp_layers, doc 50). */
+  std::string FFN_ENGINE = "cpu";
+  std::set<int> FFN_HTP_LAYERS;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
