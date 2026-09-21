@@ -66,8 +66,9 @@ rough (S < 100 lines, M < 300, L > 300).
 - Add `test/check.js` + `test/run.sh` (generates samples, bundles, runs
   check) and a `test/fixtures/` directory (git-ignored outputs).
 - Acceptance: page renders the three samples with no errors; `__nntr.metrics`
-  on the as-built sample returns `compression` 1.22 +- 0.01 and on the
-  pipelined sample 1.62 +- 0.01 (values from P0).
+  on the as-built sample returns `compression` 1.17 +- 0.03 and on the
+  pipelined sample 1.45 +- 0.05 (the 8-token default sample; the 2-token P0
+  sample gave 1.22 / 1.62).
 
 ### W1. Units-busy strip (S)
 
@@ -117,7 +118,7 @@ rough (S < 100 lines, M < 300, L > 300).
   Range applies per model in *relative* time (same phase index if both
   have phases, else whole trace).
 - Acceptance: as-built vs pipelined shows `HMX ∥ HVX` 0 -> >0 and
-  compression 1.22 -> 1.62; `qkv_proj: dequant i32->f32` mean delta 0 (same
+  compression 1.17 -> 1.45; `qkv_proj: dequant i32->f32` mean delta 0 (same
   work, moved in time).
 
 ### W4. Transport model scatter (M)

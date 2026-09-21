@@ -87,14 +87,7 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--chrome); }
 </div>
 <div class="tl" id="tl"><canvas id="cv"></canvas></div>
 <div class="panel" id="panel">
-  <div class="tabs" role="tablist">
-    <button role="tab" data-tab="sel" aria-selected="true">Selection</button>
-    <button role="tab" data-tab="wall" aria-selected="false">Wall time</button>
-    <button role="tab" data-tab="eng" aria-selected="false">Engines</button>
-    <button role="tab" data-tab="ker" aria-selected="false">Kernels</button>
-    <button role="tab" data-tab="lay" aria-selected="false">Layers</button>
-    <span class="st" id="range-label"></span>
-  </div>
+  <div class="tabs" role="tablist" id="tabs"><span class="st" id="range-label"></span></div>
   <div class="pane" id="pane"></div>
 </div>
 <div id="tip" hidden></div>
@@ -109,103 +102,150 @@ const CAT = {
   'host.cpu': 'cpu', 'host.rpc': 'rpc', 'host.wait': 'wait', 'host.layer': 'frame', 'host.phase': 'frame', 'host.load': 'load',
   'dsp.hmx': 'hmx', 'dsp.hvx': 'hvx', 'dsp.dma': 'dma', 'dsp.sync': 'sync', 'dsp.call': 'frame', 'dsp.entry': 'frame', 'qnn.op': 'cpu',
 };
+const LANES = ['dsp.hmx', 'dsp.hvx', 'dsp.dma'];
+const BUSY_CATS = [...LANES, 'host.cpu'];
 // catapult's general-purpose slice palette (color_scheme.html paletteBase), as chrome://tracing draws them
 const PALETTE = ['rgb(138,113,152)','rgb(175,112,133)','rgb(127,135,225)','rgb(93,163,141)','rgb(115,138,126)','rgb(153,119,131)','rgb(93,155,213)','rgb(116,164,166)','rgb(202,134,113)','rgb(144,139,149)','rgb(155,130,150)','rgb(105,160,167)','rgb(106,151,204)','rgb(133,147,153)','rgb(120,131,206)','rgb(88,152,203)','rgb(131,134,195)','rgb(112,158,150)','rgb(90,153,138)','rgb(93,149,194)'];
 const hash = s => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h; };
-const opOf = e => (e.args && e.args.op) || e.name;
-
-let T = null, view = { t0: 0, t1: 1 }, selected = null, filter = '', range = null, colorBy = 'op', tab = 'sel';
-const cv = $('#cv'), ctx = cv.getContext('2d'), tl = $('#tl');
-const ROW = 17, HDR = 22, LABEL_W = 170, PROC_H = 18, CTR_H = 30;
 const FONT = '11px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+const ROW = 17, HDR = 22, LABEL_W = 170, PROC_H = 18, CTR_H = 30;
 
-// ---------- parse ----------
-function parse(doc) {
+// ---------- state ----------
+let T = null;                      // {models, rows, height, tmin (0), tmax, all, md, phases, flows}
+let view = { t0: 0, t1: 1 };       // relative µs (every model is normalized to start at 0)
+let selected = null, filter = '', range = null, colorBy = 'op', tab = 'sel';
+const collapsed = new Set();
+const cv = $('#cv'), ctx = cv.getContext('2d'), tl = $('#tl');
+
+// ---------- model ----------
+function parseEvents(doc, name) {
   const ev = doc.traceEvents || doc;
   const procs = new Map();
   const P = pid => procs.get(pid) || (procs.set(pid, { pid, name: 'pid ' + pid, sort: pid, threads: new Map() }), procs.get(pid));
   const TH = (pid, tid) => { const p = P(pid); return p.threads.get(tid) || (p.threads.set(tid, { pid, tid, name: 'tid ' + tid, sort: tid, ev: [], depth: 1 }), p.threads.get(tid)); };
-  const flows = new Map(), counters = new Map();
+  const flowMap = new Map(), counters = new Map();
   let tmin = Infinity, tmax = -Infinity;
+  const push = (th, x) => { th.ev.push(x); tmin = Math.min(tmin, x.ts); tmax = Math.max(tmax, x.ts + x.dur); };
   for (const e of ev) {
     if (e.ph === 'M') {
       if (e.name === 'process_name') P(e.pid).name = e.args.name;
       else if (e.name === 'process_sort_index') P(e.pid).sort = e.args.sort_index;
       else if (e.name === 'thread_name') TH(e.pid, e.tid).name = e.args.name;
       else if (e.name === 'thread_sort_index') TH(e.pid, e.tid).sort = e.args.sort_index;
-    } else if (e.ph === 'X') {
-      TH(e.pid, e.tid).ev.push(e); tmin = Math.min(tmin, e.ts); tmax = Math.max(tmax, e.ts + e.dur);
-    } else if (e.ph === 'B' || e.ph === 'E') {
+    } else if (e.ph === 'X') push(TH(e.pid, e.tid), { ...e });
+    else if (e.ph === 'B' || e.ph === 'E') {
       const th = TH(e.pid, e.tid); th._st = th._st || [];
-      if (e.ph === 'B') th._st.push(e); else { const b = th._st.pop(); if (b) { const x = { ...b, ph: 'X', dur: e.ts - b.ts }; th.ev.push(x); tmin = Math.min(tmin, x.ts); tmax = Math.max(tmax, e.ts); } }
+      if (e.ph === 'B') th._st.push(e); else { const b = th._st.pop(); if (b) push(th, { ...b, ph: 'X', dur: e.ts - b.ts }); }
     } else if (e.ph === 'b' || e.ph === 'e') {
       const th = TH(e.pid, e.tid); th._as = th._as || new Map();
-      if (e.ph === 'b') th._as.set(e.id, e); else { const b = th._as.get(e.id); if (b) { th.ev.push({ ...b, ph: 'X', dur: e.ts - b.ts }); th._as.delete(e.id); } }
+      if (e.ph === 'b') th._as.set(e.id, e); else { const b = th._as.get(e.id); if (b) { push(th, { ...b, ph: 'X', dur: e.ts - b.ts }); th._as.delete(e.id); } }
     } else if (e.ph === 's' || e.ph === 'f') {
-      const f = flows.get(e.id) || (flows.set(e.id, {}), flows.get(e.id)); f[e.ph] = e;
+      const f = flowMap.get(e.id) || (flowMap.set(e.id, {}), flowMap.get(e.id)); f[e.ph] = { ...e };
     } else if (e.ph === 'C') {
       const key = e.pid + ':' + e.name;
       const c = counters.get(key) || (counters.set(key, { pid: e.pid, name: e.name, pts: [] }), counters.get(key));
       c.pts.push([e.ts, +Object.values(e.args)[0]]);
     }
   }
+  if (!isFinite(tmin)) tmin = 0;
+  const flows = [...flowMap.values()].filter(f => f.s && f.f);
+  for (const f of flows) { f.s.ts -= tmin; f.f.ts -= tmin; }
+  for (const c of counters.values()) { for (const p of c.pts) p[0] -= tmin; c.pts.sort((a, b) => a[0] - b[0]); }
   for (const p of procs.values()) for (const th of p.threads.values()) {
+    for (const e of th.ev) e.ts -= tmin;
     th.ev.sort((a, b) => a.ts - b.ts || b.dur - a.dur);
     const st = []; let maxd = 0;
-    for (const e of th.ev) {
+    th.ev.forEach((e, i) => {
       while (st.length && st[st.length - 1].ts + st[st.length - 1].dur <= e.ts + 1e-6) st.pop();
       e._d = st.length; maxd = Math.max(maxd, e._d); st.push(e);
-      e._cat = CAT[e.cat] || 'sync'; e._th = th; e._op = opOf(e);
+      e._cat = CAT[e.cat] || 'sync'; e._th = th; e._i = i;
+      e._op = (e.args && e.args.op) || e.name;
       e._label = e.args && e.args.op && !e.name.includes(e.args.op) ? e.args.op + ': ' + e.name : e.name;
-    }
+    });
     th.depth = maxd + 1;
   }
-  for (const c of counters.values()) c.pts.sort((a, b) => a[0] - b[0]);
   const plist = [...procs.values()].sort((a, b) => a.sort - b.sort);
   for (const p of plist) p.tlist = [...p.threads.values()].sort((a, b) => a.sort - b.sort);
-  const rows = []; let y = HDR;
-  for (const p of plist) {
-    rows.push({ kind: 'proc', p, y, h: PROC_H }); y += PROC_H;
-    for (const th of p.tlist) { const h = ROW * th.depth + 3; rows.push({ kind: 'th', th, y, h }); th._y = y; th._h = h; y += h; }
-    for (const c of counters.values()) if (c.pid === p.pid) { rows.push({ kind: 'ctr', c, y, h: CTR_H }); c._y = y; y += CTR_H; }
-  }
   const all = plist.flatMap(p => p.tlist.flatMap(t => t.ev));
   const phases = all.filter(e => e.cat === 'host.phase').sort((a, b) => a.ts - b.ts);
-  return { procs: plist, rows, height: y + 6, tmin, tmax, flows: [...flows.values()].filter(f => f.s && f.f), counters: [...counters.values()], md: doc.metadata || {}, phases, all };
+  return { name, procs: plist, tmin: 0, tmax: tmax - tmin, flows, counters: [...counters.values()], md: doc.metadata || {}, phases, all };
 }
+
+function layoutRows(models) {
+  const rows = []; let y = HDR;
+  models.forEach((m, mi) => {
+    for (const p of m.procs) {
+      const pkey = mi + ':' + p.pid, pc = collapsed.has(pkey);
+      rows.push({ kind: 'proc', p, m, key: pkey, y, h: PROC_H, collapsed: pc }); y += PROC_H;
+      if (pc) continue;
+      for (const th of p.tlist) {
+        const tkey = pkey + ':' + th.tid, depth = collapsed.has(tkey) ? 1 : th.depth;
+        const h = ROW * depth + 3; rows.push({ kind: 'th', th, m, key: tkey, y, h, depth }); th._y = y; th._h = h; y += h;
+      }
+      for (const c of m.counters) if (c.pid === p.pid) { rows.push({ kind: 'ctr', c, m, y, h: CTR_H }); c._y = y; y += CTR_H; }
+    }
+  });
+  return { rows, height: y + 6 };
+}
+
+function buildT(models) {
+  const m = models[0], L = layoutRows(models);
+  T = { models, rows: L.rows, height: L.height, tmin: 0, tmax: Math.max(...models.map(x => x.tmax)), all: m.all, md: m.md, phases: m.phases, flows: m.flows, procs: m.procs };
+}
+function relayout() { const L = layoutRows(T.models); T.rows = L.rows; T.height = L.height; resize(); draw(); }
 
 // ---------- interval math ----------
 function union(iv) { iv = iv.filter(x => x[1] > x[0]).sort((a, b) => a[0] - b[0]); const o = []; for (const x of iv) { const l = o[o.length - 1]; if (l && x[0] <= l[1]) l[1] = Math.max(l[1], x[1]); else o.push([x[0], x[1]]); } return o; }
 const len = iv => iv.reduce((s, x) => s + x[1] - x[0], 0);
-function inter(a, b) { const o = []; let i = 0, j = 0; while (i < a.length && j < b.length) { const lo = Math.max(a[i][0], b[j][0]), hi = Math.min(a[i][1], b[j][1]); if (hi > lo) o.push([lo, hi]); if (a[i][1] < b[j][1]) i++; else j++; } return o; }
-function minus(a, b) { const o = []; for (const [x0, x1] of a) { let c = x0; for (const [y0, y1] of b) { if (y1 <= c) continue; if (y0 >= x1) break; if (y0 > c) o.push([c, y0]); c = Math.max(c, y1); } if (c < x1) o.push([c, x1]); } return o; }
+const EPS = 1e-6; // µs; slices are written with 3 decimals, so anything below this is float residue
+function inter(a, b) { const o = []; let i = 0, j = 0; while (i < a.length && j < b.length) { const lo = Math.max(a[i][0], b[j][0]), hi = Math.min(a[i][1], b[j][1]); if (hi > lo + EPS) o.push([lo, hi]); if (a[i][1] < b[j][1]) i++; else j++; } return o; }
+function minus(a, b) { const o = []; for (const [x0, x1] of a) { let c = x0; for (const [y0, y1] of b) { if (y1 <= c + EPS) continue; if (y0 >= x1 - EPS) break; if (y0 > c + EPS) o.push([c, y0]); c = Math.max(c, y1); } if (c < x1 - EPS) o.push([c, x1]); } return o; }
 const clip = (e, r) => [Math.max(e.ts, r.t0), Math.min(e.ts + e.dur, r.t1)];
-const spans = (pred, r) => union(T.all.filter(e => pred(e) && e.ts < r.t1 && e.ts + e.dur > r.t0).map(e => clip(e, r)));
+const inRange = (e, r) => e.ts < r.t1 && e.ts + e.dur > r.t0;
+const spans = (pred, r, all = T.all) => union(all.filter(e => pred(e) && inRange(e, r)).map(e => clip(e, r)));
 const fmt = us => us >= 1000 ? (us / 1000).toFixed(3) + ' ms' : us.toFixed(3) + ' µs';
 const pct = x => (x * 100).toFixed(1) + '%';
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
-function metrics(r) {
+// ---------- metrics ----------
+function metrics(r, all = T.all) {
   const wall = r.t1 - r.t0;
-  const hmx = spans(e => e.cat === 'dsp.hmx', r), hvx = spans(e => e.cat === 'dsp.hvx', r), dma = spans(e => e.cat === 'dsp.dma', r);
-  const entry = spans(e => e.cat === 'dsp.entry', r), any = union([...hmx, ...hvx, ...dma]);
-  const rpc = spans(e => e.cat === 'host.rpc', r), cpu = spans(e => e.cat === 'host.cpu', r), load = spans(e => e.cat === 'host.load', r);
+  const hmx = spans(e => e.cat === 'dsp.hmx', r, all), hvx = spans(e => e.cat === 'dsp.hvx', r, all), dma = spans(e => e.cat === 'dsp.dma', r, all);
+  const entry = spans(e => e.cat === 'dsp.entry', r, all), any = union([...hmx, ...hvx, ...dma]);
+  const rpc = spans(e => e.cat === 'host.rpc', r, all), cpu = spans(e => e.cat === 'host.cpu', r, all), load = spans(e => e.cat === 'host.load', r, all);
   const overlap = inter(hmx, hvx), idle = minus(entry, any);
   const other = wall - len(union([...cpu, ...rpc, ...any, ...idle, ...load]));
   const occ = [];
-  for (const p of T.procs) for (const th of p.tlist) {
-    const c = th.ev.find(e => ['dsp.hmx', 'dsp.hvx', 'dsp.dma', 'host.cpu'].includes(e.cat)); if (!c) continue;
-    occ.push({ th, cat: c._cat, busy: len(spans(e => e._th === th && ['dsp.hmx', 'dsp.hvx', 'dsp.dma', 'host.cpu'].includes(e.cat), r)) / wall });
+  const threads = new Set(all.map(e => e._th));
+  for (const th of threads) {
+    const c = th.ev.find(e => BUSY_CATS.includes(e.cat)); if (!c) continue;
+    occ.push({ th, cat: c._cat, busy: len(spans(e => e._th === th && BUSY_CATS.includes(e.cat), r, all)) / wall });
   }
+  occ.sort((a, b) => a.th.pid - b.th.pid || a.th.sort - b.th.sort);
   return { wall, cpu: len(cpu), rpc: len(rpc), hmxOnly: len(minus(hmx, hvx)), hvxOnly: len(minus(hvx, hmx)), overlap: len(overlap), dmaOnly: len(minus(dma, union([...hmx, ...hvx]))), idle: len(idle), load: len(load), other: Math.max(0, other), any: len(any), entry: len(entry), compression: len(any) ? (len(hmx) + len(hvx) + len(dma)) / len(any) : 0, occ };
 }
-function kernels(r) {
-  const m = new Map(), mhz = T.md.dsp_clock_mhz || 1200;
-  for (const e of T.all) {
-    if (!e.args || !e.args.engine || !e.args.elems || !['dsp.hmx', 'dsp.hvx'].includes(e.cat) || e.ts >= r.t1 || e.ts + e.dur <= r.t0) continue;
+function kernels(r, all = T.all, md = T.md) {
+  const m = new Map(), mhz = md.dsp_clock_mhz || 1200;
+  for (const e of all) {
+    if (!e.args || !e.args.engine || !e.args.elems || !['dsp.hmx', 'dsp.hvx'].includes(e.cat) || !inRange(e, r)) continue;
     const k = e.args.engine + '|' + e._label, row = m.get(k) || (m.set(k, { engine: e.args.engine, name: e._label, n: 0, us: 0, elems: 0, cyc: 0 }), m.get(k));
     row.n++; row.us += e.dur; row.elems += e.args.elems; row.cyc += e.args.cycles || 0;
   }
   return [...m.values()].map(k => ({ ...k, cpe: (k.cyc || k.us * mhz) / k.elems })).sort((a, b) => b.us - a.us);
+}
+function layerRows(r, all = T.all) {
+  return all.filter(e => e.cat === 'host.layer' && inRange(e, r)).map(e => ({ e, m: metrics({ t0: Math.max(e.ts, r.t0), t1: Math.min(e.ts + e.dur, r.t1) }, all) }));
+}
+function metricsJSON(r = range) {
+  const m = metrics(r);
+  return {
+    schema: 'nntr_trace.metrics.v1', range: { label: r.label, t0_us: r.t0, t1_us: r.t1 }, wall_us: m.wall,
+    buckets: { cpu: m.cpu, rpc: m.rpc, hmx_only: m.hmxOnly, overlap: m.overlap, hvx_only: m.hvxOnly, dma_only: m.dmaOnly, dsp_idle: m.idle, load: m.load, other: m.other },
+    compression: m.compression, idle_ratio: m.entry ? m.idle / m.entry : 0,
+    engines: m.occ.map(o => ({ track: o.th.name, busy: o.busy })),
+    kernels: kernels(r).map(k => ({ engine: k.engine, name: k.name, calls: k.n, total_us: k.us, mean_us: k.us / k.n, elems: k.elems, cy_per_elem: k.cpe })),
+    layers: layerRows(r).map(({ e, m }) => ({ name: e.name, phase: e.args && e.args.phase || null, wall_us: e.dur, cpu: m.cpu, rpc: m.rpc, hmx_only: m.hmxOnly, overlap: m.overlap, hvx_only: m.hvxOnly, dma_only: m.dmaOnly, dsp_idle: m.idle })),
+  };
 }
 
 // ---------- colors ----------
@@ -228,54 +268,55 @@ function fitText(s, w) {
   while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ctx.measureText(s.slice(0, mid) + '…').width <= w) lo = mid; else hi = mid - 1; }
   return lo > 0 ? s.slice(0, lo) + '…' : '';
 }
+const xOf = t => LABEL_W + (t - view.t0) * (tl.clientWidth - LABEL_W) / (view.t1 - view.t0);
+const tOf = x => view.t0 + (x - LABEL_W) * (view.t1 - view.t0) / (tl.clientWidth - LABEL_W);
+
 function drawGutter(W, H) {
   ctx.fillStyle = css('--chrome'); ctx.fillRect(0, HDR, LABEL_W - 1, H - HDR);
   for (const row of T.rows) {
-    if (row.kind === 'proc') { ctx.fillStyle = css('--proc'); ctx.fillRect(0, row.y, W, row.h); ctx.fillStyle = css('--ink'); ctx.font = 'bold ' + FONT; ctx.fillText('▾ ' + row.p.name + ' (pid ' + row.p.pid + ')', 6, row.y + row.h / 2); ctx.font = FONT; }
-    else if (row.kind === 'ctr') { ctx.fillStyle = css('--ink-2'); ctx.fillText(row.c.name, 14, row.y + row.h / 2); }
+    if (row.kind === 'proc') { ctx.fillStyle = css('--proc'); ctx.fillRect(0, row.y, W, row.h); ctx.fillStyle = css('--ink'); ctx.font = 'bold ' + FONT; ctx.fillText((row.collapsed ? '▸ ' : '▾ ') + (T.models.length > 1 ? row.m.name + ' · ' : '') + row.p.name + ' (pid ' + row.p.pid + ')', 6, row.y + row.h / 2); ctx.font = FONT; }
+    else if (row.kind === 'ctr') { ctx.fillStyle = css('--ink-2'); ctx.fillText(fitText(row.c.name, LABEL_W - 20), 14, row.y + row.h / 2); }
     else { ctx.fillStyle = css('--ink-2'); ctx.fillText(fitText(row.th.name + ' (' + row.th.tid + ')', LABEL_W - 20), 14, row.y + row.h / 2); }
   }
   ctx.strokeStyle = css('--line'); ctx.beginPath(); ctx.moveTo(LABEL_W - .5, HDR); ctx.lineTo(LABEL_W - .5, H); ctx.stroke();
 }
+function drawCounter(row, W) {
+  const pts = row.c.pts, mx = Math.max(1, ...pts.map(p => p[1]));
+  ctx.fillStyle = PALETTE[hash(row.c.name) % PALETTE.length];
+  for (let i = 0; i < pts.length; i++) {
+    const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : view.t1; if (t1 < view.t0 || t0 > view.t1) continue;
+    const x0 = Math.max(LABEL_W, xOf(t0)), x1 = Math.min(W, xOf(t1)), h = (row.h - 6) * pts[i][1] / mx;
+    ctx.fillRect(x0, row.y + row.h - 3 - h, Math.max(1, x1 - x0), h);
+  }
+}
 function draw() {
   if (!T) return;
-  const W = tl.clientWidth, H = T.height, pw = W - LABEL_W, span = view.t1 - view.t0, k = pw / span, X = t => LABEL_W + (t - view.t0) * k;
+  const W = tl.clientWidth, H = T.height, pw = W - LABEL_W, span = view.t1 - view.t0;
   ctx.clearRect(0, 0, W, H); ctx.fillStyle = css('--bg'); ctx.fillRect(0, 0, W, H);
   ctx.font = FONT; ctx.textBaseline = 'middle';
-  if (range && (range.t0 > T.tmin || range.t1 < T.tmax)) { ctx.fillStyle = css('--ovl'); const a = Math.max(LABEL_W, X(range.t0)), b = Math.min(W, X(range.t1)); if (b > a) ctx.fillRect(a, HDR, b - a, H - HDR); }
+  if (range && (range.t0 > T.tmin || range.t1 < T.tmax)) { ctx.fillStyle = css('--ovl'); const a = Math.max(LABEL_W, xOf(range.t0)), b = Math.min(W, xOf(range.t1)); if (b > a) ctx.fillRect(a, HDR, b - a, H - HDR); }
   // ruler
   ctx.fillStyle = css('--ruler'); ctx.fillRect(0, 0, W, HDR);
   const step = niceStep(span, pw), ms = span > 2000;
   ctx.lineWidth = 1;
   for (let t = Math.ceil(view.t0 / step) * step; t <= view.t1; t += step) {
-    const x = Math.round(X(t)) + .5; if (x < LABEL_W) continue;
+    const x = Math.round(xOf(t)) + .5; if (x < LABEL_W) continue;
     ctx.strokeStyle = css('--grid'); ctx.beginPath(); ctx.moveTo(x, HDR); ctx.lineTo(x, H); ctx.stroke();
     ctx.strokeStyle = css('--line'); ctx.beginPath(); ctx.moveTo(x, HDR - 6); ctx.lineTo(x, HDR); ctx.stroke();
-    const rel = t - T.tmin; ctx.fillStyle = css('--ink-2'); ctx.fillText(ms ? (rel / 1000).toFixed(step >= 1000 ? 0 : 2) + ' ms' : rel.toFixed(0) + ' µs', x + 3, HDR / 2 - 2);
+    ctx.fillStyle = css('--ink-2'); ctx.fillText(ms ? (t / 1000).toFixed(step >= 1000 ? 0 : 2) + ' ms' : t.toFixed(0) + ' µs', x + 3, HDR / 2 - 2);
   }
   ctx.strokeStyle = css('--line'); ctx.beginPath(); ctx.moveTo(0, HDR - .5); ctx.lineTo(W, HDR - .5); ctx.stroke();
   const q = filter.toLowerCase();
-  const matches = e => !q || e._label.toLowerCase().includes(q) || (e.args && Object.values(e.args).some(v => String(v).toLowerCase().includes(q)));
   for (const row of T.rows) {
     if (row.kind === 'proc') continue;
-    if (row.kind === 'ctr') {
-      const pts = row.c.pts, mx = Math.max(1, ...pts.map(p => p[1]));
-      ctx.fillStyle = PALETTE[hash(row.c.name) % PALETTE.length];
-      for (let i = 0; i < pts.length; i++) {
-        const t0 = pts[i][0], t1 = i + 1 < pts.length ? pts[i + 1][0] : view.t1; if (t1 < view.t0 || t0 > view.t1) continue;
-        const x0 = Math.max(LABEL_W, X(t0)), x1 = Math.min(W, X(t1)), h = (row.h - 6) * pts[i][1] / mx;
-        ctx.fillRect(x0, row.y + row.h - 3 - h, Math.max(1, x1 - x0), h);
-      }
-      ctx.strokeStyle = css('--grid'); ctx.beginPath(); ctx.moveTo(LABEL_W, row.y + row.h - .5); ctx.lineTo(W, row.y + row.h - .5); ctx.stroke();
-      continue;
-    }
+    if (row.kind === 'ctr') { drawCounter(row, W); ctx.strokeStyle = css('--grid'); ctx.beginPath(); ctx.moveTo(LABEL_W, row.y + row.h - .5); ctx.lineTo(W, row.y + row.h - .5); ctx.stroke(); continue; }
     const th = row.th;
     ctx.strokeStyle = css('--grid'); ctx.beginPath(); ctx.moveTo(LABEL_W, row.y + row.h - .5); ctx.lineTo(W, row.y + row.h - .5); ctx.stroke();
     for (const e of th.ev) {
-      if (e.ts > view.t1 || e.ts + e.dur < view.t0) continue;
-      const x0 = X(e.ts), x1 = X(e.ts + e.dur), w = x1 - x0; if (w < .3) continue;
+      if (e.ts > view.t1 || e.ts + e.dur < view.t0 || e._d >= row.depth) continue;
+      const x0 = xOf(e.ts), x1 = xOf(e.ts + e.dur), w = x1 - x0; if (w < .3) continue;
       const y = row.y + 1 + e._d * ROW, h = ROW - 1, xa = Math.max(LABEL_W, x0), xb = Math.min(W, x1);
-      const dim = q && !matches(e);
+      const dim = q && !matches(e, q);
       ctx.globalAlpha = dim ? .25 : 1;
       ctx.fillStyle = sliceColor(e);
       const isFrame = e._cat === 'frame' || e._cat === 'wait';
@@ -286,12 +327,12 @@ function draw() {
       ctx.globalAlpha = 1;
     }
   }
-  if (k > 0.002) {
+  if (pw / span > 0.002) {
     ctx.strokeStyle = css('--ink-2'); ctx.fillStyle = css('--ink-2'); ctx.lineWidth = 1; ctx.globalAlpha = .8;
-    for (const f of T.flows) {
+    for (const m of T.models) for (const f of m.flows) {
       const a = f.s, b = f.f; if (b.ts < view.t0 || a.ts > view.t1) continue;
-      const ta = T.procs.find(p => p.pid === a.pid)?.threads.get(a.tid), tb = T.procs.find(p => p.pid === b.pid)?.threads.get(b.tid); if (!ta || !tb) continue;
-      const x0 = X(a.ts), y0 = ta._y + ROW / 2 + 1, x1 = X(b.ts), y1 = tb._y + ROW / 2 + 1;
+      const ta = m.procs.find(p => p.pid === a.pid)?.threads.get(a.tid), tb = m.procs.find(p => p.pid === b.pid)?.threads.get(b.tid); if (!ta || !tb || ta._y == null || tb._y == null) continue;
+      const x0 = xOf(a.ts), y0 = ta._y + ROW / 2 + 1, x1 = xOf(b.ts), y1 = tb._y + ROW / 2 + 1;
       ctx.beginPath(); ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + 16, y0, x1 - 16, y1, x1, y1); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - 5, y1 - 3); ctx.lineTo(x1 - 5, y1 + 3); ctx.closePath(); ctx.fill();
     }
@@ -299,53 +340,74 @@ function draw() {
   }
   drawGutter(W, H);
 }
+const matches = (e, q) => !q || e._label.toLowerCase().includes(q) || (e.args && Object.values(e.args).some(v => String(v).toLowerCase().includes(q)));
 
-// ---------- analysis panel ----------
+// ---------- analysis tabs ----------
 const swatch = e => `<span class="sw" style="background:${sliceColor(e)}"></span>`;
-function renderPane() {
-  const r = range, m = metrics(r), pane = $('#pane');
-  $('#range-label').textContent = `${r.label} · ${fmt(m.wall)}`;
-  for (const b of document.querySelectorAll('.tabs button')) b.setAttribute('aria-selected', b.dataset.tab === tab);
-  const bg = p => p[0] === 'ovl' ? 'repeating-linear-gradient(135deg,var(--hmx) 0 4px,var(--hvx) 4px 8px)' : 'var(--' + p[0] + ')';
-  if (tab === 'sel') {
+const bucketBg = k => k === 'ovl' ? 'repeating-linear-gradient(135deg,var(--hmx) 0 4px,var(--hvx) 4px 8px)' : 'var(--' + k + ')';
+const stackHTML = (parts, total, extra = '') => `<span class="stack" style="${extra}">${parts.map(p => `<i title="${esc(p[1])} ${fmt(p[2])}" style="width:${p[2] / total * 100}%;background:${bucketBg(p[0])}"></i>`).join('')}</span>`;
+const buckets = m => [['cpu', 'CPU (host)', m.cpu], ['rpc', 'FastRPC seam', m.rpc], ['hmx', 'HMX only', m.hmxOnly], ['ovl', 'HMX ∥ HVX', m.overlap], ['hvx', 'HVX only', m.hvxOnly], ['dma', 'DMA only', m.dmaOnly], ['sync', 'DSP idle', m.idle], ['load', 'weight load', m.load], ['frame', 'other / gaps', m.other]].filter(p => p[2] > 0);
+
+const TABS = [
+  { id: 'sel', label: 'Selection', render(pane) {
     const e = selected;
     if (!e) { pane.innerHTML = '<span class="hint">Nothing selected. Click a slice.</span>'; return; }
     const a = e.args || {}, mhz = T.md.dsp_clock_mhz || 1200;
-    const rows = [['Title', swatch(e) + e._label], ['Category', e.cat], ['Track', `${e._th.name} · pid ${e.pid} tid ${e.tid}`], ['Start', fmt(e.ts - T.tmin)], ['Wall Duration', fmt(e.dur)]];
+    const rows = [['Title', swatch(e) + esc(e._label)], ['Category', e.cat], ['Track', `${esc(e._th.name)} · pid ${e.pid} tid ${e.tid}`], ['Start', fmt(e.ts)], ['Wall Duration', fmt(e.dur)]];
     if (a.elems) rows.push(['cycles / element', (a.cycles ? a.cycles / a.elems : e.dur * mhz / a.elems).toFixed(3) + (a.cycles ? '' : ' (est. from ' + mhz + ' MHz)')]);
     const same = T.all.filter(x => x._label === e._label), tot = same.reduce((s, x) => s + x.dur, 0);
     rows.push(['Occurrences', `${same.length} · total ${fmt(tot)} · mean ${fmt(tot / same.length)}`]);
     pane.innerHTML = `<table>${rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table>` +
-      (Object.keys(a).length ? `<div style="margin-top:8px"><b>Args</b><table>${Object.entries(a).map(([k, v]) => `<tr><td class="k">${k}</td><td class="mono">${v}</td></tr>`).join('')}</table></div>` : '');
-  } else if (tab === 'wall') {
-    const parts = [['cpu', 'CPU (host)', m.cpu], ['rpc', 'FastRPC seam', m.rpc], ['hmx', 'HMX only', m.hmxOnly], ['ovl', 'HMX ∥ HVX', m.overlap], ['hvx', 'HVX only', m.hvxOnly], ['dma', 'DMA only', m.dmaOnly], ['sync', 'DSP idle', m.idle], ['load', 'weight load', m.load], ['frame', 'other / gaps', m.other]].filter(p => p[2] > 0);
-    pane.innerHTML = `<div class="stack">${parts.map(p => `<i title="${p[1]} ${fmt(p[2])}" style="width:${p[2] / m.wall * 100}%;background:${bg(p)}"></i>`).join('')}</div>
-      <table style="margin-top:8px"><tr><th></th><th>bucket</th><th class="n">time</th><th class="n">share</th></tr>${parts.map(p => `<tr><td><span class="sw" style="background:${bg(p)}"></span></td><td>${p[1]}</td><td class="n">${fmt(p[2])}</td><td class="n">${pct(p[2] / m.wall)}</td></tr>`).join('')}
+      (Object.keys(a).length ? `<div style="margin-top:8px"><b>Args</b><table>${Object.entries(a).map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join('')}</table></div>` : '');
+  } },
+  { id: 'wall', label: 'Wall time', render(pane, m) {
+    const parts = buckets(m);
+    pane.innerHTML = `<div class="stack" style="display:flex">${parts.map(p => `<i title="${esc(p[1])} ${fmt(p[2])}" style="width:${p[2] / m.wall * 100}%;background:${bucketBg(p[0])}"></i>`).join('')}</div>
+      <table style="margin-top:8px"><tr><th></th><th>bucket</th><th class="n">time</th><th class="n">share</th></tr>${parts.map(p => `<tr><td><span class="sw" style="background:${bucketBg(p[0])}"></span></td><td>${p[1]}</td><td class="n">${fmt(p[2])}</td><td class="n">${pct(p[2] / m.wall)}</td></tr>`).join('')}
       <tr><td></td><td>parallel compression</td><td class="n">${m.compression.toFixed(2)}×</td><td class="k">Σ(HMX+HVX+DMA busy) ÷ DSP wall · QNN optrace 4.1×</td></tr>
       <tr><td></td><td>idle inside DSP calls</td><td class="n">${pct(m.entry ? m.idle / m.entry : 0)}</td><td class="k">QNN 0.09 %</td></tr></table>`;
-  } else if (tab === 'eng') {
-    pane.innerHTML = `<table><tr><th>track</th><th style="width:320px">busy</th><th class="n">%</th></tr>${m.occ.map(o => `<tr><td>${o.th.name}</td><td><span class="stack" style="max-width:320px;height:10px"><i style="width:${o.busy * 100}%;background:var(--${o.cat})"></i></span></td><td class="n">${pct(o.busy)}</td></tr>`).join('')}</table>`;
-  } else if (tab === 'ker') {
-    const ks = kernels(r);
+  } },
+  { id: 'eng', label: 'Engines', render(pane, m) {
+    pane.innerHTML = `<table><tr><th>track</th><th style="width:320px">busy</th><th class="n">%</th></tr>${m.occ.map(o => `<tr><td>${esc(o.th.name)}</td><td><span class="stack" style="max-width:320px;height:10px"><i style="width:${o.busy * 100}%;background:var(--${o.cat})"></i></span></td><td class="n">${pct(o.busy)}</td></tr>`).join('')}</table>`;
+  } },
+  { id: 'ker', label: 'Kernels', render(pane) {
+    const ks = kernels(range);
     pane.innerHTML = `<table><tr><th>engine</th><th>kernel (op: name)</th><th class="n">calls</th><th class="n">total</th><th class="n">mean</th><th class="n">elems</th><th class="n">cy/elem</th><th></th></tr>` +
-      ks.slice(0, 30).map(k => `<tr class="click" data-k="${k.name.replace(/"/g, '&quot;')}"><td>${k.engine}</td><td>${k.name}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td>${k.cpe > 1 ? '<span class="pill crit">pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">outlier</span>' : ''}</td></tr>`).join('') +
+      ks.slice(0, 30).map(k => `<tr class="click" data-k="${esc(k.name)}"><td>${k.engine}</td><td>${esc(k.name)}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td>${k.cpe > 1 ? '<span class="pill crit">pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">outlier</span>' : ''}</td></tr>`).join('') +
       `</table><p class="hint">cy/elem = Σcycles ÷ Σelems (args.cycles, else dur × ${T.md.dsp_clock_mhz || 1200} MHz). QNN optrace: HMX 0.01–0.06, HVX elementwise 0.07–0.10, softmax 0.24, pathological 1.52.</p>`;
-    for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { filter = tr.dataset.k.split(': ').pop(); $('#search').value = filter; draw(); };
-  } else if (tab === 'lay') {
-    const L = T.all.filter(e => e.cat === 'host.layer' && e.ts < r.t1 && e.ts + e.dur > r.t0), mx = Math.max(1, ...L.map(e => e.dur));
-    pane.innerHTML = `<table><tr><th>layer</th><th>phase</th><th style="width:420px">CPU · RPC · HMX · HVX · DMA · idle</th><th class="n">wall</th></tr>` + L.slice(0, 60).map(e => {
-      const lm = metrics({ t0: Math.max(e.ts, r.t0), t1: Math.min(e.ts + e.dur, r.t1) });
-      const ps = [['cpu', lm.cpu], ['rpc', lm.rpc], ['hmx', lm.hmxOnly], ['ovl', lm.overlap], ['hvx', lm.hvxOnly], ['dma', lm.dmaOnly], ['sync', lm.idle], ['frame', lm.other]].filter(p => p[1] > 0);
-      return `<tr class="click" data-t0="${e.ts}" data-t1="${e.ts + e.dur}"><td>${e.name}</td><td class="k">${e.args && e.args.phase || ''}</td><td><span class="stack" style="width:${e.dur / mx * 100}%;min-width:30px;height:10px">${ps.map(p => `<i title="${p[0]} ${fmt(p[1])}" style="width:${p[1] / lm.wall * 100}%;background:${bg(p)}"></i>`).join('')}</span></td><td class="n">${fmt(e.dur)}</td></tr>`;
-    }).join('') + '</table><p class="hint">Click a row to zoom the timeline to that layer.</p>';
-    for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { view = { t0: +tr.dataset.t0, t1: +tr.dataset.t1 }; draw(); };
+    for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { setFilter(tr.dataset.k.split(': ').pop()); };
+  } },
+  { id: 'lay', label: 'Layers', render(pane) {
+    const L = layerRows(range), mx = Math.max(1, ...L.map(x => x.e.dur));
+    pane.innerHTML = `<table><tr><th>layer</th><th>phase</th><th style="width:420px">CPU · RPC · HMX · HVX · DMA · idle</th><th class="n">wall</th></tr>` + L.slice(0, 60).map(({ e, m: lm }) =>
+      `<tr class="click" data-t0="${e.ts}" data-t1="${e.ts + e.dur}"><td>${esc(e.name)}</td><td class="k">${esc(e.args && e.args.phase || '')}</td><td>${stackHTML(buckets(lm), lm.wall, `width:${e.dur / mx * 100}%;min-width:30px;height:10px`)}</td><td class="n">${fmt(e.dur)}</td></tr>`).join('') +
+      '</table><p class="hint">Click a row to zoom the timeline to that layer.</p>';
+    for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { setView(+tr.dataset.t0, +tr.dataset.t1); };
+  } },
+];
+function renderTabs() {
+  const tabs = $('#tabs'), st = $('#range-label');
+  for (const b of tabs.querySelectorAll('button')) b.remove();
+  for (const t of TABS) {
+    if (t.enabled && !t.enabled()) continue;
+    const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'tab'); b.dataset.tab = t.id; b.textContent = t.label;
+    b.setAttribute('aria-selected', t.id === tab); b.onclick = () => { tab = t.id; renderPane(); }; tabs.insertBefore(b, st);
   }
+}
+function renderPane() {
+  if (!T) return;
+  const m = metrics(range), pane = $('#pane');
+  $('#range-label').textContent = `${range.label} · ${fmt(m.wall)}`;
+  renderTabs();
+  const t = TABS.find(x => x.id === tab) || TABS[0]; tab = t.id;
+  for (const b of document.querySelectorAll('#tabs button')) b.setAttribute('aria-selected', b.dataset.tab === tab);
+  t.render(pane, m);
 }
 
 // ---------- interaction ----------
 function hit(mx, my) {
   if (!T || mx < LABEL_W) return null;
-  const k = (tl.clientWidth - LABEL_W) / (view.t1 - view.t0), t = view.t0 + (mx - LABEL_W) / k;
+  const t = tOf(mx);
   for (const row of T.rows) {
     if (row.kind !== 'th' || my < row.y || my >= row.y + row.h) continue;
     const d = Math.floor((my - row.y - 1) / ROW); let best = null;
@@ -354,9 +416,14 @@ function hit(mx, my) {
   }
   return null;
 }
+function rowAt(my) { return T.rows.find(r => my >= r.y && my < r.y + r.h); }
 function fit() { view = { t0: T.tmin, t1: T.tmax }; draw(); }
+function setView(t0, t1) { view = { t0, t1 }; draw(); }
 function zoom(f, at) { const span = Math.max(10, Math.min((T.tmax - T.tmin) * 1.5, (view.t1 - view.t0) * f)); const t = at ?? (view.t0 + view.t1) / 2, r = (t - view.t0) / (view.t1 - view.t0); view.t0 = t - r * span; view.t1 = view.t0 + span; draw(); }
 function pan(f) { const d = (view.t1 - view.t0) * f; view.t0 += d; view.t1 += d; draw(); }
+function select(e) { selected = e; tab = 'sel'; renderPane(); draw(); }
+function setFilter(s) { filter = s; $('#search').value = s; draw(); }
+function setRange(r) { range = r; renderPane(); draw(); }
 let drag = null;
 cv.addEventListener('pointerdown', ev => { drag = { x: ev.clientX, t0: view.t0, t1: view.t1, moved: false }; cv.setPointerCapture(ev.pointerId); });
 cv.addEventListener('pointermove', ev => {
@@ -364,15 +431,22 @@ cv.addEventListener('pointermove', ev => {
   if (drag) { const dx = ev.clientX - drag.x; if (Math.abs(dx) > 2) drag.moved = true; const k = (tl.clientWidth - LABEL_W) / (drag.t1 - drag.t0); view.t0 = drag.t0 - dx / k; view.t1 = drag.t1 - dx / k; draw(); return; }
   const e = hit(mx, my), tip = $('#tip');
   if (!e) { tip.hidden = true; return; }
-  tip.textContent = `${e._label}\n${fmt(e.dur)}  @ ${fmt(e.ts - T.tmin)}\n${e._th.name}` + Object.entries(e.args || {}).slice(0, 8).map(([k, v]) => `\n${k}: ${v}`).join('');
+  tip.textContent = `${e._label}\n${fmt(e.dur)}  @ ${fmt(e.ts)}\n${e._th.name}` + Object.entries(e.args || {}).slice(0, 8).map(([k, v]) => `\n${k}: ${v}`).join('');
   tip.hidden = false; tip.style.left = Math.min(window.innerWidth - 400, ev.clientX + 12) + 'px'; tip.style.top = (ev.clientY + 14) + 'px';
 });
-cv.addEventListener('pointerup', ev => { if (drag && !drag.moved) { const r = cv.getBoundingClientRect(); selected = hit(ev.clientX - r.left, ev.clientY - r.top); tab = 'sel'; renderPane(); draw(); } drag = null; });
+cv.addEventListener('pointerup', ev => {
+  if (drag && !drag.moved) {
+    const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top, row = rowAt(my);
+    if (row && row.kind === 'proc') { collapsed.has(row.key) ? collapsed.delete(row.key) : collapsed.add(row.key); relayout(); }
+    else select(hit(mx, my));
+  }
+  drag = null;
+});
 cv.addEventListener('pointerleave', () => { $('#tip').hidden = true; });
 cv.addEventListener('wheel', ev => {
   if (!ev.ctrlKey && !ev.metaKey && Math.abs(ev.deltaY) < Math.abs(ev.deltaX)) return;
   ev.preventDefault(); const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left; if (mx < LABEL_W) return;
-  const k = (tl.clientWidth - LABEL_W) / (view.t1 - view.t0); zoom(Math.exp(ev.deltaY * 0.0015), view.t0 + (mx - LABEL_W) / k);
+  zoom(Math.exp(ev.deltaY * 0.0015), tOf(mx));
 }, { passive: false });
 cv.addEventListener('dblclick', fit);
 document.addEventListener('keydown', ev => {
@@ -383,18 +457,18 @@ document.addEventListener('keydown', ev => {
 $('#reset').onclick = fit;
 $('#search').oninput = ev => { filter = ev.target.value.trim(); draw(); };
 $('#color-select').onchange = ev => { colorBy = ev.target.value; draw(); renderPane(); };
-$('#range-select').onchange = ev => { const v = ev.target.value; range = v === 'all' ? { t0: T.tmin, t1: T.tmax, label: 'whole trace' } : (e => ({ t0: e.ts, t1: e.ts + e.dur, label: e.name }))(T.phases[+v]); renderPane(); draw(); };
-for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => { tab = b.dataset.tab; renderPane(); };
+$('#range-select').onchange = ev => { const v = ev.target.value; setRange(v === 'all' ? { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' } : (e => ({ t0: e.ts, t1: e.ts + e.dur, label: e.name, kind: 'phase', index: +v }))(T.phases[+v])); };
 $('#file').onchange = ev => { const f = ev.target.files[0]; if (!f) return; f.text().then(txt => { load(JSON.parse(txt), f.name); const o = document.createElement('option'); o.value = '__file'; o.textContent = f.name; $('#trace-select').append(o); $('#trace-select').value = '__file'; }); };
 window.addEventListener('resize', () => { if (T) { resize(); draw(); } });
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());
 new MutationObserver(() => draw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
+// ---------- load ----------
 function load(doc, label) {
-  T = parse(doc); selected = null; filter = ''; $('#search').value = '';
+  buildT([parseEvents(doc, label)]); selected = null; filter = ''; $('#search').value = '';
   const md = T.md; $('#subtitle').textContent = [md.model, md.device].filter(Boolean).join(' · ') || label;
-  $('#range-select').innerHTML = '<option value="all">Range: whole trace</option>' + T.phases.map((e, i) => `<option value="${i}">Range: ${e.name}</option>`).join('');
-  range = { t0: T.tmin, t1: T.tmax, label: 'whole trace' };
+  $('#range-select').innerHTML = '<option value="all">Range: whole trace</option>' + T.phases.map((e, i) => `<option value="${i}">Range: ${esc(e.name)}</option>`).join('');
+  range = { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' };
   resize(); fit(); renderPane();
 }
 const EMB = JSON.parse($('#embedded-traces').textContent || '{}'), sel = $('#trace-select');
@@ -402,5 +476,8 @@ for (const k of Object.keys(EMB)) { const o = document.createElement('option'); 
 sel.onchange = () => { if (EMB[sel.value]) load(EMB[sel.value], sel.value); };
 const first = Object.keys(EMB)[0];
 if (first) load(EMB[first], first); else { sel.hidden = true; $('#pane').innerHTML = '<span class="hint">Load a trace.json to begin.</span>'; }
+
+// test / automation surface (VIEWER_PLAN.md W0)
+window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); } };
 })();
 </script>
