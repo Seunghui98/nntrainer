@@ -48,6 +48,7 @@
 #include <htp_backend.h>
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
+#include <htp_trace.h>
 #include <htp_wh_layout.h>
 #include <swiglu_det.h>
 
@@ -200,8 +201,9 @@ public:
         .count());
   }
 
-  void addRegister(uint64_t total_us, uint64_t convert_us, uint64_t rpc_us,
-                   bool ion) {
+  void addRegister(uint64_t t0_us, uint64_t total_us, uint64_t convert_us,
+                   uint64_t rpc_us, bool ion, unsigned K, unsigned N) {
+    HtpTrace::global().registration(t0_us, total_us, convert_us, rpc_us, K, N);
     std::lock_guard<std::mutex> lock(mutex_);
     ++reg_calls_;
     reg_total_us_ += total_us;
@@ -211,8 +213,21 @@ public:
       ++reg_ion_calls_;
   }
 
-  void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
-                 const uint32_t *stage_us) {
+  /** @brief Activation and result bytes a call moved, from its shape: an f32
+   *  activation in, one f32 M x N block per handle out. Close enough for the
+   *  trace's transport fit; the u8in entries move a quarter of the input. */
+  static uint64_t bytesIn(unsigned M, unsigned K) {
+    return static_cast<uint64_t>(M) * K * sizeof(float);
+  }
+  static uint64_t bytesOut(unsigned M, unsigned N, unsigned n_handles) {
+    return static_cast<uint64_t>(M) * N * n_handles * sizeof(float);
+  }
+
+  void addInvoke(unsigned M, unsigned K, unsigned N, unsigned n_handles,
+                 uint64_t t0_us, uint64_t host_us, const uint32_t *stage_us) {
+    HtpTrace::global().call(HtpTrace::KIND_FC, M, K, N, n_handles, t0_us,
+                            host_us, stage_us, HTP_N_STAGES, bytesIn(M, K),
+                            bytesOut(M, N, n_handles));
     std::lock_guard<std::mutex> lock(mutex_);
     Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
     ++b.calls;
@@ -230,8 +245,11 @@ public:
   /** Same buckets as addInvoke -- the fused call has its own K/N shape (the
    * down matmul's output width, not gate_up's), so it lands in its own row
    * and the two-dot path's numbers stay directly comparable across builds. */
-  void addInvokeFused(unsigned M, unsigned K, unsigned N, uint64_t host_us,
-                      const uint32_t *stage_us) {
+  void addInvokeFused(unsigned M, unsigned K, unsigned N, uint64_t t0_us,
+                      uint64_t host_us, const uint32_t *stage_us) {
+    HtpTrace::global().call(HtpTrace::KIND_FUSED, M, K, N, 2, t0_us, host_us,
+                            stage_us, HTP_FU_N_STAGES, bytesIn(M, K),
+                            bytesOut(M, N, 1));
     std::lock_guard<std::mutex> lock(mutex_);
     Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
     ++b.calls;
@@ -253,7 +271,12 @@ public:
    * so this row is directly comparable to what a plain (unfused) gate_up
    * dot() would have shown for the same layer. */
   void addInvokeGateUpSwiglu(unsigned M, unsigned K, unsigned N_gate_up,
-                             uint64_t host_us, const uint32_t *stage_us) {
+                             uint64_t t0_us, uint64_t host_us,
+                             const uint32_t *stage_us) {
+    HtpTrace::global().call(HtpTrace::KIND_GATE_UP, M, K, N_gate_up, 1, t0_us,
+                            host_us, stage_us, HTP_GU_N_STAGES, bytesIn(M, K),
+                            /* u8 AH result stays on the host scratch */
+                            static_cast<uint64_t>(M) * (N_gate_up / 2));
     std::lock_guard<std::mutex> lock(mutex_);
     Bucket &b = buckets_[std::make_tuple(K, N_gate_up, M == 1)];
     ++b.calls;
@@ -281,7 +304,11 @@ public:
    *  the first run of this call put 104.8 ms in a bucket ACC_READ and the
    *  scatter shared, and the profile could not say which. */
   void addInvokeMoeLayer(unsigned M, unsigned K, unsigned N_out,
-                         uint64_t host_us, const uint32_t *stage_us) {
+                         unsigned n_experts, uint64_t t0_us, uint64_t host_us,
+                         const uint32_t *stage_us) {
+    HtpTrace::global().call(HtpTrace::KIND_MOE, M, K, N_out, n_experts, t0_us,
+                            host_us, stage_us, HTP_MOE_N_STAGES, bytesIn(M, K),
+                            bytesOut(M, N_out, 1));
     std::lock_guard<std::mutex> lock(mutex_);
     Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1)];
     ++b.calls;
@@ -315,7 +342,8 @@ public:
    *  stays a FastRPC number), which meant it was invisible -- and at this
    *  model's shapes it is ~0.9 MB per expert, 64 times per layer. Counted
    *  here so "HTP host time" stops understating what the path costs. */
-  void addStaging(uint64_t us, uint64_t bytes) {
+  void addStaging(uint64_t t0_us, uint64_t us, uint64_t bytes) {
+    HtpTrace::global().staging(t0_us, us, bytes);
     std::lock_guard<std::mutex> lock(mutex_);
     staging_us_ += us;
     staging_bytes_ += bytes;
@@ -379,12 +407,17 @@ private:
   HtpProfile() {
     const char *env = std::getenv("NNTR_HTP_PROFILE");
     level_ = (env != nullptr) ? std::atoi(env) : 0;
+    // NNTR_TRACE wants the per-call DSP breakdown, which only the timed
+    // entry points return, so it implies profile level 2 (htp_trace.h).
+    if (HtpTrace::global().enabled() && level_ < 2)
+      level_ = 2;
     // Captured at construction, not at static-destruction time in dump():
     // HtpProfile::global() is always reached through a HtpBackend::global()
     // call first (every accelerated entry point fetches the session handle
     // before it ever touches the profile), so construction order is safe;
     // destruction order is not something to lean on for a second singleton.
     qos_mode_ = HtpBackend::global().qosMode();
+    HtpTrace::global().setMeta(level_, qos_mode_);
   }
 
   static double ms(uint64_t us) { return static_cast<double>(us) / 1000.0; }
@@ -633,7 +666,7 @@ inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
   }
   const uint64_t t0 = HtpProfile::nowUs();
   std::memcpy(dst, src, bytes);
-  p.addStaging(HtpProfile::nowUs() - t0, bytes);
+  p.addStaging(t0, HtpProfile::nowUs() - t0, bytes);
 }
 
 } // namespace
@@ -1322,7 +1355,8 @@ private:
                                " failed: err=" + std::to_string(err) + shape());
     }
     copyOut(matCdata, out_cat, M, N, blocks);
-    profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
+    profile.addInvoke(M, K, N, num_handles, t0, elapsed,
+                      timed ? stage_us : nullptr);
   }
 
   /** @brief Same call as invokeLayer, but the activation is quantized and
@@ -1391,7 +1425,8 @@ private:
     }
     stagedMemcpy(matCdata, out_cat,
                  static_cast<size_t>(out_len) * sizeof(float));
-    profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
+    profile.addInvoke(M, K, N, num_handles, t0, elapsed,
+                      timed ? stage_us : nullptr);
   }
 
   /** @brief The fused MoE expert FFN call: gate_up -> SwiGLU -> down in one
@@ -1444,7 +1479,7 @@ private:
     }
     stagedMemcpy(matCdata, out_f32,
                  static_cast<size_t>(out_len) * sizeof(float));
-    profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
+    profile.addInvokeFused(M, K, N, t0, elapsed, timed ? stage_us : nullptr);
   }
 
   /** @brief [doc 46] One call for the whole layer.
@@ -1486,6 +1521,9 @@ private:
     // and the same contention, and the output is unchanged because the
     // input is.
     const int reps = (profile.level() >= 3) ? 5 : 1;
+    // The trace places the call at the first rep's start; with reps > 1 the
+    // fastest rep's stages describe a call that ran later in that window.
+    const uint64_t t_call = profile.level() ? HtpProfile::nowUs() : 0;
     uint64_t best_elapsed = UINT64_MAX;
     int err = AEE_SUCCESS;
     for (int rep = 0; rep < reps && err == AEE_SUCCESS; ++rep) {
@@ -1540,8 +1578,8 @@ private:
     }
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
     if (profile.level()) {
-      profile.addInvokeMoeLayer(M, K, N_out, elapsed,
-                                timed ? stage_us : nullptr);
+      profile.addInvokeMoeLayer(M, K, N_out, static_cast<unsigned>(h_gu.size()),
+                                t_call, elapsed, timed ? stage_us : nullptr);
     }
   }
 
@@ -1611,7 +1649,7 @@ private:
     if (l2CheckEnabled())
       l2CheckFinite("gate_up_swiglu out_scale", act_scale_scratch_.data(),
                     m_pad, M, K, 2 * inter);
-    profile.addInvokeGateUpSwiglu(M, K, 2 * inter, elapsed,
+    profile.addInvokeGateUpSwiglu(M, K, 2 * inter, t0, elapsed,
                                   timed ? stage_us : nullptr);
   }
 
@@ -1676,7 +1714,8 @@ private:
       l2CheckFinite("down out", out_cat, static_cast<size_t>(out_len), M, K, N);
     stagedMemcpy(matCdata, out_cat,
                  static_cast<size_t>(out_len) * sizeof(float));
-    profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
+    profile.addInvoke(M, K, N, num_handles, t0, elapsed,
+                      timed ? stage_us : nullptr);
   }
 
   uint32_t get_or_register(void *matAdata, remote_handle64 session, uint32_t K,
@@ -2260,8 +2299,8 @@ private:
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0 && t_begin != 0)
-      profile.addRegister(HtpProfile::nowUs() - t_begin, /*convert_us=*/0,
-                          rpc_us, /*ion=*/true);
+      profile.addRegister(t_begin, HtpProfile::nowUs() - t_begin,
+                          /*convert_us=*/0, rpc_us, /*ion=*/true, K, N);
     return handle;
   }
 
@@ -2291,8 +2330,8 @@ private:
     }
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0) {
-      profile.addRegister(HtpProfile::nowUs() - t_begin, convert_us, rpc_us,
-                          q_w4_i8.isIon());
+      profile.addRegister(t_begin, HtpProfile::nowUs() - t_begin, convert_us,
+                          rpc_us, q_w4_i8.isIon(), K, N);
     }
 
     // Kept resident for the process lifetime -- Stage 6 (residency, see

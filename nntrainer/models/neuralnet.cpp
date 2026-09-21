@@ -60,6 +60,9 @@
 #include <safetensors_util.h>
 #include <slice_realizer.h>
 #include <util_func.h>
+#if defined(ENABLE_HEXKL)
+#include <htp_trace.h>
+#endif
 
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
@@ -1564,7 +1567,17 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
   PROFILE_TIME_START(nn_foward);
 
+#if defined(ENABLE_HEXKL)
+  // One phase span per call (prefill, or one decode token) so the HTP trace
+  // can group its FastRPC calls by token. Off unless NNTR_TRACE is set.
+  const uint64_t trace_t0 =
+    HtpTrace::global().enabled() ? HtpTrace::nowUs() : 0;
+#endif
   out = incremental_forwarding(from, to, X, label, false);
+#if defined(ENABLE_HEXKL)
+  if (trace_t0 != 0)
+    HtpTrace::global().phase(trace_t0, HtpTrace::nowUs() - trace_t0, from, to);
+#endif
 
   PROFILE_TIME_END(nn_foward);
 
