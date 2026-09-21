@@ -79,6 +79,39 @@ prefill 896 / 888 ms   decode 20.63 / 20.55 TPS   등록 1478 = MoE 1408 + in_pr
   이전이다. in_proj 콜 4.35 ms(dsp 3.21, transport 1.13 — 앞 실행 0.85~0.96보다 높다, 드리프트),
   decode 콜 1.51/transport 157 불변. dense 콜은 여전히 12~21 ms 범위 추정 → **재빌드 뒤 B로 다시**.
 
+### 1.4 B 실행 — dense 콜 10.4 ms, 기대 10.5 그대로 (2026-09-21)
+
+config B(`dense_ffn_engine`만), 8스레드, PROFILE=2, 재빌드 후 1회:
+
+```
+prefill 1000 ms   decode 20.50 TPS   등록 1424 = MoE 1408 + dense 16 (전부 아레나)
+  M>1 dense   calls=3  rows=1400 (444×2 + 워밍업 512)  blocks=88 (28+28+32)
+              host 10428 us/call  dsp 10015 (96%)  transport 413
+              [mm 5605  acc 1915  dequant 931  requant 534  stage 356  quant 272  gather 162  scatter 83]
+  M>1 MoE     calls=23  host 17029  dsp 14998  transport 2031        ← 오늘 드리프트(앞 실행 15.7~16.3)
+  M==1 MoE    host 1513  transport 158                                ← 불변
+```
+
+| | 기대 (§1.2) | 측정 |
+|---|---:|---:|
+| dsp / 콜 | 8.6 | 10.0 |
+| host / 콜 | 9.7 | 10.4 |
+| 블록당 mm | — | 191 us (MoE 행 8637/45.2 = 191, **같다**) |
+| 블록당 dsp 전체 | 252 | 342 (MoE 행 332) |
+
+- **"블록 한 콜" 논리가 예측대로 나온다.** 블록당 비용이 MoE 콜과 같고(mm 191, 전체 ≈340), dense 콜 =
+  28블록 × 340 + 고정 0.5 ≈ 10.0. §1.2의 252는 mm+acc만 센 값이었고 dequant·requant·stage를 더하면 340.
+  커널 무변경으로 다른 블록을 실어도 비용이 블록 수에 비례한다 — conv 블록(§2) 산술의 근거.
+- **손익: 층당 ARM ≈19.5(39.1 GFLOP @ 2 TFLOPS) → HTP 10.4 + 스테이징 0.4 = −8.7, 2층 −17 ms.** 벽시계
+  (1000)는 오늘 A의 921~1013 안이라 보이지 않는다 — §1.2가 예고한 대로 dense는 2층뿐이라 작다.
+- transport 413은 in_proj 콜(850~1130)의 절반 — 활성 3.6 MB만 오가서다. MoE 콜 2031은 gather/scatter의
+  row_index까지 실어서.
+- 텍스트 네 번째 변형(A와 다르고 C와도 다름). 재양자화 지점 2층 추가 = 토큰 변화, §3의 로짓 게이트 필요.
+- decode 불변 — dense 레이어의 M=1 CPU 경로가 세 FC와 바이트 동일하다는 것의 실측 확인.
+
+**판정: dense 융합은 유지한다.** 이득은 −17이지만 비용이 예측과 맞는 것이 conv 블록 −115의 전제였고,
+그 전제가 섰다.
+
 ## 2. conv 블록 상주 — 설계
 
 ### 2.1 무엇을 한 콜로
