@@ -43,12 +43,35 @@ bash tools/nntr_trace/test/run.sh                         # before committing
 - **Warnings banner.** CPU fallbacks (`args.fallback`, drawn hatched),
   dropped records (`metadata.dropped`), clock-sync violations and a disabled
   HTP backend are listed under the toolbar.
-- **Analysis tabs.** Selection (title, track, duration, cy/elem, args),
-  Wall time (buckets: CPU, FastRPC seam, HMX only, HMX ∥ HVX, HVX only, DMA
-  only, DSP idle, load, other; parallel compression; idle inside DSP calls;
-  CPU fallbacks), Engines (busy per track), Kernels (`op: name` rows with
-  cycles/element and outlier flags; click to filter), Layers (per-layer
-  stack; click to zoom).
+- **Analysis tabs.** Selection (title, track, duration, cy/elem, MACs, TOPS
+  and share of `metadata.hmx_peak_tops` when known, args), Wall time
+  (buckets: CPU, FastRPC seam, HMX only, HMX ∥ HVX, HVX only, DMA only, DSP
+  idle, load, other; parallel compression; idle inside DSP calls; CPU
+  fallbacks; copy the metrics JSON), Engines (busy per track, and the HVX
+  pool tail per fork-join kind against the `units ≥ threads × 4` rule),
+  Kernels (`op: name` rows with cycles/element, TOPS and outlier flags;
+  click to filter), Layers (per-layer stack and numbers; click to zoom),
+  Transport (FastRPC seam time against payload bytes, least-squares
+  fixed + per-MB fit, outliers beyond 2σ; click to select the call), Tokens
+  (per-token bars stacked by CPU / FastRPC / DSP busy / other, calls per
+  token, TTFT and median token time; click to zoom). Tables have Copy and
+  Download CSV buttons.
+
+## summarize.py
+
+The same metrics from the command line, for the device gate:
+
+```bash
+python3 tools/nntr_trace/summarize.py trace.json -o metrics.json
+python3 tools/nntr_trace/summarize.py trace.json --range phase:1
+python3 tools/nntr_trace/summarize.py trace.json --fail-if 'compression<1.5' --fail-if 'idle_ratio>0.05'
+```
+
+`test/test_summarize.py` holds it to the viewer's numbers (1e-6 relative)
+on the sample, so the two cannot drift. Schema `nntr_trace.metrics.v1`:
+`range`, `wall_us`, `buckets`, `compression`, `idle_ratio`, `engines`,
+`kernels`, `layers`, `tokens`, `token_summary`, `transport`, `pool_tail`,
+`warnings`, `hmx_peak_tops`.
 
 ## Format
 
