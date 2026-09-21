@@ -137,6 +137,36 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   await page.goto('file://' + path.resolve(page_path));
   await page.waitForFunction(() => window.__nntr && window.__nntr.model());
 
+  // W3: A/B compare (as built vs pipelined)
+  await use(asBuilt);
+  await page.selectOption('#cmp-select', pipelined); await page.waitForTimeout(80);
+  let w3 = await page.evaluate(() => { const T = window.__nntr.model(); return { n: T.models.length, names: T.models.map(m => m.name), rows: T.rows.length, tabs: [...document.querySelectorAll('#tabs button')].map(b => b.dataset.tab) }; });
+  ok(w3.n === 2 && /^A: /.test(w3.names[0]) && /^B: /.test(w3.names[1]) && w3.tabs.includes('cmp'), `W3 compare loads B (${w3.names.join(' | ')}), Compare tab present`);
+  await page.evaluate(() => window.__nntr.tab('cmp'));
+  const cmpText = await page.$eval('#pane', e => e.innerText);
+  const compLine = cmpText.split('\n').find(l => /parallel compression/.test(l)) || '';
+  ok(/1\.17×\s+1\.45×\s+\+0\.2[0-9]/.test(compLine.replace(/\t/g, ' ')), 'W3 compression A 1.17× -> B 1.45×: ' + compLine.trim());
+  const ovl = cmpText.split('\n').find(l => /HMX ∥ HVX/.test(l)) || '';
+  ok(/HMX ∥ HVX\s+0\.000 µs\s+[1-9]/.test(ovl.replace(/\t/g, ' ')), 'W3 overlap 0 -> >0: ' + ovl.trim());
+  const deq = await page.$$eval('#cmp-kernels tr', trs => trs.map(t => t.innerText).find(t => /qkv_proj: dequant i32->f32/.test(t)) || '');
+  ok(/\t0\.0%\t/.test(deq) || /0\.0%/.test(deq.split('\t')[9] || ''), 'W3 qkv dequant mean delta 0.0%: ' + deq.replace(/\t/g, ' | '));
+  await page.selectOption('#view-select', 'a'); await page.waitForTimeout(50);
+  const rowsA = await page.evaluate(() => window.__nntr.model().rows.length);
+  ok(rowsA < w3.rows, `W3 View: A hides B's rows (${w3.rows} -> ${rowsA})`);
+  await page.selectOption('#cmp-select', ''); await page.waitForTimeout(50);
+  ok((await page.evaluate(() => window.__nntr.model().models.length)) === 1, 'W3 Compare: none restores a single model');
+
+  // W9: QNN optrace fixture converted and shown as pid 3 beside ours
+  const qnn = names.find(n => /^qnn/.test(n));
+  await page.selectOption('#cmp-select', qnn); await page.waitForTimeout(80);
+  const w9 = await page.evaluate(() => { const B = window.__nntr.model().models[1], p = B.procs[0]; return { pid: p.pid, tids: [...p.threads.keys()].sort((a, b) => a - b), n: B.all.length, hmx: B.all.filter(e => e.cat === 'dsp.hmx').length, cls: B.all.map(e => e.args.class), cyc: B.all.every(e => e.args.cycles > 0), softmaxCpe: (() => { const k = window.__nntr.kernels({ t0: 0, t1: B.tmax }); return null; })() }; });
+  ok(w9.pid === 3 && w9.tids.join() === '256,512,513,768' && w9.n === 7 && w9.hmx === 2, `W9 converted optrace: pid ${w9.pid}, tids ${w9.tids.join()}, ${w9.n} slices (views dropped), ${w9.hmx} HMX`);
+  ok(w9.cyc && w9.cls.includes('matmul') && w9.cls.includes('softmax') && w9.cls.includes('transpose') && w9.cls.includes('dma'), `W9 classes and cycles carried over: ${[...new Set(w9.cls)].join(',')}`);
+  const qref = await page.evaluate(() => { const B = window.__nntr.model().models[1]; return window.__nntr.kernelsOf(B).map(k => [k.name, k.cls, +k.cpe.toFixed(2)]); });
+  const sm = qref.find(k => /Softmax/.test(k[0])), tr = qref.find(k => /Transpose/.test(k[0]));
+  ok(sm && sm[1] === 'softmax' && near(sm[2], 0.24, 0.01) && tr && near(tr[2], 0.71, 0.01), `W9 cy/elem from the fixture's cycles: softmax ${sm && sm[2]} (ref 0.24), transpose ${tr && tr[2]} (ref 0.71)`);
+  await page.selectOption('#cmp-select', ''); await page.waitForTimeout(50);
+
   // W0: every tab renders, range select works
   await use(asBuilt);
   for (const id of await page.$$eval('#tabs button', bs => bs.map(b => b.dataset.tab))) {

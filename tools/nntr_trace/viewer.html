@@ -84,6 +84,13 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--chrome); }
   <span class="sp"></span>
   <select id="trace-select" aria-label="Trace"></select>
   <label class="file">Load<input type="file" id="file" accept=".json,application/json"></label>
+  <select id="cmp-select" aria-label="Compare with a second trace"><option value="">Compare: none</option></select>
+  <label class="file" id="file-b-label" hidden>Compare file<input type="file" id="file-b" accept=".json,application/json"></label>
+  <select id="view-select" aria-label="Which traces to show" hidden>
+    <option value="ab">View: A + B</option>
+    <option value="a">View: A</option>
+    <option value="b">View: B</option>
+  </select>
   <select id="color-select" aria-label="Color slices by">
     <option value="op">Color: op</option>
     <option value="name">Color: name</option>
@@ -211,9 +218,11 @@ function counterAt(c, t) { // value of a counter at time t (step function), bina
   return ans < 0 ? 0 : pts[ans][1];
 }
 
+const hiddenModels = new Set(); // W3: model indices hidden by the View select
 function layoutRows(models) {
   const rows = []; let y = HDR;
   models.forEach((m, mi) => {
+    if (hiddenModels.has(mi)) return;
     for (const p of m.procs) {
       const pkey = mi + ':' + p.pid, pc = collapsed.has(pkey);
       rows.push({ kind: 'proc', p, m, key: pkey, y, h: PROC_H, collapsed: pc }); y += PROC_H;
@@ -270,7 +279,7 @@ function kernels(r, all = T.all, md = T.md) {
   const m = new Map(), mhz = md.dsp_clock_mhz || 1200;
   for (const e of all) {
     if (!e.args || !e.args.engine || !e.args.elems || !['dsp.hmx', 'dsp.hvx'].includes(e.cat) || !inRange(e, r)) continue;
-    const k = e.args.engine + '|' + e._label, row = m.get(k) || (m.set(k, { engine: e.args.engine, name: e._label, n: 0, us: 0, elems: 0, cyc: 0, ops: 0 }), m.get(k));
+    const k = e.args.engine + '|' + e._label, row = m.get(k) || (m.set(k, { engine: e.args.engine, name: e._label, cls: e.args.class || null, n: 0, us: 0, elems: 0, cyc: 0, ops: 0 }), m.get(k));
     row.n++; row.us += e.dur; row.elems += e.args.elems; row.cyc += e.args.cycles || 0; row.ops += opsOf(e) || 0;
   }
   return [...m.values()].map(k => ({ ...k, cpe: (k.cyc || k.us * mhz) / k.elems, tops: k.ops ? k.ops / k.us / 1e6 : null })).sort((a, b) => b.us - a.us);
@@ -589,8 +598,8 @@ const TABS = [
   } },
   { id: 'ker', label: 'Kernels', render(pane) {
     const ks = kernels(range);
-    pane.innerHTML = `<table id="ker-table"><tr><th>engine</th><th>kernel (op: name)</th><th class="n">calls</th><th class="n">total</th><th class="n">mean</th><th class="n">elems</th><th class="n">cy/elem</th><th class="n">TOPS</th><th></th></tr>` +
-      ks.slice(0, 40).map(k => `<tr class="click" data-k="${esc(k.name)}"><td>${k.engine}</td><td>${esc(k.name)}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td class="n">${k.tops != null ? k.tops.toFixed(3) : ''}</td><td>${k.cpe > 1 ? '<span class="pill crit">pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">outlier</span>' : ''}</td></tr>`).join('') +
+    pane.innerHTML = `<table id="ker-table"><tr><th>engine</th><th>kernel (op: name)</th><th class="n">calls</th><th class="n">total</th><th class="n">mean</th><th class="n">elems</th><th class="n">cy/elem</th><th class="n">QNN ref</th><th class="n">TOPS</th><th></th></tr>` +
+      ks.slice(0, 40).map(k => `<tr class="click" data-k="${esc(k.name)}"><td>${k.engine}</td><td>${esc(k.name)}</td><td class="n">${k.n}</td><td class="n">${fmt(k.us)}</td><td class="n">${fmt(k.us / k.n)}</td><td class="n">${k.elems.toExponential(2)}</td><td class="n">${k.cpe.toFixed(3)}</td><td class="n" title="${esc(k.cls || '')}">${QNN_REF[k.cls] || ''}</td><td class="n">${k.tops != null ? k.tops.toFixed(3) : ''}</td><td>${k.cpe > 1 ? '<span class="pill crit">pathological</span>' : k.cpe > 0.5 ? '<span class="pill bad">outlier</span>' : ''}</td></tr>`).join('') +
       `</table><p class="hint">cy/elem = Σcycles ÷ Σelems (args.cycles, else dur × ${T.md.dsp_clock_mhz || 1200} MHz). QNN optrace: HMX 0.01–0.06, HVX elementwise 0.07–0.10, softmax 0.24, pathological 1.52. TOPS = Σops ÷ Σdur for HMX rows${T.md.hmx_peak_tops ? ` (peak ${T.md.hmx_peak_tops})` : ' (peak unknown: metadata.hmx_peak_tops is null)'}.</p>`;
     for (const tr of pane.querySelectorAll('tr.click')) tr.onclick = () => { setFilter(tr.dataset.k.split(': ').pop()); };
     pane.append(exportButtons(() => tableCSV(pane.querySelector('#ker-table')), 'kernels.csv'));
@@ -756,6 +765,67 @@ window.addEventListener('resize', () => { if (T) { mmCols = null; resize(); draw
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());
 new MutationObserver(() => draw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
+// ---------- W3: A/B compare, W9: QNN reference ----------
+// ref_16 §3.3 cycles/element by kernel class (QAIRT 2.47 optrace, Qwen3-0.6B attention block)
+const QNN_REF = { matmul: '0.01–0.06', elementwise: '0.07–0.10', softmax: '0.24', transpose: '0.71', quant: '0.07–0.13', dequant: '0.07–0.13', dma: '' };
+function rangeFor(mi) { // the analysis range of model mi, in that model's own relative time
+  const m = T.models[mi]; if (mi === 0) return range;
+  if (range.kind === 'phase' && m.phases[range.index]) { const e = m.phases[range.index]; return { t0: e.ts, t1: e.ts + e.dur, label: e.name, kind: 'phase', index: range.index }; }
+  if (range.kind === 'selection') return { t0: Math.min(range.t0, m.tmax), t1: Math.min(range.t1, m.tmax), label: range.label, kind: 'selection' };
+  return { t0: 0, t1: m.tmax, label: 'whole trace', kind: 'all' };
+}
+function loadB(doc, name) {
+  const A = T.models[0], B = parseEvents(doc, name);
+  A.name = 'A: ' + (A.name || '').replace(/^A: /, ''); B.name = 'B: ' + name;
+  hiddenModels.clear(); buildT([A, B]); mmCols = null; selected = null;
+  $('#view-select').hidden = false; $('#view-select').value = 'ab';
+  resize(); fit(); renderPane();
+}
+function clearB() {
+  if (T.models.length < 2) return;
+  const A = T.models[0]; A.name = A.name.replace(/^A: /, ''); hiddenModels.clear(); buildT([A]); mmCols = null; selected = null;
+  $('#view-select').hidden = true; if (tab === 'cmp') tab = 'sel'; resize(); fit(); renderPane();
+}
+$('#cmp-select').onchange = ev => {
+  const v = ev.target.value; $('#file-b-label').hidden = v !== '__file';
+  if (!v) clearB(); else if (v !== '__file' && EMB[v]) loadB(EMB[v], v);
+};
+$('#file-b').onchange = ev => { const f = ev.target.files[0]; if (!f) return; f.text().then(txt => loadB(JSON.parse(txt), f.name)); };
+$('#view-select').onchange = ev => { hiddenModels.clear(); if (ev.target.value === 'a') hiddenModels.add(1); if (ev.target.value === 'b') hiddenModels.add(0); relayout(); };
+const dpct = (a, b) => a ? (((b - a) / a * 100).toFixed(1) + '%').replace(/^-0\.0%$/, '0.0%') : (b ? '+∞' : '0%');
+const dcell = (a, b) => `<td class="n" style="color:${b > a * 1.02 ? 'var(--critical)' : b < a * 0.98 ? 'var(--good, #0ca30c)' : 'inherit'}">${dpct(a, b)}</td>`;
+TABS.push({ id: 'cmp', label: 'Compare', enabled: () => T && T.models.length > 1, render(pane) {
+  const A = T.models[0], B = T.models[1], rA = rangeFor(0), rB = rangeFor(1);
+  const mA = metrics(rA, A.all), mB = metrics(rB, B.all);
+  const bk = m => [['cpu', 'CPU', m.cpu], ['rpc', 'FastRPC', m.rpc], ['hmx', 'HMX only', m.hmxOnly], ['ovl', 'HMX ∥ HVX', m.overlap], ['hvx', 'HVX only', m.hvxOnly], ['dma', 'DMA only', m.dmaOnly], ['sync', 'DSP idle', m.idle], ['load', 'load', m.load], ['frame', 'other', m.other]];
+  const scale = Math.max(mA.wall, mB.wall);
+  let h = `<p style="margin:0 0 6px"><b>A</b> ${esc(A.name)} (${esc(rA.label)}, ${fmt(mA.wall)}) · <b>B</b> ${esc(B.name)} (${esc(rB.label)}, ${fmt(mB.wall)})</p>`;
+  h += `<div>A ${stackHTML(bk(mA).filter(p => p[2] > 0), scale, 'width:' + (mA.wall / scale * 100) + '%;max-width:700px')}</div><div style="margin-top:3px">B ${stackHTML(bk(mB).filter(p => p[2] > 0), scale, 'width:' + (mB.wall / scale * 100) + '%;max-width:700px')}</div>`;
+  h += `<table style="margin-top:8px"><tr><th>bucket</th><th class="n">A</th><th class="n">B</th><th class="n">Δ</th></tr>` +
+    bk(mA).map((p, i) => `<tr><td><span class="sw" style="background:${bucketBg(p[0])}"></span>${p[1]}</td><td class="n">${fmt(p[2])}</td><td class="n">${fmt(bk(mB)[i][2])}</td>${dcell(p[2], bk(mB)[i][2])}</tr>`).join('') +
+    `<tr><td>wall</td><td class="n">${fmt(mA.wall)}</td><td class="n">${fmt(mB.wall)}</td>${dcell(mA.wall, mB.wall)}</tr>` +
+    `<tr><td>parallel compression</td><td class="n">${mA.compression.toFixed(2)}×</td><td class="n">${mB.compression.toFixed(2)}×</td><td class="n">${(mB.compression - mA.compression >= 0 ? '+' : '') + (mB.compression - mA.compression).toFixed(2)}</td></tr>` +
+    `<tr><td>idle inside DSP calls</td><td class="n">${pct(mA.entry ? mA.idle / mA.entry : 0)}</td><td class="n">${pct(mB.entry ? mB.idle / mB.entry : 0)}</td><td></td></tr>` +
+    `<tr><td>transport share</td><td class="n">${pct(mA.rpc / mA.wall)}</td><td class="n">${pct(mB.rpc / mB.wall)}</td><td></td></tr></table>`;
+  // kernels joined on engine|label
+  const kA = kernels(rA, A.all, A.md), kB = kernels(rB, B.all, B.md), keys = new Map();
+  for (const k of kA) keys.set(k.engine + '|' + k.name, { a: k });
+  for (const k of kB) (keys.get(k.engine + '|' + k.name) || keys.set(k.engine + '|' + k.name, {}).get(k.engine + '|' + k.name)).b = k;
+  const joined = [...keys.values()].map(x => ({ ...x, d: (x.b ? x.b.us : 0) - (x.a ? x.a.us : 0) })).sort((x, y) => Math.abs(y.d) - Math.abs(x.d));
+  const cell = (k, f, dflt = '-') => k ? f(k) : dflt;
+  h += `<h4 style="margin:14px 0 4px">Kernels (joined on engine + op: name, by |Δ total|)</h4><table id="cmp-kernels"><tr><th>engine</th><th>kernel</th><th class="n">calls A</th><th class="n">calls B</th><th class="n">total A</th><th class="n">total B</th><th class="n">Δ total</th><th class="n">mean A</th><th class="n">mean B</th><th class="n">Δ mean</th><th class="n">cy/elem A</th><th class="n">cy/elem B</th></tr>` +
+    joined.slice(0, 40).map(x => { const k = x.a || x.b; return `<tr><td>${k.engine}</td><td>${esc(k.name)}</td><td class="n">${cell(x.a, k => k.n)}</td><td class="n">${cell(x.b, k => k.n)}</td><td class="n">${cell(x.a, k => fmt(k.us))}</td><td class="n">${cell(x.b, k => fmt(k.us))}</td>${x.a && x.b ? dcell(x.a.us, x.b.us) : '<td class="n">-</td>'}<td class="n">${cell(x.a, k => fmt(k.us / k.n))}</td><td class="n">${cell(x.b, k => fmt(k.us / k.n))}</td>${x.a && x.b ? dcell(x.a.us / x.a.n, x.b.us / x.b.n) : '<td class="n">-</td>'}<td class="n">${cell(x.a, k => k.cpe.toFixed(3))}</td><td class="n">${cell(x.b, k => k.cpe.toFixed(3))}</td></tr>`; }).join('') + '</table>';
+  // layers joined on name + phase
+  const lA = layerRows(rA, A.all), lB = layerRows(rB, B.all), lk = new Map();
+  const key = e => e.name + '|' + ((e.args || {}).phase || '');
+  for (const x of lA) lk.set(key(x.e), { a: x });
+  for (const x of lB) (lk.get(key(x.e)) || lk.set(key(x.e), {}).get(key(x.e))).b = x;
+  if (lk.size) h += `<h4 style="margin:14px 0 4px">Layers</h4><table id="cmp-layers"><tr><th>layer</th><th>phase</th><th class="n">wall A</th><th class="n">wall B</th><th class="n">Δ</th></tr>` +
+    [...lk.values()].slice(0, 80).map(x => { const e = (x.a || x.b).e; return `<tr><td>${esc(e.name)}</td><td class="k">${esc((e.args || {}).phase || '')}</td><td class="n">${cell(x.a, y => fmt(y.e.dur))}</td><td class="n">${cell(x.b, y => fmt(y.e.dur))}</td>${x.a && x.b ? dcell(x.a.e.dur, x.b.e.dur) : '<td class="n">-</td>'}</tr>`; }).join('') + '</table>';
+  pane.innerHTML = h;
+  pane.append(exportButtons(() => tableCSV(pane.querySelector('#cmp-kernels')), 'compare_kernels.csv'));
+} });
+
 // ---------- W10: minimap, search navigation ----------
 const mm = $('#mm'), mctx = mm.getContext('2d');
 let mmCols = null; // per pixel column: [dsp busy fraction, host busy fraction], cached per width
@@ -855,6 +925,7 @@ let currentKey = null;
 
 // ---------- load ----------
 function load(doc, label, fromHash) {
+  hiddenModels.clear(); $('#view-select').hidden = true; $('#cmp-select').value = ''; $('#file-b-label').hidden = true; if (tab === 'cmp') tab = 'sel';
   buildT([parseEvents(doc, label)]); selected = null; filter = ''; $('#search').value = ''; currentKey = label; matchIdx = -1; mmCols = null; updateSearchCount([]); collapsed.clear();
   const md = T.md; $('#subtitle').textContent = [md.model, md.device].filter(Boolean).join(' · ') || label;
   $('#range-select').innerHTML = '<option value="all">Range: whole trace</option>' + T.phases.map((e, i) => `<option value="${i}">Range: ${esc(e.name)}</option>`).join('');
@@ -862,13 +933,14 @@ function load(doc, label, fromHash) {
   renderWarnings(); resize(); fit(); renderPane();
 }
 const EMB = JSON.parse($('#embedded-traces').textContent || '{}'), sel = $('#trace-select');
-for (const k of Object.keys(EMB)) { const o = document.createElement('option'); o.value = k; o.textContent = k; sel.append(o); }
+for (const k of Object.keys(EMB)) { const o = document.createElement('option'); o.value = k; o.textContent = k; sel.append(o); const c = document.createElement('option'); c.value = k; c.textContent = 'Compare: ' + k; $('#cmp-select').append(c); }
+{ const c = document.createElement('option'); c.value = '__file'; c.textContent = 'Compare: file…'; $('#cmp-select').append(c); }
 sel.onchange = () => { if (EMB[sel.value]) load(EMB[sel.value], sel.value); };
 const first = Object.keys(EMB)[0];
 if (first) { load(EMB[first], first); applyHash(); } else { sel.hidden = true; $('#pane').innerHTML = '<span class="hint">Load a trace.json to begin.</span>'; }
 window.addEventListener('hashchange', () => { if (T) applyHash(); });
 
 // test / automation surface (VIEWER_PLAN.md W0)
-window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), selected: () => selected, view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); }, counterAt, gotoMatch, fitMatch, setFilter, collapsed, relayout, hash: () => location.hash };
+window.__nntr = { model: () => T, metrics: r => metrics(r || range), kernels: r => kernels(r || range), metricsJSON, setRange, select: e => select(e), selected: () => selected, view: () => view, setView, load, embedded: () => Object.keys(EMB), tab: id => { tab = id; renderPane(); }, counterAt, gotoMatch, fitMatch, setFilter, collapsed, relayout, hash: () => location.hash, kernelsOf: m => kernels({ t0: 0, t1: m.tmax }, m.all, m.md), loadB, clearB };
 })();
 </script>
