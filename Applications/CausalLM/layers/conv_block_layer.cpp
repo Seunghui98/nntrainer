@@ -17,7 +17,6 @@
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
-#include <q4_0_utils.h>
 #include <thread_manager.h>
 
 #include <algorithm>
@@ -35,11 +34,11 @@ enum ConvBlockTensors { PROJ, GATED, CONV_OUT, STATE };
 
 /** NNTR_CONV_BLOCK_DIFF: run both paths at prefill and print the SNR of
  *  the accelerator's output and conv state against the CPU's, per layer.
- *  NNTR_CONV_BLOCK_SHADOW: same, and hand the model the CPU's values --
- *  the text then says whether the accelerator's numbers are what changed
- *  it. The same two discriminators the MoE path has (NNTR_L2_DIFF /
- *  NNTR_L2_SHADOW), for the same reason: wrong text cannot tell a bug
- *  from a quantization point. */
+ *  NNTR_CONV_BLOCK_SHADOW: same, and hand the model the CPU's values. The
+ *  same two discriminators the MoE path has (NNTR_L2_DIFF / NNTR_L2_SHADOW).
+ *  Read the number as "two int4 grids disagree" (doc 51 section 2.14):
+ *  the CPU path is itself Q4_0, so any other int4 recipe reads 10-20 dB
+ *  against it without being worse. Quality is judged by NNTR_PPL. */
 static bool convBlockDiffEnabled() {
   static const bool on = std::getenv("NNTR_CONV_BLOCK_DIFF") != nullptr;
   return on;
@@ -48,128 +47,6 @@ static bool convBlockShadowEnabled() {
   static const bool on = std::getenv("NNTR_CONV_BLOCK_SHADOW") != nullptr;
   return on;
 }
-/** The DSP's per-row u8 rule (hvx_quant_rows_u8_params + the pack), in
- *  f32: min and max over the row with 0 folded in, 255 steps, round to
- *  nearest, then back to f32. Applied to the CPU path's activations it
- *  isolates what the two activation points cost, apart from the weight
- *  recipe (doc 51 section 2.10). */
-static void fakeQuantRowsU8(float *x, unsigned int rows, unsigned int k) {
-  for (unsigned int r = 0; r < rows; ++r) {
-    float *row = x + static_cast<size_t>(r) * k;
-    float lo = 0.f, hi = 0.f;
-    for (unsigned int j = 0; j < k; ++j) {
-      lo = std::min(lo, row[j]);
-      hi = std::max(hi, row[j]);
-    }
-    float s = (hi - lo) / 255.f;
-    if (s <= 0.f)
-      s = 1e-8f;
-    long zp = std::lrint(-lo / s);
-    zp = std::max(0L, std::min(255L, zp));
-    for (unsigned int j = 0; j < k; ++j) {
-      long q = std::lrint(row[j] / s) + zp;
-      q = std::max(0L, std::min(255L, q));
-      row[j] = static_cast<float>(q - zp) * s;
-    }
-  }
-}
-
-/** Mean over rows of max|x| / rms(x): how far the row's largest value sits
- *  above its typical one. Per-row u8 spends its 255 steps on the range, so
- *  this ratio is what decides how many steps the typical value gets. */
-static double outlierRatio(const float *x, unsigned int rows, unsigned int k) {
-  double acc = 0.0;
-  for (unsigned int r = 0; r < rows; ++r) {
-    const float *row = x + static_cast<size_t>(r) * k;
-    double ss = 0.0, mx = 0.0;
-    for (unsigned int j = 0; j < k; ++j) {
-      ss += (double)row[j] * row[j];
-      mx = std::max(mx, std::fabs((double)row[j]));
-    }
-    acc += mx / std::sqrt(ss / k + 1e-30);
-  }
-  return acc / rows;
-}
-
-/* ---- weight-recipe emulation, f32 on the CPU (doc 51 section 2.11) ----
-   What each way of quantizing the two projections' weights would cost,
-   measured before any of them is built on the DSP. The weights come out
-   of the file as Q4_0 (a scale per 32 along K); the DSP path requantizes
-   them at load to one int4 scale per output channel. Each recipe below
-   takes the dequantized f32 weight, quantizes it its own way, and runs
-   the block in f32 with the activations through the DSP's per-row u8
-   rule, so the SNRs are comparable to the accelerator's own. */
-
-/** out[t][n] = sum_k x[t][k] * w[n][k]; w is N rows of K, as
- *  Q4_0Utils::dequantizeQ4_0x4 lays it out. */
-static void emuGemm(const float *x, unsigned int rows, unsigned int K,
-                    const float *w, unsigned int N, float *out) {
-  nntrainer::ThreadManager::Global().parallel_for(
-    0, static_cast<size_t>(rows), [&](size_t t) {
-      const float *xr = x + t * K;
-      float *o = out + t * N;
-      for (unsigned int n = 0; n < N; ++n) {
-        const float *wr = w + static_cast<size_t>(n) * K;
-        float acc = 0.f;
-        for (unsigned int k = 0; k < K; ++k)
-          acc += xr[k] * wr[k];
-        o[n] = acc;
-      }
-    });
-}
-
-/** The load-time rule (htp_qs4cx_from_q4_0x4): per output channel,
- *  scale = 15 / (rmax - rmin) with 0 folded in, round, clamp to [-8, 7]. */
-static void quantChannelsCur(float *w, unsigned int N, unsigned int K) {
-  for (unsigned int n = 0; n < N; ++n) {
-    float *row = w + static_cast<size_t>(n) * K;
-    float lo = 0.f, hi = 0.f;
-    for (unsigned int k = 0; k < K; ++k) {
-      lo = std::min(lo, row[k]);
-      hi = std::max(hi, row[k]);
-    }
-    const float scale = (lo == hi) ? 1.f : 15.f / (hi - lo);
-    for (unsigned int k = 0; k < K; ++k) {
-      long q = std::lrint(row[k] * scale);
-      q = std::max(-8L, std::min(7L, q));
-      row[k] = static_cast<float>(q) / scale;
-    }
-  }
-}
-
-/** Symmetric per channel: step = max|w| / qmax, clamp to [-qmax, qmax]. */
-static void quantChannelsSym(float *w, unsigned int N, unsigned int K,
-                             long qmax) {
-  for (unsigned int n = 0; n < N; ++n) {
-    float *row = w + static_cast<size_t>(n) * K;
-    float mx = 0.f;
-    for (unsigned int k = 0; k < K; ++k)
-      mx = std::max(mx, std::fabs(row[k]));
-    const float step = mx > 0.f ? mx / static_cast<float>(qmax) : 1.f;
-    for (unsigned int k = 0; k < K; ++k) {
-      long q = std::lrint(row[k] / step);
-      q = std::max(-qmax, std::min(qmax, q));
-      row[k] = static_cast<float>(q) * step;
-    }
-  }
-}
-
-/** Symmetric int4 per (channel, K-group of @a B): what the DSP would see
- *  if each K-group were its own registered weight with its own scale,
- *  dequantized and summed in f32. Symmetric, not the load-time rule: that
- *  rule folds 0 into an asymmetric range without a zero point, and on a
- *  small group whose min and max differ it clips one side -- the first
- *  emulation of these groups used it and read WORSE for smaller groups.
- *  B = 32 is Q4_0's own grid, so its row must land on the act-u8-only
- *  number; that is the check on this emulation. */
-static void quantChannelsBlocked(float *w, unsigned int N, unsigned int K,
-                                 unsigned int B) {
-  for (unsigned int n = 0; n < N; ++n)
-    for (unsigned int k0 = 0; k0 < K; k0 += B)
-      quantChannelsSym(w + static_cast<size_t>(n) * K + k0, 1,
-                       std::min(B, K - k0), 7L);
-}
-
 static double snrDb(const float *ref, const float *got, size_t n) {
   double sig = 0.0, err = 0.0;
   for (size_t i = 0; i < n; ++i) {
@@ -403,112 +280,12 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     ops->gemm_q4_0_conv_block_fp32(
       in_w.getData<char>(), w_ptr, out_w.getData<char>(),
       in_step.getData<float>(), h_out.data(), h_state.data(), rows, K, C, N);
-    // The activation points alone: the CPU path again with x and y put
-    // through the DSP's per-row u8 rule (weights still Q4_0). Its SNR
-    // against the reference, next to the accelerator's, says whether the
-    // loss is the activations or the weight recipe.
-    std::vector<float> x_fq(in_step.getData<float>(),
-                            in_step.getData<float>() +
-                              static_cast<size_t>(rows) * K);
-    const double x_ratio = outlierRatio(x_fq.data(), rows, K);
-    fakeQuantRowsU8(x_fq.data(), rows, K);
-    std::vector<float> p_fq(static_cast<size_t>(rows) * 3 * C);
-    nntrainer::gemm_q4_0<float>(rows, 3 * C, K, x_fq.data(), K,
-                                in_w.getData<char>(), 3 * C, p_fq.data(),
-                                3 * C);
-    std::vector<float> g_fq(static_cast<size_t>(rows) * C),
-      y_fq(static_cast<size_t>(rows) * C);
-    for (size_t r = 0; r < rows; ++r) {
-      const float *a = p_fq.data() + r * 3 * C;
-      for (unsigned int j = 0; j < C; ++j)
-        g_fq[r * C + j] = a[j] * a[2 * C + j];
-    }
-    nntrainer::causal_depthwise_conv1d_k3(g_fq.data(), w_ptr, nullptr,
-                                          y_fq.data(), 1, rows, C);
-    for (size_t r = 0; r < rows; ++r) {
-      const float *b = p_fq.data() + r * 3 * C + C;
-      for (unsigned int j = 0; j < C; ++j)
-        y_fq[r * C + j] = b[j] * y_fq[r * C + j];
-    }
-    const double y_ratio = outlierRatio(y_fq.data(), rows, C);
-    const double g_snr = snrDb(g, g_fq.data(), g_fq.size());
-    fakeQuantRowsU8(y_fq.data(), rows, C);
-    std::vector<float> o_fq(static_cast<size_t>(rows) * N);
-    nntrainer::gemm_q4_0<float>(rows, N, C, y_fq.data(), C,
-                                out_w.getData<char>(), N, o_fq.data(), N);
     std::fprintf(stderr,
-                 "[conv_block] %s rows=%u  SNR out %.1f dB  state %.1f dB | "
-                 "act-u8 only: out %.1f g %.1f | outlier max/rms x %.1f "
-                 "y %.1f%s\n",
+                 "[conv_block] %s rows=%u  SNR out %.1f dB  state %.1f dB%s\n",
                  context.getName().c_str(), rows,
                  snrDb(out_step.getData<float>(), h_out.data(), h_out.size()),
                  snrDb(state, h_state.data(), h_state.size()),
-                 snrDb(out_step.getData<float>(), o_fq.data(), o_fq.size()),
-                 g_snr, x_ratio, y_ratio,
                  convBlockShadowEnabled() ? "  (shadow: CPU values used)" : "");
-
-    // The weight recipes, emulated in f32 (see the helpers above). The
-    // accelerator's own row is recipe 0 done for real; if the emulation
-    // of it lands near the measured number the others are trustworthy.
-    {
-      std::vector<float> w_in_f(static_cast<size_t>(3) * C * K);
-      std::vector<float> w_out_f(static_cast<size_t>(N) * C);
-      nntrainer::Q4_0Utils::dequantizeQ4_0x4(
-        in_w.getData<char>(), static_cast<int>(3 * C), static_cast<int>(K),
-        w_in_f.data());
-      nntrainer::Q4_0Utils::dequantizeQ4_0x4(
-        out_w.getData<char>(), static_cast<int>(N), static_cast<int>(C),
-        w_out_f.data());
-      static const char *const names[] = {
-        "cur int4/ch", "blk32(=Q4_0)", "blk64", "blk128", "blk256", "int8/ch"};
-      std::string line = "[conv_block]   recipes (f32 emulation, act u8):";
-      for (int rcp = 0; rcp < 6; ++rcp) {
-        std::vector<float> xr(in_step.getData<float>(),
-                              in_step.getData<float>() +
-                                static_cast<size_t>(rows) * K);
-        std::vector<float> win(w_in_f), wout(w_out_f);
-        auto quant_w = [&](float *w, unsigned int n_out, unsigned int k_in,
-                           float *act, unsigned int act_rows) {
-          (void)act;
-          (void)act_rows;
-          if (rcp >= 1 && rcp <= 4)
-            quantChannelsBlocked(w, n_out, k_in, 32u << (rcp - 1));
-          else if (rcp == 5)
-            quantChannelsSym(w, n_out, k_in, 127L);
-          else
-            quantChannelsCur(w, n_out, k_in);
-        };
-        quant_w(win.data(), 3 * C, K, xr.data(), rows);
-        fakeQuantRowsU8(xr.data(), rows, K);
-        std::vector<float> pr(static_cast<size_t>(rows) * 3 * C);
-        emuGemm(xr.data(), rows, K, win.data(), 3 * C, pr.data());
-        std::vector<float> gr(static_cast<size_t>(rows) * C),
-          yr(static_cast<size_t>(rows) * C);
-        for (size_t r = 0; r < rows; ++r) {
-          const float *a = pr.data() + r * 3 * C;
-          for (unsigned int j = 0; j < C; ++j)
-            gr[r * C + j] = a[j] * a[2 * C + j];
-        }
-        nntrainer::causal_depthwise_conv1d_k3(gr.data(), w_ptr, nullptr,
-                                              yr.data(), 1, rows, C);
-        for (size_t r = 0; r < rows; ++r) {
-          const float *b = pr.data() + r * 3 * C + C;
-          for (unsigned int j = 0; j < C; ++j)
-            yr[r * C + j] = b[j] * yr[r * C + j];
-        }
-        quant_w(wout.data(), N, C, yr.data(), rows);
-        fakeQuantRowsU8(yr.data(), rows, C);
-        std::vector<float> orow(static_cast<size_t>(rows) * N);
-        emuGemm(yr.data(), rows, C, wout.data(), N, orow.data());
-        char buf[96];
-        std::snprintf(
-          buf, sizeof(buf), "  %s out %.1f g %.1f |", names[rcp],
-          snrDb(out_step.getData<float>(), orow.data(), orow.size()),
-          snrDb(g, gr.data(), gr.size()));
-        line += buf;
-      }
-      std::fprintf(stderr, "%s\n", line.c_str());
-    }
     if (!convBlockShadowEnabled()) {
       std::memcpy(out_step.getData<float>(), h_out.data(),
                   h_out.size() * sizeof(float));
