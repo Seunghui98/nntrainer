@@ -157,6 +157,38 @@ memcpy한다(uncached 청크에 nibble RMW를 하면 기어간다). 자리가 �
 100. **둘 다 들어간다, 여유 10~40 MiB.** 로드 로그의 `[HTP-PROFILE] rpcmem/ION buffer` 줄과
 등록 수로 어디에 들어갔는지 읽을 수 있다.
 
+### 3.4 네 번째 실행 — 돌았다. 그리고 이득은 −13 ms다 (2026-09-21)
+
+`NNTR_NUM_THREADS=8`, 444 토큰, in_proj 18층 HTP (attn_proj는 아직 CPU):
+
+```
+PROFILE=0   prefill 835 ms  531.7 TPS   decode 16.45 TPS
+PROFILE=2   prefill 834 ms  532.4 TPS   decode 15.23 TPS
+  K=2048 N=6144 M>1  calls=19 rows=8504  host=3985 us/call  dsp=3203  transport=782
+                      [quant 357  dequant 794  acc 501  drain 58  | mm(rest) 1492]
+  K=2048 N=2048 M>1  calls=23  host=17297  dsp=14917  transport=2380      ← MoE, 전과 같음
+  weights registered 1462 (MoE 1408 + 조각 54, 전부 아레나)
+```
+
+**돌아간다**: 18층 전부 NPU(19콜 = 18 × 444행 + 워밍업 512행), 텍스트 CPU 실행과 동일, decode에
+FC 형상 없음(M=1은 CPU). 콜은 host 4.0 ms — §2의 추정 6.2보다 싸다.
+
+**그런데 prefill은 848 → 835, −13 ms.** §2가 기대한 −65~−100의 1/5이다. 산술은 이렇다:
+
+| | ms |
+|---|---:|
+| HTP in_proj 18층: 콜 3.98 × 18 = 72 + 스테이징 14.5 MB × 18 / 15 GB/s = 17 | **≈ 89** |
+| ARM in_proj 18층 (역산: 89 − 13) | **≈ 100** |
+
+즉 ARM in_proj는 프로파일 빌드가 말한 152~212가 아니라 **≈100 ms** — ggml Q4_0 GEMM이
+N=6144짜리 넓은 행렬에서는 11.2 GFLOP를 5.6 ms(≈2 TFLOPS)에 한다. §2의 ARM 값은 프로파일
+빌드 팽창을 그대로 믿은 것이고, §4의 0단계(비프로파일 ARM 측정)를 건너뛴 대가다. **문서 45의
+결론 그대로다: 포장이 계산보다 크면 옮겨도 남는 게 없다** — 콜 4.9 ms 중 HMX+acc는 2.0.
+
+decode 16.5 vs 이전 20.8은 이 변경과 무관해 보인다(FC decode는 같은 CPU 커널, MoE decode 콜
+1.90 → 2.17 ms는 transport 553 → 814 us가 오른 것 = 호스트 쪽) — 같은 세션에서 스위치 없는
+A 실행이 아직 없어 발열인지 다른 것인지 못 가른다. **A를 먼저 돌린다.**
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`
