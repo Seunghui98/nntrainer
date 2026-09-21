@@ -208,6 +208,43 @@ decode 16.5 vs 이전 20.8은 이 변경과 무관해 보인다(FC decode는 같
 1.90 → 2.17 ms는 transport 553 → 814 us가 오른 것 = 호스트 쪽) — 같은 세션에서 스위치 없는
 A 실행이 아직 없어 발열인지 다른 것인지 못 가른다. **A를 먼저 돌린다.**
 
+### 3.5 다섯 번째 실행 — 전부 켬: 형상별 콜은 잡혔고, 벽시계는 더 나빠졌다 (2026-09-21)
+
+네 스위치 전부 `htp`, 8스레드, PROFILE=2, 앞선 실행 직후(식히지 않음):
+
+```
+prefill 945 ms 469.8 TPS   decode 11.6 TPS   등록 1528 (MoE 1408 + FC 120), 로드 +2.9 s
+  N=512   (wk/wv)        12콜  host 1750 us  dsp  629  transport 1121  [quant 364 dequant 58 acc 56]
+  N=2048  M>1            53콜  = MoE 23 + wq/wo 12 + out_proj 18 → FC 몫 ≈ (488−398)/30 = 3.0 ms/콜
+  N=6144  (in_proj)      19콜  host 4591     dsp 3251  transport 1339   (§3.4에선 3985 / 782)
+  N=7168  (up/gate)       4콜  host 4254     dsp 3609  transport  645  [quant 372 dequant 908 acc 582]
+  K=7168 N=2048 (down)    2콜  host 4076     dsp 3351  transport  726  [quant 1253 dequant 279 acc 193]
+  M==1 MoE decode       9416콜 host 2993     dsp 1360  transport 1633   (09-16: 1910 / 553)
+```
+
+**형상별 판정 (콜 host + 스테이징 vs ARM ≈2 TFLOPS):**
+
+| 그룹 | HTP 실측 | ARM 추정 | 순 |
+|---|---:|---:|---:|
+| wk/wv N=512 ×12 | 21 + 0.5 = **22** | 10–22 | **손해~본전** (§2 예측대로) |
+| wq/wo/out_proj N=2048 ×30 | 90 + 27 = **117** | ≈122 | **본전** |
+| dense up/gate ×4 + down ×2 | 25 + 6.5 = **32** | 39–65 | −7 ~ −33 |
+| in_proj ×18 | 83 + 17 = **100** | ≈100 | 0 (§3.4의 89가 100으로 — transport가 올랐다) |
+
+콜 하나하나는 예측 범위 안이다. down의 K=7168 quant 1.25 ms가 콜의 37% — 활성화 u8 변환이 K에
+비례하고 FC 커널은 그걸 숨기지 못한다.
+
+**그런데 prefill 835 → 945, decode 16.5 → 11.6.** 두 가지가 겹쳐 있다:
+
+1. **transport가 실행마다 오른다.** MoE decode 콜의 dsp는 1.36 ms로 09-16과 같은데 transport는
+   553 → 814 → 1633 us. in_proj도 782 → 1339. transport = ARM 쪽(FastRPC 스택 + 캐시 유지)이다.
+   같은 날 4번 연속 50초짜리 실행 뒤라 **발열로 ARM이 느려진 것**이 첫 후보이고, 등록 핸들 수
+   (1408 → 1528)나 힙 사용량에 FastRPC 콜 비용이 비례하는 것이 둘째 후보다. 스위치 없는 A 실행을
+   **식힌 뒤** 돌려야 가른다 — 아직 없다.
+2. **텍스트가 바뀌었다.** 요약 3문장이 §3.4까지의 실행과 다르다(더 짧은 think, 다른 문장, 428토큰에서
+   `<|im_end|>`로 정상 종료). 재양자화 층이 늘어난 결과이고, softmax 앞의 q/k/v가 가장 의심스럽다.
+   **정확도 게이트 실패** — attn_proj는 QS4CX 오프라인 양자화(§6) 없이는 끄는 것이 맞다.
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`
