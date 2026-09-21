@@ -436,3 +436,15 @@ D + SHADOW (conv 블록 CPU 값, dense HTP)  ppl 59.41   nll/token 4.085
 정리(2026-09-22): §2.10~2.13의 레시피 에뮬레이션(act-u8-only 참조, 4~6개 가중치 레시피, outlier 비율)은
 역할을 다해 코드에서 뺐다. 남는 것은 `NNTR_CONV_BLOCK_DIFF`/`_SHADOW`(CPU 대비 SNR, MoE의 L2_DIFF와 같은
 급의 판별기)와 `NNTR_PPL`(판정 지표)이다. 이 절들의 숫자는 이 문서에만 남는다.
+
+### 2.16 Phase 2 파이프라인 (코드, 호스트 체크 통과) + poll 창 실험 1차 (2026-09-22)
+
+- **conv 커널 Phase 2를 한 블록 앞서 가게 바꿨다.** 블록 n의 b 행렬곱·dequant(z[n&1]) 뒤에 그 블록의
+  gate·requant를 **백그라운드 레인**에 넣고(16행 단위 gate 4개 + requant 1개, 레인이 순서를 보장), 블록
+  n−1의 out_proj를 그 아래에서 돌린다. z·mid·requant 파라미터 2벌(VTCM 5.27 → 5.9 MiB). 동기 구간이던
+  gate 0.53 + requant 0.14 + dequant 꼬리 0.08 = 0.75 ms/콜이 HMX 아래로 들어간다 → 기대 −0.6 ms/콜,
+  18콜 −11 ms. SWIGLU 열은 이제 워커 시간(숨은 일)이고, 노출은 REQUANT 열(wait_bg)로 읽는다.
+- `NNTR_HTP_POLL_US=10000`은 드라이버가 **거부**했다(`qos_mode=1` = PM QoS로 후퇴). PM 모드의 MoE transport
+  2012 us — 가설 검증이 아니다. 다음은 1000, 5000.
+- 이 실행의 텍스트는 이전 D 실행들과 바이트 동일하다(결정적). "정확도가 깨졌다"는 인상은 §2.15의 ppl이
+  이미 답한 것과 같은 출력을 다시 본 것이다.
