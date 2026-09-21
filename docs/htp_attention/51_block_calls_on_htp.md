@@ -112,7 +112,7 @@ prefill 1000 ms   decode 20.50 TPS   등록 1424 = MoE 1408 + dense 16 (전부 �
 **판정: dense 융합은 유지한다.** 이득은 −17이지만 비용이 예측과 맞는 것이 conv 블록 −115의 전제였고,
 그 전제가 섰다.
 
-## 2. conv 블록 상주 — 설계
+## 2. conv 블록 상주 — 설계 (§2.7에 구현이 어떻게 달라졌는지)
 
 ### 2.1 무엇을 한 콜로
 
@@ -199,3 +199,51 @@ CPU 원본(in_proj+out_proj+conv 등 ≈11.3)과 비교해도 같은 폭.
 
 - rms_norm·residual을 콜에 넣기 — `_det` norm이 필요, 이득 0.3 ms/층. Phase D.
 - MoE와 conv 블록을 한 콜로(레이어 전체 상주) — 문서 45 Phase D. 이 문서의 두 블록이 그 전 단계다.
+
+### 2.7 구현 (2026-09-22) — 코드 완료, 호스트 체크 통과, 기기 미측정
+
+§2.2의 두 번째 안(가중치 상주 + 활성화 스트리밍)을 그대로 짓되, 중간값을 u8로 내리지 않는다. 열
+슬라이스 3개(a, b, c)를 **두 개씩** 올리면 되기 때문이다:
+
+```
+Phase 1  슬롯 A = W_a, 슬롯 B = W_c (2 MiB씩):  블록 b=0..6: HMX a·c 타일을 쌍으로 → dq(a)·dq(c)를 f32로 곱해 g [M×C] → DSP 힙
+Phase 2  슬롯 A = W_b, 슬롯 B = W_out:          블록 b=0..6: HMX b → dq(b)를 VTCM z에 → z *= conv1d(g)[행 mb−2..] → requant → HMX out_proj → dq → out
+```
+
+- **양자화 지점은 x→u8, (b⊙y)→u8 둘뿐** — in_proj·out_proj를 따로 HTP에 보낼 때와 같다. §2.2가 걱정한
+  "a·c를 u8로 내리는 새 지점"이 없다. g는 f32 3.6 MB로 힙을 한 번 쓰고 한 번 읽는다.
+- **conv1d는 HVX 원소 연산**: `z *= (w0·g[t] + w1·g[t−1]) + w2·g[t−2]`, FMA 없이 곱 3·합 2 순서 고정
+  (`hvx_conv_gate_f32.c`). 블록 경계 캐리가 없다 — g 전체가 힙에 있으니 앞 두 행을 그냥 읽는다.
+- **decode 상태**: 콜이 g의 마지막 2행을 `state_f32`로 돌려주고 레이어가 conv_state에 넣는다. decode(M=1)는
+  CPU 커널(`causal_depthwise_conv1d_k3_decode`) 그대로 — 기존 6개 레이어 체인과 바이트 동일.
+- 가중치 DMA 층당 8 MiB 한 번. 블록당 HMX 타일 = a 64 + c 64 + b 64 + out 64 = 256 n-tiles × 64 k-tiles,
+  §2.4의 9216과 같다. VTCM 합 5.27 MiB (staging 32 타일 2벌 포함).
+- MoE 커널의 스크래치·DMA 푸시·백그라운드 pack·MM 타이머를 `hexkl_moe_*`로 내보내 그대로 쓴다. 블록당
+  비용이 §1.4의 340 us와 같은 급이면 콜 ≈ 7블록 × 4 타일군... 계산으로 §2.4의 **≈4.8 ms**가 기대값.
+
+| 어디 | 무엇 |
+|---|---|
+| `hmx/hexkl_conv_block.{h,c}` | 레이아웃 + 두 단계 루프. `hexkl_moe_scratch` 공유 |
+| `hvx/hvx_dequant_i32.{h,c}` | `hvx_dq_mul_worker`: 두 가중치의 타일 쌍 dequant·곱 (a⊙c) |
+| `hvx/hvx_conv_gate_f32.{h,c}` | z *= conv1d(g) |
+| `test/htp/nntr_hvx.idl`, `nntr_hvx_mm_u8i4.c` | `mm_u8i4_conv_block(_timed)`; stage_us는 MoE 콜과 같은 열, SWIGLU 열 = conv gate |
+| `test/htp/host/conv_block_host_check.c` | 스칼라 참조와 비트 동일 (M=150, K=64, C=544, N=1056; M=1; 잘못된 핸들 형상; LFM2 형상 레이아웃). stub은 `hvx_scalar_stubs.c`로 빼서 MoE 체크와 공유 |
+| `htp_compute_ops.cpp` | `get_or_register_conv`: in_proj를 `get_or_register_fc`로 등록하면 K=2048에서 슬라이스가 정확히 2048열 = a, b, c (ponytail: 다른 형상은 직접 슬라이스 필요). 프로파일 행 `M>1 conv` |
+| `layers/conv_block_layer.{h,cpp}` (type `conv_block`) | in_proj·conv·out_proj 세 가중치를 파일 순서로. M>1이고 ops가 있으면 한 콜, 아니면 CPU: dot → a⊙c → conv(k3 / decode) → ⊙b → dot |
+| `lfm2_causallm.cpp` | `conv_block_engine` / `conv_block_htp_layers`; 켜지면 conv_norm → `conv_block` → residual → ffn |
+| `transformer.cpp repack_weight` | 아레나 매핑 뒤 등록 + M=512 워밍업 |
+
+**측정 config (D)** — 스위치는 conv 블록과 dense만. `conv_in_proj_engine`·`conv_out_proj_engine`·
+`attn_proj_engine`은 넣지 않는다 (conv 블록이 켜진 층에서는 어차피 무시되고, attention 층의 것은 손해):
+
+```json
+"conv_block_engine": "htp",
+"dense_ffn_engine": "htp"
+```
+
+IDL이 바뀌었으니 **세 가지를 다시 빌드**한다: `nntrainer/tensor/htp_backend/generate_stub.sh`(ARM stub),
+`test/htp/build.sh`(DSP skel → `libnntr_hvx_skel.so` push), 앱. 하나라도 빠지면 첫 콜이 AEE_EBADPARM.
+
+게이트(§2.5의 4): (1) 텍스트가 3문장 요약으로 정상인가 — 토큰은 바뀐다(양자화 지점 추가). (2) decode 불변.
+(3) `NNTR_HTP_PROFILE=2`의 `M>1 conv` 행: calls 19 (18 + 워밍업), host ≤ 5 ms/콜이 목표, SWIGLU 열이
+conv gate 시간. (4) prefill: 같은 날 A 대비 **−100 안팎**이면 §2.4의 산술대로.

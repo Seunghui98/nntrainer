@@ -280,14 +280,16 @@ public:
    *  not into acc_us. Folding them in looked tidy and cost a measurement:
    *  the first run of this call put 104.8 ms in a bucket ACC_READ and the
    *  scatter shared, and the profile could not say which. */
-  /** @param dense the dense FFN routed through the MoE layer kernel (doc
-   *  51), filed in its own row: same shapes as the MoE layer's, so the
-   *  key alone could not tell the two apart. */
+  /** @param kind 0 the MoE layer; 1 the dense FFN routed through the MoE
+   *  layer kernel (doc 51 section 1); 2 the conv block (doc 51 section 2).
+   *  Each files in its own row: the dense FFN has the MoE layer's shapes
+   *  and the conv block the MoE row's K and N_out, so the key alone could
+   *  not tell them apart. All three fill the same stage_us columns. */
   void addInvokeMoeLayer(unsigned M, unsigned K, unsigned N_out,
                          uint64_t host_us, const uint32_t *stage_us,
-                         bool dense = false) {
+                         int kind = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1, dense ? 1 : 0)];
+    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1, kind)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -435,12 +437,13 @@ private:
       const unsigned k = std::get<0>(entry.first);
       const unsigned n = std::get<1>(entry.first);
       const bool decode = std::get<2>(entry.first);
-      const bool dense = std::get<3>(entry.first) != 0;
+      static const char *const kind_name[] = {"M>1", "M>1 dense", "M>1 conv"};
+      const int kind = std::get<3>(entry.first);
       const Bucket &b = entry.second;
       std::fprintf(stderr,
                    "[HTP-PROFILE]   K=%-5u N=%-5u %-9s calls=%-7llu "
                    "rows=%-8llu host=%9.1f ms (%7.1f us/call)",
-                   k, n, decode ? "M==1" : (dense ? "M>1 dense" : "M>1"),
+                   k, n, decode ? "M==1" : kind_name[kind],
                    (unsigned long long)b.calls, (unsigned long long)b.rows,
                    ms(b.host_us),
                    b.calls ? static_cast<double>(b.host_us) / b.calls : 0.0);
@@ -672,6 +675,16 @@ public:
   // dot(), not a MoE stack) and saves the one MoE FFN caller from a
   // documented loss.
   bool accelerates_q4_0_at_m1() const override { return false; }
+
+  /** @brief The handles one conv block is registered as: in_proj's column
+   *  thirds a, b, c (get_or_register_fc's slices at this model's K) and
+   *  out_proj. Declared up here because invokeConvBlock takes it by
+   *  reference -- a parameter type has to be complete where the function
+   *  is declared. */
+  struct ConvHandles {
+    std::vector<uint32_t> h_in; /**< a, b, c */
+    uint32_t h_out = 0;
+  };
 
   // matAdata: Q4_0x4-repacked weight bytes, identity-cached across calls --
   // the same pointer for the lifetime of a loaded model (inference does not
@@ -1493,8 +1506,7 @@ private:
                       const std::vector<unsigned int> &row_count,
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
-                      unsigned int inter, unsigned int N_out,
-                      bool dense = false) {
+                      unsigned int inter, unsigned int N_out, int kind = 0) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
@@ -1573,7 +1585,77 @@ private:
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
     if (profile.level()) {
       profile.addInvokeMoeLayer(M, K, N_out, elapsed,
-                                timed ? stage_us : nullptr, dense);
+                                timed ? stage_us : nullptr, kind);
+    }
+  }
+
+  /** @brief [doc 51 section 2] One call for a whole conv block.
+   *
+   *  The activation goes over once and the output comes back once; the
+   *  four M x C intermediates the block has stay on the DSP. conv_w (24 KB)
+   *  rides along by value each call rather than being registered: it is
+   *  under a hundredth of the activation. The state (2 x C) comes back in
+   *  its own small buffer, not a size class of out_pool_: at a short M the
+   *  output would land in the same 64 KiB class and the two would alias. */
+  void invokeConvBlock(remote_handle64 session, const ConvHandles &ch,
+                       const float *conv_w, const float *act, float *out,
+                       float *state, unsigned int M, unsigned int K,
+                       unsigned int C, unsigned int N_out) {
+    const int act_len = static_cast<int>(M) * static_cast<int>(K);
+    const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
+    const int conv_len = 3 * static_cast<int>(C);
+    const int state_len = 2 * static_cast<int>(C);
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act_f32 = reinterpret_cast<float *>(
+      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
+    float *out_f32 = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
+    const size_t small_bytes =
+      static_cast<size_t>(conv_len + state_len) * sizeof(float);
+    if (!conv_buf_ || conv_buf_->size() < small_bytes)
+      conv_buf_ = std::make_unique<HtpRpcBuffer>(small_bytes);
+    float *conv_f32 = reinterpret_cast<float *>(conv_buf_->data());
+    float *state_f32 = conv_f32 + conv_len;
+    stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
+    std::memcpy(conv_f32, conv_w,
+                static_cast<size_t>(conv_len) * sizeof(float));
+
+    HtpProfile &profile = HtpProfile::global();
+    uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
+    const int err =
+      timed ? nntr_hvx_mm_u8i4_conv_block_timed(
+                session, M, K, C, N_out, ch.h_in.data(),
+                static_cast<int>(ch.h_in.size()), ch.h_out, conv_f32, conv_len,
+                act_f32, act_len, out_f32, out_len, state_f32, state_len,
+                stage_us, HTP_MOE_N_STAGES)
+            : nntr_hvx_mm_u8i4_conv_block(
+                session, M, K, C, N_out, ch.h_in.data(),
+                static_cast<int>(ch.h_in.size()), ch.h_out, conv_f32, conv_len,
+                act_f32, act_len, out_f32, out_len, state_f32, state_len);
+    const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
+    if (err != AEE_SUCCESS) {
+      std::string hint;
+      if (static_cast<unsigned>(err) == 0x8000040Eu) {
+        hint = " (AEE_EBADPARM -- if the shapes are right, the DSP skel on "
+               "the device predates mm_u8i4_conv_block: rebuild it with "
+               "test/htp/build.sh and push libnntr_hvx_skel.so)";
+      }
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_conv_block_timed"
+                          : "nntr_hvx_mm_u8i4_conv_block") +
+        " failed: err=" + std::to_string(err) + " M=" + std::to_string(M) +
+        " K=" + std::to_string(K) + " C=" + std::to_string(C) +
+        " N=" + std::to_string(N_out) + hint);
+    }
+    stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
+    std::memcpy(state, state_f32,
+                static_cast<size_t>(state_len) * sizeof(float));
+    if (profile.level()) {
+      profile.addInvokeMoeLayer(M, K, N_out, elapsed,
+                                timed ? stage_us : nullptr, /*kind=*/2);
     }
   }
 
@@ -1967,7 +2049,7 @@ private:
         row_index[c * M + r] = r;
     }
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
-                   act, out, M, K, dh.w, N, /*dense=*/true);
+                   act, out, M, K, dh.w, N, /*kind=*/1);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
@@ -1975,6 +2057,62 @@ private:
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     get_or_register_dense(up, gate, down, session, K, I, N);
+    return true;
+  }
+
+  /** @brief Registers a conv block's two Q4_0x4 weights (doc 51 section
+   *  2). in_proj goes through get_or_register_fc, whose column slices at
+   *  K = 2048 are exactly C = 2048 wide, so its three handles ARE a, b
+   *  and c and the kernel's split is free; a shape where the slices do
+   *  not fall on the thirds is refused rather than re-sliced.
+   *  ponytail: fcSliceCols(K) == C is this model's coincidence. Another
+   *  shape needs its own slicing here (three registerRm calls at c0 = 0,
+   *  C, 2C), not a change to the kernel. Cached by in_proj's pointer. */
+  const ConvHandles &get_or_register_conv(void *in_proj, void *out_proj,
+                                          remote_handle64 session, uint32_t K,
+                                          uint32_t C, uint32_t N) {
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      auto it = conv_cache_.find(in_proj);
+      if (it != conv_cache_.end())
+        return it->second;
+    }
+    const FcHandles &in = get_or_register_fc(in_proj, session, K, 3 * C);
+    const FcHandles &out = get_or_register_fc(out_proj, session, C, N);
+    if (in.handles.size() != 3 || in.cols[0] != C || in.cols[1] != C ||
+        in.cols[2] != C || out.handles.size() != 1) {
+      throw std::invalid_argument(
+        "gemm_q4_0_conv_block_fp32: in_proj [" + std::to_string(K) + " x " +
+        std::to_string(3 * C) + "] slices into " +
+        std::to_string(in.handles.size()) + " handles of " +
+        std::to_string(fcSliceCols(K)) + " columns, not the three of " +
+        std::to_string(C) + " the conv block kernel takes");
+    }
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    ConvHandles ch;
+    ch.h_in = in.handles;
+    ch.h_out = out.handles[0];
+    return conv_cache_.emplace(in_proj, std::move(ch)).first->second;
+  }
+
+  bool supports_gemm_q4_0_conv_block_fp32() const override { return true; }
+
+  void gemm_q4_0_conv_block_fp32(void *in_proj, const float *conv_w,
+                                 void *out_proj, const float *act, float *out,
+                                 float *state, unsigned int M, unsigned int K,
+                                 unsigned int C, unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const ConvHandles &ch =
+      get_or_register_conv(in_proj, out_proj, session, K, C, N);
+    invokeConvBlock(session, ch, conv_w, act, out, state, M, K, C, N);
+  }
+
+  bool register_q4_0_conv_block(void *in_proj, void *out_proj, unsigned int K,
+                                unsigned int C, unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    get_or_register_conv(in_proj, out_proj, session, K, C, N);
     return true;
   }
 
@@ -2472,6 +2610,8 @@ private:
   std::unordered_map<const void *, FcHandles> fc_cache_;
   /** Dense FFNs by their up weight's pointer; see get_or_register_dense. */
   std::unordered_map<const void *, DenseHandles> dense_cache_;
+  /** Conv blocks by their in_proj's pointer; see get_or_register_conv. */
+  std::unordered_map<const void *, ConvHandles> conv_cache_;
 
   std::vector<ArenaChunk> arena_chunks_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
@@ -2495,6 +2635,8 @@ private:
   std::mutex invoke_mutex_;
   StagingPool act_pool_;
   StagingPool out_pool_;
+  /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
+  std::unique_ptr<HtpRpcBuffer> conv_buf_;
 
   // invokeLayerU8In's scratch: the AH-packed activation (ION-backed, same
   // reasoning as act_pool_/out_pool_) and the small per-row scale/zp arrays

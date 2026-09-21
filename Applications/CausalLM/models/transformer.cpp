@@ -381,9 +381,16 @@ void Transformer::repack_weight() {
     unsigned int K, I, N;
   };
   std::vector<PendingDense> dense_pending;
+  struct PendingConv {
+    nntrainer::ComputeOps *ops;
+    void *in_proj, *out_proj;
+    const float *conv_w;
+    unsigned int K, C, N;
+  };
+  std::vector<PendingConv> conv_pending;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&fc_pending, &dense_pending](
+    fn = [&fc_pending, &dense_pending, &conv_pending](
            ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       // The tied lm_head's blocked twin (tie_word_embedding.h) is built
       // here, with every weight loaded, rather than on the first lm_head
@@ -422,6 +429,26 @@ void Transformer::repack_weight() {
                                      static_cast<unsigned int>(up.height()),
                                      static_cast<unsigned int>(up.width()),
                                      static_cast<unsigned int>(down.width())});
+          }
+        }
+        return;
+      }
+      // A conv_block layer's in_proj and out_proj, likewise (doc 51
+      // section 2): the conv weight is FP32 and rides with each call.
+      if (l.getType() == "conv_block") {
+        auto weights = context.getWeights();
+        if (weights.size() == 3 && context.getComputeOps()) {
+          auto &in_proj = weights[0]->getVariableRef();
+          auto &conv = weights[1]->getVariableRef();
+          auto &out_proj = weights[2]->getVariableRef();
+          if (in_proj.getDataType() == ml::train::TensorDim::DataType::Q4_0 &&
+              out_proj.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+            conv_pending.push_back(
+              {context.getComputeOps(), in_proj.getData<char>(),
+               out_proj.getData<char>(), conv.getData<float>(),
+               static_cast<unsigned int>(in_proj.height()),
+               static_cast<unsigned int>(conv.width()),
+               static_cast<unsigned int>(out_proj.width())});
           }
         }
         return;
@@ -562,6 +589,28 @@ void Transformer::repack_weight() {
                                       out.data(), M, p.K, p.I, p.N);
       ml_logd("dense FFN HTP kernel warmed up at load (M=%u, K=%u, I=%u, N=%u)",
               M, p.K, p.I, p.N);
+    }
+    // And the conv blocks: in_proj's three slices and out_proj registered,
+    // one warm-up call so the first prefill finds the kernel's scratch and
+    // the staging buffers already grown to this shape.
+    bool conv_warmed = false;
+    for (const auto &p : conv_pending) {
+      if (!p.ops->register_q4_0_conv_block(p.in_proj, p.out_proj, p.K, p.C,
+                                           p.N))
+        continue;
+      if (conv_warmed || !p.ops->supports_gemm_q4_0_conv_block_fp32())
+        continue;
+      conv_warmed = true;
+      const unsigned int M = 512;
+      std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
+      std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
+      std::vector<float> state(static_cast<size_t>(2) * p.C, 0.0f);
+      p.ops->gemm_q4_0_conv_block_fp32(p.in_proj, p.conv_w, p.out_proj,
+                                       act.data(), out.data(), state.data(), M,
+                                       p.K, p.C, p.N);
+      ml_logd(
+        "conv block HTP kernel warmed up at load (M=%u, K=%u, C=%u, N=%u)", M,
+        p.K, p.C, p.N);
     }
     ml_logd("QS4CX weights repacked successfully");
   } catch (const std::exception &e) {

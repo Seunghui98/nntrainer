@@ -20,6 +20,7 @@ causallm_scalar_multiply_src_abs = [meson.current_source_dir() / 'scalar_multipl
 causallm_logit_softcapping_src_abs = [meson.current_source_dir() / 'logit_softcapping.cpp']
 causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_multiply.cpp']
 causallm_dense_ffn_layer_src_abs = [meson.current_source_dir() / 'dense_ffn_layer.cpp']
+causallm_conv_block_layer_src_abs = [meson.current_source_dir() / 'conv_block_layer.cpp']
 
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
@@ -177,6 +178,20 @@ causallm_dense_ffn_layer = shared_library(
 
 causallm_dense_ffn_layer_dep = declare_dependency(
     link_with: causallm_dense_ffn_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_conv_block_layer = shared_library(
+    'conv_block_layer',
+    causallm_conv_block_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_conv_block_layer_dep = declare_dependency(
+    link_with: causallm_conv_block_layer,
     include_directories: causallm_layer_inc
 )
 

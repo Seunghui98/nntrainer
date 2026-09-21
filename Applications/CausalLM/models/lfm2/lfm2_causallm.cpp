@@ -24,6 +24,7 @@
 #include <sstream>
 
 #include <causal_conv1d_layer.h>
+#include <conv_block_layer.h>
 #include <custom_multiply.h>
 #include <embedding_layer.h>
 #include <mha_core.h>
@@ -154,6 +155,28 @@ Tensor Lfm2Transformer::createConvBlock(const int layer_id, Tensor input) {
                              withKey("packed", "false")}));
   Tensor normed = conv_norm(input);
 
+  // The block as one layer when conv_block_engine routes it (doc 51
+  // section 2): in_proj, both gates, the conv and out_proj in one
+  // accelerator call at prefill, the same CPU kernels at decode. Same
+  // three weights in the file's order, so the model file loads unchanged.
+  const std::string block_eng =
+    projEngine(CONV_BLOCK_ENGINE, CONV_BLOCK_HTP_LAYERS, layer_id);
+  if (block_eng != "cpu") {
+    LayerHandle conv_block(createLayer(
+      "conv_block", {withKey("name", prefix + "_conv_block"),
+                     withKey("unit", CONV_DIM), withKey("engine", block_eng)}));
+    Tensor block_out = conv_block(normed);
+    Tensor residual_b = input.add(block_out);
+    LayerHandle ffn_norm_b(
+      createLayer("rms_norm", {withKey("name", prefix + "_ffn_norm"),
+                               withKey("epsilon", std::to_string(NORM_EPS)),
+                               withKey("packed", "false")}));
+    Tensor ffn_normed_b = ffn_norm_b(residual_b);
+    Tensor ffn_out_b =
+      createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed_b);
+    return residual_b.add(ffn_out_b);
+  }
+
   // Expand features: [B, 1, T, DIM] → [B, 1, T, 3*CONV_DIM]
   // Its engine follows conv_in_proj_engine (doc 50): the widest FC in the
   // model, [T x 2048] x [2048 x 6144], and the one the round trip pays for.
@@ -244,6 +267,7 @@ void Lfm2Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister(nntrainer::createLayer<causallm::CustomMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::CausalConv1DLayer>);
+  tryRegister(nntrainer::createLayer<causallm::ConvBlockLayer>);
 }
 
 void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
@@ -345,6 +369,9 @@ void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
       nntr_cfg.value("conv_out_proj_engine", std::string("cpu"));
     CONV_OUT_PROJ_HTP_LAYERS = parseLayerIdList(
       nntr_cfg.value("conv_out_proj_htp_layers", std::string("")));
+    CONV_BLOCK_ENGINE = nntr_cfg.value("conv_block_engine", std::string("cpu"));
+    CONV_BLOCK_HTP_LAYERS = parseLayerIdList(
+      nntr_cfg.value("conv_block_htp_layers", std::string("")));
     FFN_ENGINE = nntr_cfg.value("dense_ffn_engine", std::string("cpu"));
     FFN_HTP_LAYERS =
       parseLayerIdList(nntr_cfg.value("dense_ffn_htp_layers", std::string("")));
