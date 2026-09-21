@@ -66,6 +66,12 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--chrome); }
 .pill { font-size: 11px; padding: 0 5px; border: 1px solid; border-radius: 2px; }
 .pill.bad { color: var(--serious); } .pill.crit { color: var(--critical); }
 .hint { color: var(--ink-3); font-size: 11px; }
+/* W7: warnings banner */
+.warn { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 4px 12px; background: #fff3cd; color: #5c4400; border-bottom: 1px solid #e0c56a; font-size: 12px; }
+.warn b { font-weight: 600; }
+.warn a { color: inherit; cursor: pointer; text-decoration: underline; margin-left: 4px; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .warn { background: #3d3512; color: #f3dd8a; border-color: #6b5b1a; } }
+:root[data-theme="dark"] .warn { background: #3d3512; color: #f3dd8a; border-color: #6b5b1a; }
 @media (max-width: 640px) { .panel { height: 220px; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -85,6 +91,7 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--chrome); }
   <button id="reset" type="button" title="Fit (0)">Fit</button>
   <span class="hint">W/S zoom · A/D pan · drag pan · click select</span>
 </div>
+<div class="warn" id="warn" hidden></div>
 <div class="tl" id="tl"><canvas id="cv"></canvas></div>
 <div class="panel" id="panel">
   <div class="tabs" role="tablist" id="tabs"><span class="st" id="range-label"></span></div>
@@ -276,7 +283,32 @@ function metricsJSON(r = range) {
     engines: m.occ.map(o => ({ track: o.th.name, busy: o.busy })),
     kernels: kernels(r).map(k => ({ engine: k.engine, name: k.name, calls: k.n, total_us: k.us, mean_us: k.us / k.n, elems: k.elems, cy_per_elem: k.cpe })),
     layers: layerRows(r).map(({ e, m }) => ({ name: e.name, phase: e.args && e.args.phase || null, wall_us: e.dur, cpu: m.cpu, rpc: m.rpc, hmx_only: m.hmxOnly, overlap: m.overlap, hvx_only: m.hvxOnly, dma_only: m.dmaOnly, dsp_idle: m.idle })),
+    warnings: (w => ({ items: w.list.map(x => x.id), fallbacks: w.fallbacks.length, fallback_us: w.fallbacks.reduce((s, e) => s + e.dur, 0), dropped: T.md.dropped || {}, clock_violations: (T.md.clock_sync || {}).violations || 0 }))(warnings()),
   };
+}
+
+// ---------- warnings (W7) ----------
+function warnings(all = T.all, md = T.md) {
+  const w = [], fb = all.filter(e => e.args && e.args.fallback);
+  const dropped = md.dropped || {};
+  if (md.htp_enabled === false) w.push({ id: 'htp', text: 'HTP backend disabled: every op ran on the CPU' });
+  if (fb.length) w.push({ id: 'fallback', text: `${fb.length} op(s) fell back to CPU (${fmt(fb.reduce((s, e) => s + e.dur, 0))})`, filter: 'fallback', first: fb[0] });
+  if ((dropped.dsp || 0) + (dropped.host || 0) > 0) w.push({ id: 'dropped', text: `dropped trace records: host ${dropped.host || 0}, dsp ${dropped.dsp || 0} (ring overflow; gaps are not idle)` });
+  if (md.clock_sync && md.clock_sync.violations > 0) w.push({ id: 'clock', text: `${md.clock_sync.violations} clock-sync violation(s): DSP spans mapped outside their host call` });
+  return { list: w, fallbacks: fb };
+}
+function renderWarnings() {
+  const el = $('#warn'), w = warnings();
+  el.hidden = !w.list.length;
+  el.innerHTML = w.list.map(x => `<span><b>⚠</b> ${esc(x.text)}${x.filter ? `<a data-f="${esc(x.filter)}">show</a>` : ''}</span>`).join('');
+  for (const a of el.querySelectorAll('a')) a.onclick = () => { const x = w.list.find(y => y.filter === a.dataset.f); setFilter(x.filter); if (x.first) { select(x.first); setView(x.first.ts - x.first.dur * .5, x.first.ts + x.first.dur * 1.5); } };
+}
+let hatchCache = null;
+function hatch() { // red diagonal hatch for fallback slices, built once per theme
+  const key = css('--critical'); if (hatchCache && hatchCache.key === key) return hatchCache.p;
+  const c = document.createElement('canvas'); c.width = c.height = 6; const g = c.getContext('2d');
+  g.strokeStyle = key; g.lineWidth = 1.5; g.beginPath(); g.moveTo(-1, 7); g.lineTo(7, -1); g.moveTo(-1, 1); g.lineTo(1, -1); g.moveTo(5, 7); g.lineTo(7, 5); g.stroke();
+  hatchCache = { key, p: ctx.createPattern(c, 'repeat') }; return hatchCache.p;
 }
 
 // ---------- colors ----------
@@ -385,6 +417,7 @@ function draw() {
       const isFrame = e._cat === 'frame' || e._cat === 'wait';
       if (isFrame && colorBy === 'engine') { ctx.globalAlpha *= .35; ctx.fillRect(xa, y, Math.max(1, xb - xa - (w > 2 ? 1 : 0)), h); ctx.globalAlpha = dim ? .25 : 1; ctx.strokeStyle = sliceColor(e); ctx.strokeRect(xa + .5, y + .5, Math.max(1, xb - xa - 1), h - 1); }
       else ctx.fillRect(xa, y, Math.max(1, xb - xa - (w > 2 ? 1 : 0)), h);
+      if (e.args && e.args.fallback) { ctx.fillStyle = hatch(); ctx.fillRect(xa, y, Math.max(1, xb - xa - 1), h); ctx.strokeStyle = css('--critical'); ctx.strokeRect(xa + .5, y + .5, Math.max(1, xb - xa - 1), h - 1); }
       if (e === selected) { ctx.strokeStyle = css('--sel'); ctx.lineWidth = 2; ctx.strokeRect(xa + 1, y + 1, Math.max(1, xb - xa - 2), h - 2); ctx.lineWidth = 1; }
       if (xb - xa > 14) { ctx.fillStyle = css('--slice-ink'); const s = fitText(e._label, xb - xa - 6); if (s) ctx.fillText(s, xa + 3, y + h / 2); }
       ctx.globalAlpha = 1;
@@ -428,7 +461,8 @@ const TABS = [
     pane.innerHTML = `<div class="stack" style="display:flex">${parts.map(p => `<i title="${esc(p[1])} ${fmt(p[2])}" style="width:${p[2] / m.wall * 100}%;background:${bucketBg(p[0])}"></i>`).join('')}</div>
       <table style="margin-top:8px"><tr><th></th><th>bucket</th><th class="n">time</th><th class="n">share</th></tr>${parts.map(p => `<tr><td><span class="sw" style="background:${bucketBg(p[0])}"></span></td><td>${p[1]}</td><td class="n">${fmt(p[2])}</td><td class="n">${pct(p[2] / m.wall)}</td></tr>`).join('')}
       <tr><td></td><td>parallel compression</td><td class="n">${m.compression.toFixed(2)}×</td><td class="k">Σ(HMX+HVX+DMA busy) ÷ DSP wall · QNN optrace 4.1×</td></tr>
-      <tr><td></td><td>idle inside DSP calls</td><td class="n">${pct(m.entry ? m.idle / m.entry : 0)}</td><td class="k">QNN 0.09 %</td></tr></table>`;
+      <tr><td></td><td>idle inside DSP calls</td><td class="n">${pct(m.entry ? m.idle / m.entry : 0)}</td><td class="k">QNN 0.09 %</td></tr>
+      ${(() => { const fb = warnings().fallbacks.filter(e => inRange(e, range)); const t = fb.reduce((s, e) => s + Math.min(e.ts + e.dur, range.t1) - Math.max(e.ts, range.t0), 0); return `<tr><td></td><td>CPU fallbacks</td><td class="n">${fb.length ? fb.length + ' · ' + fmt(t) : '0'}</td><td class="k">${fb.length ? '<span class="pill crit">ran on CPU, not HTP</span>' : 'every HTP op ran on the DSP'}</td></tr>`; })()}</table>`;
   } },
   { id: 'eng', label: 'Engines', render(pane, m) {
     pane.innerHTML = `<table><tr><th>track</th><th style="width:320px">busy</th><th class="n">%</th></tr>${m.occ.map(o => `<tr><td>${esc(o.th.name)}</td><td><span class="stack" style="max-width:320px;height:10px"><i style="width:${o.busy * 100}%;background:var(--${o.cat})"></i></span></td><td class="n">${pct(o.busy)}</td></tr>`).join('')}</table>`;
@@ -560,7 +594,7 @@ function load(doc, label) {
   const md = T.md; $('#subtitle').textContent = [md.model, md.device].filter(Boolean).join(' · ') || label;
   $('#range-select').innerHTML = '<option value="all">Range: whole trace</option>' + T.phases.map((e, i) => `<option value="${i}">Range: ${esc(e.name)}</option>`).join('');
   range = { t0: T.tmin, t1: T.tmax, label: 'whole trace', kind: 'all' };
-  resize(); fit(); renderPane();
+  renderWarnings(); resize(); fit(); renderPane();
 }
 const EMB = JSON.parse($('#embedded-traces').textContent || '{}'), sel = $('#trace-select');
 for (const k of Object.keys(EMB)) { const o = document.createElement('option'); o.value = k; o.textContent = k; sel.append(o); }
