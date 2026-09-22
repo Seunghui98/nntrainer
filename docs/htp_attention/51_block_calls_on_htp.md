@@ -621,3 +621,31 @@ GU(n)→DN(n)에서는 블록마다 세 잡이 숨을 곳이 없었다: 마지�
   quant 한 번, HMX는 같은 타일 수.
 - **attention 블록 콜(§2.20 4번)의 첫 걸음**: 이 레이어가 그 콜의 호스트 쪽 자리다 — core 담당자의 커널이
   오면 `qkv_layer`의 HTP 경로가 q/k/v 대신 attention 출력을 받아오면 된다.
+
+### 2.24 실측: 585 ms, ppl 62.09 그대로 — 두 변경 합 −33 (2026-09-22)
+
+전부 켬 config, poll 5000, §2.22 + §2.23 적용:
+
+```
+prefill 586 / 585 ms (758 TPS)   decode 24.2 TPS   ppl 62.0916 (§2.21과 소수점까지 동일 -- 산술 불변 확인)
+  M>1 MoE   calls=23  host 14448  dsp 13822  transport 627   [mm 9102 acc 2954 stage 379 drain 251+53 quant 269 dequant 243 rest 190 alloc 147 gather 84 requant 62 scatter 36]
+  M>1 dense calls=3   host 9560   dsp 9118   transport 442   [requant 57 dequant 286  -- 529/923에서]
+  M>1 conv  calls=19  host 4356   dsp 3928   transport 427
+  M>1 FC N=3072 (qkv) calls=6  host 2278  dsp 1808  transport 471  [quant 338 dequant 403 acc 239 drain 82 | mm ≈746]
+  M>1 FC N=2048 (o)   calls=7  host 1724  dsp 1347  transport 377  [quant 342 dequant 268 acc 163 drain 59 | mm ≈515]
+  staging memcpy 25.5 ms (593 MB)
+```
+
+- **§2.22 MoE 파이프라인**: requant 727 → 62, dequant 689 → 243, scatter 그대로 → 콜당 ≈ −1.1 ms(기대 −1.2~1.5).
+  dense도 같은 커널이라 −1.1. MoE transport가 964 → 627로 내려온 것은 설명 없음(콜이 짧아진 것과 같이 움직임).
+- **§2.23 qkv**: k/v 12콜 10 ms + q 12콜 ≈24 → N=3072 6콜 13.7 ms, **−20**. dsp 1808 중 quant 338 + dequant 403
+  + acc 239 + drain 82 = 1.06 ms가 HMX 밖 — FC 커널은 에필로그 파이프라인이 없다.
+- 구성(585): MoE 22 × 14.45 = **318 (54%)** · conv 78 · dense 19 · qkv 14 · o_proj 10 · 스테이징 25 · **ARM 잔여 ≈ 120**.
+- **MoE 콜의 정체는 HMX 활용률이다.** mm 9.1 + acc 3.0 = 12.1 ms/콜 = 14.45의 84%, 그리고 둘 다 블록 수에
+  비례한다: 1776 행(444 × top-4)에 HMX 블록 47 = 3008 행 슬롯 → **59%**. expert마다 64행 블록 하나는
+  차니까(평균 55행) 나머지는 패딩이고, HMX는 행 수와 무관하게 64행을 계산한다. M=444에서는 구조적 상한;
+  100%면 콜 ≈ 9.5, prefill ≈ −110. 프롬프트가 길수록 저절로 좋아진다(1024 토큰 → expert당 128행 = 꽉 찬 2블록).
+  HVX 꼬리(≤16행)는 행당 ≈13 us라 19행 위로는 HMX가 이기므로 꼬리 문턱을 올리는 것도 답이 아니다.
+- 남은 소프트웨어 지렛대는 전부 작다: gate_up[e+1] 청크를 GU(e)의 배치 c 발행 직후 청크 c 자리에 push하면
+  drain 251 → ~50 (−4); FC 커널의 quant 340(단일 스레드로 보임)·dequant 노출 (−5); MoE transport 627 vs FC 400
+  (−4); 스테이징 25(레이어 입출력을 ION에 두면 0, 텐서 할당자 훅 필요, 중간 규모).
