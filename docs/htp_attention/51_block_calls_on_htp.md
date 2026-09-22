@@ -649,3 +649,26 @@ prefill 586 / 585 ms (758 TPS)   decode 24.2 TPS   ppl 62.0916 (§2.21과 소수
 - 남은 소프트웨어 지렛대는 전부 작다: gate_up[e+1] 청크를 GU(e)의 배치 c 발행 직후 청크 c 자리에 push하면
   drain 251 → ~50 (−4); FC 커널의 quant 340(단일 스레드로 보임)·dequant 노출 (−5); MoE transport 627 vs FC 400
   (−4); 스테이징 25(레이어 입출력을 ION에 두면 0, 텐서 할당자 훅 필요, 중간 규모).
+
+### 2.25 §2.24의 1·2·3 (2026-09-22, 코드, 호스트 체크 통과)
+
+세 개를 한 커밋에. 전부 산술 불변이라 ppl 62.09 그대로여야 한다.
+
+1. **gate_up[e+1]을 청크 단위로 일찍** (`hexkl_mm_u8i4_moe.c`): GU(e)의 배치 gb가 청크 gb의 열을 마지막으로
+   읽으므로, 배치 gb 발행 직후 그 자리에 다음 expert의 청크 gb를 push. 통째로 마지막 배치 뒤에 밀면 3.5 MB가
+   DN(n−1)의 배치 둘 아래밖에 못 숨어 DRAIN 251 us. 이제 다음 블록을 GU 전에 알아야 해서 `moe_blk_next`가
+   루프 머리로. 활성화 블록은 청크들 뒤에 줄을 서므로 GATHER가 마지막 청크 쌍의 꼬리를 포함할 수 있다.
+   기대: drain 251 → ~50, −4 ms.
+2. **FC 커널 에필로그를 풀에** (`hexkl_mm_u8i4_dma.c` `hexkl_mm_u8i4_layer_run`): 결과 타일 하나 대신 스테이징
+   2벌 × acc_tiles(남는 VTCM으로 결정, ≤32, ≥1), 배치 발행 → wait → `hvx_dq_tiles_worker` submit — MoE
+   커널과 같은 모양. `accumulate`(attention의 P·V)와 acc 레이아웃 불가 경로는 동기 그대로. 스테이징 패리티는
+   행 블록·핸들에 걸쳐 하나. 끝(과 에러 경로)에서 마지막 잡을 거둔다 — out_cat이 RPC 반환 전에 완성돼야
+   한다. **quant 340은 그대로다**: 풀 안 쓴다는 추측이 틀렸다(`s->quant_pool`로 이미 분할). 기대: dequant
+   268/403 → ~50, −4 ms. 새 호스트 체크 `fc_layer_host_check.c`(핸들 셋 N=1056/512/512, M=150·1, accumulate,
+   타일 2개짜리 아레나, 1개는 거부) 비트 동일.
+3. **MoE 콜의 작은 시퀀스 다섯을 rpcmem에서** (`htp_compute_ops.cpp` `invokeMoeLayer`): 핸들·row_index·
+   row_count·row_weight를 `moe_args_buf_` 하나에 복사해 넘김. 힙에서 넘기면 드라이버가 매 콜 pin+map.
+   기대: transport 627 → ~400, −4 ms.
+
+측정: 전부 켬 config 그대로, 헤드라인 2회 + PROFILE=2 NNTR_PPL=1 1회. MoE 행 drain·transport, FC 행 dequant를
+본다. 셋 합 기대 ≈ **−12**.
