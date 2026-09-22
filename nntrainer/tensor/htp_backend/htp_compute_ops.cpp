@@ -214,7 +214,11 @@ public:
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                  const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 0)];
+    // kind 3: a plain FC call. It gets its own row because the attention
+    // q/o projections have the MoE layer call's K and N_out (2048 x 2048),
+    // and the first all-on run averaged 12 two-millisecond FC calls into
+    // the 22 fifteen-millisecond MoE calls of one "M>1" row.
+    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 3)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -437,7 +441,8 @@ private:
       const unsigned k = std::get<0>(entry.first);
       const unsigned n = std::get<1>(entry.first);
       const bool decode = std::get<2>(entry.first);
-      static const char *const kind_name[] = {"M>1", "M>1 dense", "M>1 conv"};
+      static const char *const kind_name[] = {"M>1", "M>1 dense", "M>1 conv",
+                                              "M>1 FC"};
       const int kind = std::get<3>(entry.first);
       const Bucket &b = entry.second;
       std::fprintf(stderr,

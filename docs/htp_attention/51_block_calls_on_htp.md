@@ -544,3 +544,35 @@ conv만 켠 config, 세 실행 모두 `qos_mode=2`:
   FastRPC가 매 콜 복사·매핑한다. ION 스테이징 버퍼로 옮겨 재는 것이 다음 실험(맞으면 −0.5~0.8 × 22).
 - 오늘 A(921~1013) 대비 **−205~−297**, 09-16의 848 대비 −132. 세 실행의 텍스트는 바이트 동일(§2.18의
   ppl 57.12 config).
+
+### 2.21 전부 켬: prefill 618, ppl 62.1 — attn proj는 −88, dense는 −10에 같은 ppl 값 (2026-09-22)
+
+`conv_block_engine` + `dense_ffn_engine` + `attn_proj_engine`, poll 5000, `-qs4cx-wh` 디렉터리, 등록 1520:
+
+```
+prefill 642 / 618 ms (692 / 718 TPS)   decode 24.6 TPS   ppl 62.09  (A 57.00, conv만 57.12, D 58.51, dense만 59.41)
+  K=2048 N=512  M>1       calls=12  host 843/콜   dsp 571  transport 272   [quant 299 dequant 75 acc 43]     ← k, v
+  K=2048 N=2048 M>1       calls=36  host 11140/콜 dsp 10176 transport 964  ← MoE 22 + q/o 12 + 워밍업 2가 한 행에 섞임
+  M>1 dense               calls=3   host 10677/콜 transport 605
+  M>1 conv                calls=19  host 4493/콜  dsp 3999  transport 494  (conv만 켠 실행에선 321)
+  M==1 (decode MoE)       calls=11264  host 1417/콜  transport 86
+  arm staging memcpy 28.1 ms (634.7 MB)
+```
+
+- **conv만(716) 대비 −98.** q/k/v/o가 CPU에서 80~115(문서 50 §2 추정) → HTP 34(q/o ≈24 + k/v 10)라
+  ≈ −88, dense ≈ −10. 문서 50 §3.7의 "전부 켬 +22"는 poll 100에서 24콜의 transport가 이득을 먹은 것이고,
+  poll 5000에서 뒤집혔다.
+- **ppl 62.09 = A +8.9%.** dense 몫 +4.2%(§2.17)와 attn proj 몫 ≈ +4.5%가 얹힌다. 텍스트(3문장 요약)는
+  세 실행 동일하고 정상. **거래 조건이 다르다**: attn proj는 −88 ms에 +4.5%, dense는 −10 ms에 +4.2% —
+  dense는 끄는 것이 맞다(conv + attn = 예상 prefill ≈ 630, ppl ≈ 59.6). 사용자 판단은 "문장 정상이면 OK".
+- **프로파일 결함**: `addInvoke`(일반 FC)가 kind 0으로 MoE 행과 같은 키를 써서 q/o(2048×2048)가 MoE 행에
+  섞였다. kind 3 `M>1 FC`로 분리 — 다음 실행부터 q/o 콜당 비용이 그대로 읽힌다.
+- **k/v 콜 843 us의 구성**: quant 299 + transport 272 + dsp의 나머지 ≈ 270. 연산이 아니라 고정비다. q/k/v
+  셋이 같은 x(normed residual, 3.6 MB)를 각자 양자화해서 각자 전송한다 — 한 콜(N=3072)로 묶으면 콜당
+  quant·transport·스테이징 두 벌이 사라진다(≈ −1.2 ms × 6). attention 블록 콜(§2.20 4번)의 첫 걸음.
+- **conv transport 321 → 494, dense 605.** 같은 커널·같은 poll인데 등록 1480 → 1520, 콜 수 +24에서 올랐다.
+  문서 50 §3.6의 "스테이징 크기 비례 캐시 유지비"로는 설명이 안 된다(크기 동일). 열이거나 FastRPC 핸들
+  수 비례 — 식힌 뒤 conv만 켠 실행 한 번이면 가른다.
+- prefill 618의 구성(콜당 × 콜 수): MoE ≈340 (55%) · conv 81 · q/o ≈24 · dense 21 · k/v 10 · 스테이징 28 ·
+  **ARM 잔여 ≈ 115~140 (≈20%)**. ARM 잔여는 attention core 6층(444² 어텐션 ≈ 10 GFLOP f32 → 그것만으로
+  ≈100)이 대부분일 것 — 다른 담당자 몫.
