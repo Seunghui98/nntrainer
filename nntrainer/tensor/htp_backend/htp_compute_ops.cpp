@@ -799,19 +799,21 @@ public:
     }
 
     // mm_u8i4_layer writes one contiguous [M x N_i] block per handle, in
-    // call order (see copyOut), but matCdata is one pointer per weight --
-    // stage into scratch, then hand each weight its block. M is small at
-    // this call's one real shape (decode, M==1), so this scratch and the
-    // extra copy are a handful of KB, not a hidden cost.
-    std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
-    invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
-                out_cat.data(), M, n_total, K);
-
-    size_t off = 0;
-    for (size_t i = 0; i < n; ++i) {
-      const size_t block = static_cast<size_t>(M) * N[i];
-      std::memcpy(matCdata[i], out_cat.data() + off, block * sizeof(float));
-      off += block;
+    // call order, and copyOut hands each weight its block straight out of
+    // the staging buffer. Two callers: decode's grouped expert gate_ups at
+    // M == 1, and the attention q/k/v projections at prefill (qkv_layer,
+    // doc 51 section 2.21) -- 444 rows, where a heap copy in between
+    // would be 5 MB a call. Row chunks as gemm_q4_0_accel_fp32 makes them,
+    // for the same VTCM reason.
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      std::vector<float *> dsts(n);
+      for (size_t i = 0; i < n; ++i)
+        dsts[i] = matCdata[i] + static_cast<size_t>(m0) * N[i];
+      invokeLayer(session, handles.data(), static_cast<int>(n),
+                  matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
+                  K, &N, &dsts);
     }
   }
 
@@ -1306,9 +1308,20 @@ private:
    * handle, in call order (its out_off += M * h->N), not a row-major
    * [M x sum(N_i)]. One handle is therefore the whole [M x N] and copies
    * straight through; the slices of one weight (get_or_register_fc) are
-   * interleaved back, row by row, into their column ranges. */
+   * interleaved back, row by row, into their column ranges; separate
+   * weights (@a dsts, the batch call) each get their block whole. */
   static void copyOut(float *dst, const float *out_cat, unsigned int M,
-                      unsigned int N, const std::vector<unsigned int> *blocks) {
+                      unsigned int N, const std::vector<unsigned int> *blocks,
+                      const std::vector<float *> *dsts = nullptr) {
+    if (dsts) {
+      size_t off = 0;
+      for (size_t i = 0; i < dsts->size(); ++i) {
+        const size_t block = static_cast<size_t>(M) * (*blocks)[i];
+        stagedMemcpy((*dsts)[i], out_cat + off, block * sizeof(float));
+        off += block;
+      }
+      return;
+    }
     if (!blocks || blocks->size() < 2) {
       stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float));
       return;
@@ -1327,12 +1340,14 @@ private:
   }
 
   /** @param blocks N of each handle in call order, when @a handles are the
-   *  slices of one weight and matCdata is its whole [M x N]; NULL when each
+   *  slices of one weight and matCdata is its whole [M x N], or separate
+   *  weights whose [M x N_i] blocks go to @a dsts[i]; NULL when each
    *  handle's output stays a block of its own (or there is only one). */
   void invokeLayer(remote_handle64 session, const uint32_t *handles,
                    int num_handles, float *matBdata, float *matCdata,
                    unsigned int M, unsigned int N, unsigned int K,
-                   const std::vector<unsigned int> *blocks = nullptr) {
+                   const std::vector<unsigned int> *blocks = nullptr,
+                   const std::vector<float *> *dsts = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
     const auto shape = [&]() {
@@ -1358,7 +1373,7 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer failed: err=" +
                                  std::to_string(err) + shape());
       }
-      copyOut(matCdata, out_cat, M, N, blocks);
+      copyOut(matCdata, out_cat, M, N, blocks, dsts);
       return;
     }
 
@@ -1378,7 +1393,7 @@ private:
                                              : "nntr_hvx_mm_u8i4_layer") +
                                " failed: err=" + std::to_string(err) + shape());
     }
-    copyOut(matCdata, out_cat, M, N, blocks);
+    copyOut(matCdata, out_cat, M, N, blocks, dsts);
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 

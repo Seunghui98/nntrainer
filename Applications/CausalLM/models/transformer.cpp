@@ -454,7 +454,8 @@ void Transformer::repack_weight() {
         return;
       }
       if (l.getType() != "fully_connected" &&
-          l.getType() != "shared_fully_connected" && l.getType() != "lfm2_moe")
+          l.getType() != "shared_fully_connected" &&
+          l.getType() != "qkv_layer" && l.getType() != "lfm2_moe")
         return;
 
       // An accelerator-dispatched MoE layer registers its expert weights

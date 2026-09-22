@@ -67,6 +67,11 @@ void setupLfm2MoeDeterministicWeights(TinyLfm2MoeCausalLM &model) {
         if (layer.getType() == "rms_norm" ||
             layer.getType() == "reshaped_rms_norm") {
           weight.setValue(1.0f);
+        } else if (layer.getType() == "qkv_layer" &&
+                   weight.getName().find("gamma") != std::string::npos) {
+          // q_norm / k_norm live inside the fused q/k/v layer (doc 51
+          // section 2.23); their gammas are the scales set to 1 above.
+          weight.setValue(1.0f);
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0.0f);
           weight.setValue(0, 0, 1, 0, 1.0f);

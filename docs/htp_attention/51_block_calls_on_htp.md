@@ -600,3 +600,24 @@ GU(n)→DN(n)에서는 블록마다 세 잡이 숨을 곳이 없었다: 마지�
   이제 "rq(n)을 실은 잡의 노출"이다. 실측이 답: MoE 행의 requant/dequant/scatter가 0 근처로 가야 한다.
   DN 에필로그가 배치보다 길어지면(scatter가 타일당 64번의 1벡터 호출이라) 대신 REQUANT가 오른다 — 그때는
   타일 모양 scale-add 하나(ponytail 주석).
+
+### 2.23 q/k/v를 한 콜로: `qkv_layer`에 q_norm·k_norm까지 접음 (2026-09-22, 코드)
+
+§2.21 3번. k/v 콜 843 us 중 quant 299 + transport 272가 고정비였고, q/k/v 셋이 같은 x(3.6 MB)를 각자
+양자화해 각자 보냈다. 한 콜이면 6층 × ≈1.2 ms.
+
+- **레이어**: 이미 있던 `qkv_layer`(q/k/v 가중치 셋, `Tensor::dot`의 벡터 오버로드 → `gemm_q4_0_batch_fp32`
+  한 콜)에 `feature_size`(head_dim)·`epsilon`을 더해 **q_norm·k_norm을 접었다.** 파일 순서가 q, q_norm, k,
+  k_norm, v라서 셋만 묶으면 로더가 gamma를 k 가중치로 읽는다 — 그래서 gamma 둘도 이 레이어의 가중치다
+  (FP32, `ReshapedRMSNormLayer`와 같은 요청·같은 `rms_norm_wrt_width_fp32_intrinsic` + gamma 곱).
+  출력 셋: q_normed, k_normed, v. 원본이 `__restrict`라 in-place가 안 되어 q_raw/k_raw 텐서 둘을 둔다.
+- **LFM2 attention은 엔진과 무관하게 이 레이어를 쓴다**(fully_connected 3 + reshaped_rms_norm 2 → 1). CPU
+  경로는 같은 GEMM 셋 + 같은 norm 커널이라 A config도 그대로이고, 호스트 유닛 테스트
+  (`unittest_causallm_lfm2`, `_lfm2_moe`)가 이 경로를 탄다. decode(M=1)는 벡터 dot이 CPU로 떨어지므로 불변.
+- **HTP 쪽** `gemm_q4_0_batch_fp32`: M=1 전용이던 것을 prefill 모양으로 — 행 청크(fcMaxRows)와 가중치별
+  목적지(`invokeLayer(..., &N, &dsts)`; 힙 out_cat + 두 번째 복사 5 MB/콜 제거). 프로파일 행은 `K=2048
+  N=3072 M>1 FC`로 따로 찍힌다. 로드 시 등록은 transformer.cpp의 FC 분기에 `qkv_layer` 타입 추가.
+- 기대: k/v 12콜(10 ms) + q 12콜(≈24) → 6콜 ≈ 6 × (2.0 + 0.55) ≈ 15 → **−15~−19 ms**. transport 한 번,
+  quant 한 번, HMX는 같은 타일 수.
+- **attention 블록 콜(§2.20 4번)의 첫 걸음**: 이 레이어가 그 콜의 호스트 쪽 자리다 — core 담당자의 커널이
+  오면 `qkv_layer`의 HTP 경로가 q/k/v 대신 attention 출력을 받아오면 된다.

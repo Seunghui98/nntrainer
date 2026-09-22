@@ -23,6 +23,7 @@
 #define WIN_EXPORT
 #endif
 
+#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -51,8 +52,19 @@ public:
 } // namespace props
 
 /**
- * @class   FullyConnecedLayer
- * @brief   fully connected layer
+ * @class   QKVLayer
+ * @brief   The q, k and v projections of one attention block as ONE layer,
+ *          with the per-head RMS norm of q and k folded in when
+ *          feature_size is set.
+ *
+ * One layer so the three matmuls share one activation: an accelerator
+ * takes them as one call (Tensor::dot's vector overload, doc 51 section
+ * 2.21 -- three calls each quantized and shipped the same 3.6 MB
+ * activation), and on the CPU it is the same three GEMMs. With
+ * feature_size (the head dim) the layer holds, in the model file's
+ * order, q, q_norm's gamma, k, k_norm's gamma, v, and applies the same
+ * rms_norm_wrt_width + gamma multiply ReshapedRMSNormLayer would; the
+ * outputs are q_normed, k_normed, v. Without it: q, k, v as they are.
  */
 WIN_EXPORT class QKVLayer : public nntrainer::LayerImpl {
 public:
@@ -143,8 +155,13 @@ public:
   inline static const std::string type = "qkv_layer";
 
 private:
-  std::tuple<props::QUnit, props::KUnit, props::VUnit> qkv_props;
-  std::array<unsigned int, 3> weight_idx; /**< indices of the weights */
+  /** feature_size: the head dim q and k are normed over; unset = no norm */
+  std::tuple<props::QUnit, props::KUnit, props::VUnit, props::FeatureSize,
+             nntrainer::props::Epsilon>
+    qkv_props;
+  std::array<unsigned int, 5> weight_idx; /**< q, [q_gamma,] k, [k_gamma,] v */
+  std::array<unsigned int, 2> tensor_idx; /**< q and k before the norm */
+  unsigned int feature_size = 0;
 };
 
 } // namespace causallm
