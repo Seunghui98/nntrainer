@@ -23,6 +23,7 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
+#include <lfm2_moe_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
@@ -481,7 +482,7 @@ void Transformer::repack_weight() {
       for (auto &w : weights) {
         auto &t = w->getVariableRef();
         const auto dtype = t.getDataType();
-        if (dtype == ml::train::TensorDim::DataType::QS4CX) {
+        if (dtype == ml::train::TensorDim::DataType::QS4CX && !t.isVirtual()) {
           t.pack();
         }
         if (fc_ops && dtype == ml::train::TensorDim::DataType::Q4_0) {
@@ -494,8 +495,15 @@ void Transformer::repack_weight() {
           const auto h = static_cast<unsigned int>(t.height());
           const auto wd = static_cast<unsigned int>(t.width());
           weights_wh = dtype == ml::train::TensorDim::DataType::QS4CX_WH;
-          ops->register_qs4cx_weight(t.getData<char>(), t.getScale<float>(), h,
-                                     wd, weights_wh);
+          // [doc 52] A virtual expert has no bytes here: preloadExperts
+          // below reads it from the model file into the accelerator's slot
+          // pool, keyed by the tensor itself, and the warm-up passes that
+          // key with a null scale the way the layer's forward does.
+          void *key =
+            t.isVirtual() ? static_cast<void *>(&t) : t.getData<char>();
+          float *scale = t.isVirtual() ? nullptr : t.getScale<float>();
+          if (!t.isVirtual())
+            ops->register_qs4cx_weight(key, scale, h, wd, weights_wh);
           // The expert weights come in two shapes: gate_up is [K, 2*inter]
           // and down [inter, N_out]. Sorted here for the warm-up below by
           // the identity that tells them apart, gate_up.width == 2 *
@@ -505,15 +513,25 @@ void Transformer::repack_weight() {
               gu_h = h;
               gu_w = wd;
             }
-            gu_data.push_back(t.getData<char>());
-            gu_scale.push_back(t.getScale<float>());
+            gu_data.push_back(key);
+            gu_scale.push_back(scale);
           } else {
             dn_h = h;
             dn_w = wd;
-            dn_data.push_back(t.getData<char>());
-            dn_scale.push_back(t.getScale<float>());
+            dn_data.push_back(key);
+            dn_scale.push_back(scale);
           }
         }
+      }
+      // [doc 52] Virtual experts into the shared pool now, in layer order
+      // until it is full, so the first prefill maps no arena chunk. A
+      // layer whose experts did not all fit cannot host the warm-up call.
+      bool moe_all_resident = true;
+      if (ops && l.getType() == "lfm2_moe") {
+        auto *moe = dynamic_cast<Lfm2MoELayer *>(
+          static_cast<nntrainer::LayerNode &>(l).getLayer());
+        if (moe)
+          moe_all_resident = moe->preloadExperts(context);
       }
       // [doc 47 section 20.1, lever 6] One warm-up call through the layer
       // kernel at load, so the first prefill does not pay the first call's
@@ -525,7 +543,7 @@ void Transformer::repack_weight() {
       // input, output discarded. Skipped, harmlessly, when the shapes do
       // not read as an expert pair.
       static bool moe_warmed = false;
-      if (ops && !moe_warmed && l.getType() == "lfm2_moe" &&
+      if (ops && !moe_warmed && moe_all_resident && l.getType() == "lfm2_moe" &&
           ops->supports_gemm_qs4cx_moe_layer_fp32() && !gu_data.empty() &&
           gu_data.size() == dn_data.size()) {
         if (gu_w == 2 * dn_h && gu_h == dn_w) {

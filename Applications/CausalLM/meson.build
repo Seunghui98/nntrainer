@@ -371,6 +371,7 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_moe_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_slim_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_cached_slim_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
       ],
       dependencies: [
         nntrainer_dep,
