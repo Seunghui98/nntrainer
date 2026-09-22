@@ -52,6 +52,7 @@
 #include <swiglu_det.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -64,6 +65,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -211,6 +213,23 @@ public:
       ++reg_ion_calls_;
   }
 
+  /** @brief One expert brought in from the model file at forward time, or
+   *  one released to make room (doc 52): read_us is the pread into the
+   *  arena slot, rpc_us the register/release FastRPC calls. Held as
+   *  "pending" and attributed to the next MoE layer call's row, which is
+   *  the call that paid for it, so the row reads miss/call directly. */
+  void addExpertLoad(uint64_t read_us, uint64_t rpc_us, bool is_load) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (is_load)
+      ++miss_pending_;
+    miss_read_pending_us_ += read_us;
+    miss_rpc_pending_us_ += rpc_us;
+    if (is_load)
+      ++miss_total_;
+    miss_read_total_us_ += read_us;
+    miss_rpc_total_us_ += rpc_us;
+  }
+
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                  const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -297,6 +316,10 @@ public:
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
+    b.misses += miss_pending_;
+    b.miss_read_us += miss_read_pending_us_;
+    b.miss_rpc_us += miss_rpc_pending_us_;
+    miss_pending_ = miss_read_pending_us_ = miss_rpc_pending_us_ = 0;
     if (stage_us != nullptr) {
       b.dsp_us += stage_us[HTP_MOE_T_DSP_TOTAL];
       b.quant_us += stage_us[HTP_MOE_T_QUANT];
@@ -340,6 +363,12 @@ private:
   struct Bucket {
     uint64_t calls = 0;
     uint64_t rows = 0; /**< summed M, so prefill batching is visible */
+    /** Expert cache misses paid before this row's calls (doc 52), and
+        what they cost outside the call: the file read and the FastRPC
+        register/release round trips. Both sit OUTSIDE host_us. */
+    uint64_t misses = 0;
+    uint64_t miss_read_us = 0;
+    uint64_t miss_rpc_us = 0;
     uint64_t host_us = 0;
     uint64_t dsp_us = 0;
     uint64_t quant_us = 0;
@@ -525,6 +554,18 @@ private:
                      first_us > 0.0 ? first_kb * 1.024 / first_us : 0.0,
                      dsp_us > 0.0 ? kb * 1.024 / dsp_us : 0.0);
       }
+      if (b.misses != 0 || b.miss_rpc_us != 0) {
+        std::fprintf(
+          stderr,
+          "\n[HTP-PROFILE]     expert misses: %llu (%.2f/call), "
+          "file read %.1f ms (%.2f ms/call, %.2f ms/miss), "
+          "register+release rpc %.1f ms (%.2f ms/call) -- outside "
+          "host= above",
+          (unsigned long long)b.misses, static_cast<double>(b.misses) / b.calls,
+          ms(b.miss_read_us), ms(b.miss_read_us) / static_cast<double>(b.calls),
+          b.misses ? ms(b.miss_read_us) / b.misses : 0.0, ms(b.miss_rpc_us),
+          ms(b.miss_rpc_us) / static_cast<double>(b.calls));
+      }
       std::fprintf(stderr, "\n");
     }
 
@@ -540,6 +581,16 @@ private:
       staging_us_ ? static_cast<double>(staging_bytes_) / staging_us_ / 1000.0
                   : 0.0,
       ms(reg_total_us_ + invoke_us + staging_us_));
+    if (miss_total_ != 0) {
+      std::fprintf(stderr,
+                   "[HTP-PROFILE] expert cache misses: %llu, file read "
+                   "%.1f ms (%.2f ms/miss), register+release rpc %.1f ms "
+                   "(%.2f ms/miss)\n\n",
+                   (unsigned long long)miss_total_, ms(miss_read_total_us_),
+                   ms(miss_read_total_us_) / miss_total_,
+                   ms(miss_rpc_total_us_),
+                   ms(miss_rpc_total_us_) / miss_total_);
+    }
   }
 
   int level_ = 0;
@@ -552,6 +603,9 @@ private:
   uint64_t staging_bytes_ = 0;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
+  uint64_t miss_pending_ = 0, miss_read_pending_us_ = 0,
+           miss_rpc_pending_us_ = 0;
+  uint64_t miss_total_ = 0, miss_read_total_us_ = 0, miss_rpc_total_us_ = 0;
   /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
    *  through the MoE layer kernel (doc 51). */
   std::map<std::tuple<unsigned, unsigned, bool, int>, Bucket> buckets_;
@@ -949,6 +1003,139 @@ public:
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     get_or_register_fc(data, session, K, N);
+    return true;
+  }
+
+  /**
+   * @brief [doc 52] One expert's two WH weights, read from the model file
+   *        straight into an arena slot and registered from there.
+   *
+   * The slot is the unit the LRU above this trades in: gate_up then down,
+   * each 4 KB aligned, so a release hands back exactly what the next miss
+   * needs and the pool never fragments. pread into the arena rather than
+   * activate()'s mmap + memcpy: the arena's CPU mapping is uncached, so the
+   * copy the kernel does into it IS the write to DDR the DSP will read,
+   * and there is no second copy and no page fault storm to pay. The scales
+   * and column sums follow the nibbles in the file (QS4CX_WH_Tensor's
+   * layout, written by nntr_quantize_stream), so nothing is computed here.
+   *
+   * Slot reuse means the DSP reads a slot, the host overwrites it, the DSP
+   * reads it again -- a sequence the arena tests never covered.
+   * ArenaSlotReuseMatchesHeap (unittest_hvx_mm_u8i4) is the gate for it.
+   */
+  bool register_qs4cx_wh_expert_file(const void *key_gu, const void *key_dn,
+                                     int fd, size_t off_gu, size_t off_dn,
+                                     unsigned int K, unsigned int inter,
+                                     unsigned int N_out,
+                                     bool at_load) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    if (experts_.count(key_gu) != 0)
+      return true;
+    if (fd < 0) {
+      throw std::runtime_error("register_qs4cx_wh_expert_file: the virtual "
+                               "expert weight carries no model file fd");
+    }
+    if (!ensureArena(session)) {
+      throw std::runtime_error(
+        "QS4CX_WH weights need the DSP arena, which this device did not "
+        "provide (no rpcmem_to_fd or no fastrpc_mmap).");
+    }
+    const uint32_t gu_len = static_cast<uint32_t>(whBytes(K, 2 * inter));
+    const uint32_t dn_len = static_cast<uint32_t>(whBytes(inter, N_out));
+    const uint32_t gu_stride = (gu_len + 4095u) & ~4095u;
+    const uint32_t slot_bytes = gu_stride + ((dn_len + 4095u) & ~4095u);
+    // One expert shape per process: a released slot is reused as is, and a
+    // second shape would need a second pool. Not this model.
+    if (expert_slot_bytes_ == 0) {
+      expert_slot_bytes_ = slot_bytes;
+    } else if (expert_slot_bytes_ != slot_bytes) {
+      throw std::runtime_error("register_qs4cx_wh_expert_file: expert shape "
+                               "differs from the pool's");
+    }
+
+    const uint64_t t0 = HtpProfile::nowUs();
+    ExpertSlot slot;
+    if (!free_expert_slots_.empty()) {
+      slot = free_expert_slots_.back();
+      free_expert_slots_.pop_back();
+    } else if (!place(session, slot_bytes, kArenaChunkMax, &slot.chunk,
+                      &slot.off)) {
+      throw std::runtime_error(
+        "HTP arena: cannot place an expert slot (" +
+        std::to_string(slot_bytes >> 20) + " MiB). " +
+        (arena_fail_.empty() ? "no chunk was attempted" : arena_fail_) +
+        ". mapped=" + std::to_string(arenaBytes() >> 20) + " MiB in " +
+        std::to_string(arena_chunks_.size()) +
+        " chunks, RSS=" + std::to_string(rssKb() >> 10) + " MB");
+    }
+
+    uint8_t *base = arena_chunks_[slot.chunk].buf->data() + slot.off;
+    ArenaEntry gu, dn;
+    gu.chunk = dn.chunk = slot.chunk;
+    gu.off = slot.off;
+    dn.off = slot.off + gu_stride;
+    uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
+    uint64_t t_read = 0, t_rpc = 0;
+    try {
+      readExpertWeight(fd, off_gu, K, 2 * inter, base, gu);
+      readExpertWeight(fd, off_dn, inter, N_out, base + gu_stride, dn);
+      t_read = HtpProfile::nowUs();
+      h_gu = registerFromArena(session, gu, K, 2 * inter, 0);
+      if (h_gu == kNoHandle)
+        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
+                                 std::to_string(K) + "x" +
+                                 std::to_string(2 * inter) + " WH weight");
+      h_dn = registerFromArena(session, dn, inter, N_out, 0);
+      if (h_dn == kNoHandle)
+        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
+                                 std::to_string(inter) + "x" +
+                                 std::to_string(N_out) + " WH weight");
+      t_rpc = HtpProfile::nowUs();
+    } catch (...) {
+      if (h_gu != kNoHandle)
+        nntr_hvx_weight_release_u8i4(session, h_gu);
+      free_expert_slots_.push_back(slot);
+      throw;
+    }
+    handle_cache_[key_gu] = h_gu;
+    handle_cache_[key_dn] = h_dn;
+    experts_.emplace(key_gu, ExpertResident{slot, key_dn, h_gu, h_dn});
+
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() != 0) {
+      if (at_load) // the file read stands where the convert used to
+        profile.addRegister(t_rpc - t0, t_read - t0, t_rpc - t_read, true);
+      else
+        profile.addExpertLoad(t_read - t0, t_rpc - t_read, true);
+    }
+    return true;
+  }
+
+  bool release_qs4cx_wh_expert(const void *key_gu) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = experts_.find(key_gu);
+    if (it == experts_.end())
+      return false;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int e1 = nntr_hvx_weight_release_u8i4(session, it->second.h_gu);
+    const int e2 = nntr_hvx_weight_release_u8i4(session, it->second.h_dn);
+    if (e1 != AEE_SUCCESS || e2 != AEE_SUCCESS) {
+      // The DSP still holds a handle onto this slot; reusing the slot would
+      // hand a live handle someone else's bytes. Leak the slot instead.
+      throw std::runtime_error("nntr_hvx_weight_release_u8i4 failed: err=" +
+                               std::to_string(e1 != AEE_SUCCESS ? e1 : e2));
+    }
+    handle_cache_.erase(key_gu);
+    handle_cache_.erase(it->second.key_dn);
+    free_expert_slots_.push_back(it->second.slot);
+    experts_.erase(it);
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() != 0)
+      profile.addExpertLoad(0, HtpProfile::nowUs() - t0, false);
     return true;
   }
 
@@ -2177,6 +2364,63 @@ private:
     std::vector<float> bias;
   };
 
+  /** @brief One expert's place in the arena: gate_up at off, down at
+   *  off + its 4 KB-rounded length (register_qs4cx_wh_expert_file). */
+  struct ExpertSlot {
+    uint32_t chunk = 0;
+    uint32_t off = 0;
+  };
+  struct ExpertResident {
+    ExpertSlot slot;
+    const void *key_dn;
+    uint32_t h_gu, h_dn;
+  };
+
+  /** @brief pread that finishes or throws: a short read into a weight is a
+   *  wrong matmul, never a warning. */
+  static void preadFull(int fd, void *dst, size_t len, uint64_t off,
+                        const char *what) {
+    uint8_t *p = static_cast<uint8_t *>(dst);
+    while (len != 0) {
+      const ssize_t n = ::pread(fd, p, len, static_cast<off_t>(off));
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        throw std::runtime_error(std::string("pread(") + what +
+                                 ") failed: " + std::strerror(errno));
+      }
+      if (n == 0) {
+        throw std::runtime_error(std::string("pread(") + what +
+                                 ") hit end of file: the model file is "
+                                 "shorter than its weights");
+      }
+      p += n;
+      len -= static_cast<size_t>(n);
+      off += static_cast<uint64_t>(n);
+    }
+  }
+
+  /** @brief Reads one QS4CX_WH weight from the model file: the nibbles
+   *  into the arena at @a arena_dst, the N scales and N column sums that
+   *  follow them into @a e. whBytes(K, N) is the nibble half exactly:
+   *  QS4CX_Tensor::size() counts N * ceil(K / 2) and K is a multiple of
+   *  32 here. */
+  void readExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
+                        uint8_t *arena_dst, ArenaEntry &e) {
+    const size_t nib = whBytes(K, N);
+    preadFull(fd, arena_dst, nib, off, "WH nibbles");
+    std::vector<float> tail(2 * static_cast<size_t>(N));
+    preadFull(fd, tail.data(), tail.size() * sizeof(float), off + nib,
+              "scale+colsum");
+    e.K = K;
+    e.N = N;
+    e.w_scale.assign(tail.begin(), tail.begin() + N);
+    e.colsum_w.resize(N);
+    for (uint32_t i = 0; i < N; ++i)
+      e.colsum_w[i] = static_cast<int32_t>(tail[N + i]);
+    e.bias.assign(N, 0.0f);
+  }
+
   /**
    * @brief Hands the OS back the pages of a weight that is now in the arena.
    *
@@ -2236,6 +2480,18 @@ private:
     auto it = handle_cache_.find(matAdata);
     if (it != handle_cache_.end())
       return it->second;
+    // A null scale is the layer's way of saying "this is a virtual expert's
+    // key, the bytes are in your slot pool" (register_qs4cx_wh_expert_file).
+    // Not finding it is a bookkeeping bug -- the caller's LRU let an expert
+    // reach the call without acquiring it -- and reading the key as bytes
+    // would compute a wrong answer quietly.
+    if (matAscale == nullptr) {
+      throw std::runtime_error(
+        "QS4CX_WH expert weight (" + std::to_string(K) + "x" +
+        std::to_string(N) +
+        ") is not resident: register_qs4cx_wh_expert_file must precede the "
+        "call for a virtual expert");
+    }
 
     const uint64_t t_begin = HtpProfile::nowUs();
     // There is no other way to register these. The DSP-heap path bakes its
@@ -2648,6 +2904,12 @@ private:
   std::unordered_map<const void *, ConvHandles> conv_cache_;
 
   std::vector<ArenaChunk> arena_chunks_;
+  /** Expert slots given back by release_qs4cx_wh_expert, all of
+   *  expert_slot_bytes_; a miss takes one of these before it bumps a
+   *  chunk, so after the load the chunk count never moves. */
+  std::vector<ExpertSlot> free_expert_slots_;
+  std::unordered_map<const void *, ExpertResident> experts_;
+  size_t expert_slot_bytes_ = 0;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
   /** Why the last newChunk refused, in words, for the throw that follows. */

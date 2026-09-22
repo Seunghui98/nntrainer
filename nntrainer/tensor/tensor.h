@@ -2015,6 +2015,14 @@ public:
   bool isVirtual() const { return is_virtual; }
 
   /**
+   * @brief The model file descriptor a virtual tensor captured at read()
+   *        time, or -1. What a backend needs, with getFileOffset(), to
+   *        read a virtual weight's bytes itself instead of through
+   *        activate()'s mmap.
+   */
+  int getFd() const { return fd; }
+
+  /**
    * @brief activate virtual tensor
    * @note if the tensor is virtual, this method activates virtual tensor, which
    * means allocate the tensor memory and read the corresponding value from the

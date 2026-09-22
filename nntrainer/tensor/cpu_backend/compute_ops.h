@@ -334,6 +334,40 @@ public:
     return false;
   }
 
+  // A QS4CX_WH expert pair the loader never read (a virtual weight, doc
+  // 52): the backend reads both weights' bytes from the model file at
+  // (fd, off_gu) and (fd, off_dn) into a slot it owns and registers them
+  // under key_gu / key_dn, which the caller then passes as gate_up_data /
+  // down_data -- with a null scale -- to gemm_qs4cx_moe_layer_fp32. Each
+  // weight's file layout is [WH nibbles][N scales][N column sums], as
+  // QS4CX_WH_Tensor lays it out. Idempotent for a key already resident.
+  // at_load says whether to count it as load-time registration or as a
+  // cache miss in the profile. A backend without a slot pool returns false.
+  virtual bool register_qs4cx_wh_expert_file(const void *key_gu,
+                                             const void *key_dn, int fd,
+                                             size_t off_gu, size_t off_dn,
+                                             unsigned int K, unsigned int inter,
+                                             unsigned int N_out, bool at_load) {
+    (void)key_gu;
+    (void)key_dn;
+    (void)fd;
+    (void)off_gu;
+    (void)off_dn;
+    (void)K;
+    (void)inter;
+    (void)N_out;
+    (void)at_load;
+    return false;
+  }
+
+  // Undoes the above for one expert: both handles released, the slot back
+  // in the pool for the next register_qs4cx_wh_expert_file. False when the
+  // key is not resident.
+  virtual bool release_qs4cx_wh_expert(const void *key_gu) {
+    (void)key_gu;
+    return false;
+  }
+
   // The dense SwiGLU FFN as ONE accelerator call (doc 51): up and gate
   // [K x I] and down [I x N], all Q4_0x4 as loaded; act [M x K] f32 ->
   // out [M x N] f32 = (silu(act . gate) * (act . up)) . down. The HTP
