@@ -576,3 +576,27 @@ prefill 642 / 618 ms (692 / 718 TPS)   decode 24.6 TPS   ppl 62.09  (A 57.00, co
 - prefill 618의 구성(콜당 × 콜 수): MoE ≈340 (55%) · conv 81 · q/o ≈24 · dense 21 · k/v 10 · 스테이징 28 ·
   **ARM 잔여 ≈ 115~140 (≈20%)**. ARM 잔여는 attention core 6층(444² 어텐션 ≈ 10 GFLOP f32 → 그것만으로
   ≈100)이 대부분일 것 — 다른 담당자 몫.
+
+### 2.22 MoE 커널: down을 한 블록 뒤로 — 노출된 requant·마지막 에필로그를 HMX 아래로 (2026-09-22, 코드, 호스트 체크 통과)
+
+§2.21 4번의 MoE transport가 아니라 2번(커널 안의 노출 2.2 ms/콜)부터. 전경 레인은 한 번에 한 잡이고, 잡은
+자기 submit과 자기를 거두는 wait 사이에 HMX 배치 발행이 있어야만 숨는다(문서 47 §14). 블록 순서
+GU(n)→DN(n)에서는 블록마다 세 잡이 숨을 곳이 없었다: 마지막 gate_up 에필로그(requant가 gate_off 전체를
+필요로 해서), requant 자체(동기, 풀 왕복 2번), 마지막 down 에필로그 + 그 뒤의 scatter.
+
+바꾼 것 — `hexkl_mm_u8i4_moe.c`의 블록 루프 전체:
+
+- **발행 순서 `GU(0) rq(0) | GU(1) DN(0) | GU(2) DN(1) | … | DN(N−1)`.** DN(n−1)의 배치가 GU(n)의 마지막
+  에필로그와 rq(n)을 덮고, GU(n+1)의 첫 배치가 DN(n−1)의 마지막을 덮는다.
+- **rq(n)은 DN(n−1)의 첫 에필로그 잡 안에, scatter는 모든 down 에필로그 안에** (`moe_dn_worker`: 타일 하나
+  dequant → 그 32열을 바로 out_c에 scatter-add; 라운드로빈으로 requant 유닛 4개(16행씩)도 같은 잡에). 블록당
+  잡 수 = 배치 수. 노출은 콜의 양 끝(rq(0) 앞의 에필로그 하나, 마지막 down 에필로그 하나)뿐.
+- 그러려면: mid 2벌(+112 KB VTCM, 레이아웃 7.03 MB), mid 행 파라미터 2벌, down[e]는 GU(e) 앞이 아니라
+  DN(prev) 발행 뒤에 push(안 그러면 DN(prev)가 읽는 버퍼 위에 떨어진다), 스테이징 패리티를 gate_up·down
+  배치에 걸쳐 하나로. gate_off는 1벌로 충분 — rq(n)은 GU(n+1)의 첫 에필로그 submit 전에 거둬진다.
+- 비트 동일: 타일의 32열은 그 타일만 쓰고, 원소마다 expert마다 곱셈-덧셈 한 번이 블록 순서대로 —
+  행 분할이 만들던 바이트 그대로. 호스트 체크 `MOE KERNEL MATCHES REFERENCE`(mismatches 0), 블록 5, DMA 12 KB.
+- 기대: requant 0.73~1.0 + dequant 꼬리 ~0.4 + scatter 0.24 → **−1.2~1.5 ms/콜 × 22 ≈ −30**. REQUANT 열은
+  이제 "rq(n)을 실은 잡의 노출"이다. 실측이 답: MoE 행의 requant/dequant/scatter가 0 근처로 가야 한다.
+  DN 에필로그가 배치보다 길어지면(scatter가 타일당 64번의 1벡터 호출이라) 대신 REQUANT가 오른다 — 그때는
+  타일 모양 scale-add 하나(ponytail 주석).
