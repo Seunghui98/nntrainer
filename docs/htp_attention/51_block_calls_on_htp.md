@@ -478,3 +478,24 @@ conv 블록을 HTP로      : 59.41 → 58.51   −0.90  (−1.5%)
   도구, f32에서 직접)로 dense 가중치를 다시 뽑아 이중 양자화를 없애야 한다.
 - 확인용 한 실행: `conv_block_engine`만 켠 config의 ppl이 57 근처인가. 그러면 분해가 맞고 D 대신
   그 config가 기본이 된다.
+
+### 2.18 conv만 켠 config — ppl 57.12 vs A 57.00, 그리고 파이프라인이 먹었다 (2026-09-22)
+
+`conv_block_engine`만, `NNTR_PPL=1`, PROFILE=2 (등록 1480 = MoE 1408 + conv 72):
+
+```
+ppl 57.1179  nll/token 4.045        (A 57.0017 / 4.043,  D 58.5066 / 4.069)
+M>1 conv  calls=19  host 4652  dsp 4002  transport 650
+          [mm 2061  acc 682  swiglu(hidden) 3255  dequant 389  gather 287  stage 255  quant 227  requant 0.3]
+```
+
+- **정확도 닫힘.** conv만 켜면 A와 0.2% 차이(57.12 vs 57.00). §2.17의 분해가 맞았다: 비용은 dense의
+  것이었고 conv 블록은 공짜다. **기본 config는 `conv_block_engine: "htp"` 하나다.**
+- **Phase 2 파이프라인이 먹었다**: dsp 4361 → 4002 (−359 us/콜), host 4875 → 4652 (−223). requant 대기가
+  139 → 0.3으로 사라졌고(완전히 숨었다), gate는 SWIGLU 열에 3255 us의 **워커 시간**으로 나온다 — 3 워커가
+  HMX 아래에서 돌린 숨은 일이고, 콜 벽시계 4.0 ms보다 크다는 것이 숨었다는 증거다. 18콜 −6.5 ms.
+- 대신 dequant가 79 → 389로 올랐다. 백그라운드 레인이 워커를 잡고 있는 동안 전경 에필로그가 늦게
+  집히는 것 — MoE 커널이 tail 경로에서 본 것과 같은 현상(문서 47 §21.1)이고, 그쪽은 그래서 껐다. 여기서는
+  순이득(−359)이 남아 유지한다.
+- 프로파일 고침: conv 행의 SWIGLU는 워커 시간이라 mm 잔차에서 빼면 안 된다(빼서 `rest` −3197이 나왔다).
+  kind==2에서만 제외하고 열 이름에 `(hidden)`을 붙인다.

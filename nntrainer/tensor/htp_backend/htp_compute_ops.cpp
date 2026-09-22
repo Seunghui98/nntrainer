@@ -473,24 +473,32 @@ private:
         // treat it as an upper bound on the matmul, not an exact figure.
         /* mm is the residual, so every named stage has to be subtracted --
            scatter included, or the MoE layer call's scatter time would be
-           reported as matmul. */
+           reported as matmul. The conv block call's SWIGLU column is the
+           exception: there it is WORKER time inside its background stage
+           (hexkl_conv_block.c's cb_stage_probe_add), work that ran under
+           the HMX rather than instead of it, so subtracting it made the
+           residual negative -- 3.3 ms of hidden work against a 4.0 ms
+           call. Left in the sum for every other call, where SWIGLU is
+           the fused layer's own synchronous elementwise pass. */
+        const double hidden_per = (kind == 2) ? swiglu_per : 0.0;
         const double mm_per =
           dsp_per -
-          (quant_per + swiglu_per + dequant_per + acc_per + drain_per +
-           scatter_per + stage_per + gather_per + requant_per + mm_meas_per +
-           drain_dn_per + push_per + alloc_per);
+          (quant_per + (swiglu_per - hidden_per) + dequant_per + acc_per +
+           drain_per + scatter_per + stage_per + gather_per + requant_per +
+           mm_meas_per + drain_dn_per + push_per + alloc_per);
         std::fprintf(stderr,
                      "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
-                     "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
+                     "  [quant %.1f gather %.1f requant %.1f swiglu%s %.1f "
                      "dequant %.1f acc %.1f drain %.1f+%.1f push %.1f "
                      "scatter %.1f alloc %.1f "
                      "stage %.1f mm %.1f | rest<=%.1f (%.1f%% of host) "
                      "blocks=%llu]",
                      dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
                      host_per - dsp_per, quant_per, gather_per, requant_per,
-                     swiglu_per, dequant_per, acc_per, drain_per, drain_dn_per,
-                     push_per, scatter_per, alloc_per, stage_per, mm_meas_per,
-                     mm_per, host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
+                     hidden_per != 0.0 ? "(hidden)" : "", swiglu_per,
+                     dequant_per, acc_per, drain_per, drain_dn_per, push_per,
+                     scatter_per, alloc_per, stage_per, mm_meas_per, mm_per,
+                     host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
                      (unsigned long long)b.blocks);
       }
       if (level_ >= 2 && b.calls != 0 && b.dma_first_us != 0) {
