@@ -1545,28 +1545,11 @@ private:
       stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
     stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
 
-    // The five small sequences (handles, routing) from one rpcmem buffer
-    // too: passed from the heap, the driver pins and maps their pages on
-    // every call, and this call's transport read 627 us against the FC
-    // call's 377-471 with the same ION activation and output (doc 51
-    // section 2.24). ~15 KB at prefill; the buffer only grows, and stays
-    // small enough that its cache maintenance is nothing.
-    const size_t n_rows = row_index.size();
-    const size_t n_e = row_count.size();
-    const size_t args_bytes =
-      sizeof(uint32_t) * (h_gu.size() + h_dn.size() + n_rows + n_e) +
-      sizeof(float) * n_rows;
-    ensureCapacity(moe_args_buf_, args_bytes);
-    uint32_t *a_gu = reinterpret_cast<uint32_t *>(moe_args_buf_->data());
-    uint32_t *a_dn = a_gu + h_gu.size();
-    uint32_t *a_idx = a_dn + h_dn.size();
-    uint32_t *a_cnt = a_idx + n_rows;
-    float *a_w = reinterpret_cast<float *>(a_cnt + n_e);
-    std::memcpy(a_gu, h_gu.data(), sizeof(uint32_t) * h_gu.size());
-    std::memcpy(a_dn, h_dn.data(), sizeof(uint32_t) * h_dn.size());
-    std::memcpy(a_idx, row_index.data(), sizeof(uint32_t) * n_rows);
-    std::memcpy(a_cnt, row_count.data(), sizeof(uint32_t) * n_e);
-    std::memcpy(a_w, row_weight.data(), sizeof(float) * n_rows);
+    // The five small sequences (handles, routing) go from the heap. Tried
+    // from one rpcmem buffer (doc 51 section 2.26): transport 627 -> 605
+    // us, noise. The gap to the FC calls' ~400 is the call's length, not
+    // its arguments -- a call longer than the poll window (htp_backend.cpp,
+    // 5 ms) ends in the interrupt-driven wait and pays its wake-up.
 
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
@@ -1586,19 +1569,22 @@ private:
     for (int rep = 0; rep < reps && err == AEE_SUCCESS; ++rep) {
       uint32_t rep_stage[HTP_MOE_N_STAGES] = {0};
       const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
-      err =
-        timed
-          ? nntr_hvx_mm_u8i4_moe_layer_timed(
-              session, M, K, inter, N_out, a_gu, static_cast<int>(h_gu.size()),
-              a_dn, static_cast<int>(h_dn.size()), a_idx,
-              static_cast<int>(n_rows), a_cnt, static_cast<int>(n_e), a_w,
-              static_cast<int>(n_rows), act_f32, act_len, out_f32, out_len,
-              rep_stage, HTP_MOE_N_STAGES)
-          : nntr_hvx_mm_u8i4_moe_layer(
-              session, M, K, inter, N_out, a_gu, static_cast<int>(h_gu.size()),
-              a_dn, static_cast<int>(h_dn.size()), a_idx,
-              static_cast<int>(n_rows), a_cnt, static_cast<int>(n_e), a_w,
-              static_cast<int>(n_rows), act_f32, act_len, out_f32, out_len);
+      err = timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
+                      session, M, K, inter, N_out, h_gu.data(),
+                      static_cast<int>(h_gu.size()), h_dn.data(),
+                      static_cast<int>(h_dn.size()), row_index.data(),
+                      static_cast<int>(row_index.size()), row_count.data(),
+                      static_cast<int>(row_count.size()), row_weight.data(),
+                      static_cast<int>(row_weight.size()), act_f32, act_len,
+                      out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
+                  : nntr_hvx_mm_u8i4_moe_layer(
+                      session, M, K, inter, N_out, h_gu.data(),
+                      static_cast<int>(h_gu.size()), h_dn.data(),
+                      static_cast<int>(h_dn.size()), row_index.data(),
+                      static_cast<int>(row_index.size()), row_count.data(),
+                      static_cast<int>(row_count.size()), row_weight.data(),
+                      static_cast<int>(row_weight.size()), act_f32, act_len,
+                      out_f32, out_len);
       const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
       // Fastest wins, stages and all, so the breakdown describes one real call
       // rather than a mix of a fast one and a slow one.
@@ -2685,8 +2671,6 @@ private:
   StagingPool out_pool_;
   /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
   std::unique_ptr<HtpRpcBuffer> conv_buf_;
-  /** The MoE layer call's handle and routing sequences (invokeMoeLayer). */
-  std::unique_ptr<HtpRpcBuffer> moe_args_buf_;
 
   // invokeLayerU8In's scratch: the AH-packed activation (ION-backed, same
   // reasoning as act_pool_/out_pool_) and the small per-row scale/zp arrays
