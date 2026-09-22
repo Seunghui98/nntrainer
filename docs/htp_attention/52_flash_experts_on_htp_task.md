@@ -216,3 +216,63 @@ docs/htp_attention/52_flash_experts_on_htp_task.md를 읽어. 52가 이번 과�
 - 프로파일 행 키가 (K, N, M==1, kind)라 같은 모양의 다른 콜이 한 행에 섞일 수 있다(51 §2.21).
 - 커널 바꾸면 skel도 다시 빌드·푸시. 안 하면 첫 콜이 AEE_EBADPARM.
 - `Applications/CausalLM/json.hpp`가 없으면 호스트 빌드가 CausalLM에서 멈춘다.
+
+## 10. 구현 세션 (2026-09-22) — 코드가 §4를 어디서 고쳤나, 그리고 게이트
+
+브랜치 `claude/eager-keller-f91z9o`(5622c74에서 분기). §1~§9는 그대로 두고, 코드를 끝까지 따라가
+보니 §4의 설계가 세 곳에서 바뀌었다. 전부 **기기 미측정** — 호스트에서는 빌드·LFM2 유닛 테스트·
+LRU 유닛 테스트·HTP ops 파일의 구문 검사(스텁 헤더)까지만 했다.
+
+### 10.1 §4와 다른 것
+
+1. **colsum은 이미 파일에 있다.** QS4CX_WH의 파일 레이아웃은 `[nibbles][scale N][colsum N]`
+   (`quantize_stream.cpp:851`, `QS4CX_WH_Tensor::size()`, `get_or_register_wh`가 `matAscale + N`을 읽음).
+   §4.2의 (a)/(b)/(c)는 전부 필요 없다. 미스 = pread 2회(nibbles → ION 슬롯, scale+colsum 44 KB → 힙).
+2. **`fsu: true`는 필요 없고 HTP 경로에서는 해롭다.** virtual 여부는 `requestWeight(..., is_virtual)`
+   하나로 정해지고(`tensor_pool.cpp:38` VIRTUAL → UNMANAGED, 메모리 0), 파일 오프셋은 fsu와 무관하게
+   모든 weight에 기록되며(`neuralnet.cpp:964`), fd는 추론이면 항상 열려 read에 전달되고 virtual tensor가
+   저장한다(`tensor.cpp:1422`). `fsu: true`가 실제로 하는 일은 weight_pool을 swap 캐시 풀로 바꿔 **모든**
+   non-virtual weight를 층마다 load/unload하는 것(`manager.h:148`, `neuralnet.cpp:528`) — HTP 경로에선
+   attention/conv/dense 가중치까지 토큰마다 파일에서 다시 읽게 된다. **config에 넣지 않는다.**
+3. **HTP 콜 하나가 한 층의 활성 expert 전부를 동시에 요구한다.** prefill은 층마다 32개 전부가 활성이므로
+   층당 C < 32의 LRU로는 한 콜을 만들 수 없다. 콜을 쪼개면(호스트 누적) fp32 합산 순서가 바뀌어 §1의
+   "ppl 소수점 동일" 게이트를 잃는다. 그래서 **슬롯 풀은 22층이 공유하는 하나의 LRU**다(총 S = 22×C;
+   `expert_lru.h`, `lfm2_moe_layer.cpp`의 `g_expert_lru`). 콜 직전에 그 콜의 expert를 전부 핀한 채 확보하고,
+   S ≥ 32이면 한 콜/층이 그대로다. **C의 최솟값은 2**(44슬롯, 231 MiB); C=1은 콜 분할이 필요해 안 만들었다.
+   C < 32이면 prefill은 매번 704 expert를 전부 다시 읽는다(층 L의 32개가 앞 층들을 밀어냄) — 이건 C로 안
+   줄고 3단계 prefetch(S ≥ 64)로만 겹쳐진다.
+
+### 10.2 만든 것
+
+| 파일 | 무엇 |
+|---|---|
+| `compute_ops.h` | `register_qs4cx_wh_expert_file(key_gu, key_dn, fd, off_gu, off_dn, K, inter, N_out, at_load)`, `release_qs4cx_wh_expert(key_gu)` |
+| `htp_compute_ops.cpp` | expert 쌍 슬롯(gate_up 3.5 MiB + down 1.75 MiB, 4 KB 정렬, 256 MiB 청크당 48개) + free list. 미스: free list pop(없으면 bump) → `pread` ×2 → `registerFromArena` ×2. release: `weight_release_u8i4` ×2 → 슬롯을 free list로. `handle_cache_`는 tensor 주소를 키로. 프로파일: MoE 행에 `expert misses n (x/call), file read, register+release rpc` 열과 총계 한 줄 — 전부 `host=` 밖 |
+| `tensor.h` | `getFd()` 한 줄 (virtual tensor가 read 때 저장한 fd) |
+| `lfm2_moe_layer.cpp/.h` | `NNTR_MOE_CACHE_EXPERTS` + 가속기 엔진이면 expert를 virtual로 요청. `tryMoeLayerOnAccelerator`: 활성 expert만 `g_expert_lru.acquire`(evict → release, miss → register_from_file), 배열을 활성 expert로 압축(행 0인 expert는 기여 0이라 산술 동일), key + null scale로 콜, 콜 뒤 EXTRA_TOPK(5) recency 갱신. `preloadExperts`: 로드 때 층 순서로 풀을 채움(청크 할당이 전부 로드 때 끝남) |
+| `transformer.cpp` | virtual expert는 `register_qs4cx_weight` 대신 `preloadExperts`; 워밍업은 층 0이 전부 상주일 때만 |
+| `expert_lru.h` + `unittest_expert_lru.cpp` | 공유 LRU(층별 용량 합, 핀, evict → load 순서, refresh)와 그 유닛 테스트 6개 |
+| `unittest_hvx_mm_u8i4.cpp` | `ArenaSlotReuseMatchesHeap`: 슬롯에 A → 콜 → release → 같은 오프셋에 B → 콜, 힙 핸들과 memcmp==0 |
+
+환경변수가 없으면 코드 경로가 하나도 안 바뀐다(virtual 아님, 압축 없음, LRU 없음).
+
+### 10.3 왜 슬롯 재사용에 기기 테스트가 먼저인가
+
+출하 커널은 가중치를 DMA로만 읽지만(`hexkl_mm_u8i4_moe.c:143`; HVX 꼬리는 `MOE_TAIL_MAX_ROWS=0`으로 꺼짐)
+디스크립터가 `src_bypass=0`이라 DDR 소스 읽기가 DSP L2를 거친다. 기존 아레나 테스트는 "빈 슬롯에 첫 쓰기"만
+증명했다. LRU가 만드는 "DSP가 읽음 → 호스트가 덮어씀 → DSP가 다시 읽음"에서 DSP 매핑이 캐시 가능이면 stale
+라인이 나올 수 있다. `ArenaSlotReuseMatchesHeap`가 그 판정이고, 실패하면 커널 없이 되는 우회가 없다
+(`weight_register_u8i4_arena`에 L2 invalidate 한 줄 = DSP 변경 = 이 과제 밖).
+
+### 10.4 기기에서 잴 것 (순서대로)
+
+| # | 실행 | 보는 것 | 게이트 |
+|---|---|---|---|
+| 0 | CPU cached-slim(`-q40`, architectures만 바꿈, fsu 없음) C = 1, 2, 4, 8 (+ 순수 CPU 1회) | prefill, decode TPS, VmRSS peak, Max RSS, ppl(C=32) | CPU 쪽 감 |
+| 1 | HTP, `NNTR_MOE_CACHE_EXPERTS=32` 비프로파일 2회 + PROFILE=2 PPL 1회 | ppl, 콜당 host, 등록 시간(convert 열 = 파일 읽기), peak RSS | **ppl 62.0916 동일**, 콜당 동일 |
+| 2a | `run_u8i4_layer_on_device.sh` (`ArenaSlotReuseMatchesHeap` 포함) | `arena_slot_reuse pass=1 bad_elems` | **0** |
+| 2 | HTP, C = 2 → 4 → 8, 각 cold 1회(drop_caches) + warm 2회 + PROFILE=2 PPL 1회 | peak RSS, prefill, decode TPS, MoE 행의 misses/call·read·rpc, `[M0-PROF] miss=` | RSS ∝ C, ppl 동일 |
+
+예상(§1 585 ms / 24.2 TPS 기준): C<32의 prefill은 704 미스 — warm(page cache) +1.4~2 s, cold(flash)
++2.8~3.5 s. decode: C=2(44 < 작업집합 88) 거의 전부 미스 ≈ 2~4 TPS(기능 확인용), C=4·8은 히트율이 정함 —
+그 표가 첫 결과물. 미스 하나 = pread 5.25 MiB + FastRPC 4회(release 2 + register 2, ≈1~1.8 ms).
