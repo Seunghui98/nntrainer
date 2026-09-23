@@ -539,3 +539,27 @@ page cache는 회수 가능한 메모리라 "1.9 GB"에 안 잡히지만, warm �
 **다음 (측정이 시키는 순서).** ① 시뮬레이터 결과(trace 11,286줄 수집됨): belady가 57%에서 멀면 정책이 가장 싼 지렛대다.
 ② prefetch 진단(위 M>1 행, 재실행 없음). ③ warm에서 미스의 40%가 rpc(0.25)가 됐으므로 IDL 한 콜 swap(release 2 + register 2 → 1)이
 C=8 decode 15 → ~17 TPS — DSP 변경이라 결정이 필요하다. flash 행을 올리는 것은 이 셋이 아니라 히트율(①)뿐이다.
+
+### 10.12 5단계: IDL swap 콜 — 미스 하나 = FastRPC 한 번 (코드, 호스트 체크 통과, 기기 미측정)
+
+§10.11의 warm 미스 0.64 ms 중 0.25가 FastRPC 4회(release 2 + register 2)다. DSP IDL 변경을 승인받아 한 콜로 합쳤다.
+
+- **`weight_swap_u8i4_arena(old_gu, old_dn, K, inter, N_out, arena, off_gu, off_dn, gu_scale, gu_colsum, dn_scale, dn_colsum → h_gu, h_dn)`**
+  (IDL 맨 끝에 추가 — 기존 메서드 번호가 안 바뀌어 옛 skel은 이 콜만 에러를 낸다). 새 쌍을 `weight_register_u8i4_arena`로
+  등록(bias 0)한 **뒤에** 옛 쌍을 release한다. 옛 쌍은 먼저 검증(둘 다 또는 둘 다 없음, 살아 있음, 아레나 차용, 서로 다름)하고, down
+  등록이 실패하면 gate_up을 되돌린다 — 어떤 에러에서도 레지스트리는 그대로다.
+- **호스트**: `release_qs4cx_wh_expert`가 DSP를 부르지 않는다. 키만 handle_cache_에서 지우고(즉시 히트 아님) 두 핸들은 슬롯에 실려
+  free list로 간다. 그 슬롯에 다음 expert를 pread한 뒤 swap 한 번이 새 쌍 등록 + 옛 쌍 해제. 옛 핸들은 누구도 DSP에 넘길 수 없고
+  슬롯 바이트는 콜과 콜 사이에만 덮이므로 안전하다. 로드 시·prefetch 등록도 1회(이전 2회). 프로파일 열 이름은 `swap rpc`.
+- **호스트 체크 `swap_host_check.c`**: 실제 `nntr_hvx_mm_u8i4.c`의 진입점을 실제 레지스트리(`hexkl_mm_u8i4_dma.c`) 위에서 돌린다
+  (아레나 = 정렬된 호스트 메모리). 제자리 등록·scale/colsum/bias 0 내용·swap 뒤 옛 쌍 소멸·거부 4종·롤백을 확인하고, 변이 둘(롤백
+  없음, 등록 전 release)에서 실패한다. qaic가 만들 헤더를 IDL에서 생성(`gen_nntr_hvx_h.py`)해 쓰므로 **skel 정의와 IDL의 시그니처
+  일치도 호스트에서 검사된다** — `tools/htp_syntax_check.sh`가 못 하던 것.
+- **기기 테스트 `HmxArenaSlotReuse.Swap`**: 옛 쌍이 등록된 채로 CPU가 슬롯을 덮고 swap — 실제 풀의 순서 그대로. 비트 동일 +
+  swap된 핸들의 재release 거부.
+
+기대(C=8, warm): rpc 0.25 → ~0.07 ms/미스 → decode 15 → **~17 TPS**, prefill 미스 503 × 0.18 = −90 ms, C=32 등록 −0.35 s(704 ×
+1 콜 절약 × 0.48). flash 행(1.1~1.4 ms 읽기)은 거의 안 움직인다(−0.18/1.5 = −12%).
+
+측정(`stage5.sh`): ⓪ 상주 1회로 page cache를 데움 → warm: C=8 base·prefetch, C=4, C=32 등록 → ⓕ CPU 모델을 한 번 돌려 HTP
+파일을 page cache에서 밀어낸 뒤 C=8(**flash 행을 코드로 재현**, root 불필요). prefetch 진단용으로 MoE `M>1` 행도 같이 뽑는다.
