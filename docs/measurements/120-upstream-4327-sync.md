@@ -292,49 +292,104 @@ cat $W/logs/md5.log $W/logs/therm.log
 Then fill the tables below, commit this file on the same branch, push,
 set the issue to `state:measured`.
 
-## Results (fill in)
+## Results
+
+Run 2026-09-23 17:55–18:08 by the agent on the user's request. Unit
+`R3CY10WM83Y` (SM-S938N, SM8750). `decode tok/s (last 64)` is not
+printed by this app and is left n/a.
 
 | variant | gen | run | prefill tok/s | decode tok/s (all) | decode tok/s (last 64) | peak RSS (KB) | text = A? (first differing token) | skel md5 (device) |
 |---|---|---|---|---|---|---|---|---|
-| A | 64 | 1 | | | | | (reference) | |
-| B | 64 | 1 | | | | | | |
-| A0 | 64 | 1 | | | | | | |
-| A0 | 64 | 2 | | | | | | |
-| B | 64 | 2 | | | | | | |
-| A | 64 | 2 | | | | | (reference) | |
-| A | 512 | 1 | | | | | (reference) | |
-| B | 512 | 1 | | | | | | |
-| B | 512 | 2 | | | | | | |
-| A | 512 | 2 | | | | | (reference) | |
-| A | 1024 | 1 | | | | | (reference) | |
-| B | 1024 | 1 | | | | | | |
-| B | 1024 | 2 | | | | | | |
-| A | 1024 | 2 | | | | | (reference) | |
+| A | 64 | 1 | 473.636 | 35.4178 | n/a | 5328660 | (reference) | `df496672…` |
+| B | 64 | 1 | 551.724 | 37.6471 | n/a | 5310776 | yes | `c65d6dfe…` |
+| A0 | 64 | 1 | 514.056 | 28.5714 | n/a | 5327996 | yes | `df496672…` |
+| A0 | 64 | 2 | 507.433 | 28.6738 | n/a | 5319772 | yes | `df496672…` |
+| B | 64 | 2 | 544.681 | 37.7136 | n/a | 5313520 | yes | `c65d6dfe…` |
+| A | 64 | 2 | 501.469 | 36.5297 | n/a | 5319656 | (reference) | `df496672…` |
+| A | 512 | 1 | 446.382 | 36.2298 | n/a | 5315840 | (reference) | `df496672…` |
+| B | 512 | 1 | 511.489 | 36.1837 | n/a | 5307520 | yes | `c65d6dfe…` |
+| B | 512 | 2 | 500.489 | 36.4024 | n/a | 5312264 | yes | `c65d6dfe…` |
+| A | 512 | 2 | 471.889 | 35.6919 | n/a | 5316216 | (reference) | `df496672…` |
+| A | 1024 | 1 | 459.193 | 35.2338 | n/a | 5326508 | (reference) | `df496672…` |
+| B | 1024 | 1 | 476.723 | 35.2787 | n/a | 5316680 | yes | `c65d6dfe…` |
+| B | 1024 | 2 | 476.723 | 34.9273 | n/a | 5323728 | yes | `c65d6dfe…` |
+| A | 1024 | 2 | 438.356 | 35.1058 | n/a | 5322960 | (reference) | `df496672…` |
+
+Text: the pre-`=====` output of every log (banner, md5 and
+`num_to_generate` lines excluded) hashes identically across all variants
+and runs of each G (`55f577d9` / `d7e89826` / `db08b4e1`).
+
+Means of the two runs and deltas:
+
+| G | decode A | decode B | B vs A | prefill A | prefill B | B vs A | A0 decode / prefill | A vs A0 decode |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 35.974 | **37.680** | **+4.74 %** | 487.55 | **548.20** | **+12.44 %** | 28.623 / 510.74 | **+25.68 %** |
+| 512 | 35.961 | **36.293** | **+0.92 %** | 459.14 | **505.99** | **+10.20 %** | — | — |
+| 1024 | 35.170 | **35.103** | **−0.19 %** | 448.77 | **476.72** | **+6.23 %** | — | — |
 
 Reference (not a gate; rule 23): NPU "now" **27.85 / 27.09 / 26.45**
 decode tok/s at G 64 / 512 / 1024 (#100 A, the pre-D192 arena default)
 and prefill 430–506; D192 read +4.11 / +3.29 / +4.26 % in #113; the VTCM
-feed (this A) has no E2E number yet — #117's handoff is on the device.
-Goal ≥ 50, prefill ≥ 497.
+feed (this A) read 37.38 / 36.49 / 35.01 in #117's cooled sitting on the
+same unit. Goal ≥ 50, prefill ≥ 497.
 
 ### Level-2 profile, M==1 row (G = 64)
 
 | variant | `dsp` µs/call | `host` | transport | `quant` | `swiglu` | `requant` | `scatter` | `stage` | `mm` | `rest<=` | `feed=` | `staging:` act/out/ion | `qos_mode` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| A | | | | | | | | | | | | | |
-| B | | | | | | | | | | | | | |
-| A0 | | | | | | | | | | | | | |
+| A | 711.7 | 793.9 | 82.2 | 7.7 | 1306.7 | 9.4 | 7.5 | 5.7 | **677.2** | 4.2 | 1408/1408 | 4194304 / 4194304 / y (and 65536 / 65536 / y) | 2 |
+| B | 711.3 | 799.0 | 87.7 | 8.4 | 1296.3 (`swiglu(hidden)`) | 9.3 | 7.3 | 5.9 | **676.6** | 3.7 | 1408/1408 | same | 2 |
+| A0 | 997.4 | 1184.1 | 186.7 | 16.6 | 5464.0 | 12.3 | 12.6 | 10.8 | **934.3** | 10.7 | 0/1408 | same | 2 |
 
-M>1 row (prefill, `m1_gemv=0/23`): `dsp` A ____ B ____ (rule 27: the
-prefill gate is read here when the E2E column drifts with position).
+All three M==1 rows `blocks=0 m1_gemv=1408/1408`. A and B `DMA ring:
+desc=10/call … engine 32.3..34.4 GB/s depth max=4`. B's profile has no
+`dense` / `conv` / `FC` row (count 0).
+
+M>1 row (prefill, `m1_gemv=0/23 feed=0/23`): `dsp` A **16986.0** B
+**14807.7** (−12.8 %; A0 17007.2). The drop is in `requant` 1099.0 →
+70.0, `dequant` 929.0 → 275.4, `mm` 10222.0 → 9671.6 and transport
+1978.5 → 1082.4 — upstream's default-on M>1 changes (the down matmul one
+block behind the gate_up, the pooled epilogue), which is the prefill gain
+in the E2E column.
 
 ### Ride-along
 
 `unittest_hvx_mm_u8i4 --gtest_filter='*MoeLayerM1GemvMatchesHmx*'` under
-B's skel: `bit_identical` ____ , `bad_elems_M1` ____ , `PASSED` y/n.
+B's skel: `bit_identical` **yes**, `bad_elems_M1` **0 of 40960**
+(`bad_elems_M4` 0 of 163840), `PASSED` **y** (`[  PASSED  ] 1 test.`).
+
+## Verdict
+
+* **Gate** (decode ≥ −2 % of A at each G, prefill ≥ −5 %, text = A):
+  **pass** — decode +4.74 / +0.92 / −0.19 %, prefill +12.44 / +10.20 /
+  +6.23 %, text identical at every G. The merge moves decode by nothing
+  outside run noise (M==1 `dsp` 711.7 vs 711.3); it moves **prefill up**
+  by +6–12 % through upstream's default-on M>1 changes (M>1 `dsp`
+  −12.8 %). G = 64's +4.7 % decode is mostly A's run 1 (35.42, first
+  after the profiles) against its run 2 (36.53).
+* **Ride-along gtest**: pass.
+* **A vs A0** (PR #118's VTCM feed default): decode **+25.68 %** at G = 64
+  (35.97 vs 28.62), text identical, M==1 `mm` 677.2 vs 934.3 → the
+  default is confirmed.
 
 ## Notes from the run
 
-Serial, battery / temperature checkpoints 0–5, the device `md5sum` lines,
-anything stale (FARF / AEE errors, a `source=env`, a kind row in B's
-profile), and which cells, if any, were voided and why.
+* Serial `R3CY10WM83Y` (a second phone, `R3CN80CW3FY`, was attached; all
+  commands used `ANDROID_SERIAL`). Battery 92 → 88 %, USB, screen off.
+  Checkpoints (zone0 m°C / battery 0.1 °C): ckpt0 26600 / 255; before the
+  profiles 29700–35100 / 255–268; ckpt2 58700 / 271; ckpt3 58700 / 303;
+  after G 512 60600 / 314; after G 1024 60200 / 325.
+* One change to the steps: a cool-down before each profile and each G
+  block (battery ≤ 33.0 °C and zone0 < 38 °C, capped at 5 min; waits 0–45
+  s). zone0 still reads 53–61 °C during every run.
+* Device `md5sum` of every pushed file equals `$W/md5.txt` (0
+  mismatches, `logs/md5.log`); skel md5 before each cell: A/A0
+  `df496672…` (8 logs), B `c65d6dfe…` (6 logs).
+* The model directory `models/q40-qs4cx-wh` on this phone was created in
+  #117's sitting: the workstation's config files, with the bin (md5
+  `7b7867fab5…`) and `tokenizer.json` symlinked from
+  `models/lfm2.5-8b-a1b-q40-qs4cx-wh`. Config echo: `do_sample false`,
+  `bad_word_ids [124900]`, `init_seq_len 512`, `moe_engine htp`,
+  `moe_htp_layers ""`, no other `_engine` key.
+* Every log has exactly one banner with its variant's word; no
+  `HTP-PROFILE` in any E2E log; no cell voided; no FARF/AEE errors seen.
