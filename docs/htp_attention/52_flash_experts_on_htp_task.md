@@ -475,3 +475,22 @@ DDR이 병목이면 그보다 덜. 판정 지표는 프로파일의 `file read �
 사실이고, HTP 쪽 decode를 14 위로 올릴 길은 이 구조에 없다. 여기서부터는 제품 판단이다: (1) 메모리 손잡이로 그대로 둔다,
 (2) cached 목적지 실험을 한다(+3 TPS, 기기 테스트 하나 + 아레나 메모리 타입 변경), (3) 이 경로는 prefill 전용으로 보고
 decode를 다른 구성에 맡긴다(가중치 파일 포맷이 달라 별도 과제).
+
+### 10.10 4단계: 정책 시뮬레이터, prefill 선읽기, cached 아레나 (코드, 기기 미측정)
+
+§10.9 뒤의 지렛대 분석에서 DSP를 안 바꾸고 할 수 있는 셋. 전부 환경변수 뒤에 있어 한 빌드로 A/B가 된다. 셋 다 꺼져 있으면
+코드 경로는 §10.9와 같다(인터페이스만 `ExpertFileDesc`로 바뀜).
+
+| 스위치 | 무엇 | 기대 (C=8) | 게이트 |
+|---|---|---|---|
+| `NNTR_MOE_TRACE=<path>` | 층 콜마다 `<layer> <tokens> \| <routed> \| <top-(k+5)/토큰>` 한 줄. `tools/moe_expert_cache_sim.py`가 이걸 ours / lru / lfu / random / **belady(오라클)** 로 재생한다(콜의 expert 핀, 층 공유 풀 = 기기와 같은 제약). 라우팅은 캐시와 무관하므로 상주 실행 한 번이 모든 C·정책에 답한다 | 없음 — 측정 | 시뮬의 `ours`가 §10.7 실측 미스/콜(C=2 4.00, C=4 2.36, C=8 1.71)을 재현해야 시뮬을 믿는다. belady가 57%에서 얼마 안 멀면 정책 작업은 접는다 |
+| `NNTR_MOE_PREFETCH=1` | prefill에서 층 L 콜을 보내기 전에 L+1의 비상주 expert만큼 LRU 꼬리(L의 expert·L+1 상주분 제외)를 비우고, 그 슬롯으로의 pread를 스레드 4개로 시작한 뒤 콜 → 콜이 돌아오면 join + register. 겹치는 것은 읽기뿐(register는 같은 FastRPC 세션·DSP 가중치 테이블이라 콜 뒤). 슬롯이 32+32 미만(C=2)이면 아무것도 안 한다 | prefill 미스 503 중 층당 14.4 ms만큼 숨김 → 1.1~1.4 → **≈0.9~1.1 s** | ppl 동일, 프로파일 `expert prefetch: N experts … exposed wait` 줄, M>1 행의 miss/call 감소 |
+| `NNTR_HTP_ARENA_CACHED=1` | 아레나 청크를 cached rpcmem으로, 아레나에 쓰는 세 곳(expert pread, WH memcpy, FC slice memcpy) 뒤에 `dc cvac` + `dsb sy`(EL0 허용, PoC까지). 문서 46 §34의 uncached 결정을 뒤집는 것 | 읽기 1.12 → ~0.35+clean, 미스 ≈ 0.75 ms → decode 11 → **≈14 TPS** | **기기 테스트 `HmxArenaSlotReuse.CachedCleaned` 통과가 먼저**, 그 다음 ppl 동일 |
+
+기기 테스트도 고쳤다. 기존 `ArenaSlotReuseMatchesHeap`은 슬롯을 `bake_export`로 채웠는데, 그건 RPC 출력이라 **DSP가** ION 버퍼에
+쓰는 것이었다 — 호스트 쓰기를 한 번도 시험하지 않았다(실전 증거는 §10.7의 ~93,000회 재사용). 이제 `HmxArenaSlotReuse`가
+bake_export → 힙 벡터 → CPU memcpy로 슬롯을 채우고 세 가지로 돈다: `Uncached`(출하 경로, assert), `CachedCleaned`(스위치의
+게이트, assert), `CachedNotCleaned`(보고만: 실패하면 clean이 필요하다는 증명, 통과하면 우연히 write-back됐거나 IO-coherent).
+
+prefetch와 cached를 둘 다 켜면 읽기(≈0.4 ms × 23/층 ≈ 9 ms)가 콜(14.4 ms) 안에 다 들어가 prefill ≈ 0.65 + register 0.13 ≈ **0.8 s**.
+decode는 cached만 움직인다. 읽기가 0이어도 decode 상한 19(§10.7)는 그대로다.
