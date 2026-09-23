@@ -101,14 +101,21 @@ MoE·conv·FC 커널의 비트 동일을 지킨다 — 격자를 바꾸는 변�
 ## 7. 다른 세션의 첫 프롬프트 (복사해서 쓰기)
 
 ```
-nntrainer 저장소, 브랜치 claude/lfm2-moe-ffn-hexkl-2ivn5v (PR nntrainer/nntrainer#4327의 head
-claude/htp-lfm2-moe-ffn에도 같이 푸시). 먼저 CLAUDE.md → docs/htp_attention/00_START_HERE.md →
-docs/htp_attention/53_int_requant_task.md, 그리고 53이 가리키는 52 §6~§7(측정 절차, 커밋 형식,
-ponytail 규칙)을 읽어. 과제: arXiv 2511.11248의 int32→u8 직접 재양자화를 우리 HTP MoE 커널
-(hexkl_mm_u8i4_moe.c)에 적용할 수 있는지 분석하고, 된다면 구현. 순서는 53 §5 그대로:
-논문을 읽고 53 §4의 빈칸을 먼저 채우고(§3 표의 어느 칸인지), SDK hexkl_micro.h에서 acc_read
-변형이 있는지 확인하고, 이득 산술이 −5 ms 미만이면 구현하지 말고 문서에 이유만 남겨.
-정확도 게이트는 ppl(NNTR_PPL=1, 기준 62.0916, +0.5% 이내)이고 텍스트 비교는 지표가 아니다.
-기기 측정은 전부 내가 한다 — 너는 config·명령을 주고 결과를 받아 문서(53의 다음 절)에 기록해.
-가설에 코드 쓰기 전에 분해를 재라 — 51 §2.25~2.27이 왜 그런지의 기록이다.
+나는 SeungHui Lee (shsh1004.lee@samsung.com), nntrainer 저장소의 기여자이고 브랜치
+claude/lfm2-moe-ffn-hexkl-2ivn5v와 PR nntrainer/nntrainer#4327(head claude/htp-lfm2-moe-ffn)의
+작성자다. 이 브랜치에서 나와 같이 작업해 줘. 커밋은 저장소 규칙(AGENTS.md)대로: 저자는 나,
+너는 Co-authored-by: Claude <noreply@anthropic.com>로 공동 저자, DCO Signed-off-by는 내 이름으로
+(-s; 내가 검토하고 책임진다). 네 하네스가 붙이는 다른 출처 트레일러는 그대로 둬도 된다 —
+PR 전에 내가 정리한다. 푸시는 두 브랜치에 같이 (HEAD:claude/htp-lfm2-moe-ffn과
+HEAD:claude/lfm2-moe-ffn-hexkl-2ivn5v).
+
+먼저 CLAUDE.md → docs/htp_attention/00_START_HERE.md → docs/htp_attention/53_int_requant_task.md,
+그리고 53이 가리키는 52 §6~§7(측정 절차, 일하는 방식)을 읽어. 과제: arXiv 2511.11248(양자화된
+행렬곱의 int32 누산기를 f32를 거치지 않고 u8로 재양자화하는 방법)을 우리 HTP MoE 커널
+(hexkl_mm_u8i4_moe.c)에 적용할 수 있는지 분석하고, 된다면 구현. 순서는 53 §5 그대로: 논문을
+읽고 53 §4의 빈칸을 먼저 채우고(§3 표의 어느 칸인지), SDK hexkl_micro.h에서 acc_read 변형이
+있는지 확인하고, 이득 산술이 −5 ms 미만이면 구현하지 말고 문서에 이유만 남겨. 정확도 게이트는
+ppl(NNTR_PPL=1, 기준 62.0916, +0.5% 이내)이고 텍스트 비교는 지표가 아니다. 기기 측정은 전부
+내가 한다 — 너는 config·명령을 주고 결과를 받아 문서(53의 다음 절)에 기록해. 가설에 코드 쓰기
+전에 분해를 재라 — 51 §2.25~2.27이 왜 그런지의 기록이다.
 ```
