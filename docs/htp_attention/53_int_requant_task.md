@@ -1,7 +1,9 @@
 # 53 — arXiv 2511.11248: int32 → u8 직접 재양자화, 우리 커널에 되나 (별도 세션 과제, 자체 완결)
 
-상태: **논문은 안 읽었다** — 이 문서를 쓴 컨테이너는 arxiv.org 차단. 아래 §1~§3은 우리 커널 쪽
-사실(측정·코드)이고, §4는 논문을 읽은 뒤 채울 빈칸이다. 세션의 첫 일은 논문을 읽고 §4를 채우는 것.
+상태: **닫힘 (2026-09-23, §8)** — 논문은 T-MAN(가중치 LUT 역양자화)이고 int32 → u8 재양자화 논문이
+아니다; 우리 세 커널에는 int32에서 u8로 직행할 텐서가 없고, 이득 산술은 게이트(−5 ms) 미달. 구현 안 함.
+남은 것은 SDK `hexkl_micro.h`의 acc_read 변형 확인 한 줄(§8.3)이고, 그것은 논문과 무관한 별개 지렛대다.
+§1~§3은 우리 커널 쪽 사실(측정·코드), §4는 논문에서 채운 것, §8이 판정.
 
 ## 0. 한 줄
 
@@ -70,15 +72,44 @@ int32 → u8 직행은 스케일을 **미리** 알아야 한다(고정소수점 
 논문이 어느 칸인지가 §4다. 정확도 판정은 **ppl(`NNTR_PPL=1`) 하나**: 62.0916 기준, +0.5% 이내면
 통과(51 §2.15의 규약). 텍스트 비교 금지(51 §2.9).
 
-## 4. 논문을 읽고 채울 것 (세션 첫 작업)
+## 4. 논문에서 채운 것 (2026-09-23)
 
-- [ ] 대상 하드웨어와 누산기 폭: HMX(int32 누산, 64×32 타일)와 같은 모양인가.
-- [ ] 스케일의 단위(텐서/채널/토큰/블록)와 결정 시점(정적 캘리브레이션인가, 런타임인가).
-- [ ] 비선형(SwiGLU/GELU)이 두 matmul 사이에 있을 때 어떻게 하나 — int8 LUT인가, f32로 갔다 오나.
-- [ ] 보고된 이득이 **무엇의** 이득인가: 에필로그 시간인가, 벽시계인가, 메모리인가. 우리는 에필로그가
-      이미 숨어 있으므로 벽시계 이득 주장의 전제(에필로그 노출)가 우리와 같은지가 핵심.
-- [ ] 정확도 지표와 손실(ppl이면 몇 %).
-- [ ] 위 표(§3)의 어느 칸인지. 칸이 정해지면 기대 이득 = (칸의 구조 이득) + (acc_read 변형 유무).
+**출처 주의.** 이 컨테이너도 arxiv.org와 미러 전부(alphaxiv, semanticscholar, researchgate, huggingface
+papers, paperswithcode)가 막혀 PDF 본문은 못 읽었다. 아래는 (a) 검색 엔진이 인용한 논문 본문 조각(초록,
+구현 절, 표 4), (b) 논문이 공개한 **커널 소스**(`github.com/kaleid-liner/executorch` @817bd29,
+`backends/qualcomm/runtime/op_packages/TMANOpPackage/src/ops/TMANLinear.cpp` — github.com은 열린다),
+(c) `microsoft/T-MAC/t-man`의 README·`docs/build.md`를 합친 것. 코드에서 읽은 것은 확정, 논문 조각은
+인용 문장 그대로이며 표의 나머지 칸은 모른다.
+
+**논문**: *T-MAN: Enabling End-to-End Low-Bit LLM Inference on NPUs via Unified Table Lookup*
+(USTC · Microsoft Research · Tsinghua · Microsoft, 2025-11-14). 한 줄: 저비트(1.58/2/4-bit) **가중치**를
+NPU에서 **테이블 조회로 역양자화**하는 프레임워크(T-MAC의 NPU 판). **int32 누산기 → u8 재양자화
+논문이 아니다** — §0의 전제("논문 = 누산기 직행 재양자화")가 틀렸다.
+
+- [x] **하드웨어·누산기**: Snapdragon 8 Gen 3 / 8 Elite(HTP v75/v79), HMX + HVX — 우리와 같은 칩. prefill은
+      HMX, decode는 HVX. 그러나 HMX에 넣는 dtype이 다르다: 가중치를 LUT로 **INT8**(BitNet, per-tensor) 또는
+      **FP16**(Qwen3/Llama, per-block g64/g128)으로 풀고, 활성화는 **INT16**(`LType = int16_t`, QNN
+      `--ptq 16a4w`), 출력은 **f32**(`CType = float`), 스케일은 fp16. 우리 u8×i4 네이티브 경로와 달리
+      **가중치 역양자화 단계가 존재**하고, 그것이 그들의 병목이었다("NPUs have poor performance on
+      computations other than GEMM, like dequantization").
+- [x] **스케일 단위·결정 시점**: 가중치 per-block(fp16 스케일·오프셋을 LUT에 "bake"), 활성화는 **정적**
+      (PTQ 캘리브레이션, 16a) — 코드의 `ACT_GROUP_SIZE = 256`은 K축 256 단위 그룹 스케일. 런타임
+      min/max 스캔 없음.
+- [x] **비선형**: 커스텀 op는 Linear 하나(`TMANLinear`, 보조 `TMANPrecompute`/`TMANFinalize`)이고 SwiGLU 등은
+      QNN 그래프의 일반 op(f16/int16). 정수 LUT 활성화 함수 아님. "두 matmul 사이"를 다루지 않는다.
+- [x] **이득의 정체**: prefill 1.4×, decode 3.1×, 에너지 −84%(vs 기준 NPU 방법 = QNN); 2-bit 커널 1.8–2.5×
+      vs QNN, 4-bit는 비슷; 최대 8× vs QNN-W_FP16A_FP16. 이득은 **가중치 역양자화를 DMA → HVX(LUT) → HMX
+      3단 파이프라인으로 숨긴 것**과 decode의 비트 직렬 LUT GEMV(T-MAC)다. 에필로그(누산기 → 출력)
+      얘기가 아니다 — 출력은 f32로 나가고 dtype 변환은 QNN 그래프가 한다. 즉 §2의 핵심 질문("벽시계
+      이득의 전제가 에필로그 노출인가")의 답: **아니다, 전제가 가중치 dequant 노출**이고 우리 경로에는
+      그 단계 자체가 없다.
+- [x] **정확도**: WikiText2 ppl. QNN W_INT4(per-channel) A_INT16: Llama-3.1-8B 18.62 / Qwen3-8B 25.37;
+      T-MAN W_INT2(per-block) A_INT16: 12.81 / 13.14. 주장은 "per-block 2-bit가 QNN의 per-channel 4-bit보다
+      낫다"이고, f32 대비 손실은 인용 조각에 없다.
+- [x] **§3 표의 칸**: **어느 칸도 아니다.** 활성화 쪽만 보면 "정적(캘리브레이션)" 행이지만 16비트이고,
+      재양자화 산술이 없다(f32 출력). 스캔 배리어를 없앤 대가로 활성화 비트를 두 배 쓴 것이고, HMX u8
+      경로에는 못 옮긴다 — int16 활성화면 활성화 바이트 2배 + mm dtype 변경이고, u8 정적 레시피는 51
+      §2.12~2.14에서 전부 졌다. 기대 이득 = 0 + (acc_read 변형 유무, §8.3).
 
 ## 5. 만들 순서 (게이트 있음)
 
@@ -119,3 +150,53 @@ ppl(NNTR_PPL=1, 기준 62.0916, +0.5% 이내)이고 텍스트 비교는 지표�
 내가 한다 — 너는 config·명령을 주고 결과를 받아 문서(53의 다음 절)에 기록해. 가설에 코드 쓰기
 전에 분해를 재라 — 51 §2.25~2.27이 왜 그런지의 기록이다.
 ```
+
+## 8. 판정: 구현하지 않는다 (2026-09-23)
+
+§5 0단계의 게이트에서 멈춘다. 이득 산술이 −5 ms에 못 미치고, 그보다 먼저 **구조가 안 맞는다**.
+
+### 8.1 우리 세 커널에는 int32 → u8로 직행할 텐서가 없다
+
+§1의 f32 홉을 재양자화의 **입력**이 무엇인지로 다시 보면, 어디에서도 누산기가 아니다:
+
+| 커널 | 재양자화 입력 | 그 앞에 있는 것 |
+|---|---|---|
+| MoE gate_up → down (`hexkl_mm_u8i4_moe.c`) | gate_off = silu(g)·u | g, u 각각 dequant(f32) → 비선형 |
+| conv 블록 phase 2 (`hexkl_conv_block.c`) | conv 출력 | dequant → a·c 곱 → 3탭 conv, 전부 f32 |
+| FC(q/k/v/o), MoE down (`hexkl_mm_u8i4_dma.c`, down) | 없음 | 출력이 f32여야 한다(residual stream, attention core) |
+
+int32에서 나가려면 SwiGLU(또는 곱·conv)를 정수로 해야 하고, 정수 SwiGLU는 g·u의 스케일을 **미리** 알아야
+한다(LUT 인덱스) = 정적 스케일 = 51 §2.12~2.14에서 진 레시피(SwiGLU 뒤 활성화의 outlier 때문에 per-row가
+필요했다). 동적 per-row를 유지하는 한 g·u는 f32로 풀려야 하고, 그러면 §3의 2행("int32 도메인에서
+스캔")조차 성립하지 않는다 — **스캔할 int32 텐서가 없다.** 이 아이디어가 맞는 자리는 attention이 HTP로
+올라올 때의 q/k/v 투영 → KV 블록 u8(30번 과제의 블록 양자화기) 하나뿐이고, 이 과제 밖이다.
+
+### 8.2 이득 산술 (51 §2.24, poll 5000, 전부 켬)
+
+- 노출 에필로그: dequant 243 + requant 62 + scatter 36 = **341 us/콜(2.4%) × 22 = 7.5 ms**. 산술을 무엇으로
+  바꾸든 이것이 상한이고, 그중 콜 양끝의 구조적 대기(rq(0) 앞의 마지막 gate_up 에필로그, 마지막 down
+  에필로그)는 안 사라진다. 워커 시간이 반으로 줄어 노출이 반으로 준다고 쳐도 ≤ 3.7 ms.
+- VTCM: gate_off f32 448 KB → u8 112 KB로 336 KB가 남으면 활성화 슬롯 2벌 — 상한 −0.2 ms/콜 = −4.4 ms
+  (51 §2.26이 그 이유로 안 한 것).
+- decode(M=1): 에필로그 0(§2). 해당 없음.
+- **둘 다 정적 스케일 전제**다(8.1). 정적이면 ≤ 8 ms에 ppl 손실, 동적 유지면 **0 ms**. 어느 쪽도 게이트
+  미달. §5 1단계(숨은 워커 시간 프로브)도 이 과제에서는 안 만든다 — 그 수치가 어떻게 나와도 8.1을 못
+  뒤집는다.
+
+### 8.3 열려 있는 것 하나: acc_read의 폭 (논문과 무관)
+
+acc 2,954 us(21%)는 타일당 0.36 us에 int32 8 KB를 VTCM에 내려놓는 벤더 함수 한 번씩이다. 이 트리와 이
+컨테이너에는 SDK `hexkl_micro.h`가 없고(`test/htp/host/stub/`은 `acc_read_int32`만), 트리가 아는 변형은
+`acc_read_int32`(int 경로)와 `acc_read_f16`(fp16 matmul 경로, ref_13)뿐이다. **확인은 기기 빌드 머신에서
+한 줄**(`HEXKL_ROOT`는 `test/htp/build.sh`가 쓰는 beta2 addon):
+
+```bash
+grep -n 'acc_read\|requant\|scale\|shift' "$HEXKL_ROOT"/include/hexkl_micro.h
+```
+
+판정 규칙: int 누산기를 **더 좁은 폭으로** 읽는 변형(int16/i8/u8/f16 출력 + 스케일이나 시프트 인자)이
+있으면 **별개 지렛대**("acc_read 폭")로 연다 — 읽기가 바이트 비례라면 반폭에 −1.5 ms/콜 × 22 ≈ −30 ms가
+상한이라 게이트를 넘는다. 단 (a) 스케일을 읽기 전에 알아야 하므로 gate_up에만 해당(down은 f32 출력이
+필요), (b) f16 출력은 K=2048의 u8×i4 합(최대 ~4.2M)이 f16의 정수 정밀도(2048)를 넘어 비트 동일이
+깨지므로 ppl 게이트를 다시 통과해야 하고, (c) 정적 스케일을 요구하는 변형이면 8.1의 정확도 문제가 그대로다.
+그런 변형이 없으면 이 과제는 여기서 닫힌다.
