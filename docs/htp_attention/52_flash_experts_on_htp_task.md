@@ -323,3 +323,43 @@ EXTRA_TOPK 후보 5개 중 다음 토큰에 실제로 쓰일 확률도 균일 �
 2. **순수 CPU decode 50.5 TPS vs §1의 20.6.** prefill도 2711 vs 921~1013. 같은 프롬프트(443 토큰)인데 두 방향으로 다르다.
    HTP 전부 켬(§1: 24.2 TPS)이 오늘의 CPU 50.5보다 느리다면 이야기가 달라지므로, 1단계에 **HTP 상주(환경변수 없음)
    실행을 같은 세션에** 넣어 오늘의 A를 다시 잡는다.
+
+### 10.6 단계 1 실측: 게이트 통과, 그리고 5.2 GB의 정체 — 아레나는 RSS에 없었다 (2026-09-23)
+
+같은 세션, `-qs4cx-wh`, 전부 켬 config, 실행 순서 A(상주, 환경변수 없음) ×2 → B(`NNTR_MOE_CACHE_EXPERTS=32`) ×2 →
+B PROFILE=2+PPL → A PROFILE=2+PPL. 새 바이너리 확인: C=1은 `ExpertLru: one call needs 31 experts resident but the pool
+holds 22`로 즉시 종료(첫 층 prefill의 활성 expert가 32가 아니라 31 — 444×4 라우팅에서 하나가 안 뽑힘, 정상).
+
+| | A 상주 | B 파일 경로 C=32 | 판정 |
+|---|---|---|---|
+| prefill (비프로파일 2회) | 644 / 657 | 688 / 707 | +40~50 (아래) |
+| decode TPS | 23.9 / 23.7 | 23.6 / 23.5 | 동일 |
+| **ppl** | 62.0916 | **62.0916** | **소수점까지 동일 — 게이트 통과** |
+| MoE M>1 host/콜 | 14429 (dsp 13807, transport 621) | 14469 (dsp 13743, transport 726) | dsp 동일, transport +105 |
+| M==1 host/콜 | 1443.7 (transport 90.3) | 1437.8 (transport 90.7) | 동일 |
+| conv / dense / FC transport | 479 / 537 / 423·570 | 619 / 680 / 562·719 | 전부 +100~140 |
+| 등록 | 1520 weights, convert 847 + rpc 727 = 4614 ms | 816, **파일 읽기 3594** + rpc 699 = 6265 ms | 읽기 3.7 GB에 3.6 s = 1.0 GB/s |
+| **peak RSS** | **5257 MB** | **894 MB** | 같은 상주인데 −4.4 GB |
+
+- **5.2 GB는 아레나가 아니라 로더의 임시 사본이었다.** 아레나는 ION dma-buf 매핑이라 RSS에 잡히지 않는다. 옛 경로는
+  로더가 3.7 GB를 힙으로 읽고 → memcpy → `MADV_DONTNEED`; ru_maxrss는 그 순간의 힙을 기억했다. 새 경로는 pread가
+  page cache → ION으로 바로 쓰므로 힙 사본이 없고, 894 MB가 "expert 빼고 전부"(CPU 경로의 814 MB와 같은 급)다.
+  §1의 "peak RSS 5.2 GB: 아레나 3840 + 나머지"라는 해석은 틀렸다. **실제 물리 메모리 = RSS + 아레나**(ION은 핀됨,
+  회수 불가) + page cache(회수 가능). C=32: 0.89 + 3.84 = 4.7 GB. 앞으로 헤드라인은 `Max RSS`와 프로파일의
+  `[HTP] arena chunk … mapped total` 두 줄을 같이 적는다 — RSS는 C와 무관하게 ~0.9 GB로 평평해야 하고, 아레나가
+  ⌈22C/48⌉ × 256 MiB로 움직여야 한다.
+- **prefill +40~50 중 설명되는 것은 ~7 ms**: 모든 종류의 콜에서 transport가 +100~140 us(23 MoE + 19 conv + 13 FC +
+  3 dense ≈ 7 ms). dsp 시간은 동일하므로 DSP 밖이다. 원인 미상(B는 page cache가 3.7 GB 더 차 있는 상태 — 메모리
+  압박이 FastRPC 드라이버의 콜당 작업에 닿나?). 나머지 ~35는 세션 드리프트 범위(§2.27 ±25, B가 A보다 뒤에 돌아
+  더 뜨거움). **B → A 순서로 한 번 더** 돌려 transport 차가 순서를 따라가는지 보기 전엔 쫓지 않는다.
+- **등록 6.3 s (+1.7 s).** 파일 읽기 1.0 GB/s는 memcpy(옛 경로 convert 0.56 ms/weight = 4.4 GB/s)보다 훨씬 느리다 —
+  flash에서 온 것(A의 로더가 읽은 뒤 page cache에 남아 있어야 하는데, 3.7 GB 파일 둘 + ION 3.84 + RSS로 12 GB 기기의
+  page cache가 못 버텼을 가능성)이거나 uncached 매핑으로의 copy_to_user가 CPU 병목. 2단계의 cold/warm 분리가 이걸
+  가른다(warm 미스의 read ms가 memcpy급이면 후자가 아님). 기동 1회 비용이라 우선순위는 낮다.
+
+**단계 0의 정정.** 기기 `config.json`이 단계 0 이전에 이미 `Lfm2CachedSlimMoeForCausalLM`으로 바뀌어 있었다(수동 편집
+안내를 먼저 따른 뒤 스크립트가 그 상태를 `.orig`로 백업). 따라서 §10.5의 "순수 CPU 2711 ms / 50.5 TPS / 4866 MB"와
+오늘의 0번(3140 / 48.6 / ppl 51.59)은 **둘 다 cached-slim C=32**다. §10.5의 "cached C=32(40.8)가 상주(50.5)보다 20%
+느리다"는 항목은 cached 대 cached라 소멸. **순수 CPU(`Lfm2MoeForCausalLM`)는 아직 한 번도 안 쟀고, ppl 51.59 vs 57.00은
+cached-slim의 SwiGLU(`acti_func`, 정확한 swish) 대 상주 CPU의 `swiglu_det`(결정적 근사) 차이일 가능성이 남는다.**
+2단계 스크립트 0번이 config를 원복하고 순수 CPU + PPL을 한 번 잰다.
