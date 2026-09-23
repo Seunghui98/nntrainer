@@ -297,6 +297,7 @@ public:
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
+    b.swiglu_hidden = true;
     if (stage_us != nullptr) {
       b.dsp_us += stage_us[HTP_MOE_T_DSP_TOTAL];
       b.quant_us += stage_us[HTP_MOE_T_QUANT];
@@ -344,6 +345,11 @@ private:
     uint64_t dsp_us = 0;
     uint64_t quant_us = 0;
     uint64_t swiglu_us = 0; /**< fused calls only; 0 elsewhere */
+    /** swiglu_us is WORKER time that ran under the HMX (the MoE layer
+        kernel's pool jobs, the conv block's stage units) rather than a
+        synchronous pass, so the residual must not subtract it. Set by the
+        call type that fills the bucket. */
+    bool swiglu_hidden = false;
     /** MoE layer call only: the routing multiply and scatter-add, plus
         copying the FastRPC buffers to and from cached heap. Both are work
         no other call type does, so they get their own column rather than
@@ -478,14 +484,16 @@ private:
         // treat it as an upper bound on the matmul, not an exact figure.
         /* mm is the residual, so every named stage has to be subtracted --
            scatter included, or the MoE layer call's scatter time would be
-           reported as matmul. The conv block call's SWIGLU column is the
-           exception: there it is WORKER time inside its background stage
-           (hexkl_conv_block.c's cb_stage_probe_add), work that ran under
-           the HMX rather than instead of it, so subtracting it made the
-           residual negative -- 3.3 ms of hidden work against a 4.0 ms
-           call. Left in the sum for every other call, where SWIGLU is
-           the fused layer's own synchronous elementwise pass. */
-        const double hidden_per = (kind == 2) ? swiglu_per : 0.0;
+           reported as matmul. The SWIGLU column of the MoE layer kernel's
+           rows (MoE, dense, conv) is the exception: there it is WORKER
+           time inside pool jobs (hexkl_mm_u8i4_moe.c's
+           moe_worker_probe_add, hexkl_conv_block.c's cb_stage_probe_add),
+           work that ran under the HMX rather than instead of it, so
+           subtracting it made the residual negative -- 3.3 ms of hidden
+           work against a 4.0 ms conv call. Left in the sum for the fused
+           layer call, where SWIGLU is its own synchronous elementwise
+           pass. */
+        const double hidden_per = b.swiglu_hidden ? swiglu_per : 0.0;
         const double mm_per =
           dsp_per -
           (quant_per + (swiglu_per - hidden_per) + dequant_per + acc_per +
