@@ -599,14 +599,20 @@ private:
       const unsigned k = std::get<0>(entry.first);
       const unsigned n = std::get<1>(entry.first);
       const bool decode = std::get<2>(entry.first);
+      // The kind names the row on both shapes: at decode the attention
+      // FC calls and the MoE layer share K=2048 N=2048, so "M==1" alone
+      // would print two rows nobody could tell apart. The MoE row stays
+      // the bare "M==1" every handoff greps for.
       static const char *const kind_name[] = {"M>1", "M>1 dense", "M>1 conv",
                                               "M>1 FC"};
+      static const char *const kind_name_m1[] = {"M==1", "M==1 dense",
+                                                 "M==1 conv", "M==1 FC"};
       const int kind = std::get<3>(entry.first);
       const Bucket &b = entry.second;
       std::fprintf(stderr,
-                   "[HTP-PROFILE]   K=%-5u N=%-5u %-9s calls=%-7llu "
+                   "[HTP-PROFILE]   K=%-5u N=%-5u %-10s calls=%-7llu "
                    "rows=%-8llu host=%9.1f ms (%7.1f us/call)",
-                   k, n, decode ? "M==1" : kind_name[kind],
+                   k, n, (decode ? kind_name_m1 : kind_name)[kind],
                    (unsigned long long)b.calls, (unsigned long long)b.rows,
                    ms(b.host_us),
                    b.calls ? static_cast<double>(b.host_us) / b.calls : 0.0);
