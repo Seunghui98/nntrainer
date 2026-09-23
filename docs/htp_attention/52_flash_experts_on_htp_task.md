@@ -59,7 +59,7 @@ PR nntrainer#4264 (`Jungwon-Lee`, LFM2-MoE 지원)가 넣었고 이 브랜치에
 `nntrainer/tensor/htp_backend/htp_compute_ops.cpp`:
 
 - 로드 시(`transformer.cpp`의 등록 분기, `lfm2_moe` 타입) `register_qs4cx_weight(data, scale, K, N, wh=true)`
-  → 파일의 QS4CX_WH 바이트(이미 HMX 타일 배치, `htp_wh_layout.h`)를 아레나 청크에 memcpy → 
+  → 파일의 QS4CX_WH 바이트(이미 HMX 타일 배치, `htp_wh_layout.h`)를 아레나 청크에 memcpy →
   `registerFromArena` → DSP `weight_register_u8i4_arena(K, N, arena, wh_off, w_scale, colsum_w, bias)`
   (4 KB만 건넘, 바이트는 제자리 차용) → `releaseArmSource`(ARM 사본 `MADV_DONTNEED`).
 - 아레나: `ensureArena` → `rpcmem_alloc` 256 MiB 청크 → `fastrpc_mmap(FASTRPC_MAP_FD)` →
