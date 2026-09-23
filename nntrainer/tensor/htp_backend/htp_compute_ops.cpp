@@ -570,7 +570,7 @@ private:
           stderr,
           "\n[HTP-PROFILE]     expert misses: %llu (%.2f/call), "
           "file read %.1f ms (%.2f ms/call, %.2f ms/miss), "
-          "register+release rpc %.1f ms (%.2f ms/call) -- outside "
+          "swap rpc %.1f ms (%.2f ms/call) -- outside "
           "host= above",
           (unsigned long long)b.misses, static_cast<double>(b.misses) / b.calls,
           ms(b.miss_read_us), ms(b.miss_read_us) / static_cast<double>(b.calls),
@@ -595,7 +595,7 @@ private:
     if (miss_total_ != 0) {
       std::fprintf(stderr,
                    "[HTP-PROFILE] expert cache misses: %llu, file read "
-                   "%.1f ms (%.2f ms/miss), register+release rpc %.1f ms "
+                   "%.1f ms (%.2f ms/miss), swap rpc %.1f ms "
                    "(%.2f ms/miss)\n\n",
                    (unsigned long long)miss_total_, ms(miss_read_total_us_),
                    ms(miss_read_total_us_) / miss_total_,
@@ -1138,29 +1138,31 @@ public:
     return keys;
   }
 
+  /**
+   * @brief Retires one expert without a round trip (doc 52 section 10.12).
+   *
+   * The expert stops being a hit at once -- its keys leave handle_cache_ --
+   * but its two DSP handles stay registered and travel with the slot into
+   * the free list. The next expert read into that slot releases them in
+   * the same weight_swap_u8i4_arena call that registers it. That is safe
+   * because nothing can pass a retired handle to the DSP any more, and the
+   * slot's bytes are only overwritten between calls, never under one that
+   * reads them. Handles held this way count against the DSP's table, but
+   * only up to the number of free slots, which a steady state keeps at
+   * zero: every eviction is followed by the load that wanted its slot.
+   */
   bool release_qs4cx_wh_expert(const void *key_gu) override {
-    const remote_handle64 session =
-      static_cast<remote_handle64>(HtpBackend::global().handle());
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = experts_.find(key_gu);
     if (it == experts_.end())
       return false;
-    const uint64_t t0 = HtpProfile::nowUs();
-    const int e1 = nntr_hvx_weight_release_u8i4(session, it->second.h_gu);
-    const int e2 = nntr_hvx_weight_release_u8i4(session, it->second.h_dn);
-    if (e1 != AEE_SUCCESS || e2 != AEE_SUCCESS) {
-      // The DSP still holds a handle onto this slot; reusing the slot would
-      // hand a live handle someone else's bytes. Leak the slot instead.
-      throw std::runtime_error("nntr_hvx_weight_release_u8i4 failed: err=" +
-                               std::to_string(e1 != AEE_SUCCESS ? e1 : e2));
-    }
+    ExpertSlot slot = it->second.slot;
+    slot.h_gu = it->second.h_gu;
+    slot.h_dn = it->second.h_dn;
     handle_cache_.erase(key_gu);
     handle_cache_.erase(it->second.key_dn);
-    free_expert_slots_.push_back(it->second.slot);
+    free_expert_slots_.push_back(slot);
     experts_.erase(it);
-    HtpProfile &profile = HtpProfile::global();
-    if (profile.level() != 0)
-      profile.addExpertLoad(0, HtpProfile::nowUs() - t0, 0);
     return true;
   }
 
@@ -2394,6 +2396,9 @@ private:
   struct ExpertSlot {
     uint32_t chunk = 0;
     uint32_t off = 0;
+    /** The retired expert's handles, still registered on the DSP until the
+     *  next load into this slot swaps them out; kNoHandle when none. */
+    uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
   };
   struct ExpertResident {
     ExpertSlot slot;
@@ -2519,24 +2524,34 @@ private:
   void registerStaged(remote_handle64 session, StagedExpert &st) {
     const ExpertFileDesc &d = st.d;
     uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
+    int err = AEE_SUCCESS;
     try {
       throwPread(st.rc, "expert weight");
-      h_gu = registerFromArena(session, st.gu, d.K, 2 * d.inter, 0);
-      if (h_gu == kNoHandle)
-        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
-                                 std::to_string(d.K) + "x" +
-                                 std::to_string(2 * d.inter) + " WH weight");
-      h_dn = registerFromArena(session, st.dn, d.inter, d.N_out, 0);
-      if (h_dn == kNoHandle)
-        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
-                                 std::to_string(d.inter) + "x" +
-                                 std::to_string(d.N_out) + " WH weight");
+      // One round trip: register the pair just read and release the pair
+      // retired from this slot, if any (release_qs4cx_wh_expert). On error
+      // the DSP has changed nothing, so the slot goes back to the free list
+      // still holding its retired pair.
+      err = nntr_hvx_weight_swap_u8i4_arena(
+        session, st.slot.h_gu, st.slot.h_dn, d.K, d.inter, d.N_out,
+        arena_chunks_[st.slot.chunk].dsp_id, st.gu.off, st.dn.off,
+        st.gu.w_scale.data(), static_cast<int>(st.gu.w_scale.size()),
+        st.gu.colsum_w.data(), static_cast<int>(st.gu.colsum_w.size()),
+        st.dn.w_scale.data(), static_cast<int>(st.dn.w_scale.size()),
+        st.dn.colsum_w.data(), static_cast<int>(st.dn.colsum_w.size()), &h_gu,
+        &h_dn);
+      if (err != AEE_SUCCESS) {
+        char code[16];
+        std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(err));
+        throw std::runtime_error(
+          std::string("nntr_hvx_weight_swap_u8i4_arena failed: err=") + code +
+          " (a skel older than test/htp/nntr_hvx.idl answers this call with "
+          "an error: rebuild and push libnntr_hvx_skel.so)");
+      }
     } catch (...) {
-      if (h_gu != kNoHandle)
-        nntr_hvx_weight_release_u8i4(session, h_gu);
       free_expert_slots_.push_back(st.slot);
       throw;
     }
+    st.slot.h_gu = st.slot.h_dn = kNoHandle; // released by the swap
     handle_cache_[d.key_gu] = h_gu;
     handle_cache_[d.key_dn] = h_dn;
     experts_.emplace(d.key_gu, ExpertResident{st.slot, d.key_dn, h_gu, h_dn});
