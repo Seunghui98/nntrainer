@@ -407,4 +407,24 @@ interface nntr_hvx : remote_handle64 {
    // ION mapping of a given size -- the design section 8.4 depends on.
    AEEResult mem_probe_touch(in sequence<uint8> buf,
                              rout sequence<uint64> touched_sum);
+
+   // [doc 52 section 10.12] One flash-streamed expert in, one out, in one
+   // round trip: registers gate_up [K, 2*inter] at off_gu and down
+   // [inter, N_out] at off_dn in the arena, as weight_register_u8i4_arena
+   // does (bias zero -- experts have none), and only then releases old_gu
+   // and old_dn, the pair the host retired from the slot it just refilled.
+   // 0xFFFFFFFF for both means nothing to release. On any error nothing is
+   // released and nothing stays registered, so the host's view -- old pair
+   // live, new pair absent -- still holds. Appended last so every method
+   // above keeps its index: a skel older than this IDL answers only this
+   // call with an error.
+   AEEResult weight_swap_u8i4_arena(in uint32 old_gu, in uint32 old_dn,
+                                    in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 arena,
+                                    in uint32 off_gu, in uint32 off_dn,
+                                    in sequence<float> gu_scale,
+                                    in sequence<int32> gu_colsum,
+                                    in sequence<float> dn_scale,
+                                    in sequence<int32> dn_colsum,
+                                    rout uint32 h_gu, rout uint32 h_dn);
 };
