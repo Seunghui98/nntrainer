@@ -870,6 +870,23 @@ int main(int argc, char *argv[]) {
                          include_lmhead, num_dense_layers, moe_dtype);
     addSentenceTransformerLayerDtypes(layer_dtype_map, nntr_cfg, model_path,
                                       fc_dtype);
+    if (output_format == "safetensors") {
+      // NeuralNetwork::save's safetensors writer stores at most one
+      // block-quantized weight per layer; LFM2's fused qkv_layer has three
+      // (q, k, v), so in that container it stays FP32, as it did before the
+      // map named it. The .bin path quantizes it.
+      for (auto it = layer_dtype_map.begin(); it != layer_dtype_map.end();) {
+        const std::string &name = it->first;
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, "_qkv") == 0) {
+          std::cout << "  " << name
+                    << " stays FP32: safetensors holds one quantized weight "
+                       "per layer\n";
+          it = layer_dtype_map.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
 
     std::cout << "  Layer dtype mapping (" << layer_dtype_map.size()
               << " layers targeted):\n";
