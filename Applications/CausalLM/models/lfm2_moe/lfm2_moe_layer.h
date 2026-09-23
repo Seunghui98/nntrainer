@@ -168,6 +168,9 @@ private:
    *  pool. Unset, nothing about the resident path changes. */
   bool experts_virtual;
   unsigned int cache_per_layer;
+  /** Ordinal of this MoE layer in finalize order, the layer id written to
+   *  NNTR_MOE_TRACE. */
+  unsigned int trace_layer;
 
   // intermediate tensor indices
   unsigned int router_logits_idx;

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <compute_ops.h>
 #include <cpu_backend.h>
+#include <cstdio>
 #include <cstdlib>
 #include <expert_lru.h>
 #include <iostream>
@@ -145,6 +146,24 @@ static constexpr unsigned EXTRA_TOPK = 5;
  *  layer and a per-layer bound of 2 cannot. */
 static causallm::ExpertLru g_expert_lru;
 
+/** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
+static std::atomic<unsigned> g_moe_layer_count{0};
+
+/**
+ * @brief NNTR_MOE_TRACE=<path>: one line per MoE layer call,
+ *        "<layer> <tokens> | <routed experts> | <top-(k+5) per token>",
+ *        for tools/moe_expert_cache_sim.py to replay against cache
+ *        policies offline (doc 52 section 10.10). The routing is the same
+ *        whatever the cache does, so one resident run gives every C.
+ */
+static std::FILE *moeTrace() {
+  static std::FILE *f = [] {
+    const char *path = std::getenv("NNTR_MOE_TRACE");
+    return (path != nullptr && *path != '\0') ? std::fopen(path, "w") : nullptr;
+  }();
+  return f;
+}
+
 /** @brief NNTR_MOE_CACHE_EXPERTS as a count, 0 when unset or unparsable
  *  (the resident path, unchanged). The same variable and the same parsing
  *  as Lfm2CachedSlimMoELayer, so one knob drives the CPU and HTP caches. */
@@ -178,6 +197,7 @@ Lfm2MoELayer::Lfm2MoELayer() :
   expert_bias_idx(std::numeric_limits<unsigned>::max()),
   experts_virtual(false),
   cache_per_layer(0),
+  trace_layer(0),
   router_logits_idx(std::numeric_limits<unsigned>::max()),
   decode_expert_output_idx(std::numeric_limits<unsigned>::max()),
   decode_gate_up_output_idx(std::numeric_limits<unsigned>::max()),
@@ -216,6 +236,7 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   // LRU shared by every MoE layer (g_expert_lru). A CPU-engine layer keeps
   // its resident weights whatever the variable says -- the CPU cache is
   // Lfm2CachedSlimMoELayer's job.
+  trace_layer = g_moe_layer_count.fetch_add(1);
   cache_per_layer = expertCacheFromEnv(num_experts);
   experts_virtual =
     cache_per_layer != 0 &&
@@ -968,9 +989,19 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     size_t max_assigned_tokens = 0;
     {
       M0Timer t(&g_m0.topk);
-      buildExpertAssignments(router_logits, expert_bias, total_tokens,
-                             expert_assignments,
-                             experts_virtual ? &extra_top_k : nullptr);
+      buildExpertAssignments(
+        router_logits, expert_bias, total_tokens, expert_assignments,
+        (experts_virtual || moeTrace() != nullptr) ? &extra_top_k : nullptr);
+      if (std::FILE *tf = moeTrace()) {
+        std::fprintf(tf, "%u %u |", trace_layer, total_tokens);
+        for (unsigned int e = 0; e < num_experts; ++e)
+          if (!expert_assignments[e].empty())
+            std::fprintf(tf, " %u", e);
+        std::fputs(" |", tf);
+        for (int e : extra_top_k)
+          std::fprintf(tf, " %d", e);
+        std::fputc('\n', tf);
+      }
 
       for (const auto &assignments : expert_assignments)
         max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
