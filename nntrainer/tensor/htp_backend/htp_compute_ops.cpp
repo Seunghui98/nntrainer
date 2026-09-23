@@ -50,8 +50,10 @@
 #include <htp_rpcmem.h>
 #include <htp_wh_layout.h>
 #include <swiglu_det.h>
+#include <thread_manager.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -2376,28 +2378,42 @@ private:
     uint32_t h_gu, h_dn;
   };
 
-  /** @brief pread that finishes or throws: a short read into a weight is a
-   *  wrong matmul, never a warning. */
-  static void preadFull(int fd, void *dst, size_t len, uint64_t off,
-                        const char *what) {
+  /** @brief pread that finishes: 0, or the errno, or -1 at end of file.
+   *  Does not throw, so a worker thread can call it. */
+  static int preadAll(int fd, void *dst, size_t len, uint64_t off) {
     uint8_t *p = static_cast<uint8_t *>(dst);
     while (len != 0) {
       const ssize_t n = ::pread(fd, p, len, static_cast<off_t>(off));
       if (n < 0) {
         if (errno == EINTR)
           continue;
-        throw std::runtime_error(std::string("pread(") + what +
-                                 ") failed: " + std::strerror(errno));
+        return errno;
       }
-      if (n == 0) {
-        throw std::runtime_error(std::string("pread(") + what +
-                                 ") hit end of file: the model file is "
-                                 "shorter than its weights");
-      }
+      if (n == 0)
+        return -1;
       p += n;
       len -= static_cast<size_t>(n);
       off += static_cast<uint64_t>(n);
     }
+    return 0;
+  }
+
+  /** @brief A short read into a weight is a wrong matmul, never a warning. */
+  static void throwPread(int rc, const char *what) {
+    if (rc == 0)
+      return;
+    if (rc < 0) {
+      throw std::runtime_error(std::string("pread(") + what +
+                               ") hit end of file: the model file is "
+                               "shorter than its weights");
+    }
+    throw std::runtime_error(std::string("pread(") + what +
+                             ") failed: " + std::strerror(rc));
+  }
+
+  static void preadFull(int fd, void *dst, size_t len, uint64_t off,
+                        const char *what) {
+    throwPread(preadAll(fd, dst, len, off), what);
   }
 
   /** @brief Reads one QS4CX_WH weight from the model file: the nibbles
@@ -2408,7 +2424,31 @@ private:
   void readExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
                         uint8_t *arena_dst, ArenaEntry &e) {
     const size_t nib = whBytes(K, N);
-    preadFull(fd, arena_dst, nib, off, "WH nibbles");
+    // [doc 52 section 10.7] The nibble read is 82% of a miss, and on one
+    // thread it runs at 3.8-4.7 GB/s -- one core's store rate into the
+    // uncached mapping, the same the old path's memcpy got. Sliced across
+    // the worker pool it scales with cores until DDR says stop. Page-sized
+    // slices, so no two threads write the same page. A worker cannot
+    // throw across parallel_for; each slice keeps its result and the
+    // caller throws once after the join.
+    auto &tm = ThreadManager::Global();
+    const size_t n_slices =
+      std::min<size_t>(tm.getComputeThreadCount(), kExpertReadSlicesMax);
+    const size_t slice =
+      (((nib + n_slices - 1) / n_slices) + 4095u) & ~size_t(4095u);
+    std::atomic<int> first_rc{0};
+    tm.parallel_for(0, n_slices, [&](size_t i) {
+      const size_t b = i * slice;
+      if (b >= nib)
+        return;
+      const int rc =
+        preadAll(fd, arena_dst + b, std::min(slice, nib - b), off + b);
+      if (rc != 0) {
+        int expected = 0;
+        first_rc.compare_exchange_strong(expected, rc);
+      }
+    });
+    throwPread(first_rc.load(), "WH nibbles");
     std::vector<float> tail(2 * static_cast<size_t>(N));
     preadFull(fd, tail.data(), tail.size() * sizeof(float), off + nib,
               "scale+colsum");
@@ -2910,6 +2950,9 @@ private:
   std::vector<ExpertSlot> free_expert_slots_;
   std::unordered_map<const void *, ExpertResident> experts_;
   size_t expert_slot_bytes_ = 0;
+  /** Slices of one expert weight's file read: 3.5 MiB over 8 is 448 KiB a
+   *  pread, past which the per-call cost stops paying for the split. */
+  static constexpr size_t kExpertReadSlicesMax = 8;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
   /** Why the last newChunk refused, in words, for the throw that follows. */
