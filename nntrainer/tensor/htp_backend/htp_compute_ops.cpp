@@ -66,6 +66,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
@@ -220,16 +221,24 @@ public:
    *  arena slot, rpc_us the register/release FastRPC calls. Held as
    *  "pending" and attributed to the next MoE layer call's row, which is
    *  the call that paid for it, so the row reads miss/call directly. */
-  void addExpertLoad(uint64_t read_us, uint64_t rpc_us, bool is_load) {
+  void addExpertLoad(uint64_t read_us, uint64_t rpc_us, uint64_t loads) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (is_load)
-      ++miss_pending_;
+    miss_pending_ += loads;
     miss_read_pending_us_ += read_us;
     miss_rpc_pending_us_ += rpc_us;
-    if (is_load)
-      ++miss_total_;
+    miss_total_ += loads;
     miss_read_total_us_ += read_us;
     miss_rpc_total_us_ += rpc_us;
+  }
+
+  /** @brief Experts read while a layer call ran (doc 52 section 10.10):
+   *  wait_us is only the read time the call did not cover. Kept apart from
+   *  the misses so the miss columns keep meaning a synchronous miss. */
+  void addPrefetch(uint64_t n, uint64_t wait_us, uint64_t rpc_us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prefetch_n_ += n;
+    prefetch_wait_us_ += wait_us;
+    prefetch_rpc_us_ += rpc_us;
   }
 
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
@@ -593,6 +602,15 @@ private:
                    ms(miss_rpc_total_us_),
                    ms(miss_rpc_total_us_) / miss_total_);
     }
+    if (prefetch_n_ != 0) {
+      std::fprintf(stderr,
+                   "[HTP-PROFILE] expert prefetch: %llu experts read under "
+                   "the layer calls, exposed wait %.1f ms (%.2f ms/expert), "
+                   "register rpc %.1f ms (%.2f ms/expert)\n\n",
+                   (unsigned long long)prefetch_n_, ms(prefetch_wait_us_),
+                   ms(prefetch_wait_us_) / prefetch_n_, ms(prefetch_rpc_us_),
+                   ms(prefetch_rpc_us_) / prefetch_n_);
+    }
   }
 
   int level_ = 0;
@@ -608,6 +626,7 @@ private:
   uint64_t miss_pending_ = 0, miss_read_pending_us_ = 0,
            miss_rpc_pending_us_ = 0;
   uint64_t miss_total_ = 0, miss_read_total_us_ = 0, miss_rpc_total_us_ = 0;
+  uint64_t prefetch_n_ = 0, prefetch_wait_us_ = 0, prefetch_rpc_us_ = 0;
   /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
    *  through the MoE layer kernel (doc 51). */
   std::map<std::tuple<unsigned, unsigned, bool, int>, Bucket> buckets_;
@@ -1023,96 +1042,100 @@ public:
    *
    * Slot reuse means the DSP reads a slot, the host overwrites it, the DSP
    * reads it again -- a sequence the arena tests never covered.
-   * ArenaSlotReuseMatchesHeap (unittest_hvx_mm_u8i4) is the gate for it.
+   * HmxArenaSlotReuse.Uncached (unittest_hvx_mm_u8i4) is the gate for it.
    */
-  bool register_qs4cx_wh_expert_file(const void *key_gu, const void *key_dn,
-                                     int fd, size_t off_gu, size_t off_dn,
-                                     unsigned int K, unsigned int inter,
-                                     unsigned int N_out,
+  bool register_qs4cx_wh_expert_file(const ExpertFileDesc &d,
                                      bool at_load) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     std::lock_guard<std::mutex> lock(handle_mutex_);
-    if (experts_.count(key_gu) != 0)
+    if (experts_.count(d.key_gu) != 0)
       return true;
-    if (fd < 0) {
-      throw std::runtime_error("register_qs4cx_wh_expert_file: the virtual "
-                               "expert weight carries no model file fd");
-    }
-    if (!ensureArena(session)) {
-      throw std::runtime_error(
-        "QS4CX_WH weights need the DSP arena, which this device did not "
-        "provide (no rpcmem_to_fd or no fastrpc_mmap).");
-    }
-    const uint32_t gu_len = static_cast<uint32_t>(whBytes(K, 2 * inter));
-    const uint32_t dn_len = static_cast<uint32_t>(whBytes(inter, N_out));
-    const uint32_t gu_stride = (gu_len + 4095u) & ~4095u;
-    const uint32_t slot_bytes = gu_stride + ((dn_len + 4095u) & ~4095u);
-    // One expert shape per process: a released slot is reused as is, and a
-    // second shape would need a second pool. Not this model.
-    if (expert_slot_bytes_ == 0) {
-      expert_slot_bytes_ = slot_bytes;
-    } else if (expert_slot_bytes_ != slot_bytes) {
-      throw std::runtime_error("register_qs4cx_wh_expert_file: expert shape "
-                               "differs from the pool's");
-    }
-
     const uint64_t t0 = HtpProfile::nowUs();
-    ExpertSlot slot;
-    if (!free_expert_slots_.empty()) {
-      slot = free_expert_slots_.back();
-      free_expert_slots_.pop_back();
-    } else if (!place(session, slot_bytes, kArenaChunkMax, &slot.chunk,
-                      &slot.off)) {
-      throw std::runtime_error(
-        "HTP arena: cannot place an expert slot (" +
-        std::to_string(slot_bytes >> 20) + " MiB). " +
-        (arena_fail_.empty() ? "no chunk was attempted" : arena_fail_) +
-        ". mapped=" + std::to_string(arenaBytes() >> 20) + " MiB in " +
-        std::to_string(arena_chunks_.size()) +
-        " chunks, RSS=" + std::to_string(rssKb() >> 10) + " MB");
-    }
-
-    uint8_t *base = arena_chunks_[slot.chunk].buf->data() + slot.off;
-    ArenaEntry gu, dn;
-    gu.chunk = dn.chunk = slot.chunk;
-    gu.off = slot.off;
-    dn.off = slot.off + gu_stride;
-    uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
-    uint64_t t_read = 0, t_rpc = 0;
-    try {
-      readExpertWeight(fd, off_gu, K, 2 * inter, base, gu);
-      readExpertWeight(fd, off_dn, inter, N_out, base + gu_stride, dn);
-      t_read = HtpProfile::nowUs();
-      h_gu = registerFromArena(session, gu, K, 2 * inter, 0);
-      if (h_gu == kNoHandle)
-        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
-                                 std::to_string(K) + "x" +
-                                 std::to_string(2 * inter) + " WH weight");
-      h_dn = registerFromArena(session, dn, inter, N_out, 0);
-      if (h_dn == kNoHandle)
-        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
-                                 std::to_string(inter) + "x" +
-                                 std::to_string(N_out) + " WH weight");
-      t_rpc = HtpProfile::nowUs();
-    } catch (...) {
-      if (h_gu != kNoHandle)
-        nntr_hvx_weight_release_u8i4(session, h_gu);
-      free_expert_slots_.push_back(slot);
-      throw;
-    }
-    handle_cache_[key_gu] = h_gu;
-    handle_cache_[key_dn] = h_dn;
-    experts_.emplace(key_gu, ExpertResident{slot, key_dn, h_gu, h_dn});
+    StagedExpert st = stageExpert(session, d);
+    st.rc = readExpert(st, /*use_pool=*/true);
+    const uint64_t t_read = HtpProfile::nowUs();
+    registerStaged(session, st); // throws, and frees the slot, on failure
+    const uint64_t t_rpc = HtpProfile::nowUs();
 
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0) {
       if (at_load) // the file read stands where the convert used to
         profile.addRegister(t_rpc - t0, t_read - t0, t_rpc - t_read, true);
       else
-        profile.addExpertLoad(t_read - t0, t_rpc - t_read, true);
+        profile.addExpertLoad(t_read - t0, t_rpc - t_read, 1);
     }
     return true;
+  }
+
+  /**
+   * @brief [doc 52 section 10.10] Starts reading @a ds into fresh slots on
+   *        background threads and returns; prefetch_qs4cx_wh_experts_end
+   *        joins and registers.
+   *
+   * What overlaps is the file read only. The register calls go through the
+   * same FastRPC session as the layer call the caller is about to make, and
+   * the DSP's weight table is not written while a kernel reads it, so they
+   * wait for _end. The readers are plain threads, not ThreadManager: the
+   * caller's thread is about to block in FastRPC and the pool is the ARM
+   * side's to use the moment the call returns, before _end is reached.
+   */
+  bool prefetch_qs4cx_wh_experts_begin(
+    const std::vector<ExpertFileDesc> &ds) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    joinPrefetchReaders(); // a _begin with no _end before it: finish reading
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    try {
+      for (const ExpertFileDesc &d : ds) {
+        if (experts_.count(d.key_gu) == 0)
+          prefetch_.push_back(stageExpert(session, d));
+      }
+    } catch (...) {
+      for (const StagedExpert &st : prefetch_)
+        free_expert_slots_.push_back(st.slot);
+      prefetch_.clear();
+      throw;
+    }
+    if (prefetch_.empty())
+      return false;
+    const size_t n_threads =
+      std::min<size_t>(prefetch_.size(), kPrefetchReaders);
+    for (size_t t = 0; t < n_threads; ++t) {
+      prefetch_readers_.emplace_back([this, t, n_threads] {
+        for (size_t i = t; i < prefetch_.size(); i += n_threads)
+          prefetch_[i].rc = readExpert(prefetch_[i], /*use_pool=*/false);
+      });
+    }
+    return true;
+  }
+
+  std::vector<const void *> prefetch_qs4cx_wh_experts_end() override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const uint64_t t0 = HtpProfile::nowUs();
+    joinPrefetchReaders();
+    const uint64_t t_wait = HtpProfile::nowUs();
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    std::vector<const void *> keys;
+    std::exception_ptr first;
+    for (StagedExpert &st : prefetch_) {
+      try {
+        registerStaged(session, st);
+        keys.push_back(st.d.key_gu);
+      } catch (...) {
+        if (!first)
+          first = std::current_exception();
+      }
+    }
+    const size_t n = prefetch_.size();
+    prefetch_.clear();
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() != 0) // the read time is only what the call left
+      profile.addPrefetch(n, t_wait - t0, HtpProfile::nowUs() - t_wait);
+    if (first)
+      std::rethrow_exception(first);
+    return keys;
   }
 
   bool release_qs4cx_wh_expert(const void *key_gu) override {
@@ -1137,7 +1160,7 @@ public:
     experts_.erase(it);
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0)
-      profile.addExpertLoad(0, HtpProfile::nowUs() - t0, false);
+      profile.addExpertLoad(0, HtpProfile::nowUs() - t0, 0);
     return true;
   }
 
@@ -2411,47 +2434,163 @@ private:
                              ") failed: " + std::strerror(rc));
   }
 
-  static void preadFull(int fd, void *dst, size_t len, uint64_t off,
-                        const char *what) {
-    throwPread(preadAll(fd, dst, len, off), what);
+  /** @brief One expert on its way into a slot: where it comes from, where
+   *  it goes, what the file said about it, and how the read went. */
+  struct StagedExpert {
+    ExpertFileDesc d;
+    ExpertSlot slot;
+    /** The slot's address, resolved when the slot was taken, so a reader
+     *  thread never indexes arena_chunks_ while it might grow. */
+    uint8_t *base;
+    ArenaEntry gu, dn;
+    int rc; /**< preadAll's result for the whole expert */
+  };
+
+  /** @note Call with handle_mutex_ held. */
+  StagedExpert stageExpert(remote_handle64 session, const ExpertFileDesc &d) {
+    const ExpertSlot slot = takeExpertSlot(session, d);
+    return StagedExpert{
+      d, slot, arena_chunks_[slot.chunk].buf->data() + slot.off, {}, {}, 0};
+  }
+
+  /** @brief A free slot, or a new one bumped into a chunk (the load, and
+   *  the first prefill before the pool is full). One expert shape per
+   *  process: a released slot is reused as is.
+   *  @note Call with handle_mutex_ held. */
+  ExpertSlot takeExpertSlot(remote_handle64 session, const ExpertFileDesc &d) {
+    if (d.fd < 0) {
+      throw std::runtime_error("register_qs4cx_wh_expert_file: the virtual "
+                               "expert weight carries no model file fd");
+    }
+    if (!ensureArena(session)) {
+      throw std::runtime_error(
+        "QS4CX_WH weights need the DSP arena, which this device did not "
+        "provide (no rpcmem_to_fd or no fastrpc_mmap).");
+    }
+    const uint32_t slot_bytes =
+      expertStride(d.K, 2 * d.inter) + expertStride(d.inter, d.N_out);
+    if (expert_slot_bytes_ == 0) {
+      expert_slot_bytes_ = slot_bytes;
+    } else if (expert_slot_bytes_ != slot_bytes) {
+      throw std::runtime_error("register_qs4cx_wh_expert_file: expert shape "
+                               "differs from the pool's");
+    }
+    ExpertSlot slot;
+    if (!free_expert_slots_.empty()) {
+      slot = free_expert_slots_.back();
+      free_expert_slots_.pop_back();
+    } else if (!place(session, slot_bytes, kArenaChunkMax, &slot.chunk,
+                      &slot.off)) {
+      throw std::runtime_error(
+        "HTP arena: cannot place an expert slot (" +
+        std::to_string(slot_bytes >> 20) + " MiB). " +
+        (arena_fail_.empty() ? "no chunk was attempted" : arena_fail_) +
+        ". mapped=" + std::to_string(arenaBytes() >> 20) + " MiB in " +
+        std::to_string(arena_chunks_.size()) +
+        " chunks, RSS=" + std::to_string(rssKb() >> 10) + " MB");
+    }
+    return slot;
+  }
+
+  static uint32_t expertStride(uint32_t K, uint32_t N) {
+    return (static_cast<uint32_t>(whBytes(K, N)) + 4095u) & ~4095u;
+  }
+
+  /** @brief Reads both weights of @a st into its slot. No lock and no
+   *  throw -- the slot is this expert's alone until registerStaged -- so a
+   *  background thread can run it. @return 0, errno, or -1 at EOF. */
+  int readExpert(StagedExpert &st, bool use_pool) {
+    const ExpertFileDesc &d = st.d;
+    uint8_t *base = st.base;
+    const uint32_t gu_stride = expertStride(d.K, 2 * d.inter);
+    st.gu.chunk = st.dn.chunk = st.slot.chunk;
+    st.gu.off = st.slot.off;
+    st.dn.off = st.slot.off + gu_stride;
+    const int rc =
+      readWeight(d.fd, d.off_gu, d.K, 2 * d.inter, base, st.gu, use_pool);
+    return rc != 0 ? rc
+                   : readWeight(d.fd, d.off_dn, d.inter, d.N_out,
+                                base + gu_stride, st.dn, use_pool);
+  }
+
+  /** @brief Registers a read expert and files it. On any failure the slot
+   *  goes back to the free list and this throws.
+   *  @note Call with handle_mutex_ held. */
+  void registerStaged(remote_handle64 session, StagedExpert &st) {
+    const ExpertFileDesc &d = st.d;
+    uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
+    try {
+      throwPread(st.rc, "expert weight");
+      h_gu = registerFromArena(session, st.gu, d.K, 2 * d.inter, 0);
+      if (h_gu == kNoHandle)
+        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
+                                 std::to_string(d.K) + "x" +
+                                 std::to_string(2 * d.inter) + " WH weight");
+      h_dn = registerFromArena(session, st.dn, d.inter, d.N_out, 0);
+      if (h_dn == kNoHandle)
+        throw std::runtime_error("weight_register_u8i4_arena rejected a " +
+                                 std::to_string(d.inter) + "x" +
+                                 std::to_string(d.N_out) + " WH weight");
+    } catch (...) {
+      if (h_gu != kNoHandle)
+        nntr_hvx_weight_release_u8i4(session, h_gu);
+      free_expert_slots_.push_back(st.slot);
+      throw;
+    }
+    handle_cache_[d.key_gu] = h_gu;
+    handle_cache_[d.key_dn] = h_dn;
+    experts_.emplace(d.key_gu, ExpertResident{st.slot, d.key_dn, h_gu, h_dn});
+  }
+
+  void joinPrefetchReaders() {
+    for (std::thread &t : prefetch_readers_)
+      t.join();
+    prefetch_readers_.clear();
   }
 
   /** @brief Reads one QS4CX_WH weight from the model file: the nibbles
    *  into the arena at @a arena_dst, the N scales and N column sums that
    *  follow them into @a e. whBytes(K, N) is the nibble half exactly:
    *  QS4CX_Tensor::size() counts N * ceil(K / 2) and K is a multiple of
-   *  32 here. */
-  void readExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
-                        uint8_t *arena_dst, ArenaEntry &e) {
+   *  32 here. @return 0, errno, or -1 at end of file. */
+  int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
+                 uint8_t *arena_dst, ArenaEntry &e, bool use_pool) {
     const size_t nib = whBytes(K, N);
-    // [doc 52 section 10.7] The nibble read is 82% of a miss, and on one
-    // thread it runs at 3.8-4.7 GB/s -- one core's store rate into the
-    // uncached mapping, the same the old path's memcpy got. Sliced across
-    // the worker pool it scales with cores until DDR says stop. Page-sized
-    // slices, so no two threads write the same page. A worker cannot
-    // throw across parallel_for; each slice keeps its result and the
-    // caller throws once after the join.
-    auto &tm = ThreadManager::Global();
-    const size_t n_slices =
-      std::min<size_t>(tm.getComputeThreadCount(), kExpertReadSlicesMax);
-    const size_t slice =
-      (((nib + n_slices - 1) / n_slices) + 4095u) & ~size_t(4095u);
+    // [doc 52 sections 10.7, 10.9] The nibble read is 82% of a miss and
+    // capped near 4.9 GB/s by the uncached mapping whatever the thread
+    // count: 8 slices bought 18%. Kept for the synchronous miss; the
+    // prefetch readers are already one thread per expert. Page-sized
+    // slices, so no two threads write the same page; a worker cannot throw
+    // across parallel_for, so each slice keeps its result.
     std::atomic<int> first_rc{0};
-    tm.parallel_for(0, n_slices, [&](size_t i) {
-      const size_t b = i * slice;
-      if (b >= nib)
+    auto slice_read = [&](uint8_t *dst, size_t len, uint64_t at) {
+      const int rc = preadAll(fd, dst, len, at);
+      if (rc == 0)
         return;
-      const int rc =
-        preadAll(fd, arena_dst + b, std::min(slice, nib - b), off + b);
-      if (rc != 0) {
-        int expected = 0;
-        first_rc.compare_exchange_strong(expected, rc);
-      }
-    });
-    throwPread(first_rc.load(), "WH nibbles");
+      int expected = 0;
+      first_rc.compare_exchange_strong(expected, rc);
+    };
+    if (use_pool) {
+      auto &tm = ThreadManager::Global();
+      const size_t n_slices =
+        std::min<size_t>(tm.getComputeThreadCount(), kExpertReadSlicesMax);
+      const size_t slice =
+        (((nib + n_slices - 1) / n_slices) + 4095u) & ~size_t(4095u);
+      tm.parallel_for(0, n_slices, [&](size_t i) {
+        const size_t b = i * slice;
+        if (b < nib)
+          slice_read(arena_dst + b, std::min(slice, nib - b), off + b);
+      });
+    } else {
+      slice_read(arena_dst, nib, off);
+    }
+    if (first_rc.load() != 0)
+      return first_rc.load();
     std::vector<float> tail(2 * static_cast<size_t>(N));
-    preadFull(fd, tail.data(), tail.size() * sizeof(float), off + nib,
-              "scale+colsum");
+    const int rc =
+      preadAll(fd, tail.data(), tail.size() * sizeof(float), off + nib);
+    if (rc != 0)
+      return rc;
     e.K = K;
     e.N = N;
     e.w_scale.assign(tail.begin(), tail.begin() + N);
@@ -2459,6 +2598,7 @@ private:
     for (uint32_t i = 0; i < N; ++i)
       e.colsum_w[i] = static_cast<int32_t>(tail[N + i]);
     e.bias.assign(N, 0.0f);
+    return 0;
   }
 
   /**
@@ -2953,6 +3093,13 @@ private:
   /** Slices of one expert weight's file read: 3.5 MiB over 8 is 448 KiB a
    *  pread, past which the per-call cost stops paying for the split. */
   static constexpr size_t kExpertReadSlicesMax = 8;
+  /** Experts read in the background between prefetch _begin and _end, and
+   *  the threads reading them -- one expert per thread at a time. Four:
+   *  the write rate into the arena stops scaling well before that (doc 52
+   *  section 10.9), and the ARM side has its own work after the call. */
+  std::vector<StagedExpert> prefetch_;
+  std::vector<std::thread> prefetch_readers_;
+  static constexpr size_t kPrefetchReaders = 4;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
   /** Why the last newChunk refused, in words, for the throw that follows. */

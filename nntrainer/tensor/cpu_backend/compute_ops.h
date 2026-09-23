@@ -335,29 +335,44 @@ public:
   }
 
   // A QS4CX_WH expert pair the loader never read (a virtual weight, doc
-  // 52): the backend reads both weights' bytes from the model file at
-  // (fd, off_gu) and (fd, off_dn) into a slot it owns and registers them
-  // under key_gu / key_dn, which the caller then passes as gate_up_data /
-  // down_data -- with a null scale -- to gemm_qs4cx_moe_layer_fp32. Each
-  // weight's file layout is [WH nibbles][N scales][N column sums], as
-  // QS4CX_WH_Tensor lays it out. Idempotent for a key already resident.
-  // at_load says whether to count it as load-time registration or as a
-  // cache miss in the profile. A backend without a slot pool returns false.
-  virtual bool register_qs4cx_wh_expert_file(const void *key_gu,
-                                             const void *key_dn, int fd,
-                                             size_t off_gu, size_t off_dn,
-                                             unsigned int K, unsigned int inter,
-                                             unsigned int N_out, bool at_load) {
-    (void)key_gu;
-    (void)key_dn;
-    (void)fd;
-    (void)off_gu;
-    (void)off_dn;
-    (void)K;
-    (void)inter;
-    (void)N_out;
+  // 52), and where its bytes are: gate_up [K, 2 * inter] at off_gu and down
+  // [inter, N_out] at off_dn in the model file behind fd, each laid out as
+  // QS4CX_WH_Tensor writes it -- [WH nibbles][N scales][N column sums].
+  // The keys are what the caller passes as gate_up_data / down_data, with
+  // a null scale, to gemm_qs4cx_moe_layer_fp32 once the expert is in.
+  struct ExpertFileDesc {
+    const void *key_gu;
+    const void *key_dn;
+    int fd;
+    size_t off_gu, off_dn;
+    unsigned int K, inter, N_out;
+  };
+
+  // Reads one expert from the model file into a slot the backend owns and
+  // registers it. Idempotent for a key already resident. at_load says
+  // whether the profile counts it as load-time registration or as a cache
+  // miss. A backend without a slot pool returns false.
+  virtual bool register_qs4cx_wh_expert_file(const ExpertFileDesc &d,
+                                             bool at_load) {
+    (void)d;
     (void)at_load;
     return false;
+  }
+
+  // The same, split so the file reads overlap other work (doc 52 section
+  // 10.10): _begin takes a slot per expert and starts reading in the
+  // background, _end waits for the reads and registers what was read,
+  // returning the key_gu of each expert now resident. The caller must call
+  // _end before its next ComputeOps call that touches these experts, and
+  // must have made room -- _begin takes only free or new slots. False /
+  // empty from a backend without a slot pool.
+  virtual bool
+  prefetch_qs4cx_wh_experts_begin(const std::vector<ExpertFileDesc> &ds) {
+    (void)ds;
+    return false;
+  }
+  virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() {
+    return {};
   }
 
   // Undoes the above for one expert: both handles released, the slot back
