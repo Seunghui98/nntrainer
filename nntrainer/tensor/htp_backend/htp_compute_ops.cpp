@@ -2165,7 +2165,6 @@ private:
       std::vector<uint8_t> wh(wh_len);
       whPack(rm, K, N, wh.data());
       std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(), wh_len);
-      cleanForDsp(arena_chunks_[chunk].buf->data() + off, wh_len);
       ArenaEntry e;
       e.chunk = chunk;
       e.off = off;
@@ -2566,10 +2565,8 @@ private:
     std::atomic<int> first_rc{0};
     auto slice_read = [&](uint8_t *dst, size_t len, uint64_t at) {
       const int rc = preadAll(fd, dst, len, at);
-      if (rc == 0) {
-        cleanForDsp(dst, len);
+      if (rc == 0)
         return;
-      }
       int expected = 0;
       first_rc.compare_exchange_strong(expected, rc);
     };
@@ -2602,45 +2599,6 @@ private:
       e.colsum_w[i] = static_cast<int32_t>(tail[N + i]);
     e.bias.assign(N, 0.0f);
     return 0;
-  }
-
-  /**
-   * @brief [doc 52 section 10.10] NNTR_HTP_ARENA_CACHED=1: arena chunks
-   *        are cached on the CPU, and every write into one is cleaned to
-   *        the point of coherency before the DSP may read it.
-   *
-   * The uncached mapping caps a write into the arena near 4.9 GB/s however
-   * many threads write (doc 52 section 10.9); a cached one runs at memcpy
-   * speed and pays a clean by VA instead. DC CVAC is allowed at EL0 on
-   * arm64 Linux (SCTLR_EL1.UCI), cleans to the point of coherency -- where
-   * every agent, the DSP's DMA included, sees the same bytes -- and the DSB
-   * orders it before the FastRPC call that follows. This reverses doc 46
-   * section 34's deliberate uncached arena, so it is off by default and
-   * HmxArenaSlotReuse.CachedCleaned (unittest_hvx_mm_u8i4) gates it.
-   */
-  static bool arenaCached() {
-    static const bool on = [] {
-      const char *v = std::getenv("NNTR_HTP_ARENA_CACHED");
-      return v != nullptr && *v != '\0' && *v != '0';
-    }();
-    return on;
-  }
-
-  static void cleanForDsp(const void *p, size_t len) {
-    if (!arenaCached() || len == 0)
-      return;
-#if defined(__aarch64__)
-    uint64_t ctr = 0;
-    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
-    const uintptr_t line = uintptr_t(4) << ((ctr >> 16) & 0xFu);
-    uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(line - 1);
-    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + len;
-    for (; a < end; a += line)
-      asm volatile("dc cvac, %0" : : "r"(a) : "memory");
-    asm volatile("dsb sy" : : : "memory");
-#else
-    (void)p;
-#endif
   }
 
   /**
@@ -2750,7 +2708,6 @@ private:
         " chunks, RSS=" + std::to_string(rssKb() >> 10) + " MB");
     }
     std::memcpy(arena_chunks_[chunk].buf->data() + off, matAdata, wh_len);
-    cleanForDsp(arena_chunks_[chunk].buf->data() + off, wh_len);
 
     ArenaEntry e;
     e.chunk = chunk;
@@ -2948,8 +2905,7 @@ private:
     // BEFORE attaching and used a cached buffer, so this ordering is the
     // one thing section 34 rests on that the probe did not show; the
     // ArenaUncachedWriteAfterMap test is what answers it.
-    auto buf = std::make_unique<HtpRpcBuffer>(
-      size, arenaCached() ? HTP_RPC_FLAGS_DEFAULT : HTP_RPC_FLAGS_UNCACHED);
+    auto buf = std::make_unique<HtpRpcBuffer>(size, HTP_RPC_FLAGS_UNCACHED);
     if (!buf->isIon()) {
       arena_fail_ = "rpcmem_alloc(" + std::to_string(size >> 20) +
                     " MiB) failed -- the HOST ION heap is out, so the ARM "

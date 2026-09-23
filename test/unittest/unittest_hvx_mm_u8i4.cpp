@@ -2117,48 +2117,24 @@ TEST_F(HmxMmU8I4Layer, ArenaUncachedWriteAfterMap) {
 /**
  * [doc 52] The sequence the expert LRU makes: the DSP reads an arena slot,
  * the host overwrites the slot with another expert's bytes, the DSP reads it
- * again. Run three ways, each pass compared bit for bit with the same weight
- * registered on the DSP heap:
- *
- *  - Uncached: the shipped arena. The weight DMA reads DDR through L2
- *    (src_bypass = 0), so a cacheable DSP-side mapping could serve the first
- *    expert's stale lines on the second pass.
- *  - CachedCleaned: NNTR_HTP_ARENA_CACHED's arena (doc 52 section 10.10) --
- *    a cached rpcmem buffer, written by the CPU, then DC CVAC + DSB over the
- *    written range. The gate for that switch.
- *  - CachedNotCleaned: the same without the clean. Reported, not asserted:
- *    a failure here is what proves the clean is load-bearing, a pass means
- *    the lines happened to be written back (or the path is IO-coherent).
+ * again. The weight DMA reads DDR through L2 (src_bypass = 0), so a
+ * cacheable DSP-side mapping could serve the first expert's stale lines on
+ * the second pass; each pass is compared bit for bit with the same weight
+ * registered on the DSP heap.
  *
  * The slot is filled by the CPU (bake_export into a heap vector, then
  * memcpy), as pread fills it. Filling it by bake_export straight into the
  * ION buffer, as this test first did, has the DSP write the bytes and never
  * exercises a host write at all.
+ *
+ * A cached arena with a DC CVAC clean was tried and dropped (doc 52 section
+ * 10.11): it made the DSP's weight reads slower and bought no copy speed.
  */
 class HmxArenaSlotReuse : public HmxMmU8I4Layer {
 protected:
-  /** @brief The clean NNTR_HTP_ARENA_CACHED does after every arena write
-   *  (htp_compute_ops.cpp cleanForDsp), restated because this binary does
-   *  not link the backend. */
-  static void cleanToPoC(const void *p, size_t len) {
-#if defined(__aarch64__)
-    uint64_t ctr = 0;
-    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
-    const uintptr_t line = uintptr_t(4) << ((ctr >> 16) & 0xFu);
-    uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(line - 1);
-    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + len;
-    for (; a < end; a += line)
-      asm volatile("dc cvac, %0" : : "r"(a) : "memory");
-    asm volatile("dsb sy" : : : "memory");
-#else
-    (void)p;
-    (void)len;
-#endif
-  }
-
   /** @return bad elements on the reuse pass (pass 1), or SIZE_MAX if the
    *  run could not get that far. */
-  size_t Run(uint32_t rpc_flags, bool clean, const char *path) {
+  size_t Run(const char *path) {
     const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
 
     auto alloc =
@@ -2190,10 +2166,9 @@ protected:
     // gate_up at 0, down at stride_gu.
     const uint32_t arena_bytes = stride_gu + ((dn_len + 4095u) & ~4095u);
 
-    void *buf = alloc(25, rpc_flags, (int)arena_bytes);
+    void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
     if (buf == nullptr) {
-      ADD_FAILURE() << path << ": rpcmem_alloc(flags=" << rpc_flags
-                    << ") failed";
+      ADD_FAILURE() << path << ": uncached rpcmem_alloc failed";
       return SIZE_MAX;
     }
     const int fd = to_fd(buf);
@@ -2241,10 +2216,6 @@ protected:
       }
       std::memcpy(base, host_gu.data(), gu_len);
       std::memcpy(base + stride_gu, host_dn.data(), dn_len);
-      if (clean) {
-        cleanToPoC(base, gu_len);
-        cleanToPoC(base + stride_gu, dn_len);
-      }
       uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
       if (nntr_hvx_weight_register_u8i4_arena(
             handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
@@ -2287,24 +2258,9 @@ protected:
 };
 
 TEST_F(HmxArenaSlotReuse, Uncached) {
-  EXPECT_EQ(Run(0 /*UNCACHED*/, /*clean=*/false, "arena_slot_reuse"), 0u)
+  EXPECT_EQ(Run("arena_slot_reuse"), 0u)
     << "a reused uncached slot differs from the heap weight: the DSP read "
        "stale bytes, and register_arena needs an L2 invalidate";
-}
-
-TEST_F(HmxArenaSlotReuse, CachedCleaned) {
-  EXPECT_EQ(
-    Run(1 /*RPCMEM_DEFAULT_FLAGS*/, /*clean=*/true, "arena_cached_clean"), 0u)
-    << "cached arena + DC CVAC is not enough: leave NNTR_HTP_ARENA_CACHED "
-       "off";
-}
-
-TEST_F(HmxArenaSlotReuse, CachedNotCleaned) {
-  const size_t bad =
-    Run(1 /*RPCMEM_DEFAULT_FLAGS*/, /*clean=*/false, "arena_cached_noclean");
-  std::cout << "U8I4_FIELD path=arena_cached_noclean field=verdict value="
-            << (bad == 0 ? "clean_not_proven_needed" : "clean_is_needed")
-            << std::endl;
 }
 
 TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
