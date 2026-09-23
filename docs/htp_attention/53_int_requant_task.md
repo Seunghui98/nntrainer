@@ -243,3 +243,19 @@ grep -n 'acc_read\|requant\|scale\|shift' "$HEXKL_ROOT"/include/hexkl_micro.h
 | > 70% | 그림자가 거의 찼다 — 51 §2.22의 가정이 틀렸다는 뜻 | 정수 dequant(−14%)가 아니라 **SwiGLU(70%)**가 대상; 그때도 비트 동일 계약과 ppl이 먼저 |
 
 어느 칸이든 "int32 → u8 직행"은 답이 아니고, 셋째 칸만 다른 과제(SwiGLU 비용)를 연다.
+
+**실행 1 (2026-09-23, 작성자, 전부 켬, PROFILE=2 PPL=1)**: 프로브가 **바이너리에 없었다** — MoE 행이
+`swiglu 0.0`으로 찍혔다(프로브가 들어간 skel이면 gate_up 에필로그만으로 ≥ 5 ms가 나와야 한다; conv 행의
+`swiglu(hidden) 3190.7`은 예전 코드도 같은 표기라 재빌드의 증거가 아니다). 명령 프롬프트의 브랜치가
+`claude/eager-keller-f91z9o`였다 — 6af3834(이 브랜치)의 skel·앱이 아니다. 같은 세션 기준값으로는 쓸 수 있다:
+
+```
+ppl 62.0916 (그대로)   prefill 1766 ms (PPL 켬이라 헤드라인 아님)   decode 23.1   peak RSS 5,129 MB   등록 3.78 s
+  M>1 MoE   calls=23  host 14489  dsp 13818  transport 672   [mm 9056 acc 2938 stage 388 drain 266+45 quant 278 dequant 276 alloc 138 gather 74 requant 74 scatter 42 rest 190]  blocks=1039
+  M>1 dense calls=3   host 9679   dsp 9097   transport 581   [mm 5830 acc 1927 dequant 322 requant 63]
+  M>1 conv  calls=19  host 4524   dsp 3974   transport 550   [swiglu(hidden) 3191 mm 2082 acc 665 dequant 372 gather 268]
+  M>1 FC N=3072 host 2137 dequant 5.0 | N=2048 host 1639 dequant 8.6   M==1 host 1439 dsp 1351
+```
+§2.24와 같다(MoE 14448 → 14489, dequant 243 → 276, requant 62 → 74: 세션 편차). 다시 돌릴 것: 두 브랜치 중
+하나를 6af3834로 받아 `test/htp/build.sh`로 skel을 다시 빌드·푸시하고(52 §9: 안 하면 이전 skel이 그대로 돈다),
+앱도 `build_android.sh --htp`로 다시 빌드한 뒤 같은 명령. 판정 기준은 MoE 행의 `swiglu(hidden)`이 0이 아닌 것.
