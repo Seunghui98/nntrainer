@@ -93,6 +93,12 @@ public:
    *  read here from dense_ffn_engine / dense_ffn_htp_layers. */
   std::string CONV_OUT_PROJ_ENGINE = "cpu";
   std::set<int> CONV_OUT_PROJ_HTP_LAYERS;
+  /** The whole conv block as one accelerator call (doc 51 section 2):
+   *  conv_block_engine / conv_block_htp_layers. When it applies to a layer
+   *  the two projection switches above are moot for it -- the block is one
+   *  layer, not six. */
+  std::string CONV_BLOCK_ENGINE = "cpu";
+  std::set<int> CONV_BLOCK_HTP_LAYERS;
 };
 
 /**

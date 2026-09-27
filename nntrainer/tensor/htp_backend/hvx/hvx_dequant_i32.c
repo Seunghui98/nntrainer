@@ -153,24 +153,21 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     /* Which half of a gate_up result this tile belongs to. A caller with one
        destination passes a split past the last column, so this always takes
        dst_a and never reads dst_b. */
-    float *out = (c0 < c->split) ? (c->dst_a + c0)
-                                 : (c->dst_b + (c0 - c->split));
-    hvx_dequant_acc_tile_to_f32(tile, c->row_stride, c->m_count,
-                                c->act_scale, c->act_zp, c->colsum_w + c0,
-                                c->w_scale + c0, c->bias + c0, out,
-                                c->dst_stride, /*accumulate=*/0);
+    float *out =
+      (c0 < c->split) ? (c->dst_a + c0) : (c->dst_b + (c0 - c->split));
+    hvx_dequant_acc_tile_to_f32(tile, c->row_stride, c->m_count, c->act_scale,
+                                c->act_zp, c->colsum_w + c0, c->w_scale + c0,
+                                c->bias + c0, out, c->dst_stride,
+                                /*accumulate=*/0);
   }
 }
 
-void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
-                                  uint32_t tile_stride, uint32_t n_tiles,
-                                  uint32_t nt0, uint32_t row_stride,
-                                  uint32_t m_count, const float *act_scale,
-                                  const int32_t *act_zp,
-                                  const int32_t *colsum_w,
-                                  const float *w_scale, const float *bias,
-                                  float *dst_a, float *dst_b, uint32_t split,
-                                  uint32_t dst_stride, hvx_worker_pool *pool) {
+void hvx_dequant_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t nt0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *dst_a, float *dst_b, uint32_t split,
+  uint32_t dst_stride, hvx_worker_pool *pool) {
   if (!tiles_base || n_tiles == 0u || m_count == 0u) {
     return;
   }
@@ -226,11 +223,11 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
 
     for (uint32_t m = 0; m < c->m_count; ++m) {
       const HVX_Vector g =
-        dq_row_sf(gt + (size_t)m * c->row_stride, c->act_scale[m],
-                  c->act_zp[m], csg, vwg, vbg);
+        dq_row_sf(gt + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
+                  csg, vwg, vbg);
       const HVX_Vector u =
-        dq_row_sf(ut + (size_t)m * c->row_stride, c->act_scale[m],
-                  c->act_zp[m], csu, vwu, vbu);
+        dq_row_sf(ut + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
+                  csu, vwu, vbu);
       ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + cg))[0] =
         hvx_swiglu_det_sf(g, u);
     }
@@ -246,8 +243,44 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   if (!tiles_base || n_pairs == 0u || m_count == 0u) {
     return;
   }
-  hvx_dq_swiglu_job c = {tiles_base, tile_stride, n_pairs,  g0,      row_stride,
-                         m_count,    act_scale,   act_zp,   colsum_w, w_scale,
-                         bias,       inter,       dst,      dst_stride};
+  hvx_dq_swiglu_job c = {
+    tiles_base, tile_stride, n_pairs, g0,   row_stride, m_count, act_scale,
+    act_zp,     colsum_w,    w_scale, bias, inter,      dst,     dst_stride};
   hvx_worker_pool_run(pool, hvx_dq_swiglu_worker, &c, n_pairs);
+}
+
+/* ---- fused dequant + product over tile pairs of two weights -------------- */
+
+void hvx_dq_mul_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const hvx_dq_mul_job *c = (const hvx_dq_mul_job *)vctx;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_pairs * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_pairs * (i + 1) / n_threads);
+
+  for (uint32_t j = lo; j < hi; ++j) {
+    const uint32_t col = c->c0 + j * HEXKL_ACC_TILE_COLS;
+    const int32_t *at =
+      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+    const int32_t *bt =
+      (const int32_t *)(c->tiles_base +
+                        (size_t)(c->n_pairs + j) * c->tile_stride);
+    const HVX_Vector csa =
+      Q6_Vsf_equals_Vw(((const HVX_UVector *)(c->colsum_a + col))[0]);
+    const HVX_Vector vwa = ((const HVX_UVector *)(c->w_scale_a + col))[0];
+    const HVX_Vector vba = ((const HVX_UVector *)(c->bias_a + col))[0];
+    const HVX_Vector csb =
+      Q6_Vsf_equals_Vw(((const HVX_UVector *)(c->colsum_b + col))[0]);
+    const HVX_Vector vwb = ((const HVX_UVector *)(c->w_scale_b + col))[0];
+    const HVX_Vector vbb = ((const HVX_UVector *)(c->bias_b + col))[0];
+
+    for (uint32_t m = 0; m < c->m_count; ++m) {
+      const HVX_Vector a =
+        dq_row_sf(at + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
+                  csa, vwa, vba);
+      const HVX_Vector b =
+        dq_row_sf(bt + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
+                  csb, vwb, vbb);
+      ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + col))[0] =
+        Q6_Vsf_vmpy_VsfVsf(a, b);
+    }
+  }
 }

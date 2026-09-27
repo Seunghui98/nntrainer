@@ -23,6 +23,7 @@
 
 #include <qkv_layer.h>
 
+#include <cpu_backend.h>
 #include <engine.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -36,10 +37,15 @@ namespace causallm {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum QKVParams { Q, K, V };
+/** weight_idx slots; the file's order is q, q_gamma, k, k_gamma, v */
+enum QKVWeights { WQ, WQ_GAMMA, WK, WK_GAMMA, WV };
 
 QKVLayer::QKVLayer() :
-  LayerImpl(), qkv_props(props::QUnit(), props::KUnit(), props::VUnit()) {
+  LayerImpl(),
+  qkv_props(props::QUnit(), props::KUnit(), props::VUnit(),
+            props::FeatureSize(), nntrainer::props::Epsilon()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
+  tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
 void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -92,6 +98,26 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
 
   context.setOutputDimensions(output_dims);
 
+  feature_size = std::get<props::FeatureSize>(qkv_props).empty()
+                   ? 0
+                   : std::get<props::FeatureSize>(qkv_props).get();
+  NNTR_THROW_IF(feature_size != 0 &&
+                  (q_unit % feature_size != 0 || k_unit % feature_size != 0),
+                std::invalid_argument)
+    << "qkv_layer: feature_size must divide q_unit and k_unit";
+
+  // gamma is unquantized FP32 on disk, requested FP32 regardless of the
+  // activation dtype -- ReshapedRMSNormLayer's rule, and its weight.
+  const nntrainer::TensorDim gamma_dim(
+    1, 1, 1, feature_size,
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     nntrainer::TensorDim::DataType::FP32));
+  auto request_gamma = [&](const char *name) {
+    return context.requestWeight(
+      gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, name, true);
+  };
+
   /** Q */
   nntrainer::TensorDim weight_dim(
     1, is_nchw ? 1 : q_unit, is_nchw ? in_dim.width() : 1,
@@ -99,21 +125,57 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()),
     is_nchw ? 0b0011 : 0b0101);
-  weight_idx[QKVParams::Q] = context.requestWeight(
+  weight_idx[WQ] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "qweight", true);
+  if (feature_size)
+    weight_idx[WQ_GAMMA] = request_gamma("q_norm_gamma");
 
   /** K */
   weight_dim.width(k_unit);
-  weight_idx[QKVParams::K] = context.requestWeight(
+  weight_idx[WK] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "kweight", true);
+  if (feature_size)
+    weight_idx[WK_GAMMA] = request_gamma("k_norm_gamma");
 
   /** V */
   weight_dim.width(v_unit);
-  weight_idx[QKVParams::V] = context.requestWeight(
+  weight_idx[WV] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "vweight", true);
+
+  // The norm kernel is not in-place (its pointers are __restrict), so the
+  // projections land here first and the outputs hold the normed rows.
+  if (feature_size) {
+    tensor_idx[QKVParams::Q] = context.requestTensor(
+      output_dims[QKVParams::Q], "q_raw", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+    tensor_idx[QKVParams::K] = context.requestTensor(
+      output_dims[QKVParams::K], "k_raw", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  }
+}
+
+/**
+ * @brief out = rms_norm(in) * gamma per feature_size-wide head, over the
+ *        first @a rows rows. ReshapedRMSNormLayer::incremental_forwarding's
+ *        FP32 arithmetic, call for call.
+ */
+static void headNorm(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                     nntrainer::Tensor &gamma, unsigned int rows,
+                     unsigned int feature_size, float epsilon) {
+  NNTR_THROW_IF(in.getDataType() != ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "qkv_layer: the folded norm is FP32 only";
+  const unsigned int width = in.getDim().width();
+  ml::train::TensorDim dim(1, 1, rows * (width / feature_size), feature_size);
+  nntrainer::Tensor in_step = in.getSharedDataTensor(dim, 0, true);
+  nntrainer::Tensor out_step = out.getSharedDataTensor(dim, 0, true);
+  nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+    in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+    dim.width(), epsilon);
+  out_step.multiply_i(gamma);
 }
 
 void QKVLayer::exportTo(nntrainer::Exporter &exporter,
@@ -128,18 +190,25 @@ void QKVLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void QKVLayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
-  return;
+  incremental_forwarding(context, 0,
+                         context.getInput(SINGLE_INOUT_IDX).height(), training);
 }
 
 void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                       unsigned int from, unsigned int to,
                                       bool training) {
-  nntrainer::Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
-  nntrainer::Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
-  nntrainer::Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
+  nntrainer::Tensor &Qweight = context.getWeight(weight_idx[WQ]);
+  nntrainer::Tensor &Kweight = context.getWeight(weight_idx[WK]);
+  nntrainer::Tensor &Vweight = context.getWeight(weight_idx[WV]);
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &Qhidden_ = context.getOutput(QKVParams::Q);
-  nntrainer::Tensor &Khidden_ = context.getOutput(QKVParams::K);
+  // With the norm folded in, the projections go to q_raw / k_raw and the
+  // outputs receive the normed rows below.
+  nntrainer::Tensor &Qhidden_ = feature_size
+                                  ? context.getTensor(tensor_idx[QKVParams::Q])
+                                  : context.getOutput(QKVParams::Q);
+  nntrainer::Tensor &Khidden_ = feature_size
+                                  ? context.getTensor(tensor_idx[QKVParams::K])
+                                  : context.getOutput(QKVParams::K);
   nntrainer::Tensor &Vhidden_ = context.getOutput(QKVParams::V);
 
   nntrainer::TensorDim input_dim = input_.getDim();
@@ -176,6 +245,16 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     {&Qhidden_step, &Khidden_step, &Vhidden_step});
 
   input_step.dot(Weights, Outputs);
+
+  if (feature_size) {
+    const float epsilon = std::get<nntrainer::props::Epsilon>(qkv_props).get();
+    headNorm(Qhidden_, context.getOutput(QKVParams::Q),
+             context.getWeight(weight_idx[WQ_GAMMA]), to - from, feature_size,
+             epsilon);
+    headNorm(Khidden_, context.getOutput(QKVParams::K),
+             context.getWeight(weight_idx[WK_GAMMA]), to - from, feature_size,
+             epsilon);
+  }
 }
 
 void QKVLayer::calcDerivative(nntrainer::RunLayerContext &context) { return; }
@@ -199,5 +278,9 @@ void QKVLayer::updateTensorsByInputDimensions(
   context.updateOutput(QKVParams::Q, Qoutput_dim);
   context.updateOutput(QKVParams::K, Koutput_dim);
   context.updateOutput(QKVParams::V, Voutput_dim);
+  if (feature_size) {
+    context.updateTensor(tensor_idx[QKVParams::Q], Qoutput_dim);
+    context.updateTensor(tensor_idx[QKVParams::K], Koutput_dim);
+  }
 }
 } // namespace causallm

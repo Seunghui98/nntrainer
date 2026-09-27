@@ -57,6 +57,11 @@ void setupLfm2DeterministicWeights(TinyLfm2CausalLM &model) {
         if (layer.getType() == "rms_norm" ||
             layer.getType() == "reshaped_rms_norm") {
           weight.setValue(1.0f);
+        } else if (layer.getType() == "qkv_layer" &&
+                   weight.getName().find("gamma") != std::string::npos) {
+          // q_norm / k_norm live inside the fused q/k/v layer (doc 51
+          // section 2.23); their gammas are the scales set to 1 above.
+          weight.setValue(1.0f);
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0.0f);
           weight.setValue(0, 0, 1, 0, 1.0f);
@@ -129,10 +134,9 @@ makeLfm2LayerDtypeMap(const causallm_test::TinyCausalLMDataType &data_type) {
   if (data_type.fc_layer_dtype != "FP32") {
     const auto dtype =
       causallm_test::toTensorDataType(data_type.fc_layer_dtype);
-    // layer0: attention block FC layers
-    dtype_map["layer0_wq"] = dtype;
-    dtype_map["layer0_wk"] = dtype;
-    dtype_map["layer0_wv"] = dtype;
+    // layer0: attention block FC layers. q/k/v are one qkv_layer whose
+    // norm gammas are height-1 tensors the save keeps FP32.
+    dtype_map["layer0_qkv"] = dtype;
     dtype_map["layer0_attention_out"] = dtype;
     dtype_map["layer0_ffn_up"] = dtype;
     dtype_map["layer0_ffn_gate"] = dtype;
