@@ -24,9 +24,11 @@
 #include <sstream>
 
 #include <causal_conv1d_layer.h>
+#include <conv_block_layer.h>
 #include <custom_multiply.h>
 #include <embedding_layer.h>
 #include <mha_core.h>
+#include <qkv_layer.h>
 #include <reshaped_rms_norm.h>
 #include <rms_norm.h>
 #include <swiglu.h>
@@ -74,47 +76,24 @@ Tensor Lfm2Transformer::createAttention(const int layer_id, int seq_len,
   const std::string eng =
     projEngine(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id);
 
-  // Q layer
-  LayerHandle wq(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
-     withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"), withKey("engine", eng)}));
-  Tensor q = wq(query);
-
-  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
-  LayerHandle q_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
-  Tensor q_normed = q_norm(q);
-
-  // K layer
-  LayerHandle wk(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("engine", eng)}));
-  Tensor k = wk(key);
-
-  // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
-  LayerHandle k_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
-  Tensor k_normed = k_norm(k);
-
-  // V layer
-  LayerHandle wv(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("engine", eng)}));
-  Tensor v = wv(value);
+  // q, k, v and the per-head q_norm / k_norm as one layer (qkv_layer,
+  // doc 51 section 2.21): the three projections share one activation, so
+  // an accelerator takes them as one call instead of three that each
+  // quantize and ship the same 3.6 MB; the CPU path is the same three
+  // GEMMs and the same norm kernel. The weights stay in the file's order
+  // (q, q_norm, k, k_norm, v), so a model file is read identically.
+  LayerHandle qkv(createLayer(
+    "qkv_layer",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_qkv"),
+     withKey("q_unit", head_dim * n_heads),
+     withKey("k_unit", head_dim * n_heads / GQA_SIZE),
+     withKey("v_unit", head_dim * n_heads / GQA_SIZE),
+     withKey("feature_size", std::to_string(head_dim)),
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("engine", eng)}));
+  Tensor qkv_out = qkv(query);
+  Tensor q_normed = qkv_out.output(0);
+  Tensor k_normed = qkv_out.output(1);
+  Tensor v = qkv_out.output(2);
 
   // External KV cache placeholders (per-layer). Storage is owned by the host
   // (KVCacheManager) and bound at runtime via setExternalTensors.
@@ -153,6 +132,28 @@ Tensor Lfm2Transformer::createConvBlock(const int layer_id, Tensor input) {
                              withKey("epsilon", std::to_string(NORM_EPS)),
                              withKey("packed", "false")}));
   Tensor normed = conv_norm(input);
+
+  // The block as one layer when conv_block_engine routes it (doc 51
+  // section 2): in_proj, both gates, the conv and out_proj in one
+  // accelerator call at prefill, the same CPU kernels at decode. Same
+  // three weights in the file's order, so the model file loads unchanged.
+  const std::string block_eng =
+    projEngine(CONV_BLOCK_ENGINE, CONV_BLOCK_HTP_LAYERS, layer_id);
+  if (block_eng != "cpu") {
+    LayerHandle conv_block(createLayer(
+      "conv_block", {withKey("name", prefix + "_conv_block"),
+                     withKey("unit", CONV_DIM), withKey("engine", block_eng)}));
+    Tensor block_out = conv_block(normed);
+    Tensor residual_b = input.add(block_out);
+    LayerHandle ffn_norm_b(
+      createLayer("rms_norm", {withKey("name", prefix + "_ffn_norm"),
+                               withKey("epsilon", std::to_string(NORM_EPS)),
+                               withKey("packed", "false")}));
+    Tensor ffn_normed_b = ffn_norm_b(residual_b);
+    Tensor ffn_out_b =
+      createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed_b);
+    return residual_b.add(ffn_out_b);
+  }
 
   // Expand features: [B, 1, T, DIM] → [B, 1, T, 3*CONV_DIM]
   // Its engine follows conv_in_proj_engine (doc 50): the widest FC in the
@@ -244,6 +245,8 @@ void Lfm2Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister(nntrainer::createLayer<causallm::CustomMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::CausalConv1DLayer>);
+  tryRegister(nntrainer::createLayer<causallm::ConvBlockLayer>);
+  tryRegister(nntrainer::createLayer<causallm::QKVLayer>);
 }
 
 void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
@@ -345,6 +348,9 @@ void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
       nntr_cfg.value("conv_out_proj_engine", std::string("cpu"));
     CONV_OUT_PROJ_HTP_LAYERS = parseLayerIdList(
       nntr_cfg.value("conv_out_proj_htp_layers", std::string("")));
+    CONV_BLOCK_ENGINE = nntr_cfg.value("conv_block_engine", std::string("cpu"));
+    CONV_BLOCK_HTP_LAYERS = parseLayerIdList(
+      nntr_cfg.value("conv_block_htp_layers", std::string("")));
     FFN_ENGINE = nntr_cfg.value("dense_ffn_engine", std::string("cpu"));
     FFN_HTP_LAYERS =
       parseLayerIdList(nntr_cfg.value("dense_ffn_htp_layers", std::string("")));

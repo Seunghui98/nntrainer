@@ -245,7 +245,11 @@ public:
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                  const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
+    // kind 3: a plain FC call. It gets its own row because the attention
+    // q/o projections have the MoE layer call's K and N_out (2048 x 2048),
+    // and the first all-on run averaged 12 two-millisecond FC calls into
+    // the 22 fifteen-millisecond MoE calls of one "M>1" row.
+    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 3)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -264,7 +268,7 @@ public:
   void addInvokeFused(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                       const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 0)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -286,7 +290,7 @@ public:
   void addInvokeGateUpSwiglu(unsigned M, unsigned K, unsigned N_gate_up,
                              uint64_t host_us, const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N_gate_up, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N_gate_up, M == 1, 0)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -311,12 +315,18 @@ public:
    *  not into acc_us. Folding them in looked tidy and cost a measurement:
    *  the first run of this call put 104.8 ms in a bucket ACC_READ and the
    *  scatter shared, and the profile could not say which. */
+  /** @param kind 0 the MoE layer; 1 the dense FFN routed through the MoE
+   *  layer kernel (doc 51 section 1); 2 the conv block (doc 51 section 2).
+   *  Each files in its own row: the dense FFN has the MoE layer's shapes
+   *  and the conv block the MoE row's K and N_out, so the key alone could
+   *  not tell them apart. All three fill the same stage_us columns. */
   void addInvokeMoeLayer(unsigned M, unsigned K, unsigned N_out,
                          uint64_t host_us, const uint32_t *stage_us,
                          const HtpRpcBuffer &act_stage,
-                         const HtpRpcBuffer &out_stage, size_t in_arg_bytes) {
+                         const HtpRpcBuffer &out_stage, size_t in_arg_bytes,
+                         int kind = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1, kind)];
     ++b.calls;
     b.rows += M;
     b.host_us += host_us;
@@ -327,6 +337,7 @@ public:
     b.stage_out_bytes = std::max(b.stage_out_bytes, out_stage.size());
     b.stage_ion = b.stage_ion && act_stage.isIon() && out_stage.isIon();
     b.in_arg_bytes = std::max<uint64_t>(b.in_arg_bytes, in_arg_bytes);
+    b.swiglu_hidden = true;
     if (stage_us != nullptr) {
       b.dsp_us += stage_us[HTP_MOE_T_DSP_TOTAL];
       b.quant_us += stage_us[HTP_MOE_T_QUANT];
@@ -366,9 +377,10 @@ public:
   /** @brief [#87] Whether this call's per-descriptor trace should be
    *  dumped: the first NNTR_HTP_DMA_TRACE (default 3) timed calls of each
    *  bucket. Returns the 1-based call ordinal to print, or 0. */
-  unsigned dmaTraceOrdinal(unsigned K, unsigned N_out, unsigned M) {
+  unsigned dmaTraceOrdinal(unsigned K, unsigned N_out, unsigned M,
+                           int kind = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1)];
+    Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1, kind)];
     if (b.dma_traces >= dma_trace_calls_) {
       return 0;
     }
@@ -459,6 +471,11 @@ private:
     uint64_t dsp_us = 0;
     uint64_t quant_us = 0;
     uint64_t swiglu_us = 0; /**< fused calls only; 0 elsewhere */
+    /** swiglu_us is WORKER time that ran under the HMX (the MoE layer
+        kernel's pool jobs, the conv block's stage units) rather than a
+        synchronous pass, so the residual must not subtract it. Set by the
+        call type that fills the bucket. */
+    bool swiglu_hidden = false;
     /** MoE layer call only: the routing multiply and scatter-add, plus
         copying the FastRPC buffers to and from cached heap. Both are work
         no other call type does, so they get their own column rather than
@@ -582,12 +599,16 @@ private:
       const unsigned k = std::get<0>(entry.first);
       const unsigned n = std::get<1>(entry.first);
       const bool decode = std::get<2>(entry.first);
+      static const char *const kind_name[] = {"M>1", "M>1 dense", "M>1 conv",
+                                              "M>1 FC"};
+      const int kind = std::get<3>(entry.first);
       const Bucket &b = entry.second;
       std::fprintf(stderr,
-                   "[HTP-PROFILE]   K=%-5u N=%-5u %-7s calls=%-7llu "
+                   "[HTP-PROFILE]   K=%-5u N=%-5u %-9s calls=%-7llu "
                    "rows=%-8llu host=%9.1f ms (%7.1f us/call)",
-                   k, n, decode ? "M==1" : "M>1", (unsigned long long)b.calls,
-                   (unsigned long long)b.rows, ms(b.host_us),
+                   k, n, decode ? "M==1" : kind_name[kind],
+                   (unsigned long long)b.calls, (unsigned long long)b.rows,
+                   ms(b.host_us),
                    b.calls ? static_cast<double>(b.host_us) / b.calls : 0.0);
       if (level_ >= 2 && b.calls != 0) {
         const double dsp_per = static_cast<double>(b.dsp_us) / b.calls;
@@ -615,28 +636,37 @@ private:
         // treat it as an upper bound on the matmul, not an exact figure.
         /* mm is the residual, so every named stage has to be subtracted --
            scatter included, or the MoE layer call's scatter time would be
-           reported as matmul. [#102] Except swiglu on the M=1 GEMV path:
-           there it is the sum of every worker lane's wall time inside the
-           two GEMV stages, not a stage on this clock (htp_moe_opts.h). */
+           reported as matmul. Except SWIGLU on the MoE layer kernel's rows
+           (MoE, dense, conv; upstream doc 53 section 8.4) and on the M=1
+           GEMV path (#102): there it is WORKER time inside pool jobs
+           (hexkl_mm_u8i4_moe.c's moe_worker_probe_add, hexkl_conv_block.c's
+           cb_stage_probe_add) or the sum of every lane's wall time inside
+           the two GEMV stages -- work that ran under the HMX or beside the
+           caller rather than instead of it, not a stage on this clock, so
+           subtracting it made the residual negative (3.3 ms of hidden work
+           against a 4.0 ms conv call). Left in the sum for the fused layer
+           call, where SWIGLU is its own synchronous elementwise pass
+           (htp_moe_opts.h). */
+        const bool hidden = b.swiglu_hidden || b.m1_calls != 0;
         const double mm_per = htp_moe_row_rest_us(
           dsp_per,
           quant_per + dequant_per + acc_per + drain_per + scatter_per +
             stage_per + gather_per + requant_per + mm_meas_per + drain_dn_per +
             push_per + alloc_per,
-          swiglu_per, b.m1_calls != 0);
+          swiglu_per, hidden);
         std::fprintf(
           stderr,
           "  dsp=%7.1f us/call (%4.1f%%) transport=%7.1f us/call"
-          "  [quant %.1f gather %.1f requant %.1f swiglu %.1f "
+          "  [quant %.1f gather %.1f requant %.1f swiglu%s %.1f "
           "dequant %.1f acc %.1f drain %.1f+%.1f push %.1f "
           "scatter %.1f alloc %.1f "
           "stage %.1f mm %.1f | rest<=%.1f (%.1f%% of host) "
           "blocks=%llu m1_gemv=%llu/%llu feed=%llu/%llu]",
           dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
-          host_per - dsp_per, quant_per, gather_per, requant_per, swiglu_per,
-          dequant_per, acc_per, drain_per, drain_dn_per, push_per, scatter_per,
-          alloc_per, stage_per, mm_meas_per, mm_per,
-          host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
+          host_per - dsp_per, quant_per, gather_per, requant_per,
+          hidden ? "(hidden)" : "", swiglu_per, dequant_per, acc_per, drain_per,
+          drain_dn_per, push_per, scatter_per, alloc_per, stage_per,
+          mm_meas_per, mm_per, host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
           (unsigned long long)b.blocks, (unsigned long long)b.m1_calls,
           (unsigned long long)b.calls, (unsigned long long)b.m1_feed_calls,
           (unsigned long long)b.calls);
@@ -771,7 +801,9 @@ private:
   uint64_t graph_ops_ = 0;
   uint64_t graph_dsp_us_ = 0;
   uint64_t graph_op_pcyc_ = 0;
-  std::map<std::tuple<unsigned, unsigned, bool>, Bucket> buckets_;
+  /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
+   *  through the MoE layer kernel (doc 51). */
+  std::map<std::tuple<unsigned, unsigned, bool, int>, Bucket> buckets_;
 };
 
 /**
@@ -906,6 +938,16 @@ public:
   // documented loss.
   bool accelerates_q4_0_at_m1() const override { return false; }
 
+  /** @brief The handles one conv block is registered as: in_proj's column
+   *  thirds a, b, c (get_or_register_fc's slices at this model's K) and
+   *  out_proj. Declared up here because invokeConvBlock takes it by
+   *  reference -- a parameter type has to be complete where the function
+   *  is declared. */
+  struct ConvHandles {
+    std::vector<uint32_t> h_in; /**< a, b, c */
+    uint32_t h_out = 0;
+  };
+
   // matAdata: Q4_0x4-repacked weight bytes, identity-cached across calls --
   // the same pointer for the lifetime of a loaded model (inference does not
   // move weight tensors), which is what makes registering once and keying
@@ -1006,19 +1048,21 @@ public:
     }
 
     // mm_u8i4_layer writes one contiguous [M x N_i] block per handle, in
-    // call order (see copyOut), but matCdata is one pointer per weight --
-    // stage into scratch, then hand each weight its block. M is small at
-    // this call's one real shape (decode, M==1), so this scratch and the
-    // extra copy are a handful of KB, not a hidden cost.
-    std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
-    invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
-                out_cat.data(), M, n_total, K);
-
-    size_t off = 0;
-    for (size_t i = 0; i < n; ++i) {
-      const size_t block = static_cast<size_t>(M) * N[i];
-      std::memcpy(matCdata[i], out_cat.data() + off, block * sizeof(float));
-      off += block;
+    // call order, and copyOut hands each weight its block straight out of
+    // the staging buffer. Two callers: decode's grouped expert gate_ups at
+    // M == 1, and the attention q/k/v projections at prefill (qkv_layer,
+    // doc 51 section 2.21) -- 444 rows, where a heap copy in between
+    // would be 5 MB a call. Row chunks as gemm_q4_0_accel_fp32 makes them,
+    // for the same VTCM reason.
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      std::vector<float *> dsts(n);
+      for (size_t i = 0; i < n; ++i)
+        dsts[i] = matCdata[i] + static_cast<size_t>(m0) * N[i];
+      invokeLayer(session, handles.data(), static_cast<int>(n),
+                  matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
+                  K, &N, &dsts);
     }
   }
 
@@ -1712,9 +1756,20 @@ private:
    * handle, in call order (its out_off += M * h->N), not a row-major
    * [M x sum(N_i)]. One handle is therefore the whole [M x N] and copies
    * straight through; the slices of one weight (get_or_register_fc) are
-   * interleaved back, row by row, into their column ranges. */
+   * interleaved back, row by row, into their column ranges; separate
+   * weights (@a dsts, the batch call) each get their block whole. */
   static void copyOut(float *dst, const float *out_cat, unsigned int M,
-                      unsigned int N, const std::vector<unsigned int> *blocks) {
+                      unsigned int N, const std::vector<unsigned int> *blocks,
+                      const std::vector<float *> *dsts = nullptr) {
+    if (dsts) {
+      size_t off = 0;
+      for (size_t i = 0; i < dsts->size(); ++i) {
+        const size_t block = static_cast<size_t>(M) * (*blocks)[i];
+        stagedMemcpy((*dsts)[i], out_cat + off, block * sizeof(float));
+        off += block;
+      }
+      return;
+    }
     if (!blocks || blocks->size() < 2) {
       stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float));
       return;
@@ -1733,12 +1788,14 @@ private:
   }
 
   /** @param blocks N of each handle in call order, when @a handles are the
-   *  slices of one weight and matCdata is its whole [M x N]; NULL when each
+   *  slices of one weight and matCdata is its whole [M x N], or separate
+   *  weights whose [M x N_i] blocks go to @a dsts[i]; NULL when each
    *  handle's output stays a block of its own (or there is only one). */
   void invokeLayer(remote_handle64 session, const uint32_t *handles,
                    int num_handles, float *matBdata, float *matCdata,
                    unsigned int M, unsigned int N, unsigned int K,
-                   const std::vector<unsigned int> *blocks = nullptr) {
+                   const std::vector<unsigned int> *blocks = nullptr,
+                   const std::vector<float *> *dsts = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
     const auto shape = [&]() {
@@ -1764,7 +1821,7 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer failed: err=" +
                                  std::to_string(err) + shape());
       }
-      copyOut(matCdata, out_cat, M, N, blocks);
+      copyOut(matCdata, out_cat, M, N, blocks, dsts);
       return;
     }
 
@@ -1784,7 +1841,7 @@ private:
                                              : "nntr_hvx_mm_u8i4_layer") +
                                " failed: err=" + std::to_string(err) + shape());
     }
-    copyOut(matCdata, out_cat, M, N, blocks);
+    copyOut(matCdata, out_cat, M, N, blocks, dsts);
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
@@ -2011,7 +2068,7 @@ private:
                       const std::vector<unsigned int> &row_count,
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
-                      unsigned int inter, unsigned int N_out) {
+                      unsigned int inter, unsigned int N_out, int kind = 0) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
@@ -2023,6 +2080,12 @@ private:
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
     stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
+
+    // The five small sequences (handles, routing) go from the heap. Tried
+    // from one rpcmem buffer (doc 51 section 2.26): transport 627 -> 605
+    // us, noise. The gap to the FC calls' ~400 is the call's length, not
+    // its arguments -- a call longer than the poll window (htp_backend.cpp,
+    // 5 ms) ends in the interrupt-driven wait and pays its wake-up.
 
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
@@ -2099,14 +2162,14 @@ private:
                                  row_count.size() + row_weight.size());
       profile.addInvokeMoeLayer(M, K, N_out, elapsed,
                                 timed ? stage_us : nullptr, act_stage,
-                                out_stage, in_arg_bytes);
+                                out_stage, in_arg_bytes, kind);
     }
     if (timed) {
       // [#87] The per-descriptor trace of the last repeat, for the first
       // NNTR_HTP_DMA_TRACE calls of this bucket. Read now, while the skel's
       // static tables still hold this call; printed now, so the lines sit
       // next to the token they came from.
-      const unsigned ordinal = profile.dmaTraceOrdinal(K, N_out, M);
+      const unsigned ordinal = profile.dmaTraceOrdinal(K, N_out, M, kind);
       if (ordinal != 0) {
         std::vector<uint32_t> words(HEXKL_DMA_TRACE_MAX_WORDS);
         uint32_t n_words = 0;
@@ -2121,6 +2184,82 @@ private:
                        ordinal, M, terr);
         }
       }
+    }
+  }
+
+  /** @brief [doc 51 section 2] One call for a whole conv block.
+   *
+   *  The activation goes over once and the output comes back once; the
+   *  four M x C intermediates the block has stay on the DSP. conv_w (24 KB)
+   *  rides along by value each call rather than being registered: it is
+   *  under a hundredth of the activation. The state (2 x C) comes back in
+   *  its own small buffer, not a size class of out_pool_: at a short M the
+   *  output would land in the same 64 KiB class and the two would alias. */
+  void invokeConvBlock(remote_handle64 session, const ConvHandles &ch,
+                       const float *conv_w, const float *act, float *out,
+                       float *state, unsigned int M, unsigned int K,
+                       unsigned int C, unsigned int N_out) {
+    const int act_len = static_cast<int>(M) * static_cast<int>(K);
+    const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
+    const int conv_len = 3 * static_cast<int>(C);
+    const int state_len = 2 * static_cast<int>(C);
+
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    HtpRpcBuffer &act_stage =
+      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float));
+    HtpRpcBuffer &out_stage =
+      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float));
+    float *act_f32 = reinterpret_cast<float *>(act_stage.data());
+    float *out_f32 = reinterpret_cast<float *>(out_stage.data());
+    const size_t small_bytes =
+      static_cast<size_t>(conv_len + state_len) * sizeof(float);
+    if (!conv_buf_ || conv_buf_->size() < small_bytes)
+      conv_buf_ = std::make_unique<HtpRpcBuffer>(small_bytes);
+    float *conv_f32 = reinterpret_cast<float *>(conv_buf_->data());
+    float *state_f32 = conv_f32 + conv_len;
+    stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
+    std::memcpy(conv_f32, conv_w,
+                static_cast<size_t>(conv_len) * sizeof(float));
+
+    HtpProfile &profile = HtpProfile::global();
+    uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
+    const bool timed = profile.level() >= 2;
+    const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
+    const int err =
+      timed ? nntr_hvx_mm_u8i4_conv_block_timed(
+                session, M, K, C, N_out, ch.h_in.data(),
+                static_cast<int>(ch.h_in.size()), ch.h_out, conv_f32, conv_len,
+                act_f32, act_len, out_f32, out_len, state_f32, state_len,
+                stage_us, HTP_MOE_N_STAGES)
+            : nntr_hvx_mm_u8i4_conv_block(
+                session, M, K, C, N_out, ch.h_in.data(),
+                static_cast<int>(ch.h_in.size()), ch.h_out, conv_f32, conv_len,
+                act_f32, act_len, out_f32, out_len, state_f32, state_len);
+    const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
+    if (err != AEE_SUCCESS) {
+      std::string hint;
+      if (static_cast<unsigned>(err) == 0x8000040Eu) {
+        hint = " (AEE_EBADPARM -- if the shapes are right, the DSP skel on "
+               "the device predates mm_u8i4_conv_block: rebuild it with "
+               "test/htp/build.sh and push libnntr_hvx_skel.so)";
+      }
+      throw std::runtime_error(
+        std::string(timed ? "nntr_hvx_mm_u8i4_conv_block_timed"
+                          : "nntr_hvx_mm_u8i4_conv_block") +
+        " failed: err=" + std::to_string(err) + " M=" + std::to_string(M) +
+        " K=" + std::to_string(K) + " C=" + std::to_string(C) +
+        " N=" + std::to_string(N_out) + hint);
+    }
+    stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
+    std::memcpy(state, state_f32,
+                static_cast<size_t>(state_len) * sizeof(float));
+    if (profile.level()) {
+      // [#88] Outside ION: the primitive block and the three handles;
+      // conv_w and the state ride in conv_buf_ (ION).
+      const size_t in_arg_bytes = 48 + sizeof(uint32_t) * ch.h_in.size();
+      profile.addInvokeMoeLayer(M, K, N_out, elapsed,
+                                timed ? stage_us : nullptr, act_stage,
+                                out_stage, in_arg_bytes, /*kind=*/2);
     }
   }
 
@@ -2349,50 +2488,236 @@ private:
         std::vector<float> ws(w_scale.begin() + c0, w_scale.begin() + c0 + n);
         std::vector<int32_t> cs(colsum_w.begin() + c0,
                                 colsum_w.begin() + c0 + n);
-        void *key = static_cast<char *>(matAdata) + c0;
-
-        // [doc 50 section 3.3] Into a mapped arena chunk's free room first:
-        // the 3840 MiB mapped hold 3696 of MoE weights, and the DSP heap
-        // gave the loaded app ~100 MiB before AEE_ENOMEMORY (42 slices),
-        // short of the 143 the FC weights need. Only room that is already
-        // mapped -- a new chunk would take the address space the heap
-        // registrations after this one need. The arena wants WH bytes:
-        // packed on the host into a cached buffer and copied in whole,
-        // since whPack's read-modify-write into the uncached chunk would
-        // crawl. A refusal leaves 2 MiB of the chunk unused, once.
-        uint32_t handle = kNoHandle;
-        const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, n));
-        uint32_t chunk = 0, off = 0;
-        if (ensureArena(session) && placeExisting(wh_len, &chunk, &off)) {
-          std::vector<uint8_t> wh(wh_len);
-          whPack(rm.data(), K, n, wh.data());
-          std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(),
-                      wh_len);
-          ArenaEntry e;
-          e.chunk = chunk;
-          e.off = off;
-          e.K = K;
-          e.N = n;
-          e.w_scale = ws;
-          e.colsum_w = cs;
-          e.bias.assign(n, 0.0f);
-          handle = registerFromArena(session, e, K, n, t_begin);
-          if (handle != kNoHandle)
-            handle_cache_.emplace(key, handle);
-        }
-        if (handle == kNoHandle) {
-          // The DSP heap, as the whole weight would have gone.
-          HtpRpcBuffer slice(static_cast<size_t>(K) * n);
-          std::memcpy(slice.data(), rm.data(), rm.size());
-          handle = register_locked(key, session, K, n, slice, ws, cs, t_begin,
-                                   convert_us);
-        }
-        fh.handles.push_back(handle);
+        fh.handles.push_back(registerRm(static_cast<char *>(matAdata) + c0,
+                                        session, rm.data(), K, n, ws, cs,
+                                        t_begin, convert_us));
         fh.cols.push_back(n);
         convert_us = 0; // counted once, on the first slice
       }
     }
     return fc_cache_.emplace(matAdata, std::move(fh)).first->second;
+  }
+
+  /** @brief Registers one row-major int8 [K x N] weight (values in [-8, 7],
+   *  the form htp_qs4cx_from_* produce) with its scales and column sums.
+   *
+   * [doc 50 section 3.3] Into a mapped arena chunk's free room first: the
+   * 3840 MiB mapped hold 3696 of MoE weights, and the DSP heap gave the
+   * loaded app ~100 MiB before AEE_ENOMEMORY. Only room that is already
+   * mapped -- a new chunk would take the address space the heap
+   * registrations after this one need. The arena wants WH bytes: packed
+   * on the host into a cached buffer and copied in whole, since whPack's
+   * read-modify-write into the uncached chunk would crawl. When no mapped
+   * room is left, the DSP heap, as a whole weight would have gone. A
+   * refusal by the DSP leaves the arena bytes unused, once.
+   * @param key what handle_cache_ files the handle under: an address inside
+   *            the weight this is a slice of, distinct per slice
+   * @note  Call with handle_mutex_ already held. */
+  uint32_t registerRm(void *key, remote_handle64 session, const int8_t *rm,
+                      uint32_t K, uint32_t N, std::vector<float> &ws,
+                      std::vector<int32_t> &cs, uint64_t t_begin,
+                      uint64_t convert_us) {
+    const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
+    uint32_t chunk = 0, off = 0;
+    if (ensureArena(session) && placeExisting(wh_len, &chunk, &off)) {
+      std::vector<uint8_t> wh(wh_len);
+      whPack(rm, K, N, wh.data());
+      std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(), wh_len);
+      ArenaEntry e;
+      e.chunk = chunk;
+      e.off = off;
+      e.K = K;
+      e.N = N;
+      e.w_scale = ws;
+      e.colsum_w = cs;
+      e.bias.assign(N, 0.0f);
+      const uint32_t handle = registerFromArena(session, e, K, N, t_begin);
+      if (handle != kNoHandle) {
+        handle_cache_.emplace(key, handle);
+        return handle;
+      }
+    }
+    HtpRpcBuffer buf(static_cast<size_t>(K) * N);
+    std::memcpy(buf.data(), rm, static_cast<size_t>(K) * N);
+    return register_locked(key, session, K, N, buf, ws, cs, t_begin,
+                           convert_us);
+  }
+
+  /** @brief The handles one dense FFN is registered as: chunk c of the
+   *  intermediate dimension is the expert pair (gate_up [K x 2w] with the
+   *  gate columns first, down [w x N]) of the MoE layer kernel. */
+  struct DenseHandles {
+    std::vector<uint32_t> h_gu, h_dn;
+    unsigned int w = 0; /**< columns of I per chunk */
+  };
+
+  /** @brief Columns of the intermediate dimension per chunk: the largest
+   *  divisor of I that is a multiple of 32 and at most 1792 -- this
+   *  model's expert width, so the MoE layer kernel lays VTCM out exactly
+   *  as it does for the experts (gate_up 3.5 MiB, down 1.75). 0 if none. */
+  static unsigned int denseChunkCols(unsigned int I) {
+    for (unsigned int w = std::min(I, 1792u); w >= 32u; w -= 32u) {
+      if (I % w == 0)
+        return w;
+    }
+    return 0;
+  }
+
+  /** @brief Converts and registers a dense FFN's three Q4_0x4 weights as
+   *  I / w expert pairs (doc 51). The gate_up chunk takes column slices of
+   *  gate and up, so its column sums are the full ones; the down chunk
+   *  takes a row slice, so its column sums are recomputed over those rows
+   *  -- the kernel's zero-point correction is per chunk. Cached by the up
+   *  weight's pointer. */
+  const DenseHandles &get_or_register_dense(void *up, void *gate, void *down,
+                                            remote_handle64 session, uint32_t K,
+                                            uint32_t I, uint32_t N) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = dense_cache_.find(up);
+    if (it != dense_cache_.end())
+      return it->second;
+
+    const unsigned int w = denseChunkCols(I);
+    if (w == 0) {
+      throw std::invalid_argument(
+        "gemm_q4_0_dense_ffn_fp32: intermediate size " + std::to_string(I) +
+        " has no chunk width that is a multiple of 32");
+    }
+    uint64_t t_begin = HtpProfile::nowUs();
+    std::vector<int8_t> up_rm(static_cast<size_t>(K) * I),
+      gate_rm(static_cast<size_t>(K) * I), down_rm(static_cast<size_t>(I) * N);
+    std::vector<float> up_s(I), gate_s(I), down_s(N);
+    std::vector<int32_t> up_c(I), gate_c(I), down_c(N);
+    htp_qs4cx_from_q4_0x4(up, K, I, up_rm.data(), up_s.data(), up_c.data());
+    htp_qs4cx_from_q4_0x4(gate, K, I, gate_rm.data(), gate_s.data(),
+                          gate_c.data());
+    htp_qs4cx_from_q4_0x4(down, I, N, down_rm.data(), down_s.data(),
+                          down_c.data());
+    uint64_t convert_us = HtpProfile::nowUs() - t_begin;
+
+    DenseHandles dh;
+    dh.w = w;
+    for (uint32_t c0 = 0; c0 < I; c0 += w) {
+      // gate_up chunk: [K x 2w], gate columns then up columns -- the pair
+      // layout hexkl_mm_u8i4_moe.c's epilogue reads (gate j with up w+j).
+      std::vector<int8_t> gu(static_cast<size_t>(K) * 2 * w);
+      for (uint32_t k = 0; k < K; ++k) {
+        std::memcpy(gu.data() + static_cast<size_t>(k) * 2 * w,
+                    gate_rm.data() + static_cast<size_t>(k) * I + c0, w);
+        std::memcpy(gu.data() + static_cast<size_t>(k) * 2 * w + w,
+                    up_rm.data() + static_cast<size_t>(k) * I + c0, w);
+      }
+      std::vector<float> gus(gate_s.begin() + c0, gate_s.begin() + c0 + w);
+      gus.insert(gus.end(), up_s.begin() + c0, up_s.begin() + c0 + w);
+      std::vector<int32_t> guc(gate_c.begin() + c0, gate_c.begin() + c0 + w);
+      guc.insert(guc.end(), up_c.begin() + c0, up_c.begin() + c0 + w);
+      if (c0 != 0)
+        t_begin = HtpProfile::nowUs();
+      dh.h_gu.push_back(registerRm(static_cast<char *>(gate) + c0, session,
+                                   gu.data(), K, 2 * w, gus, guc, t_begin,
+                                   convert_us));
+      convert_us = 0;
+
+      // down chunk: rows c0 .. c0 + w, contiguous in the row-major weight.
+      const int8_t *dn = down_rm.data() + static_cast<size_t>(c0) * N;
+      std::vector<int32_t> dnc(N, 0);
+      for (uint32_t r = 0; r < w; ++r) {
+        for (uint32_t n = 0; n < N; ++n)
+          dnc[n] += dn[static_cast<size_t>(r) * N + n];
+      }
+      std::vector<float> dns(down_s);
+      dh.h_dn.push_back(registerRm(static_cast<char *>(down) + c0, session, dn,
+                                   w, N, dns, dnc, HtpProfile::nowUs(), 0));
+    }
+    return dense_cache_.emplace(up, std::move(dh)).first->second;
+  }
+
+  bool supports_gemm_q4_0_dense_ffn_fp32() const override { return true; }
+
+  void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
+                                const float *act, float *out, unsigned int M,
+                                unsigned int K, unsigned int I,
+                                unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const DenseHandles &dh =
+      get_or_register_dense(up, gate, down, session, K, I, N);
+    // Every chunk is an "expert" that takes every row with weight 1: the
+    // kernel zero-fills out and scatter-adds each chunk's down result into
+    // it, which is exactly the sum over the intermediate dimension.
+    const size_t chunks = dh.h_gu.size();
+    std::vector<unsigned int> row_index(chunks * M), row_count(chunks, M);
+    std::vector<float> row_weight(chunks * M, 1.0f);
+    for (size_t c = 0; c < chunks; ++c) {
+      for (unsigned int r = 0; r < M; ++r)
+        row_index[c * M + r] = r;
+    }
+    invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
+                   act, out, M, K, dh.w, N, /*kind=*/1);
+  }
+
+  bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
+                               unsigned int I, unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    get_or_register_dense(up, gate, down, session, K, I, N);
+    return true;
+  }
+
+  /** @brief Registers a conv block's two Q4_0x4 weights (doc 51 section
+   *  2). in_proj goes through get_or_register_fc, whose column slices at
+   *  K = 2048 are exactly C = 2048 wide, so its three handles ARE a, b
+   *  and c and the kernel's split is free; a shape where the slices do
+   *  not fall on the thirds is refused rather than re-sliced.
+   *  ponytail: fcSliceCols(K) == C is this model's coincidence. Another
+   *  shape needs its own slicing here (three registerRm calls at c0 = 0,
+   *  C, 2C), not a change to the kernel. Cached by in_proj's pointer. */
+  const ConvHandles &get_or_register_conv(void *in_proj, void *out_proj,
+                                          remote_handle64 session, uint32_t K,
+                                          uint32_t C, uint32_t N) {
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      auto it = conv_cache_.find(in_proj);
+      if (it != conv_cache_.end())
+        return it->second;
+    }
+    const FcHandles &in = get_or_register_fc(in_proj, session, K, 3 * C);
+    const FcHandles &out = get_or_register_fc(out_proj, session, C, N);
+    if (in.handles.size() != 3 || in.cols[0] != C || in.cols[1] != C ||
+        in.cols[2] != C || out.handles.size() != 1) {
+      throw std::invalid_argument(
+        "gemm_q4_0_conv_block_fp32: in_proj [" + std::to_string(K) + " x " +
+        std::to_string(3 * C) + "] slices into " +
+        std::to_string(in.handles.size()) + " handles of " +
+        std::to_string(fcSliceCols(K)) + " columns, not the three of " +
+        std::to_string(C) + " the conv block kernel takes");
+    }
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    ConvHandles ch;
+    ch.h_in = in.handles;
+    ch.h_out = out.handles[0];
+    return conv_cache_.emplace(in_proj, std::move(ch)).first->second;
+  }
+
+  bool supports_gemm_q4_0_conv_block_fp32() const override { return true; }
+
+  void gemm_q4_0_conv_block_fp32(void *in_proj, const float *conv_w,
+                                 void *out_proj, const float *act, float *out,
+                                 float *state, unsigned int M, unsigned int K,
+                                 unsigned int C, unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const ConvHandles &ch =
+      get_or_register_conv(in_proj, out_proj, session, K, C, N);
+    invokeConvBlock(session, ch, conv_w, act, out, state, M, K, C, N);
+  }
+
+  bool register_q4_0_conv_block(void *in_proj, void *out_proj, unsigned int K,
+                                unsigned int C, unsigned int N) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    get_or_register_conv(in_proj, out_proj, session, K, C, N);
+    return true;
   }
 
   /* Declared here rather than beside arena_chunks_ at the bottom of the
@@ -2887,6 +3212,10 @@ private:
    *  Values are never erased or moved, so the references it hands out stay
    *  valid (std::unordered_map keeps node addresses across rehash). */
   std::unordered_map<const void *, FcHandles> fc_cache_;
+  /** Dense FFNs by their up weight's pointer; see get_or_register_dense. */
+  std::unordered_map<const void *, DenseHandles> dense_cache_;
+  /** Conv blocks by their in_proj's pointer; see get_or_register_conv. */
+  std::unordered_map<const void *, ConvHandles> conv_cache_;
 
   std::vector<ArenaChunk> arena_chunks_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
@@ -2922,6 +3251,8 @@ private:
   bool graph_short_warned_ = false;
   StagingPool act_pool_;
   StagingPool out_pool_;
+  /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
+  std::unique_ptr<HtpRpcBuffer> conv_buf_;
 
   // invokeLayerU8In's scratch: the AH-packed activation (ION-backed, same
   // reasoning as act_pool_/out_pool_) and the small per-row scale/zp arrays

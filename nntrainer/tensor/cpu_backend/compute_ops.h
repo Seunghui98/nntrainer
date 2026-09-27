@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #ifdef ENABLE_FP16
@@ -339,6 +340,79 @@ public:
                                     unsigned int N) {
     (void)data;
     (void)K;
+    (void)N;
+    return false;
+  }
+
+  // The dense SwiGLU FFN as ONE accelerator call (doc 51): up and gate
+  // [K x I] and down [I x N], all Q4_0x4 as loaded; act [M x K] f32 ->
+  // out [M x N] f32 = (silu(act . gate) * (act . up)) . down. The HTP
+  // answers it with its MoE layer kernel over column chunks of I, each
+  // chunk a whole "expert" whose down output is summed into out.
+  // register_q4_0_dense_ffn is the load-time twin, like the two above.
+  virtual bool supports_gemm_q4_0_dense_ffn_fp32() const { return false; }
+  virtual void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
+                                        const float *act, float *out,
+                                        unsigned int M, unsigned int K,
+                                        unsigned int I, unsigned int N) {
+    (void)up;
+    (void)gate;
+    (void)down;
+    (void)act;
+    (void)out;
+    (void)M;
+    (void)K;
+    (void)I;
+    (void)N;
+    throw std::runtime_error(
+      "ComputeOps::gemm_q4_0_dense_ffn_fp32 not implemented by this backend");
+  }
+  virtual bool register_q4_0_dense_ffn(void *up, void *gate, void *down,
+                                       unsigned int K, unsigned int I,
+                                       unsigned int N) {
+    (void)up;
+    (void)gate;
+    (void)down;
+    (void)K;
+    (void)I;
+    (void)N;
+    return false;
+  }
+
+  // An LFM2 conv block as ONE accelerator call (doc 51 section 2):
+  // in_proj [K x 3C] and out_proj [C x N] Q4_0x4 as loaded, conv_w [3 x C]
+  // f32 (w0 for row t, w1 for t-1, w2 for t-2); act [M x K] f32 ->
+  // out [M x N] f32 = ((b * conv1d(a * c)) . out_proj) with a | b | c the
+  // column thirds of act . in_proj, and state [2 x C] f32 <- the conv
+  // input's rows M-2 and M-1 (zero where M is shorter), the state the
+  // CPU decode path continues from. register_q4_0_conv_block is the
+  // load-time twin.
+  virtual bool supports_gemm_q4_0_conv_block_fp32() const { return false; }
+  virtual void gemm_q4_0_conv_block_fp32(void *in_proj, const float *conv_w,
+                                         void *out_proj, const float *act,
+                                         float *out, float *state,
+                                         unsigned int M, unsigned int K,
+                                         unsigned int C, unsigned int N) {
+    (void)in_proj;
+    (void)conv_w;
+    (void)out_proj;
+    (void)act;
+    (void)out;
+    (void)state;
+    (void)M;
+    (void)K;
+    (void)C;
+    (void)N;
+    throw std::runtime_error(
+      "ComputeOps::gemm_q4_0_conv_block_fp32 not implemented by this backend");
+  }
+  virtual bool register_q4_0_conv_block(void *in_proj, void *out_proj,
+                                        unsigned int K, unsigned int C,
+                                        unsigned int N) {
+    (void)in_proj;
+    (void)out_proj;
+    (void)K;
+    (void)C;
     (void)N;
     return false;
   }

@@ -39,6 +39,7 @@
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
+#include <tie_word_embedding.h>
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
@@ -526,6 +527,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
 
+  // NNTR_PPL: the prompt's teacher-forced NLL at prefill (doc 51 section
+  // 2.14), the accuracy gate. Tied lm_head only.
+  const bool ppl_on = std::getenv("NNTR_PPL") != nullptr;
+  if (ppl_on) {
+    std::vector<unsigned int> ids(init_input.begin(), init_input.end());
+    TieWordEmbedding::setPplTargets(ids);
+  }
+
   std::vector<float *> output;
 
   if (SAVE_KVCACHE) {
@@ -608,6 +617,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   auto finish_prefill = std::chrono::high_resolution_clock::now();
+  if (ppl_on) {
+    double nll = 0.0;
+    unsigned int n = 0;
+    if (TieWordEmbedding::takePpl(nll, n) && n > 0) {
+      std::cerr << "[PPL] prompt tokens=" << n << " nll/token=" << (nll / n)
+                << " ppl=" << std::exp(nll / n) << std::endl;
+    } else {
+      std::cerr << "[PPL] no positions scored (untied lm_head, or batch > 1)"
+                << std::endl;
+    }
+  }
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
 

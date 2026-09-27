@@ -208,6 +208,129 @@ decode 16.5 vs 이전 20.8은 이 변경과 무관해 보인다(FC decode는 같
 1.90 → 2.17 ms는 transport 553 → 814 us가 오른 것 = 호스트 쪽) — 같은 세션에서 스위치 없는
 A 실행이 아직 없어 발열인지 다른 것인지 못 가른다. **A를 먼저 돌린다.**
 
+### 3.5 다섯 번째 실행 — 전부 켬: 형상별 콜은 잡혔고, 벽시계는 더 나빠졌다 (2026-09-21)
+
+네 스위치 전부 `htp`, 8스레드, PROFILE=2, 앞선 실행 직후(식히지 않음):
+
+```
+prefill 945 ms 469.8 TPS   decode 11.6 TPS   등록 1528 (MoE 1408 + FC 120), 로드 +2.9 s
+  N=512   (wk/wv)        12콜  host 1750 us  dsp  629  transport 1121  [quant 364 dequant 58 acc 56]
+  N=2048  M>1            53콜  = MoE 23 + wq/wo 12 + out_proj 18 → FC 몫 ≈ (488−398)/30 = 3.0 ms/콜
+  N=6144  (in_proj)      19콜  host 4591     dsp 3251  transport 1339   (§3.4에선 3985 / 782)
+  N=7168  (up/gate)       4콜  host 4254     dsp 3609  transport  645  [quant 372 dequant 908 acc 582]
+  K=7168 N=2048 (down)    2콜  host 4076     dsp 3351  transport  726  [quant 1253 dequant 279 acc 193]
+  M==1 MoE decode       9416콜 host 2993     dsp 1360  transport 1633   (09-16: 1910 / 553)
+```
+
+**형상별 판정 (콜 host + 스테이징 vs ARM ≈2 TFLOPS):**
+
+| 그룹 | HTP 실측 | ARM 추정 | 순 |
+|---|---:|---:|---:|
+| wk/wv N=512 ×12 | 21 + 0.5 = **22** | 10–22 | **손해~본전** (§2 예측대로) |
+| wq/wo/out_proj N=2048 ×30 | 90 + 27 = **117** | ≈122 | **본전** |
+| dense up/gate ×4 + down ×2 | 25 + 6.5 = **32** | 39–65 | −7 ~ −33 |
+| in_proj ×18 | 83 + 17 = **100** | ≈100 | 0 (§3.4의 89가 100으로 — transport가 올랐다) |
+
+콜 하나하나는 예측 범위 안이다. down의 K=7168 quant 1.25 ms가 콜의 37% — 활성화 u8 변환이 K에
+비례하고 FC 커널은 그걸 숨기지 못한다.
+
+**그런데 prefill 835 → 945, decode 16.5 → 11.6.** 두 가지가 겹쳐 있다:
+
+1. **transport가 실행마다 오른다.** MoE decode 콜의 dsp는 1.36 ms로 09-16과 같은데 transport는
+   553 → 814 → 1633 us. in_proj도 782 → 1339. transport = ARM 쪽(FastRPC 스택 + 캐시 유지)이다.
+   같은 날 4번 연속 50초짜리 실행 뒤라 **발열로 ARM이 느려진 것**이 첫 후보이고, 등록 핸들 수
+   (1408 → 1528)나 힙 사용량에 FastRPC 콜 비용이 비례하는 것이 둘째 후보다. 스위치 없는 A 실행을
+   **식힌 뒤** 돌려야 가른다 — 아직 없다.
+2. **텍스트가 바뀌었다.** 요약 3문장이 §3.4까지의 실행과 다르다(더 짧은 think, 다른 문장, 428토큰에서
+   `<|im_end|>`로 정상 종료). 재양자화 층이 늘어난 결과이고, softmax 앞의 q/k/v가 가장 의심스럽다.
+   **정확도 게이트 실패** — attn_proj는 QS4CX 오프라인 양자화(§6) 없이는 끄는 것이 맞다.
+
+### 3.6 transport의 정체 — 스테이징 버퍼 크기에 비례하는 콜당 캐시 유지비 (2026-09-21)
+
+§3.5의 "전부 켬"을 한 번 더 돌렸다: prefill 996, decode 11.66, MoE decode 콜 transport **1626 us**
+(직전 1633). 7 us 차이 — 발열이면 이렇게 같을 수 없다. 형상이 불변인 MoE decode 콜의 transport를
+설정별로 놓으면:
+
+| HTP에 올린 것 | 스테이징 act / out (가장 큰 형상에 맞춰 자란 크기) | decode transport | decode TPS |
+|---|---|---:|---:|
+| MoE만 (09-16) | 3.6 / 3.6 MB | 553 us | 20.8 |
+| + in_proj (out 10.9 MB) | 3.6 / 10.9 | 814 | 16.5 |
+| + dense (act·out 12.7 MB) | 12.7 / 12.7 | 1633, 1626 | 11.6, 11.7 |
+
+증가분 +7.3 MB → +261 us, +18.2 MB → +1080 us = **36~59 us/MB**, 캐시 플러시 속도다.
+메커니즘: `invokeLayer`·MoE 콜 전부가 `act_buf_`/`out_buf_` **한 쌍**을 공유하고 `ensureCapacity`가
+가장 큰 형상에 맞춰 키웠다. ARM 캐시드 ION 버퍼는 FastRPC 드라이버가 콜마다 clean/invalidate를
+하는데, 그 범위가 **넘긴 바이트가 아니라 dma-buf 전체**다. 8 KB를 쓰는 decode 콜이 25 MB를
+플러시했고, prefill의 82콜 전부가 같은 세금을 냈다(in_proj 콜 transport 782 → 1496).
+
+**수정**: 크기 클래스별 버퍼(`StagingPool`/`stage`, 64 KiB부터 2배씩). decode는 64 KiB 쌍, MoE
+prefill은 4 MiB, in_proj·dense는 16 MiB. 기대: decode transport 553 근처로 → **≈20 TPS 복구**,
+prefill 콜 82개 × 0.3~0.7 ms → **−40~−60 ms** (835 기준으로 in_proj·dense의 진짜 값이 그때 보인다).
+ION 합계 ≈40 MB(이전 25). 이 세금은 in_proj 이전에도 있었다 — 3.6 MB 쌍의 553 us 중 ≈260이
+그것이니, MoE만 돌 때도 decode 콜당 ≈0.25 ms(22층 5 ms/token)는 돌아온다.
+
+### 3.7 크기 클래스 적용 — decode 복구, prefill은 FC가 손해라는 것이 남았다 (2026-09-21)
+
+전부 켠 채(등록 1528) 같은 명령:
+
+```
+prefill 943 ms 470.8 TPS   decode 20.48 TPS (직전 11.66)
+  M==1 MoE decode  host 1513 us  dsp 1353  transport  161   (직전 2985 / 1359 / 1626; 09-16: 1910 / 553)
+  N=512  (wk/wv)   host 1029     transport  456   (직전 2115 / 1470)
+  N=2048 M>1       host 8364     transport 1101   (직전 9302 / 2011)   ← MoE 23 + FC 30 합산
+  N=6144 (in_proj) host 4299     transport 1092   (직전 4762 / 1496)
+  N=7168 / K=7168  host 4164 / 3944                (직전 4250 / 4066)
+```
+
+**§3.6의 진단이 맞았다.** 형상이 불변인 MoE decode 콜의 transport가 1626 → **161 us**, 09-16의
+553보다도 낮다(3.6 MB 쌍 → 64 KiB 쌍). decode 11.7 → 20.5 TPS. prefill 콜 82개 전부 transport가
+0.4~1 ms씩 내려 prefill 996 → 943.
+
+**남은 것 둘:**
+
+1. **prefill 943은 여전히 in_proj만 켠 835보다 느리다.** HTP에 올린 FC의 host 합 ≈204 ms + 스테이징
+   ≈45 = **≈250 ms**인데, 그 FC들이 ARM에서 걸리던 시간은 §3.4 방식으로 역산하면 ≈115~210. 즉
+   **k/v·q/o·out_proj는 손해, dense는 본전~소폭 이득**. FC를 HTP로 보내는 건 여기서 닫는다 —
+   남기는 건 §3.6의 스테이징 수정(MoE만 돌려도 decode 콜 0.39 ms, prefill 콜 1.3 ms를 돌려준다)과
+   실측 표다.
+2. **ARM 쪽이 09-16보다 느리다.** decode 48.8 ms/token = MoE 33.3 + ARM 15.5인데 09-16은 48.1 = 42.0 +
+   ≈6. prefill도 HTP 콜 합을 빼면 ARM 잔여 ≈324 (in_proj만 켰을 때 366, 거기서 FC ≈115~210이 빠졌어야
+   한다). 발열이거나, `engine=htp`인 FC 레이어의 **decode CPU 경로**가 cpu 엔진의 것과 다른 것이다
+   (같은 `CpuComputeOps::gemm_q4_0_fp32`로 읽히지만 실측이 없다). **스위치 전부 끈 A 실행**이 가른다:
+   decode가 ≈25 TPS(1/(33.3+6))로 나오면 FC 스위치가 ARM decode를 늦춘 것이고, 20.5면 발열/환경이다.
+
+### 3.8 A 실행 — 오늘의 기준선은 848이 아니라 921~1013이다 (2026-09-21)
+
+스위치 없음(MoE만), 8스레드, PROFILE=0, 연속 2회:
+
+```
+prefill 921 ms 482 TPS / 1013 ms 438 TPS      decode 21.18 / 21.09 TPS      텍스트 2회 동일
+```
+
+| | 09-16 | 오늘 A | 뜻 |
+|---|---:|---:|---|
+| prefill | 848 (3회 최솟값) | **921 / 1013** | 기기가 오늘 +73~+165 느리다. 연속 2회가 10% 벌어진다 |
+| decode | 20.8 | **21.1** | §3.6 수정 후에도 거의 그대로 — 콜 transport −0.39 ms×22가 벽시계엔 안 보인다 |
+
+**§3.7·§1.3의 "ARM이 느리다"는 스위치 탓이 아니다** — 스위치 없는 A도 같은 만큼 느리다. 오늘 기기
+(발열·DVFS)의 상태이고, 09-16의 848은 오늘 비교 기준으로 못 쓴다. 같은 날 A/B/C만 유효하다.
+
+같은 날 비교:
+
+| config | prefill (2회 최솟값) | vs A |
+|---|---:|---:|
+| A: MoE만 | 921 | — |
+| C: + in_proj + dense 융합 | 888 | **−33** |
+| 전부 켬 (§3.7) | 943 | +22 |
+
+−33은 기대(in_proj −13, dense −15~−20)와 맞지만 A 자체의 편차(92 ms)보다 작다. **FC 단위 효과는
+오늘 기기의 노이즈 안에 있다** — 그래서 판정은 벽시계가 아니라 프로파일의 콜 행(`N=6144`, `M>1 dense`)으로
+한다. decode는 A 21.1 vs C 20.6 — 4회 일관된 0.5 TPS 차(≈1.2 ms/token)인데, C의 FC decode 경로는
+같은 CPU 커널이라 설명이 없다. 노이즈로 두고, 다시 보이면 조사한다.
+
+텍스트: A는 2회 동일하고, in_proj만 켠 실행·C와는 다르다. **양자화 지점이 바뀔 때마다 토큰이 바뀐다**는
+것을 A가 확인한다 — 게이트는 로짓 차로 바꿔야 한다.
+
 ## 4. 측정 — 실행 순서와 읽을 것
 
 config는 문서 49 §6의 NPU config(`moe_engine: htp`)에 키만 더한다. 프롬프트·`num_to_generate`

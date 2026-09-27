@@ -167,7 +167,24 @@ public:
    */
   WIN_EXPORT void prepareLmhead(nntrainer::RunLayerContext &context);
 
+  /**
+   * @brief NNTR_PPL (doc 51 section 2.14): the prompt's teacher-forced
+   *        negative log-likelihood at prefill, the accuracy gate that
+   *        replaces reading the generated text.
+   *
+   * The app hands the prompt's ids in before the prefill. The lm_head then
+   * computes every prefill position's logits, not only the last row's,
+   * and sums -log softmax(logits[t])[ids[t + 1]]; the model's own output
+   * (the last row) is untouched. takePpl returns the sum and the count
+   * and clears them. Process-wide state: one prompt at a time, batch 1.
+   */
+  WIN_EXPORT static void setPplTargets(const std::vector<unsigned int> &ids);
+  WIN_EXPORT static bool takePpl(double &nll_sum, unsigned int &count);
+
 private:
+  static std::vector<unsigned int> ppl_targets_;
+  static double ppl_nll_;
+  static unsigned int ppl_count_;
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Unit, nntrainer::props::Scale>
     tieword_embedding_props;
