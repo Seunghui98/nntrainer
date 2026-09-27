@@ -43,7 +43,7 @@ Branch `htp/<issue#>-<slug>` @ `<sha>` — estimated device time: <N> min
 | /local/mnt/workspace/models/lfm2.5-8b-a1b/q40-qs4cx-wh/*_ARM.bin | | NPU model |
 
 ## Steps (workstation, phone on USB)
-1. `git fetch && git checkout htp/<issue#>-<slug>`; `source tools/htp/env.sh`; rebuild or reuse the artifacts above (`md5sum` must match the table).
+1. `git fetch && git checkout htp/<issue#>-<slug>`; `source tools/htp/env.sh`; rebuild or reuse the artifacts above (`md5sum -c staged/md5.txt` before pushing; it exits 1 on a mismatch, and the device's `md5sum` is compared by hand).
 2. `adb devices` lists exactly one device; record its serial under Notes (any S25 Ultra is allowed, contract §4.2 — the handoff never names one). Note battery % and whether the phone is warm.
 3. Install once: `(cd Applications/CausalLM && ./install_android.sh --model=<model dir>)` for each model dir, then
    `adb push test/htp/build/libnntr_hvx_skel.A.so /data/local/tmp/nntrainer/causallm/libnntr_hvx_skel.so`.
@@ -66,6 +66,14 @@ Reference: NPU now 20.8 / CPU now 48 decode tok/s, NPU prefill 523 (PR doc 49; r
 ## Notes from the run
 <thermal, first-run page faults, FARF/AEE errors, anything stale>
 ```
+
+## Dump ride-along (optional, never in a tok/s cell)
+
+`NNTR_HTP_DUMP=/data/local/tmp/dump` on one decode run (prompt 16, G = 4)
+writes every MoE call's input / output and a manifest; pull the directory
+and run `tools/htp/htp_dump_eval.py <host dump of the same prompt on the
+x86-packed twin> <device dump>` on the workstation. `bit_identical=0`
+names the first call and side that differs (plan 84 §3.1 level (d)).
 
 ## Reading a filled one (supervisor / implementer)
 
