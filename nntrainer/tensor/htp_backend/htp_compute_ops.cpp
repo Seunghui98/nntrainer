@@ -1973,6 +1973,46 @@ private:
     profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
+  /** @brief [#84] NNTR_HTP_DUMP=<dir>: every MoE call's input (M x K f32)
+   *  and output (M x N_out f32) as <dir>/moe_<call>_in.f32 / _out.f32, in
+   *  call order, plus one line per call in <dir>/manifest.txt
+   *  (name entry M K inter N_out kind). Read once, off unless the
+   *  variable is set: with it unset this is one static load and a branch
+   *  per call. tools/htp/htp_dump_eval.py compares two such directories;
+   *  the first file that differs names the call, which is where a _det is
+   *  missing (plan 84 section 3.1). Never in a tok/s run: 16 KiB of file
+   *  I/O per call. Callers hold invoke_mutex_, so the counter is plain. */
+  static void dumpMoeCall(const char *entry, const float *act, size_t act_n,
+                          const float *out, size_t out_n, unsigned int M,
+                          unsigned int K, unsigned int inter,
+                          unsigned int N_out, int kind) {
+    static const char *dir = std::getenv("NNTR_HTP_DUMP");
+    if (dir == nullptr)
+      return;
+    static unsigned int call = 0;
+    char name[32];
+    std::snprintf(name, sizeof(name), "moe_%05u", call);
+    const std::string base = std::string(dir) + "/" + name;
+    const auto write = [&](const std::string &path, const float *p, size_t n) {
+      FILE *f = std::fopen(path.c_str(), "wb");
+      if (f == nullptr || std::fwrite(p, sizeof(float), n, f) != n)
+        throw std::runtime_error("NNTR_HTP_DUMP: cannot write " + path);
+      std::fclose(f);
+    };
+    write(base + "_in.f32", act, act_n);
+    write(base + "_out.f32", out, out_n);
+    // Truncated by this process's first call: a reused directory would
+    // otherwise list a previous run's calls, and its stale files with them.
+    FILE *m = std::fopen((std::string(dir) + "/manifest.txt").c_str(),
+                         call == 0 ? "w" : "a");
+    if (m == nullptr)
+      throw std::runtime_error("NNTR_HTP_DUMP: cannot write the manifest");
+    ++call;
+    std::fprintf(m, "%s %s %u %u %u %u %d\n", name, entry, M, K, inter, N_out,
+                 kind);
+    std::fclose(m);
+  }
+
   /** @brief [#85] The per-token entry from one MoE op: the same staging
    *  pools and profile bucket as invokeMoeLayer, so the M==1 row reads
    *  the same across the two paths. In this issue a call never crosses a
@@ -2045,6 +2085,8 @@ private:
                                " (only MOE is resident, so op + 1 expected)");
     }
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
+    dumpMoeCall("forward", act, static_cast<size_t>(act_len), out,
+                static_cast<size_t>(out_len), 1u, K, 0u, N_out, 0);
     if (profile.level()) {
       // The prim block (start_op, pos, six lengths) and the three routing
       // sequences; the 64 handles no longer travel (plan 83 section 2).
@@ -2159,6 +2201,8 @@ private:
         " failed: err=" + std::to_string(err) + hint);
     }
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
+    dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
+                static_cast<size_t>(out_len), M, K, inter, N_out, kind);
     if (profile.level()) {
       // [#88] The bytes the stub hands the driver outside ION: the 48-byte
       // primitive block (_primIn[12] in generated/nntr_hvx_stub.c) and the

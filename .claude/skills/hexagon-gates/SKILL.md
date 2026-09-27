@@ -63,10 +63,18 @@ NNTR_QUANTIZE_STREAM_BIN=$PWD/build/Applications/CausalLM/nntr_quantize_stream \
   ./build/Applications/CausalLM/unittest_causallm_models --gtest_filter='*Lfm2Moe*'
 bash test/htp/host/run_host_checks.sh
 bash tools/htp_syntax_check.sh
+bash test/htp/host/run_inproc_e2e.sh      # SDK headers + qaic sourced; no device
 ```
 Pass: every gtest `[  PASSED  ]` — 6 for `*Lfm2Moe*` (3 differential + 3
 tiny-model), none skipped; `run_host_checks.sh` prints `ALL CHECKS PASS`
-and `WORKER POOL LANES OK`; the syntax check exits 0. The tiny fixture's
+and `WORKER POOL LANES OK`; the syntax check exits 0; `run_inproc_e2e.sh`
+prints `E2E eval golden … bit_identical=1`, `E2E eval hmx-loop …
+bit_identical=1`, `E2E tokens htp==cpu 8/8`, `E2E eval cpu … min_snr_db=`
+(≥ 60), `E2E eval self-test ok` and `INPROC E2E PASS` (it configures
+`build_htp_host/` itself; tens of minutes the first time, ≈ 1 min after;
+needs `source tools/htp/env.sh` for the SDK headers and `qaic`, nothing
+else — HexKL and the phone are not involved, and no number it prints is
+a device number). The tiny fixture's
 weight file is gitignored and generated once per checkout:
 `python3 test/unittest/models/causallm_reference/generators/generate_lfm2_moe_reference.py`
 then `git checkout -- test/unittest/models/causallm_reference/lfm2_moe_tiny/`
