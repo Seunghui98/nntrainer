@@ -520,4 +520,37 @@ interface nntr_hvx : remote_handle64 {
                            rout uint32 resume_at,
                            rout sequence<uint32> op_pcycles,
                            rout sequence<uint32> stage_us);
+
+   // [#82] The M=1 small ops (hvx_m1_ops_f32.c) against the scalar spec
+   // nntrainer/tensor/m1_ops_det.h. Test entries: no model path calls
+   // them, and they use the caller's buffers only (no session state, heap
+   // or VTCM). A bad shape is AEE_EINVALIDFORMAT, never AEE_EBADPARM,
+   // which stays the stale-skel symptom.
+   //
+   // RMSNorm over x in chunks of `chunk` floats (a power of two, a
+   // multiple of 32, dividing xLen), gamma of `chunk` floats shared by
+   // every chunk (chunk == xLen: the hidden norm; 64: the per-head q/k
+   // norm). row_scale is xLen / chunk floats, r per chunk, so a mismatch
+   // says whether the reduction + rsqrt or the scaling diverged.
+   AEEResult rmsnorm_det_f32(in uint32 chunk, in float eps,
+                             in sequence<float> x, in sequence<float> gamma,
+                             rout sequence<float> y,
+                             rout sequence<float> row_scale);
+
+   // RoPE at head_dim 64: qk is n_q q heads then (qkLen / 64 - n_q) k
+   // heads of 64 contiguous floats, cs the 64-float cos[32] | sin[32] row
+   // of one position; y receives the rotated copy.
+   AEEResult rope64_det_f32(in uint32 n_q, in sequence<float> cs,
+                            in sequence<float> qk, rout sequence<float> y);
+
+   // Causal depthwise conv1d (L=3) + gate for one token, C = yLen (a
+   // multiple of 32): abc = a | b | c (3C), conv_w = w0 | w1 | w2 (3C),
+   // state_in = x_{t-2} | x_{t-1} (2C), y = b * conv1d(a*c) (C). state_out
+   // is 3C: rows 0-1 the new state x_{t-1} | a*c, row 2 the kernel's
+   // scratch (hvx_m1_ops_f32.h).
+   AEEResult conv_gate_m1_f32(in sequence<float> abc,
+                              in sequence<float> conv_w,
+                              in sequence<float> state_in,
+                              rout sequence<float> y,
+                              rout sequence<float> state_out);
 };
