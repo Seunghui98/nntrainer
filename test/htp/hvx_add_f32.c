@@ -201,6 +201,9 @@ int nntr_hvx_close(remote_handle64 handle) {
   }
   nntr_hvx_arenas_put_all(s);
   hexkl_moe_scratch_free(&s->moe_scratch);
+  /* [#81] The attention cache borrows the pool, so it goes first. */
+  hvx_attn_m1_free(s->attn_m1);
+  s->attn_m1 = NULL;
   hvx_worker_pool_destroy(s->quant_pool);
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {

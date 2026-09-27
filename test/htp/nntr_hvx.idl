@@ -553,4 +553,40 @@ interface nntr_hvx : remote_handle64 {
                               in sequence<float> state_in,
                               rout sequence<float> y,
                               rout sequence<float> state_out);
+
+   // [#81] Decode attention at m=1 (hvx_attn_m1_f32.c) against the scalar
+   // spec nntrainer/tensor/attn_m1_det.h, with a session-owned f32 KV
+   // cache: Kt [layer][kv][head_dim][max_seq], V [layer][kv][max_seq]
+   // [head_dim], allocated at register for the whole shape (48 MiB at the
+   // LFM2.5 shape and max_seq 2048) and freed at release or close. layer
+   // is the attention-layer ordinal. Not wired into the model here: #85's
+   // ATTN_M1 slot stays NULL. One cache per session: a second register
+   // without a release is AEE_EBADSTATE. A bad shape or a position out
+   // of range is AEE_EINVALIDFORMAT, a hole (pos or kv_from past the
+   // layer's length) or a missing cache AEE_EBADSTATE; never AEE_EBADPARM,
+   // which stays the stale-skel symptom.
+   AEEResult attn_m1_register(in uint32 n_layers, in uint32 n_kv,
+                              in uint32 gqa, in uint32 head_dim,
+                              in uint32 max_seq);
+   AEEResult attn_m1_release();
+
+   // Bulk append of n_rows positions [kv_from, kv_from + n_rows) of one
+   // layer from the CPU cache layout, k_rows / v_rows [n_rows][n_kv]
+   // [head_dim] f32 (how the wiring issue seeds the prompt's rows after
+   // the CPU prefill). Sets the layer's length to kv_from + n_rows.
+   AEEResult attn_m1_kv_append(in uint32 layer, in uint32 kv_from,
+                               in uint32 n_rows, in sequence<float> k_rows,
+                               in sequence<float> v_rows);
+
+   // Appends position pos (k, v: [n_kv][head_dim], post-RoPE) to layer and
+   // returns the attention of q ([n_kv * gqa][head_dim], post-RoPE) over
+   // positions 0..pos in y ([n_kv * gqa][head_dim]); scale is the
+   // model's 1/sqrt(head_dim). pos <= the layer's length: equal appends,
+   // less rewinds. stats is empty, or 2 * n_kv * gqa floats receiving
+   // (m, l) per q head -- the localising intermediates a device mismatch
+   // is read with; production passes it empty and pays nothing.
+   AEEResult attn_m1_forward(in uint32 layer, in uint32 pos, in float scale,
+                             in sequence<float> q, in sequence<float> k,
+                             in sequence<float> v, rout sequence<float> y,
+                             rout sequence<float> stats);
 };
