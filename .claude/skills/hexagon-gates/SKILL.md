@@ -16,7 +16,14 @@ hosts:
   (one shell per rung; `build/` and `test/htp/build/` are created in the
   mounted checkout). The container carries SDK 6.4.0.2 (toolv19
   19.0.04), NDK r26d, clang-format-14, meson/ninja and gcc. **Rungs 0 and 1
-  pass there (2026-09-27: `ALL CHECKS PASS`, syntax check rc 0). Rungs 2
+  pass there (2026-09-27 on `b4c96bdb`: `ninja -C build` 790 targets,
+  `*qs4cx*` 2/2, `*Lfm2Moe*` 6/6, `ALL CHECKS PASS`, syntax check rc 0).
+  The container is `--rm`, so anything installed with pip is gone next
+  run: the tiny fixture's generator needs torch, so generate it in one
+  shell (`pip3 install --break-system-packages --index-url
+  https://download.pytorch.org/whl/cpu torch && python3 test/unittest/models/causallm_reference/generators/generate_lfm2_moe_reference.py`
+  then the `git checkout --` line); the generated weight file lives in the
+  mounted checkout and survives. Rungs 2
   and 3 need HexKL beta.2, which the Mac does not have** (its
   `~/Qualcomm/hexkl_addon` is beta1: `hexkl_micro_hw_init` has two
   arguments, the tree calls it with three, so `build.sh` stops at
