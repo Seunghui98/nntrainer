@@ -74,7 +74,7 @@ mkdir -p generated build
     -I "$HEXAGON_SDK_ROOT/incs/stddef" \
     -mdll -o generated nntr_hvx.idl
 
-SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c generated/nntr_hvx_skel.c"
+SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c nntr_hvx_small_ops.c generated/nntr_hvx_skel.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4_moe.c $BACKEND/hmx/hexkl_graph.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_conv_block.c"
@@ -84,6 +84,7 @@ SRCS="$SRCS $BACKEND/hmx/hexkl_probe.c $BACKEND/hmx/hexkl_acc_tile.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_attn_dtype.c $BACKEND/hmx/hexkl_attn_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_swiglu_f32.c $BACKEND/hvx/hvx_conv_gate_f32.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_m1_ops_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_scale_add_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c $BACKEND/hvx/hvx_softmax_blocked_f32.c"
