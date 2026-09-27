@@ -3,10 +3,31 @@ name: hexagon-gates
 description: The verification ladder for any change on the htp_moe branch (format → host build and host checks → DSP skel → Android app and device gtest → device handoff), with the exact workstation commands and what "pass" means at each rung. Use before claiming an HTP change works.
 ---
 
-All commands run natively on the Ubuntu workstation from the repo root
-after `source tools/htp/env.sh` (SDK 6.4.0.1, HexKL beta.2 `lib/6.4.0.1`,
-NDK r30, model dir; contract `docs/plans/0001-htp-moe-decode-agent-system.md`
-§4.1). Never report a rung as passed without its pass line in the output.
+All commands run from the repo root after `source tools/htp/env.sh`
+(contract `docs/plans/0001-htp-moe-decode-agent-system.md` §4.1). Two
+hosts:
+
+* **Ubuntu workstation** (native): SDK 6.4.0.1, HexKL beta.2
+  `lib/6.4.0.1`, NDK r30, the model dir. All four rungs.
+* **Mac client** (`tools/docker/run.sh`, linux/amd64 container under
+  OrbStack; `source tools/htp/env.sh` on the Mac itself prints
+  `env.sh: no SDK` — that is how you tell): every command below is run as
+  `tools/docker/run.sh bash -c 'source tools/htp/env.sh && <command>'`
+  (one shell per rung; `build/` and `test/htp/build/` are created in the
+  mounted checkout). The container carries SDK 6.4.0.2 (toolv19
+  19.0.04), NDK r26d, clang-format-14, meson/ninja and gcc. **Rungs 0 and 1
+  pass there (2026-09-27: `ALL CHECKS PASS`, syntax check rc 0). Rungs 2
+  and 3 need HexKL beta.2, which the Mac does not have** (its
+  `~/Qualcomm/hexkl_addon` is beta1: `hexkl_micro_hw_init` has two
+  arguments, the tree calls it with three, so `build.sh` stops at
+  `hexkl_micro.h:194`). Until the user drops the beta.2 package at
+  `~/Qualcomm/hexkl_addon` (flat `lib/hexagon_toolv19_v79/` layout, or
+  `lib/6.4.0.2/...`), a PR from the Mac says "rung 2/3 not run here" and
+  the skel/app md5s are produced on the workstation. The x86 build under
+  emulation is several times slower than native; `run_host_checks.sh`
+  is ≈ 1 min, the host build tens of minutes from scratch.
+
+Never report a rung as passed without its pass line in the output.
 Rungs are cumulative: a PR needs 0–3; a step inside a plan needs the rung
 the plan names. There is no simulator rung in this tree.
 

@@ -22,7 +22,11 @@ comments to address). Read the issue and `docs/plans/<issue#>-*.md`.
 1. Branch: `git checkout htp_moe && git pull --ff-only`, then
    `git checkout -b htp/<issue#>-<slug>` (or check out the existing branch
    for a resumed issue). Set the issue to `state:in-progress`.
-   `source tools/htp/env.sh` in every shell.
+   `source tools/htp/env.sh` in every shell; on the Mac client (it prints
+   `env.sh: no SDK`) run every gate as
+   `tools/docker/run.sh bash -c 'source tools/htp/env.sh && <command>'`
+   and read the `hexagon-gates` host note for the rungs that cannot run
+   there.
 2. Implement the plan step by step. After every step run the gate the plan
    names. Never skip a failing gate; fix or stop and report.
 3. Kernel changes: check each item of the review list in `hexagon-gates`

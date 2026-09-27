@@ -9,8 +9,11 @@ You are the orchestrator for one cycle. The contract is
 
 Preconditions (check, do not fix silently): current branch is `htp_moe`
 or a `htp/*` branch with a clean tree; `source tools/htp/env.sh` prints
-its summary line with no `missing` warning; `gh auth status` is logged
-in. If the tree is dirty, stop and say what is uncommitted.
+its summary line with no `missing` warning — on the Mac client run it as
+`tools/docker/run.sh bash -c 'source tools/htp/env.sh'` (the `hexagon-gates`
+skill says which rungs the container can run); `gh auth status` is logged
+in or the GitHub MCP is connected as the owner. If the tree is dirty, stop
+and say what is uncommitted.
 
 ## Steps
 
