@@ -70,6 +70,9 @@ typedef struct {
                                  attn_m1_register; NULL = none. Borrows
                                  quant_pool, so it is freed in close()
                                  before hvx_worker_pool_destroy */
+  struct nntr_hvx_dspq *dspq; /**< [#141] the MoE call's dspqueue thread
+                                 (nntr_hvx_dspq.c); NULL = no queue.
+                                 Stopped first in close() */
 } nntr_hvx_session;
 
 /** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with
@@ -80,6 +83,11 @@ typedef struct {
 uint32_t nntr_hvx_moe_stage_count(void);
 int nntr_hvx_moe_stage_fill(uint32_t *stage_us, uint64_t t0, uint64_t t1,
                             int rc);
+
+/** @brief [#141] Stops and frees the session's dspqueue thread, if any.
+ *  close() calls it first, while the tables the thread reads still exist.
+ *  Lives in nntr_hvx_dspq.c. */
+void nntr_hvx_dspq_shutdown(nntr_hvx_session *s);
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the
  *  weight tables are released, since a borrowed slot points into one. Lives

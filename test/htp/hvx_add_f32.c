@@ -186,6 +186,8 @@ int nntr_hvx_close(remote_handle64 handle) {
   if (!s) {
     return AEE_SUCCESS;
   }
+  /* [#141] The queue thread runs kernels on this session: it stops first. */
+  nntr_hvx_dspq_shutdown(s);
   /* [#85] The graph names weight handles, so it goes before the tables. */
   hexkl_graph_free(s->graph);
   s->graph = NULL;
