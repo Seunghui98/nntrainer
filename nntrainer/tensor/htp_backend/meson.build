@@ -63,7 +63,8 @@ if get_option('htp-inproc')
   # What is in and what is out: the entries the ARM side references
   # (open/close, the u8i4 weight and MoE calls, the arena, moe_set_opts,
   # the #85 graph entries) plus the #82/#81 small-op and m=1 attention
-  # entries, whose kernels already compile on hvx_emu. Left out, because
+  # entries, whose kernels already compile on hvx_emu, and the #141 MoE
+  # dspqueue thread against inproc/dspqueue_standin.c. Left out, because
   # nothing here references them and their kernels need intrinsics
   # hvx_emu does not emulate: nntr_hvx_softmax.c, nntr_hvx_attn.c,
   # nntr_hvx_mm_u8i8.c, nntr_hvx_dma_probe.c (device-gtest-only entries).
@@ -77,6 +78,7 @@ if get_option('htp-inproc')
     htp_test_dir / 'nntr_hvx_graph.c',
     htp_test_dir / 'nntr_hvx_small_ops.c',
     htp_test_dir / 'nntr_hvx_attn_m1.c',
+    htp_test_dir / 'nntr_hvx_dspq.c',
     'hmx/hexkl_mm_u8i4.c',
     'hmx/hexkl_mm_u8i4_dma.c',
     'hmx/hexkl_mm_u8i4_moe.c',
@@ -96,6 +98,7 @@ if get_option('htp-inproc')
     htp_host_dir / 'standin' / 'hvx_scalar.c',
     htp_host_dir / 'inproc' / 'hexkl_micro_standin.c',
     htp_host_dir / 'inproc' / 'rpc_standin.c',
+    htp_host_dir / 'inproc' / 'dspqueue_standin.c',
   )
   # inproc/ first: it shadows HAP_perf.h (the SDK's reads Hexagon
   # registers) and provides hexagon_protos.h; stub/ is reached through
