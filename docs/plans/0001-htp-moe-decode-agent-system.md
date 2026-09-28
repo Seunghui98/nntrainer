@@ -239,7 +239,7 @@ Handoff rules (user decisions Q3, Q13, Q18, Q19):
   not edited.
 * Commits: `git commit -s` in the user's name plus
   the `Co-Authored-By:` trailer of the model that wrote the commit (the
-  planner, implementer and guide writer run on Opus 5.5:
+  implementer and guide writer run on Opus 5.5:
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`); one topic per
   commit; body ≥ 8 words; new `.c/.h/.cpp/.py` files carry a doxygen
   `@file`/`@brief` header.
@@ -348,7 +348,7 @@ recorded in BENCHMARK.md's artifact section once built.
 
 | date | decision |
 |---|---|
-| 2026-09-28 | **Agent models:** `hexagon-planner`, `hexagon-implementer` and `hexagon-guide-writer` run on Opus 5.5 (`model: claude-opus-5-5` in `.claude/agents/`); `hexagon-supervisor` keeps the session's model. **Text comparison stays mandatory** in every per-token-entry handoff: the decode PPL adds a column, it never replaces the text column or the user's text approval |
+| 2026-09-28 | **Agent models:** `hexagon-implementer` and `hexagon-guide-writer` run on Opus 5.5 (`model: claude-opus-5-5` in `.claude/agents/`); `hexagon-supervisor` and `hexagon-planner` keep the session's model. **Text comparison stays mandatory** in every per-token-entry handoff: the decode PPL adds a column, it never replaces the text column or the user's text approval |
 | 2026-09-28 | **Decode-PPL reference = variant A (switch off, same NPU model, same sitting), not the CPU `q40` run.** The CPU model's different weights put its PPL ≈ 4.9 % from the NPU model before any switch is on, which would swamp a +2 % gate; A differs from B/C/D by the switch alone and is bit-identical run to run (#136's dump sitting). Threshold stays +2 %; the text-approval step stays. The CPU `q40` PPL is information for #110 only |
 | 2026-09-28 | **Order: #130 PR → #130 device sitting → #132.** The remaining CPU decode ops (M=1 FCs, router + top-k, final norm + lm_head; LEDGER ㉓) become DSP-resident only after #130 is merged and measured; filed as #132 (`state:needs-plan`, p1). hvx_impl's DMA descriptor queue does not reduce the call count (it is weight prefetch, LEDGER §4); only the resident set does |
 | 2026-09-28 | **⑨ accuracy column = (a) + (b) + user approval.** For handoffs that run the per-token entry (#130 onward) the accuracy gate keeps the text-identical column (a), adds `NNTR_PPL` vs the CPU `q40` PPL (b), and adds a step where the user reads each variant's generated text and approves it (`text approved: y/n`); differing text is not a fail by itself, an unapproved text is not a pass, a PPL regression fails on its own. Option (c) (CPU NEON `_det` twin) is not taken. Same day: PR #124's Mac container environment reverted (`0feb13cf`); the gates run on the workstation only |
