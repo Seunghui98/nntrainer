@@ -128,10 +128,16 @@ typedef struct {
  *        (an A/B, or bisecting a mismatch the self-check reports).
  */
 void hvx_int_gu_worker_c(uint32_t n_threads, uint32_t i, void *job);
-#if defined(__hexagon__)
+/* HEXKL_INT_EPILOGUE_HVX is what test/htp/build.sh defines for the DSP
+   skel, which always compiles hvx_int_epilogue_hvx.c; __hexagon__ is the
+   compiler's own mark, kept as a fallback. */
+#if defined(__hexagon__) || defined(HEXKL_INT_EPILOGUE_HVX)
+#define HVX_INT_EPILOGUE_HAVE_HVX 1
+#endif
+#if defined(HVX_INT_EPILOGUE_HAVE_HVX)
 void hvx_int_gu_worker_hvx(uint32_t n_threads, uint32_t i, void *job);
 #endif
-#if defined(__hexagon__) && !defined(HEXKL_INT_EPILOGUE_SCALAR)
+#if defined(HVX_INT_EPILOGUE_HAVE_HVX) && !defined(HEXKL_INT_EPILOGUE_SCALAR)
 #define hvx_int_gu_worker hvx_int_gu_worker_hvx
 #define hvx_int_rq_rows hvx_int_rq_rows_hvx
 #else
@@ -159,7 +165,7 @@ void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
                        uint32_t batch_cols, uint32_t inter, uint32_t m_valid,
                        uint32_t m0, uint32_t m1, float *scale, int32_t *zp,
                        uint8_t *out_ah);
-#if defined(__hexagon__)
+#if defined(HVX_INT_EPILOGUE_HAVE_HVX)
 /** The HVX version. Rows are done four at a time (one 128-byte store per
  *  k-tile); a group of fewer than four rows at the end of [m0, m1) goes
  *  through the reference. m0 is a multiple of 4. */

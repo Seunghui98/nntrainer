@@ -94,6 +94,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
+    -DHEXKL_INT_EPILOGUE_HVX=1 \
     ${HEXKL_MOE_INT_EPILOGUE:+-DHEXKL_MOE_INT_EPILOGUE=1} \
     ${HEXKL_INT_EPILOGUE_SCALAR:+-DHEXKL_INT_EPILOGUE_SCALAR=1} \
     -Wall -Werror \
