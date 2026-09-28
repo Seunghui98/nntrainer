@@ -366,6 +366,16 @@ public:
     return false;
   }
 
+  // The same for several experts, none at load (doc 52 section 10.23): a
+  // backend with a batched register makes one round trip for all of them.
+  virtual bool
+  register_qs4cx_wh_expert_files(const std::vector<ExpertFileDesc> &ds) {
+    for (const ExpertFileDesc &d : ds)
+      if (!register_qs4cx_wh_expert_file(d, /*at_load=*/false))
+        return false;
+    return true;
+  }
+
   // The same, split so the file reads overlap other work (doc 52 sections
   // 10.10, 10.20): _begin queues one batch -- a slot per expert, read in the
   // background -- and returns; several batches may be in flight. _end waits

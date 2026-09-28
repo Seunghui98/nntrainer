@@ -1097,6 +1097,36 @@ public:
     return true;
   }
 
+  /** [doc 52 section 10.23] One call's misses: each read in turn, then all
+   *  registered in one round trip instead of one each. */
+  bool register_qs4cx_wh_expert_files(
+    const std::vector<ExpertFileDesc> &ds) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    const uint64_t t0 = HtpProfile::nowUs();
+    std::vector<StagedExpert> sts;
+    try {
+      for (const ExpertFileDesc &d : ds) {
+        if (experts_.count(d.key_gu) != 0)
+          continue;
+        sts.push_back(stageExpert(session, d));
+        sts.back().rc = readExpert(sts.back(), /*use_pool=*/true);
+      }
+    } catch (...) {
+      for (const StagedExpert &st : sts)
+        free_expert_slots_.push_back(st.slot);
+      throw;
+    }
+    const uint64_t t_read = HtpProfile::nowUs();
+    registerStagedBatch(session, sts); // files what it can, then throws
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level() != 0 && !sts.empty())
+      profile.addExpertLoad(t_read - t0, HtpProfile::nowUs() - t_read,
+                            sts.size());
+    return true;
+  }
+
   /**
    * @brief [doc 52 sections 10.10, 10.20] Queues one batch of experts --
    *        one layer's -- to be read into fresh slots by the prefetch
@@ -1165,17 +1195,16 @@ public:
     }
     const uint64_t t_wait = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(handle_mutex_);
-    std::vector<const void *> keys;
     std::exception_ptr first;
-    for (StagedExpert &st : batch->experts) {
-      try {
-        registerStaged(session, st);
-        keys.push_back(st.d.key_gu);
-      } catch (...) {
-        if (!first)
-          first = std::current_exception();
-      }
+    try {
+      registerStagedBatch(session, batch->experts);
+    } catch (...) {
+      first = std::current_exception();
     }
+    std::vector<const void *> keys;
+    for (const StagedExpert &st : batch->experts)
+      if (experts_.count(st.d.key_gu) != 0)
+        keys.push_back(st.d.key_gu);
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0) // the read time is only what the calls left
       profile.addPrefetch(batch->experts.size(), done_on_entry, t_wait - t0,
@@ -2623,10 +2652,97 @@ private:
       free_expert_slots_.push_back(st.slot);
       throw;
     }
+    fileRegistered(st, h_gu, h_dn);
+  }
+
+  /** @brief Files an expert the DSP has just registered.
+   *  @note Call with handle_mutex_ held. */
+  void fileRegistered(StagedExpert &st, uint32_t h_gu, uint32_t h_dn) {
+    const ExpertFileDesc &d = st.d;
     st.slot.h_gu = st.slot.h_dn = kNoHandle; // released by the swap
     handle_cache_[d.key_gu] = h_gu;
     handle_cache_[d.key_dn] = h_dn;
     experts_.emplace(d.key_gu, ExpertResident{st.slot, d.key_dn, h_gu, h_dn});
+  }
+
+  /**
+   * @brief registerStaged for several experts in ONE round trip (doc 52
+   *        section 10.23): a prefill layer's read-ahead batch, or one call's
+   *        misses. The experts the DSP swapped are filed; one whose read
+   *        failed, and every one from the first the DSP refused on, goes
+   *        back to the free list with its retired pair, which the DSP still
+   *        holds. The first failure is thrown after that.
+   * @note Call with handle_mutex_ held.
+   */
+  void registerStagedBatch(remote_handle64 session,
+                           std::vector<StagedExpert> &sts) {
+    std::exception_ptr first;
+    std::vector<StagedExpert *> ok;
+    for (StagedExpert &st : sts) {
+      if (st.rc == 0) {
+        ok.push_back(&st);
+        continue;
+      }
+      free_expert_slots_.push_back(st.slot);
+      if (!first) {
+        try {
+          throwPread(st.rc, "expert weight");
+        } catch (...) {
+          first = std::current_exception();
+        }
+      }
+    }
+    if (!ok.empty()) {
+      const ExpertFileDesc &d0 = ok[0]->d;
+      const size_t n = ok.size();
+      std::vector<uint32_t> og(n), od(n), ar(n), ofg(n), ofd(n);
+      std::vector<uint32_t> hg(n, kNoHandle), hd(n, kNoHandle);
+      std::vector<float> gs, ds;
+      std::vector<int32_t> gc, dc;
+      for (size_t i = 0; i < n; ++i) {
+        const StagedExpert &st = *ok[i];
+        og[i] = st.slot.h_gu;
+        od[i] = st.slot.h_dn;
+        ar[i] = arena_chunks_[st.slot.chunk].dsp_id;
+        ofg[i] = st.gu.off;
+        ofd[i] = st.dn.off;
+        gs.insert(gs.end(), st.gu.w_scale.begin(), st.gu.w_scale.end());
+        gc.insert(gc.end(), st.gu.colsum_w.begin(), st.gu.colsum_w.end());
+        ds.insert(ds.end(), st.dn.w_scale.begin(), st.dn.w_scale.end());
+        dc.insert(dc.end(), st.dn.colsum_w.begin(), st.dn.colsum_w.end());
+      }
+      const int ni = static_cast<int>(n);
+      uint32_t done = 0;
+      int32_t err = AEE_SUCCESS;
+      const int rc = nntr_hvx_weight_swap_batch_u8i4_arena(
+        session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(), ni,
+        ar.data(), ni, ofg.data(), ni, ofd.data(), ni, gs.data(),
+        static_cast<int>(gs.size()), gc.data(), static_cast<int>(gc.size()),
+        ds.data(), static_cast<int>(ds.size()), dc.data(),
+        static_cast<int>(dc.size()), hg.data(), ni, hd.data(), ni, &done, &err);
+      if (rc != AEE_SUCCESS) { // refused whole: the DSP changed nothing
+        done = 0;
+        err = rc;
+      }
+      for (size_t i = 0; i < n; ++i) {
+        if (i < done)
+          fileRegistered(*ok[i], hg[i], hd[i]);
+        else
+          free_expert_slots_.push_back(ok[i]->slot);
+      }
+      if (done < n && !first) {
+        char code[16];
+        std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(err));
+        first = std::make_exception_ptr(std::runtime_error(
+          std::string("nntr_hvx_weight_swap_batch_u8i4_arena failed: err=") +
+          code + " at expert " + std::to_string(done) + " of " +
+          std::to_string(n) +
+          " (a skel older than test/htp/nntr_hvx.idl answers this call with "
+          "an error: rebuild and push libnntr_hvx_skel.so)"));
+      }
+    }
+    if (first)
+      std::rethrow_exception(first);
   }
 
   /** @brief Starts the readers once, pinned to NNTR_MOE_PREFETCH_CPUS or
