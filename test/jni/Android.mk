@@ -1055,4 +1055,32 @@ LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
 LOCAL_STATIC_LIBRARIES := googletest_main
 
 include $(BUILD_EXECUTABLE)
+
+# [#141] dspqueue vs FastRPC round-trip microbench. dspqueue_* is resolved
+# with dlsym (no import), ENABLE_HEXKL only unlocks htp_rpcmem.h.
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_hvx_dspq
+LOCAL_CFLAGS := -Igoogletest/include -pthread -fexceptions -O3 -DNDK_BUILD=1 \
+	 -DENABLE_HEXKL=1
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_hvx_dspq_bench.cpp \
+	 ../htp/generated/nntr_hvx_stub.c
+
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
+	 $(LOCAL_PATH)/../../nntrainer/tensor/htp_backend \
+	 $(LOCAL_PATH)/../htp/generated \
+	 $(HEXAGON_SDK_ROOT)/incs \
+	 $(HEXAGON_SDK_ROOT)/incs/stddef \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
+
+LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
+	 -lcdsprpc -ldl
+
+LOCAL_STATIC_LIBRARIES := googletest_main
+
+include $(BUILD_EXECUTABLE)
 endif
