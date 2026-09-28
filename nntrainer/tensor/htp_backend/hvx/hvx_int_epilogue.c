@@ -276,10 +276,11 @@ void hvx_int_gu_worker_c(uint32_t n_threads, uint32_t i, void *vjob) {
 
 /* ---- the requantization ---------------------------------------------- */
 
-void hvx_int_rq_rows(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
-                     uint32_t e_stride, uint32_t n_batches, uint32_t batch_cols,
-                     uint32_t inter, uint32_t m_valid, uint32_t m0, uint32_t m1,
-                     float *scale, int32_t *zp, uint8_t *out_ah) {
+void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
+                       uint32_t e_stride, uint32_t n_batches,
+                       uint32_t batch_cols, uint32_t inter, uint32_t m_valid,
+                       uint32_t m0, uint32_t m1, float *scale, int32_t *zp,
+                       uint8_t *out_ah) {
   const uint32_t n_ktiles = inter / 32u;
   for (uint32_t m = m0; m < m1; ++m) {
     uint8_t *blk = out_ah + (size_t)(m / 64u) * n_ktiles * 2048u;
