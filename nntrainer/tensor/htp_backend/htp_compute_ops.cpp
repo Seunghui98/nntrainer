@@ -46,6 +46,7 @@
 #include <cpu_ops_table.h>
 #include <htp_act_quant.h>
 #include <htp_backend.h>
+#include <htp_dspq_wire.h>
 #include <htp_graph_desc.h>
 #include <htp_moe_opts.h>
 #include <htp_q4_0_convert.h>
@@ -54,6 +55,7 @@
 #include <swiglu_det.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -333,10 +335,11 @@ public:
                          uint64_t host_us, const uint32_t *stage_us,
                          const HtpRpcBuffer &act_stage,
                          const HtpRpcBuffer &out_stage, size_t in_arg_bytes,
-                         int kind = 0) {
+                         int kind = 0, bool via_dspq = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     Bucket &b = buckets_[std::make_tuple(K, N_out, M == 1, kind)];
     ++b.calls;
+    b.dspq_calls += via_dspq ? 1 : 0;
     b.rows += M;
     b.host_us += host_us;
     // [#88] What this call staged through, for the staging: line. The
@@ -549,6 +552,9 @@ private:
     size_t stage_out_bytes = 0;
     bool stage_ion = true;
     uint64_t in_arg_bytes = 0;
+    /** [#141] Of calls, how many rode the dspqueue; then in_arg_bytes is
+        the request message, not the stub's non-ION in-args. */
+    uint64_t dspq_calls = 0;
   };
 
   HtpProfile() {
@@ -769,10 +775,20 @@ private:
         // sixth sequence and the rout are the two staging buffers).
         std::fprintf(stderr,
                      "\n[HTP-PROFILE]     staging: act %zu B out %zu B ion=%c  "
-                     "rpc allocs=%u (session)  non-ION in-args=6/%llu B",
+                     "rpc allocs=%u (session)  ",
                      b.stage_act_bytes, b.stage_out_bytes,
-                     b.stage_ion ? 'y' : 'n', HtpRpcBuffer::allocCount(),
-                     (unsigned long long)b.in_arg_bytes);
+                     b.stage_ion ? 'y' : 'n', HtpRpcBuffer::allocCount());
+        if (b.dspq_calls != 0) {
+          // [#141] The request message is copied into the queue's shared
+          // memory; the act/out classes above are the queue's buffers.
+          std::fprintf(stderr, "via=dspq %llu/%llu calls msg=%llu B",
+                       (unsigned long long)b.dspq_calls,
+                       (unsigned long long)b.calls,
+                       (unsigned long long)b.in_arg_bytes);
+        } else {
+          std::fprintf(stderr, "non-ION in-args=6/%llu B",
+                       (unsigned long long)b.in_arg_bytes);
+        }
       }
       std::fprintf(stderr, "\n");
     }
@@ -2593,6 +2609,265 @@ private:
     }
   }
 
+  /** @brief [#141] The M==1 MoE call's dspqueue (plan 141-dspq-moe.md
+   *  section 3.4): the queue, its two ION buffers mapped once, and the
+   *  counters. Shared with the HtpBackend close hook, which tears it down
+   *  before the session closes: the two singletons' destruction order is
+   *  not fixed, so the hook must own what it touches. */
+  struct DspqMoe {
+    enum State { UNTRIED, ON, OFF } state = UNTRIED;
+    bool broken = false; /**< a transport failure after ON: every later
+                              call throws, never FastRPC (section 3.5) */
+    const HtpDspqApi *api = nullptr;
+    dspqueue_t q = nullptr;
+    remote_handle64 session = 0;
+    std::unique_ptr<HtpRpcBuffer> act, out;
+    bool act_mapped = false, out_mapped = false;
+    uint32_t seq = 0;
+    uint64_t calls = 0;
+    uint32_t arm_spin_us = 0;
+    std::atomic<int> cb_err{0}; /**< the queue's error callback */
+    std::vector<uint32_t> msg;  /**< the request message, reused */
+  };
+
+  static constexpr uint32_t kDspqTimeoutUs = 5000000; /**< 5 s, never a hang */
+
+  static void dspqErrorCb(dspqueue_t, AEEResult err, void *ctx) {
+    static_cast<DspqMoe *>(ctx)->cb_err.store(err == 0 ? -1 : err);
+  }
+
+  /** @brief Undoes whatever creation got through, in reverse. */
+  static void dspqRelease(DspqMoe &st) {
+    const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    if (st.act_mapped)
+      mem.munmap(CDSP_DOMAIN_ID, st.act->fd(), st.act->data(), st.act->size());
+    if (st.out_mapped)
+      mem.munmap(CDSP_DOMAIN_ID, st.out->fd(), st.out->data(), st.out->size());
+    st.act_mapped = st.out_mapped = false;
+    if (st.q != nullptr)
+      st.api->close(st.q);
+    st.q = nullptr;
+  }
+
+  /** @brief The close hook: QUIT, stop the DSP thread, close, unmap. */
+  static void dspqTeardown(DspqMoe &st) {
+    if (st.state != DspqMoe::ON)
+      return;
+    st.state = DspqMoe::OFF;
+    const uint32_t quit[2] = {HTP_DSPQ_OP_QUIT, 0};
+    st.api->write(st.q, 0, 0, nullptr, sizeof(quit),
+                  reinterpret_cast<const uint8_t *>(quit), kDspqTimeoutUs);
+    uint32_t res[4] = {0, 0, 0, 0};
+    const int err = nntr_hvx_dspq_stop(st.session, res, 4);
+    std::fprintf(stderr,
+                 "[HTP] dspq: close calls=%llu served=%u bad=%u "
+                 "empty_polls=%u dsp_spin_us=%u stop_err=0x%x\n",
+                 (unsigned long long)st.calls, res[0], res[1], res[2], res[3],
+                 static_cast<unsigned>(err));
+    dspqRelease(st);
+  }
+
+  /** @brief Creation, once, at the first M==1 MoE call (section 3.4); any
+   *  failure prints one "dspq: off" line and is never retried. */
+  void dspqCreate(remote_handle64 session) {
+    auto st = std::make_shared<DspqMoe>();
+    dspq_ = st;
+    st->state = DspqMoe::OFF;
+    st->session = session;
+    char why[96] = "";
+    int err = 0;
+    auto fail = [&](const char *step, int e) {
+      std::snprintf(why, sizeof(why), "%s 0x%x", step,
+                    static_cast<unsigned>(e));
+      err = e != 0 ? e : -1;
+    };
+    const HtpDspqApi &api = HtpDspqApi::get();
+    st->api = &api;
+    const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    if (api.missing != nullptr) {
+      std::snprintf(why, sizeof(why), "dlsym %s", api.missing);
+      err = -1;
+    }
+    if (err == 0) {
+      const int e = api.create(CDSP_DOMAIN_ID, 0, HTP_DSPQ_REQ_QUEUE_BYTES,
+                               HTP_DSPQ_RESP_QUEUE_BYTES, nullptr, dspqErrorCb,
+                               st.get(), &st->q);
+      if (e != AEE_SUCCESS) {
+        st->q = nullptr;
+        fail("create", e);
+      }
+    }
+    uint64_t id = 0;
+    if (err == 0) {
+      const int e = api.export_(st->q, &id);
+      if (e != AEE_SUCCESS)
+        fail("export", e);
+    }
+    if (err == 0) {
+      st->act = std::make_unique<HtpRpcBuffer>(HTP_DSPQ_BUF_BYTES);
+      st->out = std::make_unique<HtpRpcBuffer>(HTP_DSPQ_BUF_BYTES);
+      if (!st->act->isIon() || !st->out->isIon() || st->act->fd() < 0 ||
+          st->out->fd() < 0 || mem.mmap == nullptr) {
+        fail("ion", 0);
+      }
+    }
+    if (err == 0) {
+      int e = mem.mmap(CDSP_DOMAIN_ID, st->act->fd(), st->act->data(), 0,
+                       st->act->size(), FASTRPC_MAP_FD);
+      st->act_mapped = (e == 0);
+      if (e == 0) {
+        e = mem.mmap(CDSP_DOMAIN_ID, st->out->fd(), st->out->data(), 0,
+                     st->out->size(), FASTRPC_MAP_FD);
+        st->out_mapped = (e == 0);
+      }
+      if (e != 0)
+        fail("fastrpc_mmap", e);
+    }
+    const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
+    const uint32_t dsp_spin_us =
+      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
+               : 1000;
+    if (err == 0) {
+      const int e = nntr_hvx_dspq_start(session, id, dsp_spin_us);
+      if (e != AEE_SUCCESS)
+        fail(static_cast<unsigned>(e) == 0x8000040Eu
+               ? "dspq_start (stale skel: rebuild test/htp/build.sh)"
+               : "dspq_start",
+             e);
+    }
+    if (err != 0) {
+      dspqRelease(*st);
+      std::fprintf(stderr,
+                   "[HTP] dspq: off (%s) -- MoE calls stay on FastRPC\n", why);
+      return;
+    }
+    st->state = DspqMoe::ON;
+    st->arm_spin_us = HtpBackend::global().pollUs();
+    std::fprintf(stderr,
+                 "[HTP] dspq: on queue=0x%llx dsp_spin_us=%u arm_spin_us=%u "
+                 "buffers=2x%u ion=y\n",
+                 (unsigned long long)id, dsp_spin_us, st->arm_spin_us,
+                 static_cast<unsigned>(HTP_DSPQ_BUF_BYTES));
+    HtpBackend::global().atClose([st] { dspqTeardown(*st); });
+  }
+
+  /** @brief Whether this call can ride the queue; creates it on first use.
+   *  Caller holds invoke_mutex_. */
+  bool dspqReady(remote_handle64 session, size_t act_bytes, size_t out_bytes,
+                 uint64_t msg_bytes) {
+    static const bool enabled = [] {
+      const char *e = std::getenv("NNTR_HTP_DSPQ");
+      return e != nullptr && std::atoi(e) == 1;
+    }();
+    if (!enabled)
+      return false;
+    if (!dspq_)
+      dspqCreate(session);
+    // The DSP may still hold the failed packet and its buffers: neither a
+    // retry on the queue nor a FastRPC fallback is safe.
+    if (dspq_->broken)
+      throw std::runtime_error("dspq: the queue failed on an earlier call");
+    // ponytail: a call larger than the packet or the 64 KiB buffers takes
+    // FastRPC; every MoE layer of this model has one shape that fits.
+    return dspq_->state == DspqMoe::ON && dspq_->session == session &&
+           act_bytes <= HTP_DSPQ_BUF_BYTES && out_bytes <= HTP_DSPQ_BUF_BYTES &&
+           msg_bytes <= HTP_DSPQ_MAX_MSG;
+  }
+
+  /** @brief One request/response pair (section 3.1); the activation is
+   *  already in the queue's act buffer and the output lands in its out
+   *  buffer. Transport failures throw: the DSP may still hold the packet,
+   *  so a FastRPC retry could run on the same buffers at once. Caller
+   *  holds invoke_mutex_.
+   *  @return the kernel's rc */
+  int dspqCall(unsigned M, unsigned K, unsigned inter, unsigned N_out,
+               const std::vector<uint32_t> &h_gu,
+               const std::vector<uint32_t> &h_dn,
+               const std::vector<unsigned int> &row_index,
+               const std::vector<unsigned int> &row_count,
+               const std::vector<float> &row_weight, size_t act_bytes,
+               size_t out_bytes, uint32_t *stage_us) {
+    static_assert(HTP_MOE_N_STAGES == HTP_DSPQ_STAGES,
+                  "htp_dspq_wire.h's stage count is the timed call's");
+    DspqMoe &st = *dspq_;
+    const uint32_t ne = static_cast<uint32_t>(h_gu.size());
+    const uint32_t nr = static_cast<uint32_t>(row_index.size());
+    const uint32_t seq = ++st.seq;
+    const htp_dspq_req_hdr hdr = {HTP_DSPQ_OP_MOE,
+                                  seq,
+                                  stage_us ? HTP_DSPQ_FLAG_TIMED : 0u,
+                                  M,
+                                  K,
+                                  inter,
+                                  N_out,
+                                  ne,
+                                  nr};
+    const size_t words = htp_dspq_req_bytes(ne, nr) / 4;
+    st.msg.resize(words);
+    uint32_t *w = st.msg.data();
+    std::memcpy(w, &hdr, sizeof(hdr));
+    w += sizeof(hdr) / 4;
+    std::memcpy(w, h_gu.data(), 4u * ne);
+    std::memcpy(w + ne, h_dn.data(), 4u * ne);
+    std::memcpy(w + 2 * ne, row_count.data(), 4u * ne);
+    std::memcpy(w + 3 * ne, row_index.data(), 4u * nr);
+    std::memcpy(w + 3 * ne + nr, row_weight.data(), 4u * nr);
+
+    struct dspqueue_buffer bufs[2] = {};
+    bufs[0].fd = static_cast<uint32_t>(st.act->fd());
+    bufs[0].size = static_cast<uint32_t>(act_bytes);
+    bufs[0].flags = DSPQUEUE_BUFFER_FLAG_REF |
+                    DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER |
+                    DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
+    bufs[0].ptr = st.act->data();
+    bufs[1].fd = static_cast<uint32_t>(st.out->fd());
+    bufs[1].size = static_cast<uint32_t>(out_bytes);
+    bufs[1].flags = DSPQUEUE_BUFFER_FLAG_REF;
+    bufs[1].ptr = st.out->data();
+
+    const HtpDspqApi &api = *st.api;
+    int err = api.write(st.q, 0, 2, bufs, static_cast<uint32_t>(words * 4),
+                        reinterpret_cast<const uint8_t *>(st.msg.data()),
+                        kDspqTimeoutUs);
+    htp_dspq_resp resp;
+    uint32_t flags = 0, rnb = 0, len = 0;
+    struct dspqueue_buffer rbufs[2] = {};
+    if (err == AEE_SUCCESS) {
+      // Spin for the poll-QoS window, as the FastRPC call does, then block.
+      const uint64_t t0 = HtpProfile::nowUs();
+      for (uint32_t spins = 1;; ++spins) {
+        err = api.read_noblock(st.q, &flags, 2, &rnb, rbufs, sizeof(resp), &len,
+                               reinterpret_cast<uint8_t *>(&resp));
+        if (err != AEE_EWOULDBLOCK)
+          break;
+        if ((spins & 255u) == 0 && HtpProfile::nowUs() - t0 >= st.arm_spin_us) {
+          err = api.read(st.q, &flags, 2, &rnb, rbufs, sizeof(resp), &len,
+                         reinterpret_cast<uint8_t *>(&resp), kDspqTimeoutUs);
+          break;
+        }
+      }
+    }
+    const int cb = st.cb_err.load();
+    if (err != AEE_SUCCESS || cb != 0 || len < HTP_DSPQ_RESP_BASE_BYTES ||
+        resp.seq != seq || rnb != 2) {
+      st.broken = true;
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "dspq: MoE call %u failed: err=0x%x cb_err=0x%x len=%u "
+                    "seq=%u nb=%u",
+                    seq, static_cast<unsigned>(err), static_cast<unsigned>(cb),
+                    len, len >= 4 ? resp.seq : 0u, rnb);
+      throw std::runtime_error(msg);
+    }
+    ++st.calls;
+    if (stage_us != nullptr && resp.rc == AEE_SUCCESS) {
+      if (len != HTP_DSPQ_RESP_BASE_BYTES + 4u * HTP_DSPQ_STAGES)
+        throw std::runtime_error("dspq: timed response without stage slots");
+      std::memcpy(stage_us, resp.stage_us, sizeof(resp.stage_us));
+    }
+    return resp.rc;
+  }
+
   /** @brief [doc 46] One call for the whole layer.
    *
    *  The activation goes over once instead of once per expert, and the
@@ -2612,14 +2887,27 @@ private:
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
+    const size_t act_bytes = static_cast<size_t>(act_len) * sizeof(float);
+    const size_t out_bytes = static_cast<size_t>(out_len) * sizeof(float);
+    const uint64_t msg_bytes =
+      htp_dspq_req_bytes(static_cast<uint32_t>(h_gu.size()),
+                         static_cast<uint32_t>(row_index.size()));
+
     std::lock_guard<std::mutex> lock(invoke_mutex_);
+    // [#141] The M==1 MoE call rides the dspqueue under NNTR_HTP_DSPQ=1:
+    // the same DSP function, the same argument bytes, only the transport
+    // differs. Anything the packet cannot carry stays on FastRPC.
+    const bool via_dspq = M == 1 && kind == 0 && h_dn.size() == h_gu.size() &&
+                          row_count.size() == h_gu.size() &&
+                          row_weight.size() == row_index.size() &&
+                          dspqReady(session, act_bytes, out_bytes, msg_bytes);
     HtpRpcBuffer &act_stage =
-      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float));
+      via_dspq ? *dspq_->act : stage(act_pool_, act_bytes);
     HtpRpcBuffer &out_stage =
-      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float));
+      via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
-    stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
+    stagedMemcpy(act_f32, act, act_bytes);
 
     // The five small sequences (handles, routing) go from the heap. Tried
     // from one rpcmem buffer (doc 51 section 2.26): transport 627 -> 605
@@ -2645,22 +2933,25 @@ private:
     for (int rep = 0; rep < reps && err == AEE_SUCCESS; ++rep) {
       uint32_t rep_stage[HTP_MOE_N_STAGES] = {0};
       const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
-      err = timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
-                      session, M, K, inter, N_out, h_gu.data(),
-                      static_cast<int>(h_gu.size()), h_dn.data(),
-                      static_cast<int>(h_dn.size()), row_index.data(),
-                      static_cast<int>(row_index.size()), row_count.data(),
-                      static_cast<int>(row_count.size()), row_weight.data(),
-                      static_cast<int>(row_weight.size()), act_f32, act_len,
-                      out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
-                  : nntr_hvx_mm_u8i4_moe_layer(
-                      session, M, K, inter, N_out, h_gu.data(),
-                      static_cast<int>(h_gu.size()), h_dn.data(),
-                      static_cast<int>(h_dn.size()), row_index.data(),
-                      static_cast<int>(row_index.size()), row_count.data(),
-                      static_cast<int>(row_count.size()), row_weight.data(),
-                      static_cast<int>(row_weight.size()), act_f32, act_len,
-                      out_f32, out_len);
+      err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
+                                row_count, row_weight, act_bytes, out_bytes,
+                                timed ? rep_stage : nullptr)
+            : timed  ? nntr_hvx_mm_u8i4_moe_layer_timed(
+                         session, M, K, inter, N_out, h_gu.data(),
+                         static_cast<int>(h_gu.size()), h_dn.data(),
+                         static_cast<int>(h_dn.size()), row_index.data(),
+                         static_cast<int>(row_index.size()), row_count.data(),
+                         static_cast<int>(row_count.size()), row_weight.data(),
+                         static_cast<int>(row_weight.size()), act_f32, act_len,
+                         out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
+                    : nntr_hvx_mm_u8i4_moe_layer(
+                        session, M, K, inter, N_out, h_gu.data(),
+                        static_cast<int>(h_gu.size()), h_dn.data(),
+                        static_cast<int>(h_dn.size()), row_index.data(),
+                        static_cast<int>(row_index.size()), row_count.data(),
+                        static_cast<int>(row_count.size()), row_weight.data(),
+                        static_cast<int>(row_weight.size()), act_f32, act_len,
+                        out_f32, out_len);
       const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
       // Fastest wins, stages and all, so the breakdown describes one real call
       // rather than a mix of a fast one and a slow one.
@@ -2690,9 +2981,10 @@ private:
       throw std::runtime_error(
         std::string(timed ? "nntr_hvx_mm_u8i4_moe_layer_timed"
                           : "nntr_hvx_mm_u8i4_moe_layer") +
-        " failed: err=" + std::to_string(err) + hint);
+        " failed: err=" + std::to_string(err) + hint +
+        (via_dspq ? " (via dspq)" : ""));
     }
-    stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
+    stagedMemcpy(out, out_f32, out_bytes);
     dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
                 static_cast<size_t>(out_len), M, K, inter, N_out, kind,
                 row_count);
@@ -2701,11 +2993,13 @@ private:
       // primitive block (_primIn[12] in generated/nntr_hvx_stub.c) and the
       // five uint32/float sequences that are not the staged activation.
       const size_t in_arg_bytes =
-        48 + sizeof(uint32_t) * (h_gu.size() + h_dn.size() + row_index.size() +
-                                 row_count.size() + row_weight.size());
+        via_dspq ? static_cast<size_t>(msg_bytes)
+                 : 48 + sizeof(uint32_t) *
+                          (h_gu.size() + h_dn.size() + row_index.size() +
+                           row_count.size() + row_weight.size());
       profile.addInvokeMoeLayer(M, K, N_out, elapsed,
                                 timed ? stage_us : nullptr, act_stage,
-                                out_stage, in_arg_bytes, kind);
+                                out_stage, in_arg_bytes, kind, via_dspq);
     }
     if (timed) {
       // [#87] The per-descriptor trace of the last repeat, for the first
@@ -3822,6 +4116,9 @@ private:
   uint64_t fwd_tokens_ = 0; /**< of them at the first resident op */
   StagingPool act_pool_;
   StagingPool out_pool_;
+  /** [#141] The M==1 MoE call's dspqueue; null until the first such call
+      under NNTR_HTP_DSPQ=1. */
+  std::shared_ptr<DspqMoe> dspq_;
   /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
   std::unique_ptr<HtpRpcBuffer> conv_buf_;
 

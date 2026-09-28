@@ -28,8 +28,6 @@
 #include <string>
 #include <vector>
 
-#include <dlfcn.h>
-
 #include "dspqueue.h"
 #include "htp_rpc_bench.h"
 #include "htp_rpcmem.h"
@@ -37,6 +35,7 @@
 
 namespace {
 
+using DspqApi = nntrainer::HtpDspqApi;
 using nntrainer::HtpRpcBuffer;
 using nntrainer::HtpRpcMemApi;
 using Clock = std::chrono::steady_clock;
@@ -46,36 +45,6 @@ constexpr int kTimed = 1000;
 constexpr uint32_t kPay = 12288;             // one activation row, 12 KiB
 constexpr uint32_t kReadTimeoutUs = 5000000; // arm=B: 5 s, never a hang
 constexpr uint32_t kOpEcho = 1, kOpQuit = 2; // nntr_hvx_dspq_bench.c
-
-/** dspqueue, resolved at runtime (htp_rpcmem.h's precedent for rpcmem). */
-struct DspqApi {
-  decltype(&dspqueue_create) create = nullptr;
-  decltype(&dspqueue_close) close = nullptr;
-  decltype(&dspqueue_export) export_ = nullptr;
-  decltype(&dspqueue_write) write = nullptr;
-  decltype(&dspqueue_read) read = nullptr;
-  decltype(&dspqueue_read_noblock) read_noblock = nullptr;
-  decltype(&dspqueue_get_stat) get_stat = nullptr;
-  const char *missing = nullptr; /**< first unresolved name, or null */
-
-  DspqApi() {
-    resolve(create, "dspqueue_create");
-    resolve(close, "dspqueue_close");
-    resolve(export_, "dspqueue_export");
-    resolve(write, "dspqueue_write");
-    resolve(read, "dspqueue_read");
-    resolve(read_noblock, "dspqueue_read_noblock");
-    resolve(get_stat, "dspqueue_get_stat");
-  }
-
-private:
-  template <typename F> void resolve(F &f, const char *name) {
-    f = reinterpret_cast<F>(dlsym(RTLD_DEFAULT, name));
-    if (f == nullptr && missing == nullptr) {
-      missing = name;
-    }
-  }
-};
 
 /** @brief One row's statistics over the timed samples (µs). */
 struct Row {

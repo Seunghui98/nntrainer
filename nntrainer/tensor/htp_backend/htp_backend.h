@@ -35,6 +35,8 @@
 #ifdef ENABLE_HEXKL
 
 #include <cstdint>
+#include <functional>
+#include <vector>
 
 namespace nntrainer {
 
@@ -72,6 +74,22 @@ public:
    */
   int qosMode() const { return qos_mode_; }
 
+  /**
+   * @brief The poll-QoS window the driver accepted, in us (NNTR_HTP_POLL_US,
+   *        default 5000), or 0 when poll QoS was refused (qosMode() != 2):
+   *        how long a FastRPC call spins before it blocks. [#141] The
+   *        dspqueue MoE call spins its response wait for the same window.
+   */
+  uint32_t pollUs() const { return poll_us_; }
+
+  /**
+   * @brief [#141] Runs fn in ~HtpBackend, in registration order, before
+   *        the session is closed: the shutdown hook for state that makes
+   *        RPC calls on the session (the dspqueue thread). fn must own
+   *        what it touches; HtpComputeOps may already be destroyed.
+   */
+  void atClose(std::function<void()> fn) { at_close_.push_back(std::move(fn)); }
+
   ~HtpBackend();
 
   HtpBackend(const HtpBackend &) = delete;
@@ -84,6 +102,8 @@ private:
   uint64_t handle_ = 0; ///< remote_handle64 from nntr_hvx_open; opaque here
                         ///< so this header does not need <remote.h>.
   int qos_mode_ = 0;
+  uint32_t poll_us_ = 0;
+  std::vector<std::function<void()>> at_close_;
 };
 
 } // namespace nntrainer
