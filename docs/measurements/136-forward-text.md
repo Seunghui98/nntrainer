@@ -121,3 +121,23 @@ for the re-plan: the silicon `HvxM1Ops` gtest failure `rmsnorm kind=2
 bad_y=2048` (every element of one norm kind differs, #137) — larger than the
 "subnormal ulp" reading of rule 37 — and whatever the Android CPU path does
 differently from the host's in the norm (fp16 activations, NEON rsqrt).
+
+## Kernel-level check (workstation, from the `MOE,RMSNORM` dump)
+
+Each RMSNORM stretch's dumped input recomputed in the Android CPU's order
+(`neon::rms_norm_wrt_width_fp32_intrinsic`: 4 × 4-lane FMA accumulators, f32
+`1 / sqrt(mean + eps)`), with gamma implied from the DSP output, against the
+DSP output: **131–148 dB** (last-bit differences). Row scale vs an f64
+reference: DSP 0.7–3.9 × 10⁻⁸, CPU order 1.5–27 × 10⁻⁸ — the DSP kernel is
+the closer of the two.
+
+**So the resident RMSNORM is correct on silicon; the 34 dB at the first MoE
+input is last-bit differences amplified by the quantized pipeline between
+the norm and the MoE** (the CPU Q4_0 GEMM's per-block activation quantizer
+and the MoE's u8 quantizer flip a level wherever a value sits at a rounding
+boundary; LEDGER ⑱ recorded the same mechanism). Two such perturbations flip
+the greedy token at pos 512 on this prompt. #136 is therefore not a defect in
+the wired kinds: "text identical to the CPU run" cannot hold for any resident
+kind on this pipeline, however exact the kernel. The accuracy gate for the
+per-token entry needs the decode-side PPL (#134) to judge quality, not text
+identity.
