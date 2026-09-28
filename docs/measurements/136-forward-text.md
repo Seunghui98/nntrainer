@@ -84,3 +84,40 @@ six-kind run 287 / 59400, after four bisect cells 322 / 56000, end 342 / 55600.
 
 Logs: `/local/mnt/workspace/htp_moe/136/logs/` (`off_G64_r1`, `fwd_G64_r1`,
 `k_<mask>`, `md5.log`, `therm.log`).
+
+## Dump sitting (same day 16:50–17:00, same unit and artifacts, G = 4)
+
+`NNTR_HTP_DUMP=<dir>` (+ `NNTR_HTP_DUMP_ALL=1` for switch-on runs) on six
+runs: switch off (twice), `KINDS=MOE`, `MOE,RMSNORM`, `MOE,ROPE,ATTN_M1`, and
+the failing `MOE,RMSNORM,ROPE,ATTN_M1`. Dumps under
+`/local/mnt/workspace/htp_moe/136/dump_<run>/`. SNR of each MoE call's input
+against the first switch-off run (prefill = calls 0–22, decode token 1 =
+calls 23–44, token 2 = 45–):
+
+| run | prefill | decode token 1 (first → last MoE layer) | decode token 2 | text (G = 4) |
+|---|---|---|---|---|
+| switch off, second run | 23/23 bit-identical | all bit-identical | bit-identical | same |
+| `KINDS=MOE` | 23/23 bit-identical | all bit-identical | bit-identical | same |
+| `MOE,RMSNORM` | bit-identical | 34.2 → … → 18.2 dB | 34.6 dB (recovers) | same |
+| `MOE,ROPE,ATTN_M1` | bit-identical | 40.2 → … → 18.3 dB | 43.6 dB (recovers) | same |
+| **`MOE,RMSNORM,ROPE,ATTN_M1`** | bit-identical | 33.7 → … → 18.3 dB | **−1.6 dB** (another token) | **differs** (`town` → `final`) |
+
+Per stretch, the failing run at pos 512 matches the `MOE,RMSNORM` run's
+RMSNORM stretches and the `MOE,ROPE,ATTN_M1` run's attention stretches at
+28–46 dB (layer 0's norm bit-identical); at pos 513 the very first RMSNORM
+input (layer 0, the new token's embedding) is at 0.2 dB: the token chosen at
+pos 512 differs. The KV seeds are byte-identical across runs.
+
+**Reading.** The CPU switch-off path and the MoE-only entry are bit-exact run
+to run, so every dB below ∞ is what a resident kind puts in. **On silicon a
+resident RMSNORM alone moves the first decode token's first MoE input to
+34 dB (≈ 2 % relative) and the last to 18 dB; the attention stretch alone does
+the same (40 → 18 dB).** Each alone leaves the greedy token unchanged at this
+prompt; together the two deviations flip the token decided at pos 512, and
+the text runs away from there. So #136 is **not a logic / binding / race
+fault**: it is two per-kind numeric deviations far larger than the host
+measured (RMSNORM 129 dB, attention 39 dB on the fixture), stacked. Leads
+for the re-plan: the silicon `HvxM1Ops` gtest failure `rmsnorm kind=2
+bad_y=2048` (every element of one norm kind differs, #137) — larger than the
+"subnormal ulp" reading of rule 37 — and whatever the Android CPU path does
+differently from the host's in the norm (fp16 activations, NEON rsqrt).
