@@ -232,7 +232,9 @@ interface nntr_hvx : remote_handle64 {
    // attn_f16_prefill_resident's contract over a quantized cache: Q as
    // per-row uint8, K^T / V as the cache's int8 or int4 tiles, P as uint8
    // with the per-token V scales folded in, f32 output. stats_us is in
-   // the order of hexkl_attn_q_stats (9 phase times, then the block count).
+   // the order of hexkl_attn_q_stats: 9 phase times, the block count, the
+   // whole call in microseconds, and its processor kilocycles (their ratio
+   // is the clock the DSP ran at).
    AEEResult attn_q_prefill(in uint32 kv_handle, in uint32 n_q,
                             in uint32 cache_from, in uint32 cache_to,
                             in uint32 n_head_q, in uint32 window,

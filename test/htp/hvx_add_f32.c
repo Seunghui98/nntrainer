@@ -15,6 +15,7 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <HAP_power.h>
 #include <remote.h>
 
 #include <hexagon_types.h>
@@ -31,12 +32,80 @@
 /** @brief float lanes per HVX vector. */
 #define LANES ((int)(VLEN / sizeof(float)))
 
+/**
+ * @brief Votes the DSP to its top clocks for the life of the session:
+ *        compute client class, core and bus at the maximum corner with
+ *        DCVS and sleep off, HVX on, HMX on at its maximum clock -- the
+ *        sequence llama.cpp's HTP backend uses. Without a vote the core
+ *        runs at whatever DCVS picked for a bursty client, and every
+ *        kernel time here (and their ratios to each other) moves with it.
+ *        The session pointer is the vote's context; the vote ends with the
+ *        process.
+ */
+static int nntr_hvx_power_vote(void *ctx) {
+  HAP_power_request_t req;
+  memset(&req, 0, sizeof(req));
+  req.type = HAP_power_set_apptype;
+  req.apptype = HAP_POWER_COMPUTE_CLIENT_CLASS;
+  int res = HAP_power_set(ctx, &req);
+  if (res != AEE_SUCCESS) {
+    return res;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = HAP_power_set_DCVS_v3;
+  req.dcvs_v3.set_dcvs_enable = TRUE;
+  req.dcvs_v3.dcvs_enable = FALSE;
+  req.dcvs_v3.set_core_params = TRUE;
+  req.dcvs_v3.core_params.min_corner = HAP_DCVS_VCORNER_MAX;
+  req.dcvs_v3.core_params.max_corner = HAP_DCVS_VCORNER_MAX;
+  req.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
+  req.dcvs_v3.set_bus_params = TRUE;
+  req.dcvs_v3.bus_params.min_corner = HAP_DCVS_VCORNER_MAX;
+  req.dcvs_v3.bus_params.max_corner = HAP_DCVS_VCORNER_MAX;
+  req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_MAX;
+  req.dcvs_v3.set_sleep_disable = TRUE;
+  req.dcvs_v3.sleep_disable = TRUE;
+  res = HAP_power_set(ctx, &req);
+  if (res != AEE_SUCCESS) {
+    return res;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = HAP_power_set_HVX;
+  req.hvx.power_up = TRUE;
+  res = HAP_power_set(ctx, &req);
+  if (res != AEE_SUCCESS) {
+    return res;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = HAP_power_set_HMX_v2;
+  req.hmx_v2.set_power = TRUE;
+  req.hmx_v2.power_up = TRUE;
+  req.hmx_v2.set_clock = TRUE;
+  req.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
+  req.hmx_v2.min_corner = HAP_DCVS_EXP_VCORNER_MAX;
+  req.hmx_v2.max_corner = HAP_DCVS_EXP_VCORNER_MAX;
+  req.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
+  return HAP_power_set(ctx, &req);
+}
+
 int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   (void)uri;
 
   nntr_hvx_session *s = (nntr_hvx_session *)calloc(1, sizeof(nntr_hvx_session));
   if (!s) {
     return AEE_ENOMEMORY;
+  }
+
+  // Before hw_init: HexKL's own setup does not vote, and the HMX lock is
+  // easier to get with the unit powered.
+  int pres = nntr_hvx_power_vote(s);
+  if (pres != AEE_SUCCESS) {
+    // A part without a separate HMX clock rejects the HMX_v2 request; the
+    // core/bus votes above already went through. Report, keep going.
+    FARF(ALWAYS, "nntr_hvx_open: power vote returned 0x%08x", pres);
   }
 
   // hw_init and the HMX lock happen once here, for the session's whole

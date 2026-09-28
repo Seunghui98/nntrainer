@@ -38,28 +38,33 @@ device (SM8850 / v81), Q3's kind switch came for free with Q2. Branch:
   groups behave very differently from uniform noise. Smaller blocks make u8
   P *more* precise (the row max is local), which also rules out a
   global-max two-pass P for accuracy reasons.
-- Q2 performance (128x1024, 16/4 heads, hd 128, on-DSP): 16 ms against the
-  fp16 resident path's 2.6 ms. HMX is not the problem (Q.K^T 0.48 ms, P'.V
-  0.48 ms, of which most is the 0.38 us int32 accumulator readouts); the
-  HVX passes are: acc->S dequant 3.8 ms, f32 O update 4.5 ms, P' quant
-  2.3 ms, Q prep 2.4 ms -- 60-70 cycles per 64-row tile row for ~10 vector
-  ops, i.e. latency-bound single-row loops, plus a pool fork/join and two
-  mallocs per q block in Q prep. Fixing that (rows unrolled 4-wide, Q
-  quantized once per head, block scales staged as vectors, larger bc)
-  is Phase Q2b, before the decode kernel; the expectation stays "near
-  fp16 for prefill, the wins are memory and decode".
+- Q2b (throughput): 128x1024 (16/4 heads, hd 128) went from 16 ms to
+  3.95 ms on-DSP against the fp16 resident path's 2.58 ms; 32x4096 from
+  12.0 to 2.69 ms. The DSP runs at 2.1 GHz throughout (measured from the
+  processor cycle counter the stats now carry). The cause was not the
+  arithmetic: **the scalar unit's access to VTCM is slow** (tens of cycles
+  per load or store, not pipelined). The first kernel kept its per-row
+  metadata -- Q scales and zero points, P' scales, rescale factors -- in
+  VTCM and read them with scalar loads to feed `vsplat`; gathered Q rows
+  and block V scales into VTCM with `memcpy` and scalar stores; and
+  extracted row maxima to scalars (`vextract`) for a scalar divide. Each
+  cost 60-140 cycles per tile row against ~15 of vector work. Now the
+  metadata lives in cached heap memory, Q rows are gathered with vector
+  loads and stores, the registry stores V scales group-major so P-quant
+  reads a block's scales from DDR as one unaligned vector per column tile
+  (no staging), and the P' scale path is all vectors (row max broadcast by
+  the reduction, Newton reciprocal, scale stored as the splat the O update
+  loads). The rule for this backend: **VTCM is for vector instructions and
+  DMA only; anything the scalar unit touches goes in heap memory.**
 
-Goal: the same attention layer (`MHACoreLayer` -> `ComputeOps` -> FastRPC ->
-HMX/HVX) with the KV cache held as int8 (A8W8) or int4 (A8W4) on the DSP and
-the matmuls run on HMX's 8-bit port through the HexKL kernels this tree
-already uses for its A8W4/A8W8 fully-connected layers
-(`hexkl_micro_hmx_mm_u8i8` / `_u8i4`, `rm_to_wh_i8` / `_i4`, the int32
-accumulator), with `hvx_quant_u8` / `hvx_dequant_i32` and the fp16 attention's
-HVX softmax reused as they are.
-
-"A8" is the activation port: Q and the probabilities P enter HMX as uint8.
-"W8" / "W4" is what plays the weight: K^T in Q.K^T and V in P.V, i.e. the
-cache.
+  Phase times, 128x1024, us: qprep 359, dma 259, qk 335, dequant 470,
+  softmax 387 (exposed), pquant 1316, pv 304, oupd 308, store 119. What is
+  left is P-quant's arithmetic on the pool (two passes over P per V
+  group); folding its row-max pass into the shared softmax's pass 2 would
+  take ~0.4 ms more, later. Also from this phase: `nntr_hvx_open` now
+  votes the DSP to its top core / bus / HMX clocks (llama.cpp's sequence);
+  it trimmed the HMX phases by ~30% and is a precondition for comparable
+  numbers.
 
 ## 1. Where things stand
 
@@ -274,7 +279,7 @@ CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 |---|---|---|
 | Q1 | `hexkl_acc_tile` port; `hexkl_kv_q` registry + on-DSP quantizer; IDL register/append/release + a `kv_q_dump` debug entry; host references for the quantizer | host: quantizer/dequant round trip; device: dump == host reference bit-exact, acc layout probe usable |
 | Q2 | `hexkl_attn_q_plan.h` + host test; A8W8 / A8W4 prefill kernel; `attn_q_prefill`; CPU model of the arithmetic | done: DSP vs model >= 45 dB on the fp16 suite's shapes (softcap, sink, window, GQA, both kinds); scheme SNR in the status header |
-| Q2b | HVX passes at throughput: 4-row unrolled dequant / O update / P' quant, Q quantized once per head, vector-staged block scales, bc chooser for the int path | 128x1024 within 1.5x of the fp16 resident path |
+| Q2b | HVX passes at throughput: no scalar VTCM access (metadata in heap, vector gathers, group-major V scales read from DDR, all-vector P' scales), Q quantized once per head chunk, DSP power vote | done: 128x1024 at 1.53x of the fp16 resident path, 3.95 vs 2.58 ms |
 | Q3 | (folded into Q2: the kind switch is one struct) mixed K/V kinds if real data asks for K i8 + V i4 | -- |
 | Q4 | `hvx_attn_decode_q` (A8W8, then A8W4 via unpack) | SNR >= 40 / 30 dB; time vs fp16 decode at 1x1024, 1x4096 |
 | Q5 | `ComputeOps` seam, `HtpComputeOps`, `MHACoreLayer` append/by-handle, config key | CausalLM runs with `attention_kv_dtype` on device; output tokens match fp16 run on a short prompt |
