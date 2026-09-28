@@ -594,12 +594,26 @@ interface nntr_hvx : remote_handle64 {
    // before the first forward that runs it: which is HTP_GRAPH_PARAM_*
    // (htp_graph_desc.h, the lengths beside it) -- a norm's gamma (K, or
    // q | k gamma of 2 x head_dim for QK_NORM), a conv op's weights (3N)
-   // or its state seed (2N, re-sendable), or the RoPE table (max_seq x
-   // 64 with op == HTP_GRAPH_NO_OP). The copy lives on the DSP heap for
+   // or its state seed (2N, re-sendable), the RoPE table (max_seq x 64
+   // with op == HTP_GRAPH_NO_OP), or a ROUTER_TOPK op's gate weight
+   // (K x n_experts, [K][E]) and bias (n_experts) (#132). The copy lives on the DSP heap for
    // the graph's life (plan 130 section 3.1), so the per-token calls
    // carry activations only. A wrong length or a kind that does not take
    // which is AEE_EINVALIDFORMAT, an op or which out of range
    // AEE_EBADITEM, no graph AEE_EBADSTATE; never AEE_EBADPARM.
    AEEResult graph_set_param(in uint32 op, in uint32 which,
                              in sequence<float> data);
+
+   // [#132] The MoE router of one token (hvx_m1_ops_f32.c's
+   // hvx_router_topk_f32) against the scalar spec m1_router_topk_det
+   // (nntrainer/tensor/m1_ops_det.h): K = xLen (a multiple of 4), E =
+   // biasLen (1..32), w the [K][E] gate weight; logits (E), the top_k
+   // selected experts in selection order and their routing weights. A bad
+   // shape is AEE_EINVALIDFORMAT; never AEE_EBADPARM.
+   AEEResult router_topk_det_f32(in uint32 top_k, in sequence<float> x,
+                                 in sequence<float> w,
+                                 in sequence<float> bias,
+                                 rout sequence<float> logits,
+                                 rout sequence<uint32> sel,
+                                 rout sequence<float> weight);
 };
