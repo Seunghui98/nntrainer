@@ -24,7 +24,8 @@
  *
  * The prompt is deterministic, ids[i] = 1 + (7 i mod 30): inside the
  * 32-token vocabulary, never bos (0) or eos (31). Output:
- *   E2E step k pos=p n=m top1=t logprob=l     (k = 0 is the prefill)
+ *   E2E step k pos=p n=m top1=t logprob=l margin=d   (k = 0 is the prefill;
+ *                                                     d = top1 - top2 logit)
  *   E2E gen t0 t1 ...
  * Exit 0, or 1 with `E2E FAIL <reason>` on any exception.
  */
@@ -135,13 +136,18 @@ int run(const Options &o) {
     ids, o.steps, [&](size_t step, const float *logits) {
       const float *top = std::max_element(logits, logits + vocab);
       double lse = 0.0;
-      for (size_t v = 0; v < vocab; ++v)
+      float second = -INFINITY;
+      for (size_t v = 0; v < vocab; ++v) {
         lse += std::exp(static_cast<double>(logits[v] - *top));
+        if (logits + v != top && logits[v] > second)
+          second = logits[v];
+      }
       const double logprob = -std::log(lse);
-      std::printf("E2E step %zu pos=%u n=%u top1=%ld logprob=%.6f\n", step,
-                  step == 0 ? 0u : o.prompt + static_cast<unsigned>(step) - 1u,
-                  step == 0 ? o.prompt : 1u, static_cast<long>(top - logits),
-                  logprob);
+      std::printf(
+        "E2E step %zu pos=%u n=%u top1=%ld logprob=%.6f margin=%.6f\n", step,
+        step == 0 ? 0u : o.prompt + static_cast<unsigned>(step) - 1u,
+        step == 0 ? o.prompt : 1u, static_cast<long>(top - logits), logprob,
+        static_cast<double>(*top - second));
       if (!o.dump.empty())
         writeLogits(o.dump, step, logits, vocab);
     });
