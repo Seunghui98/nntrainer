@@ -584,7 +584,9 @@ interface nntr_hvx : remote_handle64 {
    // model's 1/sqrt(head_dim). pos <= the layer's length: equal appends,
    // less rewinds. stats is empty, or 2 * n_kv * gqa floats receiving
    // (m, l) per q head -- the localising intermediates a device mismatch
-   // is read with; production passes it empty and pays nothing.
+   // is read with; production passes it empty and pays nothing. [#146]
+   // 2 * n_kv * gqa + ATTN_M1_PROF_WORDS floats also receives the phase
+   // pcycle words after the pairs (uint32 bits, attn_m1_det.h).
    AEEResult attn_m1_forward(in uint32 layer, in uint32 pos, in float scale,
                              in sequence<float> q, in sequence<float> k,
                              in sequence<float> v, rout sequence<float> y,
