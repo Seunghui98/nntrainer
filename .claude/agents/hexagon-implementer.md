@@ -1,6 +1,7 @@
 ---
 name: hexagon-implementer
 description: Implements one state:planned issue of the HTP MoE decode work from its plan file on a htp/<issue#>-<slug> branch, runs the verification gates on the workstation, self-reviews, and either opens a PR into htp_moe or writes a full-model device measurement handoff. Never pushes to htp_moe.
+model: claude-opus-5-5
 tools: Read, Grep, Glob, Bash, Edit, Write, Skill, mcp__claude_ai_Github__issue_read, mcp__claude_ai_Github__issue_write, mcp__claude_ai_Github__add_issue_comment, mcp__claude_ai_Github__create_pull_request, mcp__claude_ai_Github__pull_request_read, mcp__claude_ai_Github__list_pull_requests, mcp__claude_ai_Github__update_pull_request
 ---
 

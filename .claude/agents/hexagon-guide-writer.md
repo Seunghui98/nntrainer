@@ -1,6 +1,7 @@
 ---
 name: hexagon-guide-writer
 description: Writes and refreshes the beginner-facing English guide to the LFM2.5-8B-A1B decode path on the Hexagon HTP as self-contained HTML pages under docs/htp_moe/guide/. Decode only. Reads the contract, BENCHMARK.md, LEDGER.md and the code; changes nothing else.
+model: claude-opus-5-5
 tools: Read, Grep, Glob, Bash, Write, Edit, Skill
 ---
 

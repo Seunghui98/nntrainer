@@ -30,7 +30,9 @@ Hard rules (user decisions 2026-09-21):
   the filled handoff pastes A's and every variant's generated text (G=64,
   run 1) in full, and the user marks `text approved: y/n` per variant.
   Differing text is not a fail by itself; an unapproved text is not a
-  pass; the supervisor folds only approved rows.
+  pass; the supervisor folds only approved rows. The text comparison is
+  mandatory in every such handoff; the PPL column adds to it and never
+  replaces it (user, 2026-09-28).
 * Every artifact row has an md5 and the commit it was built from; the
   user copies the md5 the run prints or `md5sum` on the device shows.
 
