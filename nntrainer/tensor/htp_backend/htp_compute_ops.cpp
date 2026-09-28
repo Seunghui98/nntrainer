@@ -1239,11 +1239,13 @@ public:
                      &row_index, &row_count, &row_weight);
         return;
       }
-      if (M == 1 && !graph_short_warned_) {
+      if (M == 1 && !graph_short_warned_ && moe_bound_ != moe_ops_.size()) {
         // moe_htp_layers naming a subset: the list's MoE ops can never all
         // be bound, so say so once instead of silently taking the
         // per-layer path under a measurement switch. The small-op hooks
-        // read the same condition and return 0 (the CPU path).
+        // read the same condition and return 0 (the CPU path). All bound
+        // but not taken above -- a row the hooks do not drive, or MOE not
+        // resident -- is not this case (#132).
         graph_short_warned_ = true;
         std::fprintf(stderr,
                      "[HTP] graph: %zu of %zu MoE ops bound at the first "
