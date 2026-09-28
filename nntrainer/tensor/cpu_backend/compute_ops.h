@@ -348,6 +348,13 @@ public:
     unsigned int K, inter, N_out;
   };
 
+  // How many expert slots the caller will ever hold at once (the LRU's
+  // capacity), so the backend can size its memory to that instead of to a
+  // fixed chunk. Advisory; call before the first register. Doc 52 section
+  // 10.14: at NNTR_MOE_CACHE_EXPERTS=1 the pool is 116 MiB, and a 256 MiB
+  // chunk would hide the saving.
+  virtual void reserve_qs4cx_wh_expert_slots(size_t n) { (void)n; }
+
   // Reads one expert from the model file into a slot the backend owns and
   // registers it. Idempotent for a key already resident. at_load says
   // whether the profile counts it as load-time registration or as a cache

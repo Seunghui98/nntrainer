@@ -1138,6 +1138,11 @@ public:
     return keys;
   }
 
+  void reserve_qs4cx_wh_expert_slots(size_t n) override {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    expert_slots_wanted_ = n;
+  }
+
   /**
    * @brief Retires one expert without a round trip (doc 52 section 10.12).
    *
@@ -2481,11 +2486,20 @@ private:
                                "differs from the pool's");
     }
     ExpertSlot slot;
+    // A new chunk is sized to the slots still to come when the caller said
+    // how many there will be (reserve_qs4cx_wh_expert_slots), else a full
+    // chunk as before. newChunk rounds up to its 64 MiB grain.
+    const size_t left = expert_slots_wanted_ > expert_slots_placed_
+                          ? expert_slots_wanted_ - expert_slots_placed_
+                          : 0;
+    const size_t want =
+      left != 0 ? std::min(kArenaChunkMax, left * slot_bytes) : kArenaChunkMax;
     if (!free_expert_slots_.empty()) {
       slot = free_expert_slots_.back();
       free_expert_slots_.pop_back();
-    } else if (!place(session, slot_bytes, kArenaChunkMax, &slot.chunk,
-                      &slot.off)) {
+    } else if (place(session, slot_bytes, want, &slot.chunk, &slot.off)) {
+      ++expert_slots_placed_;
+    } else {
       throw std::runtime_error(
         "HTP arena: cannot place an expert slot (" +
         std::to_string(slot_bytes >> 20) + " MiB). " +
@@ -3105,6 +3119,8 @@ private:
   std::vector<ExpertSlot> free_expert_slots_;
   std::unordered_map<const void *, ExpertResident> experts_;
   size_t expert_slot_bytes_ = 0;
+  /** reserve_qs4cx_wh_expert_slots's count, and slots placed so far. */
+  size_t expert_slots_wanted_ = 0, expert_slots_placed_ = 0;
   /** Slices of one expert weight's file read: 3.5 MiB over 8 is 448 KiB a
    *  pread, past which the per-call cost stops paying for the split. */
   static constexpr size_t kExpertReadSlicesMax = 8;
