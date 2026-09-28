@@ -521,6 +521,49 @@ int nntr_hvx_weight_swap_u8i4_arena(
   return AEE_SUCCESS;
 }
 
+int nntr_hvx_weight_swap_batch_u8i4_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, const float *gu_scale, int gu_scaleLen,
+  const int32 *gu_colsum, int gu_colsumLen, const float *dn_scale,
+  int dn_scaleLen, const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu,
+  int h_guLen, uint32 *h_dn, int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  const uint32 n_gu = 2u * inter;
+  int i, rc = AEE_SUCCESS;
+  if (!handle || !n_done || !err) {
+    return AEE_EBADPARM;
+  }
+  *n_done = 0;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (uint64_t)gu_scaleLen != (uint64_t)n * n_gu ||
+      (uint64_t)gu_colsumLen != (uint64_t)n * n_gu ||
+      (uint64_t)dn_scaleLen != (uint64_t)n * N_out ||
+      (uint64_t)dn_colsumLen != (uint64_t)n * N_out) {
+    FARF(ERROR, "weight_swap_batch_u8i4_arena: bad lengths (n=%d)", n);
+    return AEE_EBADPARM;
+  }
+  /* One expert at a time through the single call, so each keeps its
+     all-or-nothing guarantee and the batch stops at the first refusal. */
+  for (i = 0; i < n; ++i) {
+    rc = nntr_hvx_weight_swap_u8i4_arena(
+      handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i], off_gu[i],
+      off_dn[i], gu_scale + (size_t)i * n_gu, (int)n_gu,
+      gu_colsum + (size_t)i * n_gu, (int)n_gu, dn_scale + (size_t)i * N_out,
+      (int)N_out, dn_colsum + (size_t)i * N_out, (int)N_out, &h_gu[i],
+      &h_dn[i]);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS; /* a partial batch reports through n_done and err */
+}
+
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
                                 uint32 max_chunks, uint32 *chunks_ok,
                                 int chunks_okLen, uint64 *touched_sum,

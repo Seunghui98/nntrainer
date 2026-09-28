@@ -427,4 +427,30 @@ interface nntr_hvx : remote_handle64 {
                                     in sequence<float> dn_scale,
                                     in sequence<int32> dn_colsum,
                                     rout uint32 h_gu, rout uint32 h_dn);
+
+   // [doc 52 section 10.23] weight_swap_u8i4_arena for n experts in one
+   // round trip -- a prefill layer's read-ahead batch or a decode call's
+   // misses. Expert i's arrays are the i-th n_gu = 2*inter (gate_up) and
+   // N_out (down) entries of the flat sequences; old_*[i] is the pair
+   // retired from its slot (0xFFFFFFFF for none). The experts are swapped
+   // in order, each exactly as the single call does it; on an error at
+   // expert i, experts 0..i-1 are swapped, i onwards untouched, n_done
+   // says i and err holds the error. The call itself fails only when the
+   // lengths disagree, before anything is touched: a failed call's outputs
+   // need not reach the host, so a partial batch has to be a success.
+   // Appended last, like the single call before it.
+   AEEResult weight_swap_batch_u8i4_arena(in uint32 K, in uint32 inter,
+                                          in uint32 N_out,
+                                          in sequence<uint32> old_gu,
+                                          in sequence<uint32> old_dn,
+                                          in sequence<uint32> arena,
+                                          in sequence<uint32> off_gu,
+                                          in sequence<uint32> off_dn,
+                                          in sequence<float> gu_scale,
+                                          in sequence<int32> gu_colsum,
+                                          in sequence<float> dn_scale,
+                                          in sequence<int32> dn_colsum,
+                                          rout sequence<uint32> h_gu,
+                                          rout sequence<uint32> h_dn,
+                                          rout uint32 n_done, rout int32 err);
 };

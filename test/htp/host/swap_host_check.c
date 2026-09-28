@@ -145,6 +145,39 @@ int main(void) {
   CHECK(swap(g2, d2, 100, 4096, &x, &y) != AEE_SUCCESS);
   CHECK(live() == 2);
 
+  /* 6. The batch (doc 52 section 10.23): expert 0 swaps out the live pair
+        into 0/4096, expert 1 is a fresh pair past the arena. Expert 0 must
+        land, expert 1 must not, and the call itself succeeds so the host
+        hears which. */
+  {
+    static float bgs[2 * NGU], bds[2 * NOUT];
+    static int32_t bgc[2 * NGU], bdc[2 * NOUT];
+    for (int e = 0; e < 2; ++e) {
+      memcpy(bgs + e * NGU, gu_s, sizeof(gu_s));
+      memcpy(bgc + e * NGU, gu_c, sizeof(gu_c));
+      memcpy(bds + e * NOUT, dn_s, sizeof(dn_s));
+      memcpy(bdc + e * NOUT, dn_c, sizeof(dn_c));
+    }
+    uint32_t og[2] = {g2, NONE}, od[2] = {d2, NONE}, ar[2] = {0, 0};
+    uint32_t ofg[2] = {0, ARENA - 512}, ofd[2] = {4096, 8192};
+    uint32_t hg[2] = {NONE, NONE}, hd[2] = {NONE, NONE}, done = 99;
+    int32_t err = 0;
+    CHECK(nntr_hvx_weight_swap_batch_u8i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, og, 2, od, 2, ar,
+            2, ofg, 2, ofd, 2, bgs, 2 * NGU, bgc, 2 * NGU, bds, 2 * NOUT, bdc,
+            2 * NOUT, hg, 2, hd, 2, &done, &err) == AEE_SUCCESS);
+    CHECK(done == 1 && err != AEE_SUCCESS);
+    CHECK(live() == 2); /* old pair out, expert 0 in, expert 1 absent */
+    CHECK(g_s.weights_u8i4.slots[hg[0]].wh_bytes == va);
+    CHECK(g_s.weights_u8i4.slots[hd[0]].wh_bytes == va + 4096);
+    /* Lengths that disagree: refused whole, before anything moves. */
+    CHECK(nntr_hvx_weight_swap_batch_u8i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, og, 2, od, 1, ar,
+            2, ofg, 2, ofd, 2, bgs, 2 * NGU, bgc, 2 * NGU, bds, 2 * NOUT, bdc,
+            2 * NOUT, hg, 2, hd, 2, &done, &err) == AEE_EBADPARM);
+    CHECK(done == 0 && live() == 2);
+  }
+
   printf("WEIGHT SWAP OK\n");
   return 0;
 }
