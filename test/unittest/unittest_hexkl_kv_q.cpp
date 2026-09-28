@@ -136,7 +136,7 @@ TEST(HexklKvQ, RegisterRoundsUpAndReleases) {
   // Untouched rows: scale 1, zero values.
   EXPECT_FLOAT_EQ(kv->s_k[hexkl_kv_q_sk_index(kv, 1, 127)], 1.0f);
   EXPECT_FLOAT_EQ(kv->s_v[hexkl_kv_q_sv_index(kv, 1, 127, 1)], 1.0f);
-  EXPECT_EQ(kv->kt4[hexkl_kv_q_kt4_index(kv, 1, 127, 63)], 0);
+  EXPECT_EQ(kv->kt4[hexkl_kv_q_kt4_index(kv, 1, 127, 63)], HEXKL_KV_Q_BIAS);
   EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
   EXPECT_EQ(hexkl_kv_q_get(&tbl, h), nullptr);
   EXPECT_NE(hexkl_kv_q_release(&tbl, h), 0);

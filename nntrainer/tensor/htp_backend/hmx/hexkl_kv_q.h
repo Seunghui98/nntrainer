@@ -20,9 +20,12 @@
  *   read DDR fast and VTCM slowly, so the staging is DDR.
  * - The HVX decode kernel wants one vrmpy per (32 cache rows x 4 dims) for
  *   the scores and per (4 rows x 32 dims) for the values, which fixes the
- *   master layouts: K^T as [hd/4][rows][4] and V as [rows/4][hd][4], both
- *   int8 containers (int4 values in [-8, 7] unpacked; packing is a
- *   follow-up).
+ *   master layouts: K^T as [hd/4][rows][4] and V as [rows/4][hd][4]. They
+ *   are stored offset-binary (value + 128, one byte each; int4 values in
+ *   [-7, 7] unpacked, packing is a follow-up) because vrmpy's vector
+ *   operand is unsigned bytes against a scalar register of 4 unsigned
+ *   bytes -- Q or P' -- and the +128 comes out as one integer correction
+ *   per block (128 * sum of the scalar side's bytes).
  *
  * Scales are symmetric, per token: K one scale per (row, kv head) over
  * head_dim plus colsum (the int sum over head_dim, for the uint8 activation
@@ -45,8 +48,8 @@
 extern "C" {
 #endif
 
-/** @brief Resident caches per session (one per attention layer). */
-#define HEXKL_KV_Q_MAX 64u
+/** @brief Resident caches per session: one per (attention layer, batch). */
+#define HEXKL_KV_Q_MAX 128u
 /** @brief Extra s_v rows after the last head (the largest block size). */
 #define HEXKL_KV_Q_SV_PAD 256u
 
@@ -66,8 +69,8 @@ typedef struct {
   uint32_t head_dim;    /**< multiple of 32, at most 256 */
   uint32_t n_col_tiles; /**< max_rows / 32 */
   uint32_t n_dot_tiles; /**< head_dim / 32 */
-  int8_t *kt4;          /**< [n_head_kv][head_dim/4][max_rows][4] */
-  int8_t *v4;           /**< [n_head_kv][max_rows/4][head_dim][4] */
+  uint8_t *kt4;         /**< [n_head_kv][head_dim/4][max_rows][4], q+128 */
+  uint8_t *v4;          /**< [n_head_kv][max_rows/4][head_dim][4], q+128 */
   float *s_k;           /**< [n_head_kv][max_rows] */
   int32_t *colsum_k;    /**< [n_head_kv][max_rows] */
   float *s_v;           /**< [n_head_kv][head_dim/32][max_rows + pad]: a
@@ -123,6 +126,9 @@ static inline int32_t hexkl_kv_q_qmax(hexkl_kv_q_kind kind) {
 static inline uint32_t hexkl_kv_q_tile_bytes(hexkl_kv_q_kind kind) {
   return kind == HEXKL_KV_Q4 ? 512u : 1024u;
 }
+
+/** @brief Offset-binary encoding of the masters. */
+#define HEXKL_KV_Q_BIAS 128
 
 /** @brief Master index of K[row][dim] for kv head n: 4-dim interleaved. */
 static inline size_t hexkl_kv_q_kt4_index(const hexkl_kv_q *kv, uint32_t n,

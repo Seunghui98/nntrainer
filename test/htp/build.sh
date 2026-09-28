@@ -66,7 +66,7 @@ mkdir -p generated build
 SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_attn_f16.c"
 SRCS="$SRCS nntr_hvx_attn_q.c generated/nntr_hvx_skel.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_acc_tile.c $BACKEND/hmx/hexkl_kv_q.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_attn_q.c"
+SRCS="$SRCS $BACKEND/hmx/hexkl_attn_q.c $BACKEND/hvx/hvx_attn_decode_q.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i8_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_dma_ring.c $BACKEND/hmx/hexkl_attn_f16.c"

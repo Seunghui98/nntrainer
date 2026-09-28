@@ -1,7 +1,11 @@
 # A8W8 / A8W4 flash attention on HMX over a quantized KV cache
 
-Status: 2026-09-28. Phases Q1 and Q2 (A8W8 and A8W4 prefill kernel) run on
-device (SM8850 / v81), Q3's kind switch came for free with Q2. Branch:
+Status: 2026-09-28. Phases Q1, Q2, Q2b (A8W8 and A8W4 prefill kernel, at
+throughput) and Q4 (the vrmpy decode kernel) run on device (SM8850 / v81);
+Q3's kind switch came for free with Q2. Q5 (the `ComputeOps` /
+`MHACoreLayer` seam and the `attention_kv_dtype` config key) is implemented
+and compiles for arm64 and the host; its end-to-end gate is pending an
+Android build of the app. Branch:
 `htp/quant-dequant-hvx-opt`. Builds on `20_hmx_flash_attention_plan.md`
 (fp16 attention, delivered through Phase 4d).
 
@@ -56,6 +60,24 @@ device (SM8850 / v81), Q3's kind switch came for free with Q2. Branch:
   the reduction, Newton reciprocal, scale stored as the splat the O update
   loads). The rule for this backend: **VTCM is for vector instructions and
   DMA only; anything the scalar unit touches goes in heap memory.**
+
+- Q4 (decode): `hvx_attn_decode_q` matches the CPU model (bc = 32, f32
+  scores) to 69-137 dB on every shape (GQA, ragged rows, hd 32..128,
+  window, softcap, sink, both kinds) -- effectively bit-exact, the f32
+  polynomial exp2 and the model's exp2 agreeing to the last bit or two --
+  and its SNR against the exact reference equals the model's: 42 dB at
+  int8 (32-row P' blocks are more precise than the prefill's), 20 dB at
+  int4. On-DSP time, 16/4 heads, hd 128: 1x1024 194 us (fp16 decode
+  963 us, 5.0x), 1x4096 922 us (fp16 3734 us, 4.05x); int4 957 us at 4096
+  -- the same bytes as int8 until the masters are packed. The trick that
+  made it cheap: the masters are stored offset-binary (value + 128) so
+  both matmuls are `vrmpy(Vub, Rub)` with Q or P' as 4 uint8 in a scalar
+  register -- one vector load and one vrmpy per 32 rows x 4 dims (scores)
+  and per 4 rows x 32 dims (values), no splats -- and the +128 comes out as
+  one integer correction per block from the sum of the scalar side's
+  bytes, which the P' quantization computes anyway. Every running softmax
+  quantity is a vector with all lanes equal; nothing is extracted to a
+  scalar and nothing touches VTCM.
 
   Phase times, 128x1024, us: qprep 359, dma 259, qk 335, dequant 470,
   softmax 387 (exposed), pquant 1316, pv 304, oupd 308, store 119. What is
@@ -281,8 +303,8 @@ CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 | Q2 | `hexkl_attn_q_plan.h` + host test; A8W8 / A8W4 prefill kernel; `attn_q_prefill`; CPU model of the arithmetic | done: DSP vs model >= 45 dB on the fp16 suite's shapes (softcap, sink, window, GQA, both kinds); scheme SNR in the status header |
 | Q2b | HVX passes at throughput: no scalar VTCM access (metadata in heap, vector gathers, group-major V scales read from DDR, all-vector P' scales), Q quantized once per head chunk, DSP power vote | done: 128x1024 at 1.53x of the fp16 resident path, 3.95 vs 2.58 ms |
 | Q3 | (folded into Q2: the kind switch is one struct) mixed K/V kinds if real data asks for K i8 + V i4 | -- |
-| Q4 | `hvx_attn_decode_q` (A8W8, then A8W4 via unpack) | SNR >= 40 / 30 dB; time vs fp16 decode at 1x1024, 1x4096 |
-| Q5 | `ComputeOps` seam, `HtpComputeOps`, `MHACoreLayer` append/by-handle, config key | CausalLM runs with `attention_kv_dtype` on device; output tokens match fp16 run on a short prompt |
+| Q4 | `hvx_attn_decode_q`: both kinds from the same offset-binary masters, Q and P' as 4 uint8 in a scalar register against `vrmpy(Vub, Rub)`, f32 softmax with all-lanes-equal running state, nothing touches VTCM | done: DSP vs model 69-137 dB; 5.0x / 4.05x faster than the fp16 decode at 1x1024 / 1x4096 |
+| Q5 | `ComputeOps::kv_cache_q_{register,append,release}` + `sdpa_q_kvcache`, `HtpComputeOps` forwarding, `MHACoreLayer` `kv_cache_quant` property with a per-batch mirror that re-appends from the first row that may differ (rewind, cache load), `attention_kv_dtype` in nntr_config.json | implemented, compiles (host CausalLM, arm64 HTP ops); gate: CausalLM on device with `attention_engine: htp` + `attention_kv_dtype: q8`, tokens vs the fp16 run |
 | Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4; doc update | -- |
 
 ## 5. Risks

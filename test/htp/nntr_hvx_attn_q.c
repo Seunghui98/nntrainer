@@ -14,12 +14,14 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <HAP_perf.h>
 #include <remote.h>
 
 #include "hexkl_acc_tile.h"
 #include "hexkl_attn_q.h"
 #include "hexkl_kv_q.h"
 #include "hexkl_micro.h"
+#include "hvx_attn_decode_q.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -290,5 +292,48 @@ int nntr_hvx_attn_q_prefill(remote_handle64 handle, uint32 kv_handle,
   stats_us[QSTAT_N_BLOCKS] = st.n_blocks;
   stats_us[QSTAT_US_TOTAL] = (uint32)st.us_total;
   stats_us[QSTAT_KCYCLES] = (uint32)(st.pcycles / 1000u);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_attn_q_decode(remote_handle64 handle, uint32 kv_handle, uint32 n_q,
+                           uint32 cache_from, uint32 cache_to, uint32 n_head_q,
+                           uint32 window, float softcap, const float *q_f32,
+                           int q_f32Len, const float *sinks, int sinksLen,
+                           float *out_f32, int out_f32Len, uint32 *stats_us,
+                           int stats_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
+  if (!kv || cache_to > kv->max_rows) {
+    FARF(ERROR, "attn_q_decode: bad handle or cache_to");
+    return AEE_EBADPARM;
+  }
+  hexkl_attn_f16_shape shape = {n_q,           cache_from,   cache_to, n_head_q,
+                                kv->n_head_kv, kv->head_dim, window,   softcap};
+  const uint64_t q_elems = (uint64_t)n_q * n_head_q * kv->head_dim;
+  if ((uint64_t)q_f32Len != q_elems || (uint64_t)out_f32Len != q_elems ||
+      stats_usLen < 2 || (sinksLen != 0 && (uint32)sinksLen != n_head_q)) {
+    FARF(ERROR, "attn_q_decode: bad lengths");
+    return AEE_EBADPARM;
+  }
+  hexkl_attn_q_io io;
+  memset(&io, 0, sizeof(io));
+  io.q = q_f32;
+  io.q_stride = n_head_q * kv->head_dim;
+  io.sinks = sinksLen ? sinks : NULL;
+  io.out = out_f32;
+  io.out_stride = n_head_q * kv->head_dim;
+  io.kv = kv;
+  uint64_t us = 0;
+  const uint64_t c0 = HAP_perf_get_pcycles();
+  int res = hvx_attn_decode_q(&shape, &io, s->quant_pool, &us);
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "attn_q_decode: kernel failed: 0x%08x", res);
+    return res;
+  }
+  stats_us[0] = (uint32)us;
+  stats_us[1] = (uint32)((HAP_perf_get_pcycles() - c0) / 1000u);
   return AEE_SUCCESS;
 }

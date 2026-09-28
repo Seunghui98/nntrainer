@@ -347,6 +347,119 @@ TEST_F(HvxAttnQPrefill, ReportPhaseTimes) {
   RunShape(0, {32, 4064, 4096, 16, 4, 128, 0, 16, 256}, kSnrQ8, true);
 }
 
+/**
+ * @brief The decode kernel against the exact reference and the CPU model
+ *        with its own arithmetic: 32-row P' blocks, f32 scores.
+ */
+class HvxAttnQDecode : public hvx_test::SessionTest {
+protected:
+  void RunDecode(uint32_t kind, const AttnShape &s, double floor_db,
+                 bool report = false) {
+    SCOPED_TRACE(
+      "decode kind=" + std::to_string(kind) + " n_q=" + std::to_string(s.n_q) +
+      " from=" + std::to_string(s.cache_from) + " to=" +
+      std::to_string(s.cache_to) + " hq=" + std::to_string(s.n_head_q) +
+      " hkv=" + std::to_string(s.n_head_kv) +
+      " hd=" + std::to_string(s.head_dim) + " win=" + std::to_string(s.window) +
+      " cap=" + std::to_string(s.softcap) +
+      " sink=" + std::to_string(s.use_sink));
+    const size_t q_elems = static_cast<size_t>(s.n_q) * s.n_head_q * s.head_dim;
+    const uint32_t width = s.n_head_kv * s.head_dim;
+    const size_t kv_elems = static_cast<size_t>(s.cache_to) * width;
+    std::vector<float> q(q_elems);
+    fill_deterministic(q, 0xDEC0DE01u, 3.0f);
+    std::vector<uint16_t> k(kv_elems), v(kv_elems);
+    fill_hf(k, 0xDEC0DE02u, 1.0f);
+    fill_hf(v, 0xDEC0DE03u, 1.0f);
+    std::vector<float> sinks;
+    if (s.use_sink) {
+      sinks.resize(s.n_head_q);
+      fill_deterministic(sinks, 0xDEC0DE04u, 2.0f);
+    }
+    std::vector<float> want;
+    ref_attention(s, q, k, v, sinks, want);
+
+    uint32_t h = 0;
+    int err = nntr_hvx_kv_register_q(handle_, kind, s.cache_to, s.n_head_kv,
+                                     s.head_dim, &h);
+    ASSERT_EQ(err, AEE_SUCCESS) << "kv_register_q failed: " << hex(err);
+    err =
+      nntr_hvx_kv_append_q(handle_, h, 0, k.data(), static_cast<int>(kv_elems),
+                           v.data(), static_cast<int>(kv_elems));
+    ASSERT_EQ(err, AEE_SUCCESS) << "kv_append_q failed: " << hex(err);
+
+    std::vector<float> got(q_elems, 0.0f);
+    std::vector<uint32_t> stats(2, 0);
+    err = nntr_hvx_attn_q_decode(handle_, h, s.n_q, s.cache_from, s.cache_to,
+                                 s.n_head_q, s.window, s.softcap, q.data(),
+                                 static_cast<int>(q.size()), sinks.data(),
+                                 static_cast<int>(sinks.size()), got.data(),
+                                 static_cast<int>(got.size()), stats.data(), 2);
+    EXPECT_EQ(nntr_hvx_kv_release_q(handle_, h), AEE_SUCCESS);
+    ASSERT_EQ(err, AEE_SUCCESS) << "attn_q_decode failed: " << hex(err);
+    for (size_t i = 0; i < got.size(); ++i) {
+      ASSERT_TRUE(std::isfinite(got[i])) << "non-finite output at " << i;
+    }
+
+    QModelKnobs kn = knobs_for_kind(kind);
+    kn.s_hf = false;
+    std::vector<float> model;
+    model_attention_q(kn, s, q, k, v, sinks, 32, model);
+    const double snr = snr_db(want, got);
+    const double snr_model = snr_db(want, model);
+    const double snr_vs_model = snr_db(model, got);
+    EXPECT_GT(snr_vs_model, 45.0) << "DSP vs model " << snr_vs_model << " dB";
+    EXPECT_GT(snr, snr_model - 1.0)
+      << "SNR " << snr << " dB vs model " << snr_model << " dB";
+    EXPECT_GT(snr, floor_db) << "SNR " << snr << " dB below the floor";
+    std::cout << "ATTN_Q_FIELD path=decode kind=" << kind << " shape=" << s.n_q
+              << "x" << s.cache_to << "x" << s.n_head_q << "/" << s.n_head_kv
+              << "x" << s.head_dim << " field=snr_db value=" << snr
+              << " model=" << snr_model << " dsp_vs_model=" << snr_vs_model
+              << "\n";
+    if (report) {
+      std::cout << "ATTN_Q_FIELD path=decode kind=" << kind
+                << " shape=" << s.n_q << "x" << s.cache_to << "x" << s.n_head_q
+                << "/" << s.n_head_kv << "x" << s.head_dim
+                << " field=total_us value=" << stats[0] << "\n";
+    }
+  }
+};
+
+TEST_F(HvxAttnQDecode, Int8SingleTokenGqa) {
+  RunDecode(0, {1, 511, 512, 16, 4, 128, 0, 0, 0}, kSnrQ8);
+  // Ragged: 500 rows is not a block multiple.
+  RunDecode(0, {1, 499, 500, 16, 4, 128, 0, 0, 0}, kSnrQ8);
+}
+
+TEST_F(HvxAttnQDecode, Int8FewTokensHeadDim32To96) {
+  RunDecode(0, {4, 300, 304, 8, 8, 64, 0, 0, 0}, kSnrQ8);
+  RunDecode(0, {3, 100, 103, 8, 2, 96, 0, 0, 0}, kSnrQ8);
+  RunDecode(0, {2, 60, 62, 4, 2, 32, 0, 0, 0}, kSnrQ8);
+}
+
+TEST_F(HvxAttnQDecode, Int8WindowSinkSoftcap) {
+  AttnShape s{2, 700, 702, 8, 4, 128, 256, 0, 0};
+  RunDecode(0, s, kSnrQ8);
+  s.use_sink = true;
+  RunDecode(0, s, kSnrQ8);
+  s.softcap = 30.0f;
+  RunDecode(0, s, kSnrQ8);
+}
+
+TEST_F(HvxAttnQDecode, Int4) {
+  RunDecode(1, {1, 511, 512, 16, 4, 128, 0, 0, 0}, kSnrQ4);
+  RunDecode(1, {3, 100, 103, 8, 2, 96, 0, 0, 0}, kSnrQ4);
+  AttnShape s{2, 700, 702, 8, 4, 128, 256, 0, 0, 30.0f, true};
+  RunDecode(1, s, kSnrQ4);
+}
+
+TEST_F(HvxAttnQDecode, ReportTimes) {
+  RunDecode(0, {1, 1023, 1024, 16, 4, 128, 0, 0, 0}, kSnrQ8, true);
+  RunDecode(0, {1, 4095, 4096, 16, 4, 128, 0, 0, 0}, kSnrQ8, true);
+  RunDecode(1, {1, 4095, 4096, 16, 4, 128, 0, 0, 0}, kSnrQ4, true);
+}
+
 TEST_F(HvxAttnQ, AccumulatorLayoutIsRowMajorStrided) {
   std::vector<uint32_t> layout(3, 0);
   const int err = nntr_hvx_probe_acc_i32_layout(handle_, layout.data(), 3);

@@ -243,4 +243,16 @@ interface nntr_hvx : remote_handle64 {
                             in sequence<float> sinks,
                             rout sequence<float> out_f32,
                             rout sequence<uint32> stats_us);
+
+   // The decode counterpart over the quantized cache: no HMX, one (row,
+   // head) per HVX work unit, Q.K^T and P'.V by vrmpy over the registry's
+   // masters, f32 softmax; the same quantization of Q and P' as the
+   // prefill kernel with 32-row blocks. stats_us = { total us, kcycles }.
+   AEEResult attn_q_decode(in uint32 kv_handle, in uint32 n_q,
+                           in uint32 cache_from, in uint32 cache_to,
+                           in uint32 n_head_q, in uint32 window,
+                           in float softcap, in sequence<float> q_f32,
+                           in sequence<float> sinks,
+                           rout sequence<float> out_f32,
+                           rout sequence<uint32> stats_us);
 };

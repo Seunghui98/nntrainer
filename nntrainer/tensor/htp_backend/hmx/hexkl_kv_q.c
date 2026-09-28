@@ -140,8 +140,9 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   const size_t n_tiles = rows / 32u * kv->n_dot_tiles;
   // calloc throughout: rows past cache_to read as zero with scale 1, so a
   // block that runs past the cache multiplies finite zeros, never garbage.
-  kv->kt4 = (int8_t *)calloc(values, 1u);
-  kv->v4 = (int8_t *)calloc(values, 1u);
+  // Offset-binary masters: an unwritten row must read as 0, i.e. 128.
+  kv->kt4 = (uint8_t *)malloc(values);
+  kv->v4 = (uint8_t *)malloc(values);
   kv->s_k = (float *)calloc(rows, sizeof(float));
   kv->colsum_k = (int32_t *)calloc(rows, sizeof(int32_t));
   kv->s_v =
@@ -155,6 +156,8 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
     free_slot(kv);
     return AEE_ENOMEMORY;
   }
+  memset(kv->kt4, HEXKL_KV_Q_BIAS, values);
+  memset(kv->v4, HEXKL_KV_Q_BIAS, values);
   for (size_t i = 0; i < rows; ++i) {
     kv->s_k[i] = 1.0f;
   }
@@ -188,9 +191,11 @@ void hexkl_kv_q_stage(hexkl_kv_q *kv, uint32_t n, uint32_t c) {
     const uint32_t row = row0 + rr;
     for (uint32_t d = 0; d < hd; ++d) {
       kv->stage_kt[(size_t)d * 32u + rr] =
-        kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)];
+        (int8_t)((int)kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)] -
+                 HEXKL_KV_Q_BIAS);
       kv->stage_v[(size_t)rr * hd + d] =
-        kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)];
+        (int8_t)((int)kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] -
+                 HEXKL_KV_Q_BIAS);
     }
   }
 }
@@ -268,7 +273,8 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
       kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = sk;
       kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)] = cs;
       for (uint32_t d = 0; d < hd; ++d) {
-        kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)] = q[d];
+        kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)] =
+          (uint8_t)(q[d] + HEXKL_KV_Q_BIAS);
       }
 
       for (uint32_t d = 0; d < hd; ++d) {
@@ -279,7 +285,8 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
         kv->s_v[hexkl_kv_q_sv_index(kv, n, row, g)] = sv[g];
       }
       for (uint32_t d = 0; d < hd; ++d) {
-        kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] = q[d];
+        kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] =
+          (uint8_t)(q[d] + HEXKL_KV_Q_BIAS);
       }
     }
   }
@@ -315,13 +322,15 @@ int hexkl_kv_q_dump(const hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
       if (k_q) {
         for (uint32_t d = 0; d < hd; ++d) {
           k_q[(size_t)r * stride + n * hd + d] =
-            kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)];
+            (int8_t)((int)kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)] -
+                     HEXKL_KV_Q_BIAS);
         }
       }
       if (v_q) {
         for (uint32_t d = 0; d < hd; ++d) {
           v_q[(size_t)r * stride + n * hd + d] =
-            kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)];
+            (int8_t)((int)kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] -
+                     HEXKL_KV_Q_BIAS);
         }
       }
       if (s_k) {
