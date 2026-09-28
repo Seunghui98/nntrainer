@@ -281,6 +281,20 @@ fi
 log_info "Build artifacts:"
 
 check_artifact "libcausallm_core.so" || exit 1
+# [#135] The HTP decode hooks (NNTR_HTP_FORWARD) are #ifdef ENABLE_HEXKL in
+# the app and the define comes from the prebuilt Android.mk (jni/meson.build).
+# A builddir configured before that export keeps its old Android.mk under
+# --cache; this catches it, and catches the reverse (an HTP builddir reused
+# without --htp). LEDGER rule 36.
+n_htp=$(strings libs/arm64-v8a/libcausallm_core.so | grep -c NNTR_HTP_FORWARD_KINDS || true)  # grep -c exits 1 on 0 matches; set -e
+if [ "$USE_HTP" -eq 1 ] && [ "$n_htp" -lt 1 ]; then
+    log_error "libcausallm_core.so has no NNTR_HTP_FORWARD_KINDS: ENABLE_HEXKL missing (stale builddir/android_build_result/Android.mk? run 'ninja -C builddir install' or rebuild without --cache)"
+    exit 1
+elif [ "$USE_HTP" -eq 0 ] && [ "$n_htp" -ne 0 ]; then
+    log_error "libcausallm_core.so carries ENABLE_HEXKL but --htp was not given: builddir is an HTP build (pass --htp, or rebuild without --cache)"
+    exit 1
+fi
+log_info "ENABLE_HEXKL in libcausallm_core.so: $n_htp NNTR_HTP_FORWARD_KINDS strings (expected $([ "$USE_HTP" -eq 1 ] && echo '>= 1' || echo 0))"
 check_artifact "nntrainer_causallm" || exit 1
 check_artifact "nntr_quantize" || exit 1
 check_artifact "nntr_safetensors_info" || exit 1
