@@ -891,3 +891,26 @@ C=8, warm, 실행 사이 30 s. 속도는 계측 없는 실행, 분석은 `NNTR_H
 **다음 지렛대: DSP 쪽 제자리 재바인딩.** 옛 쌍과 새 expert는 모양(K, N)이 같으므로, 옛 핸들을 해제하고 새로 등록하는 대신 옛 핸들의
 아레나 포인터와 스케일·colsum만 덮어쓰면 malloc/free 12회·calloc·슬롯 탐색이 없어지고 memcpy(약 45 KB)만 남는다. 예상 등록
 38 → 약 10 ms, decode swap 토큰당 약 −2 ms(+3%). skel만 바뀌고 IDL은 그대로다.
+
+### 10.25 DSP 제자리 재바인딩, decode 선읽기 상한 지표 (코드, 호스트 체크 통과, 기기 미측정)
+
+§10.24에서 배치 swap 뒤에도 expert당 0.07 ms가 DSP 쪽 등록 자체(weight 2개 × malloc 3 + memcpy, 옛 쌍 free 6, 슬롯 탐색, 0 bias
+calloc)였다.
+
+- **`hexkl_weight_u8i4_rebind_arena`** (레지스트리): 살아 있는 아레나 차용 슬롯을 같은 모양의 새 바이트로 제자리에서 바꾼다 — 핸들 번호와
+  배열은 그대로, 아레나 포인터 교체, 스케일·colsum memcpy, bias 0. 할당·해제·탐색이 없다.
+- **`weight_swap_u8i4_arena`**: 옛 쌍이 새 expert와 모양이 같으면(expert 풀에서는 항상) 두 핸들을 재바인딩하고 **같은 핸들 번호를 돌려준다.**
+  아레나 범위·정렬을 두 weight 모두 먼저 검사해서, 거부되면 옛 쌍은 그대로다(all-or-nothing 유지). 모양이 다르거나 옛 쌍이 없으면 기존의
+  등록 + 해제 경로. IDL은 그대로이고 skel만 바뀐다. 배치 swap도 이 경로를 탄다.
+  - 호스트는 핸들 번호로 역참조하지 않는다(`handle_cache_`는 키 → 핸들이고, 해제 때 옛 키가 지워진다). 핸들 번호로 캐시하는 커널도 없다
+    (레지스트리 슬롯에 캐시 필드가 없음을 확인).
+  - 아레나 범위 검사는 `arena_weight_at`으로 빼서 등록과 재바인딩이 같은 검사를 쓴다.
+- `swap_host_check`: 재바인딩이 같은 번호·같은 배열·새 스케일·0 bias를 돌려주는지, down이 범위 밖이거나 정렬이 틀리면 **gate_up도 안 바뀌는지**,
+  모양이 다른 옛 쌍은 등록 + 해제로 가는지. 사전 정렬 검사를 뺀 변형은 이 검사에서 실패한다(확인함).
+- **`tools/moe_expert_cache_sim.py`**: decode 선읽기의 상한 지표 추가 — 같은 층의 직전 토큰 top-(4+m)이 이번 토큰의 expert를 얼마나
+  덮는지(m=0..5). 기본 비용도 §10.24 값으로 갱신(base 41.6 ms, 미스 0.47 ms).
+
+예상: 등록 38 → 약 10 ms(prefill −25 ms, 같은 세션 상주 대비 +10 ms 안), decode swap 토큰당 약 −1.5 ms.
+
+측정(`opt2.sh`): 같은 세션 상주·C=8 k=1 리더 2(warm), 라우팅 trace 1회(시뮬레이터용), CPU 모델을 먼저 돌려 page cache를 밀어낸 cold
+첫 prefill(k=0, k=1 r2, k=4 r2, k=4 r4).
