@@ -230,12 +230,21 @@ static inline HVX_Vector reduce_sum_sf(HVX_Vector v) {
   return v;
 }
 
-/** @brief One kv head, written by the unit that owns scratch lane @a lane;
- *         @a ps (NULL: no timestamps) accumulates the phase pcycles. */
-static void attn_head(const forward_job *job, uint32_t h, uint32_t lane,
-                      prof_slot *ps) {
+/**
+ * @brief One kv head, written by the unit that owns scratch lane @a lane;
+ *        @a ps (NULL: no timestamps) accumulates the phase pcycles.
+ *
+ * Always inlined so attn_head can call it with a literal (gqa, hd): then
+ * the g / i loops unroll and acc, vmax and o live in registers instead of
+ * on the stack (plan 146 section 3.2: a runtime trip count spilled every
+ * accumulator to a vmem load/store per MAC). Same operations, same order
+ * per lane, whichever call site -- the spec does not move.
+ */
+static inline __attribute__((always_inline)) void
+attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
+          const uint32_t gqa, const uint32_t hd) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
-  const uint32_t gqa = ctx->gqa, hd = ctx->head_dim, ms = ctx->max_seq;
+  const uint32_t ms = ctx->max_seq;
   const uint32_t L = job->L, nblk = (L + LANES - 1u) / LANES;
   const uint32_t n_live = L - (nblk - 1u) * LANES; /* lanes of the last */
   /* The last block needs a mask only when it is partial; a full one skips
@@ -316,11 +325,17 @@ static void attn_head(const forward_job *job, uint32_t h, uint32_t lane,
     }
   }
   for (uint32_t p = 0; p < L; ++p) {
+    /* The V row once per p, not once per g: the o stores no longer alias
+       it once o is in registers, but a local says so in every build. */
     const HVX_Vector *vp = (const HVX_Vector *)(vv + (size_t)p * hd);
+    HVX_Vector vr[MAX_HD_VEC];
+    for (uint32_t i = 0; i < nvec; ++i) {
+      vr[i] = vp[i];
+    }
     for (uint32_t g = 0; g < gqa; ++g) {
       const HVX_Vector ep = hvx_splat_sf(e[(size_t)g * ms + p]);
       for (uint32_t i = 0; i < nvec; ++i) {
-        o[g][i] = Q6_Vsf_vadd_VsfVsf(o[g][i], Q6_Vsf_vmpy_VsfVsf(ep, vp[i]));
+        o[g][i] = Q6_Vsf_vadd_VsfVsf(o[g][i], Q6_Vsf_vmpy_VsfVsf(ep, vr[i]));
       }
     }
   }
@@ -332,6 +347,18 @@ static void attn_head(const forward_job *job, uint32_t h, uint32_t lane,
   }
   if (ps) {
     prof_mark(&ps->pv, &t);
+  }
+}
+
+/** @brief attn_body at LFM2.5's (gqa 4, head_dim 64) with constants, every
+ *         other registered shape on the runtime-shape copy. */
+static void attn_head(const forward_job *job, uint32_t h, uint32_t lane,
+                      prof_slot *ps) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  if (ctx->gqa == 4u && ctx->head_dim == 64u) {
+    attn_body(job, h, lane, ps, 4u, 64u);
+  } else {
+    attn_body(job, h, lane, ps, ctx->gqa, ctx->head_dim);
   }
 }
 
