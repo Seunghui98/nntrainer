@@ -46,12 +46,20 @@ bit_identical=1`, `E2E tokens htp==cpu 8/8`, `E2E eval cpu … min_snr_db=`
 `build_htp_host/` itself; tens of minutes the first time, ≈ 1 min after;
 needs `source tools/htp/env.sh` for the SDK headers and `qaic`, nothing
 else — HexKL and the phone are not involved, and no number it prints is
-a device number). The tiny fixture's
-weight file is gitignored and generated once per checkout:
+a device number). Since #130 it also prints
+`E2E fwd tiny … calls/token=11`, `E2E eval fwd-tiny … min_snr_db=` (≥ 30),
+`E2E fwd tiny-all-kinds refused: AEE_ESCHEMENOTSUPPORTED`, `E2E eval
+golden-hd64 … bit_identical=1`, `E2E fwd hd64 … calls/token=12`, `E2E eval
+fwd-hd64 … min_snr_db=` (≥ 30) and `E2E tokens fwd==off 8/8
+expected_mismatch=0`. The two fixtures'
+weight files are gitignored and generated once per checkout:
 `python3 test/unittest/models/causallm_reference/generators/generate_lfm2_moe_reference.py`
 then `git checkout -- test/unittest/models/causallm_reference/lfm2_moe_tiny/`
 (the generator also rewrites `meta.json` / `nntr_config.json`; the
-reference logits are deterministic and must not change). Without it the
+reference logits are deterministic and must not change), and the hd64 one
+with `--dim 128 --n-heads 2 --n-kv-heads 1 --head-dim 64 --max-pos 32
+--out test/unittest/models/causallm_reference/lfm2_moe_tiny_hd64` then the
+same `git checkout --` of that directory. Without the first the
 three differential tests are `SKIPPED`, which is not a pass. The `build/` directory is configured with
 `meson setup build -Denable-transformer=true -Denable-tflite-backbone=false
 -Denable-tflite-interpreter=false` plus
