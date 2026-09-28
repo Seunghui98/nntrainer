@@ -2755,9 +2755,11 @@ private:
    *  Caller holds invoke_mutex_. */
   bool dspqReady(remote_handle64 session, size_t act_bytes, size_t out_bytes,
                  uint64_t msg_bytes) {
+    // On by default since the #141 sitting (user, 2026-09-28): bit-identical
+    // MoE dumps, decode +7.1 / +5.0 %. NNTR_HTP_DSPQ=0 keeps FastRPC.
     static const bool enabled = [] {
       const char *e = std::getenv("NNTR_HTP_DSPQ");
-      return e != nullptr && std::atoi(e) == 1;
+      return e == nullptr || std::atoi(e) != 0;
     }();
     if (!enabled)
       return false;
@@ -2894,9 +2896,10 @@ private:
                          static_cast<uint32_t>(row_index.size()));
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    // [#141] The M==1 MoE call rides the dspqueue under NNTR_HTP_DSPQ=1:
-    // the same DSP function, the same argument bytes, only the transport
-    // differs. Anything the packet cannot carry stays on FastRPC.
+    // [#141] The M==1 MoE call rides the dspqueue (default since the #141
+    // sitting; NNTR_HTP_DSPQ=0 keeps FastRPC): the same DSP function, the same
+    // argument bytes, only the transport differs. Anything the packet cannot
+    // carry stays on FastRPC.
     const bool via_dspq = M == 1 && kind == 0 && h_dn.size() == h_gu.size() &&
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
@@ -4117,7 +4120,7 @@ private:
   StagingPool act_pool_;
   StagingPool out_pool_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
-      under NNTR_HTP_DSPQ=1. */
+      unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
   /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
   std::unique_ptr<HtpRpcBuffer> conv_buf_;

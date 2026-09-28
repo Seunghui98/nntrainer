@@ -154,6 +154,9 @@ calls_per_token() { # the backend's close-time summary line
   sed -n 's/.*forward calls=[0-9]* tokens=[0-9]* calls\/token=\([0-9.]*\).*/\1/p' "$1"
 }
 echo "== htp (M1_GEMV default)"
+# dspqueue is the default since #141: every run below is FastRPC unless it
+# sets NNTR_HTP_DSPQ=1 itself, so the switch-off goldens stay the reference.
+export NNTR_HTP_DSPQ=0
 run_e2e htp "$OUT/htp" htp "$OUT/dump_htp" "$OUT/htp.log"
 echo "== htp, NNTR_MOE_HTP_M1_GEMV=0 (HMX loop at M = 1)"
 NNTR_MOE_HTP_M1_GEMV=0 run_e2e hmx "$OUT/htp" htp "$OUT/dump_hmx" "$OUT/hmx.log"
