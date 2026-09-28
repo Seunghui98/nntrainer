@@ -276,18 +276,22 @@ static void rq_row_params(const hvx_int_hmeta *mr, uint32_t n_batches,
   iq_rq_params_set(mn, mx, o->Fmin, &o->P);
 }
 
-/** One row's u8 values for k-tile kt, as 32 words in [0, 255]. */
+/** One row's u8 values for k-tile kt, as 32 words the pack saturates to
+ *  [0, 255]. */
 static inline HVX_Vector rq_row_tile(const int32_t *hr, const rq_row *o,
                                      uint32_t kt, uint32_t batch_cols) {
   if (!o->valid || o->P.zero) {
     return Q6_V_vzero();
   }
   const uint32_t b = (kt * 32u) / batch_cols;
-  const HVX_Vector v = vasr_rnd_R(vload(hr + kt * 32u), o->sh[b]);
+  const int sh = o->sh[b]; /* 0 for the coarsest batch: no rounding shift */
+  const HVX_Vector hv = vload(hr + kt * 32u);
+  const HVX_Vector v = sh ? vasr_rnd_R(hv, sh) : hv;
   const HVX_Vector y = vasr_rnd_R(
     vmulhi(Q6_Vw_vasl_VwR(v, o->P.ls), vsplat(o->P.M << 16)), o->P.e);
-  const HVX_Vector q = Q6_Vw_vadd_VwVw(y, vsplat(o->P.z));
-  return Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(q, Q6_V_vzero()), vsplat(255));
+  /* No clamp: the caller's two saturating packs clip to [0, 255] exactly
+     as one would (hvx_quant_u8.c's note on Q6_Vub_vpack_VhVh_sat). */
+  return Q6_Vw_vadd_VwVw(y, vsplat(o->P.z));
 }
 
 void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
