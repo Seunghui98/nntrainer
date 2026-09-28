@@ -88,3 +88,19 @@ TEST_F(HvxIntEpilogue, RejectsShortCounts) {
   unsigned c[4] = {0, 0, 0, 0};
   EXPECT_EQ(nntr_hvx_int_epilogue_selfcheck(handle_, 1u, c, 4), AEE_EBADPARM);
 }
+
+int main(int argc, char **argv) {
+  int result = -1;
+  try {
+    testing::InitGoogleTest(&argc, argv);
+  } catch (...) {
+    std::cerr << "Error during InitGoogleTest" << std::endl;
+    return 0;
+  }
+  try {
+    result = RUN_ALL_TESTS();
+  } catch (...) {
+    std::cerr << "Error during RUN_ALL_TESTS()" << std::endl;
+  }
+  return result;
+}
