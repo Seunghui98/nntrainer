@@ -616,4 +616,15 @@ interface nntr_hvx : remote_handle64 {
                                  rout sequence<float> logits,
                                  rout sequence<uint32> sel,
                                  rout sequence<float> weight);
+
+   // [#141] dspqueue microbench, DEBUG ONLY (no model path calls these).
+   // start imports the queue the ARM side exported and parks one DSP thread
+   // on it: mode 0 blocks in dspqueue_read (signalled), mode 1 spins on
+   // dspqueue_read_noblock (polling). AEE_EUNSUPPORTED: this DSP image has
+   // no dspqueue. AEE_EBADSTATE: a bench queue is already open.
+   // Never AEE_EBADPARM (the stale-skel symptom, rule 3).
+   AEEResult dspq_bench_start(in uint64 queue_id, in uint32 mode);
+   // Stops the thread and closes the queue.
+   // res: [packets served, empty polls, bad packets, mode]
+   AEEResult dspq_bench_stop(rout sequence<uint32> res);
 };
