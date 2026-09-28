@@ -159,12 +159,14 @@ static std::atomic<unsigned> g_moe_layer_count{0};
 
 /** @brief NNTR_MOE_PREFETCH=<k>: prefill reads the experts of the layers up
  *  to k ahead under the current layers' calls (doc 52 sections 10.10,
- *  10.20); 0 or unset is off. C=8 has room for k=4: this layer's 32 and
- *  four more layers' fit its 176 slots. */
+ *  10.20); 0 turns it off. Unset is 4 (section 10.26): warm, k made no
+ *  difference, while a cold first prefill fell 2318 -> 935 ms at k=4.
+ *  Where the pool has no room -- C=8 fits this layer's 32 and four more
+ *  layers' in its 176 slots, C <= 3 not even one -- queuing just stops. */
 static int expertPrefetchDepth() {
   static const int k = [] {
     const char *v = std::getenv("NNTR_MOE_PREFETCH");
-    return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+    return v != nullptr ? std::max(0, std::atoi(v)) : 4;
   }();
   return k;
 }
