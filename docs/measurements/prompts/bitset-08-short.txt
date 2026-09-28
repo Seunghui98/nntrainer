@@ -1,0 +1,1 @@
+List ten common fruits, one per line, and after each one write the colour it usually has when it is ripe.
