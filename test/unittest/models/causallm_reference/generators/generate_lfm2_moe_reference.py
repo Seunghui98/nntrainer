@@ -13,6 +13,8 @@
 ## Usage:
 ##   python3 generate_lfm2_moe_reference.py [--out <dir>] [--seed <int>] [--n <int>]
 ##       [--dim D] [--n-heads H] [--n-kv-heads KV] [--head-dim HD] [--max-pos P]
+##       [--layer-types conv,attention,...] [--num-dense N] [--rope-theta T]
+##       [--moe-inter I]
 ##
 ## Default output: test/unittest/models/causallm_reference/lfm2_moe_tiny/
 ## (byte-identical at the default shape). The shape options write a second
@@ -20,6 +22,12 @@
 ## is `--dim 128 --n-heads 2 --n-kv-heads 1 --head-dim 64 --max-pos 32
 ## --out ../lfm2_moe_tiny_hd64`: what the m=1 attention kernels need
 ## (head_dim 64, a multiple-of-32 max_seq), with conv_dim following dim.
+## The third fixture, lfm2_moe_tiny_lfm25 (#136), is LFM2.5-8B-A1B's per-layer
+## shape at six layers: `--dim 2048 --n-heads 32 --n-kv-heads 8 --head-dim 64
+## --max-pos 2048 --layer-types conv,conv,attention,conv,attention,conv
+## --num-dense 2 --rope-theta 5000000 --moe-inter 256 --out
+## ../lfm2_moe_tiny_lfm25` (moe_inter 32 is refused by the HTP MoE layout at
+## hidden 2048: the down chunk count exceeds MOE_MAX_CHUNKS).
 ##
 ## Binary layout (USE_EMBEDDING=false, tie_word_embeddings=true):
 ##   [embed_tokens.T] [per-layer weights] [embedding_norm]
@@ -449,7 +457,8 @@ def write_configs(out_dir: pathlib.Path, bin_name: str,
 
 def main() -> None:
     global DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, GQA_SIZE, MAX_POS
-    global CONV_DIM, CONV_DIM_OUT
+    global CONV_DIM, CONV_DIM_OUT, LAYER_TYPES, N_LAYERS, NUM_DENSE_LAYERS
+    global ROPE_THETA, MOE_INTERMEDIATE
     parser = argparse.ArgumentParser(
         description="Generate LFM2-MoE tiny reference fixtures (pure-PyTorch)")
     parser.add_argument("--out",  type=pathlib.Path, default=DEFAULT_OUT)
@@ -460,10 +469,20 @@ def main() -> None:
     parser.add_argument("--n-kv-heads", type=int, default=N_KV_HEADS)
     parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
     parser.add_argument("--max-pos", type=int, default=MAX_POS)
+    parser.add_argument("--layer-types", type=str, default=",".join(LAYER_TYPES))
+    parser.add_argument("--num-dense", type=int, default=NUM_DENSE_LAYERS)
+    parser.add_argument("--rope-theta", type=float, default=ROPE_THETA)
+    parser.add_argument("--moe-inter", type=int, default=MOE_INTERMEDIATE)
     args = parser.parse_args()
 
     DIM, N_HEADS, N_KV_HEADS = args.dim, args.n_heads, args.n_kv_heads
     HEAD_DIM, MAX_POS = args.head_dim, args.max_pos
+    LAYER_TYPES = args.layer_types.split(",")
+    N_LAYERS = len(LAYER_TYPES)
+    NUM_DENSE_LAYERS = args.num_dense
+    ROPE_THETA = args.rope_theta
+    MOE_INTERMEDIATE = args.moe_inter
+    assert MOE_INTERMEDIATE % 32 == 0, "moe_inter must be a multiple of 32"
     assert N_HEADS % N_KV_HEADS == 0, "n_heads must be a multiple of n_kv_heads"
     assert N_HEADS * HEAD_DIM == DIM, "n_heads * head_dim must equal dim"
     GQA_SIZE = N_HEADS // N_KV_HEADS

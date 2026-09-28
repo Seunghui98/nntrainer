@@ -33,6 +33,14 @@
 # top2) there is below 2 x rms(got - ref) -- the rounding noise is larger
 # than the decision gap (plan 130 section 3.5); an unexpected one exits 1.
 #
+# Routing (#136). A manifest line may end in r=<row_count per expert>,
+# the routing the ARM side handed the call. With --snr-floor the first
+# call whose routing differs between the two runs is a top-k flip at a
+# near-tie -- rounding, not wiring, when every file before it is inside
+# the floor -- and from that call on the floor is not applied (the tokens
+# policy is the verdict there): the summary line names it as
+# routing_flip=<call> and gates min_snr_db_gated, the minimum before it.
+#
 # SNR = 10 log10(sum(ref^2) / sum((ref - got)^2)), inf when identical.
 # Lifted from hvx_impl's hexagon_e2e_test --eval (LEDGER section 4 lift 4).
 
@@ -62,6 +70,19 @@ def file_list(ref_dir):
             logits.append((int(m.group(1)), entry))
     names.extend(entry for _, entry in sorted(logits))
     return names
+
+
+def routing(d):
+    """call name -> its r= field of manifest.txt, for the calls that have one."""
+    out = {}
+    manifest = os.path.join(d, "manifest.txt")
+    if os.path.isfile(manifest):
+        with open(manifest) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) > 1 and parts[-1].startswith("r="):
+                    out[parts[0]] = parts[-1]
+    return out
 
 
 def snr_db(ref, got):
@@ -136,8 +157,15 @@ def main():
         return 2
     identical = True
     min_snr = math.inf
+    min_snr_gated = math.inf
     first_diff = "-"
+    ref_routing, got_routing = routing(a.ref_dir), routing(a.got_dir)
+    flip = None
     for name in names:
+        call = name[:-len("_in.f32")] if name.endswith("_in.f32") else None
+        if flip is None and call is not None and call in ref_routing and \
+                ref_routing[call] != got_routing.get(call):
+            flip = call
         rp = os.path.join(a.ref_dir, name)
         gp = os.path.join(a.got_dir, name)
         if not os.path.isfile(gp):
@@ -158,10 +186,14 @@ def main():
                 first_diff = name
             identical = False
             min_snr = min(min_snr, s)
+            if flip is None:
+                min_snr_gated = min(min_snr_gated, s)
     print(f"E2E eval {a.label} files={len(names)} bit_identical={int(identical)} "
-          f"min_snr_db={min_snr:.2f} first_diff={first_diff}")
-    if a.snr_floor is not None and min_snr < a.snr_floor:
-        print(f"E2E eval {a.label} FAIL min_snr_db={min_snr:.2f} < floor "
+          f"min_snr_db={min_snr:.2f} first_diff={first_diff}"
+          + (f" routing_flip={flip} min_snr_db_gated={min_snr_gated:.2f}"
+             if flip else ""))
+    if a.snr_floor is not None and min_snr_gated < a.snr_floor:
+        print(f"E2E eval {a.label} FAIL min_snr_db={min_snr_gated:.2f} < floor "
               f"{a.snr_floor:g} (a wiring fault reads 0-20 dB)")
         return 1
     return 0 if identical or a.allow_diff else 1

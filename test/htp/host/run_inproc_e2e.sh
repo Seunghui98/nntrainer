@@ -32,9 +32,19 @@
 #   E2E fwd hd64 kinds=MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1 calls/token=12
 #   E2E eval fwd-hd64 ... min_snr_db=<x>               (x >= 30 gated)
 #   E2E tokens fwd==off 8/8 expected_mismatch=0        (section 3.5's policy)
-# NNTR_INPROC_GOLDEN=update rewrites test/htp/host/golden/lfm2_moe_tiny
-# and lfm2_moe_tiny_hd64 from this run's switch-off HTP dumps (deliberate,
-# like reference_logits.json).
+# and, since #136, LFM2.5's per-layer shape (lfm2_moe_tiny_lfm25: hidden
+# 2048, 32 / 8 heads, six layers, max_seq 2048) at prompt 512 -- the
+# real-shape case that the two small fixtures could not exercise:
+#   E2E eval golden-lfm25 ... bit_identical=1         (logits only, off)
+#   E2E fwd lfm25 kinds=<all six> calls/token=23.00
+#   E2E eval fwd-lfm25 ... min_snr_db=<x> routing_flip=moe_00010 min_snr_db_gated=<y>
+#                              (y >= 30 gated: the floor stops at the first
+#                              router top-k flip, a near-tie on random
+#                              weights; the tokens policy is the verdict there)
+#   E2E tokens fwd==off-lfm25 8/8 expected_mismatch=0
+# NNTR_INPROC_GOLDEN=update rewrites test/htp/host/golden/lfm2_moe_tiny,
+# lfm2_moe_tiny_hd64 and lfm2_moe_tiny_lfm25 from this run's switch-off
+# HTP dumps (deliberate, like reference_logits.json).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -43,6 +53,8 @@ FIX="$ROOT/test/unittest/models/causallm_reference/lfm2_moe_tiny"
 FIX64="$ROOT/test/unittest/models/causallm_reference/lfm2_moe_tiny_hd64"
 GOLDEN="$HERE/golden/lfm2_moe_tiny"
 GOLDEN64="$HERE/golden/lfm2_moe_tiny_hd64"
+FIX25="$ROOT/test/unittest/models/causallm_reference/lfm2_moe_tiny_lfm25"
+GOLDEN25="$HERE/golden/lfm2_moe_tiny_lfm25"
 EVAL="python3 $ROOT/tools/htp/htp_dump_eval.py"
 PROMPT=16
 STEPS=8
@@ -73,6 +85,12 @@ if [ ! -f "$FIX64/nntr_lfm2_moe_tiny_fp32.bin" ]; then
   echo "E2E FAIL hd64 fixture weights missing: run" >&2
   echo "  python3 $GEN --dim 128 --n-heads 2 --n-kv-heads 1 --head-dim 64 --max-pos 32 --out $FIX64" >&2
   echo "  git checkout -- $FIX64/" >&2
+  exit 1
+fi
+if [ ! -f "$FIX25/nntr_lfm2_moe_tiny_fp32.bin" ]; then
+  echo "E2E FAIL lfm25 fixture weights missing: run" >&2
+  echo "  python3 $GEN --dim 2048 --n-heads 32 --n-kv-heads 8 --head-dim 64 --max-pos 2048 --layer-types conv,conv,attention,conv,attention,conv --num-dense 2 --rope-theta 5000000 --moe-inter 256 --out $FIX25" >&2
+  echo "  git checkout -- $FIX25/" >&2
   exit 1
 fi
 
@@ -124,14 +142,27 @@ run_e2e hd64-off "$OUT/htp64" htp "$OUT/dump_64off" "$OUT/64off.log" --max-seq 3
 echo "== hd64 htp, NNTR_HTP_FORWARD=1 (all six kinds)"
 NNTR_HTP_FORWARD=1 \
   run_e2e hd64-fwd "$OUT/htp64" htp "$OUT/dump_64fwd" "$OUT/64fwd.log" --max-seq 32
+# [#136] the real-shape fixture at prompt 512 (the device's prompt length):
+# the per-token entry after a long CPU prefill, the KV seed of 512 rows,
+# RoPE past 512, the conv state seed, at LFM2.5's widths
+"$Q" "$FIX25" -o "$OUT/htp25" --fc_dtype Q4_0 --moe_dtype QS4CX_WH > "$OUT/q_htp25.log"
+echo "== lfm25 htp, switch off, prompt 512"
+PROMPT=512 run_e2e lfm25-off "$OUT/htp25" htp "$OUT/dump_25off" "$OUT/25off.log" --max-seq 2048
+echo "== lfm25 htp, NNTR_HTP_FORWARD=1 (all six kinds), prompt 512"
+PROMPT=512 NNTR_HTP_FORWARD=1 \
+  run_e2e lfm25-fwd "$OUT/htp25" htp "$OUT/dump_25fwd" "$OUT/25fwd.log" --max-seq 2048
 
 if [ "${NNTR_INPROC_GOLDEN:-}" = update ]; then
-  mkdir -p "$GOLDEN" "$GOLDEN64"
-  rm -f "$GOLDEN"/*.f32 "$GOLDEN/manifest.txt" "$GOLDEN64"/*.f32 "$GOLDEN64/manifest.txt"
+  mkdir -p "$GOLDEN" "$GOLDEN64" "$GOLDEN25"
+  rm -f "$GOLDEN"/*.f32 "$GOLDEN/manifest.txt" "$GOLDEN64"/*.f32 "$GOLDEN64/manifest.txt" \
+    "$GOLDEN25"/*.f32
   cp "$OUT"/dump_htp/*.f32 "$OUT/dump_htp/manifest.txt" "$GOLDEN/"
   cp "$OUT"/dump_64off/*.f32 "$OUT/dump_64off/manifest.txt" "$GOLDEN64/"
+  # logits only: a prompt-512 MoE call's input is 4 MiB (README.md there)
+  cp "$OUT"/dump_25off/logits_*.f32 "$GOLDEN25/"
   echo "golden updated: $GOLDEN ($(ls "$GOLDEN"/*.f32 | wc -l) files)," \
-    "$GOLDEN64 ($(ls "$GOLDEN64"/*.f32 | wc -l) files)"
+    "$GOLDEN64 ($(ls "$GOLDEN64"/*.f32 | wc -l) files)," \
+    "$GOLDEN25 ($(ls "$GOLDEN25"/*.f32 | wc -l) files)"
 fi
 
 fail=0
@@ -188,6 +219,20 @@ grep -q '^\[HTP\] graph: init n_ops=30 resident=RMSNORM|CONV1D_GATE|QK_NORM|ROPE
   { echo "E2E FAIL hd64: no init line with every kind resident"; fail=1; }
 grep -q '^\[HTP\] attn_m1: registered layers=1 kv=1 gqa=2 head_dim=64 max_seq=32 cache=16 KiB' "$OUT/64fwd.log" ||
   { echo "E2E FAIL hd64: no attn_m1 registration line"; fail=1; }
+# (g) [#136] the lfm25 fixture: its logits golden with the switch off; with
+# it on, 23 calls per token (the stretch count of the six-layer list with
+# every kind resident, plan 136 section 0.2), the SNR floor, the token
+# policy, and the init lines at LFM2.5's widths
+$EVAL --label golden-lfm25 "$GOLDEN25" "$OUT/dump_25off" | tail -1 || fail=1
+calls="$(calls_per_token "$OUT/25fwd.log")"
+echo "E2E fwd lfm25 kinds=$ALL_KINDS calls/token=${calls:-none}"
+[ "$calls" = 23.00 ] || fail=1
+$EVAL --label fwd-lfm25 --allow-diff --snr-floor $SNR_FLOOR "$OUT/dump_25off" "$OUT/dump_25fwd" | tail -1 || fail=1
+$EVAL --label 'fwd==off-lfm25' --tokens-policy "$OUT/dump_25off" "$OUT/dump_25fwd" | tail -1 || fail=1
+grep -q '^\[HTP\] graph: init n_ops=58 resident=RMSNORM|CONV1D_GATE|QK_NORM|ROPE|ATTN_M1|MOE ' "$OUT/25fwd.log" ||
+  { echo "E2E FAIL lfm25: no init line with every kind resident"; fail=1; }
+grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=16384 KiB' "$OUT/25fwd.log" ||
+  { echo "E2E FAIL lfm25: no attn_m1 registration line"; fail=1; }
 
 # The comparator's own check: identical -> 1; one byte flipped -> 0 with a
 # finite SNR and exit 1; a truncated file -> exit 2.
