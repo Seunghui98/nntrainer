@@ -151,7 +151,7 @@ int main(void) {
 
   /* integer path, ONE batch of all 56 pairs */
   int32_t *hq = (int32_t *)malloc(sizeof(int32_t) * M * INTER);
-  int16_t he[M * 8];
+  hvx_int_hmeta he[M * 8];
   uint8_t *ah = (uint8_t *)malloc((size_t)M * INTER);
   float sc[M];
   int32_t zq[M];
@@ -170,8 +170,8 @@ int main(void) {
   job.inter = INTER;
   job.dst = hq;
   job.dst_stride = INTER;
-  job.h_e = he;
-  job.e_stride = 8;
+  job.h_meta = he;
+  job.meta_stride = 8;
   job.batch = 0;
   /* three threads, as the pool would split it */
   for (uint32_t t = 0; t < 3; ++t)
@@ -180,7 +180,7 @@ int main(void) {
 
   /* the same block through batches of 16 pairs (16,16,16,8) */
   int32_t *hq2 = (int32_t *)malloc(sizeof(int32_t) * M * INTER);
-  int16_t he2[M * 8];
+  hvx_int_hmeta he2[M * 8];
   uint8_t *ah2 = (uint8_t *)malloc((size_t)M * INTER);
   float sc2[M];
   int32_t zq2[M];
@@ -201,7 +201,7 @@ int main(void) {
       jb.n_pairs = np;
       jb.g0 = g0;
       jb.dst = hq2;
-      jb.h_e = he2;
+      jb.h_meta = he2;
       jb.batch = b;
       hvx_int_gu_worker(1, 0, &jb);
     }

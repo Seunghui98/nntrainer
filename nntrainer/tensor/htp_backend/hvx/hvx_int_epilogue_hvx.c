@@ -215,7 +215,9 @@ void hvx_int_gu_worker_hvx(uint32_t n_threads, uint32_t i, void *vjob) {
     iq_row_fmt_set(&fg, vrow_amax(c, r, 0u, cg0, zp), ms, es, wb_g, bb_g);
     iq_row_fmt_set(&fu, vrow_amax(c, r, c->n_pairs, cu0, zp), ms, es, wb_u,
                    bb_u);
-    c->h_e[(size_t)r * c->e_stride + c->batch] = (int16_t)(fg.F + fu.F - 30);
+    hvx_int_hmeta *meta = c->h_meta + (size_t)r * c->meta_stride + c->batch;
+    meta->F = fg.F + fu.F - 30;
+    HVX_Vector vmn = Q6_V_vzero(), vmx = Q6_V_vzero(); /* the range holds 0 */
     int32_t *dst = c->dst + (size_t)r * c->dst_stride + cg0;
     for (uint32_t j = 0; j < c->n_pairs; ++j) {
       const uint32_t cg = cg0 + j * 32u, cu = cu0 + j * 32u;
@@ -244,7 +246,15 @@ void hvx_int_gu_worker_hvx(uint32_t n_threads, uint32_t i, void *vjob) {
       const HVX_Vector h = Q6_Vw_vadd_VwVw(
         vmulhi(gs, vhi16(u_hi)), Q6_Vw_vasr_VwR(vmulhi(gs, vhi16(u_lo)), 15));
       *(HVX_UVector *)(dst + j * 32u) = h;
+      vmn = Q6_Vw_vmin_VwVw(vmn, h);
+      vmx = Q6_Vw_vmax_VwVw(vmx, h);
     }
+    for (uint32_t rot = VLEN / 2u; rot >= 4u; rot >>= 1) {
+      vmn = Q6_Vw_vmin_VwVw(vmn, Q6_V_vror_VR(vmn, (int)rot));
+      vmx = Q6_Vw_vmax_VwVw(vmx, Q6_V_vror_VR(vmx, (int)rot));
+    }
+    meta->mn = vlane0_s32(vmn);
+    meta->mx = vlane0_s32(vmx);
   }
 }
 
@@ -254,34 +264,16 @@ typedef struct {
   int valid;
   int Fmin;
   iq_rq_params P;
-  int sh[16]; /**< per batch: h_e - Fmin (MOE_MAX_CHUNKS batches at most) */
+  int sh[16]; /**< per batch: F - Fmin (MOE_MAX_CHUNKS batches at most) */
 } rq_row;
 
-static void rq_row_scan(const int32_t *hr, const int16_t *er,
-                        uint32_t n_batches, uint32_t batch_cols, uint32_t inter,
-                        rq_row *o) {
-  int Fmin = er[0];
-  for (uint32_t b = 1; b < n_batches; ++b) {
-    Fmin = er[b] < Fmin ? er[b] : Fmin;
-  }
-  o->Fmin = Fmin;
-  HVX_Vector vmn = Q6_V_vzero(), vmx = Q6_V_vzero(); /* the range holds 0 */
-  for (uint32_t b = 0; b < n_batches; ++b) {
-    const int sh = er[b] - Fmin;
-    o->sh[b] = sh;
-    const uint32_t c0 = b * batch_cols;
-    const uint32_t c1 = (c0 + batch_cols < inter) ? c0 + batch_cols : inter;
-    for (uint32_t cc = c0; cc < c1; cc += 32u) {
-      const HVX_Vector v = vasr_rnd_R(vload(hr + cc), sh);
-      vmn = Q6_Vw_vmin_VwVw(vmn, v);
-      vmx = Q6_Vw_vmax_VwVw(vmx, v);
-    }
-  }
-  for (uint32_t rot = VLEN / 2u; rot >= 4u; rot >>= 1) {
-    vmn = Q6_Vw_vmin_VwVw(vmn, Q6_V_vror_VR(vmn, (int)rot));
-    vmx = Q6_Vw_vmax_VwVw(vmx, Q6_V_vror_VR(vmx, (int)rot));
-  }
-  iq_rq_params_set(vlane0_s32(vmn), vlane0_s32(vmx), Fmin, &o->P);
+/** The row's parameters from its batches' metadata -- scalar, a few
+ *  words a batch; the mantissas are read once, by rq_row_tile. */
+static void rq_row_params(const hvx_int_hmeta *mr, uint32_t n_batches,
+                          rq_row *o) {
+  int32_t mn, mx;
+  iq_row_range(mr, n_batches, o->sh, &o->Fmin, &mn, &mx);
+  iq_rq_params_set(mn, mx, o->Fmin, &o->P);
 }
 
 /** One row's u8 values for k-tile kt, as 32 words in [0, 255]. */
@@ -299,7 +291,7 @@ static inline HVX_Vector rq_row_tile(const int32_t *hr, const rq_row *o,
 }
 
 void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
-                         const int16_t *h_e, uint32_t e_stride,
+                         const hvx_int_hmeta *h_meta, uint32_t meta_stride,
                          uint32_t n_batches, uint32_t batch_cols,
                          uint32_t inter, uint32_t m_valid, uint32_t m0,
                          uint32_t m1, float *scale, int32_t *zp,
@@ -312,8 +304,7 @@ void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
       const uint32_t mm = m + q;
       rows[q].valid = mm < m_valid;
       if (rows[q].valid) {
-        rq_row_scan(h + (size_t)mm * h_stride, h_e + (size_t)mm * e_stride,
-                    n_batches, batch_cols, inter, &rows[q]);
+        rq_row_params(h_meta + (size_t)mm * meta_stride, n_batches, &rows[q]);
         scale[mm] = rows[q].P.scale;
         zp[mm] = rows[q].P.z;
       } else {
@@ -342,8 +333,8 @@ void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
   }
   if (m < m1) {
     /* a partial group: the reference handles rows one at a time */
-    hvx_int_rq_rows_c(h, h_stride, h_e, e_stride, n_batches, batch_cols, inter,
-                      m_valid, m, m1, scale, zp, out_ah);
+    hvx_int_rq_rows_c(h, h_stride, h_meta, meta_stride, n_batches, batch_cols,
+                      inter, m_valid, m, m1, scale, zp, out_ah);
   }
 }
 

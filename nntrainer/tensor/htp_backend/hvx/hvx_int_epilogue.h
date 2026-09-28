@@ -97,9 +97,14 @@ void hvx_int_wq_free(hvx_int_wq *q);
  * hold RAW accumulators; the zero-point correction happens here.
  *
  * Output: dst[r][c] = round(silu(g)*u * 2^F) for the batch's columns c,
- * with F = h_e[r * e_stride + batch]. Rows at or past m_count are not
- * touched.
+ * with F, and the min and max of those values, in
+ * h_meta[r * meta_stride + batch]. Rows at or past m_count are not touched.
  */
+typedef struct {
+  int32_t mn, mx; /**< the batch's range of the row's mantissas */
+  int32_t F;      /**< their exponent: h = mantissa * 2^-F */
+} hvx_int_hmeta;
+
 typedef struct {
   const uint8_t *tiles_base;
   uint32_t tile_stride;
@@ -114,8 +119,8 @@ typedef struct {
   uint32_t inter;
   int32_t *dst; /**< [rows x inter] mantissas, row stride dst_stride */
   uint32_t dst_stride;
-  int16_t *h_e; /**< [rows x e_stride] exponents F per (row, batch) */
-  uint32_t e_stride;
+  hvx_int_hmeta *h_meta; /**< [rows x meta_stride], one per (row, batch) */
+  uint32_t meta_stride;
   uint32_t batch; /**< this run's index within the block's batches */
 } hvx_int_gu_job;
 
@@ -153,24 +158,27 @@ void hvx_int_gu_worker_hvx(uint32_t n_threads, uint32_t i, void *job);
  *        include 0).
  *
  * h holds the batches' mantissas side by side (batch b at columns
- * [b * batch_cols, ...), the last one shorter), h_e their exponents. Rows
- * at or past m_valid are padding: their bytes are zeroed and their
+ * [b * batch_cols, ...), the last one shorter), h_meta their exponents and
+ * ranges. A row's range is taken from the batches' ranges, not rescanned:
+ * the rounding shift that brings a batch to the row's format is monotone,
+ * so the shifted min and max ARE the min and max of the shifted values.
+ * Rows at or past m_valid are padding: their bytes are zeroed and their
  * parameters set to scale 1, zp 0, as the f32 path leaves them.
  *
  * @param out_ah the destination block's first AH tile (64-row blocks,
  *               2048-byte k-tiles, 32 bytes a row -- hvx_quant_u8.h)
  */
-void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
-                       uint32_t e_stride, uint32_t n_batches,
-                       uint32_t batch_cols, uint32_t inter, uint32_t m_valid,
-                       uint32_t m0, uint32_t m1, float *scale, int32_t *zp,
-                       uint8_t *out_ah);
+void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride,
+                       const hvx_int_hmeta *h_meta, uint32_t meta_stride,
+                       uint32_t n_batches, uint32_t batch_cols, uint32_t inter,
+                       uint32_t m_valid, uint32_t m0, uint32_t m1, float *scale,
+                       int32_t *zp, uint8_t *out_ah);
 #if defined(HVX_INT_EPILOGUE_HAVE_HVX)
 /** The HVX version. Rows are done four at a time (one 128-byte store per
  *  k-tile); a group of fewer than four rows at the end of [m0, m1) goes
  *  through the reference. m0 is a multiple of 4. */
 void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
-                         const int16_t *h_e, uint32_t e_stride,
+                         const hvx_int_hmeta *h_meta, uint32_t meta_stride,
                          uint32_t n_batches, uint32_t batch_cols,
                          uint32_t inter, uint32_t m_valid, uint32_t m0,
                          uint32_t m1, float *scale, int32_t *zp,

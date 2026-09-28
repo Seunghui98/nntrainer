@@ -115,7 +115,7 @@ int main(void) {
       {
         static int32_t gu_i32[2 * CHECK_INTER], stage[2 * 16 * 32],
           hq[CHECK_INTER];
-        static int16_t he[16];
+        static hvx_int_hmeta he[16];
         static uint8_t ah1[(CHECK_INTER / 32) * 2048];
         static hvx_int_wq *wq_of[8];
         if (!wq_of[e]) {
@@ -147,8 +147,8 @@ int main(void) {
           jb.inter = inter;
           jb.dst = hq;
           jb.dst_stride = inter;
-          jb.h_e = he;
-          jb.e_stride = 16u;
+          jb.h_meta = he;
+          jb.meta_stride = 16u;
           jb.batch = b;
           hvx_int_gu_worker(1u, 0u, &jb);
         }

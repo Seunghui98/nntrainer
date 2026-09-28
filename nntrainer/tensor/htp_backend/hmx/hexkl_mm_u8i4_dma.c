@@ -157,6 +157,16 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   h->N = N;
   h->iq = NULL;
   h->in_use = 1;
+#if HEXKL_MOE_INT_EPILOGUE
+  /* The columns' fixed-point constants, with the upload rather than on
+     the first compute call (doc 53 section 9.10): ~25 ns a column, 3
+     bytes a column. The MoE kernel still bakes a slot it finds unbaked. */
+  const int rc = hvx_int_wq_bake((hvx_int_wq **)&h->iq, w_scale, bias, N);
+  if (rc != AEE_SUCCESS) {
+    hexkl_weight_u8i4_release(tbl, slot); /* in_use is set: it frees */
+    return rc;
+  }
+#endif
   return AEE_SUCCESS;
 }
 

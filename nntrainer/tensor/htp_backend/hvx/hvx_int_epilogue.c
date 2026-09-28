@@ -244,7 +244,9 @@ void hvx_int_gu_worker_c(uint32_t n_threads, uint32_t i, void *vjob) {
        second is a full 32 x 32 through the 16-bit multiplier -- u's high
        15 bits and its low 15 bits separately -- so u keeps its precision
        and h lands in Q(Fg + Fu - 30) with |h| < 2^30. */
-    c->h_e[(size_t)r * c->e_stride + c->batch] = (int16_t)(fg.F + fu.F - 30);
+    hvx_int_hmeta *meta = c->h_meta + (size_t)r * c->meta_stride + c->batch;
+    meta->F = fg.F + fu.F - 30;
+    int32_t mn = 0, mx = 0;
     int32_t *dst = c->dst + (size_t)r * c->dst_stride + cg0;
     for (uint32_t j = 0; j < c->n_pairs; ++j) {
       const int32_t *grow =
@@ -268,19 +270,24 @@ void hvx_int_gu_worker_c(uint32_t n_threads, uint32_t i, void *vjob) {
         const int32_t gs = MULHI(g, sg);
         const int32_t u_hi = u >> 15;    /* floor */
         const int32_t u_lo = u & 0x7FFF; /* [0, 2^15) */
-        dst[j * 32u + l] = MULHI(gs, u_hi) + (MULHI(gs, u_lo) >> 15);
+        const int32_t h = MULHI(gs, u_hi) + (MULHI(gs, u_lo) >> 15);
+        dst[j * 32u + l] = h;
+        mn = iq_min(mn, h);
+        mx = iq_max(mx, h);
       }
     }
+    meta->mn = mn;
+    meta->mx = mx;
   }
 }
 
 /* ---- the requantization ---------------------------------------------- */
 
-void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
-                       uint32_t e_stride, uint32_t n_batches,
-                       uint32_t batch_cols, uint32_t inter, uint32_t m_valid,
-                       uint32_t m0, uint32_t m1, float *scale, int32_t *zp,
-                       uint8_t *out_ah) {
+void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride,
+                       const hvx_int_hmeta *h_meta, uint32_t meta_stride,
+                       uint32_t n_batches, uint32_t batch_cols, uint32_t inter,
+                       uint32_t m_valid, uint32_t m0, uint32_t m1, float *scale,
+                       int32_t *zp, uint8_t *out_ah) {
   const uint32_t n_ktiles = inter / 32u;
   for (uint32_t m = m0; m < m1; ++m) {
     uint8_t *blk = out_ah + (size_t)(m / 64u) * n_ktiles * 2048u;
@@ -294,23 +301,11 @@ void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
       continue;
     }
     const int32_t *hr = h + (size_t)m * h_stride;
-    const int16_t *er = h_e + (size_t)m * e_stride;
-    /* The row's common format: the coarsest batch's. */
-    int Fmin = er[0];
-    for (uint32_t b = 1; b < n_batches; ++b) {
-      Fmin = er[b] < Fmin ? er[b] : Fmin;
-    }
-    int32_t mn = 0, mx = 0; /* the range includes 0, as the f32 scan's */
-    for (uint32_t b = 0; b < n_batches; ++b) {
-      const int sh = er[b] - Fmin;
-      const uint32_t c0 = b * batch_cols;
-      const uint32_t c1 = (c0 + batch_cols < inter) ? c0 + batch_cols : inter;
-      for (uint32_t cc = c0; cc < c1; ++cc) {
-        const int32_t v = iq_asr_rnd(hr[cc], sh);
-        mn = iq_min(mn, v);
-        mx = iq_max(mx, v);
-      }
-    }
+    int sh[16]; /* MOE_MAX_CHUNKS batches at most */
+    int Fmin;
+    int32_t mn, mx;
+    iq_row_range(h_meta + (size_t)m * meta_stride, n_batches, sh, &Fmin, &mn,
+                 &mx);
     iq_rq_params P;
     iq_rq_params_set(mn, mx, Fmin, &P);
     if (P.zero) {
@@ -324,11 +319,10 @@ void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
     const int ls = P.ls, e = P.e;
     const int32_t M = P.M, z = P.z;
     for (uint32_t b = 0; b < n_batches; ++b) {
-      const int sh = er[b] - Fmin;
       const uint32_t c0 = b * batch_cols;
       const uint32_t c1 = (c0 + batch_cols < inter) ? c0 + batch_cols : inter;
       for (uint32_t cc = c0; cc < c1; ++cc) {
-        const int32_t v = iq_asr_rnd(hr[cc], sh);
+        const int32_t v = iq_asr_rnd(hr[cc], sh[b]);
         const int32_t y = iq_asr_rnd(MULHI(iq_shl(v, ls), M), e);
         int32_t q = y + z;
         q = q < 0 ? 0 : (q > 255 ? 255 : q);

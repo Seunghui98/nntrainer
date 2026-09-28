@@ -66,8 +66,10 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
     (int32_t *)malloc(sizeof(int32_t) * 2u * SC_HALF * SC_ROWS * 32u);
   int32_t *h_c = (int32_t *)malloc(sizeof(int32_t) * SC_ROWS * SC_INTER);
   int32_t *h_v = (int32_t *)malloc(sizeof(int32_t) * SC_ROWS * SC_INTER);
-  int16_t *e_c = (int16_t *)malloc(sizeof(int16_t) * SC_ROWS * SC_ESTRIDE);
-  int16_t *e_v = (int16_t *)malloc(sizeof(int16_t) * SC_ROWS * SC_ESTRIDE);
+  hvx_int_hmeta *e_c =
+    (hvx_int_hmeta *)malloc(sizeof(hvx_int_hmeta) * SC_ROWS * SC_ESTRIDE);
+  hvx_int_hmeta *e_v =
+    (hvx_int_hmeta *)malloc(sizeof(hvx_int_hmeta) * SC_ROWS * SC_ESTRIDE);
   uint8_t *ah_c = (uint8_t *)malloc((size_t)SC_ROWS * SC_INTER);
   uint8_t *ah_v = (uint8_t *)malloc((size_t)SC_ROWS * SC_INTER);
   float *sc_c = (float *)malloc(sizeof(float) * SC_ROWS);
@@ -121,8 +123,8 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
   /* gate_up, batch by batch, both implementations on the same staging */
   memset(h_c, 0, sizeof(int32_t) * SC_ROWS * SC_INTER);
   memset(h_v, 0, sizeof(int32_t) * SC_ROWS * SC_INTER);
-  memset(e_c, 0, sizeof(int16_t) * SC_ROWS * SC_ESTRIDE);
-  memset(e_v, 0, sizeof(int16_t) * SC_ROWS * SC_ESTRIDE);
+  memset(e_c, 0, sizeof(hvx_int_hmeta) * SC_ROWS * SC_ESTRIDE);
+  memset(e_v, 0, sizeof(hvx_int_hmeta) * SC_ROWS * SC_ESTRIDE);
   uint32_t n_batches = 0;
   for (uint32_t g0 = 0, b = 0; g0 < SC_NT; g0 += SC_HALF, ++b) {
     const uint32_t np = (SC_NT - g0 < SC_HALF) ? SC_NT - g0 : SC_HALF;
@@ -148,13 +150,13 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
     jb.wq = wq;
     jb.inter = SC_INTER;
     jb.dst_stride = SC_INTER;
-    jb.e_stride = SC_ESTRIDE;
+    jb.meta_stride = SC_ESTRIDE;
     jb.batch = b;
     jb.dst = h_c;
-    jb.h_e = e_c;
+    jb.h_meta = e_c;
     hvx_int_gu_worker_c(1u, 0u, &jb);
     jb.dst = h_v;
-    jb.h_e = e_v;
+    jb.h_meta = e_v;
     /* three slices, as the pool would run it */
     for (uint32_t t = 0; t < 3u; ++t) {
       hvx_int_gu_worker_hvx(3u, t, &jb);
@@ -169,7 +171,8 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
       checksum = checksum * 31u + (uint32_t)h_v[k];
     }
     for (uint32_t b = 0; b < n_batches; ++b) {
-      mism_e += (e_c[r * SC_ESTRIDE + b] != e_v[r * SC_ESTRIDE + b]);
+      mism_e += (memcmp(&e_c[r * SC_ESTRIDE + b], &e_v[r * SC_ESTRIDE + b],
+                        sizeof(hvx_int_hmeta)) != 0);
     }
   }
 
@@ -226,7 +229,8 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
     if (!found) { /* only an exponent differs: take that row, its batch */
       for (uint32_t r = 0; r < SC_VALID && !found; ++r) {
         for (uint32_t b = 0; b < n_batches; ++b) {
-          if (e_c[r * SC_ESTRIDE + b] != e_v[r * SC_ESTRIDE + b]) {
+          if (memcmp(&e_c[r * SC_ESTRIDE + b], &e_v[r * SC_ESTRIDE + b],
+                     sizeof(hvx_int_hmeta)) != 0) {
             fr = r;
             fc = b * SC_HALF * 32u;
             found = 1;
@@ -261,7 +265,7 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
     jb.wq = wq;
     jb.inter = SC_INTER;
     jb.dst_stride = SC_INTER;
-    jb.e_stride = SC_ESTRIDE;
+    jb.meta_stride = SC_ESTRIDE;
     jb.batch = b;
     static int32_t o_c[8 * 32], o_v[8 * 32], m_c[8], m_v[8];
     hvx_int_dbg_gu_c(&jb, fr, j, o_c, m_c);

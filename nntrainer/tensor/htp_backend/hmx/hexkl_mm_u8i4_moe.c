@@ -53,11 +53,9 @@
 #include "hvx_dequant_i32.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
+#include "hvx_int_epilogue.h" /* hvx_int_hmeta in both builds */
 #include "hvx_quant_u8.h"
 #include "hvx_scale_add_f32.h"
-#if HEXKL_MOE_INT_EPILOGUE
-#include "hvx_int_epilogue.h"
-#endif
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 #define ROUND_UP_SZ(v, a) ((((v) + ((a)-1)) / (a)) * (a))
@@ -267,9 +265,9 @@ typedef struct {
   float *rq_scale; /**< 64 each, the params the next down dequantizes with */
   int32_t *rq_zp;
   uint8_t *mid; /**< the mid buffer it packs into */
-  /* integer epilogue build only: the exponents the gate_up jobs left, one
-     per (row, batch), and the batch geometry to read gate with */
-  const int16_t *h_e;
+  /* integer epilogue build only: the exponent and range the gate_up jobs
+     left per (row, batch), and the batch geometry to read gate with */
+  const hvx_int_hmeta *h_meta;
   uint32_t rq_n_batches, rq_batch_cols;
 } moe_dn_ctx;
 
@@ -295,10 +293,10 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
       const uint32_t r1 =
         (m4 - r0 < MOE_RQ_UNIT_ROWS) ? m4 : r0 + MOE_RQ_UNIT_ROWS;
 #if HEXKL_MOE_INT_EPILOGUE
-      /* Integer scan and requant of the int32 mantissas the gate_up jobs
-         left, per-batch exponents normalised inside; padding rows are
-         zeroed there (doc 53 section 9). */
-      hvx_int_rq_rows((const int32_t *)c->gate, c->inter, c->h_e,
+      /* Integer requant of the int32 mantissas the gate_up jobs left, the
+         row's range from their per-batch metadata, exponents normalised
+         inside; padding rows are zeroed there (doc 53 section 9). */
+      hvx_int_rq_rows((const int32_t *)c->gate, c->inter, c->h_meta,
                       MOE_MAX_CHUNKS, c->rq_n_batches, c->rq_batch_cols,
                       c->inter, c->rq_m_blk, r0, r1, c->rq_scale, c->rq_zp,
                       c->mid);
@@ -716,10 +714,10 @@ int hexkl_mm_u8i4_moe_layer_run(
       return AEE_EBADPARM;
     }
 #if HEXKL_MOE_INT_EPILOGUE
-    /* The gate_up columns' fixed-point constants, once per weight for the
-       life of the slot (~10 ns a column: a first prefill call pays ~1 ms
-       a layer, a cached-slim miss ~40 us an expert). Before any job is
-       submitted, so the pool never sees a half-baked table. */
+    /* The gate_up columns' fixed-point constants. The upload bakes them
+       (hexkl_mm_u8i4_dma.c); this covers a slot filled another way, and
+       runs before any job is submitted so the pool never sees a
+       half-baked table. */
     if (!g->iq) {
       rc = hvx_int_wq_bake((hvx_int_wq **)&tbl->slots[h_gate_up[e]].iq,
                            g->w_scale, g->bias, g->N);
@@ -763,7 +761,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* Pairs per staged batch; the chunk size the gate_up pushes use too. */
   const uint32_t half = L.acc_tiles / 2u;
   /* Batches a block's gate_up takes: what the integer requant normalises
-     across (h_e is that wide per row). */
+     across (h_meta is that wide per row). */
   const uint32_t n_gu_batches = (inter_ntiles + half - 1u) / half;
   /* Bounded arrays below; a shape that needs more chunks than they hold is
      refused up front rather than overrun. 4 and 2 for this model. */
@@ -824,9 +822,9 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
   /* One done byte per slot block for the background pack. */
   const size_t sz_pack_done = n_slots_cap / HEXKL_MOE_PACK_UNIT_ROWS + 1u;
-  /* Integer epilogue: the exponent each gate_up job leaves per (row,
-     batch) for the requantization to normalise against. */
-  const size_t sz_he = sizeof(int16_t) * BR * MOE_MAX_CHUNKS;
+  /* Integer epilogue: the exponent and range each gate_up job leaves per
+     (row, batch) for the requantization to normalise against. */
+  const size_t sz_he = sizeof(hvx_int_hmeta) * BR * MOE_MAX_CHUNKS;
   /* The tail path (moe_tail_*): jobs, done bytes and contexts for as many
      tails as there are experts -- a bound, like n_slots_cap, so the block
      never regrows -- one shared staging set, and each tail's own result. */
@@ -884,7 +882,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
   float *out_c = (float *)hexkl_moe_carve(&cur, sz_out_c);
   uint8_t *pack_done = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
-  int16_t *h_e = (int16_t *)hexkl_moe_carve(&cur, sz_he);
+  hvx_int_hmeta *h_meta = (hvx_int_hmeta *)hexkl_moe_carve(&cur, sz_he);
   hvx_bg_job *jobs = (hvx_bg_job *)hexkl_moe_carve(&cur, sz_jobs);
   uint8_t *tail_done = (uint8_t *)hexkl_moe_carve(&cur, sz_tail_done);
   moe_tail_ctx *tails = (moe_tail_ctx *)hexkl_moe_carve(&cur, sz_tail_ctx);
@@ -1211,8 +1209,8 @@ int hexkl_mm_u8i4_moe_layer_run(
           jb->inter = inter;
           jb->dst = (int32_t *)gate;
           jb->dst_stride = inter;
-          jb->h_e = h_e;
-          jb->e_stride = MOE_MAX_CHUNKS;
+          jb->h_meta = h_meta;
+          jb->meta_stride = MOE_MAX_CHUNKS;
           jb->batch = gb;
           hvx_worker_pool_submit(pool, moe_gu_worker, jb, blk.m_blk);
 #else
@@ -1280,7 +1278,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       rq0.rq_scale = rq_scale;
       rq0.rq_zp = rq_zp;
       rq0.mid = vtcm_base + L.mid_off;
-      rq0.h_e = h_e;
+      rq0.h_meta = h_meta;
       rq0.rq_n_batches = n_gu_batches;
       rq0.rq_batch_cols = half * HEXKL_HMX_INT8_BLOCK_N_COL;
       hvx_worker_pool_submit(pool, moe_dn_worker, &rq0, MOE_RQ_UNITS);
@@ -1388,7 +1386,7 @@ int hexkl_mm_u8i4_moe_layer_run(
             c->rq_scale = rq_scale + (n & 1u) * BR;
             c->rq_zp = rq_zp + (n & 1u) * BR;
             c->mid = vtcm_base + L.mid_off + (n & 1u) * mid_bytes;
-            c->h_e = h_e;
+            c->h_meta = h_meta;
             c->rq_n_batches = n_gu_batches;
             c->rq_batch_cols = half * HEXKL_HMX_INT8_BLOCK_N_COL;
           } else {

@@ -190,7 +190,29 @@ static inline void iq_batch_bounds(const hvx_int_wq *q, uint32_t t0, uint32_t n,
   *bb = b;
 }
 
-/** A row's requantization parameters from its scanned range. */
+/** A row's common format and range from its batches' metadata: the
+ *  coarsest batch's exponent, and each batch's range brought to it by the
+ *  same rounding shift its values take (iq_asr_rnd is monotone, so this is
+ *  the range of the shifted values). sh[b] is that shift; the range holds
+ *  0, as the f32 scan's does. */
+static inline void iq_row_range(const hvx_int_hmeta *mr, uint32_t n_batches,
+                                int *sh, int *Fmin, int32_t *mn, int32_t *mx) {
+  int F = mr[0].F;
+  for (uint32_t b = 1; b < n_batches; ++b) {
+    F = mr[b].F < F ? mr[b].F : F;
+  }
+  int32_t lo = 0, hi = 0;
+  for (uint32_t b = 0; b < n_batches; ++b) {
+    sh[b] = mr[b].F - F;
+    lo = iq_min(lo, iq_asr_rnd(mr[b].mn, sh[b]));
+    hi = iq_max(hi, iq_asr_rnd(mr[b].mx, sh[b]));
+  }
+  *Fmin = F;
+  *mn = lo;
+  *mx = hi;
+}
+
+/** A row's requantization parameters from its range. */
 typedef struct {
   int zero;  /**< range empty: bytes 0, scale 1, zp 0 */
   int ls;    /**< v and R are shifted left by this */
