@@ -286,7 +286,10 @@ if get_option('enable-htp')
   # Derive the Hexagon SDK root from the addon path (two levels up).
   # remote.h and AEEStdErr.h live under <sdk_root>/incs/ and
   # <sdk_root>/incs/stddef/ respectively; sdkl.h is in the addon include/.
-  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  hexagon_sdk_root = get_option('hexagon-sdk-root')
+  if hexagon_sdk_root == ''
+    hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  endif
   # ipc/fastrpc/incs: the FastRPC client-side headers the generated stub
   # and HtpBackend's session (remote.h, remote64.h) come from.
   # ipc/fastrpc/rpcmem/inc: rpcmem.h, the DSP-shared allocator behind

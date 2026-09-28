@@ -270,6 +270,89 @@ public:
    */
   virtual void free_shared(void *block) { (void)block; }
 
+  /**
+   * @brief A quantized copy of an attention layer's KV cache that lives on
+   *        the accelerator, appended row by row and attended over in place.
+   *
+   * The layer keeps its fp16 cache as the source of truth and mirrors the
+   * rows it writes: kv_cache_q_register() once per (layer, batch) with the
+   * cache's capacity, kv_cache_q_append() with the fp16 rows of each step
+   * (or of any range that changed, e.g. after a cache load or rewind --
+   * rows may be rewritten), then sdpa_q_kvcache() by handle with the same
+   * contract as sdpa_fp16_kvcache() minus the cache pointers. The
+   * accelerator quantizes at append time (per-token scales) and never
+   * revisits a row; how it stores the cache is its own business. The
+   * default backend has none: register returns -1 and the layer stays on
+   * its fp16 path.
+   *
+   * @param kind      0 = int8 (A8W8), 1 = int4 (A8W4)
+   * @param max_rows  cache capacity in rows
+   * @return a handle >= 0, or -1 when this backend has no quantized cache
+   *         or the registration failed
+   */
+  virtual bool supports_kv_cache_q() const { return false; }
+  virtual int kv_cache_q_register(unsigned int kind, unsigned int max_rows,
+                                  unsigned int n_head_kv,
+                                  unsigned int head_dim) {
+    (void)kind;
+    (void)max_rows;
+    (void)n_head_kv;
+    (void)head_dim;
+    return -1;
+  }
+
+  /**
+   * @brief Writes cache rows [row0, row0 + n_rows) of the fp16 cache into
+   *        the accelerator's copy.
+   *
+   * @param kv_stride  elements per cache row (n_head_kv * head_dim); rows
+   *                   are dense fp16 bit patterns, K post-RoPE, V raw
+   * @return false on a transport failure; the caller then drops the
+   *         handle and takes the fp16 path
+   */
+  virtual bool kv_cache_q_append(int handle, unsigned int row0,
+                                 unsigned int n_rows, unsigned int kv_stride,
+                                 const uint16_t *k_rows,
+                                 const uint16_t *v_rows) {
+    (void)handle;
+    (void)row0;
+    (void)n_rows;
+    (void)kv_stride;
+    (void)k_rows;
+    (void)v_rows;
+    return false;
+  }
+
+  virtual void kv_cache_q_release(int handle) { (void)handle; }
+
+  /**
+   * @brief sdpa_fp16_kvcache() over a registered quantized cache. Rows
+   *        [0, cache_to) of the handle must be current (appended).
+   */
+  virtual bool sdpa_q_kvcache(int handle, const float *q, unsigned int q_stride,
+                              unsigned int n_q, unsigned int cache_from,
+                              unsigned int cache_to, unsigned int n_head_q,
+                              unsigned int n_head_kv, unsigned int head_dim,
+                              unsigned int window, float softcap,
+                              const float *sinks, float *out,
+                              unsigned int out_stride) {
+    (void)handle;
+    (void)q;
+    (void)q_stride;
+    (void)n_q;
+    (void)cache_from;
+    (void)cache_to;
+    (void)n_head_q;
+    (void)n_head_kv;
+    (void)head_dim;
+    (void)window;
+    (void)softcap;
+    (void)sinks;
+    (void)out;
+    (void)out_stride;
+    return false;
+  }
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,

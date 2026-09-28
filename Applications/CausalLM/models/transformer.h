@@ -139,6 +139,16 @@ public:
   virtual void initialize();
 
   /**
+   * @brief Creates the attention core layer ("mha_core") with the caller's
+   *        properties plus the ones nntr_config.json selects for every
+   *        attention layer: "engine" from "attention_engine" and
+   *        "kv_cache_quant" from "attention_kv_dtype". Every model's
+   *        createAttention goes through this so the config keys apply
+   *        regardless of which class builds the block.
+   */
+  LayerHandle createAttentionCore(std::vector<std::string> props);
+
+  /**
    * @brief Load the model weights from a file
    */
   virtual void load_weight(const std::string &weight_path);
@@ -380,6 +390,13 @@ protected:
    *        there so the accelerator reads them in place.
    */
   std::string ATTENTION_ENGINE;
+  /**
+   * @brief "attention_kv_dtype" in nntr_config.json: "q8" or "q4" keeps an
+   *        int8 / int4 mirror of every layer's KV cache on the attention
+   *        engine and runs attention over it (mha_core's kv_cache_quant);
+   *        empty attends over the fp16 cache.
+   */
+  std::string ATTENTION_KV_DTYPE;
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
 

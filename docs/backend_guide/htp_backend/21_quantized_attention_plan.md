@@ -3,9 +3,13 @@
 Status: 2026-09-28. Phases Q1, Q2, Q2b (A8W8 and A8W4 prefill kernel, at
 throughput) and Q4 (the vrmpy decode kernel) run on device (SM8850 / v81);
 Q3's kind switch came for free with Q2. Q5 (the `ComputeOps` /
-`MHACoreLayer` seam and the `attention_kv_dtype` config key) is implemented
-and compiles for arm64 and the host; its end-to-end gate is pending an
-Android build of the app. Branch:
+`MHACoreLayer` seam and the `attention_kv_dtype` config key) is delivered
+end to end: Qwen3-0.6B (fp32 weights, 28 layers, 16/8 heads, hd 128) on
+the device produces the identical 24 greedy tokens with the CPU, with
+`attention_engine: htp` over the fp16 cache, and with `attention_kv_dtype:
+q8`, every layer's attention on the DSP; `q4` collapses to "a a a a ..."
+-- int4 K with one scale per token is what the model analysis said it is,
+so int4 stays an experiment until a K-int8 / V-int4 kind exists. Branch:
 `htp/quant-dequant-hvx-opt`. Builds on `20_hmx_flash_attention_plan.md`
 (fp16 attention, delivered through Phase 4d).
 
@@ -78,6 +82,31 @@ Android build of the app. Branch:
   bytes, which the P' quantization computes anyway. Every running softmax
   quantity is a vector with all lanes equal; nothing is extracted to a
   scalar and nothing touches VTCM.
+
+- Q5 (end to end): three things kept the DSP path from ever engaging in
+  the app until this phase, none of them in the kernels. (1) Every model
+  class (Qwen3, Gemma, GPT-OSS, LFM2, Qwen2, BERT, ViT) builds its own
+  `mha_core` and never saw the `engine` property the base
+  `Transformer::createAttention` added; all of them now go through
+  `Transformer::createAttentionCore`, which appends `engine` and
+  `kv_cache_quant` from the config. (2) On Android with fp16 the layer
+  hands its per-batch helpers fp16 Q/output steps, and the accelerated
+  paths demanded f32; they now stage fp16 through f32. (3) `forwarding()`
+  (the external-cache path) never captured the context's `ComputeOps`.
+  The fp16 HTP path of Phase 4c had therefore never run in the app either.
+  With those fixed, Qwen3-0.6B at 22 prompt + 24 generated tokens
+  (512-row cache, NNTR_NUM_THREADS=4): CPU 287 ms prefill / 1081 ms
+  generation; HTP fp16 310 / 1174; HTP int8 708 / 3181; HTP int4 1397 /
+  3824 (and wrong). At this cache size the attention itself is a few
+  microseconds per layer and the time is FastRPC: the fp16 path makes one
+  call per layer per step, the quantized path two (append, then attend),
+  each ~1 ms round trip including the DSP-side scalar quantizer of the
+  appended rows, times 28 layers. The fix is mechanical and is the next
+  item: one `attn_q_step` entry that appends the step's rows and attends
+  in the same call, and an HVX quantizer for the appended rows. The DSP
+  path pays for itself only where the attention is large -- long
+  contexts, where the fp16 numbers above (2.6 ms vs the CPU's tens of ms
+  per layer at 4096 rows) apply.
 
   Phase times, 128x1024, us: qprep 359, dma 259, qk 335, dequant 470,
   softmax 387 (exposed), pquant 1316, pv 304, oupd 308, store 119. What is
@@ -304,8 +333,9 @@ CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 | Q2b | HVX passes at throughput: no scalar VTCM access (metadata in heap, vector gathers, group-major V scales read from DDR, all-vector P' scales), Q quantized once per head chunk, DSP power vote | done: 128x1024 at 1.53x of the fp16 resident path, 3.95 vs 2.58 ms |
 | Q3 | (folded into Q2: the kind switch is one struct) mixed K/V kinds if real data asks for K i8 + V i4 | -- |
 | Q4 | `hvx_attn_decode_q`: both kinds from the same offset-binary masters, Q and P' as 4 uint8 in a scalar register against `vrmpy(Vub, Rub)`, f32 softmax with all-lanes-equal running state, nothing touches VTCM | done: DSP vs model 69-137 dB; 5.0x / 4.05x faster than the fp16 decode at 1x1024 / 1x4096 |
-| Q5 | `ComputeOps::kv_cache_q_{register,append,release}` + `sdpa_q_kvcache`, `HtpComputeOps` forwarding, `MHACoreLayer` `kv_cache_quant` property with a per-batch mirror that re-appends from the first row that may differ (rewind, cache load), `attention_kv_dtype` in nntr_config.json | implemented, compiles (host CausalLM, arm64 HTP ops); gate: CausalLM on device with `attention_engine: htp` + `attention_kv_dtype: q8`, tokens vs the fp16 run |
-| Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4; doc update | -- |
+| Q5 | `ComputeOps::kv_cache_q_{register,append,release}` + `sdpa_q_kvcache`, `HtpComputeOps` forwarding, `MHACoreLayer` `kv_cache_quant` property with a per-batch mirror that re-appends from the first row that may differ (rewind, cache load), `attention_kv_dtype` in nntr_config.json, `Transformer::createAttentionCore` | done: Qwen3-0.6B on device, identical greedy tokens for CPU / HTP fp16 / HTP int8 |
+| Q5b | One FastRPC call per layer per step for the quantized path (append + attend), HVX quantizer for appended rows | per-step overhead at parity with the fp16 path |
+| Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4 -- kernel numbers are in the status header; the model-level table needs a long-context prompt and Q5b | partly done |
 
 ## 5. Risks
 - **Accumulator layout**: the probe may find a non-affine layout on v81;
