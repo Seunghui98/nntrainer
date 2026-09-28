@@ -138,6 +138,36 @@ def report(calls, caches, base_ms, miss_ms):
             tps = 1000.0 / (base_ms + layers * mpc * miss_ms)
             print(f"{c:>3} {cap:>5} {p:>7} {mpc:>17.2f} {hit:>6.1f} "
                   f"{pm:>15} {tps:>12.1f}")
+    spec = speculation(calls)
+    if spec[0][1]:
+        print("decode read-ahead ceiling: share of a token's experts in the "
+              "same layer's previous token's top-(4+m)")
+        for m, (cov, n, reads) in spec.items():
+            calls_n = n / per_call if per_call else 0
+            print(f"  top-{4 + m}: {100.0 * cov / n:5.1f}% covered, "
+                  f"{reads / calls_n if calls_n else 0:.1f} candidates/call")
+
+
+def speculation(calls):
+    """Decode read-ahead's ceiling (doc 52 section 10.25): for each decode
+    call, the share of its routed experts that the SAME layer's previous
+    decode token had in its top-(4+m), m = 0..5 -- what reading that
+    token's next-ranked experts during the other layers' calls could have
+    had resident in time. -> {m: (covered, routed, reads per call)}."""
+    prev = {}
+    out = {m: [0, 0, 0] for m in range(6)}
+    for layer, tokens, routed, ext in calls:
+        if tokens != 1:
+            continue
+        last = prev.get(layer)
+        if last is not None:
+            for m in range(6):
+                window = set(last[:4 + m])
+                out[m][0] += sum(1 for e in routed if e in window)
+                out[m][1] += len(routed)
+                out[m][2] += len(window)
+        prev[layer] = ext
+    return {m: tuple(v) for m, v in out.items()}
 
 
 def selftest():
@@ -162,6 +192,11 @@ def selftest():
     assert simulate(calls, 2, "ours")[0] == 3
     # Prefill calls count apart from decode.
     assert simulate([(0, 2, [0, 1], [])], 2, "lru") == (0, 0, 2)
+    # Speculation: layer 0 routes [1, 2] after a token whose top list was
+    # [2, 5, 1, ...]: top-4 covers both.
+    spec = speculation([(0, 1, [0, 3], [2, 5, 1, 7, 9, 8, 6, 4, 3]),
+                        (0, 1, [1, 2], [])])
+    assert spec[0] == (2, 2, 4) and spec[5][0] == 2
     # Parsing.
     assert parse(["3 1 | 4 7 | 7 4 9\n", "\n"]) == [(3, 1, [4, 7], [7, 4, 9])]
     print("selftest OK")
@@ -172,10 +207,12 @@ def main():
     ap.add_argument("trace", nargs="?")
     ap.add_argument("--cache", type=int, nargs="+", default=[2, 4, 8, 16],
                     help="experts per layer (NNTR_MOE_CACHE_EXPERTS)")
-    ap.add_argument("--base-ms", type=float, default=42.0,
-                    help="resident decode token, ms (doc 52: 1000/23.8)")
-    ap.add_argument("--miss-ms", type=float, default=1.37,
-                    help="one synchronous miss, ms (doc 52 section 10.9)")
+    ap.add_argument("--base-ms", type=float, default=41.6,
+                    help="resident decode token, ms (doc 52 section 10.24: "
+                         "1000/24.0)")
+    ap.add_argument("--miss-ms", type=float, default=0.47,
+                    help="one warm miss, read + swap, ms (doc 52 section "
+                         "10.24)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
