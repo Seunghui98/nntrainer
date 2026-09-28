@@ -21,9 +21,12 @@ Hard rules (user decisions 2026-09-21):
   (y/n, first differing token index), `NNTR_L2_DIFF` result when the
   variant changes DSP arithmetic. **Handoffs that run the per-token entry
   (`NNTR_HTP_FORWARD=1`, #130 onward; user decision 2026-09-28) add two
-  things:** a `PPL` column (`NNTR_PPL=1` on one extra run per variant and
-  G=64, the CPU `q40` PPL of the same prompt as the reference, fail above
-  +2 % unless the plan says otherwise) and a **text approval** section —
+  things:** a decode `PPL` column (`NNTR_PPL_DECODE=cont.ids`, #134: A's
+  first PPL run at G=512 with no `cont.ids` writes A's own continuation,
+  every other variant — and A once more, as a null check — is forced on
+  it; the reference is **A of the same sitting**, never the CPU `q40` run
+  (user decision 2026-09-28); fail above +2 % of A unless the plan says
+  otherwise) and a **text approval** section —
   the filled handoff pastes A's and every variant's generated text (G=64,
   run 1) in full, and the user marks `text approved: y/n` per variant.
   Differing text is not a fail by itself; an unapproved text is not a
@@ -78,7 +81,7 @@ Branch `htp/<issue#>-<slug>` @ `<sha>` — estimated device time: <N> min
 Reference: NPU now 20.8 / CPU now 48 decode tok/s, NPU prefill 523 (PR doc 49; replaced by the first handoff). Goal ≥ 50, prefill ≥ 497.
 
 ## Text approval (per-token-entry handoffs only)
-| variant | PPL (NNTR_PPL, G=64) | generated text (G=64, run 1) | text approved (user: y/n) |
+| variant | decode PPL (NNTR_PPL_DECODE, G=512, forced on A) | generated text (G=64, run 1) | text approved (user: y/n) |
 |---|---|---|---|
 | A | | <paste> | (reference) |
 | B | | <paste> | |
