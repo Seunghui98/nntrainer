@@ -323,6 +323,33 @@ commits), PR #125 (`d0552b1e`, #82), PR #126 (`1afbf0aa`, #81), PR #127
 The "synced to `4ae1ebd7`" line above is the record; #82's `hvx_conv_gate_f32`
 reuse (case (a)) stands. Rungs 2–3 for these PRs: §3a.**
 
+**Cycle 18 (seen 2026-09-28, the first sitting after the weekend's Mac
+cycles): PR head unchanged at `4ae1ebd7` (updated 2026-09-23 02:14 UTC;
+`gh pr view 4327` and the branch's last fifteen commits end there).
+Nothing to decide upstream. On our side: `htp_moe` @ `39af2f39` (=
+origin; cycle-16b fold `dbaf24b5` + plan 130), no filled handoff since
+#120, no open PR into `htp_moe`, no `state:measured` issue. Consistency
+check of the weekend's merges: #120 / #82 / #81 / #84 / #89 / #85 are
+closed against PRs #121 / #125 / #126 / #127 / #128 / #119, and the tree
+carries what plan 130 assumes (`hvx/hvx_m1_ops_f32`, `hvx_attn_m1_f32`,
+`hvx_conv_gate_f32`, `m1_ops_det.h`, `attn_m1_det.h`, the `attn_m1_*` IDL
+entries, `run_inproc_e2e.sh`, `htp_dump_eval.py`; `hexkl_graph.c`'s table
+still MOE-only). Two things were stale and are fixed: the tracker #76 body
+(cycle-12 text: "frozen at `2ce38d65`", provisional "now") is rewritten to
+the merged state, and ten closed issues still carried a `state:*` label
+(#117 #105 #102 #101 #100 #87 #85 `review`, #78 `in-progress`, #91 #114
+`needs-plan`) — removed. Ruling recorded on #76: **#122 (docs/htp tech
+docs, `state:in-progress`, user-driven sessions) is a docs track and does
+not occupy the implementer's single `in-progress` slot**, so #130 may go
+`in-progress` beside it. Local housekeeping left to the user / orchestrator
+(not an agent output): worktrees of merged branches (`~/nntrainer-120`,
+`-85`, `-guide`, `-moe` = `htp_moe_cycle` @ `d79c0efe`, `-A` detached)
+and their `[gone]` local branches; `~/nntrainer-122` at `7d14d9fa` is three
+commits behind `origin/htp/122-tech-docs` (`4c73bb01`). Rungs 2–3 md5s
+for a post-#121 skel are still unrecorded (§3a); #130's gate produces
+them. Queue: #130 planned p1, #99 / #90 planned p2, #110 parked — no new
+issue.**
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
