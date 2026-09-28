@@ -175,16 +175,24 @@ else
     "source tools/htp/env.sh)"
 fi
 
-# The per-token entry skeleton (#85): htp_graph_desc.h's validator and
-# LFM2 builder (the LFM2.5 list validates, each mutation fails with its
-# own code, never AEE_EBADPARM) and hexkl_graph.c's forward loop on the
-# tiny fixture's shapes -- the identity with nothing resident, and with
-# MOE resident byte-equal to a direct layer_run call on a recording
-# stand-in of the kernel (the kernel's own loops are the first check's).
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
-  -I "$HERE/stub" -I "$BACKEND" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+# The per-token entry (#85): htp_graph_desc.h's validator and LFM2
+# builder (the LFM2.5 list validates, each mutation fails with its own
+# code, never AEE_EBADPARM) and hexkl_graph.c's forward loop on the tiny
+# fixture's shapes -- the identity with nothing resident, and with MOE
+# resident byte-equal to a direct layer_run call on a recording stand-in
+# of the kernel (the kernel's own loops are the first check's). Since
+# #130 the same binary links the REAL small-op and m=1 attention sources
+# on hvx_emu/ (and the worker pool on pthreads), and memcmp's each
+# resident stretch's output against the scalar specs -- so the same
+# -ffp-contract=off / -include malloc.h flags as the two checks below.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -pthread -include malloc.h \
+  -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/graph_host_check" \
-  "$HERE/graph_host_check.c" "$BACKEND/hmx/hexkl_graph.c"
+  "$HERE/graph_host_check.c" "$BACKEND/hmx/hexkl_graph.c" \
+  "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
+  "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
 
 "$OUT/graph_host_check"
 

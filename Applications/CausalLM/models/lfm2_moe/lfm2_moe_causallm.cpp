@@ -78,14 +78,32 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
     shape.head_dim = static_cast<uint32_t>(HEAD_DIM);
     shape.vocab = NUM_VOCAB;
     shape.max_seq = MAX_SEQ_LEN;
+    shape.eps = NORM_EPS;
     std::vector<uint8_t> attn(layer_types_.size());
     for (size_t l = 0; l < layer_types_.size(); ++l)
       attn[l] = layer_types_[l] != "conv";
+    // [#130] NNTR_HTP_FORWARD_KINDS (comma-separated kind names) chooses
+    // which kinds carry the resident bit; the default is every kind the
+    // skel and the ARM hooks run. The bit is the one source of truth for
+    // both sides (plan 130 section 3.2).
+    const char *kinds = std::getenv("NNTR_HTP_FORWARD_KINDS");
+    const uint32_t mask =
+      kinds != nullptr
+        ? htp_graph_kinds_parse(kinds)
+        : (HTP_GRAPH_KIND_BIT(HTP_OP_MOE) | HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) |
+           HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) |
+           HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |
+           HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) |
+           HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1));
+    if (mask == 0u)
+      throw std::runtime_error(
+        std::string("Lfm2Moe: NNTR_HTP_FORWARD_KINDS: unknown kind in '") +
+        kinds + "'");
     std::vector<uint32_t> words(
       htp_graph_words_for(shape.n_layers, HTP_GRAPH_MAX_OPS));
     const uint32_t n =
       htp_graph_lfm2_build(words.data(), static_cast<uint32_t>(words.size()),
-                           &shape, attn.data(), HTP_GRAPH_KIND_BIT(HTP_OP_MOE));
+                           &shape, attn.data(), mask);
     if (n == 0u)
       throw std::runtime_error("Lfm2Moe: NNTR_HTP_FORWARD: the decode op list "
                                "does not fit HTP_GRAPH_MAX_OPS");

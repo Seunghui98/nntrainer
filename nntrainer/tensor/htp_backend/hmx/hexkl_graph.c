@@ -4,16 +4,21 @@
  *
  * @file   hexkl_graph.c
  * @date   23 Sep 2026
- * @brief  The session's validated decode op table and its forward loop (#85)
+ * @brief  The session's validated decode op table and its forward loop
+ *         (#85), with the small ops and m=1 attention resident (#130)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
  * Address space (LEDGER rule 8): one hexkl_graph is HTP_GRAPH_MAX_OPS x
- * (304 + 8) B of table, about 80 KiB, plus HTP_GRAPH_N_SLOTS x slot_words
- * f32 of activation slots (24 KiB with only MOE resident at hidden 2048),
- * all DSP heap, no arena, no VTCM, no DMA. That is noise against the
- * ~182 MiB heap and needs no arena accounting.
+ * (320 + 8 + 8 + 8 + 4) B of table, about 87 KiB, plus HTP_GRAPH_N_SLOTS
+ * x slot_words f32 of activation slots (36 KiB at LFM2.5: QK_NORM's 3072
+ * words is the widest resident op), plus the parameters bound through
+ * hexkl_graph_set_param -- about 1.8 MiB at LFM2.5 (49 gammas of 8 KiB,
+ * 18 x (24 + 24) KiB conv weight and state, a 512 KiB RoPE table at
+ * max_seq 2048; plan 82 section 3.4) -- all DSP heap, no arena, no VTCM,
+ * no DMA. The 48 MiB KV cache the ATTN_M1 op reads is the session's
+ * (hvx_attn_m1_f32.h's budget note), borrowed through the env.
  */
 
 #include "hexkl_graph.h"
@@ -23,6 +28,8 @@
 
 #include <AEEStdErr.h>
 #include <HAP_perf.h>
+
+#include "hvx_m1_ops_f32.h"
 
 /* htp_graph_desc.h restates the SDK's codes so it can be built with no
    SDK; here both are in scope, so a drift is a build error. */
@@ -34,7 +41,9 @@
   HTP_GRAPH_E_UNSUPPORTED != AEE_EUNSUPPORTED ||                               \
   HTP_GRAPH_E_NOTYPE != AEE_ENOTYPE ||                                         \
   HTP_GRAPH_E_INVALIDITEM != AEE_EINVALIDITEM ||                               \
-  HTP_GRAPH_E_INVHANDLE != AEE_EINVHANDLE
+  HTP_GRAPH_E_INVHANDLE != AEE_EINVHANDLE ||                                   \
+  HTP_GRAPH_E_SCHEMENOTSUPPORTED != AEE_ESCHEMENOTSUPPORTED ||                 \
+  HTP_GRAPH_E_NOTALLOWED != AEE_ENOTALLOWED
 #error "htp_graph_desc.h's error codes drifted from AEEStdErr.h"
 #endif
 
@@ -42,6 +51,7 @@
 typedef struct {
   const hexkl_graph_env *env;
   hexkl_graph_routing routing; /**< n_experts 0 once consumed */
+  uint32_t pos;                /**< the token position (ROPE, ATTN_M1) */
 } graph_call;
 
 typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
@@ -86,21 +96,110 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
     r->row_weight, in, out, env->pool, env->scratch, env->moe_flags);
 }
 
+/* ---- the small ops (#82) and m=1 attention (#81), as they are ---------- */
+
+static float graph_eps(const htp_graph_op *op) {
+  float eps;
+  memcpy(&eps, &op->eps_bits, sizeof(eps));
+  return eps;
+}
+
+static int graph_op_rmsnorm(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  const float *gamma = g->param[op - g->ops];
+  (void)call;
+  if (gamma == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_rmsnorm_f32(in, gamma, out, op->K, op->K, graph_eps(op), NULL);
+  return AEE_SUCCESS;
+}
+
+/* q heads with gamma[0..head_dim), k heads with gamma[head_dim..2 head_dim),
+   v copied through: the row stays q | k | v for ROPE and ATTN_M1. */
+static int graph_op_qk_norm(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  const float *gamma = g->param[op - g->ops];
+  const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
+                 n_k = op->n_kv * hd;
+  const float eps = graph_eps(op);
+  (void)call;
+  if (gamma == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_rmsnorm_f32(in, gamma, out, n_q, hd, eps, NULL);
+  hvx_rmsnorm_f32(in + n_q, gamma + hd, out + n_q, n_k, hd, eps, NULL);
+  if (in != out) {
+    memcpy(out + n_q + n_k, in + n_q + n_k, (size_t)n_k * sizeof(float));
+  }
+  return AEE_SUCCESS;
+}
+
+static int graph_op_rope(hexkl_graph *g, const htp_graph_op *op,
+                         graph_call *call, const float *in, float *out) {
+  const uint32_t n_q = op->gqa * op->n_kv;
+  if (g->rope_cs == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (in != out) {
+    memcpy(out, in, (size_t)op->K * sizeof(float));
+  }
+  hvx_rope64_f32(out, n_q, out + (size_t)n_q * 64u, op->n_kv,
+                 g->rope_cs + (size_t)call->pos * 64u);
+  return AEE_SUCCESS;
+}
+
+static int graph_op_conv1d_gate(hexkl_graph *g, const htp_graph_op *op,
+                                graph_call *call, const float *in, float *out) {
+  const uint32_t i = (uint32_t)(op - g->ops);
+  (void)call;
+  if (g->param[i] == NULL || g->state[i] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_conv_gate_m1_f32(in, g->state[i], g->param[i], out, op->N);
+  return AEE_SUCCESS;
+}
+
+/** @brief 1/sqrt(head_dim) for the head_dims the validator admits (32,
+ *  64, 128): exact 0.125f at 64, and no libm on the skel's import list. */
+static float graph_attn_scale(uint32_t head_dim) {
+  switch (head_dim) {
+  case 32u:
+    return 0.17677669529663688f;
+  case 64u:
+    return 0.125f;
+  default:
+    return 0.08838834764831845f; /* 128 */
+  }
+}
+
+static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
+                 n_k = op->n_kv * hd;
+  if (call->env->attn_m1 == NULL) {
+    return AEE_EBADSTATE;
+  }
+  return hvx_attn_m1_forward(call->env->attn_m1, g->ordinal[op - g->ops],
+                             call->pos, graph_attn_scale(hd), in, in + n_q,
+                             in + n_q + n_k, out, NULL);
+}
+
 /** @brief The kernel table: a NULL slot is a kind this build does not run
  *  (hvx_impl's htp_op_table rule); the validator refuses a resident bit on
  *  it with AEE_ECLASSNOTSUPPORT, so forward never reaches a NULL. */
 static const graph_kernel kernels[HTP_OP_KIND_N] = {
-  NULL,         /* RMSNORM      #82 */
-  NULL,         /* FC           plan 85 section 7 */
-  NULL,         /* CONV1D_GATE  #82 */
-  NULL,         /* QK_NORM      #82 */
-  NULL,         /* ROPE         #82 */
-  NULL,         /* ATTN_M1      #81 */
-  NULL,         /* ADD */
-  NULL,         /* ROUTER_TOPK */
-  graph_op_moe, /* MOE */
-  NULL,         /* DENSE_FFN */
-  NULL,         /* LM_HEAD */
+  graph_op_rmsnorm,     /* RMSNORM      #82 */
+  NULL,                 /* FC           plan 85 section 7 */
+  graph_op_conv1d_gate, /* CONV1D_GATE  #82 */
+  graph_op_qk_norm,     /* QK_NORM      #82 */
+  graph_op_rope,        /* ROPE         #82 */
+  graph_op_attn_m1,     /* ATTN_M1      #81 */
+  NULL,                 /* ADD */
+  NULL,                 /* ROUTER_TOPK */
+  graph_op_moe,         /* MOE */
+  NULL,                 /* DENSE_FFN */
+  NULL,                 /* LM_HEAD */
 };
 
 uint32_t hexkl_graph_resident_kinds(void) {
@@ -124,7 +223,7 @@ static int graph_check_handle(const hexkl_weight_u8i4_table *tbl, uint32_t h,
 
 int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
                      const hexkl_weight_u8i4_table *tbl, hexkl_graph **out) {
-  uint32_t n_ops = 0, i, e, slot_words = 0;
+  uint32_t n_ops = 0, i, e, slot_words = 0, n_attn = 0;
   hexkl_graph *g;
   int rc;
   if (out == NULL || tbl == NULL) {
@@ -177,17 +276,84 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
   }
   for (i = 0; i < n_ops; ++i) {
     g->ops[i] = *htp_graph_op_cat(words, i);
+    if (g->ops[i].kind == HTP_OP_ATTN_M1) {
+      g->ordinal[i] = n_attn++;
+    }
   }
   *out = g;
   return AEE_SUCCESS;
 }
 
 void hexkl_graph_free(hexkl_graph *g) {
+  uint32_t i;
   if (g == NULL) {
     return;
   }
+  for (i = 0; i < g->n_ops; ++i) {
+    free(g->param[i]);
+    free(g->state[i]);
+  }
+  free(g->rope_cs);
   free(g->slots);
   free(g);
+}
+
+/** @brief The parameter's length for (kind, which), 0 when the kind does
+ *  not take it. */
+static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
+  switch (which) {
+  case HTP_GRAPH_PARAM_GAMMA:
+    return op->kind == HTP_OP_RMSNORM   ? op->K
+           : op->kind == HTP_OP_QK_NORM ? 2u * op->head_dim
+                                        : 0u;
+  case HTP_GRAPH_PARAM_CONV_W:
+    return op->kind == HTP_OP_CONV1D_GATE ? 3u * op->N : 0u;
+  case HTP_GRAPH_PARAM_CONV_STATE:
+    return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
+  default:
+    return 0u;
+  }
+}
+
+int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
+                          const float *data, uint32_t n) {
+  float **dst;
+  uint32_t want, alloc;
+  if (g == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (which >= HTP_GRAPH_PARAM_N || data == NULL) {
+    return AEE_EBADITEM;
+  }
+  if (which == HTP_GRAPH_PARAM_ROPE_TABLE) {
+    if (op != HTP_GRAPH_NO_OP) {
+      return AEE_EBADITEM;
+    }
+    want = alloc = g->max_seq * 64u;
+    dst = &g->rope_cs;
+  } else {
+    if (op >= g->n_ops) {
+      return AEE_EBADITEM;
+    }
+    want = graph_param_len(&g->ops[op], which);
+    if (want == 0u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    /* the conv state buffer is 3 rows: the kernel's scratch is row 2 */
+    alloc = (which == HTP_GRAPH_PARAM_CONV_STATE) ? 3u * g->ops[op].N : want;
+    dst = (which == HTP_GRAPH_PARAM_CONV_STATE) ? &g->state[op] : &g->param[op];
+  }
+  if (n != want) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (*dst == NULL) {
+    *dst = (float *)calloc(alloc, sizeof(float));
+    if (*dst == NULL) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  memcpy(*dst, data, (size_t)n * sizeof(float));
+  return AEE_SUCCESS;
 }
 
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
@@ -241,6 +407,7 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
   last = NULL;
   n_run = 0;
   call.env = env;
+  call.pos = pos;
   if (routing != NULL) {
     call.routing = *routing;
   } else {
