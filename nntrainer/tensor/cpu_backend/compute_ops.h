@@ -326,16 +326,26 @@ public:
   virtual void kv_cache_q_release(int handle) { (void)handle; }
 
   /**
-   * @brief sdpa_fp16_kvcache() over a registered quantized cache. Rows
-   *        [0, cache_to) of the handle must be current (appended).
+   * @brief sdpa_fp16_kvcache() over a registered quantized cache, with the
+   *        rows the cache is missing appended in the same round trip:
+   *        rows [append_row0, append_row0 + append_rows) are written from
+   *        k_rows / v_rows (dense, kv_stride elements per row) before the
+   *        attention runs. append_rows == 0 attends over the rows already
+   *        there. One accelerator call per layer per step is what keeps
+   *        the transport cost at the fp16 path's.
    */
-  virtual bool sdpa_q_kvcache(int handle, const float *q, unsigned int q_stride,
-                              unsigned int n_q, unsigned int cache_from,
-                              unsigned int cache_to, unsigned int n_head_q,
-                              unsigned int n_head_kv, unsigned int head_dim,
-                              unsigned int window, float softcap,
-                              const float *sinks, float *out,
-                              unsigned int out_stride) {
+  virtual bool sdpa_q_kvcache(
+    int handle, unsigned int append_row0, unsigned int append_rows,
+    unsigned int kv_stride, const uint16_t *k_rows, const uint16_t *v_rows,
+    const float *q, unsigned int q_stride, unsigned int n_q,
+    unsigned int cache_from, unsigned int cache_to, unsigned int n_head_q,
+    unsigned int n_head_kv, unsigned int head_dim, unsigned int window,
+    float softcap, const float *sinks, float *out, unsigned int out_stride) {
+    (void)append_row0;
+    (void)append_rows;
+    (void)kv_stride;
+    (void)k_rows;
+    (void)v_rows;
     (void)handle;
     (void)q;
     (void)q_stride;

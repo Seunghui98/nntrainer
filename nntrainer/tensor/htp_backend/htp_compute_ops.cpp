@@ -113,37 +113,35 @@ public:
     }
   }
 
-  bool sdpa_q_kvcache(int handle, const float *q, unsigned int q_stride,
-                      unsigned int n_q, unsigned int cache_from,
-                      unsigned int cache_to, unsigned int n_head_q,
-                      unsigned int n_head_kv, unsigned int head_dim,
-                      unsigned int window, float softcap, const float *sinks,
-                      float *out, unsigned int out_stride) override {
+  bool sdpa_q_kvcache(int handle, unsigned int append_row0,
+                      unsigned int append_rows, unsigned int kv_stride,
+                      const uint16_t *k_rows, const uint16_t *v_rows,
+                      const float *q, unsigned int q_stride, unsigned int n_q,
+                      unsigned int cache_from, unsigned int cache_to,
+                      unsigned int n_head_q, unsigned int n_head_kv,
+                      unsigned int head_dim, unsigned int window, float softcap,
+                      const float *sinks, float *out,
+                      unsigned int out_stride) override {
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
         head_dim > 256 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
-        q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim) {
+        q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
+        (append_rows != 0 &&
+         (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
       return false;
     }
     const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
-    const uint32_t kv = static_cast<uint32_t>(handle);
     const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
     const int sinks_len = sinks ? static_cast<int>(n_head_q) : 0;
-    uint32_t stats[12] = {0};
-    int err;
-    if (n_q < kDecodeMaxRows && head_dim <= kDecodeMaxHeadDim) {
-      err = nntr_hvx_attn_q_decode(h, kv, n_q, cache_from, cache_to, n_head_q,
-                                   window, softcap, q, q_len, sinks, sinks_len,
-                                   out, q_len, stats, 2);
-    } else {
-      err = nntr_hvx_attn_q_prefill(
-        h, kv, n_q, cache_from, cache_to, n_head_q, window, /*br=*/0, /*bc=*/0,
-        softcap, q, q_len, sinks, sinks_len, out, q_len, stats, 12);
-    }
+    const int rows_len = static_cast<int>(append_rows * kv_stride);
+    uint32_t stats[8] = {0};
+    const int err = nntr_hvx_attn_q_step(
+      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q, q_len,
+      sinks, sinks_len, out, q_len, stats, 8);
     if (err != AEE_SUCCESS) {
-      ml_logw("HTP quantized attention (%s) failed: 0x%x; CPU fallback",
-              n_q < kDecodeMaxRows ? "decode" : "prefill", err);
+      ml_logw("HTP quantized attention step failed: 0x%x; CPU fallback", err);
       return false;
     }
     return true;

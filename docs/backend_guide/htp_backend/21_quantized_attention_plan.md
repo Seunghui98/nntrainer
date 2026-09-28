@@ -117,6 +117,29 @@ so int4 stays an experiment until a K-int8 / V-int4 kind exists. Branch:
   it trimmed the HMX phases by ~30% and is a precondition for comparable
   numbers.
 
+- Q5b (one call per layer per step): `attn_q_step` appends the step's
+  rows and attends in the same FastRPC call, so the quantized path makes
+  as many calls as the fp16 one. The append itself was 1.45 ms per row at
+  int8 (scalar quantizer 252 us, staging 587 us, rebaking the 32-row tile
+  607 us). Two changes took it to 30 us: the int8 WH tiles are written
+  directly from a probed layout (two ramp bakes through `rm_to_wh_i8` at
+  open give the byte position of every (row, column) of a 32x32 tile, and
+  the appended row's 32 bytes per head-dim tile go straight to those
+  positions -- no staging, no rebake), and the quantizer is HVX
+  (`hvx_kv_quant.c`: widen, absmax, multiply, round-to-nearest-even,
+  clamp and the column sum as vectors; the scale from the vector maximum
+  on the scalar unit, so the scales are bit-identical to the C reference
+  and the values differ by at most one step on rare f32 ties, which the
+  dump test tolerates). Int4 still restages and rebakes (~1.3 ms per row)
+  because its WH byte order is not the int8 one; a second probe is the
+  obvious follow-up if int4 ever earns it. `StepTiming` on device
+  (16/8 heads, hd 128, us): int8 append 30 / attend 109 at 512 rows, 41 /
+  1137 at 4096; int4 1222 / 109 and 1371 / 1141. Model level, the same
+  22 + 24 tokens as Q5: HTP int8 408 ms prefill / 1136 ms generation
+  (was 708 / 3181), HTP fp16 310 / 1164, CPU 300 / 1077 -- the quantized
+  path is now at parity with the fp16 one, and both sit on the FastRPC
+  floor at this cache size.
+
 ## 1. Where things stand
 
 ### 1.1 Reusable, on this branch
@@ -309,18 +332,25 @@ kv_append_q(handle, row0, in seq<uint16> k_rows, in seq<uint16> v_rows)
 attn_q_prefill(handle, n_q, cache_from, cache_to, n_head_q, window, br, bc,
                softcap, q_f32, sinks, rout out_f32, rout stats_us)
 attn_q_decode (same, no br/bc)
+attn_q_step   (handle, row0, in seq<uint16> k_rows, v_rows, n_q, cache_from,
+               cache_to, n_head_q, window, softcap, q_f32, sinks,
+               rout out_f32, rout stats_us)          -- Q5b: append + attend
 probe_acc_i32_layout(rout base, rout stride)          -- device test only
 ```
-kind: 0 = A8W8, 1 = A8W4.
+kind: 0 = A8W8, 1 = A8W4. `attn_q_step` is what the host uses per layer
+per step; it picks the decode kernel for n_q < 5 (hd <= 128) and the
+prefill kernel otherwise, and its stats carry append / attend / quant /
+stage / bake microseconds.
 
 ### 3.5 Host seam
 `ComputeOps`: `supports_sdpa_q_kvcache()`, `kv_cache_register(kind, ...)`,
 `kv_cache_append(handle, row0, n, k_f16, v_f16)`, `kv_cache_release`,
-`sdpa_q_kvcache(handle, q, ...)`. `HtpComputeOps` forwards.
-`MHACoreLayer`: on the first step with `attention_kv_dtype` set, registers
-one handle per layer (`max_timestep`); in `one_batch_incremental_forwarding`
-right after `b_cache_key_step` / `b_cache_value_step` are written, appends
-those rows; `try_accelerated_attention` calls by handle; any failure ->
+`sdpa_q_kvcache(handle, append_row0, append_rows, k_rows, v_rows, q, ...)`
+(Q5b: the rows to append travel with the attention call). `HtpComputeOps`
+forwards. `MHACoreLayer`: on the first step with `attention_kv_dtype` set,
+registers one handle per layer (`max_timestep`); `try_quantized_attention`
+hands the fp16 cache rows from the first unsynced one up to `cache_to` to
+that single call and marks them synced on success; any failure ->
 CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 (layer, batch).
 
@@ -334,7 +364,7 @@ CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 | Q3 | (folded into Q2: the kind switch is one struct) mixed K/V kinds if real data asks for K i8 + V i4 | -- |
 | Q4 | `hvx_attn_decode_q`: both kinds from the same offset-binary masters, Q and P' as 4 uint8 in a scalar register against `vrmpy(Vub, Rub)`, f32 softmax with all-lanes-equal running state, nothing touches VTCM | done: DSP vs model 69-137 dB; 5.0x / 4.05x faster than the fp16 decode at 1x1024 / 1x4096 |
 | Q5 | `ComputeOps::kv_cache_q_{register,append,release}` + `sdpa_q_kvcache`, `HtpComputeOps` forwarding, `MHACoreLayer` `kv_cache_quant` property with a per-batch mirror that re-appends from the first row that may differ (rewind, cache load), `attention_kv_dtype` in nntr_config.json, `Transformer::createAttentionCore` | done: Qwen3-0.6B on device, identical greedy tokens for CPU / HTP fp16 / HTP int8 |
-| Q5b | One FastRPC call per layer per step for the quantized path (append + attend), HVX quantizer for appended rows | per-step overhead at parity with the fp16 path |
+| Q5b | One FastRPC call per layer per step for the quantized path (append + attend), direct WH-tile writes for int8 from a probed layout, HVX quantizer for appended rows | done: int8 append 1.45 ms -> 30 us per row; model-level generation 3181 -> 1136 ms, at parity with the fp16 path (1164) |
 | Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4 -- kernel numbers are in the status header; the model-level table needs a long-context prompt and Q5b | partly done |
 
 ## 5. Risks

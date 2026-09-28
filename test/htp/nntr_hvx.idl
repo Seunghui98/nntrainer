@@ -255,4 +255,18 @@ interface nntr_hvx : remote_handle64 {
                            in sequence<float> sinks,
                            rout sequence<float> out_f32,
                            rout sequence<uint32> stats_us);
+
+   // One step in one round trip: appends cache rows [row0, row0 + n) from
+   // k_rows / v_rows (n = length / (n_head_kv*head_dim); empty = nothing
+   // to append), then attends over rows [0, cache_to) -- decode (HVX) for
+   // fewer than 5 query rows with head_dim <= 128, prefill (HMX) otherwise.
+   // stats_us = { append us, attention us, 0 decode / 1 prefill, total us,
+   // append quantize us, append stage us, append bake us, rows appended }.
+   AEEResult attn_q_step(in uint32 kv_handle, in uint32 row0,
+                         in sequence<uint16> k_rows, in sequence<uint16> v_rows,
+                         in uint32 n_q, in uint32 cache_from, in uint32 cache_to,
+                         in uint32 n_head_q, in uint32 window, in float softcap,
+                         in sequence<float> q_f32, in sequence<float> sinks,
+                         rout sequence<float> out_f32,
+                         rout sequence<uint32> stats_us);
 };
