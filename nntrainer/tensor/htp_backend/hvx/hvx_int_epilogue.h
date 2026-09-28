@@ -119,8 +119,25 @@ typedef struct {
   uint32_t batch; /**< this run's index within the block's batches */
 } hvx_int_gu_job;
 
-/** @brief hvx_worker_pool_func over an hvx_int_gu_job. */
-void hvx_int_gu_worker(uint32_t n_threads, uint32_t i, void *job);
+/**
+ * @brief hvx_worker_pool_func over an hvx_int_gu_job, in two
+ *        implementations with identical output: the portable C (_c, the
+ *        reference, runs anywhere) and HVX intrinsics (_hvx, DSP builds
+ *        only). Callers use hvx_int_gu_worker, which is the HVX one on
+ *        the DSP unless HEXKL_INT_EPILOGUE_SCALAR forces the reference
+ *        (an A/B, or bisecting a mismatch the self-check reports).
+ */
+void hvx_int_gu_worker_c(uint32_t n_threads, uint32_t i, void *job);
+#if defined(__hexagon__)
+void hvx_int_gu_worker_hvx(uint32_t n_threads, uint32_t i, void *job);
+#endif
+#if defined(__hexagon__) && !defined(HEXKL_INT_EPILOGUE_SCALAR)
+#define hvx_int_gu_worker hvx_int_gu_worker_hvx
+#define hvx_int_rq_rows hvx_int_rq_rows_hvx
+#else
+#define hvx_int_gu_worker hvx_int_gu_worker_c
+#define hvx_int_rq_rows hvx_int_rq_rows_c
+#endif
 
 /**
  * @brief Requantizes rows [m0, m1) of the SwiGLU result to u8 AH tiles,
@@ -137,10 +154,22 @@ void hvx_int_gu_worker(uint32_t n_threads, uint32_t i, void *job);
  * @param out_ah the destination block's first AH tile (64-row blocks,
  *               2048-byte k-tiles, 32 bytes a row -- hvx_quant_u8.h)
  */
-void hvx_int_rq_rows(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
-                     uint32_t e_stride, uint32_t n_batches, uint32_t batch_cols,
-                     uint32_t inter, uint32_t m_valid, uint32_t m0, uint32_t m1,
-                     float *scale, int32_t *zp, uint8_t *out_ah);
+void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
+                       uint32_t e_stride, uint32_t n_batches,
+                       uint32_t batch_cols, uint32_t inter, uint32_t m_valid,
+                       uint32_t m0, uint32_t m1, float *scale, int32_t *zp,
+                       uint8_t *out_ah);
+#if defined(__hexagon__)
+/** The HVX version. Rows are done four at a time (one 128-byte store per
+ *  k-tile); a group of fewer than four rows at the end of [m0, m1) goes
+ *  through the reference. m0 is a multiple of 4. */
+void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
+                         const int16_t *h_e, uint32_t e_stride,
+                         uint32_t n_batches, uint32_t batch_cols,
+                         uint32_t inter, uint32_t m_valid, uint32_t m0,
+                         uint32_t m1, float *scale, int32_t *zp,
+                         uint8_t *out_ah);
+#endif
 
 /**
  * @brief sigmoid(x) in Q15 for x = g * 2^-F, |x| clamped to 16 -- the

@@ -10,6 +10,7 @@
 # Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
 # Integer MoE epilogue:      HEXKL_MOE_INT_EPILOGUE=1 ./build.sh   (doc 53 section 9;
 #                            an A/B against the f32 epilogue is two skels)
+#   ... its C reference instead of the HVX version: add HEXKL_INT_EPILOGUE_SCALAR=1
 
 set -eu
 
@@ -76,7 +77,7 @@ mkdir -p generated build
     -I "$HEXAGON_SDK_ROOT/incs/stddef" \
     -mdll -o generated nntr_hvx.idl
 
-SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c generated/nntr_hvx_skel.c"
+SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_int_epilogue.c generated/nntr_hvx_skel.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4_moe.c $BACKEND/hmx/hexkl_conv_block.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i8_dma.c"
@@ -84,7 +85,7 @@ SRCS="$SRCS $BACKEND/hmx/hexkl_dma_ring.c $BACKEND/hmx/hexkl_kv_quant.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_probe.c $BACKEND/hmx/hexkl_acc_tile.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_attn_dtype.c $BACKEND/hmx/hexkl_attn_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_int_epilogue.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_int_epilogue.c $BACKEND/hvx/hvx_int_epilogue_hvx.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_swiglu_f32.c $BACKEND/hvx/hvx_conv_gate_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_scale_add_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
@@ -94,6 +95,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
     ${HEXKL_MOE_INT_EPILOGUE:+-DHEXKL_MOE_INT_EPILOGUE=1} \
+    ${HEXKL_INT_EPILOGUE_SCALAR:+-DHEXKL_INT_EPILOGUE_SCALAR=1} \
     -Wall -Werror \
     -I generated \
     -I "$HEXKL_ROOT/include" \

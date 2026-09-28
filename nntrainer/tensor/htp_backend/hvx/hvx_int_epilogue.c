@@ -31,102 +31,16 @@
 
 #include <AEEStdErr.h>
 
-/* ---- the primitive set ---------------------------------------------- */
+#include "hvx_int_epilogue_impl.h"
 
-static inline int32_t iq_sat32(int64_t v) {
-  if (v > INT32_MAX) {
-    return INT32_MAX;
-  }
-  if (v < INT32_MIN) {
-    return INT32_MIN;
-  }
-  return (int32_t)v;
-}
+/* ---- the primitive set: hvx_int_epilogue_impl.h; exposed for the checks */
 
-/** Q6_Vw_vmpyo_VwVh_s1_rnd_sat: a times the signed 16-bit b, doubled,
- *  rounded, high word -- round(a * b / 2^15) with saturation. */
 int32_t hvx_int_mulhi_q15(int32_t a, int32_t b16) {
-  const int64_t p = (int64_t)a * (int64_t)b16 * 2 + 0x8000;
-  return iq_sat32(p >> 16);
+  return iq_mulhi_q15(a, b16);
 }
-#define MULHI(a, b) hvx_int_mulhi_q15((a), (b))
-
-/** vadd of 2^(k-1) then vasr by k. k is clamped to 30: the add must not
- *  overflow for |x| < 2^31 - 2^29, and a value that needs a shift of 30
- *  or more is below 2^-29 of the batch's full scale, where 0 or 1 is
- *  the right answer to the precision this carries. */
-static inline int32_t iq_asr_rnd(int32_t x, int k) {
-  if (k <= 0) {
-    return x;
-  }
-  if (k > 30) {
-    k = 30;
-  }
-  return (int32_t)(((int64_t)x + ((int64_t)1 << (k - 1))) >> k);
-}
-
-/** vasr by k, no rounding, k clamped to [0, 30]. */
-static inline int32_t iq_asr(int32_t x, int k) {
-  if (k <= 0) {
-    return x;
-  }
-  if (k > 30) {
-    k = 30;
-  }
-  return x >> k;
-}
-
-/** 32 - clz(v): v < 2^nbits(v). Q6_Vw_vcl0_Vuw. */
-static inline int iq_nbits(uint32_t v) {
-  int n = 0;
-  while (v != 0u) {
-    ++n;
-    v >>= 1;
-  }
-  return n;
-}
-
-static inline int32_t iq_min(int32_t a, int32_t b) { return a < b ? a : b; }
-static inline int32_t iq_max(int32_t a, int32_t b) { return a > b ? a : b; }
+#define MULHI(a, b) iq_mulhi_q15((a), (b))
 
 /* ---- the bake -------------------------------------------------------- */
-
-/** v > 0 -> m in [2^14, 2^15), e with v ~= m * 2^e (15 significant
- *  bits); v <= 0 (or not finite) -> 0, 0. */
-static void iq_split15(float v, int16_t *m, int8_t *e) {
-  int ex = 0;
-  if (!(v > 0.0f) || !isfinite(v)) {
-    *m = 0;
-    *e = 0;
-    return;
-  }
-  const float f = frexpf(v, &ex); /* [0.5, 1) */
-  long mm = lrintf(f * 32768.0f); /* [16384, 32768] */
-  if (mm >= 32768L) {
-    mm = 16384L;
-    ex += 1;
-  }
-  *m = (int16_t)mm;
-  *e = (int8_t)(ex - 15);
-}
-
-/** signed v -> |m| in [2^29, 2^30), e with v ~= m * 2^e; 0 -> 0, 0. */
-static void iq_split30(float v, int32_t *m, int8_t *e) {
-  int ex = 0;
-  if (v == 0.0f || !isfinite(v)) {
-    *m = 0;
-    *e = 0;
-    return;
-  }
-  const float f = frexpf(v, &ex); /* +-[0.5, 1) */
-  long mm = lrintf(f * 1073741824.0f);
-  if (mm >= 1073741824L || mm <= -1073741824L) {
-    mm = (mm > 0) ? 536870912L : -536870912L;
-    ex += 1;
-  }
-  *m = (int32_t)mm;
-  *e = (int8_t)(ex - 30);
-}
 
 int hvx_int_wq_bake(hvx_int_wq **out, const float *w_scale, const float *bias,
                     uint32_t N) {
@@ -148,12 +62,15 @@ int hvx_int_wq_bake(hvx_int_wq **out, const float *w_scale, const float *bias,
     return AEE_ENOMEMORY;
   }
   q->N = N;
-  q->wm = (int16_t *)malloc(sizeof(int16_t) * N);
-  q->we = (int8_t *)malloc(N);
+  /* wm, we and be are read by the HVX version as whole 128-byte vectors
+     of which the first 64 or 32 bytes are the tile's, so each carries
+     one vector of slack past its last column. */
+  q->wm = (int16_t *)calloc(N + 64u, sizeof(int16_t));
+  q->we = (int8_t *)calloc(N + 128u, 1u);
   q->t_wb = (int8_t *)malloc(nt);
   if (has_bias) {
     q->bm = (int32_t *)malloc(sizeof(int32_t) * N);
-    q->be = (int8_t *)malloc(N);
+    q->be = (int8_t *)calloc(N + 128u, 1u);
     q->t_bb = (int8_t *)malloc(nt);
   }
   if (!q->wm || !q->we || !q->t_wb ||
@@ -200,17 +117,16 @@ void hvx_int_wq_free(hvx_int_wq *q) {
 /* ---- the sigmoid ----------------------------------------------------- */
 
 /** 2^-f on [0, 1), f in Q15, result Q30. Degree 5, near-minimax. */
-static const int32_t IQ_EXP2[6] = {1073741765, -744256846, 257890762,
-                                   -59377499,  9890100,    -1017427};
+const int32_t hvx_int_exp2_q30[6] = {1073741765, -744256846, 257890762,
+                                     -59377499,  9890100,    -1017427};
 /** 1/(1+e) on [0, 1], e in Q15, result Q30. Degree 7, near-minimax. */
-static const int32_t IQ_RCP[8] = {1073740448,  -1073555713, 1069536611,
-                                  -1036489911, 903790356,   -615589948,
-                                  269881404,   -54443308};
-/** log2(e) / 2 in Q15: the multiplier is 16-bit, and log2(e) is not. */
-#define IQ_LOG2E_HALF_Q15 23637
-/** |x| is clamped to 16 = 2^4 in Q24: sigmoid is within 1.2e-7 of 0 or
- *  1 beyond it, and 2^28 leaves the Q24 word two bits of headroom. */
-#define IQ_X_MAX_Q24 (1 << 28)
+const int32_t hvx_int_rcp_q30[8] = {1073740448,  -1073555713, 1069536611,
+                                    -1036489911, 903790356,   -615589948,
+                                    269881404,   -54443308};
+/* IQ_LOG2E_HALF_Q15 (log2(e)/2, since the multiplier is 16-bit and
+   log2(e) is not) and IQ_X_MAX_Q24 (|x| clamped to 16: sigmoid is within
+   1.2e-7 of 0 or 1 beyond it, and 2^28 leaves two bits of headroom) are
+   in hvx_int_epilogue_impl.h, shared with the vector version. */
 
 int32_t hvx_int_sigmoid_q15(int32_t g_q, int F) {
   /* x = g * 2^-F -> Q24, saturating. F < 24 is a left shift: the value
@@ -243,9 +159,9 @@ int32_t hvx_int_sigmoid_q15(int32_t g_q, int F) {
   if (f15 > 32767) {
     f15 = 32767;
   }
-  int32_t p = IQ_EXP2[5];
+  int32_t p = hvx_int_exp2_q30[5];
   for (int i = 4; i >= 0; --i) {
-    p = MULHI(p, f15) + IQ_EXP2[i];
+    p = MULHI(p, f15) + hvx_int_exp2_q30[i];
   }
   /* e^-|x| = 2^-n * 2^-f, Q30 -> Q15 for the next polynomial's argument */
   const int32_t e = iq_asr(p, n);
@@ -253,9 +169,9 @@ int32_t hvx_int_sigmoid_q15(int32_t g_q, int F) {
   if (e15 > 32767) {
     e15 = 32767;
   }
-  int32_t r = IQ_RCP[7];
+  int32_t r = hvx_int_rcp_q30[7];
   for (int i = 6; i >= 0; --i) {
-    r = MULHI(r, e15) + IQ_RCP[i];
+    r = MULHI(r, e15) + hvx_int_rcp_q30[i];
   }
   int32_t s = (r + (1 << 14)) >> 15; /* sigmoid(|x|) in Q15, [2^14, 2^15] */
   if (s > 32767) {
@@ -265,31 +181,6 @@ int32_t hvx_int_sigmoid_q15(int32_t g_q, int F) {
 }
 
 /* ---- the gate_up epilogue -------------------------------------------- */
-
-/** One row's dequant parameters for one staged batch, chosen from the
- *  data: see the header's NUMBER FORMATS. */
-typedef struct {
-  int nb; /**< nbits(max |A|) over the batch */
-  int sa; /**< A is pre-shifted left by this to fill 30 bits */
-  int B;  /**< every |result| < 2^B */
-  int F;  /**< the result's fixed point: q = value * 2^F, |q| < 2^30 */
-  int es; /**< the row's activation scale exponent */
-  int32_t ms;
-} iq_row_fmt;
-
-static void iq_row_fmt_set(iq_row_fmt *o, uint32_t amax, int32_t ms, int es,
-                           int t_wb, int t_bb) {
-  o->nb = iq_nbits(amax);
-  o->sa = 30 - o->nb;
-  o->ms = ms;
-  o->es = es;
-  int B = o->nb + 15 + es + t_wb;
-  if (t_bb > B) {
-    B = t_bb;
-  }
-  o->B = B + 1;
-  o->F = 30 - o->B;
-}
 
 /** (A * s * w + b) * 2^F, the dequant of hvx_dequant_i32.h in fixed
  *  point. Two multiply-highs and three shifts; the shifts are right
@@ -328,21 +219,7 @@ static uint32_t iq_row_amax(const hvx_int_gu_job *c, uint32_t r, uint32_t s0,
   return amax;
 }
 
-/** The batch's tile bounds: the largest over its n-tiles. */
-static void iq_batch_bounds(const hvx_int_wq *q, uint32_t t0, uint32_t n,
-                            int *wb, int *bb) {
-  int w = -128, b = -128;
-  for (uint32_t t = t0; t < t0 + n; ++t) {
-    w = q->t_wb[t] > w ? q->t_wb[t] : w;
-    if (q->t_bb) {
-      b = q->t_bb[t] > b ? q->t_bb[t] : b;
-    }
-  }
-  *wb = w;
-  *bb = b;
-}
-
-void hvx_int_gu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+void hvx_int_gu_worker_c(uint32_t n_threads, uint32_t i, void *vjob) {
   const hvx_int_gu_job *c = (const hvx_int_gu_job *)vjob;
   const uint32_t lo = (uint32_t)((uint64_t)c->m_count * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->m_count * (i + 1) / n_threads);
@@ -433,8 +310,9 @@ void hvx_int_rq_rows(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
         mx = iq_max(mx, v);
       }
     }
-    const int64_t R64 = (int64_t)mx - (int64_t)mn; /* < 2^31 */
-    if (R64 == 0) {
+    iq_rq_params P;
+    iq_rq_params_set(mn, mx, Fmin, &P);
+    if (P.zero) {
       for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
         memset(row0 + (size_t)kt * 2048u, 0, 32u);
       }
@@ -442,19 +320,8 @@ void hvx_int_rq_rows(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
       zp[m] = 0;
       continue;
     }
-    const int32_t R = (int32_t)R64;
-    /* y = round(v * 255 / R) as one multiply-high: v and R are shifted
-       left together until R fills 30 or 31 bits, then M = 255 * 2^(15+e)
-       / R is a 14-15 bit multiplier and y = round(mulhi(v, M) / 2^e). */
-    int ls = 30 - iq_nbits((uint32_t)R);
-    if (ls < 0) {
-      ls = 0;
-    }
-    const int32_t Rn = R << ls;
-    const int e = iq_nbits((uint32_t)Rn) - 9; /* 21 or 22 */
-    const int64_t num = (int64_t)255 << (15 + e);
-    const int32_t M = (int32_t)((num + (Rn / 2)) / Rn); /* [16320, 32640] */
-    const int32_t z = iq_asr_rnd(MULHI((-mn) << ls, M), e);
+    const int ls = P.ls, e = P.e;
+    const int32_t M = P.M, z = P.z;
     for (uint32_t b = 0; b < n_batches; ++b) {
       const int sh = er[b] - Fmin;
       const uint32_t c0 = b * batch_cols;
@@ -467,7 +334,7 @@ void hvx_int_rq_rows(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
         row0[(size_t)(cc / 32u) * 2048u + (cc % 32u)] = (uint8_t)q;
       }
     }
-    scale[m] = ldexpf((float)R / 255.0f, -Fmin);
+    scale[m] = P.scale;
     zp[m] = z;
   }
 }

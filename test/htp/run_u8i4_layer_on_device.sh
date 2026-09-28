@@ -119,7 +119,7 @@ fi
     NNTRAINER_ROOT="$REPO_ROOT" \
     HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
     unittest_hvx_mm_u8i4 unittest_hvx_softmax unittest_hvx_attn \
-    unittest_hvx_fc
+    unittest_hvx_fc unittest_hvx_int_epilogue
 ) || fail "ndk-build failed -- see the error above.
 
 A failed build used to fall through to whatever binary was left from last
@@ -140,6 +140,7 @@ ATTN_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_attn"
 # The other half of the QNN comparison table: one fully connected layer at
 # Qwen3-0.6B's q_proj shape, u8 x i8, reported the way QNN net-run reports.
 FC_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_fc"
+IQ_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_int_epilogue"
 [ -f "$FC_BIN" ] || fail "test binary did not build: $FC_BIN"
 
 # --- 4. push + run -----------------------------------------------------------
@@ -150,6 +151,7 @@ adb push "$TEST_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$SOFTMAX_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$ATTN_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$FC_BIN" "$DEVICE_TMP/" >/dev/null
+adb push "$IQ_BIN" "$DEVICE_TMP/" >/dev/null
 # c++_shared runtime the test binary links against (APP_STL in Application.mk)
 CXX_SHARED="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 [ -f "$CXX_SHARED" ] && adb push "$CXX_SHARED" "$DEVICE_TMP/" >/dev/null
@@ -186,6 +188,13 @@ adb shell "cd $DEVICE_TMP && \
   chmod +x unittest_hvx_fc && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
   ./unittest_hvx_fc" 2>&1 | tee /tmp/hvx_fc_device_run.log
+
+echo
+log "4e/4  Integer MoE epilogue: HVX against its C reference, bit for bit"
+adb shell "cd $DEVICE_TMP && \
+  chmod +x unittest_hvx_int_epilogue && \
+  LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
+  ./unittest_hvx_int_epilogue" 2>&1 | tee /tmp/hvx_int_epilogue_device_run.log
 
 echo
 log "Summary"

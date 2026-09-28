@@ -229,6 +229,14 @@ interface nntr_hvx : remote_handle64 {
                             rout sequence<float> exp_out,
                             rout sequence<float> recip_out);
 
+   // The integer MoE epilogue's HVX implementation against its portable C
+   // reference, both run on the DSP on data generated there from `seed`
+   // (nntr_hvx_int_epilogue.c). counts[0..4] are mismatch counts --
+   // SwiGLU mantissas, their exponents, requant bytes, scale bits, zero
+   // points -- and must all be 0; [5] elements compared, [6] a checksum of
+   // the HVX output, [7] batches. At least 8 entries.
+   AEEResult int_epilogue_selfcheck(in uint32 seed, rout sequence<uint32> counts);
+
    AEEResult softmax_f32(in uint32 M, in uint32 K, in uint32 m_first,
                          in float scale, in sequence<float> x,
                          rout sequence<float> y);
