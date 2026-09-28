@@ -176,26 +176,6 @@ sets everything below; agents put that line first in every shell.
 correctness is decided by host scalar specs and bit-identity checks (gate 1)
 and by the device (gate 4); nothing in between.
 
-### 4.1a Mac client (rungs 0–1 in a container; user decision 2026-09-27)
-
-The `hvx_impl` dev container (`tools/docker/run.sh`, linux/amd64 under
-OrbStack, Dockerfile in `tools/docker/`) is carried onto `htp_moe` so the
-Mac can run cycles when the workstation is out of reach. `run.sh` mounts
-the checkout at `/work`, `~/Qualcomm/Hexagon_SDK/<ver>` at
-`/opt/qcom/Hexagon_SDK/<ver>` and `~/Qualcomm/hexkl_addon` at
-`/opt/qcom/hexkl_addon`; the image ships NDK r26d, clang-format-14, meson,
-ninja, gcc. `tools/htp/env.sh` detects the container and picks the newest
-mounted SDK (6.4.0.2 here), the mounted HexKL (either `lib/<ver>/` or the
-flat `lib/hexagon_toolv19_v79/` layout), `/model`, and a UTF-8 locale for
-`qaic`. Every gate command is then
-`tools/docker/run.sh bash -c 'source tools/htp/env.sh && <command>'`.
-
-| rung | on the Mac | note |
-|---|---|---|
-| 0 format, 1 host build + host checks + syntax check | yes | `ALL CHECKS PASS` 2026-09-27 on `b4c96bdb`; x86 emulation is several times slower than native |
-| 2 skel, 3 Android app / device gtest | **no until HexKL beta.2 is on the Mac** | `~/Qualcomm/hexkl_addon` is beta1 (`hexkl_micro_hw_init` two arguments); the tree needs beta.2. A PR opened from the Mac states that rungs 2–3 were not run; the workstation produces the skel/app md5s before any handoff |
-| 4 device | never | as §4.2 |
-
 ### 4.2 Device (user only)
 
 Galaxy S25 Ultra — **any unit** (user decision 2026-09-22; two units,
@@ -366,7 +346,6 @@ recorded in BENCHMARK.md's artifact section once built.
 
 | date | decision |
 |---|---|
-| 2026-09-27 | **Mac client through the dev container** ("htp_moe 환경으로 고쳐서 작업"): the `hvx_impl` container comes onto `htp_moe` (§4.1a); rungs 0–1 run there, rungs 2–3 wait for HexKL beta.2 on the Mac, the workstation stays the reference for skel/app md5s and handoffs. Same day: PR #121's conflict with `htp_moe` @ `b4c96bdb` (PR #119) is resolved as a rebase with rungs 0–1 only; the #120 sitting stands because the per-token entry is off by default |
 | 2026-09-23 | **A consistent sub-gate decode win with byte-identical text may land as the default** ("1번으로 진행", cycle 12, LEDGER rule 33): #113's D192 (one-row GEMV loop + 192 KB `l2fetch` lead) missed its `mm` ≤ 840 gate at 937.0 but is +4.11 / +3.29 / +4.26 % decode at G 64 / 512 / 1024 with identical text and prefill within 0.08 %, so `HVX_GEMV_M1_ROWS1=1u` and `HVX_GEMV_PF_LEAD_KB=192u` become the defaults on PR #115. Conditions: the win holds at all three G in one sitting, outside the sitting's own A spread, text = A, prefill gate met; the issue's gate still decides whether the issue is done. Same day: PR #107 closed by the user, superseded by PR #115 |
 | 2026-09-21 | No simulator in this project: host bit checks + device only |
 | 2026-09-22 | **Any device serial.** The same-device requirement (`R3CY10WM83Y` as the anchor unit, per-cell unit ratio) is dropped: any S25 Ultra may run an `htp_moe` handoff, handoffs name no serial, the filled handoff records the serial used, results are compared only inside one sitting (A/B) plus same-unit drift where the unit happens to repeat. The second-unit anchor sitting (#91 → #94 ⑮) is withdrawn, not re-filed. Same day: #94 sitting 2 replaces the provisional "now" (§1); its variant C (M=1 GEMV) is accepted as the LEDGER ⑯ verdict although the device skel was the user's own build of the same sources (rule 14 → rule 21) |

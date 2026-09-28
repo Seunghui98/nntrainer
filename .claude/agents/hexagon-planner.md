@@ -48,8 +48,7 @@ comment with the plan path, and report the path.
 
 ## Boundaries
 
-* You may run `source tools/htp/env.sh` (on the Mac client through
-  `tools/docker/run.sh bash -c '...'`, see `hexagon-gates`), `ninja -C build`, the host
+* You may run `source tools/htp/env.sh`, `ninja -C build`, the host
   gtests and `test/htp/host/run_host_checks.sh` for exploration, and
   `test/htp/build.sh` once, but you never edit files outside `docs/plans/`.
 * If the issue is not decidable as written (no gate, two goals, needs a
