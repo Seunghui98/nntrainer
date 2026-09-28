@@ -286,6 +286,7 @@ check_artifact "libcausallm_core.so" || exit 1
 # A builddir configured before that export keeps its old Android.mk under
 # --cache; this catches it, and catches the reverse (an HTP builddir reused
 # without --htp). LEDGER rule 36.
+command -v strings >/dev/null || { log_error "'strings' (binutils) not found; needed for the ENABLE_HEXKL check"; exit 1; }
 n_htp=$(strings libs/arm64-v8a/libcausallm_core.so | grep -c NNTR_HTP_FORWARD_KINDS || true)  # grep -c exits 1 on 0 matches; set -e
 if [ "$USE_HTP" -eq 1 ] && [ "$n_htp" -lt 1 ]; then
     log_error "libcausallm_core.so has no NNTR_HTP_FORWARD_KINDS: ENABLE_HEXKL missing (stale builddir/android_build_result/Android.mk? run 'ninja -C builddir install' or rebuild without --cache)"
