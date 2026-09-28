@@ -96,6 +96,7 @@ or the device fails with `AEE_EBADPARM (0x8000040E)`. Variants:
 ```
 (cd Applications/CausalLM && ./build_android.sh --htp)        # add --cache to reuse builddir
 readelf -d builddir/android_build_result/lib/arm64-v8a/libnntrainer.so | grep -E 'libsdkl|libcdsprpc'
+strings Applications/CausalLM/jni/libs/arm64-v8a/libcausallm_core.so | grep -c NNTR_HTP_FORWARD_KINDS   # >= 1 (2 today)
 md5sum Applications/CausalLM/jni/libs/arm64-v8a/{nntrainer_causallm,libcausallm_core.so} \
        Applications/CausalLM/jni/obj/local/arm64-v8a/{libnntrainer.so,libccapi-nntrainer.so}
 ln -sfn $PWD/subprojects/googletest/googletest test/jni/googletest     # once per checkout; in .git/info/exclude
@@ -110,7 +111,14 @@ and `libc++_shared.so` stay under `jni/obj/local/arm64-v8a/`, while
 lists the `obj/local` paths (or copies them into `libs/` first) so the
 install step does not push stale files.
 Pass: both `NEEDED` lines present (`libsdkl.so`, `libcdsprpc.so`); the
-binaries exist; md5s recorded for the handoff. Never `--clean` a builddir
+`strings` count is >= 1 (the app's `NNTR_HTP_FORWARD` hooks are `#ifdef
+ENABLE_HEXKL`, exported to the app by the prebuilt `Android.mk` since
+#135; `build_android.sh` itself exits 1 when the count disagrees with
+`--htp`, LEDGER rule 36); the binaries exist; md5s recorded for the
+handoff. A `builddir` configured before #135 must run `(cd builddir &&
+ninja install)` once (or a build without `--cache`): `--cache` skips
+meson and keeps the old installed `Android.mk` without the define — the
+script's check names this case. Never `--clean` a builddir
 that was configured with `--htp` unless you re-run with `--htp` (the
 option lives only in `builddir` and is dropped silently). A `--profile`
 build is a separate builddir and is never the TPS binary.

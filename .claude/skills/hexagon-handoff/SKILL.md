@@ -52,6 +52,12 @@ Branch `htp/<issue#>-<slug>` @ `<sha>` — estimated device time: <N> min
 
 ## Steps (workstation, phone on USB)
 1. `git fetch && git checkout htp/<issue#>-<slug>`; `source tools/htp/env.sh`; rebuild or reuse the artifacts above (`md5sum -c staged/md5.txt` before pushing; it exits 1 on a mismatch, and the device's `md5sum` is compared by hand).
+   Sanity before pushing (each variant's app set):
+   ```
+   strings <libnntrainer.so> | grep -c 'graph: forward calls'        # 1
+   strings <libcausallm_core.so> | grep -c NNTR_HTP_FORWARD_KINDS    # >= 1 (rule 36)
+   ```
+   A variant whose log lacks its expected banner (`[HTP] graph: init …` for `NNTR_HTP_FORWARD=1`) is **void** — recorded as void, never read as "at A's speed" (rule 36).
 2. `adb devices` lists exactly one device; record its serial under Notes (any S25 Ultra is allowed, contract §4.2 — the handoff never names one). Note battery % and whether the phone is warm.
 3. Install once: `(cd Applications/CausalLM && ./install_android.sh --model=<model dir>)` for each model dir, then
    `adb push test/htp/build/libnntr_hvx_skel.A.so /data/local/tmp/nntrainer/causallm/libnntr_hvx_skel.so`.
