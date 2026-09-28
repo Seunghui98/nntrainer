@@ -31,7 +31,7 @@ own G = 512 continuation, **reference = A of this sitting**, fail above +2 %;
 
 Not run: an A0 on the pre-#143 tree (the pool fix's own prefill gate). PR
 #145 changed the IDL, so A0 needs a separate `c5dcb382` set and would be a
-fifth variant; open as a user decision.
+fifth variant; **the user accepted #143 without it (2026-09-28)**.
 
 ## Artifacts (`/local/mnt/workspace/htp_moe/134-132/set/`, `md5.txt` next to it)
 
