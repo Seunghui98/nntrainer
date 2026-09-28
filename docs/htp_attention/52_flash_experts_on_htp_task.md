@@ -843,3 +843,24 @@ C=8, warm, 실행 사이 30 s. 속도는 계측 없는 실행, 분석은 `NNTR_H
   단계가 느려진다는 §10.21의 해석과 맞는다. transport는 실행마다 0.8~1.3 ms로 흔들린다.
 - 상주(약 580 ms)까지 남은 약 90 ms = 등록 약 55 ms + 층 콜 지연 약 35 ms.
 - decode 히트 57.2%로 모두 같고, t_k0의 decode 15.74는 첫 실행이라 낮게 나온 편차로 본다(프로파일 실행은 넷 다 16.4~16.5).
+
+### 10.23 배치 swap: 한 번의 RPC로 여러 expert 등록 (코드, 호스트 체크 통과, 기기 미측정)
+
+§10.22에서 상주 대비 남은 약 90 ms 중 55 ms가 prefill 동안의 등록(expert 528개 × swap RPC 약 0.1 ms)이었다. decode도 콜당 미스
+1.71개를 각각 RPC 하나로 등록한다(토큰당 약 3.8 ms).
+
+- **IDL `weight_swap_batch_u8i4_arena`** (맨 뒤에 추가, 기존 번호 유지). expert n개의 old 쌍·아레나 위치·스케일·colsum을 평평한 배열로
+  받아 skel이 기존 단일 swap을 차례로 부른다. expert i에서 실패하면 0..i−1은 반영, i부터는 그대로이고 `n_done`과 `err`로 알린다.
+  **호출 자체는 길이가 안 맞을 때만 실패한다** — FastRPC는 실패한 호출의 출력을 호스트로 돌려보내지 않을 수 있어, 부분 실패도
+  성공으로 돌아와야 호스트가 어디까지 됐는지 안다.
+- **호스트.** `registerStagedBatch`가 한 배치를 RPC 한 번으로 등록하고, 반영된 것은 파일링, 나머지는 슬롯을 빈 목록으로(DSP가 옛
+  쌍을 그대로 들고 있으므로 다음 swap이 해제) 돌린다.
+  - prefill 선읽기: `prefetch_qs4cx_wh_experts_end`가 층 배치(약 24개)를 한 번에 → 층당 RPC 24회 → 1회.
+  - 동기 미스(decode, 선읽기 없는 prefill): 새 `ComputeOps::register_qs4cx_wh_expert_files`. 레이어의 `acquire`가 미스를 모두
+    비운 뒤 이름을 넘기므로, 미스를 모아 읽고 한 번에 등록한다. 기본 구현은 하나씩(다른 백엔드용).
+- `swap_host_check`에 배치 검사 추가: 첫 expert는 반영·두 번째(아레나 밖)는 거부되어 `n_done=1`, 호출은 성공, 길이 불일치는 통째
+  거부. 실제 skel 함수와 실제 레지스트리, IDL에서 만든 헤더로 확인한다.
+- **skel과 stub을 다시 만들어야 한다.** 옛 skel에서는 이 호출이 에러로 돌아오고 레이어가 멈춘다(메시지가 skel 재빌드를 안내).
+
+예상(C=8, warm): prefill 등록 55 ms → 층당 RPC 1회 + expert당 DSP 등록 비용. expert당 DSP 비용을 모르므로 절감 폭은 기기에서
+잰다. decode는 콜당 RPC 1.71 → 1회 이하(미스 있는 콜만)라 토큰당 1~2 ms(+2~3%) 예상.
