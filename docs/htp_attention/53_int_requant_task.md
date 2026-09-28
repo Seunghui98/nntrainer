@@ -467,3 +467,36 @@ adb -s R3CY10WM83Y shell "cd /data/local/tmp/nntrainer/causallm && LD_LIBRARY_PA
 그대로), C에서 **ppl 60.9269 정확히**(같은 격자; 다르면 B가 통과했어도 커널 배선 문제), 프로파일 MoE 행의
 `swiglu(hidden)`이 23 ms 근처·노출 dequant/requant가 §8.5 수준(합 ≤ 0.4 ms/콜)·decode 24 근처. gtest의 `libc++_shared.so`가
 앱 디렉터리에 없으면 NDK의 `sysroot/usr/lib/aarch64-linux-android/libc++_shared.so`를 같이 push.
+
+### 9.9 HVX 실측: 비트 동일, ppl 60.9269 재현, 콜 19.3 ms (2026-09-28, 작성자)
+
+기기 자기검사가 두 판을 잡아 줬다(각각 한 번의 기기 왕복): `Q6_Vuw_vmax_VuwVuw`는 없는 명령(signed vmax로),
+`Q6_Vw_vmpyi_VwRh`는 짝수 레인에 스칼라의 하위 하프워드·홀수 레인에 상위 하프워드를 곱하는 명령이라 홀수 레인의
+zp·colsum이 0으로 곱해졌다(단계별 프로브가 "A_gate 레인 1"로 짚음; `vmpyie_VwVuh` + splat으로). 그 사이 bake의
+`frexpf`/`lrintf`(층당 첫 콜에 ~15 ms의 이름 없는 시간)를 정수 비트 연산으로 바꿨다 — 2천만 float(타이 포함)에서
+옛 결과와 비트 동일.
+
+```
+gtest unittest_hvx_int_epilogue: [  PASSED  ] 3 tests  (가수·지수·바이트·scale·zp 불일치 0, 시드 2·7)
+ppl 60.9269 (스칼라 빌드와 동일 -- 같은 격자)   prefill 1815 ms (PPL 켬; f32 1605, 스칼라 정수 7916)   decode 23.6 (f32 24.2)
+  M>1 MoE   host 19315  dsp 17246  transport 2068  [swiglu 29181 (워커 합)  requant 610  dequant 179  acc 2971  mm 9275  이름없음 ≈ 2.9 ms]
+  M>1 dense host 10231  dsp 9776   [swiglu 25381  requant 400]
+  M==1      host 1441   dsp 1359   [swiglu 184]                          (f32 1436 -- 같다)
+  conv·FC 행 불변
+```
+
+f32(51 §2.24: host 14448, requant 62, dequant 243, transport 627) 대비 **콜당 +4.9 ms**, 셋으로 나뉜다:
+
+| 항목 | f32 | HVX 정수 | 원인 |
+|---|---:|---:|---|
+| requant 노출 | 62 | 610 | rq 유닛이 f32의 ~3배 무겁다: 스캔 패스(56벡터 × 5 op)와 양자화 패스(× 9 op)에 행별 스칼라 파라미터. DN(n−1) 첫 에필로그 잡이 배치 발행(44 us)을 블록당 ~13 us 넘긴다 |
+| 이름 없는 DSP 시간 | 0.2 | 2.9 ms | 정수판 bake도 열당 ~25 ns × 3584 × expert 32 = 2.9 ms, 층당 **첫 콜에만**(decode 행에 없다). 프로세스당 한 번 ≈ 64 ms; cached-slim에서는 미스당 ~90 us(읽기 0.4 ms 옆) |
+| transport | 627 | 2068 | 콜이 길어진 만큼 따라 움직인다(스칼라 빌드 272 ms 콜에서 4.4 ms). DSP 시간이 돌아오면 같이 돌아올 것 |
+
+워커 시간(swiglu 열) 29.2 ms/콜 vs f32 23.2: dequant −8 op와 시그모이드 +~15 op의 합이 예상대로 "비슷하거나 약간
+많다"의 위쪽. 그림자 36 ms의 81%.
+
+**다음 손질(§9.10)**: rq의 스캔 패스를 없앤다 — gate_up 워커가 h를 만들면서 (행, 배치)별 min/max를 같이 남기면
+(벡터당 2 op, 행당 레인 축소 1회) rq는 양자화 패스만 남는다. asr_rnd가 단조라 배치별 min/max에 시프트를 적용한 것이
+원소를 스캔한 것과 **같은 값**이다 → 격자 불변, ppl 60.9269 그대로여야 한다. bake의 2.9 ms는 첫 콜 한정이라 두고
+기록만 한다.
