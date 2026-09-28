@@ -4,8 +4,9 @@
  *
  * @file   graph_host_check.c
  * @date   23 Sep 2026
- * @brief  Host check of the per-token entry skeleton's op table and forward
- *         loop (#85)
+ * @brief  Host check of the per-token entry's op table and forward loop
+ *         (#85), and of the small ops and m=1 attention wired into it
+ *         (#130) against their scalar specs
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -26,7 +27,17 @@
    stand-in here that records its arguments and mixes every input into
    its output -- the loop structure inside it is moe_layer_host_check's
    job, and bit identity on the real kernel holds by construction once the
-   arguments are the same (same function, same session state). */
+   arguments are the same (same function, same session state).
+
+   Stretch half (#130), on the hd64 fixture's shapes (hidden 128, 2 q
+   heads, 1 kv head, head_dim 64, max_seq 64): the REAL hvx_m1_ops_f32.c,
+   hvx_conv_gate_f32.c and hvx_attn_m1_f32.c on hvx_emu/, driven through
+   graph_set_param and forward, memcmp'd against m1_ops_det.h and
+   attn_m1_det.h stretch by stretch -- [RMSNORM], an 8-token
+   [CONV1D_GATE] chain from a seeded state, [QK_NORM ROPE ATTN_M1] at four
+   positions after a kv_append seed -- plus resume_at, the builder's slot
+   routing, the per-op pcycles and the forward-time refusals (a missing
+   parameter, state, table or cache, and the cache's hole). */
 #include "hexkl_graph.h"
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
@@ -34,6 +45,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "attn_m1_det.h"
+#include "m1_ops_det.h"
 
 static int g_fail;
 #define CHECK(cond, ...)                                                       \
@@ -100,11 +114,20 @@ int hexkl_mm_u8i4_moe_layer_run(
 
 /* ---- shapes ------------------------------------------------------------ */
 static const char *const kLfm25Layers = "CCACCCACCCACCCACCCACCACC";
-static const htp_graph_lfm2_shape kLfm25 = {24, 2,  2048, 7168, 1792,   32,
-                                            4,  32, 8,    64,   128000, 2048};
+static const htp_graph_lfm2_shape kLfm25 = {24, 2, 2048, 7168,   1792, 32,   4,
+                                            32, 8, 64,   128000, 2048, 1e-5f};
 /* unittest_causallm_lfm2_moe.cpp:85-113, layer_types [attention, conv] */
-static const htp_graph_lfm2_shape kTiny = {2, 0, 64, 64, 64, 4,
-                                           2, 8, 4,  8,  32, 8};
+static const htp_graph_lfm2_shape kTiny = {2, 0, 64, 64, 64, 4,    2,
+                                           8, 4, 8,  32, 8,  1e-6f};
+/* lfm2_moe_tiny_hd64 (plan 130 section 3.4): what the attention kinds
+   need -- head_dim 64, a gqa of 2, max_seq a multiple of 32 */
+static const htp_graph_lfm2_shape kHd64 = {3, 1, 128, 64, 32, 4,    2,
+                                           2, 1, 64,  32, 64, 1e-6f};
+#define ALL_KINDS                                                              \
+  (HTP_GRAPH_KIND_BIT(HTP_OP_MOE) | HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) |       \
+   HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |      \
+   HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) |                                    \
+   HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1))
 
 static uint32_t build(uint32_t *w, uint32_t cap, const htp_graph_lfm2_shape *s,
                       const char *layers, uint32_t resident) {
@@ -154,7 +177,48 @@ static void mut_next_mm_not_mm(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_resident_no_kernel(uint32_t *w, uint32_t *n) {
-  htp_graph_op_at(w, 0)->resident = 1u;
+  htp_graph_op_at(w, 1)->resident = 1u; /* op 1 is an FC */
+  (void)n;
+}
+/* #130: the v2 record's rules, one negative per new kind */
+static void mut_eps_zero(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, 0)->eps_bits = 0u;
+  (void)n;
+}
+static void mut_rope_before_qk_norm(uint32_t *w, uint32_t *n) {
+  /* the two records differ only in kind, so swapping the kinds is the
+     order mutation and nothing else */
+  const uint32_t q = nth_op(w, HTP_OP_QK_NORM, 0);
+  htp_graph_op_at(w, q)->kind = HTP_OP_ROPE;
+  htp_graph_op_at(w, q + 1u)->kind = HTP_OP_QK_NORM;
+  (void)n;
+}
+static void mut_rope_head_dim_32(uint32_t *w, uint32_t *n) {
+  /* K = 3072 = (6 + 2) x 12 x 32 keeps the record consistent, so only
+     the kernel's head_dim 64 rule can refuse it */
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 2));
+  op->head_dim = 32u;
+  op->n_kv = 12u;
+  op->gqa = 6u;
+  (void)n;
+}
+static void mut_qk_norm_head_dim_96(uint32_t *w, uint32_t *n) {
+  /* K = 3072 = (2 + 2) x 8 x 96: consistent, and the per-head norm's
+     chunk would not be a power of two */
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_QK_NORM, 1));
+  op->head_dim = 96u;
+  op->gqa = 2u;
+  (void)n;
+}
+static void mut_attn_without_rope(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 4))->resident = 0u;
+  (void)n;
+}
+static void mut_rmsnorm_k_not_pow2(uint32_t *w, uint32_t *n) {
+  /* the final norm: K == hidden is not a validator rule for RMSNORM, so
+     only the kernel's power-of-two rule can refuse 2048 + 32 */
+  htp_graph_op_at(w, w[3] - 2u)->K = 2080u;
+  htp_graph_op_at(w, w[3] - 2u)->N = 2080u;
   (void)n;
 }
 static void mut_truncated(uint32_t *w, uint32_t *n) {
@@ -195,6 +259,16 @@ static const struct {
   {"bad magic", mut_magic, HTP_GRAPH_E_INVALIDFORMAT},
   {"wrong version", mut_version, HTP_GRAPH_E_UNSUPPORTED},
   {"lm_head not last", mut_lm_head_not_last, HTP_GRAPH_E_INVALIDITEM},
+  {"RMSNORM eps_bits 0", mut_eps_zero, HTP_GRAPH_E_INVALIDFORMAT},
+  {"ROPE before QK_NORM", mut_rope_before_qk_norm, HTP_GRAPH_E_INVALIDITEM},
+  {"ROPE resident at head_dim 32", mut_rope_head_dim_32,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"ATTN_M1 resident, its ROPE not", mut_attn_without_rope,
+   HTP_GRAPH_E_NOTALLOWED},
+  {"QK_NORM resident at head_dim 96", mut_qk_norm_head_dim_96,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"RMSNORM resident at K 2080", mut_rmsnorm_k_not_pow2,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
 };
 
 static void check_validator(void) {
@@ -202,10 +276,12 @@ static void check_validator(void) {
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
   static uint32_t m[sizeof(w) / sizeof(w[0])];
   const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
-  const uint32_t resident_ok = HTP_GRAPH_KIND_BIT(HTP_OP_MOE);
+  const uint32_t resident_ok = ALL_KINDS;
   uint32_t n = build(w, cap, &kLfm25, kLfm25Layers, resident_ok);
   uint32_t n_ops = 0, i, rc;
+  char names[128];
   CHECK(n != 0u, "LFM2.5 build refused");
+  CHECK(HTP_GRAPH_OP_WORDS == 80u && HTP_GRAPH_VERSION == 2u, "wire v2");
   rc = htp_graph_validate(w, n, resident_ok, &n_ops);
   CHECK(rc == 0u, "LFM2.5 validate: %s", htp_graph_err_name(rc));
   CHECK(n_ops == 228u, "LFM2.5 n_ops %u (want 228)", n_ops);
@@ -226,13 +302,40 @@ static void check_validator(void) {
   for (i = 0; i < n_ops; ++i) {
     const htp_graph_op *op = htp_graph_op_cat(w, i);
     CHECK(op->next_mm == HTP_GRAPH_NO_OP || op->next_mm > i, "next_mm %u", i);
-    CHECK(op->resident == (op->kind == HTP_OP_MOE), "resident bit %u", i);
+    CHECK(op->resident == ((resident_ok & HTP_GRAPH_KIND_BIT(op->kind)) != 0u),
+          "resident bit %u", i);
+    if (op->kind == HTP_OP_ATTN_M1)
+      CHECK(op->n_kv == 8u && op->gqa == 4u && op->head_dim == 64u &&
+              op->K == 3072u && op->N == 2048u,
+            "ATTN_M1 record %u", i);
+    if (op->kind == HTP_OP_RMSNORM || op->kind == HTP_OP_QK_NORM)
+      CHECK(op->eps_bits == 0x3727C5ACu, "eps_bits %u = 0x%x", i, op->eps_bits);
   }
   CHECK(htp_graph_op_cat(w, 1)->next_mm == 3u, "op 1 (in_proj) -> op 3");
   CHECK(htp_graph_op_cat(w, n_ops - 1u)->next_mm == HTP_GRAPH_NO_OP,
         "lm_head has no next");
-  printf("GRAPH VALIDATOR OK: LFM2.5-8B-A1B n_ops=%u moe=22 words=%u\n", n_ops,
-         n);
+  printf("GRAPH VALIDATOR OK: LFM2.5-8B-A1B n_ops=%u moe=22 words=%u "
+         "resident=%s\n",
+         n_ops, n, htp_graph_kinds_str(resident_ok, names, sizeof(names)));
+  /* the mask parser both sides read NNTR_HTP_FORWARD_KINDS with */
+  CHECK(htp_graph_kinds_parse("MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1") ==
+          resident_ok,
+        "kinds parse (all)");
+  CHECK(htp_graph_kinds_parse("MOE") == HTP_GRAPH_KIND_BIT(HTP_OP_MOE) &&
+          htp_graph_kinds_parse("MOE,BOGUS") == 0u &&
+          htp_graph_kinds_parse("") == 0u,
+        "kinds parse (one, bad, empty)");
+  /* the hd8 fixture with the attention kinds resident: the kernels'
+     head_dim rule, end to end through the validator */
+  {
+    static uint32_t t[sizeof(w) / sizeof(w[0])];
+    const uint32_t nt = build(t, cap, &kTiny, "AC", resident_ok);
+    rc = htp_graph_validate(t, nt, resident_ok, NULL);
+    CHECK(rc == HTP_GRAPH_E_SCHEMENOTSUPPORTED, "tiny hd8 all kinds: %s",
+          htp_graph_err_name(rc));
+    printf("  tiny fixture (head_dim 8), all kinds resident -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+  }
 
   printf("  mutation                                  -> code\n");
   for (i = 0; i < sizeof(kMutations) / sizeof(kMutations[0]); ++i) {
@@ -255,7 +358,9 @@ static void check_validator(void) {
           HTP_GRAPH_E_BADITEM == (uint32_t)AEE_EBADITEM &&
           HTP_GRAPH_E_CLASSNOTSUPPORT == (uint32_t)AEE_ECLASSNOTSUPPORT &&
           HTP_GRAPH_E_INCOMPLETEITEM == (uint32_t)AEE_EINCOMPLETEITEM &&
-          HTP_GRAPH_E_BADSTATE == (uint32_t)AEE_EBADSTATE,
+          HTP_GRAPH_E_BADSTATE == (uint32_t)AEE_EBADSTATE &&
+          HTP_GRAPH_E_SCHEMENOTSUPPORTED == (uint32_t)AEE_ESCHEMENOTSUPPORTED &&
+          HTP_GRAPH_E_NOTALLOWED == (uint32_t)AEE_ENOTALLOWED,
         "error code values drifted from AEEStdErr.h");
   CHECK(hexkl_graph_resident_kinds() == resident_ok,
         "kernel table: resident kinds 0x%x", hexkl_graph_resident_kinds());
@@ -468,9 +573,253 @@ static void check_forward(void) {
   printf("GRAPH FORWARD REFUSALS OK\n");
 }
 
+/* ---- stretch half (#130): the real kernels vs the scalar specs --------- */
+#define HD 64u
+#define N_Q 2u
+#define N_KV 1u
+#define HID 128u
+#define MAX_SEQ 64u
+
+static void fill(float *p, uint32_t n, uint32_t *seed) {
+  uint32_t i;
+  for (i = 0; i < n; ++i)
+    p[i] = frand(seed);
+}
+
+/** @brief Every op run has a pcycle bracket, no other op does. */
+static void check_pcycles(const hexkl_graph *g, uint32_t s, uint32_t e,
+                          const char *what) {
+  uint32_t j;
+  for (j = 0; j < HTP_GRAPH_MAX_OPS; ++j)
+    CHECK((g->op_pcycles[j] != 0u) == (j >= s && j < e), "%s pcycles[%u]", what,
+          j);
+}
+
+static void check_stretches(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  const uint32_t mask = ALL_KINDS & ~HTP_GRAPH_KIND_BIT(HTP_OP_MOE);
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 777u, t, i, p;
+  static float gamma[HID], in[3u * HID], out[HID], ref[HID];
+  static float conv_w[3u * HID], state[2u * HID], state_ref[2u * HID];
+  static float qk_gamma[2u * HD], cs[MAX_SEQ * HD], qn[N_Q * HD], kn[HD];
+  static float k_rows[MAX_SEQ * N_KV * HD], v_rows[MAX_SEQ * N_KV * HD];
+  static float kt[N_KV * HD * MAX_SEQ], vv[N_KV * MAX_SEQ * HD], e[MAX_SEQ];
+  const uint32_t positions[4] = {0u, 31u, 32u, 63u};
+  uint32_t op_rms, op_conv, op_qk;
+  int err = 0;
+
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  n = build(w, cap, &kHd64, "CAC", mask);
+  CHECK(n != 0u, "hd64 build");
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  CHECK(rc == 0u && g != NULL, "hd64 init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(g->n_ops == 30u && g->slot_words == 3u * HID, "hd64 n_ops %u slots %u",
+        g->n_ops, g->slot_words);
+  op_rms = nth_op(w, HTP_OP_RMSNORM, 0);
+  op_conv = nth_op(w, HTP_OP_CONV1D_GATE, 0);
+  op_qk = nth_op(w, HTP_OP_QK_NORM, 0);
+  CHECK(op_rms == 0u && op_conv == 2u && op_qk == 10u &&
+          g->ops[op_qk + 1u].kind == HTP_OP_ROPE &&
+          g->ops[op_qk + 2u].kind == HTP_OP_ATTN_M1 &&
+          g->ordinal[op_qk + 2u] == 0u,
+        "hd64 op indices %u %u %u", op_rms, op_conv, op_qk);
+
+  /* (1) [RMSNORM]: no gamma -> EBADSTATE; then bit-identical to the spec */
+  fill(in, HID, &seed);
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_rms, 1000u, 0u, NULL, in, HID,
+                                     out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "RMSNORM without gamma: %s",
+        htp_graph_err_name(rc));
+  printf("  RMSNORM forward with no gamma bound       -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  fill(gamma, HID, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(g, op_rms, HTP_GRAPH_PARAM_GAMMA, gamma,
+                                       HID - 1u);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "gamma length: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, op_conv, HTP_GRAPH_PARAM_GAMMA, gamma,
+                                       HID);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "gamma on a conv op: %s",
+        htp_graph_err_name(rc));
+  rc =
+    (uint32_t)hexkl_graph_set_param(g, 99u, HTP_GRAPH_PARAM_GAMMA, gamma, HID);
+  CHECK(rc == (uint32_t)AEE_EBADITEM, "gamma op out of range: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, op_rms, HTP_GRAPH_PARAM_GAMMA, gamma,
+                                       HID);
+  CHECK(rc == 0u, "set gamma: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_rms, 1000u, 0u, NULL, in, HID,
+                                     out, HID, &resume);
+  CHECK(rc == 0u && resume == op_rms + 1u, "RMSNORM forward: %s resume %u",
+        htp_graph_err_name(rc), resume);
+  m1_rmsnorm_det(in, gamma, ref, HID, HID, kHd64.eps, NULL);
+  CHECK(memcmp(out, ref, HID * sizeof(float)) == 0, "RMSNORM differs");
+  check_pcycles(g, op_rms, op_rms + 1u, "RMSNORM");
+  err |= memcmp(out, ref, HID * sizeof(float)) != 0;
+
+  /* (2) [CONV1D_GATE]: no conv_w / state -> EBADSTATE; an 8-token chain
+     from a seeded state; the state re-sent mid-chain */
+  fill(in, 3u * HID, &seed);
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_conv, 1000u, 0u, NULL, in,
+                                     3u * HID, out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "CONV1D_GATE without conv_w: %s",
+        htp_graph_err_name(rc));
+  printf("  CONV1D_GATE forward with no conv_w bound  -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  fill(conv_w, 3u * HID, &seed);
+  fill(state, 2u * HID, &seed);
+  memcpy(state_ref, state, sizeof(state_ref));
+  rc = (uint32_t)hexkl_graph_set_param(g, op_conv, HTP_GRAPH_PARAM_CONV_W,
+                                       conv_w, 3u * HID);
+  CHECK(rc == 0u, "set conv_w: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_conv, 1000u, 0u, NULL, in,
+                                     3u * HID, out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "CONV1D_GATE without state: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, op_conv, HTP_GRAPH_PARAM_CONV_STATE,
+                                       state, 2u * HID);
+  CHECK(rc == 0u, "set conv state: %s", htp_graph_err_name(rc));
+  for (t = 0; t < 12u; ++t) {
+    if (t == 8u) {
+      /* re-seed: the DSP state must follow the sent one, not its own */
+      fill(state, 2u * HID, &seed);
+      memcpy(state_ref, state, sizeof(state_ref));
+      rc = (uint32_t)hexkl_graph_set_param(
+        g, op_conv, HTP_GRAPH_PARAM_CONV_STATE, state, 2u * HID);
+      CHECK(rc == 0u, "re-send conv state: %s", htp_graph_err_name(rc));
+    }
+    fill(in, 3u * HID, &seed);
+    rc = (uint32_t)hexkl_graph_forward(g, &env, op_conv, 1000u, t, NULL, in,
+                                       3u * HID, out, HID, &resume);
+    CHECK(rc == 0u && resume == op_conv + 1u, "conv t=%u: %s resume %u", t,
+          htp_graph_err_name(rc), resume);
+    m1_conv_gate_det(in, state_ref, conv_w, ref, HID);
+    CHECK(memcmp(out, ref, HID * sizeof(float)) == 0, "conv t=%u differs", t);
+    err |= memcmp(out, ref, HID * sizeof(float)) != 0;
+  }
+  check_pcycles(g, op_conv, op_conv + 1u, "CONV1D_GATE");
+  CHECK(memcmp(g->state[op_conv], state_ref, sizeof(state_ref)) == 0,
+        "conv state after the chain");
+
+  /* (3) [QK_NORM ROPE ATTN_M1]: no gamma / table / cache -> EBADSTATE;
+     then, at four positions after a kv_append seed, bit-identical to
+     rmsnorm_det -> rope64_det -> attn_m1_det */
+  fill(in, (N_Q + 2u * N_KV) * HD, &seed);
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_qk, 1000u, 0u, NULL, in,
+                                     (N_Q + 2u * N_KV) * HD, out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "QK_NORM without gamma: %s",
+        htp_graph_err_name(rc));
+  fill(qk_gamma, 2u * HD, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(g, op_qk, HTP_GRAPH_PARAM_GAMMA,
+                                       qk_gamma, 2u * HD);
+  CHECK(rc == 0u, "set qk gamma: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_qk, 1000u, 0u, NULL, in,
+                                     (N_Q + 2u * N_KV) * HD, out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "ROPE without table: %s",
+        htp_graph_err_name(rc));
+  printf("  ROPE forward with no table bound          -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  fill(cs, MAX_SEQ * HD, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(g, op_qk, HTP_GRAPH_PARAM_ROPE_TABLE, cs,
+                                       MAX_SEQ * HD);
+  CHECK(rc == (uint32_t)AEE_EBADITEM, "rope table on an op: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(
+    g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, cs, MAX_SEQ * HD);
+  CHECK(rc == 0u, "set rope table: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_qk, 1000u, 0u, NULL, in,
+                                     (N_Q + 2u * N_KV) * HD, out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "ATTN_M1 without cache: %s",
+        htp_graph_err_name(rc));
+  printf("  ATTN_M1 forward with no cache registered  -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  fill(k_rows, MAX_SEQ * N_KV * HD, &seed);
+  fill(v_rows, MAX_SEQ * N_KV * HD, &seed);
+  for (p = 0; p < 4u; ++p) {
+    const uint32_t pos = positions[p];
+    int cerr = 0;
+    env.attn_m1 =
+      hvx_attn_m1_create(1u, N_KV, N_Q / N_KV, HD, MAX_SEQ, NULL, &cerr);
+    CHECK(env.attn_m1 != NULL, "attn_m1_create: %d", cerr);
+    if (env.attn_m1 == NULL)
+      break;
+    memset(kt, 0, sizeof(kt));
+    memset(vv, 0, sizeof(vv));
+    if (pos != 0u) {
+      rc = (uint32_t)hvx_attn_m1_kv_append(env.attn_m1, 0u, 0u, pos, k_rows,
+                                           v_rows);
+      CHECK(rc == 0u, "kv_append %u rows: %s", pos, htp_graph_err_name(rc));
+      for (i = 0; i < pos; ++i)
+        attn_m1_det_append(kt, vv, HD, MAX_SEQ, i, k_rows + (size_t)i * HD,
+                           v_rows + (size_t)i * HD);
+    }
+    fill(in, (N_Q + 2u * N_KV) * HD, &seed);
+    memset(out, 0, sizeof(out));
+    rc =
+      (uint32_t)hexkl_graph_forward(g, &env, op_qk, 1000u, pos, NULL, in,
+                                    (N_Q + 2u * N_KV) * HD, out, HID, &resume);
+    CHECK(rc == 0u && resume == op_qk + 3u, "attn pos %u: %s resume %u", pos,
+          htp_graph_err_name(rc), resume);
+    /* the spec: per-head norm, RoPE on q then k heads, append, attend */
+    m1_rmsnorm_det(in, qk_gamma, qn, N_Q * HD, HD, kHd64.eps, NULL);
+    m1_rmsnorm_det(in + N_Q * HD, qk_gamma + HD, kn, HD, HD, kHd64.eps, NULL);
+    for (i = 0; i < N_Q; ++i)
+      m1_rope64_det(qn + i * HD, cs + (size_t)pos * HD);
+    m1_rope64_det(kn, cs + (size_t)pos * HD);
+    attn_m1_det_append(kt, vv, HD, MAX_SEQ, pos, kn, in + (N_Q + 1u) * HD);
+    attn_m1_det_forward(qn, kt, vv, N_KV, N_Q / N_KV, HD, MAX_SEQ, pos + 1u,
+                        0.125f, e, ref, NULL);
+    CHECK(memcmp(out, ref, HID * sizeof(float)) == 0, "attn pos %u differs",
+          pos);
+    err |= memcmp(out, ref, HID * sizeof(float)) != 0;
+    /* slot routing: QK_NORM and ROPE ran in place in slot 2 (the roped
+       q | k and the untouched v), ATTN_M1 wrote slot 1 */
+    CHECK(memcmp(g->slots + 2u * g->slot_words, qn, N_Q * HD * sizeof(float)) ==
+              0 &&
+            memcmp(g->slots + 2u * g->slot_words + N_Q * HD, kn,
+                   HD * sizeof(float)) == 0 &&
+            memcmp(g->slots + 2u * g->slot_words + (N_Q + 1u) * HD,
+                   in + (N_Q + 1u) * HD, HD * sizeof(float)) == 0 &&
+            memcmp(g->slots + 1u * g->slot_words, out, HID * sizeof(float)) ==
+              0,
+          "slot routing at pos %u", pos);
+    check_pcycles(g, op_qk, op_qk + 3u, "attention stretch");
+    if (p == 3u) {
+      /* the cache's own hole check passes through: pos past the length */
+      rc = (uint32_t)hexkl_graph_forward(g, &env, op_qk, 1000u, 10u, NULL, in,
+                                         (N_Q + 2u * N_KV) * HD, out, HID,
+                                         &resume);
+      CHECK(rc == 0u, "rewind to pos 10 (kernel allows): %s",
+            htp_graph_err_name(rc));
+      rc = (uint32_t)hexkl_graph_forward(g, &env, op_qk, 1000u, 20u, NULL, in,
+                                         (N_Q + 2u * N_KV) * HD, out, HID,
+                                         &resume);
+      CHECK(rc == (uint32_t)AEE_EBADSTATE, "hole at pos 20: %s",
+            htp_graph_err_name(rc));
+      printf("  ATTN_M1 forward at a hole (pos > kv_len)  -> %s (0x%x)\n",
+             htp_graph_err_name(rc), rc);
+    }
+    hvx_attn_m1_free(env.attn_m1);
+    env.attn_m1 = NULL;
+  }
+  hexkl_graph_free(g);
+  if (err == 0)
+    printf("GRAPH STRETCH BIT-IDENTICAL: RMSNORM CONV1D_GATE "
+           "QK_NORM+ROPE+ATTN_M1 (hd64 shape, pos 0/31/32/63, conv chain "
+           "of 12 with a re-seed)\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
+  check_stretches();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;

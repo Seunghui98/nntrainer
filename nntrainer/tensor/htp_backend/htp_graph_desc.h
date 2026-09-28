@@ -5,7 +5,7 @@
  * @file   htp_graph_desc.h
  * @date   23 Sep 2026
  * @brief  The per-token decode graph as the DSP receives it: wire format,
- *         validator and the LFM2 builder, as pure C99 (#85)
+ *         validator and the LFM2 builder, as pure C99 (#85, v2 in #130)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -23,6 +23,11 @@
  *           ffn_kind[n_layers]    (HTP_GRAPH_FFN_*)
  *           ops[n_ops]            (HTP_GRAPH_OP_WORDS each, htp_graph_op)
  *
+ * Version 2 (#130) adds four words to the op record -- n_kv, gqa,
+ * head_dim for the attention kinds and eps_bits for the norms -- and the
+ * kernel shape rules of #81 / #82 to the validator. A v1 skel refuses a
+ * v2 list with AEE_EUNSUPPORTED, never AEE_EBADPARM.
+ *
  * The list carries every op of the decode step with its real kind, so the
  * validator can check layer consistency, and a per-op resident bit says
  * whether this build's kernel table runs it. forward() runs from a start
@@ -36,10 +41,10 @@
 #include <string.h>
 
 #define HTP_GRAPH_MAGIC 0x47505448u /* "HTPG" */
-#define HTP_GRAPH_VERSION 1u
+#define HTP_GRAPH_VERSION 2u
 #define HTP_GRAPH_HEADER_WORDS 7u
 /** @brief LFM2.5-8B-A1B is 228 ops (section htp_graph_lfm2_build); the
- *  table is HTP_GRAPH_OP_WORDS x 4 B per op, so 256 is 76 KiB of DSP
+ *  table is HTP_GRAPH_OP_WORDS x 4 B per op, so 256 is 80 KiB of DSP
  *  heap at graph_init (address-space note in hexkl_graph.c). */
 #define HTP_GRAPH_MAX_OPS 256u
 #define HTP_GRAPH_MAX_LAYERS 64u
@@ -64,6 +69,81 @@ enum {
 };
 #define HTP_GRAPH_KIND_BIT(k) (1u << (k))
 
+/** @brief The kind's name, for log lines and NNTR_HTP_FORWARD_KINDS. */
+static inline const char *htp_graph_kind_name(uint32_t k) {
+  static const char *const names[HTP_OP_KIND_N] = {
+    "RMSNORM", "FC",          "CONV1D_GATE", "QK_NORM",   "ROPE",   "ATTN_M1",
+    "ADD",     "ROUTER_TOPK", "MOE",         "DENSE_FFN", "LM_HEAD"};
+  return k < HTP_OP_KIND_N ? names[k] : "?";
+}
+
+/** @brief Parses a comma-separated list of kind names ("MOE,RMSNORM")
+ *  into a HTP_GRAPH_KIND_BIT mask. @return the mask, or 0 for an unknown
+ *  or empty name (a caller with a default checks for NULL first). */
+static inline uint32_t htp_graph_kinds_parse(const char *s) {
+  uint32_t mask = 0;
+  while (s != NULL && *s != '\0') {
+    const char *e = s;
+    uint32_t k;
+    size_t n;
+    while (*e != '\0' && *e != ',')
+      ++e;
+    n = (size_t)(e - s);
+    for (k = 0; k < HTP_OP_KIND_N; ++k) {
+      const char *name = htp_graph_kind_name(k);
+      if (strlen(name) == n && strncmp(name, s, n) == 0)
+        break;
+    }
+    if (k == HTP_OP_KIND_N)
+      return 0u;
+    mask |= HTP_GRAPH_KIND_BIT(k);
+    s = (*e == ',') ? e + 1 : e;
+  }
+  return mask;
+}
+
+/** @brief Writes the mask as "MOE|RMSNORM|..." ("-" when empty) into
+ *  @a buf of @a cap bytes (128 holds every kind) and returns it. */
+static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
+                                              size_t cap) {
+  size_t off = 0;
+  uint32_t k;
+  buf[0] = '\0';
+  for (k = 0; k < HTP_OP_KIND_N && off + 1 < cap; ++k) {
+    const char *name;
+    size_t n;
+    if ((mask & HTP_GRAPH_KIND_BIT(k)) == 0u)
+      continue;
+    name = htp_graph_kind_name(k);
+    n = strlen(name);
+    if (off + n + 2 > cap)
+      break;
+    if (off != 0)
+      buf[off++] = '|';
+    memcpy(buf + off, name, n + 1);
+    off += n;
+  }
+  if (off == 0 && cap > 1) {
+    buf[0] = '-';
+    buf[1] = '\0';
+  }
+  return buf;
+}
+
+/** @brief graph_set_param's `which` (#130): the f32 parameters an op
+ *  reads, bound once after graph_init. GAMMA is K floats for RMSNORM and
+ *  2 x head_dim (q gamma | k gamma) for QK_NORM; CONV_W is 3 x N
+ *  (w0 | w1 | w2) and CONV_STATE 2 x N (x_{t-2} | x_{t-1}) for
+ *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
+ *  position) with op == HTP_GRAPH_NO_OP. */
+enum {
+  HTP_GRAPH_PARAM_GAMMA = 0,
+  HTP_GRAPH_PARAM_CONV_W,
+  HTP_GRAPH_PARAM_CONV_STATE,
+  HTP_GRAPH_PARAM_ROPE_TABLE,
+  HTP_GRAPH_PARAM_N
+};
+
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
 enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
 
@@ -78,7 +158,10 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * (the cross-op prefetch hook is a later issue), the validator only
  * requires it to point forward. h_gu / h_dn are the MoE op's registered
  * weight handles, bound by the ARM before graph_init; other kinds leave
- * them 0.
+ * them 0. n_kv / gqa / head_dim describe the attention kinds (QK_NORM,
+ * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
+ * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
+ * QK_NORM); both are 0 elsewhere.
  */
 typedef struct {
   uint32_t kind;
@@ -93,10 +176,14 @@ typedef struct {
   uint32_t out_slot;
   uint32_t next_mm;
   uint32_t rsv;
+  uint32_t n_kv;
+  uint32_t gqa;
+  uint32_t head_dim;
+  uint32_t eps_bits;
   uint32_t h_gu[HTP_GRAPH_MAX_EXPERTS];
   uint32_t h_dn[HTP_GRAPH_MAX_EXPERTS];
 } htp_graph_op;
-#define HTP_GRAPH_OP_WORDS (12u + 2u * HTP_GRAPH_MAX_EXPERTS)
+#define HTP_GRAPH_OP_WORDS (16u + 2u * HTP_GRAPH_MAX_EXPERTS)
 typedef char
   htp_graph_op_size_check[sizeof(htp_graph_op) == HTP_GRAPH_OP_WORDS * 4u ? 1
                                                                           : -1];
@@ -113,12 +200,14 @@ typedef char
 #endif
 #define HTP_GRAPH_E_CLASSNOTSUPPORT (HTP_GRAPH_EOFFSET + 0x003u)
 #define HTP_GRAPH_E_BADSTATE (HTP_GRAPH_EOFFSET + 0x00Du)
+#define HTP_GRAPH_E_SCHEMENOTSUPPORTED (HTP_GRAPH_EOFFSET + 0x00Fu)
 #define HTP_GRAPH_E_BADITEM (HTP_GRAPH_EOFFSET + 0x010u)
 #define HTP_GRAPH_E_INVALIDFORMAT (HTP_GRAPH_EOFFSET + 0x011u)
 #define HTP_GRAPH_E_INCOMPLETEITEM (HTP_GRAPH_EOFFSET + 0x012u)
 #define HTP_GRAPH_E_UNSUPPORTED (HTP_GRAPH_EOFFSET + 0x014u)
 #define HTP_GRAPH_E_NOTYPE (HTP_GRAPH_EOFFSET + 0x022u)
 #define HTP_GRAPH_E_INVALIDITEM (HTP_GRAPH_EOFFSET + 0x02Au)
+#define HTP_GRAPH_E_NOTALLOWED (HTP_GRAPH_EOFFSET + 0x02Bu)
 #define HTP_GRAPH_E_INVHANDLE (HTP_GRAPH_EOFFSET + 0x02Cu)
 
 /** @brief The code's name for a log line, on either side's offset. */
@@ -132,6 +221,8 @@ static inline const char *htp_graph_err_name(uint32_t code) {
     return "AEE_EBADSTATE";
   case 0x00Eu:
     return "AEE_EBADPARM";
+  case 0x00Fu:
+    return "AEE_ESCHEMENOTSUPPORTED";
   case 0x010u:
     return "AEE_EBADITEM";
   case 0x011u:
@@ -144,6 +235,8 @@ static inline const char *htp_graph_err_name(uint32_t code) {
     return "AEE_ENOTYPE";
   case 0x02Au:
     return "AEE_EINVALIDITEM";
+  case 0x02Bu:
+    return "AEE_ENOTALLOWED";
   case 0x02Cu:
     return "AEE_EINVHANDLE";
   default:
@@ -188,14 +281,23 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         graph_host_check.c): INVALIDFORMAT for magic and every shape,
  *         UNSUPPORTED for the version, INCOMPLETEITEM for a short list,
  *         NOTYPE for a kind this header does not know, INVALIDITEM for an
- *         op in the wrong layer kind, BADITEM for a next_mm that does not
- *         point forward at a weight-streaming op, CLASSNOTSUPPORT for a
- *         resident bit on a kind with no kernel here
+ *         op in the wrong layer kind or an attention op out of the
+ *         QK_NORM -> ROPE -> ATTN_M1 order, BADITEM for a next_mm that
+ *         does not point forward at a weight-streaming op, CLASSNOTSUPPORT
+ *         for a resident bit on a kind with no kernel here,
+ *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
+ *         rule (RMSNORM: K a power of two and a multiple of 32; QK_NORM /
+ *         ATTN_M1: head_dim 32, 64 or 128 -- the per-head norm's chunk
+ *         must be a power of two too -- gqa <= 8, max_seq a multiple of
+ *         32; ROPE: head_dim 64), NOTALLOWED for a resident
+ *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
+ *         apply RoPE, since mha_core does on the CPU)
  */
 static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
                                           uint32_t resident_ok,
                                           uint32_t *n_ops_out) {
   uint32_t n_layers, n_ops, hidden, vocab, max_seq, i, prev_layer = 0;
+  uint32_t attn_layer = HTP_GRAPH_NO_OP, attn_stage = 0, rope_resident = 0;
   if (w == NULL || n_words < HTP_GRAPH_HEADER_WORDS)
     return HTP_GRAPH_E_INCOMPLETEITEM;
   if (w[0] != HTP_GRAPH_MAGIC)
@@ -294,6 +396,42 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     default:
       break;
     }
+    /* v2: the attention record, its in-layer order and the norm epsilon */
+    if (k == HTP_OP_QK_NORM || k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) {
+      if (op->n_kv == 0u || op->gqa == 0u || op->head_dim == 0u ||
+          op->K != (op->gqa + 2u) * op->n_kv * op->head_dim ||
+          (k == HTP_OP_ATTN_M1 && op->N != op->gqa * op->n_kv * op->head_dim))
+        return HTP_GRAPH_E_INVALIDFORMAT;
+      if (op->layer != attn_layer) {
+        attn_layer = op->layer;
+        attn_stage = 0u;
+        rope_resident = 0u;
+      }
+      if ((k == HTP_OP_QK_NORM && attn_stage != 0u) ||
+          (k == HTP_OP_ROPE && attn_stage != 1u) ||
+          (k == HTP_OP_ATTN_M1 && attn_stage != 2u))
+        return HTP_GRAPH_E_INVALIDITEM;
+      ++attn_stage;
+      if (k == HTP_OP_ROPE)
+        rope_resident = op->resident;
+      if (op->resident != 0u) {
+        if (op->head_dim % 32u != 0u || op->head_dim > 128u ||
+            (op->head_dim & (op->head_dim - 1u)) != 0u || op->gqa > 8u ||
+            max_seq % 32u != 0u || (k == HTP_OP_ROPE && op->head_dim != 64u))
+          return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
+        if (k == HTP_OP_ATTN_M1 && rope_resident == 0u)
+          return HTP_GRAPH_E_NOTALLOWED;
+      }
+    }
+    if (k == HTP_OP_RMSNORM || k == HTP_OP_QK_NORM) {
+      /* a positive finite f32: sign clear, exponent neither 0 nor 0xFF */
+      const uint32_t exp = op->eps_bits & 0x7F800000u;
+      if ((op->eps_bits & 0x80000000u) != 0u || exp == 0u || exp == 0x7F800000u)
+        return HTP_GRAPH_E_INVALIDFORMAT;
+    }
+    if (k == HTP_OP_RMSNORM && op->resident != 0u &&
+        (op->K % 32u != 0u || (op->K & (op->K - 1u)) != 0u))
+      return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     if (op->next_mm != HTP_GRAPH_NO_OP &&
         (op->next_mm <= i || op->next_mm >= n_ops ||
          !htp_graph_kind_streams_weights(
@@ -321,6 +459,7 @@ typedef struct {
   uint32_t head_dim;
   uint32_t vocab;
   uint32_t max_seq;
+  float eps; /**< rms_norm_eps (Transformer::NORM_EPS), every norm */
 } htp_graph_lfm2_shape;
 
 static inline htp_graph_op *
@@ -361,10 +500,12 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
                                             uint32_t resident_mask) {
   const uint32_t h = s->hidden;
   const uint32_t qkv = (s->n_heads + 2u * s->n_kv_heads) * s->head_dim;
-  uint32_t n = 0, l, i, last_mm;
+  uint32_t n = 0, l, i, last_mm, eps_bits;
+  htp_graph_op *op;
   /* 11 per attention layer, 9 per conv layer, 2 for the tail */
   uint32_t n_ops_max = 0;
-  if (s->n_layers == 0u || s->n_layers > HTP_GRAPH_MAX_LAYERS)
+  if (s->n_layers == 0u || s->n_layers > HTP_GRAPH_MAX_LAYERS ||
+      s->n_kv_heads == 0u || s->n_heads % s->n_kv_heads != 0u)
     return 0u;
   for (l = 0; l < s->n_layers; ++l)
     n_ops_max += layer_is_attn[l] ? 11u : 9u;
@@ -379,6 +520,7 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
   w[4] = h;
   w[5] = s->vocab;
   w[6] = s->max_seq;
+  memcpy(&eps_bits, &s->eps, sizeof(eps_bits));
   for (l = 0; l < s->n_layers; ++l) {
     w[HTP_GRAPH_HEADER_WORDS + l] =
       layer_is_attn[l] ? HTP_GRAPH_LAYER_ATTN : HTP_GRAPH_LAYER_CONV;
@@ -386,14 +528,24 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
       l < s->n_dense_layers ? HTP_GRAPH_FFN_DENSE : HTP_GRAPH_FFN_MOE;
   }
   for (l = 0; l < s->n_layers; ++l) {
-    htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, l, h, h, 0, 1, resident_mask);
+    op =
+      htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, l, h, h, 0, 1, resident_mask);
+    op->eps_bits = eps_bits;
     if (layer_is_attn[l]) {
+      uint32_t a;
       htp_graph_lfm2_emit(w, &n, HTP_OP_FC, l, h, qkv, 1, 2, resident_mask);
-      htp_graph_lfm2_emit(w, &n, HTP_OP_QK_NORM, l, qkv, qkv, 2, 2,
-                          resident_mask);
+      op = htp_graph_lfm2_emit(w, &n, HTP_OP_QK_NORM, l, qkv, qkv, 2, 2,
+                               resident_mask);
+      op->eps_bits = eps_bits;
       htp_graph_lfm2_emit(w, &n, HTP_OP_ROPE, l, qkv, qkv, 2, 2, resident_mask);
       htp_graph_lfm2_emit(w, &n, HTP_OP_ATTN_M1, l, qkv, h, 2, 1,
                           resident_mask);
+      for (a = n - 3u; a < n; ++a) {
+        op = htp_graph_op_at(w, a);
+        op->n_kv = s->n_kv_heads;
+        op->gqa = s->n_heads / s->n_kv_heads;
+        op->head_dim = s->head_dim;
+      }
       htp_graph_lfm2_emit(w, &n, HTP_OP_FC, l, h, h, 1, 2, resident_mask);
     } else {
       htp_graph_lfm2_emit(w, &n, HTP_OP_FC, l, h, 3u * h, 1, 2, resident_mask);
@@ -402,7 +554,9 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
       htp_graph_lfm2_emit(w, &n, HTP_OP_FC, l, h, h, 1, 2, resident_mask);
     }
     htp_graph_lfm2_emit(w, &n, HTP_OP_ADD, l, h, h, 2, 0, resident_mask);
-    htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, l, h, h, 0, 1, resident_mask);
+    op =
+      htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, l, h, h, 0, 1, resident_mask);
+    op->eps_bits = eps_bits;
     if (l < s->n_dense_layers) {
       htp_graph_op *op = htp_graph_lfm2_emit(
         w, &n, HTP_OP_DENSE_FFN, l, h, s->inter_dense, 1, 2, resident_mask);
@@ -420,8 +574,9 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
     }
     htp_graph_lfm2_emit(w, &n, HTP_OP_ADD, l, h, h, 2, 0, resident_mask);
   }
-  htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, s->n_layers, h, h, 0, 1,
-                      resident_mask);
+  op = htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, s->n_layers, h, h, 0, 1,
+                           resident_mask);
+  op->eps_bits = eps_bits;
   htp_graph_lfm2_emit(w, &n, HTP_OP_LM_HEAD, s->n_layers, h, s->vocab, 1, 2,
                       resident_mask);
   w[3] = n;
