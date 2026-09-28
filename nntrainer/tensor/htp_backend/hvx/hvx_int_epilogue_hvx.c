@@ -169,15 +169,17 @@ static inline HVX_Vector vA(const hvx_int_gu_job *c, uint32_t r, uint32_t slot,
                          Q6_Vw_vmpyi_VwRh(vload(c->colsum_w + col), zp));
 }
 
+/** HVX has no unsigned word max; |A| < 2^24 (K = 2048 terms of at most
+ *  255 x 8, and the zp * colsum correction of the same size), so the
+ *  signed one is exact here, as the reference's unsigned max is. */
 static uint32_t vrow_amax(const hvx_int_gu_job *c, uint32_t r, uint32_t s0,
                           uint32_t col0, int32_t zp) {
   HVX_Vector m = Q6_V_vzero();
   for (uint32_t j = 0; j < c->n_pairs; ++j) {
-    m = Q6_Vuw_vmax_VuwVuw(m,
-                           Q6_Vw_vabs_Vw(vA(c, r, s0 + j, col0 + j * 32u, zp)));
+    m = Q6_Vw_vmax_VwVw(m, Q6_Vw_vabs_Vw(vA(c, r, s0 + j, col0 + j * 32u, zp)));
   }
   for (uint32_t rot = VLEN / 2u; rot >= 4u; rot >>= 1) {
-    m = Q6_Vuw_vmax_VuwVuw(m, Q6_V_vror_VR(m, (int)rot));
+    m = Q6_Vw_vmax_VwVw(m, Q6_V_vror_VR(m, (int)rot));
   }
   return vlane0_u32(m);
 }
