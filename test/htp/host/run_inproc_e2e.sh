@@ -68,6 +68,15 @@
 #                              carries it unchanged)
 #   E2E tokens d==off-tiny / -hd64 / -lfm25 8/8 expected_mismatch=0
 #   E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED
+# and, since #141 step 2, the M==1 MoE calls over dspqueue
+# (NNTR_HTP_DSPQ=1, inproc/dspqueue_standin.c; plan 141-dspq-moe.md step 4),
+# each against the switch-off run's dumps, every call's bytes:
+#   E2E eval dspq-tiny ... bit_identical=1
+#   E2E eval dspq-lfm25 ... bit_identical=1            (prompt 512, SPIN_US=0)
+#   E2E eval dspq-hmx ... bit_identical=1              (NNTR_MOE_HTP_M1_GEMV=0)
+#   E2E dspq on-lines tiny/lfm25/hmx calls=<n> ok      (on once, close
+#                              calls=N served=N bad=0, N = M==1 MoE calls)
+#   E2E dspq off-path banner=1 bit_identical=1         (NNTR_INPROC_NO_DSPQ=1)
 # NNTR_INPROC_GOLDEN=update rewrites test/htp/host/golden/lfm2_moe_tiny,
 # lfm2_moe_tiny_hd64 and lfm2_moe_tiny_lfm25 from this run's switch-off
 # HTP dumps (deliberate, like reference_logits.json).
@@ -145,6 +154,9 @@ calls_per_token() { # the backend's close-time summary line
   sed -n 's/.*forward calls=[0-9]* tokens=[0-9]* calls\/token=\([0-9.]*\).*/\1/p' "$1"
 }
 echo "== htp (M1_GEMV default)"
+# dspqueue is the default since #141: every run below is FastRPC unless it
+# sets NNTR_HTP_DSPQ=1 itself, so the switch-off goldens stay the reference.
+export NNTR_HTP_DSPQ=0
 run_e2e htp "$OUT/htp" htp "$OUT/dump_htp" "$OUT/htp.log"
 echo "== htp, NNTR_MOE_HTP_M1_GEMV=0 (HMX loop at M = 1)"
 NNTR_MOE_HTP_M1_GEMV=0 run_e2e hmx "$OUT/htp" htp "$OUT/dump_hmx" "$OUT/hmx.log"
@@ -192,6 +204,17 @@ NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
 echo "== [#132] lfm25 htp, KINDS=<six>,ADD,ROUTER_TOPK, prompt 512"
 PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
   run_e2e lfm25-d "$OUT/htp25" htp "$OUT/dump_25d" "$OUT/25d.log" --max-seq 2048
+# [#141] the M==1 MoE calls over dspqueue: tiny (DSP spins between calls),
+# lfm25 at prompt 512 (DSP always blocks), the HMX loop at M = 1, and a
+# runtime without dspqueue (the off banner, FastRPC throughout)
+echo "== [#141] htp, NNTR_HTP_DSPQ=1 (tiny / lfm25 SPIN_US=0 / HMX loop / no dspqueue)"
+NNTR_HTP_DSPQ=1 run_e2e dspq-tiny "$OUT/htp" htp "$OUT/dump_dspq" "$OUT/dspq.log"
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_DSPQ_SPIN_US=0 \
+  run_e2e dspq-lfm25 "$OUT/htp25" htp "$OUT/dump_25dspq" "$OUT/25dspq.log" --max-seq 2048
+NNTR_HTP_DSPQ=1 NNTR_MOE_HTP_M1_GEMV=0 \
+  run_e2e dspq-hmx "$OUT/htp" htp "$OUT/dump_dspqhmx" "$OUT/dspqhmx.log"
+NNTR_INPROC_NO_DSPQ=1 NNTR_HTP_DSPQ=1 \
+  run_e2e dspq-off "$OUT/htp" htp "$OUT/dump_dspqoff" "$OUT/dspqoff.log"
 echo "== [#132] htp, ADD resident without RMSNORM (must be refused)"
 rc_add=0
 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=MOE,CONV1D_GATE,ADD "$E2E" \
@@ -318,6 +341,36 @@ if [ $rc_add = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ENOTALLOWED'
   echo "E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED"
 else
   echo "E2E FAIL ADD without RMSNORM not refused (rc=$rc_add)"; fail=1
+fi
+
+# (i) [#141] dspqueue: the same DSP function on the same bytes, so every
+# MoE call and every logit is bit-identical to the switch-off run; the on
+# line once, and the close line's served = the ARM's calls = the manifest's
+# M==1 MoE calls, bad = 0.
+m1_calls() { awk '$2 == "moe_layer" && $3 == 1 && $7 == 0' "$1/manifest.txt" | wc -l; }
+for d in "tiny dspq dump_htp dump_dspq" "lfm25 25dspq dump_25off dump_25dspq" \
+  "hmx dspqhmx dump_hmx dump_dspqhmx"; do
+  read -r fx tag ref dump <<< "$d"
+  $EVAL --label "dspq-$fx" "$OUT/$ref" "$OUT/$dump" | tail -1 || fail=1
+  n="$(m1_calls "$OUT/$dump")"
+  if [ "$n" -gt 0 ] && [ "$(grep -c '^\[HTP\] dspq: on ' "$OUT/$tag.log")" = 1 ] &&
+    grep -q "^\[HTP\] dspq: close calls=$n served=$n bad=0 " "$OUT/$tag.log"; then
+    echo "E2E dspq on-lines $fx calls=$n ok"
+  else
+    echo "E2E FAIL dspq $fx: on/close lines (manifest M==1 calls=$n)"
+    grep '^\[HTP\] dspq' "$OUT/$tag.log" || true
+    fail=1
+  fi
+done
+grep -q 'dsp_spin_us=0 ' "$OUT/25dspq.log" ||
+  { echo "E2E FAIL dspq lfm25: NNTR_HTP_DSPQ_SPIN_US=0 not applied"; fail=1; }
+off_line="$($EVAL --label dspq-off "$OUT/dump_htp" "$OUT/dump_dspqoff" | tail -1 || true)"
+banner="$(grep -c '^\[HTP\] dspq: off (create 0x[0-9a-f]*) -- MoE calls stay on FastRPC$' "$OUT/dspqoff.log" || true)"
+if [ "$banner" = 1 ] && grep -q 'bit_identical=1' <<< "$off_line" &&
+  ! grep -q 'dspq: close' "$OUT/dspqoff.log"; then
+  echo "E2E dspq off-path banner=1 bit_identical=1"
+else
+  echo "E2E FAIL dspq off-path banner=$banner ($off_line)"; fail=1
 fi
 
 # (h) [#134] NNTR_PPL_DECODE on the app's own decode loop (CausalLM::run,

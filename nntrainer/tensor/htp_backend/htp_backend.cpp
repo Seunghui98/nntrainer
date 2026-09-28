@@ -95,6 +95,7 @@ HtpBackend::HtpBackend() {
     remote_handle64_control(h, DSPRPC_CONTROL_LATENCY, &lat, sizeof(lat));
   if (qos_err == AEE_SUCCESS) {
     qos_mode_ = 2;
+    poll_us_ = lat.latency;
   } else {
     std::memset(&lat, 0, sizeof(lat));
     lat.enable = RPC_PM_QOS;
@@ -113,6 +114,9 @@ HtpBackend::HtpBackend() {
 
 HtpBackend::~HtpBackend() {
   if (enabled_) {
+    for (auto &fn : at_close_) {
+      fn();
+    }
     nntr_hvx_close(static_cast<remote_handle64>(handle_));
     enabled_ = false;
   }

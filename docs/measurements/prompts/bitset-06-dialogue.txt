@@ -1,0 +1,10 @@
+The following is a conversation between a user and a helpful travel assistant.
+
+User: Hi, I'm planning a four-day trip to Lisbon in late October with my partner. We like walking, food and old neighbourhoods, but we're not really into museums.
+Assistant: That sounds like a great time to visit: the summer crowds are gone and the weather is usually mild, around 18 to 22 degrees. Do you already know where you'll be staying?
+User: We booked a small hotel in Baixa, near the river. We arrive on a Thursday at around two in the afternoon and leave on Monday evening.
+Assistant: Baixa is very central, so you can walk to most places. Would you like a day-by-day plan, or just a list of suggestions?
+User: A day-by-day plan would be great. One more thing: my partner doesn't eat meat, but fish is fine. And we'd like one day trip out of the city if it's easy by train.
+Assistant: Understood. A day trip to Sintra or Cascais is easy by train from Lisbon. Which of the two appeals to you more, palaces and forest or the coast?
+User: Palaces and forest, definitely. Also, is it worth buying a transport card, or should we just pay per ride?
+Assistant:

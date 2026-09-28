@@ -627,4 +627,18 @@ interface nntr_hvx : remote_handle64 {
    // Stops the thread and closes the queue.
    // res: [packets served, empty polls, bad packets, mode]
    AEEResult dspq_bench_stop(rout sequence<uint32> res);
+
+   // [#141 step 2] The M==1 MoE layer call over dspqueue (plan
+   // docs/plans/141-dspq-moe.md; packet: htp_backend/htp_dspq_wire.h).
+   // start imports the queue the ARM side exported and parks one DSP thread
+   // on it that runs mm_u8i4_moe_layer[_timed] -- the same C function -- per
+   // request packet. After each response it spins spin_us on read_noblock,
+   // then blocks (spin_us 0 = always block). AEE_EUNSUPPORTED: this DSP
+   // image has no dspqueue. AEE_EBADSTATE: the session already has a queue.
+   // Never AEE_EBADPARM (the stale-skel symptom, rule 3). close() stops a
+   // queue that is still open.
+   AEEResult dspq_start(in uint64 queue_id, in uint32 spin_us);
+   // Stops the thread and closes the queue.
+   // res: [packets served, bad packets, empty polls, spin_us]
+   AEEResult dspq_stop(rout sequence<uint32> res);
 };

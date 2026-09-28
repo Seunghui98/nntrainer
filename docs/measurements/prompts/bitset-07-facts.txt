@@ -1,0 +1,15 @@
+Write a clear, well-organised encyclopedia-style article for a general audience about the history and science of the transistor. Cover the following points in order, using one paragraph for each.
+
+First, the problem the transistor was meant to solve: the vacuum tubes used in radios, telephone exchanges and early computers such as ENIAC, and why their size, heat, power consumption and short lifetime were a serious limitation.
+
+Second, the invention of the point-contact transistor at Bell Laboratories in December 1947 by John Bardeen and Walter Brattain, the junction transistor that William Shockley developed shortly afterwards, and the Nobel Prize in Physics the three men shared in 1956.
+
+Third, the basic physics in plain language: what a semiconductor is, why silicon and germanium are used, what doping with small amounts of other elements does, what n-type and p-type material are, and how a small current or voltage at one terminal can control a much larger current between the other two, so that the device can act as an amplifier or as a switch.
+
+Fourth, the move from germanium to silicon, the invention of the integrated circuit by Jack Kilby and Robert Noyce around 1958 and 1959, and the planar process that made it possible to put many transistors on a single chip.
+
+Fifth, the MOSFET, why it became the dominant type of transistor, and how the number of transistors on a chip grew from a few thousand in the early 1970s to tens of billions today, including a short explanation of what Moore's law says and why the pace of shrinking transistors has slowed in recent years.
+
+Sixth, the effect of all this on everyday life, from pocket radios and hearing aids to personal computers, mobile phones and the data centres behind the internet.
+
+Keep the tone factual and neutral, avoid unnecessary jargon, explain any technical term the first time it is used, and end with a short concluding paragraph.

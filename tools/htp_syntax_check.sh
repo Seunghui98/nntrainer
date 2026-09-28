@@ -49,6 +49,45 @@ cat > "$STUB/AEEStdErr.h" <<'H'
 #define AEE_EUNSUPPORTED 20
 H
 
+# [#141] dspqueue.h: the types and the entries HtpDspqApi takes decltype of.
+cat > "$STUB/dspqueue.h" <<'H'
+#pragma once
+#include <stdint.h>
+typedef int AEEResult;
+#define AEE_EWOULDBLOCK 516
+#define DSPQUEUE_TIMEOUT_NONE 0xffffffff
+enum dspqueue_buffer_flags {
+  DSPQUEUE_BUFFER_FLAG_REF = 4, DSPQUEUE_BUFFER_FLAG_DEREF = 8,
+  DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER = 0x10,
+  DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT = 0x80
+};
+enum dspqueue_stat { DSPQUEUE_STAT_SIGNALING_PERF = 7 };
+struct dspqueue;
+typedef struct dspqueue *dspqueue_t;
+struct dspqueue_buffer {
+  uint32_t fd, size, offset, flags;
+  union { void *ptr; uint64_t address; };
+};
+typedef void (*dspqueue_callback_t)(dspqueue_t, AEEResult, void *);
+extern "C" {
+AEEResult dspqueue_create(int, uint32_t, uint32_t, uint32_t,
+                          dspqueue_callback_t, dspqueue_callback_t, void *,
+                          dspqueue_t *);
+AEEResult dspqueue_close(dspqueue_t);
+AEEResult dspqueue_export(dspqueue_t, uint64_t *);
+AEEResult dspqueue_write(dspqueue_t, uint32_t, uint32_t,
+                         struct dspqueue_buffer *, uint32_t, const uint8_t *,
+                         uint32_t);
+AEEResult dspqueue_read_noblock(dspqueue_t, uint32_t *, uint32_t, uint32_t *,
+                                struct dspqueue_buffer *, uint32_t, uint32_t *,
+                                uint8_t *);
+AEEResult dspqueue_read(dspqueue_t, uint32_t *, uint32_t, uint32_t *,
+                        struct dspqueue_buffer *, uint32_t, uint32_t *,
+                        uint8_t *, uint32_t);
+AEEResult dspqueue_get_stat(dspqueue_t, enum dspqueue_stat, uint64_t *);
+}
+H
+
 # Variadic on purpose: see the note above about what this cannot check.
 {
   echo '#pragma once'
