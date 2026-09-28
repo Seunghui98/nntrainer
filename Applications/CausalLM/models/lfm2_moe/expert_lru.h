@@ -23,6 +23,7 @@
 #define __CAUSALLM_EXPERT_LRU_H__
 #ifdef __cplusplus
 
+#include <algorithm>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -58,6 +59,21 @@ public:
   }
 
   /**
+   * @brief [doc 52 section 10.20] Counts @a n slots as taken by keys that
+   *        are not in the LRU yet -- read-ahead still in flight -- so that
+   *        neither makeRoom() nor acquire() hands those slots out again.
+   *        unhold() gives them back, just before the keys are acquire()d.
+   */
+  void hold(size_t n) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    held_ += n;
+  }
+  void unhold(size_t n) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    held_ -= std::min(n, held_);
+  }
+
+  /**
    * @brief Evicts least recently used keys outside @a pinned until @a n more
    *        keys fit -- room for keys the caller will bring in itself and
    *        then hand to acquire() with a load that does nothing.
@@ -67,14 +83,14 @@ public:
   bool makeRoom(size_t n, const std::vector<Key> &pinned,
                 const std::function<void(Key)> &evict) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const size_t cap = capacity_ - std::min(held_, capacity_);
     std::unordered_set<Key> pin(pinned.begin(), pinned.end());
     size_t pinned_resident = 0;
     for (Key k : pin)
       pinned_resident += pos_.count(k);
-    if (pinned_resident + n > capacity_)
+    if (pinned_resident + n > cap)
       return false;
-    size_t excess =
-      order_.size() + n > capacity_ ? order_.size() + n - capacity_ : 0;
+    size_t excess = order_.size() + n > cap ? order_.size() + n - cap : 0;
     for (auto it = order_.begin(); excess != 0 && it != order_.end();) {
       if (pin.count(*it) != 0) {
         ++it;
@@ -108,6 +124,13 @@ public:
         " experts resident but the pool holds " + std::to_string(capacity_) +
         " (NNTR_MOE_CACHE_EXPERTS x MoE layers); raise it");
     }
+    const size_t cap = capacity_ - std::min(held_, capacity_);
+    if (need.size() > cap) {
+      throw std::logic_error("ExpertLru: read-ahead holds " +
+                             std::to_string(held_) +
+                             " slots, too many for a call that needs " +
+                             std::to_string(need.size()));
+    }
     std::unordered_set<Key> pinned(need.begin(), need.end());
     std::vector<Key> misses;
     for (Key k : need) {
@@ -120,8 +143,8 @@ public:
     // Evictions first, all of them: a slot has to be free before its
     // replacement is read, and the caller's release/register pair is
     // cheapest back to back.
-    size_t excess = order_.size() + misses.size() > capacity_
-                      ? order_.size() + misses.size() - capacity_
+    size_t excess = order_.size() + misses.size() > cap
+                      ? order_.size() + misses.size() - cap
                       : 0;
     for (auto it = order_.begin(); excess != 0 && it != order_.end();) {
       if (pinned.count(*it) != 0) {
@@ -169,6 +192,7 @@ private:
 
   mutable std::mutex mutex_;
   size_t capacity_ = 0;
+  size_t held_ = 0; /**< slots taken by keys still being read (hold()) */
   std::set<const void *> layers_;
   Order order_; /**< front = least recently used */
   std::unordered_map<Key, Order::iterator> pos_;

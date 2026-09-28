@@ -20,6 +20,7 @@
 #include <cpu_backend.h>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <expert_lru.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
@@ -156,15 +157,23 @@ static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
 /** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
 static std::atomic<unsigned> g_moe_layer_count{0};
 
-/** @brief NNTR_MOE_PREFETCH=1: prefill reads the next layer's experts under
- *  the current layer's call (doc 52 section 10.10). */
-static bool expertPrefetchEnabled() {
-  static const bool on = [] {
+/** @brief NNTR_MOE_PREFETCH=<k>: prefill reads the experts of the layers up
+ *  to k ahead under the current layers' calls (doc 52 sections 10.10,
+ *  10.20); 0 or unset is off. C=8 has room for k=4: this layer's 32 and
+ *  four more layers' fit its 176 slots. */
+static int expertPrefetchDepth() {
+  static const int k = [] {
     const char *v = std::getenv("NNTR_MOE_PREFETCH");
-    return v != nullptr && *v != '\0' && *v != '0';
+    return v != nullptr ? std::max(0, std::atoi(v)) : 0;
   }();
-  return on;
+  return k;
 }
+
+/** [doc 52 section 10.20] Read-ahead batches in flight, oldest first: the
+ *  layer slot each was queued for and the LRU slots it holds. */
+static std::deque<std::pair<int, size_t>> g_prefetch_batches;
+/** The next layer slot to queue in the current prefill. */
+static int g_prefetch_next = 0;
 
 /**
  * @brief NNTR_MOE_TRACE=<path>: one line per MoE layer call,
@@ -821,51 +830,76 @@ static bool tryMoeLayerOnAccelerator(
       }
     }
   } else {
-    stage(active);
-
-    // [doc 52 section 10.10] Prefill routes every token to its top-4, so
-    // the next layer will want (nearly) all of its experts: read the ones
-    // it lacks while this call runs. Room is made first by evicting
-    // outside this call's experts and the next layer's resident ones --
-    // with fewer than 32 + 32 slots there is none and this does nothing.
-    // Only the reads overlap; registering waits for the call.
-    bool prefetching = false;
-    if (experts_virtual && total_tokens > 1 && expertPrefetchEnabled() &&
-        expert_layer_slot >= 0 &&
-        static_cast<size_t>(expert_layer_slot) + 1 < g_expert_layers.size()) {
-      std::vector<causallm::ExpertLru::Key> pinned(need);
-      std::vector<ExpertFileDesc> want;
-      for (const ExpertFileDesc &d : g_expert_layers[expert_layer_slot + 1]) {
-        if (g_expert_lru.resident(d.key_gu))
-          pinned.push_back(d.key_gu);
-        else
-          want.push_back(d);
-      }
-      if (!want.empty() && g_expert_lru.makeRoom(want.size(), pinned, release))
-        prefetching = ops->prefetch_qs4cx_wh_experts_begin(want);
-    }
-    // The prefetched experts are the backend's the moment _end registers
-    // them, so the LRU has to hear about them whether or not the call threw.
-    auto finish_prefetch = [&] {
-      if (!prefetching)
-        return;
-      prefetching = false;
+    // [doc 52 sections 10.10, 10.20] Prefill read-ahead: prefill routes
+    // every token to its top-4, so a layer wants (nearly) all 32 of its
+    // experts, and which ones is known long before its turn. This layer
+    // queues the ones layers up to NNTR_MOE_PREFETCH ahead lack, the
+    // backend reads them while this and the following calls run, and each
+    // layer registers its own batch -- between calls -- before it stages.
+    // Room comes from evicting outside this call's experts and the queued
+    // layers' resident ones, and the in-flight slots are held so no miss
+    // takes them; where there is no room the queue stops and resumes a
+    // layer later.
+    const int depth =
+      experts_virtual && total_tokens > 1 && expert_layer_slot >= 0
+        ? expertPrefetchDepth()
+        : 0;
+    auto take_batch = [&] {
+      const size_t held = g_prefetch_batches.front().second;
+      g_prefetch_batches.pop_front();
+      g_expert_lru.unhold(held);
       g_expert_lru.acquire(
         ops->prefetch_qs4cx_wh_experts_end(), [](causallm::ExpertLru::Key) {},
         [](causallm::ExpertLru::Key) {
           throw std::logic_error("expert prefetch overfilled the LRU");
         });
     };
-    try {
-      call(output.getData<float>());
-    } catch (...) {
-      try {
-        finish_prefetch();
-      } catch (...) {
-      }
-      throw;
+    if (depth > 0) {
+      // Layer 0 starts a prefill: whatever an earlier one left goes first.
+      while (!g_prefetch_batches.empty() &&
+             (expert_layer_slot == 0 ||
+              g_prefetch_batches.front().first <= expert_layer_slot))
+        take_batch();
+      if (expert_layer_slot == 0)
+        g_prefetch_next = 1;
     }
-    finish_prefetch();
+
+    stage(active);
+
+    if (depth > 0) {
+      g_prefetch_next = std::max(g_prefetch_next, expert_layer_slot + 1);
+      const int last = std::min(expert_layer_slot + depth,
+                                static_cast<int>(g_expert_layers.size()) - 1);
+      for (; g_prefetch_next <= last; ++g_prefetch_next) {
+        std::vector<causallm::ExpertLru::Key> pinned(need);
+        for (int l = expert_layer_slot + 1; l <= g_prefetch_next; ++l)
+          for (const ExpertFileDesc &d : g_expert_layers[l])
+            if (g_expert_lru.resident(d.key_gu))
+              pinned.push_back(d.key_gu);
+        std::vector<ExpertFileDesc> want;
+        for (const ExpertFileDesc &d : g_expert_layers[g_prefetch_next])
+          if (!g_expert_lru.resident(d.key_gu))
+            want.push_back(d);
+        if (want.empty())
+          continue;
+        if (!g_expert_lru.makeRoom(want.size(), pinned, release))
+          break;
+        g_expert_lru.hold(want.size());
+        bool queued = false;
+        try {
+          queued = ops->prefetch_qs4cx_wh_experts_begin(want);
+        } catch (...) {
+          g_expert_lru.unhold(want.size());
+          throw;
+        }
+        if (queued)
+          g_prefetch_batches.emplace_back(g_prefetch_next, want.size());
+        else
+          g_expert_lru.unhold(want.size());
+      }
+    }
+
+    call(output.getData<float>());
   }
 
   // Recency from the routing's extended top-k, token by token, so the

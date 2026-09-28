@@ -366,13 +366,15 @@ public:
     return false;
   }
 
-  // The same, split so the file reads overlap other work (doc 52 section
-  // 10.10): _begin takes a slot per expert and starts reading in the
-  // background, _end waits for the reads and registers what was read,
-  // returning the key_gu of each expert now resident. The caller must call
-  // _end before its next ComputeOps call that touches these experts, and
-  // must have made room -- _begin takes only free or new slots. False /
-  // empty from a backend without a slot pool.
+  // The same, split so the file reads overlap other work (doc 52 sections
+  // 10.10, 10.20): _begin queues one batch -- a slot per expert, read in the
+  // background -- and returns; several batches may be in flight. _end waits
+  // for the OLDEST batch, registers it, and returns the key_gu of each of
+  // its experts now resident (empty when none is queued). The caller must
+  // _end a batch before any ComputeOps call that touches its experts, only
+  // between accelerator calls, and must have made room -- _begin takes
+  // only free or new slots. False / empty from a backend without a slot
+  // pool.
   virtual bool
   prefetch_qs4cx_wh_experts_begin(const std::vector<ExpertFileDesc> &ds) {
     (void)ds;

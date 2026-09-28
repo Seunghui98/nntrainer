@@ -154,4 +154,32 @@ TEST(ExpertLru, MakeRoomRefusesWithoutEvictingWhenPinsFillThePool) {
   EXPECT_TRUE(r.evicted.empty());
 }
 
+TEST(ExpertLru, HeldSlotsAreNotHandedOutUntilUnheld) {
+  // Doc 52 section 10.20: read-ahead in flight owns its slots before its
+  // keys are in the LRU, so a miss meanwhile must evict instead.
+  ExpertLru lru;
+  int layer;
+  lru.addLayer(&layer, 6);
+  Recorder r;
+  lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
+  EXPECT_TRUE(lru.makeRoom(2, {}, r.evict)); // 4 + 2 fit: nothing goes
+  EXPECT_TRUE(r.evicted.empty());
+  lru.hold(2);
+  // Two misses with two slots held: 0 and 1 go, not the held slots.
+  EXPECT_EQ(lru.acquire({key(4), key(5)}, r.load, r.evict), 2u);
+  EXPECT_EQ(r.evicted, (std::vector<int>{0, 1}));
+  EXPECT_EQ(lru.size(), 4u);
+  // Pins filling what the hold leaves refuse more room.
+  EXPECT_FALSE(lru.makeRoom(1, {key(2), key(3), key(4), key(5)}, r.evict));
+  // A call needing more than the hold leaves is a caller bug.
+  EXPECT_THROW(
+    lru.acquire({key(10), key(11), key(12), key(13), key(14)}, r.load, r.evict),
+    std::logic_error);
+  // The reads land: unhold, then file them with no eviction.
+  lru.unhold(2);
+  lru.acquire({key(8), key(9)}, [](ExpertLru::Key) {}, r.evict);
+  EXPECT_EQ(r.evicted.size(), 2u);
+  EXPECT_EQ(lru.size(), 6u);
+}
+
 } // namespace

@@ -57,10 +57,12 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -235,14 +237,13 @@ public:
   /** @brief Experts read while a layer call ran (doc 52 section 10.10):
    *  wait_us is only the read time the call did not cover. Kept apart from
    *  the misses so the miss columns keep meaning a synchronous miss. */
-  void addPrefetch(uint64_t n, uint64_t done_at_return, uint64_t wait_us,
-                   uint64_t copy_us, uint64_t rpc_us, uint32_t caller_cpus,
+  void addPrefetch(uint64_t n, uint64_t done_on_entry, uint64_t wait_us,
+                   uint64_t rpc_us, uint32_t caller_cpus,
                    uint32_t reader_cpus) {
     std::lock_guard<std::mutex> lock(mutex_);
     prefetch_n_ += n;
-    prefetch_done_at_return_ += done_at_return;
+    prefetch_done_on_entry_ += done_on_entry;
     prefetch_wait_us_ += wait_us;
-    prefetch_copy_us_ += copy_us;
     prefetch_rpc_us_ += rpc_us;
     prefetch_caller_cpus_ |= caller_cpus;
     prefetch_reader_cpus_ |= reader_cpus;
@@ -617,10 +618,9 @@ private:
                    (unsigned long long)prefetch_n_, ms(prefetch_wait_us_),
                    ms(prefetch_wait_us_) / prefetch_n_, ms(prefetch_rpc_us_),
                    ms(prefetch_rpc_us_) / prefetch_n_);
-      // [doc 52 section 10.18] Whether the readers make progress while the
-      // layer call runs: the experts already read when the call returned,
-      // the heap -> ION copy NNTR_MOE_PREFETCH_HEAP moved between calls,
-      // and the cores each side ran on.
+      // [doc 52 sections 10.18, 10.20] How far ahead the readers were: the
+      // experts already read when their layer asked for them, and the
+      // cores each side ran on.
       auto cpus = [](uint32_t m) {
         std::string out;
         for (int c = 0; c < 32; ++c)
@@ -630,12 +630,12 @@ private:
       };
       std::fprintf(stderr,
                    "[HTP-PROFILE] expert prefetch progress: %llu of %llu read "
-                   "when the call returned (%.0f%%), heap->ION copy %.1f ms, "
-                   "caller cpus {%s}, reader cpus {%s}\n\n",
-                   (unsigned long long)prefetch_done_at_return_,
+                   "when their layer asked (%.0f%%), caller cpus {%s}, reader "
+                   "cpus {%s}\n\n",
+                   (unsigned long long)prefetch_done_on_entry_,
                    (unsigned long long)prefetch_n_,
-                   100.0 * prefetch_done_at_return_ / prefetch_n_,
-                   ms(prefetch_copy_us_), cpus(prefetch_caller_cpus_).c_str(),
+                   100.0 * prefetch_done_on_entry_ / prefetch_n_,
+                   cpus(prefetch_caller_cpus_).c_str(),
                    cpus(prefetch_reader_cpus_).c_str());
     }
   }
@@ -654,7 +654,7 @@ private:
            miss_rpc_pending_us_ = 0;
   uint64_t miss_total_ = 0, miss_read_total_us_ = 0, miss_rpc_total_us_ = 0;
   uint64_t prefetch_n_ = 0, prefetch_wait_us_ = 0, prefetch_rpc_us_ = 0;
-  uint64_t prefetch_done_at_return_ = 0, prefetch_copy_us_ = 0;
+  uint64_t prefetch_done_on_entry_ = 0;
   uint32_t prefetch_caller_cpus_ = 0, prefetch_reader_cpus_ = 0;
   /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
    *  through the MoE layer kernel (doc 51). */
@@ -1098,76 +1098,76 @@ public:
   }
 
   /**
-   * @brief [doc 52 section 10.10] Starts reading @a ds into fresh slots on
-   *        background threads and returns; prefetch_qs4cx_wh_experts_end
-   *        joins and registers.
+   * @brief [doc 52 sections 10.10, 10.20] Queues one batch of experts --
+   *        one layer's -- to be read into fresh slots by the prefetch
+   *        readers, and returns at once. Batches are read and handed back
+   *        in the order they were queued, so a caller can keep several
+   *        layers in flight and collect the oldest with
+   *        prefetch_qs4cx_wh_experts_end.
    *
    * What overlaps is the file read only. The register calls go through the
-   * same FastRPC session as the layer call the caller is about to make, and
-   * the DSP's weight table is not written while a kernel reads it, so they
-   * wait for _end. The readers are plain threads, not ThreadManager: the
-   * caller's thread is about to block in FastRPC and the pool is the ARM
-   * side's to use the moment the call returns, before _end is reached.
+   * same FastRPC session as the layer calls, and the DSP's weight table is
+   * not written while a kernel reads it, so they wait for _end, which the
+   * caller makes between calls. The readers are this backend's own
+   * threads, not ThreadManager's: they have to keep reading while the
+   * caller blocks in FastRPC and while ThreadManager's workers run the ARM
+   * side between calls. They stay off the caller's core (section 10.19:
+   * sharing it slowed each layer call by up to 7 ms).
    */
   bool prefetch_qs4cx_wh_experts_begin(
     const std::vector<ExpertFileDesc> &ds) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    joinPrefetchReaders(); // a _begin with no _end before it: finish reading
-    std::lock_guard<std::mutex> lock(handle_mutex_);
-    try {
-      for (const ExpertFileDesc &d : ds) {
-        if (experts_.count(d.key_gu) == 0)
-          prefetch_.push_back(stageExpert(session, d));
-      }
-    } catch (...) {
-      for (const StagedExpert &st : prefetch_)
-        free_expert_slots_.push_back(st.slot);
-      prefetch_.clear();
-      throw;
-    }
-    if (prefetch_.empty())
-      return false;
-    const PrefetchKnobs &knobs = prefetchKnobs();
-    if (knobs.heap) { // read into the heap, copied into the slot at _end
-      while (prefetch_heap_.size() < prefetch_.size())
-        prefetch_heap_.emplace_back(new uint8_t[expert_slot_bytes_]);
-      for (size_t i = 0; i < prefetch_.size(); ++i)
-        prefetch_[i].read_to = prefetch_heap_[i].get();
-    }
-    prefetch_done_.store(0);
-    prefetch_reader_cpus_.store(0);
-    prefetch_caller_cpus_ = cpuBit();
-    const size_t n_threads = std::min(prefetch_.size(), knobs.readers);
-    for (size_t t = 0; t < n_threads; ++t) {
-      prefetch_readers_.emplace_back([this, t, n_threads, &knobs] {
-        pinToCpus(knobs.cpus);
-        for (size_t i = t; i < prefetch_.size(); i += n_threads) {
-          prefetch_reader_cpus_.fetch_or(cpuBit());
-          prefetch_[i].rc = readExpert(prefetch_[i], /*use_pool=*/false);
-          prefetch_done_.fetch_add(1);
+    auto batch = std::make_unique<PrefetchBatch>();
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      try {
+        for (const ExpertFileDesc &d : ds) {
+          if (experts_.count(d.key_gu) == 0)
+            batch->experts.push_back(stageExpert(session, d));
         }
-      });
+      } catch (...) {
+        for (const StagedExpert &st : batch->experts)
+          free_expert_slots_.push_back(st.slot);
+        throw;
+      }
     }
+    if (batch->experts.empty())
+      return false;
+    startPrefetchReaders();
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    PrefetchBatch *b = batch.get();
+    prefetch_batches_.push_back(std::move(batch));
+    for (size_t i = 0; i < b->experts.size(); ++i)
+      prefetch_jobs_.emplace_back(b, i);
+    prefetch_cv_.notify_all();
     return true;
   }
 
+  /** @brief Waits for the oldest queued batch, registers it, and returns
+   *  its keys. Empty when nothing is queued. */
   std::vector<const void *> prefetch_qs4cx_wh_experts_end() override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const uint64_t t0 = HtpProfile::nowUs();
-    const size_t done_at_return = prefetch_done_.load();
-    const uint32_t caller_cpus = prefetch_caller_cpus_ | cpuBit();
-    joinPrefetchReaders();
+    std::unique_ptr<PrefetchBatch> batch;
+    size_t done_on_entry = 0;
+    {
+      std::unique_lock<std::mutex> lock(prefetch_mutex_);
+      if (prefetch_batches_.empty())
+        return {};
+      PrefetchBatch *b = prefetch_batches_.front().get();
+      done_on_entry = b->done;
+      prefetch_done_cv_.wait(lock,
+                             [b] { return b->done == b->experts.size(); });
+      batch = std::move(prefetch_batches_.front());
+      prefetch_batches_.pop_front();
+    }
     const uint64_t t_wait = HtpProfile::nowUs();
-    for (StagedExpert &st : prefetch_)
-      if (st.read_to != st.base && st.rc == 0)
-        std::memcpy(st.base, st.read_to, expert_slot_bytes_);
-    const uint64_t t_copy = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(handle_mutex_);
     std::vector<const void *> keys;
     std::exception_ptr first;
-    for (StagedExpert &st : prefetch_) {
+    for (StagedExpert &st : batch->experts) {
       try {
         registerStaged(session, st);
         keys.push_back(st.d.key_gu);
@@ -1176,16 +1176,24 @@ public:
           first = std::current_exception();
       }
     }
-    const size_t n = prefetch_.size();
-    prefetch_.clear();
     HtpProfile &profile = HtpProfile::global();
-    if (profile.level() != 0) // the read time is only what the call left
-      profile.addPrefetch(n, done_at_return, t_wait - t0, t_copy - t_wait,
-                          HtpProfile::nowUs() - t_copy, caller_cpus,
+    if (profile.level() != 0) // the read time is only what the calls left
+      profile.addPrefetch(batch->experts.size(), done_on_entry, t_wait - t0,
+                          HtpProfile::nowUs() - t_wait, prefetch_caller_cpus_,
                           prefetch_reader_cpus_.load());
     if (first)
       std::rethrow_exception(first);
     return keys;
+  }
+
+  ~HtpComputeOps() override {
+    {
+      std::lock_guard<std::mutex> lock(prefetch_mutex_);
+      prefetch_stop_ = true;
+    }
+    prefetch_cv_.notify_all();
+    for (std::thread &t : prefetch_readers_)
+      t.join();
   }
 
   void reserve_qs4cx_wh_expert_slots(size_t n) override {
@@ -2504,16 +2512,13 @@ private:
     uint8_t *base;
     ArenaEntry gu, dn;
     int rc; /**< preadAll's result for the whole expert */
-    /** Where readExpert writes: base, or a heap buffer copied into base
-     *  before registering (NNTR_MOE_PREFETCH_HEAP). */
-    uint8_t *read_to;
   };
 
   /** @note Call with handle_mutex_ held. */
   StagedExpert stageExpert(remote_handle64 session, const ExpertFileDesc &d) {
     const ExpertSlot slot = takeExpertSlot(session, d);
-    uint8_t *base = arena_chunks_[slot.chunk].buf->data() + slot.off;
-    return StagedExpert{d, slot, base, {}, {}, 0, base};
+    return StagedExpert{
+      d, slot, arena_chunks_[slot.chunk].buf->data() + slot.off, {}, {}, 0};
   }
 
   /** @brief A free slot, or a new one bumped into a chunk (the load, and
@@ -2573,7 +2578,7 @@ private:
    *  background thread can run it. @return 0, errno, or -1 at EOF. */
   int readExpert(StagedExpert &st, bool use_pool) {
     const ExpertFileDesc &d = st.d;
-    uint8_t *base = st.read_to;
+    uint8_t *base = st.base;
     const uint32_t gu_stride = expertStride(d.K, 2 * d.inter);
     st.gu.chunk = st.dn.chunk = st.slot.chunk;
     st.gu.off = st.slot.off;
@@ -2624,10 +2629,48 @@ private:
     experts_.emplace(d.key_gu, ExpertResident{st.slot, d.key_dn, h_gu, h_dn});
   }
 
-  void joinPrefetchReaders() {
-    for (std::thread &t : prefetch_readers_)
-      t.join();
-    prefetch_readers_.clear();
+  /** @brief Starts the readers once, pinned to NNTR_MOE_PREFETCH_CPUS or
+   *  else to every core but the caller's. */
+  void startPrefetchReaders() {
+    if (!prefetch_readers_.empty())
+      return;
+    const PrefetchKnobs &knobs = prefetchKnobs();
+    prefetch_caller_cpus_ = cpuBit();
+    std::vector<int> cpus = knobs.cpus;
+    if (cpus.empty() && prefetch_caller_cpus_ != 0) {
+      const long n = sysconf(_SC_NPROCESSORS_CONF);
+      for (int c = 0; c < n && c < 32; ++c)
+        if ((prefetch_caller_cpus_ & (1u << c)) == 0)
+          cpus.push_back(c);
+    }
+    for (size_t t = 0; t < knobs.readers; ++t)
+      prefetch_readers_.emplace_back([this, cpus] {
+        pinToCpus(cpus);
+        prefetchReaderLoop();
+      });
+  }
+
+  void prefetchReaderLoop() {
+    for (;;) {
+      std::pair<PrefetchBatch *, size_t> job;
+      {
+        std::unique_lock<std::mutex> lock(prefetch_mutex_);
+        prefetch_cv_.wait(
+          lock, [this] { return prefetch_stop_ || !prefetch_jobs_.empty(); });
+        if (prefetch_stop_)
+          return;
+        job = prefetch_jobs_.front();
+        prefetch_jobs_.pop_front();
+      }
+      prefetch_reader_cpus_.fetch_or(cpuBit());
+      StagedExpert &st = job.first->experts[job.second];
+      st.rc = readExpert(st, /*use_pool=*/false);
+      {
+        std::lock_guard<std::mutex> lock(prefetch_mutex_);
+        ++job.first->done;
+      }
+      prefetch_done_cv_.notify_all();
+    }
   }
 
   /** @brief Reads one QS4CX_WH weight from the model file: the nibbles
@@ -3182,10 +3225,19 @@ private:
    *  the write rate into the arena stops scaling well before that (doc 52
    *  section 10.9), and the ARM side has its own work after the call. */
   std::vector<StagedExpert> prefetch_;
+  /** One _begin's experts; done counts the ones read. */
+  struct PrefetchBatch {
+    std::vector<StagedExpert> experts;
+    size_t done = 0;
+  };
+  /** Queued batches, oldest first, and their unread experts, all under
+   *  prefetch_mutex_. A batch's address is stable until _end takes it. */
+  std::mutex prefetch_mutex_;
+  std::condition_variable prefetch_cv_, prefetch_done_cv_;
+  std::deque<std::unique_ptr<PrefetchBatch>> prefetch_batches_;
+  std::deque<std::pair<PrefetchBatch *, size_t>> prefetch_jobs_;
+  bool prefetch_stop_ = false;
   std::vector<std::thread> prefetch_readers_;
-  /** NNTR_MOE_PREFETCH_HEAP's read buffers, one expert each, kept. */
-  std::vector<std::unique_ptr<uint8_t[]>> prefetch_heap_;
-  std::atomic<size_t> prefetch_done_{0};
   std::atomic<uint32_t> prefetch_reader_cpus_{0};
   uint32_t prefetch_caller_cpus_ = 0;
 
@@ -3193,16 +3245,14 @@ private:
    * @brief [doc 52 section 10.18] Measurement switches for the prefetch
    *        readers, read once. Section 10.13 found the readers make almost
    *        no progress while the layer call runs and the call's host side
-   *        grows by 7 ms; these separate scheduling (READERS, CPUS) from the
-   *        uncached ION write path (HEAP). Not defaults.
+   *        grows by 7 ms; section 10.19 traced that to the readers
+   *        sharing the caller's core. Not defaults.
    *  - NNTR_MOE_PREFETCH_READERS=<n>: reader threads (4)
    *  - NNTR_MOE_PREFETCH_CPUS=<a,b,..>: pin the readers to these cores
-   *  - NNTR_MOE_PREFETCH_HEAP=1: read into heap buffers, copied into the
-   *    slot at _end, between calls
+   *    (default: every core but the caller's)
    */
   struct PrefetchKnobs {
     size_t readers = 4;
-    bool heap = false;
     std::vector<int> cpus;
   };
   static const PrefetchKnobs &prefetchKnobs() {
@@ -3210,8 +3260,6 @@ private:
       PrefetchKnobs r;
       if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
         r.readers = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
-      const char *h = std::getenv("NNTR_MOE_PREFETCH_HEAP");
-      r.heap = h != nullptr && *h != '\0' && *h != '0';
       if (const char *v = std::getenv("NNTR_MOE_PREFETCH_CPUS")) {
         for (const char *p = v; *p != '\0';) {
           char *end = nullptr;
