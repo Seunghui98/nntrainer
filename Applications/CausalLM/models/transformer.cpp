@@ -652,7 +652,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
                                    normed, normed, normed);
 
   LayerHandle decoder_add(createLayer(
-    "addition",
+    RESIDUAL_ADD_TYPE,
     {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
   Tensor residual = decoder_add({input, att_out});
 
@@ -666,7 +666,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
-    "addition",
+    RESIDUAL_ADD_TYPE,
     {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
   return decoder_output({residual, ffn_out});
 }
