@@ -412,6 +412,26 @@ void nntr_hvx_arenas_put_all(nntr_hvx_session *s) {
 #endif
 }
 
+/** @brief The address of a K x N weight at @a wh_off in arena @a arena, or
+ *  NULL when the arena is unknown or the weight runs past its end. The
+ *  extent check is here and not only in the registry: the registry sees a
+ *  pointer, this is the one place that knows how big the mapping behind it
+ *  is. Overflow-safe in 64-bit. */
+static const uint8_t *arena_weight_at(nntr_hvx_session *s, uint32 arena,
+                                      uint32 wh_off, uint32 K, uint32 N) {
+  const nntr_hvx_arena *a = nntr_hvx_arena_slot(s, arena);
+  const uint32 wh_bytes = (K / 32u) * (N / 32u) * 512u;
+  if (!a) {
+    return NULL;
+  }
+  if ((uint64_t)wh_off + wh_bytes > a->bytes) {
+    FARF(ERROR, "weight arena: off=%u + %u past arena %u", (unsigned)wh_off,
+         (unsigned)wh_bytes, (unsigned)a->bytes);
+    return NULL;
+  }
+  return a->va + wh_off;
+}
+
 int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
                                         uint32 N, uint32 arena, uint32 wh_off,
                                         const float *w_scale, int w_scaleLen,
@@ -419,8 +439,7 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
                                         const float *bias, int biasLen,
                                         uint32 *w_handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  const nntr_hvx_arena *a;
-  uint32 wh_bytes;
+  const uint8_t *wh;
   if (!s || !w_handle) {
     return AEE_EBADPARM;
   }
@@ -430,22 +449,13 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
          (unsigned)K, (unsigned)N);
     return AEE_EBADPARM;
   }
-  a = nntr_hvx_arena_slot(s, arena);
-  if (!a) {
-    return AEE_EBADPARM;
-  }
-  /* The extent check is here and not only in the registry: the registry
-     sees a pointer, this is the one place that knows how big the mapping
-     behind it is. Overflow-safe in 64-bit. */
-  wh_bytes = (K / 32u) * (N / 32u) * 512u;
-  if ((uint64_t)wh_off + wh_bytes > a->bytes) {
-    FARF(ERROR, "weight_register_u8i4_arena: off=%u + %u past arena %u",
-         (unsigned)wh_off, (unsigned)wh_bytes, (unsigned)a->bytes);
+  wh = arena_weight_at(s, arena, wh_off, K, N);
+  if (!wh) {
     return AEE_EBADPARM;
   }
   return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
-                                          a->va + wh_off, w_scale, colsum_w,
-                                          bias, w_handle);
+                                          wh, w_scale, colsum_w, bias,
+                                          w_handle);
 }
 
 /** @brief The IDL's "nothing to release" for weight_swap_u8i4_arena. */
@@ -489,6 +499,37 @@ int nntr_hvx_weight_swap_u8i4_arena(
     FARF(ERROR, "weight_swap_u8i4_arena: old pair %u/%u is not releasable",
          (unsigned)old_gu, (unsigned)old_dn);
     return AEE_EBADPARM;
+  }
+  /* [doc 52 section 10.25] The retired pair has the new expert's shape --
+     every swap in the expert pool -- so rebind both handles in place: no
+     allocation, no free, no slot search, which were most of a swap's DSP
+     time. Everything that can refuse is checked before either is touched,
+     so a refusal still leaves the old pair as it was. */
+  if (release_old && s->weights_u8i4.slots[old_gu].K == K &&
+      s->weights_u8i4.slots[old_gu].N == n_gu &&
+      s->weights_u8i4.slots[old_dn].K == inter &&
+      s->weights_u8i4.slots[old_dn].N == N_out) {
+    const uint8_t *wg = arena_weight_at(s, arena, off_gu, K, n_gu);
+    const uint8_t *wd = arena_weight_at(s, arena, off_dn, inter, N_out);
+    /* 512: the registry's WEIGHT_TILE_BYTES_U8I4, which rebind also checks
+       -- checked here too so the second rebind cannot refuse after the
+       first has landed. */
+    if (!wg || !wd || ((uintptr_t)wg % 512u) != 0u ||
+        ((uintptr_t)wd % 512u) != 0u) {
+      return AEE_EBADPARM;
+    }
+    rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu, wg,
+                                        gu_scale, gu_colsum);
+    if (rc == AEE_SUCCESS) {
+      rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
+                                          N_out, wd, dn_scale, dn_colsum);
+    }
+    if (rc != AEE_SUCCESS) { /* unreachable after the checks above */
+      return rc;
+    }
+    *h_gu = old_gu;
+    *h_dn = old_dn;
+    return AEE_SUCCESS;
   }
   bias = (float *)calloc(n_gu > N_out ? n_gu : N_out, sizeof(float));
   if (!bias) {

@@ -114,12 +114,20 @@ int main(void) {
   for (int i = 0; i < NGU; ++i)
     CHECK(wg->bias[i] == 0.0f);
 
-  /* 2. The swap proper: new pair in, old pair out, in one call. */
+  /* 2. The swap proper: new pair in, old pair out, in one call. Same shape,
+        so (doc 52 section 10.25) the handles are rebound in place: same
+        numbers, same arrays, new bytes and scales, bias still zero. */
+  const float *arr_g = g_s.weights_u8i4.slots[g].w_scale;
+  for (int i = 0; i < NGU; ++i)
+    gu_s[i] = 100.0f + (float)i;
   uint32_t g2 = NONE, d2 = NONE;
   CHECK(swap(g, d, 8192, 12288, &g2, &d2) == AEE_SUCCESS);
   CHECK(live() == 2);
-  CHECK(!g_s.weights_u8i4.slots[g].in_use || g == g2 || g == d2);
-  CHECK(!g_s.weights_u8i4.slots[d].in_use || d == g2 || d == d2);
+  CHECK(g2 == g && d2 == d);
+  CHECK(g_s.weights_u8i4.slots[g2].w_scale == arr_g); /* not reallocated */
+  CHECK(memcmp(g_s.weights_u8i4.slots[g2].w_scale, gu_s, sizeof(gu_s)) == 0);
+  for (int i = 0; i < NGU; ++i)
+    CHECK(g_s.weights_u8i4.slots[g2].bias[i] == 0.0f);
   CHECK(g_s.weights_u8i4.slots[g2].wh_bytes == va + 8192);
   CHECK(g_s.weights_u8i4.slots[d2].wh_bytes == va + 12288);
 
@@ -135,15 +143,40 @@ int main(void) {
   CHECK(live() == 2 && x == 1234 && y == 1234);
   CHECK(g_s.weights_u8i4.slots[g2].in_use && g_s.weights_u8i4.slots[d2].in_use);
 
-  /* 4. gate_up registers, down does not (past the arena): gate_up is
-        rolled back and the old pair stays live. */
+  /* 4. gate_up fits, down does not (past the arena): refused before
+        either handle is rebound, so the old pair is live and unchanged. */
   CHECK(swap(g2, d2, 0, ARENA - 512, &x, &y) != AEE_SUCCESS);
   CHECK(live() == 2);
   CHECK(g_s.weights_u8i4.slots[g2].in_use && g_s.weights_u8i4.slots[d2].in_use);
+  CHECK(g_s.weights_u8i4.slots[g2].wh_bytes == va + 8192);
+  CHECK(g_s.weights_u8i4.slots[d2].wh_bytes == va + 12288);
 
-  /* 5. Unaligned gate_up: refused by the registry, nothing changes. */
-  CHECK(swap(g2, d2, 100, 4096, &x, &y) != AEE_SUCCESS);
+  /* 5. Unaligned down: refused, nothing changes -- not even gate_up. */
+  CHECK(swap(g2, d2, 0, 4096 + 100, &x, &y) != AEE_SUCCESS);
   CHECK(live() == 2);
+  CHECK(g_s.weights_u8i4.slots[g2].wh_bytes == va + 8192);
+
+  /* 5b. A retired pair of another shape falls back to register + release:
+         new handles, the old ones freed. */
+  {
+    enum { I2 = 64, NGU2 = 2 * I2 };
+    static float s2[NGU2];
+    static int32_t c2[NGU2];
+    uint32_t og = NONE, od = NONE, ng = NONE, nd = NONE;
+    CHECK(nntr_hvx_weight_swap_u8i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, NONE, NONE, K, I2, NOUT, 0, 0,
+            8192, s2, NGU2, c2, NGU2, dn_s, NOUT, dn_c, NOUT, &og,
+            &od) == AEE_SUCCESS);
+    CHECK(live() == 4);
+    CHECK(swap(og, od, 0, 4096, &ng, &nd) == AEE_SUCCESS);
+    CHECK(live() == 4);
+    CHECK(g_s.weights_u8i4.slots[ng].K == K && g_s.weights_u8i4.slots[ng].N == NGU);
+    CHECK(g_s.weights_u8i4.slots[ng].wh_bytes == va);
+    /* back to two: release the fallback's pair */
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, ng);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, nd);
+    CHECK(live() == 2);
+  }
 
   /* 6. The batch (doc 52 section 10.23): expert 0 swaps out the live pair
         into 0/4096, expert 1 is a fresh pair past the arena. Expert 0 must
