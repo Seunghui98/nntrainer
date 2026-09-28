@@ -74,7 +74,7 @@ mkdir -p generated build
     -I "$HEXAGON_SDK_ROOT/incs/stddef" \
     -mdll -o generated nntr_hvx.idl
 
-SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c nntr_hvx_small_ops.c nntr_hvx_attn_m1.c generated/nntr_hvx_skel.c"
+SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c nntr_hvx_small_ops.c nntr_hvx_attn_m1.c nntr_hvx_dspq_bench.c generated/nntr_hvx_skel.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4_moe.c $BACKEND/hmx/hexkl_graph.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_conv_block.c"
@@ -123,11 +123,22 @@ if [ -z "$UND" ]; then
     echo "Error: $READELF returned no undefined symbols; guard cannot run" >&2
     exit 1
 fi
-BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$)' || true)
+BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|dspqueue_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$)' || true)
 if [ -n "$BAD" ]; then
     echo "Error: skel has undefined symbols the DSP image will not provide:" >&2
     echo "$BAD" | sed 's/^/  /' >&2
     echo "Add the defining .c to SRCS in $0 (see #97)." >&2
+    exit 1
+fi
+# [#141] dspqueue_* is optional in the DSP image. A non-weak import would stop
+# the whole skel from loading (0x80000406) where dspqueue is absent, taking
+# the production app down with the bench; weak, the bench's start returns
+# AEE_EUNSUPPORTED instead.
+STRONG_DSPQ=$("$READELF" --dyn-syms build/libnntr_hvx_skel.so |
+    awk '$7=="UND" && $8 ~ /^dspqueue_/ && $5!="WEAK" {print $8}')
+if [ -n "$STRONG_DSPQ" ]; then
+    echo "Error: dspqueue_* must be imported WEAK (#pragma weak), found:" >&2
+    echo "$STRONG_DSPQ" | sed 's/^/  /' >&2
     exit 1
 fi
 echo "UNDEFINED SYMBOLS OK ($(echo "$UND" | wc -l) runtime imports)"
