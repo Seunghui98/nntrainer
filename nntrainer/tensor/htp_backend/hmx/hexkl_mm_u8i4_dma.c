@@ -27,6 +27,7 @@
 #include "hvx_swiglu_f32.h"
 
 #include "hexkl_probe.h"
+#include "hvx_int_epilogue.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
@@ -154,6 +155,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   memcpy(h->bias, bias, sizeof(float) * N);
   h->K = K;
   h->N = N;
+  h->iq = NULL;
   h->in_use = 1;
   return AEE_SUCCESS;
 }
@@ -305,6 +307,8 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle) {
   free(h->w_scale);
   free(h->colsum_w);
   free(h->bias);
+  hvx_int_wq_free((hvx_int_wq *)h->iq);
+  h->iq = NULL;
   memset(h, 0, sizeof(*h));
   return AEE_SUCCESS;
 }

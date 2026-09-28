@@ -29,9 +29,44 @@ cc=${CC:-gcc}
   -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_int_epilogue.c" -lm
 
 "$OUT/moe_layer_host_check"
+
+# The same kernel with the integer gate_up epilogue (doc 53 section 9):
+# no tails (they are f32-only), the reference runs the kernel's own
+# integer functions per row, so this checks the wiring of that build --
+# the batches' exponents, the requant units, the bake -- not its numerics,
+# which int_epilogue_host_check below and perplexity on device do.
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -DHEXKL_MOE_INT_EPILOGUE=1 -DMOE_TAIL_MAX_ROWS=0u \
+  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/moe_layer_host_check_int" \
+  "$HERE/moe_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_int_epilogue.c" -lm
+
+"$OUT/moe_layer_host_check_int"
+
+# ... and once more at a width that takes two staged batches a block
+# (18 pairs against a 16-pair batch), so the per-batch exponents and their
+# normalisation in the requant units are exercised through the kernel.
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -DHEXKL_MOE_INT_EPILOGUE=1 -DMOE_TAIL_MAX_ROWS=0u -DCHECK_INTER=576 \
+  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/moe_layer_host_check_int576" \
+  "$HERE/moe_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_int_epilogue.c" -lm
+
+"$OUT/moe_layer_host_check_int576"
+
+# The integer epilogue's numerics against the f32 grid and exact
+# arithmetic, on LFM2-shaped synthetic data.
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -I "$HERE/stub" -I "$BACKEND/hvx" \
+  -o "$OUT/int_epilogue_host_check" \
+  "$HERE/int_epilogue_host_check.c" "$BACKEND/hvx/hvx_int_epilogue.c" -lm
+
+"$OUT/int_epilogue_host_check"
 
 # The conv block kernel (doc 51 section 2) on the same stand-ins. It is
 # built on the MoE kernel's exported helpers, so that file links in too.
@@ -42,7 +77,8 @@ cc=${CC:-gcc}
   -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/conv_block_host_check" \
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
-  "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
+  "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
+  "$BACKEND/hvx/hvx_int_epilogue.c" -lm
 
 "$OUT/conv_block_host_check"
 
@@ -52,7 +88,7 @@ cc=${CC:-gcc}
   -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/fc_layer_host_check" \
   "$HERE/fc_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" -lm
+  "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" "$BACKEND/hvx/hvx_int_epilogue.c" -lm
 
 "$OUT/fc_layer_host_check"
 

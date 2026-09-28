@@ -405,6 +405,20 @@ void ref_mm(const W *w, const uint8_t *a_u8, float a_scale, int32_t a_zp,
         ((float)(s - a_zp * w->cs[col])) * a_scale * w->ws[col] + w->bias[col];
     }
 }
+void ref_mm_i32(const W *w, const uint8_t *a_u8, int32_t *out) {
+  const uint32_t kt_n = w->K / 32u, nt_n = w->N / 32u;
+  for (uint32_t nt = 0; nt < nt_n; ++nt)
+    for (uint32_t c = 0; c < 32; ++c) {
+      int32_t s = 0;
+      for (uint32_t kt = 0; kt < kt_n; ++kt)
+        for (uint32_t k = 0; k < 32; ++k)
+          s +=
+            (int32_t)a_u8[kt * 32 + k] *
+            wh_value((const uint8_t *)w->nib + (size_t)(kt * nt_n + nt) * 512u,
+                     k, c);
+      out[nt * 32 + c] = s;
+    }
+}
 void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
                int32_t *zp) {
   float lo = 0.f, hi = 0.f;

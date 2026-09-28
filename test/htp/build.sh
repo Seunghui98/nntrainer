@@ -8,6 +8,8 @@
 #   only from lib/6.1.1.0 up. 6.4.0.1 is the verified combination.
 # Override the target with: HEX_ARCH=v75 ./build.sh
 # Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
+# Integer MoE epilogue:      HEXKL_MOE_INT_EPILOGUE=1 ./build.sh   (doc 53 section 9;
+#                            an A/B against the f32 epilogue is two skels)
 
 set -eu
 
@@ -82,6 +84,7 @@ SRCS="$SRCS $BACKEND/hmx/hexkl_dma_ring.c $BACKEND/hmx/hexkl_kv_quant.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_probe.c $BACKEND/hmx/hexkl_acc_tile.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_attn_dtype.c $BACKEND/hmx/hexkl_attn_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_int_epilogue.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_swiglu_f32.c $BACKEND/hvx/hvx_conv_gate_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_scale_add_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
@@ -90,6 +93,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
+    ${HEXKL_MOE_INT_EPILOGUE:+-DHEXKL_MOE_INT_EPILOGUE=1} \
     -Wall -Werror \
     -I generated \
     -I "$HEXKL_ROOT/include" \

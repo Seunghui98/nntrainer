@@ -47,6 +47,11 @@ typedef struct {
   float *bias;       /**< N entries */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
+  /** The columns' fixed-point constants for the integer epilogue
+      (hvx_int_epilogue.h), baked from w_scale and bias the first time a
+      MoE layer call uses this weight as a gate_up, NULL until then;
+      freed with the slot. */
+  void *iq;
 } hexkl_weight_u8i4;
 
 typedef struct {

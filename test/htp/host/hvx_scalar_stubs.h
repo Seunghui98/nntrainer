@@ -26,6 +26,8 @@ typedef struct {
 /* out[N] = dequant(a_u8 . w) with the same formula the tile stand-in uses. */
 void ref_mm(const W *w, const uint8_t *a_u8, float a_scale, int32_t a_zp,
             float *out);
+/* The raw int32 sums ref_mm dequantizes, for the integer epilogue. */
+void ref_mm_i32(const W *w, const uint8_t *a_u8, int32_t *out);
 /* Per-row u8 quantization, the scan-and-pack stand-ins' formula. */
 void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
                int32_t *zp);

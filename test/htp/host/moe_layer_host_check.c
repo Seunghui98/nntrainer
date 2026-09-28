@@ -21,9 +21,20 @@
 #include <string.h>
 
 #include "hvx_scalar_stubs.h"
+#if HEXKL_MOE_INT_EPILOGUE
+#include "hvx_int_epilogue.h"
+#endif
+
+/* inter is overridable so the integer epilogue build can be run with a
+   width that takes more than one staged batch per block (the layout caps
+   a batch at 16 pairs = 512 columns): run_host_checks.sh builds it at 576
+   as well as the default 32. */
+#ifndef CHECK_INTER
+#define CHECK_INTER 32
+#endif
 
 int main(void) {
-  const uint32_t M = 37, K = 64, inter = 32, N_out = 64, NE = 5;
+  const uint32_t M = 37, K = 64, inter = CHECK_INTER, N_out = 64, NE = 5;
   static uint8_t vtcm[8u << 20];
 
   hexkl_moe_layout L;
@@ -92,12 +103,68 @@ int main(void) {
       float as;
       int32_t az;
       quant_row(act + (size_t)row * K, K, aq, &as, &az);
+      float ms;
+      int32_t mz;
+#if HEXKL_MOE_INT_EPILOGUE
+      /* The kernel's own integer epilogue on this row: raw sums staged the
+         way the kernel stages them (np gate tiles then the np up tiles
+         opposite, in batches of L.acc_tiles / 2 pairs), so the per-batch
+         exponents and every rounding are the kernel's. What the check
+         then verifies is the wiring -- rows, weights, batches, buffers --
+         as the f32 build does with its stand-ins. */
+      {
+        static int32_t gu_i32[2 * CHECK_INTER], stage[2 * 16 * 32],
+          hq[CHECK_INTER];
+        static int16_t he[16];
+        static uint8_t ah1[(CHECK_INTER / 32) * 2048];
+        static hvx_int_wq *wq_of[8];
+        if (!wq_of[e]) {
+          if (hvx_int_wq_bake(&wq_of[e], wg[e].ws, wg[e].bias, 2 * inter))
+            return 1;
+        }
+        ref_mm_i32(&wg[e], aq, gu_i32);
+        const uint32_t half = L.acc_tiles / 2u, inter_nt = inter / 32u;
+        const uint32_t n_batches = (inter_nt + half - 1u) / half;
+        for (uint32_t g0 = 0, b = 0; g0 < inter_nt; g0 += half, ++b) {
+          const uint32_t np = (inter_nt - g0 < half) ? inter_nt - g0 : half;
+          for (uint32_t j = 0; j < np; ++j) {
+            memcpy(stage + j * 32u, gu_i32 + (g0 + j) * 32u, 32u * 4u);
+            memcpy(stage + (np + j) * 32u, gu_i32 + inter + (g0 + j) * 32u,
+                   32u * 4u);
+          }
+          hvx_int_gu_job jb;
+          memset(&jb, 0, sizeof jb);
+          jb.tiles_base = (const uint8_t *)stage;
+          jb.tile_stride = 32u * 4u;
+          jb.n_pairs = np;
+          jb.g0 = g0;
+          jb.row_stride = 32u;
+          jb.m_count = 1u;
+          jb.act_scale = &as;
+          jb.act_zp = &az;
+          jb.colsum_w = wg[e].cs;
+          jb.wq = wq_of[e];
+          jb.inter = inter;
+          jb.dst = hq;
+          jb.dst_stride = inter;
+          jb.h_e = he;
+          jb.e_stride = 16u;
+          jb.batch = b;
+          hvx_int_gu_worker(1u, 0u, &jb);
+        }
+        hvx_int_rq_rows(hq, inter, he, 16u, n_batches, half * 32u, inter, 1u,
+                        0u, 1u, &ms, &mz, ah1);
+        for (uint32_t j = 0; j < inter; ++j)
+          mq[j] = ah1[(size_t)(j / 32u) * 2048u + (j % 32u)];
+      }
+      (void)gu;
+      (void)mid;
+#else
       ref_mm(&wg[e], aq, as, az, gu);
       for (uint32_t j = 0; j < inter; ++j)
         mid[j] = gu[j] / (1.f + expf(-gu[j])) * gu[inter + j];
-      float ms;
-      int32_t mz;
       quant_row(mid, inter, mq, &ms, &mz);
+#endif
       ref_mm(&wd[e], mq, ms, mz, dn);
       for (uint32_t c = 0; c < N_out; ++c) {
         /* Two operations through a volatile, matching what the kernel and
@@ -148,9 +215,15 @@ int main(void) {
        80 -> 1 + a 16-row tail, 90 -> 2 (its 26-row second block is over
        the tail threshold). 6 would mean a tail went to the HMX after all,
        4 that a full block was skipped. */
-    printf("HMX blocks        : %llu (want 5: two tails on the HVX)\n",
-           (unsigned long long)hexkl_probe_us[HEXKL_PROBE_BLOCKS]);
-    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 5u)
+#if MOE_TAIL_MAX_ROWS > 0
+    const unsigned long long want_blocks = 5u;
+#else
+    const unsigned long long want_blocks = 7u; /* no tails: 2+1+2+2 */
+#endif
+    printf("HMX blocks        : %llu (want %llu%s)\n",
+           (unsigned long long)hexkl_probe_us[HEXKL_PROBE_BLOCKS], want_blocks,
+           want_blocks == 5u ? ": two tails on the HVX" : "");
+    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] != want_blocks)
       fail = 1;
   }
 
