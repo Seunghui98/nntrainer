@@ -326,3 +326,41 @@ dumps, 4 after the text set) — the Q vs Q0 power proxy:
 
 Close-line `empty_polls` of Q vs Q0 (the DSP spin window's cost), FARF /
 AEE errors, anything stale.
+
+## Results
+
+Run 2026-09-28 21:2x–21:5x KST by the orchestrator (user's request), unit
+`R3CY10WM83Y` (SM-S938N; a second, unauthorized device `R3CN80CW3FY` was on
+USB and never addressed). Device `md5sum` = `md5.txt` (MD5 OK). Thermal
+(battery °C·10 / zone0 m°C): 265 / 27400 start, 316 / 58700 after G=64,
+338 / 59000 after G=512, 337 / 45900 after the dumps, 343 / 56000 after the
+text set.
+
+### Gates
+
+| # | result | pass |
+|---|---|---|
+| G1 | `a2 files=2862 bit_identical=1`; `q files=2862 bit_identical=1`; `q0 files=2862 bit_identical=1` (manifest 1431 rows) | **yes** |
+| G2 | 8/8 prompts identical, Q vs A at G=64 (prefill counts 512 / 207 / 117 / 326 / 207 / 276 / 402 / 24 as the README) | **yes** |
+| G3 | 8/8 tok/s cells identical, Q and Q0 vs A | **yes** |
+| G4 | see the tok/s table: Q − A = +2.62 (G=64) and +1.79 tok/s (G=512), A's own r1/r2 spread 0.04 and 1.51 | **yes** |
+| G5 | M==1 row: A `transport=87.9 µs/call`, `dsp=709.4`, `mm 674.9`; Q `transport=14.1`, `dsp=700.0` (−1.3 %), `mm 673.7` (−0.2 %); Q staging `via=dspq 1408/1408 calls msg=452 B` | **yes** |
+| — | every Q / Q0 log: `dspq: on` once, `dspq: close calls=N served=N bad=0 stop_err=0x0`, N = 176 / 1408 / 11264 at G = 8 / 64 / 512; no `dspq: off`; no `dspq` line in any A log | **yes** |
+
+### tok/s (prompt 512; mirrored A Q Q0 | Q0 Q A)
+
+| variant | G | prefill r1 / r2 | decode r1 / r2 | decode mean | vs A |
+|---|---|---|---|---|---|
+| A | 64 | 559.0 / 540.1 | 36.80 / 36.76 | **36.78** | — |
+| Q | 64 | 560.8 / 545.3 | 39.48 / 39.31 | **39.40** | **+7.1 %** |
+| Q0 | 64 | 537.8 / 542.4 | 38.16 / 38.93 | 38.55 | +4.8 % |
+| A | 512 | 528.4 / 406.7 | 36.74 / 35.23 | **35.98** | — |
+| Q | 512 | 483.5 / 436.5 | 38.55 / 36.99 | **37.77** | **+5.0 %** |
+| Q0 | 512 | 460.0 / 420.4 | 36.47 / 35.81 | 36.14 | +0.4 % |
+
+Q (DSP spins up to 1 ms between calls) takes the whole transport win; Q0
+(DSP blocks at once) keeps only part of it at G=64 and none at G=512. Prefill
+is untouched by construction (M>1 stays on FastRPC) and follows the phone's
+temperature in every variant.
+
+Profiles (not tok/s): `prof_A` decode 34.92, `prof_Q` 38.23 tok/s.
