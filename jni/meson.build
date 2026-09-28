@@ -38,11 +38,12 @@ and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
 
 # ABI-affecting defines exported to prebuilt consumers via Android-prebuilt.mk:
-# they gate the _FP16 type in the public headers (tensor_dim.h), so apps that
-# link the prebuilts must compile with the same values.
+# they gate the _FP16 type in the public headers (tensor_dim.h), and
+# ENABLE_HEXKL gates get_htp_ops() (compute_ops.h) and the app's HTP decode
+# hooks, so apps that link the prebuilts must compile with the same values.
 nntrainer_abi_defines = []
 foreach define : extra_defines
-  if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1'
+  if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1' or define == '-DENABLE_HEXKL=1'
     nntrainer_abi_defines += define
   endif
 endforeach
