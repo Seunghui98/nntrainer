@@ -60,13 +60,25 @@ protected:
 };
 
 void expect_identical(remote_handle64 h, unsigned seed) {
-  std::vector<unsigned> counts(8, 0xFFFFFFFFu);
+  std::vector<unsigned> counts(16, 0xFFFFFFFFu);
   const int err = nntr_hvx_int_epilogue_selfcheck(
     h, seed, counts.data(), static_cast<int>(counts.size()));
   ASSERT_EQ(err, AEE_SUCCESS) << "selfcheck failed: " << hex(err);
   std::cout << "INT_EPILOGUE seed=" << seed << " elements=" << counts[5]
             << " batches=" << counts[7] << " checksum=0x" << std::hex
             << counts[6] << std::dec << "\n";
+  if (counts[0] | counts[1]) {
+    static const char *const stage[] = {"A_gate", "A_up",   "we",      "wm",
+                                        "g",      "u",      "sigmoid", "h",
+                                        "amax_g", "amax_u", "F"};
+    const unsigned st = counts[8];
+    std::cout << "INT_EPILOGUE first divergence: stage "
+              << (st < 11 ? stage[st] : "none") << " lane " << counts[9]
+              << " ref " << static_cast<int>(counts[10]) << " hvx "
+              << static_cast<int>(counts[11]) << " at row " << counts[12]
+              << " col " << counts[13] << " (amax_g ref " << counts[14]
+              << " hvx " << counts[15] << ")\n";
+  }
   EXPECT_GT(counts[5], 0u);
   EXPECT_EQ(counts[7], 4u) << "expected 4 staged batches (16,16,16,8 pairs)";
   EXPECT_EQ(counts[0], 0u) << "SwiGLU mantissas differ";
@@ -86,7 +98,10 @@ TEST_F(HvxIntEpilogue, MatchesReferenceWithBias) {
 }
 TEST_F(HvxIntEpilogue, RejectsShortCounts) {
   unsigned c[4] = {0, 0, 0, 0};
-  EXPECT_EQ(nntr_hvx_int_epilogue_selfcheck(handle_, 1u, c, 4), AEE_EBADPARM);
+  /* FastRPC returns the DSP's error with its 0x80000400 domain offset. */
+  const int err = nntr_hvx_int_epilogue_selfcheck(handle_, 1u, c, 4);
+  EXPECT_TRUE(err == AEE_EBADPARM || err == AEE_EBADPARM + 0x80000400)
+    << "got " << hex(err);
 }
 
 int main(int argc, char **argv) {

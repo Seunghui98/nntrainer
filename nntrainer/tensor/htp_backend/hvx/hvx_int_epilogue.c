@@ -143,7 +143,7 @@ int32_t hvx_int_sigmoid_q15(int32_t g_q, int F) {
     } else if (g_q <= -lim) {
       x = -IQ_X_MAX_Q24;
     } else {
-      x = g_q << ls;
+      x = iq_shl(g_q, ls);
     }
   }
   x = iq_max(iq_min(x, IQ_X_MAX_Q24), -IQ_X_MAX_Q24);
@@ -189,7 +189,7 @@ static inline int32_t iq_lin(int32_t A, const iq_row_fmt *fm, int16_t wm,
                              int8_t we, const int32_t *bm, const int8_t *be) {
   int32_t g = 0;
   if (wm != 0) {
-    const int32_t A1 = (A << fm->sa);
+    const int32_t A1 = iq_shl(A, fm->sa);
     const int32_t p1 = MULHI(A1, wm);
     const int32_t p2 = MULHI(p1, fm->ms);
     g = iq_asr_rnd(p2, fm->B - fm->nb - fm->es - we - 30);
@@ -329,7 +329,7 @@ void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
       const uint32_t c1 = (c0 + batch_cols < inter) ? c0 + batch_cols : inter;
       for (uint32_t cc = c0; cc < c1; ++cc) {
         const int32_t v = iq_asr_rnd(hr[cc], sh);
-        const int32_t y = iq_asr_rnd(MULHI(v << ls, M), e);
+        const int32_t y = iq_asr_rnd(MULHI(iq_shl(v, ls), M), e);
         int32_t q = y + z;
         q = q < 0 ? 0 : (q > 255 ? 255 : q);
         row0[(size_t)(cc / 32u) * 2048u + (cc % 32u)] = (uint8_t)q;
@@ -338,4 +338,60 @@ void hvx_int_rq_rows_c(const int32_t *h, uint32_t h_stride, const int16_t *h_e,
     scale[m] = P.scale;
     zp[m] = z;
   }
+}
+
+/* ---- the stage-by-stage probe the device self-check compares --------- */
+
+void hvx_int_dbg_gu_c(const hvx_int_gu_job *c, uint32_t r, uint32_t j,
+                      int32_t *out, int32_t *meta) {
+  const uint32_t cg0 = c->g0 * 32u, cu0 = c->inter + cg0;
+  int wb_g, bb_g, wb_u, bb_u;
+  iq_batch_bounds(c->wq, c->g0, c->n_pairs, &wb_g, &bb_g);
+  iq_batch_bounds(c->wq, c->inter / 32u + c->g0, c->n_pairs, &wb_u, &bb_u);
+  int16_t ms;
+  int8_t es;
+  iq_split15(c->act_scale[r], &ms, &es);
+  const int32_t zp = c->act_zp[r];
+  const uint32_t amax_g = iq_row_amax(c, r, 0u, cg0, zp);
+  const uint32_t amax_u = iq_row_amax(c, r, c->n_pairs, cu0, zp);
+  iq_row_fmt fg, fu;
+  iq_row_fmt_set(&fg, amax_g, ms, es, wb_g, bb_g);
+  iq_row_fmt_set(&fu, amax_u, ms, es, wb_u, bb_u);
+  const uint32_t cg = cg0 + j * 32u, cu = cu0 + j * 32u;
+  const int32_t *grow =
+    (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride) +
+    (size_t)r * c->row_stride;
+  const int32_t *urow =
+    (const int32_t *)(c->tiles_base +
+                      (size_t)(c->n_pairs + j) * c->tile_stride) +
+    (size_t)r * c->row_stride;
+  for (uint32_t l = 0; l < 32u; ++l) {
+    const int32_t Ag = grow[l] - zp * c->colsum_w[cg + l];
+    const int32_t Au = urow[l] - zp * c->colsum_w[cu + l];
+    const int32_t g = iq_lin(Ag, &fg, c->wq->wm[cg + l], c->wq->we[cg + l],
+                             c->wq->bm ? &c->wq->bm[cg + l] : NULL,
+                             c->wq->be ? &c->wq->be[cg + l] : NULL);
+    const int32_t u = iq_lin(Au, &fu, c->wq->wm[cu + l], c->wq->we[cu + l],
+                             c->wq->bm ? &c->wq->bm[cu + l] : NULL,
+                             c->wq->be ? &c->wq->be[cu + l] : NULL);
+    const int32_t sg = hvx_int_sigmoid_q15(g, fg.F);
+    const int32_t gs = MULHI(g, sg);
+    const int32_t u_hi = u >> 15, u_lo = u & 0x7FFF;
+    out[0 * 32 + l] = Ag;
+    out[1 * 32 + l] = Au;
+    out[2 * 32 + l] = c->wq->we[cg + l];
+    out[3 * 32 + l] = (int32_t)((uint32_t)(uint16_t)c->wq->wm[cg + l] << 16);
+    out[4 * 32 + l] = g;
+    out[5 * 32 + l] = u;
+    out[6 * 32 + l] = sg;
+    out[7 * 32 + l] = MULHI(gs, u_hi) + (MULHI(gs, u_lo) >> 15);
+  }
+  meta[0] = (int32_t)amax_g;
+  meta[1] = (int32_t)amax_u;
+  meta[2] = fg.F;
+  meta[3] = fu.F;
+  meta[4] = fg.sa;
+  meta[5] = fg.B;
+  meta[6] = ms;
+  meta[7] = es;
 }

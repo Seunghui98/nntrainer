@@ -79,6 +79,12 @@ static inline int iq_nbits(uint32_t v) {
   return n;
 }
 
+/** x << k as the hardware does it (vasl): defined for negative x too,
+ *  which C's << is not. */
+static inline int32_t iq_shl(int32_t x, int k) {
+  return (int32_t)((uint32_t)x << k);
+}
+
 static inline int32_t iq_min(int32_t a, int32_t b) { return a < b ? a : b; }
 static inline int32_t iq_max(int32_t a, int32_t b) { return a > b ? a : b; }
 
@@ -183,14 +189,14 @@ static inline void iq_rq_params_set(int32_t mn, int32_t mx, int Fmin,
   if (ls < 0) {
     ls = 0;
   }
-  const int32_t Rn = R << ls;
+  const int32_t Rn = iq_shl(R, ls);
   const int e = iq_nbits((uint32_t)Rn) - 9; /* 21 or 22 */
   const int64_t num = (int64_t)255 << (15 + e);
   p->zero = 0;
   p->ls = ls;
   p->e = e;
   p->M = (int32_t)((num + (Rn / 2)) / Rn);
-  p->z = iq_asr_rnd(iq_mulhi_q15((-mn) << ls, p->M), e);
+  p->z = iq_asr_rnd(iq_mulhi_q15(iq_shl(-mn, ls), p->M), e);
   p->scale = ldexpf((float)R / 255.0f, -Fmin);
 }
 

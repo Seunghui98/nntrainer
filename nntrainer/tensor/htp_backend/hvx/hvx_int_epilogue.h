@@ -188,6 +188,20 @@ int32_t hvx_int_sigmoid_q15(int32_t g_q, int F);
 /** @brief mulhi_q15 as defined in the file comment, for the host check. */
 int32_t hvx_int_mulhi_q15(int32_t a, int32_t b16);
 
+/**
+ * @brief The gate_up epilogue of ONE (row r, pair j) of a job, every stage
+ *        kept: out[8][32] = A_gate, A_up, we (per lane), wm << 16, g, u,
+ *        sigmoid(g), h; meta[8] = amax_g, amax_u, F_g, F_u, sa_g, B_g,
+ *        ms, es. The device self-check runs both and reports the first
+ *        stage where they part, which names the instruction at fault.
+ */
+void hvx_int_dbg_gu_c(const hvx_int_gu_job *c, uint32_t r, uint32_t j,
+                      int32_t *out, int32_t *meta);
+#if defined(HVX_INT_EPILOGUE_HAVE_HVX)
+void hvx_int_dbg_gu_hvx(const hvx_int_gu_job *c, uint32_t r, uint32_t j,
+                        int32_t *out, int32_t *meta);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

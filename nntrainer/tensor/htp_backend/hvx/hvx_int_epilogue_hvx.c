@@ -83,14 +83,19 @@ static inline HVX_Vector vload_i16x32(const int16_t *p) {
 static inline HVX_Vector vload_i8x32(const int8_t *p) {
   return Q6_V_lo_W(Q6_Ww_vunpack_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(vload(p)))));
 }
+/** Lane 0 of v, through an UNALIGNED store to a plain stack array -- the
+ *  idiom hvx_quant_u8.c uses. An aligned vector store to a stack buffer
+ *  is not safe here: the hardware masks the address to 128 bytes, so if
+ *  the frame is not aligned the store lands elsewhere and the read is
+ *  stale, silently. */
 static inline uint32_t vlane0_u32(HVX_Vector v) {
-  uint32_t buf[LANES] __attribute__((aligned(VLEN)));
-  *(HVX_Vector *)buf = v;
+  uint32_t buf[LANES];
+  *(HVX_UVector *)buf = v;
   return buf[0];
 }
 static inline int32_t vlane0_s32(HVX_Vector v) {
-  int32_t buf[LANES] __attribute__((aligned(VLEN)));
-  *(HVX_Vector *)buf = v;
+  int32_t buf[LANES];
+  *(HVX_UVector *)buf = v;
   return buf[0];
 }
 
@@ -334,4 +339,64 @@ void hvx_int_rq_rows_hvx(const int32_t *h, uint32_t h_stride,
     hvx_int_rq_rows_c(h, h_stride, h_e, e_stride, n_batches, batch_cols, inter,
                       m_valid, m, m1, scale, zp, out_ah);
   }
+}
+
+/* ---- the stage-by-stage probe the device self-check compares --------- */
+
+void hvx_int_dbg_gu_hvx(const hvx_int_gu_job *c, uint32_t r, uint32_t j,
+                        int32_t *out, int32_t *meta) {
+  const uint32_t cg0 = c->g0 * 32u, cu0 = c->inter + cg0;
+  int wb_g, bb_g, wb_u, bb_u;
+  iq_batch_bounds(c->wq, c->g0, c->n_pairs, &wb_g, &bb_g);
+  iq_batch_bounds(c->wq, c->inter / 32u + c->g0, c->n_pairs, &wb_u, &bb_u);
+  int16_t ms;
+  int8_t es;
+  iq_split15(c->act_scale[r], &ms, &es);
+  const int32_t zp = c->act_zp[r];
+  const uint32_t amax_g = vrow_amax(c, r, 0u, cg0, zp);
+  const uint32_t amax_u = vrow_amax(c, r, c->n_pairs, cu0, zp);
+  iq_row_fmt fg, fu;
+  iq_row_fmt_set(&fg, amax_g, ms, es, wb_g, bb_g);
+  iq_row_fmt_set(&fu, amax_u, ms, es, wb_u, bb_u);
+  const uint32_t cg = cg0 + j * 32u, cu = cu0 + j * 32u;
+  const HVX_Vector Ag = vA(c, r, j, cg, zp);
+  const HVX_Vector Au = vA(c, r, c->n_pairs + j, cu, zp);
+  const HVX_Vector wmg = vhi16(vload_i16x32(c->wq->wm + cg));
+  const HVX_Vector wmu = vhi16(vload_i16x32(c->wq->wm + cu));
+  const HVX_Vector weg = vload_i8x32(c->wq->we + cg);
+  const HVX_Vector weu = vload_i8x32(c->wq->we + cu);
+  HVX_Vector g, u;
+  if (c->wq->bm) {
+    const HVX_Vector bmg = vload(c->wq->bm + cg), bmu = vload(c->wq->bm + cu);
+    const HVX_Vector beg = vload_i8x32(c->wq->be + cg);
+    const HVX_Vector beu = vload_i8x32(c->wq->be + cu);
+    g = vlin(Ag, &fg, wmg, weg, &bmg, &beg);
+    u = vlin(Au, &fu, wmu, weu, &bmu, &beu);
+  } else {
+    g = vlin(Ag, &fg, wmg, weg, NULL, NULL);
+    u = vlin(Au, &fu, wmu, weu, NULL, NULL);
+  }
+  const HVX_Vector sg = vsigmoid_q15(g, fg.F);
+  const HVX_Vector gs = vmulhi(g, vhi16(sg));
+  const HVX_Vector u_hi = Q6_Vw_vasr_VwR(u, 15);
+  const HVX_Vector u_lo = Q6_V_vand_VV(u, vsplat(0x7FFF));
+  const HVX_Vector h = Q6_Vw_vadd_VwVw(
+    vmulhi(gs, vhi16(u_hi)), Q6_Vw_vasr_VwR(vmulhi(gs, vhi16(u_lo)), 15));
+  HVX_UVector *o = (HVX_UVector *)out;
+  o[0] = Ag;
+  o[1] = Au;
+  o[2] = weg; /* the unpacked per-lane exponents, as loaded */
+  o[3] = wmg; /* wm in the high halfword */
+  o[4] = g;
+  o[5] = u;
+  o[6] = sg;
+  o[7] = h;
+  meta[0] = (int32_t)amax_g;
+  meta[1] = (int32_t)amax_u;
+  meta[2] = fg.F;
+  meta[3] = fu.F;
+  meta[4] = fg.sa;
+  meta[5] = fg.B;
+  meta[6] = ms;
+  meta[7] = es;
 }

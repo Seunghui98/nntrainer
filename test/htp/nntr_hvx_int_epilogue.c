@@ -17,7 +17,7 @@
  * and zero points of the requantization. The inputs come from an integer
  * generator seeded by the caller, with outlier rows and columns, and the
  * odd seeds give the weight a nonzero bias so that path is exercised too.
- * Nothing crosses FastRPC but the seed and eight counters, so the test
+ * Nothing crosses FastRPC but the seed and sixteen counters, so the test
  * needs no host model -- the reference IS the host model, compiled for
  * the DSP.
  */
@@ -49,7 +49,7 @@ static uint32_t sc_lcg(uint32_t *s) {
 int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
                                     uint32 *counts, int countsLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || !counts || countsLen < 8) {
+  if (!s || !counts || countsLen < 16) {
     return AEE_EBADPARM;
   }
   memset(counts, 0, sizeof(uint32) * (size_t)countsLen);
@@ -203,6 +203,99 @@ int nntr_hvx_int_epilogue_selfcheck(remote_handle64 handle, uint32 seed,
   counts[5] = SC_VALID * SC_INTER;
   counts[6] = checksum;
   counts[7] = n_batches;
+  /* Where the gate_up implementations first part: the first mismatching
+     element's (row, column), then that pair through both probes, stage by
+     stage. counts[8] = stage index of the first differing stage (0 A_g,
+     1 A_u, 2 we, 3 wm, 4 g, 5 u, 6 sigmoid, 7 h; 8 = amax_g, 9 = amax_u,
+     10 = F differs with equal amax; 255 = none found), [9] lane, [10]
+     reference value, [11] HVX value, [12] row, [13] column, [14] the
+     reference's amax_g, [15] the HVX amax_g. */
+  counts[8] = 255u;
+  if (mism_h | mism_e) {
+    uint32_t fr = 0, fc = 0, found = 0;
+    for (uint32_t r = 0; r < SC_VALID && !found; ++r) {
+      for (uint32_t cc = 0; cc < SC_INTER; ++cc) {
+        if (h_c[(size_t)r * SC_INTER + cc] != h_v[(size_t)r * SC_INTER + cc]) {
+          fr = r;
+          fc = cc;
+          found = 1;
+          break;
+        }
+      }
+    }
+    if (!found) { /* only an exponent differs: take that row, its batch */
+      for (uint32_t r = 0; r < SC_VALID && !found; ++r) {
+        for (uint32_t b = 0; b < n_batches; ++b) {
+          if (e_c[r * SC_ESTRIDE + b] != e_v[r * SC_ESTRIDE + b]) {
+            fr = r;
+            fc = b * SC_HALF * 32u;
+            found = 1;
+            break;
+          }
+        }
+      }
+    }
+    const uint32_t b = fc / (SC_HALF * 32u);
+    const uint32_t g0 = b * SC_HALF;
+    const uint32_t np = (SC_NT - g0 < SC_HALF) ? SC_NT - g0 : SC_HALF;
+    const uint32_t j = (fc - g0 * 32u) / 32u;
+    for (uint32_t q = 0; q < np; ++q) {
+      memcpy(stage + (size_t)q * SC_ROWS * 32u,
+             acc + (size_t)(g0 + q) * SC_ROWS * 32u,
+             sizeof(int32_t) * SC_ROWS * 32u);
+      memcpy(stage + (size_t)(np + q) * SC_ROWS * 32u,
+             acc + (size_t)(SC_NT + g0 + q) * SC_ROWS * 32u,
+             sizeof(int32_t) * SC_ROWS * 32u);
+    }
+    hvx_int_gu_job jb;
+    memset(&jb, 0, sizeof jb);
+    jb.tiles_base = (const uint8_t *)stage;
+    jb.tile_stride = SC_ROWS * 32u * 4u;
+    jb.n_pairs = np;
+    jb.g0 = g0;
+    jb.row_stride = 32u;
+    jb.m_count = SC_VALID;
+    jb.act_scale = act_scale;
+    jb.act_zp = act_zp;
+    jb.colsum_w = colsum;
+    jb.wq = wq;
+    jb.inter = SC_INTER;
+    jb.dst_stride = SC_INTER;
+    jb.e_stride = SC_ESTRIDE;
+    jb.batch = b;
+    static int32_t o_c[8 * 32], o_v[8 * 32], m_c[8], m_v[8];
+    hvx_int_dbg_gu_c(&jb, fr, j, o_c, m_c);
+    hvx_int_dbg_gu_hvx(&jb, fr, j, o_v, m_v);
+    counts[12] = fr;
+    counts[13] = fc;
+    counts[14] = (uint32_t)m_c[0];
+    counts[15] = (uint32_t)m_v[0];
+    if (m_c[0] != m_v[0]) {
+      counts[8] = 8u;
+      counts[10] = (uint32_t)m_c[0];
+      counts[11] = (uint32_t)m_v[0];
+    } else if (m_c[1] != m_v[1]) {
+      counts[8] = 9u;
+      counts[10] = (uint32_t)m_c[1];
+      counts[11] = (uint32_t)m_v[1];
+    } else if (m_c[2] != m_v[2] || m_c[3] != m_v[3]) {
+      counts[8] = 10u;
+      counts[10] = (uint32_t)m_c[2];
+      counts[11] = (uint32_t)m_v[2];
+    } else {
+      for (uint32_t st = 0; st < 8u && counts[8] == 255u; ++st) {
+        for (uint32_t l = 0; l < 32u; ++l) {
+          if (o_c[st * 32u + l] != o_v[st * 32u + l]) {
+            counts[8] = st;
+            counts[9] = l;
+            counts[10] = (uint32_t)o_c[st * 32u + l];
+            counts[11] = (uint32_t)o_v[st * 32u + l];
+            break;
+          }
+        }
+      }
+    }
+  }
   if (mism_h | mism_e | mism_b | mism_s | mism_z) {
     FARF(ERROR,
          "int_epilogue_selfcheck seed=%u: h %u e %u bytes %u scale %u zp %u",
