@@ -16,6 +16,10 @@ every C and every policy:
   random   uniform among the unpinned (seeded)
   belady   evicts the expert whose next use is farthest away: the best any
            policy can do on this trace, the ceiling for policy work
+  lrfu:H   frequency and recency in one score: each use adds 1, and the
+           score halves every H tokens; evicts the lowest (doc 52 10.27)
+  lrfu+:H  lrfu, plus half a use for each expert a decode token ranked 5th
+           to 9th -- the routing's own guess at what comes next
 
 Usage:
   NNTR_MOE_TRACE=/data/local/tmp/moe_trace.txt ./nntrainer_causallm <model>
@@ -27,6 +31,7 @@ misses_per_call x miss_ms), with base_ms the resident decode token and
 miss_ms one synchronous miss, both measured in doc 52 sections 10.7-10.9.
 """
 import argparse
+import math
 import random as _random
 import sys
 from collections import OrderedDict
@@ -50,11 +55,23 @@ def parse(lines):
     return calls
 
 
-def simulate(calls, capacity, policy, seed=0):
+def simulate(calls, capacity, policy, seed=0, layers=1):
     """-> (decode misses, decode calls, prefill misses). Keys are
-    (layer, expert). Raises when one call needs more than the pool holds."""
+    (layer, expert). Raises when one call needs more than the pool holds.
+    lrfu:H / lrfu+:H take H in tokens, layers calls each."""
     order = OrderedDict()   # resident keys, least recent first
     freq = {}
+    crf, last = {}, {}      # lrfu: score as of call last[k]
+    base, _, hl = policy.partition(":")
+    half = float(hl) * layers if hl else 0.0
+
+    def use(k, i, w=1.0):   # lrfu: decay the score to call i, then add w
+        crf[k] = w + crf.get(k, 0.0) * 2.0 ** (-(i - last.get(k, i)) / half)
+        last[k] = i
+
+    def score(k, i):        # lrfu: log2 of the score decayed to call i
+        c = crf.get(k, 0.0)
+        return (math.log2(c) if c > 0 else -1e9) - (i - last.get(k, i)) / half
     rng = _random.Random(seed)
     next_use = {}
     if policy == "belady":  # positions at which each key is needed
@@ -81,6 +98,8 @@ def simulate(calls, capacity, policy, seed=0):
         misses = [k for k in need if k not in order]
         for k in need:
             freq[k] = freq.get(k, 0) + 1
+            if base in ("lrfu", "lrfu+"):
+                use(k, i)
             if k in order:
                 order.move_to_end(k)
         excess = len(order) + len(misses) - capacity
@@ -94,6 +113,8 @@ def simulate(calls, capacity, policy, seed=0):
                 victim = rng.choice(cand)
             elif policy == "belady":
                 victim = max(cand, key=lambda k: upcoming(k, i))
+            elif base in ("lrfu", "lrfu+"):
+                victim = min(cand, key=lambda k: score(k, i))
             else:
                 raise ValueError(policy)
             del order[victim]
@@ -105,6 +126,9 @@ def simulate(calls, capacity, policy, seed=0):
                 k = (layer, e)
                 if k in order:
                     order.move_to_end(k)
+        if base == "lrfu+" and tokens == 1:
+            for e in ext[4:9]:
+                use((layer, e), i, 0.5)
         if tokens == 1:
             dec_calls += 1
             dec_miss += len(misses)
@@ -114,29 +138,30 @@ def simulate(calls, capacity, policy, seed=0):
 
 
 POLICIES = ["ours", "lru", "lfu", "random", "belady"]
+HALF_LIVES = [2, 8, 32, 128]  # tokens, for lrfu and lrfu+
 
 
-def report(calls, caches, base_ms, miss_ms):
+def report(calls, caches, base_ms, miss_ms, policies):
     layers = len({c[0] for c in calls})
     routed = sum(len(c[2]) for c in calls if c[1] == 1)
     decode_calls = sum(1 for c in calls if c[1] == 1)
     per_call = routed / decode_calls if decode_calls else 0
     print(f"trace: {len(calls)} calls, {layers} layers, {decode_calls} decode "
           f"calls routing {per_call:.2f} experts each")
-    print(f"{'C':>3} {'slots':>5} {'policy':>7} {'miss/decode call':>17} "
+    print(f"{'C':>3} {'slots':>5} {'policy':>9} {'miss/decode call':>17} "
           f"{'hit %':>6} {'prefill misses':>15} {'TPS (arith)':>12}")
     for c in caches:
         cap = c * layers
-        for p in POLICIES:
+        for p in policies:
             try:
-                dm, dc, pm = simulate(calls, cap, p)
+                dm, dc, pm = simulate(calls, cap, p, layers=layers)
             except ValueError as err:
-                print(f"{c:>3} {cap:>5} {p:>7}  -- {err}")
+                print(f"{c:>3} {cap:>5} {p:>9}  -- {err}")
                 break
             mpc = dm / dc if dc else 0.0
             hit = 100.0 * (1 - dm / routed) if routed else 0.0
             tps = 1000.0 / (base_ms + layers * mpc * miss_ms)
-            print(f"{c:>3} {cap:>5} {p:>7} {mpc:>17.2f} {hit:>6.1f} "
+            print(f"{c:>3} {cap:>5} {p:>9} {mpc:>17.2f} {hit:>6.1f} "
                   f"{pm:>15} {tps:>12.1f}")
     spec = speculation(calls)
     if spec[0][1]:
@@ -197,6 +222,20 @@ def selftest():
     spec = speculation([(0, 1, [0, 3], [2, 5, 1, 7, 9, 8, 6, 4, 3]),
                         (0, 1, [1, 2], [])])
     assert spec[0] == (2, 2, 4) and spec[5][0] == 2
+    # lrfu: a key used twice outlives one used once more recently, while its
+    # score has not halved away; with a short half-life recency wins again.
+    calls = [(0, 1, [0], []), (0, 1, [0], []), (0, 1, [1], []),
+             (0, 1, [2], []), (0, 1, [0], [])]
+    assert simulate(calls, 2, "lrfu:100")[0] == 3  # 1 goes, 0 stays
+    assert simulate(calls, 2, "lru")[0] == 4       # 0 goes
+    assert simulate(calls, 2, "lrfu:0.1")[0] == 4  # recency again
+    # lrfu+: an expert the last token ranked 5th counts as half a use.
+    # Token 2 ranks 9 fifth, so when 0 needs a slot lrfu+ keeps 9 over 4.
+    ext = [4, 1, 2, 3, 9, 5, 6, 7, 8]
+    calls = [(0, 1, [9], []), (0, 1, [4], ext), (0, 1, [0], []),
+             (0, 1, [9], [])]
+    assert simulate(calls, 2, "lrfu:100")[0] == 4   # 9 went, missed again
+    assert simulate(calls, 2, "lrfu+:100")[0] == 3  # 4 went, 9 hits
     # Parsing.
     assert parse(["3 1 | 4 7 | 7 4 9\n", "\n"]) == [(3, 1, [4, 7], [7, 4, 9])]
     print("selftest OK")
@@ -213,6 +252,11 @@ def main():
     ap.add_argument("--miss-ms", type=float, default=0.47,
                     help="one warm miss, read + swap, ms (doc 52 section "
                          "10.24)")
+    ap.add_argument("--policies", nargs="+",
+                    default=POLICIES + [f"{b}:{h}" for b in ("lrfu", "lrfu+")
+                                        for h in HALF_LIVES],
+                    help="policies to replay; lrfu:H and lrfu+:H take a "
+                         "half-life H in tokens")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -221,7 +265,7 @@ def main():
     if not a.trace:
         ap.error("a trace file, or --selftest")
     with open(a.trace) as f:
-        report(parse(f), a.cache, a.base_ms, a.miss_ms)
+        report(parse(f), a.cache, a.base_ms, a.miss_ms, a.policies)
 
 
 if __name__ == "__main__":
