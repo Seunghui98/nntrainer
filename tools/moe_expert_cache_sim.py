@@ -246,12 +246,12 @@ def main():
     ap.add_argument("trace", nargs="?")
     ap.add_argument("--cache", type=int, nargs="+", default=[2, 4, 8, 16],
                     help="experts per layer (NNTR_MOE_CACHE_EXPERTS)")
-    ap.add_argument("--base-ms", type=float, default=41.6,
-                    help="resident decode token, ms (doc 52 section 10.24: "
-                         "1000/24.0)")
-    ap.add_argument("--miss-ms", type=float, default=0.47,
+    ap.add_argument("--base-ms", type=float, default=40.6,
+                    help="resident decode token, ms (doc 52 section 10.28: "
+                         "1000/24.61)")
+    ap.add_argument("--miss-ms", type=float, default=0.40,
                     help="one warm miss, read + swap, ms (doc 52 section "
-                         "10.24)")
+                         "10.29: 0.33 read + 0.07 swap)")
     ap.add_argument("--policies", nargs="+",
                     default=POLICIES + [f"{b}:{h}" for b in ("lrfu", "lrfu+")
                                         for h in HALF_LIVES],
