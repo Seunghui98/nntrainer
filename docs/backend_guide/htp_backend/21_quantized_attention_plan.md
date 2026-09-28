@@ -1,14 +1,53 @@
 # A8W8 / A8W4 flash attention on HMX over a quantized KV cache
 
-Status: 2026-09-28, Phase Q1 delivered on device (SM8850 / v81):
-`unittest_hexkl_kv_q` 5/5 host, `unittest_hvx_attn_q` 4/4 device -- the DSP
-quantizer matches the same C on the ARM side bit for bit for both kinds, HMX
-over the baked int8 and int4 tiles equals a plain int matmul over the masters
-exactly, and the int32 accumulator readout probe found `usable=1 base=0
-row_stride=32`: the tile lands as a plain row-major 64x32 int32 matrix, so
-every int kernel reads it as 64 HVX vectors with no permutation table.
-Branch: `htp/quant-dequant-hvx-opt`. Builds on
-`20_hmx_flash_attention_plan.md` (fp16 attention, delivered through Phase 4d).
+Status: 2026-09-28. Phases Q1 and Q2 (A8W8 and A8W4 prefill kernel) run on
+device (SM8850 / v81), Q3's kind switch came for free with Q2. Branch:
+`htp/quant-dequant-hvx-opt`. Builds on `20_hmx_flash_attention_plan.md`
+(fp16 attention, delivered through Phase 4d).
+
+- Q1: `unittest_hexkl_kv_q` 5/5 host, `unittest_hvx_attn_q` registry tests
+  4/4 device -- the DSP quantizer matches the same C on the ARM side bit for
+  bit for both kinds, HMX over the baked int8 and int4 tiles equals a plain
+  int matmul over the masters exactly, and the int32 accumulator readout
+  probe found `usable=1 base=0 row_stride=32`: a plain row-major 64x32 int32
+  tile, 64 HVX vectors, no permutation table.
+- Q2: `hexkl_attn_q_prefill` reproduces a CPU model of its own arithmetic
+  (`test/unittest/hvx_attn_q_model.h`) to 45-59 dB on every shape (GQA,
+  straddling q blocks, window, softcap, sink, hd 32..256, both kinds), and
+  its SNR against the exact reference equals the model's to within 0.05 dB.
+  The device gate is therefore agreement with the model (>= 45 dB) plus a
+  sanity floor; the absolute numbers below are the *scheme's*, measured on
+  the test's uniform random data (Q at +-3, K/V at +-1) with the model:
+
+  | term alone | dB | | full scheme | dB |
+  |---|---|---|---|---|
+  | Q u8 per row | 48.2 | | A8W8, bc=32 / 64 / 128 / 256 / 1024 | 41.8 / 41.1 / 40.3 / 39.3 / 37.1 |
+  | K i8 per token | 48.0 | | A8W8 with P exact (bc=128) | 43.4 |
+  | V i8 per token+group | 48.2 | | A8W4 | 20.0 |
+  | P u8 per row+block (bc=128) | 43.2 | | K i8 + V i4 | 23.2 |
+  | K i4 or V i4, any grouping | 23.0 / 23.2 | | K i4 + V i8 | 22.9 |
+
+  Every int8 term sits at the theoretical floor of 8-bit uniform
+  quantization on uniform data (step/sqrt(12) against amax/sqrt(3) is
+  48 dB), and any int4 term at its 23 dB; finer scale groups do not move
+  uniform data, and neither does the u8 zero point by more than ~1 dB. So
+  the plan's "A8W4 >= 30 dB" was not reachable on this data by any int4
+  scheme, and the K-vs-V asymmetry the prior branch saw was its per-channel
+  V scale, not int4 itself. What int4 is worth has to be judged on real
+  K/V (Phase Q5's model run), where token-correlated V and outlier-free
+  groups behave very differently from uniform noise. Smaller blocks make u8
+  P *more* precise (the row max is local), which also rules out a
+  global-max two-pass P for accuracy reasons.
+- Q2 performance (128x1024, 16/4 heads, hd 128, on-DSP): 16 ms against the
+  fp16 resident path's 2.6 ms. HMX is not the problem (Q.K^T 0.48 ms, P'.V
+  0.48 ms, of which most is the 0.38 us int32 accumulator readouts); the
+  HVX passes are: acc->S dequant 3.8 ms, f32 O update 4.5 ms, P' quant
+  2.3 ms, Q prep 2.4 ms -- 60-70 cycles per 64-row tile row for ~10 vector
+  ops, i.e. latency-bound single-row loops, plus a pool fork/join and two
+  mallocs per q block in Q prep. Fixing that (rows unrolled 4-wide, Q
+  quantized once per head, block scales staged as vectors, larger bc)
+  is Phase Q2b, before the decode kernel; the expectation stays "near
+  fp16 for prefill, the wins are memory and decode".
 
 Goal: the same attention layer (`MHACoreLayer` -> `ComputeOps` -> FastRPC ->
 HMX/HVX) with the KV cache held as int8 (A8W8) or int4 (A8W4) on the DSP and
@@ -234,8 +273,9 @@ CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 | # | Deliverable | Gate |
 |---|---|---|
 | Q1 | `hexkl_acc_tile` port; `hexkl_kv_q` registry + on-DSP quantizer; IDL register/append/release + a `kv_q_dump` debug entry; host references for the quantizer | host: quantizer/dequant round trip; device: dump == host reference bit-exact, acc layout probe usable |
-| Q2 | `hexkl_attn_q_plan.h` + host test; A8W8 prefill kernel; `attn_q_prefill` | device SNR >= 40 dB on the fp16 suite's shapes (softcap, sink, window, GQA) |
-| Q3 | A8W4 kind (tiles, bake, range) | device SNR >= 30 dB; report K-i4 vs V-i4 contribution separately (mixed kinds in the test) |
+| Q2 | `hexkl_attn_q_plan.h` + host test; A8W8 / A8W4 prefill kernel; `attn_q_prefill`; CPU model of the arithmetic | done: DSP vs model >= 45 dB on the fp16 suite's shapes (softcap, sink, window, GQA, both kinds); scheme SNR in the status header |
+| Q2b | HVX passes at throughput: 4-row unrolled dequant / O update / P' quant, Q quantized once per head, vector-staged block scales, bc chooser for the int path | 128x1024 within 1.5x of the fp16 resident path |
+| Q3 | (folded into Q2: the kind switch is one struct) mixed K/V kinds if real data asks for K i8 + V i4 | -- |
 | Q4 | `hvx_attn_decode_q` (A8W8, then A8W4 via unpack) | SNR >= 40 / 30 dB; time vs fp16 decode at 1x1024, 1x4096 |
 | Q5 | `ComputeOps` seam, `HtpComputeOps`, `MHACoreLayer` append/by-handle, config key | CausalLM runs with `attention_kv_dtype` on device; output tokens match fp16 run on a short prompt |
 | Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4; doc update | -- |

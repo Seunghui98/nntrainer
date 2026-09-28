@@ -214,6 +214,21 @@ unittest_hexkl_kv_q_exe = executable(
   install: get_option('enable-test'),
   install_dir: application_install_dir
 )
+unittest_hexkl_attn_q_plan_exe = executable(
+  'unittest_hexkl_attn_q_plan',
+  'unittest_hexkl_attn_q_plan.cpp',
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_attn_q_plan', unittest_hexkl_attn_q_plan_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_attn_q_plan')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
   args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_q')],
   timeout: test_timeout,

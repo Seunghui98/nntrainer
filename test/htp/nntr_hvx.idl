@@ -228,4 +228,17 @@ interface nntr_hvx : remote_handle64 {
                            in sequence<uint8> act_s, in sequence<uint8> act_p,
                            rout sequence<int32> s_i32,
                            rout sequence<int32> o_i32);
+
+   // attn_f16_prefill_resident's contract over a quantized cache: Q as
+   // per-row uint8, K^T / V as the cache's int8 or int4 tiles, P as uint8
+   // with the per-token V scales folded in, f32 output. stats_us is in
+   // the order of hexkl_attn_q_stats (9 phase times, then the block count).
+   AEEResult attn_q_prefill(in uint32 kv_handle, in uint32 n_q,
+                            in uint32 cache_from, in uint32 cache_to,
+                            in uint32 n_head_q, in uint32 window,
+                            in uint32 br, in uint32 bc, in float softcap,
+                            in sequence<float> q_f32,
+                            in sequence<float> sinks,
+                            rout sequence<float> out_f32,
+                            rout sequence<uint32> stats_us);
 };
