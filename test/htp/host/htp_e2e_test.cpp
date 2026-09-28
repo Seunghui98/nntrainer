@@ -20,13 +20,19 @@
  *
  *   htp_e2e_test --model <quantized dir> --tokenizer <tokenizer.json>
  *                [--prompt 16] [--steps 8] [--moe-engine htp|cpu]
- *                [--dump <dir>] [--max-seq N]
+ *                [--dump <dir>] [--max-seq N] [--run]
  *
  * The prompt is deterministic, ids[i] = 1 + (7 i mod 30): inside the
  * 32-token vocabulary, never bos (0) or eos (31). Output:
  *   E2E step k pos=p n=m top1=t logprob=l margin=d   (k = 0 is the prefill;
  *                                                     d = top1 - top2 logit)
  *   E2E gen t0 t1 ...
+ * --run goes through the app's own CausalLM::run instead (#134): the same
+ * ids as text (the fixture tokenizer is WordLevel + Whitespace, so
+ * 1 -> hello, 2 -> world, k -> tok<k> maps back 1:1), num_to_generate =
+ * steps - 1 (run emits the prefill token plus that many), no E2E step
+ * lines, and E2E gen read back from the model's token history. It is the
+ * path NNTR_PPL_DECODE lives on.
  * Exit 0, or 1 with `E2E FAIL <reason>` on any exception.
  */
 
@@ -48,6 +54,7 @@ namespace {
 struct Options {
   std::string model, tokenizer, engine = "htp", dump;
   unsigned prompt = 16, steps = 8, max_seq = 0;
+  bool run = false;
 };
 
 Options parse(int argc, char **argv) {
@@ -73,6 +80,8 @@ Options parse(int argc, char **argv) {
       o.steps = static_cast<unsigned>(std::stoul(value()));
     else if (a == "--max-seq")
       o.max_seq = static_cast<unsigned>(std::stoul(value()));
+    else if (a == "--run")
+      o.run = true;
     else
       throw std::invalid_argument("unknown option " + a);
   }
@@ -107,8 +116,10 @@ int run(const Options &o) {
   nntr["tokenizer_file"] = o.tokenizer;
   nntr["moe_engine"] = o.engine;
   nntr["max_seq_len"] = o.max_seq;
-  nntr["num_to_generate"] = o.steps;
-  nntr["init_seq_len"] = o.prompt; // the prefill buffer; the fixture says 4
+  nntr["num_to_generate"] = o.run ? o.steps - 1 : o.steps;
+  // the prefill buffer; the fixture says 4. run() records the prefill's
+  // token only when the prompt is shorter than it, as in the app's config.
+  nntr["init_seq_len"] = o.run ? o.prompt + 1 : o.prompt;
   if (cfg.value("max_position_embeddings", 0u) < o.max_seq)
     cfg["max_position_embeddings"] = o.max_seq;
   const std::string weights =
@@ -131,6 +142,20 @@ int run(const Options &o) {
   for (unsigned i = 0; i < o.prompt; ++i)
     ids[i] = 1u + (7u * i) % 30u;
   const size_t vocab = cfg["vocab_size"].get<size_t>();
+
+  if (o.run) {
+    std::string text;
+    for (unsigned i = 0; i < o.prompt; ++i)
+      text += (i ? " " : "") + (ids[i] == 1   ? std::string("hello")
+                                : ids[i] == 2 ? std::string("world")
+                                              : "tok" + std::to_string(ids[i]));
+    model.runPrompt(text);
+    std::string line = "E2E gen";
+    for (unsigned k = 0; k < o.steps; ++k)
+      line += " " + std::to_string(model.tokenAt(o.prompt + k));
+    std::printf("%s\n", line.c_str());
+    return 0;
+  }
 
   const auto tokens = model.greedyGenerateFromIds(
     ids, o.steps, [&](size_t step, const float *logits) {

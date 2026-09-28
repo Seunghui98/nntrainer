@@ -51,7 +51,11 @@ a device number). Since #130 it also prints
 `E2E fwd tiny-all-kinds refused: AEE_ESCHEMENOTSUPPORTED`, `E2E eval
 golden-hd64 … bit_identical=1`, `E2E fwd hd64 … calls/token=12`, `E2E eval
 fwd-hd64 … min_snr_db=` (≥ 30) and `E2E tokens fwd==off 8/8
-expected_mismatch=0`. The two fixtures'
+expected_mismatch=0`. Since #134 (`NNTR_PPL_DECODE` through the app's
+`CausalLM::run`, `htp_e2e_test --run`) also `E2E ppl-decode self==forced
+tokens=7 identical=1`, `E2E tokens run==adapter 8/8`, `E2E ppl-decode
+index |dec-(S24-S17)|=<d> ok` (d < 1e-2) and `E2E ppl-decode hd64 off=…
+on=… delta=… top1=7/7`. The two fixtures'
 weight files are gitignored and generated once per checkout:
 `python3 test/unittest/models/causallm_reference/generators/generate_lfm2_moe_reference.py`
 then `git checkout -- test/unittest/models/causallm_reference/lfm2_moe_tiny/`

@@ -42,6 +42,16 @@
 #                              router top-k flip, a near-tie on random
 #                              weights; the tokens policy is the verdict there)
 #   E2E tokens fwd==off-lfm25 8/8 expected_mismatch=0
+# and, since #134, NNTR_PPL_DECODE through the app's CausalLM::run (--run;
+# plan 134 section 1 gates 1-4):
+#   E2E ppl-decode self==forced tokens=7 identical=1   (step lines to 17
+#                              digits and the MoE dumps bit-identical)
+#   E2E tokens run==adapter 8/8                        (run() = the loop above)
+#   E2E ppl-decode index |dec-(S24-S17)|=<d> ok        (d < 1e-2 nats: a
+#                              non-greedy forced continuation against the
+#                              prefill NNTR_PPL sums of prompts 24 and 17)
+#   E2E ppl-decode hd64 off=<ppl> on=<ppl> delta=<%> top1=7/7   (printed;
+#                              gated: finite, and top1 7/7)
 # NNTR_INPROC_GOLDEN=update rewrites test/htp/host/golden/lfm2_moe_tiny,
 # lfm2_moe_tiny_hd64 and lfm2_moe_tiny_lfm25 from this run's switch-off
 # HTP dumps (deliberate, like reference_logits.json).
@@ -233,6 +243,81 @@ grep -q '^\[HTP\] graph: init n_ops=58 resident=RMSNORM|CONV1D_GATE|QK_NORM|ROPE
   { echo "E2E FAIL lfm25: no init line with every kind resident"; fail=1; }
 grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=16384 KiB' "$OUT/25fwd.log" ||
   { echo "E2E FAIL lfm25: no attn_m1 registration line"; fail=1; }
+
+# (h) [#134] NNTR_PPL_DECODE on the app's own decode loop (CausalLM::run,
+# --run). g1: the self run writes its greedy continuation, the forced run
+# reads it back; both score the same logits, so every step line and every
+# MoE call match exactly. g2: run() emits the adapter path's tokens. g3:
+# forcing a NON-greedy continuation (prompt ids 16..23, all distinct; the
+# greedy path is 16 at every step, blind to an off-by-one) equals the
+# difference of the prefill NNTR_PPL sums of prompts 24 and 17, which score
+# the same seven targets; a shifted target reads O(0.1-1) nats per token
+# here, the 6-digit prefill print adds <= 3e-4. The CPU engine: the index
+# logic is under test, not the engine. g4: the six-kind entry forced on
+# the hd64 switch-off continuation; the numbers are the fixture's, not
+# silicon's (39 dB here, 18 dB on the device: plan 134 section 5).
+dec_steps() { grep -o '\[PPL\] decode step=.*' "$1" || true; }
+dec_field() { # dec_field <log> <field>: from the [PPL] decode tokens= line
+  sed -n "s/.*\[PPL\] decode tokens=.* $2=\([^ ]*\).*/\1/p" "$1"
+}
+echo "== [#134] run() path, NNTR_PPL_DECODE self then forced (hd8, htp)"
+NNTR_PPL_DECODE="$OUT/g.ids" run_e2e run-self "$OUT/htp" htp "$OUT/dump_gself" "$OUT/gself.log" --run
+NNTR_PPL_DECODE="$OUT/g.ids" run_e2e run-forced "$OUT/htp" htp "$OUT/dump_gforced" "$OUT/gforced.log" --run
+g_eval="$($EVAL --label ppl-decode-forced "$OUT/dump_gself" "$OUT/dump_gforced" | tail -1 || true)"
+echo "$g_eval"
+n="$(dec_steps "$OUT/gself.log" | wc -l)"
+if [ "$n" = $((STEPS - 1)) ] && [ "$(dec_field "$OUT/gself.log" source)" = self ] &&
+  [ "$(dec_field "$OUT/gforced.log" source)" = file ] &&
+  [ "$(dec_steps "$OUT/gself.log")" = "$(dec_steps "$OUT/gforced.log")" ] &&
+  grep -q 'bit_identical=1' <<< "$g_eval"; then
+  echo "E2E ppl-decode self==forced tokens=$n identical=1"
+else
+  echo "E2E FAIL ppl-decode self vs forced (steps=$n)"; fail=1
+fi
+run_gen="$(grep '^E2E gen ' "$OUT/gself.log")"
+same=$(paste <(tr ' ' '\n' <<< "$htp_gen") <(tr ' ' '\n' <<< "$run_gen") |
+  tail -n +3 | awk '$1==$2{n++} END{print n+0}')
+echo "E2E tokens run==adapter $same/$STEPS"
+[ "$same" = "$STEPS" ] || fail=1
+echo "== [#134] index check: forced non-greedy continuation vs prefill NNTR_PPL (cpu)"
+echo "23 30 7 14 21 28 5 12" > "$OUT/idx.ids"
+NNTR_PPL_DECODE="$OUT/idx.ids" "$E2E" --model "$OUT/cpu" --tokenizer "$FIX/tokenizer.json" \
+  --moe-engine cpu --run --prompt 16 --steps 8 > "$OUT/idx.log" 2>&1 || true
+for p in 17 24; do
+  NNTR_PPL=1 "$E2E" --model "$OUT/cpu" --tokenizer "$FIX/tokenizer.json" \
+    --moe-engine cpu --run --prompt $p --steps 1 > "$OUT/idx$p.log" 2>&1 || true
+done
+dec="$(dec_field "$OUT/idx.log" nll_sum)"
+a17="$(sed -n 's/.*\[PPL\] prompt tokens=16 nll\/token=\([^ ]*\).*/\1/p' "$OUT/idx17.log")"
+a24="$(sed -n 's/.*\[PPL\] prompt tokens=23 nll\/token=\([^ ]*\).*/\1/p' "$OUT/idx24.log")"
+if [ -n "$dec" ] && [ -n "$a17" ] && [ -n "$a24" ] &&
+  grep -q '^E2E gen 23 30 7 14 21 28 5 12$' "$OUT/idx.log"; then
+  d="$(awk -v d="$dec" -v a="$a24" -v b="$a17" \
+    'BEGIN{x = d - (23 * a - 16 * b); if (x < 0) x = -x; printf "%.2g", x}')"
+  if awk -v d="$d" 'BEGIN{exit !(d < 1e-2)}'; then
+    echo "E2E ppl-decode index |dec-(S24-S17)|=$d ok"
+  else
+    echo "E2E FAIL ppl-decode index |dec-(S24-S17)|=$d >= 1e-2"; fail=1
+  fi
+else
+  echo "E2E FAIL ppl-decode index: missing line (dec=$dec a17=$a17 a24=$a24)"; fail=1
+fi
+echo "== [#134] hd64: switch off self, then all six kinds forced on it"
+NNTR_PPL_DECODE="$OUT/h.ids" \
+  run_e2e run-64off "$OUT/htp64" htp "$OUT/dump_g64off" "$OUT/g64off.log" --max-seq 32 --run
+NNTR_HTP_FORWARD=1 NNTR_PPL_DECODE="$OUT/h.ids" \
+  run_e2e run-64fwd "$OUT/htp64" htp "$OUT/dump_g64fwd" "$OUT/g64fwd.log" --max-seq 32 --run
+off="$(dec_field "$OUT/g64off.log" ppl)"
+on="$(dec_field "$OUT/g64fwd.log" ppl)"
+top1="$(dec_field "$OUT/g64fwd.log" top1)"
+line="E2E ppl-decode hd64 off=${off:-none} on=${on:-none}"
+if [ "$(dec_field "$OUT/g64fwd.log" source)" = file ] &&
+  awk -v a="$off" -v b="$on" 'BEGIN{exit !(a + 0 > 0 && b + 0 > 0 && a + 0 < 1e30 && b + 0 < 1e30)}'; then
+  echo "$line delta=$(awk -v a="$off" -v b="$on" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') top1=$top1"
+  [ "$top1" = "$((STEPS - 1))/$((STEPS - 1))" ] || fail=1
+else
+  echo "E2E FAIL $line (not finite, or not forced)"; fail=1
+fi
 
 # The comparator's own check: identical -> 1; one byte flipped -> 0 with a
 # finite SNR and exit 1; a truncated file -> exit 2.

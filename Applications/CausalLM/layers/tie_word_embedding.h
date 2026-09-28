@@ -181,6 +181,10 @@ public:
   WIN_EXPORT static void setPplTargets(const std::vector<unsigned int> &ids);
   WIN_EXPORT static bool takePpl(double &nll_sum, unsigned int &count);
 
+  /** @brief -log softmax(logits)[target] over vocab logits, in double */
+  WIN_EXPORT static double nllOf(const float *logits, unsigned int vocab,
+                                 unsigned int target);
+
 private:
   static std::vector<unsigned int> ppl_targets_;
   static double ppl_nll_;

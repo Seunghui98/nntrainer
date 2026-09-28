@@ -379,9 +379,8 @@ bool TieWordEmbedding::takePpl(double &nll_sum, unsigned int &count) {
   return true;
 }
 
-/** -log softmax(logits)[target], in double. */
-static double nllOf(const float *logits, unsigned int vocab,
-                    unsigned int target) {
+double TieWordEmbedding::nllOf(const float *logits, unsigned int vocab,
+                               unsigned int target) {
   float mx = logits[0];
   for (unsigned int v = 1; v < vocab; ++v)
     mx = std::max(mx, logits[v]);
