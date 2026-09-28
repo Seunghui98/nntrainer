@@ -448,6 +448,14 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
     throw std::runtime_error("virtual MoE experts need the layer's engine to "
                              "provide ComputeOps; none is registered");
   }
+  // Every virtual layer has finalized by now, so the pool's capacity is
+  // final: size the backend's slot memory to it, once.
+  static bool reserved = false;
+  if (!reserved) {
+    ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity());
+    reserved = true;
+  }
+
   std::vector<ExpertFileDesc> descs;
   descs.reserve(num_experts);
   for (unsigned int e = 0; e < num_experts; ++e)
@@ -714,104 +722,142 @@ static bool tryMoeLayerOnAccelerator(
                              "accelerator does not hold");
     }
   };
+
+  // One call's worth: make @a group resident (virtual experts), and build
+  // the arrays the kernel takes for it. Grouped by expert in expert order
+  // -- the layout the kernel slices by running offsets, so the order here
+  // is part of the contract, not a convenience.
   std::vector<causallm::ExpertLru::Key> need;
-  if (experts_virtual) {
-    std::unordered_map<causallm::ExpertLru::Key, size_t> expert_of;
-    need.reserve(active.size());
-    for (size_t e : active) {
-      auto *key = &context.getWeight(gate_up_indices[e]);
-      need.push_back(key);
-      expert_of[key] = e;
-    }
-    g_m0.misses += g_expert_lru.acquire(
-      need,
-      [&](causallm::ExpertLru::Key k) {
-        const size_t e = expert_of[k];
-        loadVirtualExpert(ops,
-                          expertDesc(context.getWeight(gate_up_indices[e]),
-                                     context.getWeight(down_indices[e])),
-                          /*at_load=*/false);
-      },
-      release);
-    for (size_t i = 0; i < active.size(); ++i) {
-      const size_t e = active[i];
-      gu_data[i] = &context.getWeight(gate_up_indices[e]);
-      dn_data[i] = &context.getWeight(down_indices[e]);
-      gu_scale[i] = nullptr;
-      dn_scale[i] = nullptr;
-    }
-    gu_data.resize(active.size());
-    dn_data.resize(active.size());
-    gu_scale.resize(active.size());
-    dn_scale.resize(active.size());
-  }
-
-  // Grouped by expert in expert order -- the layout the kernel slices by
-  // running offsets, so the order here is part of the contract, not a
-  // convenience.
-  std::vector<unsigned int> row_index, row_count(active.size());
+  std::vector<void *> call_gu, call_dn;
+  std::vector<float *> call_gus, call_dns;
+  std::vector<unsigned int> row_index, row_count;
   std::vector<float> row_weight;
-  size_t total_rows = 0;
-  for (const auto &a : expert_assignments) {
-    total_rows += a.size();
-  }
-  row_index.reserve(total_rows);
-  row_weight.reserve(total_rows);
-  for (size_t i = 0; i < active.size(); ++i) {
-    const size_t e = active[i];
-    row_count[i] = static_cast<unsigned int>(expert_assignments[e].size());
-    for (const auto &pair : expert_assignments[e]) {
-      row_index.push_back(pair.first);
-      row_weight.push_back(pair.second);
+  auto stage = [&](const std::vector<size_t> &group) {
+    need.clear();
+    call_gu.clear();
+    call_dn.clear();
+    call_gus.clear();
+    call_dns.clear();
+    row_index.clear();
+    row_count.clear();
+    row_weight.clear();
+    if (experts_virtual) {
+      std::unordered_map<causallm::ExpertLru::Key, size_t> expert_of;
+      for (size_t e : group) {
+        auto *key = &context.getWeight(gate_up_indices[e]);
+        need.push_back(key);
+        expert_of[key] = e;
+      }
+      g_m0.misses += g_expert_lru.acquire(
+        need,
+        [&](causallm::ExpertLru::Key k) {
+          const size_t e = expert_of[k];
+          loadVirtualExpert(ops,
+                            expertDesc(context.getWeight(gate_up_indices[e]),
+                                       context.getWeight(down_indices[e])),
+                            /*at_load=*/false);
+        },
+        release);
     }
-  }
-
-  // [doc 52 section 10.10] Prefill routes every token to its top-4, so the
-  // next layer will want (nearly) all of its experts: read the ones it
-  // lacks while this call runs. Room is made first by evicting outside
-  // this call's experts and the next layer's resident ones -- with fewer
-  // than 32 + 32 slots there is none and this does nothing. Only the reads
-  // overlap; registering waits for the call (see the backend's _begin).
-  bool prefetching = false;
-  if (experts_virtual && total_tokens > 1 && expertPrefetchEnabled() &&
-      expert_layer_slot >= 0 &&
-      static_cast<size_t>(expert_layer_slot) + 1 < g_expert_layers.size()) {
-    std::vector<causallm::ExpertLru::Key> pinned(need);
-    std::vector<ExpertFileDesc> want;
-    for (const ExpertFileDesc &d : g_expert_layers[expert_layer_slot + 1]) {
-      if (g_expert_lru.resident(d.key_gu))
-        pinned.push_back(d.key_gu);
-      else
-        want.push_back(d);
+    for (size_t e : group) {
+      if (experts_virtual) { // the tensor's address is the key, no scale
+        call_gu.push_back(&context.getWeight(gate_up_indices[e]));
+        call_dn.push_back(&context.getWeight(down_indices[e]));
+        call_gus.push_back(nullptr);
+        call_dns.push_back(nullptr);
+      } else {
+        call_gu.push_back(gu_data[e]);
+        call_dn.push_back(dn_data[e]);
+        call_gus.push_back(gu_scale[e]);
+        call_dns.push_back(dn_scale[e]);
+      }
+      row_count.push_back(
+        static_cast<unsigned int>(expert_assignments[e].size()));
+      for (const auto &pair : expert_assignments[e]) {
+        row_index.push_back(pair.first);
+        row_weight.push_back(pair.second);
+      }
     }
-    if (!want.empty() && g_expert_lru.makeRoom(want.size(), pinned, release))
-      prefetching = ops->prefetch_qs4cx_wh_experts_begin(want);
-  }
-  // The prefetched experts are the backend's the moment _end registers
-  // them, so the LRU has to hear about them whether or not the call threw.
-  auto finish_prefetch = [&] {
-    if (!prefetching)
-      return;
-    prefetching = false;
-    g_expert_lru.acquire(
-      ops->prefetch_qs4cx_wh_experts_end(), [](causallm::ExpertLru::Key) {},
-      [](causallm::ExpertLru::Key) {
-        throw std::logic_error("expert prefetch overfilled the LRU");
-      });
   };
-  try {
+  auto call = [&](float *dst) {
     ops->gemm_qs4cx_moe_layer_fp32(
-      gu_data, gu_scale, dn_data, dn_scale, row_index, row_count, row_weight,
-      input.getData<float>(), output.getData<float>(), total_tokens,
-      hidden_size, intermediate_size, hidden_size, weights_wh);
-  } catch (...) {
-    try {
-      finish_prefetch();
-    } catch (...) {
+      call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
+      input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
+      hidden_size, weights_wh);
+  };
+
+  // [doc 52 section 10.14] A layer call needs all of its routed experts
+  // resident at once, and at NNTR_MOE_CACHE_EXPERTS=1 the shared pool (one
+  // slot per layer, 22) is smaller than a prefill layer's 31-32. Then the
+  // call goes out in pool-sized groups and the host adds their outputs.
+  // Each call zero-fills its whole output and scatter-adds only its own
+  // experts' rows, so the sum is the layer's output with the fp32 addition
+  // order changed across group boundaries: the ppl can move in its last
+  // digits, unlike every other path here. Only prefill ever takes this; a
+  // decode call's 4 experts always fit.
+  if (experts_virtual && active.size() > g_expert_lru.capacity()) {
+    const size_t cap = g_expert_lru.capacity();
+    float *out = output.getData<float>();
+    const size_t n_out = static_cast<size_t>(total_tokens) * hidden_size;
+    std::vector<float> part(n_out);
+    for (size_t g0 = 0; g0 < active.size(); g0 += cap) {
+      const size_t g1 = std::min(active.size(), g0 + cap);
+      stage(std::vector<size_t>(active.begin() + g0, active.begin() + g1));
+      if (g0 == 0) {
+        call(out);
+      } else {
+        call(part.data());
+        for (size_t i = 0; i < n_out; ++i)
+          out[i] += part[i];
+      }
     }
-    throw;
+  } else {
+    stage(active);
+
+    // [doc 52 section 10.10] Prefill routes every token to its top-4, so
+    // the next layer will want (nearly) all of its experts: read the ones
+    // it lacks while this call runs. Room is made first by evicting
+    // outside this call's experts and the next layer's resident ones --
+    // with fewer than 32 + 32 slots there is none and this does nothing.
+    // Only the reads overlap; registering waits for the call.
+    bool prefetching = false;
+    if (experts_virtual && total_tokens > 1 && expertPrefetchEnabled() &&
+        expert_layer_slot >= 0 &&
+        static_cast<size_t>(expert_layer_slot) + 1 < g_expert_layers.size()) {
+      std::vector<causallm::ExpertLru::Key> pinned(need);
+      std::vector<ExpertFileDesc> want;
+      for (const ExpertFileDesc &d : g_expert_layers[expert_layer_slot + 1]) {
+        if (g_expert_lru.resident(d.key_gu))
+          pinned.push_back(d.key_gu);
+        else
+          want.push_back(d);
+      }
+      if (!want.empty() && g_expert_lru.makeRoom(want.size(), pinned, release))
+        prefetching = ops->prefetch_qs4cx_wh_experts_begin(want);
+    }
+    // The prefetched experts are the backend's the moment _end registers
+    // them, so the LRU has to hear about them whether or not the call threw.
+    auto finish_prefetch = [&] {
+      if (!prefetching)
+        return;
+      prefetching = false;
+      g_expert_lru.acquire(
+        ops->prefetch_qs4cx_wh_experts_end(), [](causallm::ExpertLru::Key) {},
+        [](causallm::ExpertLru::Key) {
+          throw std::logic_error("expert prefetch overfilled the LRU");
+        });
+    };
+    try {
+      call(output.getData<float>());
+    } catch (...) {
+      try {
+        finish_prefetch();
+      } catch (...) {
+      }
+      throw;
+    }
+    finish_prefetch();
   }
-  finish_prefetch();
 
   // Recency from the routing's extended top-k, token by token, so the
   // last token's likely-next experts end up most recent -- the rule
