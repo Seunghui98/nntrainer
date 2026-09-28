@@ -1348,6 +1348,188 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
   }
 }
 
+/**
+ * Doc 52 section 10.16: the model's C=1 path splits a prefill layer call into
+ * expert groups and adds the outputs on the host, and its ppl moved 1.5% --
+ * deterministically, and differently for 22+10 than for 16+16. At the
+ * model's scale (32 experts, M=444, top-4), this asks the two questions the
+ * ppl cannot: does a row's output depend on which OTHER experts share the
+ * call (it must not -- a row only one group touches has to come back
+ * bit-identical), and which of the whole and the split call matches the
+ * per-expert two-call reference.
+ */
+TEST_F(HmxMmU8I4Layer, MoeLayerSplitMatchesWhole) {
+  const uint32_t K = 2048, I = 1792, N = 2048, M = 444, NE = 32, TOPK = 4;
+  // Four distinct weight pairs, cycled: neighbouring experts always differ,
+  // which is what the kernel's weight pipeline sees, and 32 distinct pairs
+  // would need 168 MiB of DSP heap for no extra coverage.
+  const uint32_t NW = 4;
+  std::vector<Weight> gu(NW), dn(NW);
+  for (uint32_t w = 0; w < NW; ++w) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xB1E00000u + w, gu[w]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xD1000000u + w, dn[w]));
+    gu[w].w_f32 = std::vector<float>();
+    dn[w].w_f32 = std::vector<float>();
+  }
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    h_gu[e] = gu[e % NW].handle;
+    h_dn[e] = dn[e % NW].handle;
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0010u);
+
+  // Top-4 routing: every token to 4 distinct experts, rows in token order
+  // within an expert, experts in expert order -- the layer's layout.
+  std::vector<std::vector<std::pair<uint32_t, float>>> rows_of(NE);
+  std::vector<uint32_t> expert_mask(M, 0); // bit e: token routed to e
+  {
+    uint32_t st = 0xFEEDu;
+    for (uint32_t t = 0; t < M; ++t) {
+      for (uint32_t k = 0; k < TOPK; ++k) {
+        uint32_t e;
+        do {
+          st = st * 1664525u + 1013904223u;
+          e = (st >> 8) % NE;
+        } while (expert_mask[t] & (1u << e));
+        expert_mask[t] |= 1u << e;
+        st = st * 1664525u + 1013904223u;
+        rows_of[e].push_back({t, 0.05f + 0.45f * ((st >> 8) % 1000u) / 1000.f});
+      }
+    }
+  }
+  // One call over experts [e0, e1), into out.
+  auto run = [&](uint32_t e0, uint32_t e1, std::vector<float> &out) {
+    std::vector<uint32_t> ri, rc, hg(h_gu.begin() + e0, h_gu.begin() + e1),
+      hd(h_dn.begin() + e0, h_dn.begin() + e1);
+    std::vector<float> rw;
+    for (uint32_t e = e0; e < e1; ++e) {
+      rc.push_back(static_cast<uint32_t>(rows_of[e].size()));
+      for (const auto &p : rows_of[e]) {
+        ri.push_back(p.first);
+        rw.push_back(p.second);
+      }
+    }
+    out.assign(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
+    return nntr_hvx_mm_u8i4_moe_layer(
+      handle_, M, K, I, N, hg.data(), static_cast<int>(hg.size()), hd.data(),
+      static_cast<int>(hd.size()), ri.data(), static_cast<int>(ri.size()),
+      rc.data(), static_cast<int>(rc.size()), rw.data(),
+      static_cast<int>(rw.size()), x.data(), static_cast<int>(x.size()),
+      out.data(), static_cast<int>(out.size()));
+  };
+
+  // Reference: each expert through the two calls, scatter-added on the host
+  // in expert order (MoeLayerMatchesTwoCallReference's loop).
+  std::vector<float> want(static_cast<size_t>(M) * N, 0.0f);
+  for (uint32_t e = 0; e < NE; ++e) {
+    const uint32_t n_e = static_cast<uint32_t>(rows_of[e].size());
+    if (n_e == 0)
+      continue;
+    std::vector<float> xe(static_cast<size_t>(n_e) * K);
+    for (uint32_t i = 0; i < n_e; ++i)
+      std::memcpy(&xe[static_cast<size_t>(i) * K],
+                  &x[static_cast<size_t>(rows_of[e][i].first) * K],
+                  sizeof(float) * K);
+    const uint32_t m_pad = (n_e + 63) / 64 * 64;
+    std::vector<uint8_t> mid_ah(static_cast<size_t>(m_pad) * I, 0);
+    std::vector<float> mid_scale(m_pad, 1.0f);
+    std::vector<int32_t> mid_zp(m_pad, 0);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_gate_up_swiglu(
+                handle_, n_e, K, h_gu[e], xe.data(),
+                static_cast<int>(xe.size()), mid_ah.data(),
+                static_cast<int>(mid_ah.size()), mid_scale.data(),
+                static_cast<int>(mid_scale.size()), mid_zp.data(),
+                static_cast<int>(mid_zp.size())),
+              AEE_SUCCESS);
+    std::vector<float> ye(static_cast<size_t>(n_e) * N, 0.0f);
+    const uint32_t dh[1] = {h_dn[e]};
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer_u8in(
+                handle_, n_e, I, dh, 1, mid_ah.data(),
+                static_cast<int>(mid_ah.size()), mid_scale.data(),
+                static_cast<int>(mid_scale.size()), mid_zp.data(),
+                static_cast<int>(mid_zp.size()), ye.data(),
+                static_cast<int>(ye.size())),
+              AEE_SUCCESS);
+    for (uint32_t i = 0; i < n_e; ++i) {
+      float *dst = &want[static_cast<size_t>(rows_of[e][i].first) * N];
+      const float *src = &ye[static_cast<size_t>(i) * N];
+      const float w = rows_of[e][i].second;
+      for (uint32_t c = 0; c < N; ++c) {
+        const float p = src[c] * w; // rounded before the add, as on the DSP
+        dst[c] = dst[c] + p;
+      }
+    }
+  }
+  float big = 0.0f;
+  for (float v : want)
+    big = std::max(big, std::fabs(v));
+
+  // a vs b over the rows @a pick selects: elements not ==, and the worst
+  // difference against the output's largest magnitude.
+  auto compare = [&](const char *what, const std::vector<float> &a,
+                     const std::vector<float> &b,
+                     const std::function<bool(uint32_t)> &pick) {
+    size_t bad = 0, n = 0;
+    uint32_t bad_rows = 0;
+    double worst = 0.0;
+    for (uint32_t r = 0; r < M; ++r) {
+      if (!pick(r))
+        continue;
+      bool row_bad = false;
+      for (uint32_t c = 0; c < N; ++c) {
+        const size_t i = static_cast<size_t>(r) * N + c;
+        ++n;
+        if (!(a[i] == b[i])) {
+          ++bad;
+          row_bad = true;
+          worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]));
+        }
+      }
+      bad_rows += row_bad;
+    }
+    std::cout << "U8I4_FIELD path=moe_split field=" << what
+              << " bad_elems=" << bad << " of " << n << " bad_rows=" << bad_rows
+              << " worst_rel=" << worst / big << std::endl;
+    return bad;
+  };
+  auto all = [](uint32_t) { return true; };
+
+  std::vector<float> whole;
+  ASSERT_EQ(run(0, NE, whole), AEE_SUCCESS);
+  const size_t whole_bad = compare("whole_vs_ref", whole, want, all);
+
+  for (uint32_t g : {22u, 16u}) {
+    std::vector<float> split, part;
+    ASSERT_EQ(run(0, g, split), AEE_SUCCESS);
+    ASSERT_EQ(run(g, NE, part), AEE_SUCCESS);
+    for (size_t i = 0; i < split.size(); ++i)
+      split[i] += part[i]; // what lfm2_moe_layer.cpp does
+    const uint32_t lo = (1u << g) - 1u;
+    auto one_group = [&](uint32_t r) {
+      return (expert_mask[r] & lo) == 0u || (expert_mask[r] & ~lo) == 0u;
+    };
+    auto both = [&](uint32_t r) { return !one_group(r); };
+    const std::string tag = "split" + std::to_string(g);
+    const size_t one_bad = compare((tag + "_vs_whole_one_group_rows").c_str(),
+                                   split, whole, one_group);
+    compare((tag + "_vs_whole_two_group_rows").c_str(), split, whole, both);
+    compare((tag + "_vs_ref").c_str(), split, want, all);
+    // x + 0.0f == x, so a row only one group wrote must come back as the
+    // whole call wrote it; anything else means a row's output depends on
+    // the rest of the call.
+    EXPECT_EQ(one_bad, 0u) << tag << ": rows one group touched changed";
+  }
+  EXPECT_EQ(whole_bad, 0u)
+    << "the whole call at 32 experts differs from the two-call reference";
+
+  for (uint32_t w = 0; w < NW; ++w) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu[w].handle), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn[w].handle), AEE_SUCCESS);
+  }
+}
+
 TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
   const uint32_t K = 2048, I = 1792, N = 2048;
 
