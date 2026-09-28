@@ -423,3 +423,47 @@ prefill 7916 ms (56 TPS)   decode 13.4 TPS (499 토큰, EOS로 조기 종료)   
   같은 값이어야 한다 — 이것이 벡터판의 정확도 게이트), (c) 프로파일에서 MoE `swiglu(hidden)`이 f32의 23 ms 근처로
   돌아오고 노출 dequant/requant가 §8.5 수준(0.33 ms/콜)인지. §8.5대로 벽시계 이득은 기대하지 않는다; 이 과제의
   산출물은 "f32 없는 에필로그가 정확도를 지킨다"는 사실과 그 커널이다.
+
+### 9.8 HVX 벡터화 — 코드, 기기 검증 대기 (2026-09-28)
+
+§9.5의 매핑을 그대로 적용했다. 기기에서 돌리지 못했으므로 아래는 "무엇을 만들었고 무엇으로 검증하나"이고,
+결과는 9.9에 적는다.
+
+- `hvx_int_epilogue_hvx.c` — `hvx_int_gu_worker_hvx`, `hvx_int_rq_rows_hvx`. 32열 루프가 벡터 하나: `MULHI` →
+  `Q6_Vw_vmpyo_VwVh_s1_rnd_sat`(곱셈기는 상위 하프워드에), 라운딩 시프트 → `vadd` + `vasr`(레인별 양은 `we`/`be`를
+  int8 → 워드로 언팩, [0, 30] 클램프 뒤), zp·colsum → `Q6_Vw_vmpyi_VwRh`, 행 max\|A\|와 requant min/max의 레인 축소는
+  `vror` 5단. 시그모이드는 워드 32레인 그대로(다항식 12항 = mulhi 12회). requant는 f32 경로의 `quant_pack_group4`
+  처럼 4행을 한 번에 팩해 k-타일당 128 B 스토어 하나.
+- `hvx_int_epilogue_impl.h` — 행·배치 스칼라 부분(형식, 상한, requant 곱셈기)을 두 구현이 **같은 코드**로 쓴다.
+  벡터 파일이 참조와 다른 곳은 원소 루프뿐.
+- 선택: 헤더의 매크로 — DSP 빌드는 `_hvx`, 호스트는 `_c`, `HEXKL_INT_EPILOGUE_SCALAR=1`이면 DSP도 `_c`(A/B, 이등분용).
+- **기기 자기검사** `nntr_hvx_int_epilogue.c` + IDL `int_epilogue_selfcheck` + `unittest_hvx_int_epilogue`: DSP가
+  LFM2 모양 블록(64×3584, 배치 16·16·16·8, 유효 61행, 시드 홀수면 bias 있음)을 스스로 만들어 두 구현을 다 돌리고
+  가수·지수·바이트·scale 비트·zp의 불일치 수를 돌려준다. 호스트 모델이 따로 없다 — 참조가 곧 호스트 모델을 DSP용으로
+  컴파일한 것. 이 컨테이너에서는 인트린식 타입만 스텁으로 바꾼 구문 검사까지 했다(통과); 의미 검증은 기기.
+- 호스트 체크 7개 전부 통과(참조 경로는 리팩터만, 격자 불변).
+
+**기기 절차 (작성자)** — 세 번의 실행, 순서대로. IDL이 바뀌었으니 앱도 다시 빌드한다.
+
+```bash
+cd ~/workspace/nntrainer                      # 이 브랜치 최신
+# A. skel(HVX 정수 에필로그) + 앱
+HEXKL_MOE_INT_EPILOGUE=1 ./test/htp/build.sh
+(cd Applications/CausalLM && ./build_android.sh --htp && ./install_android.sh --model=lfm2.5-8b-a1b-q40-qs4cx-wh)
+adb -s R3CY10WM83Y push test/htp/build/libnntr_hvx_skel.so /data/local/tmp/nntrainer/causallm/
+
+# B. 자기검사 gtest (빠른 길: 이 바이너리 하나만 빌드해 앱 디렉터리에서 실행)
+(cd test/jni && "$ANDROID_NDK/ndk-build" NDK_PROJECT_PATH=. NDK_APPLICATION_MK=./Application.mk \
+   APP_BUILD_SCRIPT=./Android.mk NNTRAINER_ROOT="$PWD/../.." HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" unittest_hvx_int_epilogue)
+adb -s R3CY10WM83Y push test/jni/obj/local/arm64-v8a/unittest_hvx_int_epilogue /data/local/tmp/nntrainer/causallm/
+adb -s R3CY10WM83Y shell "cd /data/local/tmp/nntrainer/causallm && chmod +x unittest_hvx_int_epilogue && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ./unittest_hvx_int_epilogue"
+#    (또는 전체: bash test/htp/run_u8i4_layer_on_device.sh — 4e/4 단계. 자기 디렉터리에 자기 skel을 쓰므로 앱 쪽과 안 섞인다)
+
+# C. ppl + 프로파일
+adb -s R3CY10WM83Y shell "cd /data/local/tmp/nntrainer/causallm && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. NNTR_NUM_THREADS=8 NNTR_HTP_PROFILE=2 NNTR_PPL=1 ./nntrainer_causallm ./models/lfm2.5-8b-a1b-q40-qs4cx-wh" 2>&1 | tee int_epilogue_hvx_ppl.txt
+```
+
+판정 셋(§9.7): B에서 `[  PASSED  ] 3 tests`(불일치 0 — 하나라도 있으면 그 카운터 이름과 `INT_EPILOGUE seed=` 줄을
+그대로), C에서 **ppl 60.9269 정확히**(같은 격자; 다르면 B가 통과했어도 커널 배선 문제), 프로파일 MoE 행의
+`swiglu(hidden)`이 23 ms 근처·노출 dequant/requant가 §8.5 수준(합 ≤ 0.4 ms/콜)·decode 24 근처. gtest의 `libc++_shared.so`가
+앱 디렉터리에 없으면 NDK의 `sysroot/usr/lib/aarch64-linux-android/libc++_shared.so`를 같이 push.
