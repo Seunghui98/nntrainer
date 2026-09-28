@@ -80,7 +80,7 @@ six-kind run 287 / 59400, after four bisect cells 322 / 56000, end 342 / 55600.
 | cell | generated text (G = 64) | text approved (user: y/n) |
 |---|---|---|
 | switch off | …town has a single main street that climbs from the harbour to a stone church at the top of the hill, and along it stand a bakery, a hardware shop, two pubs, a post office that also sells fishing line, a small museum that opens only on summer weekends, and a lifeboat station | (reference) |
-| all six kinds | …final answer should be the same as the original, but you must not stop until you are told to. The original description is the same as the original, but you must not stop until you are told to. The final answer should be the same as the original, but you must not stop until you are told to. | |
+| all six kinds | …final answer should be the same as the original, but you must not stop until you are told to. The original description is the same as the original, but you must not stop until you are told to. The final answer should be the same as the original, but you must not stop until you are told to. | **n** (user, 2026-09-28: fail) |
 
 Logs: `/local/mnt/workspace/htp_moe/136/logs/` (`off_G64_r1`, `fwd_G64_r1`,
 `k_<mask>`, `md5.log`, `therm.log`).
