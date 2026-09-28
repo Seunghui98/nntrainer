@@ -32,6 +32,15 @@
  *
  * Inputs: an LCG from a fixed seed, plus three fixed rows / heads: all
  * zeros, all subnormal (+-1e-39) and large (|x| ~ 1e4).
+ *
+ * The router (#132) has no tolerance half: its output is a selection. It
+ * is memcmp'd against the spec (logits, selection order, weights) at
+ * three shapes on random, exact-tie and 1-ulp near-tie rows; then the
+ * spec is set against a copy of the CPU's buildExpertAssignments (expf, a
+ * true divide, a sequential dot, the total-order comparator) on 100000
+ * LFM2.5-shaped rows, and every selection that differs must sit at a CPU
+ * 4th/5th score gap below 1e-4 -- the near-tie class, never a logic or
+ * tie-rule difference.
  */
 
 #include <math.h>
@@ -452,16 +461,194 @@ static void check_conv(void) {
   free(state2);
 }
 
+/* ---- router (#132) ----------------------------------------------------- */
+
+enum { ROUTER_MAX_K = 2048, ROUTER_MAX_E = 32 };
+
+/** @brief A router case's inputs: W [K][E] and its 32-column copy. Row
+ *         kind 0 random; 1 exact tie (experts e1 < e2 share a column and a
+ *         bias, both biased above the rest after three sure winners, so
+ *         they meet at the last selected place); 2 the same with e2's bias
+ *         one ulp above e1's. */
+static void router_inputs(float *x, float *w, float *w32, float *bias,
+                          uint32_t K, uint32_t E, uint32_t top_k, int kind) {
+  fill_rand(x, K, -2.0f, 2.0f);
+  fill_rand(w, K * E, -0.05f, 0.05f);
+  fill_rand(bias, E, -0.01f, 0.01f);
+  if (kind != 0) {
+    const uint32_t e1 = (g_seed >> 8) % (E - 1u);
+    const uint32_t e2 = e1 + 1u + (g_seed >> 16) % (E - 1u - e1);
+    for (uint32_t k = 0; k < K; ++k) {
+      w[(size_t)k * E + e2] = w[(size_t)k * E + e1];
+    }
+    for (uint32_t e = 0, n = 0; e < E && n + 1u < top_k; ++e) {
+      if (e != e1 && e != e2) {
+        bias[e] = 2.0f;
+        ++n;
+      }
+    }
+    bias[e1] = 1.0f;
+    bias[e2] = kind == 1 ? 1.0f : nextafterf(1.0f, 2.0f);
+  }
+  for (uint32_t k = 0; k < K; ++k) {
+    for (uint32_t e = 0; e < ROUTER_MAX_E; ++e) {
+      w32[(size_t)k * ROUTER_MAX_E + e] = e < E ? w[(size_t)k * E + e] : 0.0f;
+    }
+  }
+}
+
+static void check_router_kernel(void) {
+  static const uint32_t shapes[3][3] = {
+    {2048u, 32u, 4u}, {128u, 4u, 2u}, {64u, 4u, 2u}};
+  float *x = malloc(ROUTER_MAX_K * sizeof(float));
+  float *w = malloc((size_t)ROUTER_MAX_K * ROUTER_MAX_E * sizeof(float));
+  float *w32 = malloc((size_t)ROUTER_MAX_K * ROUTER_MAX_E * sizeof(float));
+  float bias[ROUTER_MAX_E], lg_h[ROUTER_MAX_E], lg_d[ROUTER_MAX_E];
+  float wt_h[ROUTER_MAX_E], wt_d[ROUTER_MAX_E];
+  uint32_t sel_h[ROUTER_MAX_E], sel_d[ROUTER_MAX_E];
+  for (int s = 0; s < 3; ++s) {
+    const uint32_t K = shapes[s][0], E = shapes[s][1], top_k = shapes[s][2];
+    uint32_t bad = 0, ties_low = 0, rows = 0;
+    for (int kind = 0; kind < 3; ++kind) {
+      for (int rep = 0; rep < 8; ++rep, ++rows) {
+        router_inputs(x, w, w32, bias, K, E, top_k, kind);
+        memset(lg_h, 0xA5, sizeof(lg_h));
+        memset(wt_h, 0xA5, sizeof(wt_h));
+        memset(sel_h, 0xA5, sizeof(sel_h));
+        hvx_router_topk_f32(x, w32, bias, K, E, top_k, lg_h, sel_h, wt_h);
+        m1_router_topk_det(x, w, bias, K, E, top_k, lg_d, sel_d, wt_d);
+        bad += memcmp(lg_h, lg_d, E * sizeof(float)) != 0;
+        bad += memcmp(sel_h, sel_d, top_k * sizeof(uint32_t)) != 0;
+        bad += memcmp(wt_h, wt_d, top_k * sizeof(float)) != 0;
+        if (kind == 1) {
+          /* the tied pair's lower index is the last one selected */
+          uint32_t lo = E, hi = 0;
+          for (uint32_t e = 0; e < E; ++e) {
+            if (bias[e] == 1.0f) {
+              lo = e < lo ? e : lo;
+              hi = e > hi ? e : hi;
+            }
+          }
+          ties_low += sel_d[top_k - 1u] == lo && lo < hi;
+        }
+      }
+    }
+    printf("ROUTER TOPK K=%u E=%u top_k=%u rows=%u (random, exact tie, "
+           "1-ulp near tie) bad=%u tie_to_lowest=%u/8\n",
+           K, E, top_k, rows, bad, ties_low);
+    CHECK(bad == 0u, "router K=%u: HVX differs from m1_router_topk_det", K);
+    CHECK(ties_low == 8u,
+          "router K=%u: an exact tie did not go to the lower "
+          "index",
+          K);
+  }
+  free(x);
+  free(w);
+  free(w32);
+}
+
+/** @brief buildExpertAssignments (lfm2_moe_layer.cpp) in C: a sequential
+ *         dot for the logits (the CPU's BLAS has its own order), expf, a
+ *         true divide, and std::partial_sort under the total order score
+ *         descending, index ascending -- a full sort gives the same first
+ *         top_k. Also returns the 4th / 5th score gap. */
+typedef struct {
+  float s;
+  int e;
+} scored_t;
+static int scored_cmp(const void *pa, const void *pb) {
+  const scored_t *a = pa, *b = pb;
+  if (a->s != b->s) {
+    return a->s > b->s ? -1 : 1;
+  }
+  return a->e - b->e;
+}
+static float router_cpu(const float *x, const float *w, const float *bias,
+                        uint32_t K, uint32_t E, uint32_t top_k, uint32_t *sel,
+                        float *logits) {
+  scored_t sc[ROUTER_MAX_E];
+  for (uint32_t e = 0; e < E; ++e) {
+    float l = 0.0f;
+    for (uint32_t k = 0; k < K; ++k) {
+      l += x[k] * w[(size_t)k * E + e];
+    }
+    logits[e] = l;
+    const float s = 1.0f / (1.0f + expf(-l));
+    sc[e].s = s + bias[e];
+    sc[e].e = (int)e;
+  }
+  qsort(sc, E, sizeof(sc[0]), scored_cmp);
+  for (uint32_t r = 0; r < top_k; ++r) {
+    sel[r] = (uint32_t)sc[r].e;
+  }
+  return sc[top_k - 1u].s - sc[top_k].s;
+}
+
+static uint32_t sel_mask(const uint32_t *sel, uint32_t top_k) {
+  uint32_t m = 0;
+  for (uint32_t r = 0; r < top_k; ++r) {
+    m |= 1u << sel[r];
+  }
+  return m;
+}
+
+static void check_router_vs_cpu(void) {
+  enum { ROWS = 100000, TIE_ROWS = 1000 };
+  const uint32_t K = 2048u, E = 32u, top_k = 4u;
+  float *x = malloc(K * sizeof(float));
+  float *w = malloc((size_t)K * E * sizeof(float));
+  float *w32 = malloc((size_t)K * ROUTER_MAX_E * sizeof(float));
+  float bias[ROUTER_MAX_E], lg[ROUTER_MAX_E], lg_c[ROUTER_MAX_E];
+  float wt[ROUTER_MAX_E];
+  uint32_t sel_d[ROUTER_MAX_E], sel_c[ROUTER_MAX_E];
+  uint32_t flips = 0, tie_flips = 0;
+  float max_gap = 0.0f, max_dlogit = 0.0f;
+  /* one weight matrix and bias (a layer), a fresh activation per row */
+  router_inputs(x, w, w32, bias, K, E, top_k, 0);
+  for (uint32_t row = 0; row < ROWS; ++row) {
+    fill_rand(x, K, -2.0f, 2.0f);
+    m1_router_topk_det(x, w, bias, K, E, top_k, lg, sel_d, wt);
+    const float gap = router_cpu(x, w, bias, K, E, top_k, sel_c, lg_c);
+    for (uint32_t e = 0; e < E; ++e) {
+      const float d = fabsf(lg[e] - lg_c[e]);
+      max_dlogit = d > max_dlogit ? d : max_dlogit;
+    }
+    if (sel_mask(sel_d, top_k) != sel_mask(sel_c, top_k)) {
+      ++flips;
+      max_gap = gap > max_gap ? gap : max_gap;
+    }
+  }
+  for (uint32_t row = 0; row < TIE_ROWS; ++row) {
+    router_inputs(x, w, w32, bias, K, E, top_k, 1);
+    m1_router_topk_det(x, w, bias, K, E, top_k, lg, sel_d, wt);
+    router_cpu(x, w, bias, K, E, top_k, sel_c, lg_c);
+    tie_flips += sel_mask(sel_d, top_k) != sel_mask(sel_c, top_k);
+  }
+  /* max_dlogit is the noise scale a flip needs a gap below */
+  printf("ROUTER SPEC vs CPU rows=%d set_flips=%u max_gap_at_flip=%.3g "
+         "max_logit_diff=%.3g exact_tie_rows=%d tie_flips=%u\n",
+         ROWS, flips, (double)max_gap, (double)max_dlogit, TIE_ROWS, tie_flips);
+  CHECK(max_gap < 1e-4f, "router spec vs CPU: a flip at a score gap %.3g",
+        (double)max_gap);
+  CHECK(tie_flips == 0u, "router spec vs CPU: %u exact ties split", tie_flips);
+  free(x);
+  free(w);
+  free(w32);
+}
+
 int main(void) {
   check_rmsnorm("rmsnorm", 2048u, 2048u);
   check_rmsnorm("qk_norm_q", 32u * 64u, 64u);
   check_rmsnorm("qk_norm_k", 8u * 64u, 64u);
   check_rope();
   check_conv();
+  check_router_kernel();
+  check_router_vs_cpu();
   if (g_fail) {
     printf("M1 OPS CHECK FAILED\n");
     return 1;
   }
+  printf("ROUTER TOPK BIT-IDENTICAL\n");
   printf("M1 OPS BIT-IDENTICAL\n");
   return 0;
 }
