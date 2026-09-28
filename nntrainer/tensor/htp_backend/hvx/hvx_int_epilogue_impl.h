@@ -22,6 +22,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "hvx_int_epilogue.h"
 
@@ -88,40 +89,67 @@ static inline int32_t iq_shl(int32_t x, int k) {
 static inline int32_t iq_min(int32_t a, int32_t b) { return a < b ? a : b; }
 static inline int32_t iq_max(int32_t a, int32_t b) { return a > b ? a : b; }
 
-/** v > 0 -> m in [2^14, 2^15), e with v ~= m * 2^e; else 0, 0. */
+/** The IEEE-754 fields of a finite, normal, nonzero float: v = (-1)^s *
+ *  (2^23 + mant) * 2^(exp - 150). Denormals and zero return 0 (treated
+ *  as zero: no scale or bias here is that small), NaN and inf return 0
+ *  too. Integer only: the bake runs on the DSP's scalar core once per
+ *  weight, and frexpf + lrintf there cost ~0.5 ms an expert -- 15 ms of
+ *  a prefill call, since every layer bakes on its first call. */
+static inline int iq_float_fields(float v, uint32_t *mant24, int *exp8,
+                                  int *neg) {
+  uint32_t b;
+  memcpy(&b, &v, 4);
+  const int e = (int)((b >> 23) & 0xFFu);
+  if (e == 0 || e == 0xFF) {
+    return 0;
+  }
+  *mant24 = (b & 0x7FFFFFu) | 0x800000u;
+  *exp8 = e;
+  *neg = (b >> 31) != 0u;
+  return 1;
+}
+
+/** v > 0 -> m in [2^14, 2^15), e with v ~= m * 2^e; else 0, 0.
+ *  m = round(1.mant * 2^14), ties to even, exactly what lrintf(frexpf(v)
+ *  * 32768) gave: the same bits, so the grid the device measured is
+ *  unchanged. */
 static inline void iq_split15(float v, int16_t *m, int8_t *e) {
-  int ex = 0;
-  if (!(v > 0.0f) || !isfinite(v)) {
+  uint32_t mant24;
+  int exp8, neg;
+  if (!iq_float_fields(v, &mant24, &exp8, &neg) || neg) {
     *m = 0;
     *e = 0;
     return;
   }
-  const float f = frexpf(v, &ex);
-  long mm = lrintf(f * 32768.0f);
-  if (mm >= 32768L) {
-    mm = 16384L;
+  /* 1.mant * 2^14 = mant24 / 2^9: round the low 9 bits, ties to even */
+  const uint32_t low = mant24 & 0x1FFu;
+  uint32_t mm = mant24 >> 9; /* [2^14, 2^15) */
+  if (low > 0x100u || (low == 0x100u && (mm & 1u))) {
+    mm += 1u;
+  }
+  int ex = exp8 - 126; /* frexpf's exponent: v = f * 2^ex, f in [0.5, 1) */
+  if (mm >= 32768u) {
+    mm = 16384u;
     ex += 1;
   }
   *m = (int16_t)mm;
   *e = (int8_t)(ex - 15);
 }
 
-/** signed v -> |m| in [2^29, 2^30), e with v ~= m * 2^e; 0 -> 0, 0. */
+/** signed v -> |m| in [2^29, 2^30), e with v ~= m * 2^e; 0 -> 0, 0.
+ *  m = 1.mant * 2^29 exactly (24 significant bits fit), as lrintf(frexpf
+ *  (v) * 2^30) gave. */
 static inline void iq_split30(float v, int32_t *m, int8_t *e) {
-  int ex = 0;
-  if (v == 0.0f || !isfinite(v)) {
+  uint32_t mant24;
+  int exp8, neg;
+  if (!iq_float_fields(v, &mant24, &exp8, &neg)) {
     *m = 0;
     *e = 0;
     return;
   }
-  const float f = frexpf(v, &ex);
-  long mm = lrintf(f * 1073741824.0f);
-  if (mm >= 1073741824L || mm <= -1073741824L) {
-    mm = (mm > 0) ? 536870912L : -536870912L;
-    ex += 1;
-  }
-  *m = (int32_t)mm;
-  *e = (int8_t)(ex - 30);
+  const int32_t mm = (int32_t)(mant24 << 6); /* [2^29, 2^30) */
+  *m = neg ? -mm : mm;
+  *e = (int8_t)((exp8 - 126) - 30);
 }
 
 /** One row's dequant format for one staged batch (header, NUMBER FORMATS). */

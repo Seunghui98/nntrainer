@@ -26,8 +26,10 @@
  *   k = 0 and 2^(k-1) otherwise, then vasr by k. Amounts are clamped to
  *   [0, 30] first, as the reference does, because the hardware masks the
  *   amount and the add must not overflow.
- * - zp * colsum is Q6_Vw_vmpyi_VwRh (word times the scalar's signed low
- *   halfword; zp is at most 255).
+ * - zp * colsum is Q6_Vw_vmpyie_VwVuh against a splat of zp: word times
+ *   the lane's low unsigned halfword, exact for zp <= 255 and |colsum| <
+ *   2^16. (vmpyi(Vu.w, Rt.h) is not that: it pairs even lanes with the
+ *   scalar's low halfword and odd lanes with its high one.)
  * - The lane reduce for max |A| and for the requant's min/max is five
  *   rotate-and-combine steps, then lane 0.
  */
@@ -170,8 +172,12 @@ static inline HVX_Vector vA(const hvx_int_gu_job *c, uint32_t r, uint32_t slot,
   const int32_t *row =
     (const int32_t *)(c->tiles_base + (size_t)slot * c->tile_stride) +
     (size_t)r * c->row_stride;
-  return Q6_Vw_vsub_VwVw(vload(row),
-                         Q6_Vw_vmpyi_VwRh(vload(c->colsum_w + col), zp));
+  /* zp * colsum as word x unsigned-halfword (the low halfword of each
+     lane of a splat), NOT vmpyi(Vu.w, Rt.h): that one takes the scalar's
+     low halfword for even lanes and its high halfword for odd lanes, so
+     odd lanes were multiplied by 0 -- the self-check's "A_gate lane 1". */
+  return Q6_Vw_vsub_VwVw(
+    vload(row), Q6_Vw_vmpyie_VwVuh(vload(c->colsum_w + col), vsplat(zp)));
 }
 
 /** HVX has no unsigned word max; |A| < 2^24 (K = 2048 terms of at most
