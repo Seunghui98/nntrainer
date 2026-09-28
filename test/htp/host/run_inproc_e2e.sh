@@ -52,6 +52,22 @@
 #                              prefill NNTR_PPL sums of prompts 24 and 17)
 #   E2E ppl-decode hd64 off=<ppl> on=<ppl> delta=<%> top1=7/7   (printed;
 #                              gated: finite, and top1 7/7)
+# and, since #132, ADD and ROUTER_TOPK resident (logits only: no MoE stretch
+# is sole any more, so the switch-on runs dump no decode MoE call):
+#   E2E fwd tiny kinds=MOE,RMSNORM,CONV1D_GATE,ADD calls/token=9.00
+#   E2E eval add==noadd-tiny ... bit_identical=1       (ADD is IEEE a + b)
+#   E2E fwd hd64 kinds=<six>,ADD calls/token=10.00
+#   E2E eval add==noadd-hd64 ... bit_identical=1
+#   E2E fwd tiny kinds=MOE,RMSNORM,CONV1D_GATE,ADD,ROUTER_TOPK calls/token=7.00
+#   E2E fwd hd64 kinds=<six>,ADD,ROUTER_TOPK calls/token=8.00
+#   E2E fwd lfm25 kinds=<six>,ADD,ROUTER_TOPK calls/token=15.00
+#   E2E eval d-tiny / d-hd64 ... min_snr_db=<x>       (x >= 30 gated, vs off)
+#   E2E eval d-lfm25 ... min_snr_db=<x>                (x >= 30 gated, vs the
+#                              six-kind run: B's own near-tie routing flip
+#                              reads 16 dB against off at logits_2, and D
+#                              carries it unchanged)
+#   E2E tokens d==off-tiny / -hd64 / -lfm25 8/8 expected_mismatch=0
+#   E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED
 # NNTR_INPROC_GOLDEN=update rewrites test/htp/host/golden/lfm2_moe_tiny,
 # lfm2_moe_tiny_hd64 and lfm2_moe_tiny_lfm25 from this run's switch-off
 # HTP dumps (deliberate, like reference_logits.json).
@@ -161,6 +177,27 @@ PROMPT=512 run_e2e lfm25-off "$OUT/htp25" htp "$OUT/dump_25off" "$OUT/25off.log"
 echo "== lfm25 htp, NNTR_HTP_FORWARD=1 (all six kinds), prompt 512"
 PROMPT=512 NNTR_HTP_FORWARD=1 \
   run_e2e lfm25-fwd "$OUT/htp25" htp "$OUT/dump_25fwd" "$OUT/25fwd.log" --max-seq 2048
+# [#132] ADD, then ADD + ROUTER_TOPK (D), on the three fixtures
+D_TINY=MOE,RMSNORM,CONV1D_GATE,ADD
+echo "== [#132] htp, NNTR_HTP_FORWARD=1 KINDS=$D_TINY / +ROUTER_TOPK"
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$D_TINY \
+  run_e2e tiny-add "$OUT/htp" htp "$OUT/dump_add" "$OUT/add.log"
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$D_TINY,ROUTER_TOPK \
+  run_e2e tiny-d "$OUT/htp" htp "$OUT/dump_d" "$OUT/d.log"
+echo "== [#132] hd64 htp, KINDS=<six>,ADD / +ROUTER_TOPK"
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD \
+  run_e2e hd64-add "$OUT/htp64" htp "$OUT/dump_64add" "$OUT/64add.log" --max-seq 32
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
+  run_e2e hd64-d "$OUT/htp64" htp "$OUT/dump_64d" "$OUT/64d.log" --max-seq 32
+echo "== [#132] lfm25 htp, KINDS=<six>,ADD,ROUTER_TOPK, prompt 512"
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
+  run_e2e lfm25-d "$OUT/htp25" htp "$OUT/dump_25d" "$OUT/25d.log" --max-seq 2048
+echo "== [#132] htp, ADD resident without RMSNORM (must be refused)"
+rc_add=0
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=MOE,CONV1D_GATE,ADD "$E2E" \
+  --model "$OUT/htp" --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT \
+  --steps $STEPS --moe-engine htp > "$OUT/add_nonorm.log" 2>&1 || rc_add=$?
+tail -1 "$OUT/add_nonorm.log"
 
 if [ "${NNTR_INPROC_GOLDEN:-}" = update ]; then
   mkdir -p "$GOLDEN" "$GOLDEN64" "$GOLDEN25"
@@ -243,6 +280,45 @@ grep -q '^\[HTP\] graph: init n_ops=58 resident=RMSNORM|CONV1D_GATE|QK_NORM|ROPE
   { echo "E2E FAIL lfm25: no init line with every kind resident"; fail=1; }
 grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=16384 KiB' "$OUT/25fwd.log" ||
   { echo "E2E FAIL lfm25: no attn_m1 registration line"; fail=1; }
+# (h) [#132] ADD alone moves no bit (IEEE a + b on both sides) and takes
+# two calls per MoE layer off; ROUTER_TOPK takes one more (hd8 11 -> 9 ->
+# 7, hd64 12 -> 10 -> 8, lfm25 23 -> 19 -> 15, plan 132 section 0). The
+# switch-on runs dump no decode MoE call, so each reference is its
+# run's logits alone (a directory with no manifest compares logits only).
+# D's SNR reference is the switch-off run, except on lfm25: there B (the
+# six kinds) already reads 16 dB against off at the #136 routing flip
+# (moe_00010, a near-tie), which the logits-only compare cannot skip, so
+# D is gated against B -- the step this PR adds; the tokens policy stays
+# against off.
+logits_only() { mkdir -p "$2" && cp "$1"/logits_*.f32 "$2/"; }
+logits_only "$OUT/dump_fwd" "$OUT/ref_fwd"
+logits_only "$OUT/dump_64fwd" "$OUT/ref_64fwd"
+logits_only "$OUT/dump_htp" "$OUT/ref_off"
+logits_only "$OUT/dump_64off" "$OUT/ref_64off"
+logits_only "$OUT/dump_25fwd" "$OUT/ref_25fwd"
+calls="$(calls_per_token "$OUT/add.log")"
+echo "E2E fwd tiny kinds=$D_TINY calls/token=${calls:-none}"
+[ "$calls" = 9.00 ] || fail=1
+$EVAL --label add==noadd-tiny "$OUT/ref_fwd" "$OUT/dump_add" | tail -1 || fail=1
+calls="$(calls_per_token "$OUT/64add.log")"
+echo "E2E fwd hd64 kinds=$ALL_KINDS,ADD calls/token=${calls:-none}"
+[ "$calls" = 10.00 ] || fail=1
+$EVAL --label add==noadd-hd64 "$OUT/ref_64fwd" "$OUT/dump_64add" | tail -1 || fail=1
+for d in "tiny $D_TINY,ROUTER_TOPK d 7.00 ref_off dump_htp" \
+  "hd64 $ALL_KINDS,ADD,ROUTER_TOPK 64d 8.00 ref_64off dump_64off" \
+  "lfm25 $ALL_KINDS,ADD,ROUTER_TOPK 25d 15.00 ref_25fwd dump_25off"; do
+  read -r fx kinds tag want ref off <<< "$d"
+  calls="$(calls_per_token "$OUT/$tag.log")"
+  echo "E2E fwd $fx kinds=$kinds calls/token=${calls:-none}"
+  [ "$calls" = "$want" ] || fail=1
+  $EVAL --label "d-$fx" --allow-diff --snr-floor $SNR_FLOOR "$OUT/$ref" "$OUT/dump_$tag" | tail -1 || fail=1
+  $EVAL --label "d==off-$fx" --tokens-policy "$OUT/$off" "$OUT/dump_$tag" | tail -1 || fail=1
+done
+if [ $rc_add = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ENOTALLOWED' "$OUT/add_nonorm.log"; then
+  echo "E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED"
+else
+  echo "E2E FAIL ADD without RMSNORM not refused (rc=$rc_add)"; fail=1
+fi
 
 # (h) [#134] NNTR_PPL_DECODE on the app's own decode loop (CausalLM::run,
 # --run). g1: the self run writes its greedy continuation, the forced run

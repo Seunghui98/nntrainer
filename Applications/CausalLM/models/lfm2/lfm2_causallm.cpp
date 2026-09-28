@@ -31,6 +31,7 @@
 #include <mha_core.h>
 #include <qkv_layer.h>
 #include <reshaped_rms_norm.h>
+#include <residual_add.h>
 #include <rms_norm.h>
 #include <swiglu.h>
 #include <tie_word_embedding.h>
@@ -154,7 +155,11 @@ Tensor Lfm2Transformer::createConvBlock(const int layer_id, Tensor input) {
       "conv_block", {withKey("name", prefix + "_conv_block"),
                      withKey("unit", CONV_DIM), withKey("engine", block_eng)}));
     Tensor block_out = conv_block(normed);
-    Tensor residual_b = input.add(block_out);
+    // [#132] the residual first, the addend second (residual_add's
+    // operand order; "addition" unless NNTR_HTP_FORWARD)
+    LayerHandle add_b(
+      createLayer(RESIDUAL_ADD_TYPE, {withKey("name", prefix + "_conv_add")}));
+    Tensor residual_b = add_b({input, block_out});
     LayerHandle ffn_norm_b(
       createLayer("rms_norm", {withKey("name", prefix + "_ffn_norm"),
                                withKey("epsilon", std::to_string(NORM_EPS)),
@@ -162,7 +167,9 @@ Tensor Lfm2Transformer::createConvBlock(const int layer_id, Tensor input) {
     Tensor ffn_normed_b = ffn_norm_b(residual_b);
     Tensor ffn_out_b =
       createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed_b);
-    return residual_b.add(ffn_out_b);
+    LayerHandle add_ffn_b(
+      createLayer(RESIDUAL_ADD_TYPE, {withKey("name", prefix + "_ffn_add")}));
+    return add_ffn_b({residual_b, ffn_out_b});
   }
 
   // Expand features: [B, 1, T, DIM] → [B, 1, T, 3*CONV_DIM]
@@ -257,12 +264,16 @@ void Lfm2Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::CausalConv1DLayer>);
   tryRegister(nntrainer::createLayer<causallm::ConvBlockLayer>);
   tryRegister(nntrainer::createLayer<causallm::QKVLayer>);
+  tryRegister(nntrainer::createLayer<causallm::ResidualAddLayer>);
 }
 
 void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
                                           json &nntr_cfg,
                                           bool require_layer_types) {
   (void)generation_cfg;
+  // [#132] the residual adds carry the HTP ADD hook under the switch
+  if (htpForwardSwitch())
+    RESIDUAL_ADD_TYPE = "residual_add";
 
   try {
     unsigned int ff_dim = INTERMEDIATE_SIZE;

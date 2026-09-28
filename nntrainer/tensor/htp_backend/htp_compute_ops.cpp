@@ -1226,19 +1226,26 @@ public:
     // per-layer numbers as the graph's.
     if (forwardSwitch() && !graph_words_.empty()) {
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
-      if (M == 1 && moe_bound_ == moe_ops_.size()) {
+      // [#132] A sole MOE stretch runs here; with ADD resident the stretch
+      // is [MOE ADD RMSNORM] and the next layer's norm hook runs it, so a
+      // row the hooks do not drive (row_bound_ false: a one-token prompt
+      // binding as it goes) keeps the per-layer path.
+      const bool sole = stretch_end_[op] == op + 1u;
+      if (M == 1 && moe_bound_ == moe_ops_.size() && graphOp(op)->resident &&
+          (sole || row_bound_)) {
         ensureGraphInit(session);
-        // [#130] pos 0: no MoE stretch reads the position (its neighbours
-        // are the ARM's FC and ADD, so the stretch is the one op).
-        invokeForward(session, op, op + 1u, 0u, row_index, row_count,
-                      row_weight, act, K, out, N_out, true);
+        // pos: no MoE stretch reads the position; the hooks' row does
+        runStretchOp(session, op, sole ? 0u : cur_pos_, act, K, out, N_out,
+                     &row_index, &row_count, &row_weight);
         return;
       }
-      if (M == 1 && !graph_short_warned_) {
+      if (M == 1 && !graph_short_warned_ && moe_bound_ != moe_ops_.size()) {
         // moe_htp_layers naming a subset: the list's MoE ops can never all
         // be bound, so say so once instead of silently taking the
         // per-layer path under a measurement switch. The small-op hooks
-        // read the same condition and return 0 (the CPU path).
+        // read the same condition and return 0 (the CPU path). All bound
+        // but not taken above -- a row the hooks do not drive, or MOE not
+        // resident -- is not this case (#132).
         graph_short_warned_ = true;
         std::fprintf(stderr,
                      "[HTP] graph: %zu of %zu MoE ops bound at the first "
@@ -1277,13 +1284,16 @@ public:
               : "");
   }
 
-  /** [#130] The kinds this ARM side can drive: the MoE call and the four
-   *  layer hooks (htp_decode_hook.h). The skel's own table is checked at
-   *  graph_init (AEE_ECLASSNOTSUPPORT names a kind it lacks). */
+  /** [#130] The kinds this ARM side can drive: the MoE call and the
+   *  layer hooks (htp_decode_hook.h), with #132's residual add and router.
+   *  The skel's own table is checked at graph_init (AEE_ECLASSNOTSUPPORT
+   *  names a kind it lacks). */
   static constexpr uint32_t kArmKinds =
     HTP_GRAPH_KIND_BIT(HTP_OP_MOE) | HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) |
     HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |
-    HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) | HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1);
+    HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK);
 
   bool set_decode_graph_desc(const std::vector<uint32_t> &words) override {
     std::lock_guard<std::mutex> lock(graph_mutex_);
@@ -1312,6 +1322,16 @@ public:
       throw std::invalid_argument("set_decode_graph_desc: QK_NORM / ROPE "
                                   "resident without ATTN_M1 (no CPU layer "
                                   "consumes their output)");
+    }
+    // [#132] A resident ROUTER_TOPK needs ADD resident: then the ffn norm
+    // before it and the ADD after its MOE are resident too, so the MoE
+    // layer's one hook is always mid-stretch and the layer skips its
+    // router, top-k and experts. Without ADD the MoE call would start the
+    // stretch, and it has no row of its own to start it with.
+    if ((mask & HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK)) != 0u &&
+        (mask & HTP_GRAPH_KIND_BIT(HTP_OP_ADD)) == 0u) {
+      throw std::invalid_argument("set_decode_graph_desc: ROUTER_TOPK "
+                                  "resident without ADD");
     }
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
@@ -1363,7 +1383,7 @@ public:
     kv_len_.assign(n_attn, 0);
     std::fill(std::begin(kind_next_), std::end(kind_next_), 0u);
     cur_pos_ = HTP_GRAPH_NO_OP;
-    pending_op_ = HTP_GRAPH_NO_OP;
+    clearPending();
     seed_ordinal_ = HTP_GRAPH_NO_OP;
     rope_bound_ = false;
     attn_registered_ = false;
@@ -1424,7 +1444,7 @@ public:
         throw std::runtime_error(
           "decode_op_fp32: pos moved to " + std::to_string(pos) +
           " with the stretch input of op " + std::to_string(pending_op_) +
-          " pending (its attention hook never came)");
+          " pending (its last hook never came)");
       }
       std::fill(std::begin(kind_next_), std::end(kind_next_), 0u);
       cur_pos_ = pos;
@@ -1465,9 +1485,7 @@ public:
                  "gamma");
         param_bound_[op] = 1;
       }
-      invokeForward(session, op, stretch_end_[op], pos, {}, {}, {}, in, in_len,
-                    out, out_len, false);
-      return 1;
+      break;
     case HTP_OP_CONV1D_GATE:
       if (!param_bound_[op]) {
         setParam(session, op, HTP_GRAPH_PARAM_CONV_W, param, param_len,
@@ -1485,10 +1503,8 @@ public:
                         std::to_string(op) + ".f32",
                       state, state_len);
       }
-      invokeForward(session, op, stretch_end_[op], pos, {}, {}, {}, in, in_len,
-                    out, out_len, false);
       conv_next_pos_[op] = pos + 1u;
-      return 1;
+      break;
     case HTP_OP_QK_NORM:
       if (!param_bound_[op]) {
         setParam(session, op, HTP_GRAPH_PARAM_GAMMA, param, param_len,
@@ -1500,13 +1516,8 @@ public:
                                  std::to_string(in_len) + " floats, want " +
                                  std::to_string(rec->K));
       }
-      // first op of the [QK_NORM ROPE ATTN_M1] stretch: keep the row for
-      // the attention hook, which runs the stretch
-      pending_in_.assign(in, in + in_len);
-      pending_op_ = op;
-      return 1;
+      break;
     case HTP_OP_ATTN_M1: {
-      const uint32_t s = stretch_start_[op], e = stretch_end_[op];
       const uint32_t ord = attn_ordinal_[op];
       if (!rope_bound_) {
         setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, param,
@@ -1521,26 +1532,100 @@ public:
         --kind_next_[kind]; // the layer calls again for this same op
         return 2;
       }
-      const float *act = in;
-      unsigned act_len = in_len;
-      if (graphOp(s)->kind == HTP_OP_QK_NORM) {
-        if (pending_op_ != s) {
-          throw std::runtime_error(
-            "decode_op_fp32: ATTN_M1 op " + std::to_string(op) +
-            " without its QK_NORM op " + std::to_string(s) + "'s row");
-        }
-        act = pending_in_.data();
-        act_len = static_cast<unsigned>(pending_in_.size());
-      }
-      invokeForward(session, s, e, pos, {}, {}, {}, act, act_len, out, out_len,
-                    false);
-      pending_op_ = HTP_GRAPH_NO_OP;
       kv_len_[ord] = pos + 1u;
-      return 1;
+      break;
     }
+    case HTP_OP_ADD:
+      break;
+    case HTP_OP_ROUTER_TOPK:
+      // [#132] the gate weight [K][E] and the expert bias, once
+      if (!param_bound_[op]) {
+        setParam(session, op, HTP_GRAPH_PARAM_ROUTER_W, param, param_len,
+                 rec->K * rec->n_experts, "router weight");
+        setParam(session, op, HTP_GRAPH_PARAM_ROUTER_BIAS, state, state_len,
+                 rec->n_experts, "router bias");
+        param_bound_[op] = 1;
+      }
+      break;
     default:
       return 0;
     }
+    runStretchOp(session, op, pos, in, in_len, out, out_len, nullptr, nullptr,
+                 nullptr);
+    return 1;
+  }
+
+  /** [#132] Every hook's one dispatch over its op's stretch [s, e) (plan
+   *  132 section 3.4): the first op keeps its input row (and, for a MOE
+   *  op, the ARM's routing) pending and returns; a mid op checks that the
+   *  row is there and returns; the last op -- or a sole one -- runs the
+   *  stretch on the pending row, or on its own when it is also the first.
+   *  The layer skips its kernel either way: only the last op's @a out is
+   *  written, and the CPU tensors between are stale by design (the DSP
+   *  holds the stream: slot 0 the residual, the routing in the router's
+   *  record). */
+  void runStretchOp(remote_handle64 session, uint32_t op, uint32_t pos,
+                    const float *in, unsigned in_len, float *out,
+                    unsigned out_len, const std::vector<unsigned int> *ri,
+                    const std::vector<unsigned int> *rc,
+                    const std::vector<float> *rw) {
+    static const std::vector<unsigned int> no_u;
+    static const std::vector<float> no_f;
+    const uint32_t s = stretch_start_[op], e = stretch_end_[op];
+    // The level-3 repeat, the MoE dump and the M==1 MoE profile row are
+    // for the sole MOE stretch only: an ADD in a stretch moves slot 0, so
+    // a repeat would add twice, and C (KINDS=MOE) stays comparable to A.
+    const bool sole_moe = graphOp(s)->kind == HTP_OP_MOE && e == s + 1u;
+    // ROPE has no layer hook: a [ROPE ATTN_M1] stretch starts at the
+    // attention hook, whose row is ROPE's input
+    uint32_t first = s;
+    while (graphOp(first)->kind == HTP_OP_ROPE)
+      ++first;
+    if (first == op) {
+      if (pending_op_ != HTP_GRAPH_NO_OP) {
+        throw std::runtime_error(
+          "decode_op_fp32: op " + std::to_string(op) +
+          " starts a stretch while op " + std::to_string(pending_op_) +
+          "'s row is pending (its last hook never came)");
+      }
+      if (e == op + 1u) {
+        invokeForward(session, s, e, pos, ri ? *ri : no_u, rc ? *rc : no_u,
+                      rw ? *rw : no_f, in, in_len, out, out_len, sole_moe);
+        return;
+      }
+      if (in == nullptr) {
+        throw std::runtime_error("decode_op_fp32: op " + std::to_string(op) +
+                                 " starts a stretch with no row");
+      }
+      pending_in_.assign(in, in + in_len);
+      pending_ri_ = ri ? *ri : no_u;
+      pending_rc_ = rc ? *rc : no_u;
+      pending_rw_ = rw ? *rw : no_f;
+      pending_op_ = s;
+      return;
+    }
+    if (pending_op_ != s) {
+      throw std::runtime_error(
+        "decode_op_fp32: " +
+        std::string(htp_graph_kind_name(graphOp(op)->kind)) + " op " +
+        std::to_string(op) + " without the row of its stretch's first op " +
+        std::to_string(s) + " (its hook never came)");
+    }
+    if (e == op + 1u) {
+      invokeForward(session, s, e, pos, pending_ri_, pending_rc_, pending_rw_,
+                    pending_in_.data(),
+                    static_cast<unsigned>(pending_in_.size()), out, out_len,
+                    sole_moe);
+      clearPending();
+    }
+  }
+
+  void clearPending() {
+    pending_op_ = HTP_GRAPH_NO_OP;
+    pending_in_.clear();
+    pending_ri_.clear();
+    pending_rc_.clear();
+    pending_rw_.clear();
   }
 
   bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
@@ -3712,8 +3797,9 @@ private:
   // hooks' counters index), per op whether its parameter is bound and,
   // for CONV1D_GATE, the position its DSP state is valid for; per
   // attention ordinal the DSP cache's length (the kernel's kv_len,
-  // mirrored). pending_in_ is the QK_NORM hook's row until its ATTN_M1
-  // hook consumes it. Touched by the model's thread only.
+  // mirrored). pending_in_ is the row of the stretch's first op (QK_NORM,
+  // ADD, or a MOE op with its routing) until the stretch's last hook runs
+  // it (#132's role dispatch). Touched by the model's thread only.
   uint32_t resident_mask_ = 0;
   std::vector<uint32_t> stretch_start_, stretch_end_, attn_ordinal_;
   std::vector<uint32_t> kind_ops_[HTP_OP_KIND_N];
@@ -3728,6 +3814,9 @@ private:
   uint32_t seed_ordinal_ = HTP_GRAPH_NO_OP;
   uint32_t pending_op_ = HTP_GRAPH_NO_OP;
   std::vector<float> pending_in_;
+  // [#132] the routing a MOE op that starts a stretch was handed
+  std::vector<unsigned int> pending_ri_, pending_rc_;
+  std::vector<float> pending_rw_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;  /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0; /**< of them at the first resident op */

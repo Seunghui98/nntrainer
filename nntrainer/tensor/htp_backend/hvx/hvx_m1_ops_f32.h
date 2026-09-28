@@ -5,15 +5,15 @@
  * @file   hvx_m1_ops_f32.h
  * @date   27 Sep 2026
  * @brief  The M=1 small ops on HVX: RMSNorm (whole row / per head), RoPE at
- *         head_dim 64, causal conv1d L=3 + gate -- each bit-identical to
- *         nntrainer/tensor/m1_ops_det.h
+ *         head_dim 64, causal conv1d L=3 + gate, the MoE router (#132) --
+ *         each bit-identical to nntrainer/tensor/m1_ops_det.h
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
  * The specification, its operation order and its domain live in
  * m1_ops_det.h; this file implements it in plain Vsf (no qf32, no sf FMA --
- * HVX has none) and nothing else. All three run on the calling thread: no
+ * HVX has none) and nothing else. All four run on the calling thread: no
  * worker pool, no VTCM, no DMA, no heap. Every load and store goes through
  * HVX_UVector, because the FastRPC buffers the test entries hand in, and
  * the per-token entry's activation slots, carry no 128-byte alignment.
@@ -70,5 +70,30 @@ void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
  */
 void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
                           float *out, uint32_t C);
+
+/**
+ * @brief The MoE router of one token (m1_router_topk_det): logits, sigmoid,
+ *        biased top-k with the lowest index winning a tie, and the
+ *        normalized routing weights.
+ *
+ * One weight row is one vector: four lane accumulators over k mod 4 give
+ * the spec's summation order per expert. The weight read (K x 128 B, 256
+ * KiB at LFM2.5) is direct HVX loads from DDR with an l2fetch of the next
+ * 16 KiB ahead -- a hint that moves no bits.
+ *
+ * @param x       K floats
+ * @param w32     K x 32 floats: the [K][E] gate weight padded to 32 columns
+ *                (lanes >= E are read and ignored)
+ * @param bias    E floats
+ * @param K       a multiple of 4
+ * @param E       1..32
+ * @param top_k   1..E
+ * @param logits  E floats out
+ * @param sel     top_k expert indices out, in selection order
+ * @param weight  top_k routing weights out, in selection order
+ */
+void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
+                         uint32_t K, uint32_t E, uint32_t top_k, float *logits,
+                         uint32_t *sel, float *weight);
 
 #endif /* __NNTRAINER_HVX_M1_OPS_F32_H__ */

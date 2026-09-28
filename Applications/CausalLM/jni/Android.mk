@@ -107,6 +107,7 @@ LOCAL_SRC_FILES := \
     ../layers/tie_word_embedding.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../layers/qkv_layer.cpp \
+    ../layers/residual_add.cpp \
     ../layers/dense_ffn_layer.cpp \
     ../layers/conv_block_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
@@ -232,6 +233,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/lm_head.cpp\
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../layers/qkv_layer.cpp \
+    ../layers/residual_add.cpp \
     ../layers/dense_ffn_layer.cpp \
     ../layers/conv_block_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \

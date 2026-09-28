@@ -5,7 +5,8 @@
  * @file   m1_ops_det.h
  * @date   27 Sep 2026
  * @brief  The scalar specification of the M=1 small ops: RMSNorm (whole row
- *         and per head), RoPE at head_dim 64, causal conv1d L=3 + gate
+ *         and per head), RoPE at head_dim 64, causal conv1d L=3 + gate, and
+ *         the MoE router's logits + sigmoid + top-k (#132)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -57,9 +58,27 @@
  *     out = b*y
  *     state <- s1 | g
  *
- * DOMAIN (the analogue of LEDGER section 4's SiLU/exp argument clamp). No
- * op here contains an exp, so no argument clamp applies; what bounds the
- * inputs instead is the rsqrt seed. d >= eps = 1e-5 keeps the seed in the
+ *   router_topk_det(x[K], W[K][E], bias[E], top_k), E <= 32, K % 4 == 0
+ *   (#132; LFM2's buildExpertAssignments, lfm2_moe_layer.cpp):
+ *     a_j      = 0,  a_j = a_j + x[k] * W[k][e]  for k = j (mod 4), in k
+ *                order                  (four lane accumulators on HVX)
+ *     logit[e] = (a_0 + a_1) + (a_2 + a_3)
+ *     sig[e]   = recip_det(1 + exp_det(0 - logit[e]))   (swiglu_det.h)
+ *     score[e] = sig[e] + bias[e]
+ *     sel[r]   = argmax of score over the unchosen, the LOWEST index on a
+ *                tie, r = 0 .. top_k-1  (the CPU comparator's total order)
+ *     wsum     = 0, wsum = wsum + sig[sel[r]] in selection order
+ *     inv      = recip_det(wsum + 1e-6)
+ *     weight[r] = (sig[sel[r]] * inv) * 1.0  (NORM_TOPK_PROB, its epsilon
+ *                and ROUTED_SCALING_FACTOR)
+ *     ponytail: LFM2's router constants are hard-coded here; a router with
+ *     another scale or no normalization needs them in the op record.
+ *
+ * DOMAIN (the analogue of LEDGER section 4's SiLU/exp argument clamp). The
+ * router's exp is exp_det, clamped to [-88, 85] (swiglu_det.h), so its
+ * recip_det sees 1 + e in [1, 1 + e^85] and wsum + 1e-6 in [1e-6, 4]: both
+ * inside recip_det's seed range. The other ops contain no exp; what bounds
+ * their inputs is the rsqrt seed. d >= eps = 1e-5 keeps the seed in the
  * normal range from below; from above, the sum of chunk squares stays
  * finite while |x| < sqrt(FLT_MAX / chunk), about 4e17 at chunk = 2048
  * and 2.3e18 at 64, and a residual row past that is already broken. "fp32
@@ -78,6 +97,8 @@
 
 #include <stdint.h>
 #include <string.h>
+
+#include "swiglu_det.h"
 
 /** @brief f32 lanes in one 128-byte HVX vector; the reduction's width. */
 #define M1_DET_LANES 32u
@@ -217,6 +238,57 @@ static inline void m1_conv_gate_det(const float *abc, float *state,
     out[j] = m1_det_mul(b[j], y);
     s0[j] = s1[j];
     s1[j] = g;
+  }
+}
+
+/** @brief Router width limit: one HVX vector of f32 lanes per weight row. */
+#define M1_DET_ROUTER_MAX_E M1_DET_LANES
+
+/**
+ * @brief The MoE router of one token: logits, sigmoid, biased top-k and the
+ *        normalized routing weights (LFM2's buildExpertAssignments).
+ *
+ * @param x       K floats, the ffn-normed row
+ * @param w       K x E floats, row-major [K][E] (the gate weight's layout)
+ * @param bias    E floats, added for the selection only
+ * @param K       a multiple of 4
+ * @param E       1..32
+ * @param top_k   1..E
+ * @param logits  E floats out
+ * @param sel     top_k expert indices out, in selection order
+ * @param weight  top_k routing weights out, in selection order
+ */
+static inline void m1_router_topk_det(const float *x, const float *w,
+                                      const float *bias, uint32_t K, uint32_t E,
+                                      uint32_t top_k, float *logits,
+                                      uint32_t *sel, float *weight) {
+  float sig[M1_DET_ROUTER_MAX_E], score[M1_DET_ROUTER_MAX_E];
+  uint32_t taken = 0u, e, r, k;
+  float wsum = 0.0f, inv;
+  for (e = 0; e < E; ++e) {
+    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (k = 0; k < K; ++k) {
+      a[k & 3u] = m1_det_add(a[k & 3u], m1_det_mul(x[k], w[(size_t)k * E + e]));
+    }
+    logits[e] = m1_det_add(m1_det_add(a[0], a[1]), m1_det_add(a[2], a[3]));
+    sig[e] = swiglu_det_recip(
+      m1_det_add(1.0f, swiglu_det_exp(m1_det_sub(0.0f, logits[e]))));
+    score[e] = m1_det_add(sig[e], bias[e]);
+  }
+  for (r = 0; r < top_k; ++r) {
+    uint32_t best = E;
+    for (e = 0; e < E; ++e) {
+      if (!(taken & (1u << e)) && (best == E || score[e] > score[best])) {
+        best = e;
+      }
+    }
+    taken |= 1u << best;
+    sel[r] = best;
+    wsum = m1_det_add(wsum, sig[best]);
+  }
+  inv = swiglu_det_recip(m1_det_add(wsum, 1e-6f));
+  for (r = 0; r < top_k; ++r) {
+    weight[r] = m1_det_mul(m1_det_mul(sig[sel[r]], inv), 1.0f);
   }
 }
 

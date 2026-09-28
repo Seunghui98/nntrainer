@@ -83,8 +83,9 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
     for (size_t l = 0; l < layer_types_.size(); ++l)
       attn[l] = layer_types_[l] != "conv";
     // [#130] NNTR_HTP_FORWARD_KINDS (comma-separated kind names) chooses
-    // which kinds carry the resident bit; the default is every kind the
-    // skel and the ARM hooks run. The bit is the one source of truth for
+    // which kinds carry the resident bit; the default is #130's six kinds,
+    // so its recipes keep their meaning -- #132's ADD and ROUTER_TOPK are
+    // opt-in (...,ADD,ROUTER_TOPK). The bit is the one source of truth for
     // both sides (plan 130 section 3.2).
     const char *kinds = std::getenv("NNTR_HTP_FORWARD_KINDS");
     const uint32_t mask =

@@ -18,6 +18,7 @@
 #include <compute_ops.h>
 #include <cpu_backend.h>
 #include <cstdlib>
+#include <htp_decode_hook.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
 #include <node_exporter.h>
@@ -290,11 +291,13 @@ void Lfm2MoELayer::buildExpertAssignments(
       scored[e] = {s + bias[e], static_cast<int>(e)};
     }
 
-    // top-k experts by (sigmoid + bias)
+    // top-k experts by (sigmoid + bias); an exact tie goes to the lower
+    // index -- a total order, so the selection does not depend on the
+    // library's partial_sort, and the HTP router's rule (m1_ops_det.h)
     std::partial_sort(
       scored.begin(), scored.begin() + topk, scored.end(),
       [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
-        return a.first > b.first;
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
       });
 
     // routing weights come from the bias-free sigmoid scores
@@ -766,6 +769,18 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
       // reshape output: [B,1,S,H] -> [B*S,1,1,H]
       output.reshape({total_tokens, 1, 1, hidden_size});
+    }
+
+    // [#132] one decode row: the HTP routes, runs the experts and adds
+    // the result into its resident residual in the same stretch, so the
+    // layer writes nothing (the next norm hook returns the stream)
+    if (total_tokens == 1 &&
+        gate_weights.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        htpDecodeRouter(from, input.getData<float>(), hidden_size,
+                        gate_weights.getData<float>(), num_experts,
+                        expert_bias.getData<float>())) {
+      output.reshape({batch_size, 1, seq_len, hidden_size});
+      continue;
     }
 
     // routing

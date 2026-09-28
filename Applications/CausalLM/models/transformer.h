@@ -371,6 +371,10 @@ protected:
   int NUM_KEY_VALUE_HEADS;
   int NUM_TO_GENERATE;
   std::string MODEL_TENSOR_TYPE;
+  /** The layer type of createTransformerDecoderBlock's two residual adds:
+   *  the core "addition", or a model's own (LFM2 under NNTR_HTP_FORWARD
+   *  takes "residual_add", which carries the HTP decode hook; #132). */
+  std::string RESIDUAL_ADD_TYPE = "addition";
   std::string EMBEDDING_DTYPE; /** embedding dtype */
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
