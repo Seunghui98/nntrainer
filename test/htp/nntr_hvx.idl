@@ -188,4 +188,44 @@ interface nntr_hvx : remote_handle64 {
                                        in sequence<float> sinks,
                                        rout sequence<float> out_f32,
                                        rout sequence<uint32> stats_us);
+
+   // --- resident int8 / int4 KV cache with per-token scales (A8W8 / A8W4) ---
+   //
+   // kind 0 = int8 (A8W8), 1 = int4 (A8W4). Rows arrive as the cache's own
+   // row-major fp16 ([n][n_head_kv*head_dim]) and are quantized on the DSP:
+   // K symmetric per (row, head) with colsum, V symmetric per (row, head,
+   // 32-dim group); masters in decode layout plus baked HMX WH tiles. See
+   // hexkl_kv_q.h and 21_quantized_attention_plan.md.
+   AEEResult kv_register_q(in uint32 kind, in uint32 max_rows,
+                           in uint32 n_head_kv, in uint32 head_dim,
+                           rout uint32 kv_handle);
+
+   AEEResult kv_release_q(in uint32 kv_handle);
+
+   AEEResult kv_append_q(in uint32 kv_handle, in uint32 row0,
+                         in sequence<uint16> k_rows,
+                         in sequence<uint16> v_rows);
+
+   // Rows [row0, row0+n_rows) back in row-major order: k_q / v_q
+   // [n_rows][n_head_kv*head_dim] int8, s_k / colsum_k [n_rows][n_head_kv],
+   // s_v [n_rows][n_head_kv][head_dim/32]. Test and debug use.
+   AEEResult kv_dump_q(in uint32 kv_handle, in uint32 row0, in uint32 n_rows,
+                       rout sequence<int8> k_q, rout sequence<int8> v_q,
+                       rout sequence<float> s_k, rout sequence<int32> colsum_k,
+                       rout sequence<float> s_v);
+
+   // The int32 accumulator readout layout as hexkl_acc_layout_get derives
+   // it: layout = { usable, base, row_stride }.
+   AEEResult probe_acc_i32_layout(rout sequence<uint32> layout);
+
+   // Runs HMX against the baked tiles of column tile c (cache rows
+   // 32c..32c+31) of kv head n: s_i32 [64][32] = act_s [64][head_dim] u8
+   // . K^T, o_i32 [64][head_dim] = act_p [64][32] u8 . V, both read from the
+   // accumulator through the probed layout. Exact integers, so the host
+   // checks them against its own int matmul over kv_dump_q's masters --
+   // this is what gates the bake, the kind and the layout probe together.
+   AEEResult probe_kv_q_mm(in uint32 kv_handle, in uint32 n, in uint32 c,
+                           in sequence<uint8> act_s, in sequence<uint8> act_p,
+                           rout sequence<int32> s_i32,
+                           rout sequence<int32> o_i32);
 };

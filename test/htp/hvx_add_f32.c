@@ -117,6 +117,11 @@ int nntr_hvx_close(remote_handle64 handle) {
       hexkl_kv_tiles_f16_release(&s->kv_tiles, i);
     }
   }
+  for (uint32_t i = 0; i < HEXKL_KV_Q_MAX; ++i) {
+    if (s->kv_q.slots[i].in_use) {
+      hexkl_kv_q_release(&s->kv_q, i);
+    }
+  }
   hvx_worker_pool_destroy(s->quant_pool);
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {

@@ -200,6 +200,26 @@ test('unittest_hexkl_kv_tiles_f16', unittest_hexkl_kv_tiles_f16_exe,
   suite: 'unittests'
 )
 
+# The quantized (int8 / int4) KV cache registry: quantizer, master layouts
+# and append / dump bookkeeping are plain C; only the HexKL tile bake is
+# DSP-side and is exercised by the device test instead.
+unittest_hexkl_kv_q_exe = executable(
+  'unittest_hexkl_kv_q',
+  ['unittest_hexkl_kv_q.cpp',
+   '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_q.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_q')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')
