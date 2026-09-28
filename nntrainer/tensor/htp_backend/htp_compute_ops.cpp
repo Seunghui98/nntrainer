@@ -249,6 +249,15 @@ public:
     prefetch_reader_cpus_ |= reader_cpus;
   }
 
+  /** @brief One expert a reader thread read: how long, and whether it was
+   *  for the batch the layer asks for next (read at full width) or a later
+   *  one (doc 52 section 10.30). */
+  void addPrefetchRead(uint64_t read_us, bool next) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prefetch_read_us_ += read_us;
+    ++(next ? prefetch_read_next_ : prefetch_read_ahead_);
+  }
+
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
                  const uint32_t *stage_us) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -637,6 +646,19 @@ private:
                    100.0 * prefetch_done_on_entry_ / prefetch_n_,
                    cpus(prefetch_caller_cpus_).c_str(),
                    cpus(prefetch_reader_cpus_).c_str());
+      // [doc 52 section 10.30] How the readers spent their time: the
+      // per-expert read on a reader thread (page cache 0.5-1 ms, flash
+      // 4-5 ms), and how many experts were read for the next batch at full
+      // width against how many further ahead at the narrower width.
+      const uint64_t reads = prefetch_read_next_ + prefetch_read_ahead_;
+      if (reads != 0)
+        std::fprintf(stderr,
+                     "[HTP-PROFILE] expert prefetch readers: %.2f ms/expert on "
+                     "a reader, %llu experts read for the next batch (full "
+                     "width), %llu further ahead (ahead width)\n\n",
+                     ms(prefetch_read_us_) / reads,
+                     (unsigned long long)prefetch_read_next_,
+                     (unsigned long long)prefetch_read_ahead_);
     }
   }
 
@@ -655,6 +677,8 @@ private:
   uint64_t miss_total_ = 0, miss_read_total_us_ = 0, miss_rpc_total_us_ = 0;
   uint64_t prefetch_n_ = 0, prefetch_wait_us_ = 0, prefetch_rpc_us_ = 0;
   uint64_t prefetch_done_on_entry_ = 0;
+  uint64_t prefetch_read_us_ = 0, prefetch_read_next_ = 0,
+           prefetch_read_ahead_ = 0;
   uint32_t prefetch_caller_cpus_ = 0, prefetch_reader_cpus_ = 0;
   /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
    *  through the MoE layer kernel (doc 51). */
@@ -1193,6 +1217,7 @@ public:
       batch = std::move(prefetch_batches_.front());
       prefetch_batches_.pop_front();
     }
+    prefetch_cv_.notify_all(); // the next batch is now the one to widen on
     const uint64_t t_wait = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(handle_mutex_);
     std::exception_ptr first;
@@ -2471,9 +2496,10 @@ private:
     size_t used;     /**< bump pointer */
   };
 
-  /** @brief Where one weight sits, and the three small arrays that are not
-   *  worth arena space (4 KB against 3.5 MB) and would need their own
-   *  alignment rules if they were. */
+  /** @brief Where one weight sits, and its three small arrays when they
+   *  are passed to the DSP by value (the resident path). An expert slot
+   *  keeps them in the arena after the WH bytes instead (readWeight) and
+   *  leaves these empty. */
   struct ArenaEntry {
     uint32_t chunk;
     uint32_t off;
@@ -2598,8 +2624,12 @@ private:
     return slot;
   }
 
+  /** @brief One weight's span in an expert slot: its WH bytes, then its N
+   *  f32 scales and N i32 column sums (doc 52 section 10.30: the DSP takes
+   *  them from here, so a swap carries offsets and nothing else), rounded
+   *  to a page. +44 KB on a 5.25 MB expert. */
   static uint32_t expertStride(uint32_t K, uint32_t N) {
-    return (static_cast<uint32_t>(whBytes(K, N)) + 4095u) & ~4095u;
+    return (static_cast<uint32_t>(whBytes(K, N)) + 8u * N + 4095u) & ~4095u;
   }
 
   /** @brief Reads both weights of @a st into its slot. No lock and no
@@ -2766,32 +2796,56 @@ private:
       });
   }
 
+  /** @brief Takes the oldest unread expert and reads it. An expert of the
+   *  oldest batch -- the one _end will ask for next -- is taken at once;
+   *  one of a later batch only while fewer than ahead_readers are busy
+   *  (PrefetchKnobs). */
   void prefetchReaderLoop() {
+    const size_t ahead = prefetchKnobs().ahead_readers;
     for (;;) {
       std::pair<PrefetchBatch *, size_t> job;
+      bool next = false;
       {
         std::unique_lock<std::mutex> lock(prefetch_mutex_);
-        prefetch_cv_.wait(
-          lock, [this] { return prefetch_stop_ || !prefetch_jobs_.empty(); });
+        prefetch_cv_.wait(lock, [this, ahead, &next] {
+          if (prefetch_stop_)
+            return true;
+          if (prefetch_jobs_.empty())
+            return false;
+          next =
+            prefetch_jobs_.front().first == prefetch_batches_.front().get();
+          return next || prefetch_active_ < ahead;
+        });
         if (prefetch_stop_)
           return;
         job = prefetch_jobs_.front();
         prefetch_jobs_.pop_front();
+        ++prefetch_active_;
       }
       prefetch_reader_cpus_.fetch_or(cpuBit());
+      const uint64_t t0 = HtpProfile::nowUs();
       StagedExpert &st = job.first->experts[job.second];
       st.rc = readExpert(st, /*use_pool=*/false);
+      HtpProfile &profile = HtpProfile::global();
+      if (profile.level() != 0)
+        profile.addPrefetchRead(HtpProfile::nowUs() - t0, next);
       {
         std::lock_guard<std::mutex> lock(prefetch_mutex_);
+        --prefetch_active_;
         ++job.first->done;
       }
       prefetch_done_cv_.notify_all();
+      prefetch_cv_.notify_all(); // a reader held back by ahead may go
     }
   }
 
-  /** @brief Reads one QS4CX_WH weight from the model file: the nibbles
-   *  into the arena at @a arena_dst, the N scales and N column sums that
-   *  follow them into @a e. whBytes(K, N) is the nibble half exactly:
+  /** @brief Reads one QS4CX_WH weight from the model file into the arena
+   *  at @a arena_dst: the nibbles, then the N scales and N column sums
+   *  that follow them in the file, laid out as the DSP registry expects
+   *  (f32 scales, then i32 column sums -- the file keeps the sums as f32,
+   *  so they pass through a small buffer). @a e gets the shape only; its
+   *  arrays stay empty, which is what tells the swap call the arrays are
+   *  in the arena. whBytes(K, N) is the nibble half exactly:
    *  QS4CX_Tensor::size() counts N * ceil(K / 2) and K is a multiple of
    *  32 here. @return 0, errno, or -1 at end of file. */
   int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
@@ -2832,13 +2886,15 @@ private:
       preadAll(fd, tail.data(), tail.size() * sizeof(float), off + nib);
     if (rc != 0)
       return rc;
+    std::vector<int32_t> colsum(N);
+    for (uint32_t i = 0; i < N; ++i)
+      colsum[i] = static_cast<int32_t>(tail[N + i]);
+    // Two sequential stores into the uncached mapping, never a read back.
+    std::memcpy(arena_dst + nib, tail.data(), sizeof(float) * N);
+    std::memcpy(arena_dst + nib + sizeof(float) * N, colsum.data(),
+                sizeof(int32_t) * N);
     e.K = K;
     e.N = N;
-    e.w_scale.assign(tail.begin(), tail.begin() + N);
-    e.colsum_w.resize(N);
-    for (uint32_t i = 0; i < N; ++i)
-      e.colsum_w[i] = static_cast<int32_t>(tail[N + i]);
-    e.bias.assign(N, 0.0f);
     return 0;
   }
 
@@ -3352,6 +3408,7 @@ private:
   std::condition_variable prefetch_cv_, prefetch_done_cv_;
   std::deque<std::unique_ptr<PrefetchBatch>> prefetch_batches_;
   std::deque<std::pair<PrefetchBatch *, size_t>> prefetch_jobs_;
+  size_t prefetch_active_ = 0; /**< readers inside readExpert */
   bool prefetch_stop_ = false;
   std::vector<std::thread> prefetch_readers_;
   std::atomic<uint32_t> prefetch_reader_cpus_{0};
@@ -3364,11 +3421,20 @@ private:
    *        grows by 7 ms; section 10.19 traced that to the readers
    *        sharing the caller's core. Not defaults.
    *  - NNTR_MOE_PREFETCH_READERS=<n>: reader threads (4)
+   *  - NNTR_MOE_PREFETCH_AHEAD_READERS=<n>: how many of them may work on a
+   *    batch that is not the next one the layer will ask for (2). Doc 52
+   *    section 10.30: readers writing into the arena slow the layer call
+   *    that runs meanwhile (DDR), four of them by 1.7 ms a call and two by
+   *    0.4; four are needed only when the reads come from flash and the
+   *    next batch is late. So the full width goes to the next batch and
+   *    the rest is read narrower. Set equal to READERS for the old
+   *    behaviour.
    *  - NNTR_MOE_PREFETCH_CPUS=<a,b,..>: pin the readers to these cores
    *    (default: every core but the caller's)
    */
   struct PrefetchKnobs {
     size_t readers = 4;
+    size_t ahead_readers = 2;
     std::vector<int> cpus;
   };
   static const PrefetchKnobs &prefetchKnobs() {
@@ -3376,6 +3442,9 @@ private:
       PrefetchKnobs r;
       if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
         r.readers = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
+      if (const char *v = std::getenv("NNTR_MOE_PREFETCH_AHEAD_READERS"))
+        r.ahead_readers = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
+      r.ahead_readers = std::min(r.ahead_readers, r.readers);
       if (const char *v = std::getenv("NNTR_MOE_PREFETCH_CPUS")) {
         for (const char *p = v; *p != '\0';) {
           char *end = nullptr;

@@ -45,6 +45,7 @@ typedef struct {
   float *w_scale;    /**< N entries */
   int32_t *colsum_w; /**< N entries */
   float *bias;       /**< N entries */
+  void *arrays;      /**< the one allocation the three arrays sit in */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
 } hexkl_weight_u8i4;
@@ -85,9 +86,14 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
  *
  * Nothing is copied and nothing is allocated for the bytes: the slot points
  * at @a wh and release() leaves it alone. The three N-sized arrays are
- * copied, they are small. The caller guarantees @a wh stays mapped and
- * unchanged for the handle's lifetime -- the arena code refuses to detach
- * while a slot borrows from it, which is the check that keeps that promise.
+ * copied, they are small. With @a w_scale, @a colsum_w and @a bias all NULL
+ * the scales and column sums are taken from the arena instead, where the
+ * host laid them right after the WH bytes (N f32 scales, then N i32 column
+ * sums; doc 52 section 10.30), and the bias is zero: @a wh must then be
+ * followed by 8*N mapped bytes, which the caller checks against its arena.
+ * The caller guarantees @a wh stays mapped and unchanged for the handle's
+ * lifetime -- the arena code refuses to detach while a slot borrows from
+ * it, which is the check that keeps that promise.
  *
  * @a wh must be WEIGHT_TILE_BYTES_U8I4-aligned: every DMA out of it starts
  * on a tile boundary and the ring's 2D descriptors assume it.
@@ -104,6 +110,8 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
  *        its arrays, the scales and column sums are overwritten and the
  *        bias zeroed. What an expert swap does when the retired pair has
  *        the new expert's shape -- no allocation, no free, no slot search.
+ *        NULL @a w_scale and @a colsum_w take them from the arena after
+ *        @a wh, as hexkl_weight_u8i4_register_arena does.
  *
  * @return AEE_SUCCESS, or AEE_EBADPARM (changing nothing) for a free,
  *         owned or differently shaped slot, or an unaligned @a wh.

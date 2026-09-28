@@ -211,6 +211,91 @@ int main(void) {
     CHECK(done == 0 && live() == 2);
   }
 
+  /* 7. [doc 52 section 10.30] Empty sequences: the scales and column sums
+        come from the arena, right after each weight's WH bytes -- N f32
+        then N i32 -- and the bias is zero. Rebind in place first, then
+        the register path (a retired pair of another shape), then the
+        extent check that now covers the tail, then the batch. */
+  {
+    const uint32_t og0 = NONE, od0 = NONE;
+    uint32_t g3 = NONE, d3 = NONE, x2 = 77, y2 = 77;
+    float *gt = (float *)(va + 8192 + GU_BYTES);  /* gate_up's tail */
+    float *dt = (float *)(va + 12288 + DN_BYTES); /* down's tail */
+    for (int i = 0; i < NGU; ++i) {
+      gt[i] = 7.5f - (float)i;
+      ((int32_t *)gt)[NGU + i] = 1000 + i;
+    }
+    for (int i = 0; i < NOUT; ++i) {
+      dt[i] = -1.0f * (float)i;
+      ((int32_t *)dt)[NOUT + i] = -i;
+    }
+    /* the live pair from 6 has this shape: rebound in place */
+    uint32_t lg = NONE, ld = NONE;
+    for (unsigned i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
+      const hexkl_weight_u8i4 *w = &g_s.weights_u8i4.slots[i];
+      if (w->in_use && w->K == K && w->N == NGU)
+        lg = i;
+      if (w->in_use && w->K == INTER && w->N == NOUT)
+        ld = i;
+    }
+    CHECK(lg != NONE && ld != NONE);
+    const float *arr_lg = g_s.weights_u8i4.slots[lg].w_scale;
+    CHECK(nntr_hvx_weight_swap_u8i4_arena((remote_handle64)(uintptr_t)&g_s, lg,
+                                          ld, K, INTER, NOUT, 0, 8192, 12288,
+                                          NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                          &g3, &d3) == AEE_SUCCESS);
+    CHECK(g3 == lg && d3 == ld && live() == 2);
+    CHECK(g_s.weights_u8i4.slots[g3].w_scale == arr_lg);
+    CHECK(memcmp(g_s.weights_u8i4.slots[g3].w_scale, gt, sizeof(float) * NGU) ==
+          0);
+    CHECK(memcmp(g_s.weights_u8i4.slots[g3].colsum_w, gt + NGU,
+                 sizeof(int32_t) * NGU) == 0);
+    CHECK(memcmp(g_s.weights_u8i4.slots[d3].w_scale, dt,
+                 sizeof(float) * NOUT) == 0);
+    CHECK(memcmp(g_s.weights_u8i4.slots[d3].colsum_w, dt + NOUT,
+                 sizeof(int32_t) * NOUT) == 0);
+    for (int i = 0; i < NGU; ++i)
+      CHECK(g_s.weights_u8i4.slots[g3].bias[i] == 0.0f);
+    /* register path: nothing to release, same arena bytes */
+    CHECK(nntr_hvx_weight_swap_u8i4_arena((remote_handle64)(uintptr_t)&g_s, og0,
+                                          od0, K, INTER, NOUT, 0, 8192, 12288,
+                                          NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                          &x2, &y2) == AEE_SUCCESS);
+    CHECK(live() == 4 && x2 != g3 && y2 != d3);
+    CHECK(memcmp(g_s.weights_u8i4.slots[x2].colsum_w, gt + NGU,
+                 sizeof(int32_t) * NGU) == 0);
+    for (int i = 0; i < NOUT; ++i)
+      CHECK(g_s.weights_u8i4.slots[y2].bias[i] == 0.0f);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, x2);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, y2);
+    CHECK(live() == 2);
+    /* down's WH bytes fit the arena but its tail does not: refused, and
+       gate_up (checked first) is untouched */
+    CHECK(nntr_hvx_weight_swap_u8i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, g3, d3, K, INTER, NOUT, 0, 0,
+            ARENA - DN_BYTES, NULL, 0, NULL, 0, NULL, 0, NULL, 0, &x2,
+            &y2) == AEE_EBADPARM);
+    CHECK(g_s.weights_u8i4.slots[g3].wh_bytes == va + 8192 && live() == 2);
+    /* half empty is a length mismatch, not the tail protocol */
+    CHECK(nntr_hvx_weight_swap_u8i4_arena((remote_handle64)(uintptr_t)&g_s, g3,
+                                          d3, K, INTER, NOUT, 0, 8192, 12288,
+                                          NULL, 0, NULL, 0, dn_s, NOUT, dn_c,
+                                          NOUT, &x2, &y2) == AEE_EBADPARM);
+    /* the batch, one expert, empty flat sequences */
+    {
+      uint32_t bog[1] = {g3}, bod[1] = {d3}, bar[1] = {0}, bofg[1] = {8192},
+               bofd[1] = {12288}, bhg[1] = {NONE}, bhd[1] = {NONE}, done = 9;
+      int32_t err = 1;
+      gt[0] = 42.0f;
+      CHECK(nntr_hvx_weight_swap_batch_u8i4_arena(
+              (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, bog, 1, bod, 1,
+              bar, 1, bofg, 1, bofd, 1, NULL, 0, NULL, 0, NULL, 0, NULL, 0, bhg,
+              1, bhd, 1, &done, &err) == AEE_SUCCESS);
+      CHECK(done == 1 && err == AEE_SUCCESS && bhg[0] == g3 && bhd[0] == d3);
+      CHECK(g_s.weights_u8i4.slots[g3].w_scale[0] == 42.0f);
+    }
+  }
+
   printf("WEIGHT SWAP OK\n");
   return 0;
 }

@@ -140,3 +140,13 @@ void hexkl_dma_ring_drain(void) {
   }
   g_started = 0; // engine idle after drain -- the next push must dmstart
 }
+
+void hexkl_dcache_inva(const void *p, uint32_t bytes) {
+  const uintptr_t line = 32u; /* L1 line; L2's 64 B lines cover it */
+  uintptr_t a = (uintptr_t)p & ~(line - 1u);
+  const uintptr_t end = (uintptr_t)p + bytes;
+  for (; a < end; a += line) {
+    Q6_dcinva_A((void *)a);
+  }
+  asm volatile("" ::: "memory");
+}

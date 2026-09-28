@@ -1034,3 +1034,35 @@ calloc)였다.
 2. 히트 expert 계산과 미스 읽기를 겹친다(층 콜을 히트분 → 미스분으로 나누기). 둘 다 DDR을 쓰므로 겹치는 이득은 제한적이다.
    decode 층 콜 DSP 시간과 미스 읽기 시간을 먼저 재고 판단한다.
 3. swap 0.07 ms/미스(토큰당 2.6 ms)는 §10.28 다음 2번(스케일·colsum 빌려 쓰기)으로 줄일 수 있다. 최대 +1.1 TPS.
+
+### 10.30 등록을 offset만으로, 리더는 "다음 배치"에만 넓게 (코드, 호스트 체크 통과, 기기 미측정)
+
+§10.28의 warm +62 ms 두 몫을 각각 없앤다. 등록 34 ms(expert마다 스케일·colsum 44 KB를 RPC 인자로 넘기고 DSP가 복사)와,
+리더 4개가 아레나에 쓰는 동안 층 콜이 느려지는 약 40 ms(DSP +1.0, transport +0.7 ms/콜; 리더 2개면 +0.4).
+
+**1. 스케일·colsum을 아레나에 두고 DSP가 가져간다.**
+- 호스트 `readWeight`: 파일의 꼬리(N f32 스케일, N f32 colsum)를 읽어 colsum만 i32로 바꾼 뒤 **WH 바이트 바로 뒤 아레나 칸에** 쓴다.
+  칸 stride는 `round4K(whBytes + 8N)`, expert당 +44 KB(+0.8%). `ArenaEntry`의 벡터는 비워 두고, 그게 swap 호출에 "인자가 아레나에 있다"는 신호다.
+- IDL은 그대로다. `weight_swap_u8i4_arena`·`_batch`에 **네 sequence가 모두 비면** 꼬리를 아레나에서 읽는다(옛 skel은 길이 오류로 거부 →
+  호스트 오류 메시지가 skel 재빌드를 말한다). 배열을 넘기는 옛 형식도 그대로 받는다(테스트, 상주 경로의 `register_u8i4_arena`).
+- 레지스트리 `hexkl_weight_u8i4_register_arena`/`rebind_arena`에 NULL 배열 = 꼬리 모드. 꼬리는 **memcpy가 아니라 DMA**로 힙 배열에 옮긴다:
+  아레나는 호스트 uncached DDR이라 스칼라 코어가 1 GB/s 아래로 읽고(문서 46 §10), DMA는 대역폭대로 읽는다. 앞뒤로 `dcinva`(원본: 이전 swap이
+  L2에 남긴 줄, 목적지: epilogue가 L1에 남긴 줄). 세 배열은 128 정렬 블록 하나로 합쳤다(`arrays`). epilogue는 전과 같이 힙 배열을 읽는다 —
+  아레나를 직접 가리키면 타일마다 uncached 로드가 나서 dequant가 망가진다.
+- `arena_weight_at`의 범위 검사가 꼬리 8N을 포함한다.
+- 기대: 배치 RPC 인자 1 MB → 500 B. 층당 등록 1.5 → ~0.3 ms(DMA 48회 + 왕복), prefill 34 → **~7 ms**. decode swap은 왕복이 대부분이라 2.6 → ~2 ms/토큰.
+- 호스트 체크 `swap_host_check` 7번: 제자리 재바인딩·등록 경로·꼬리 범위 초과 거부·반만 빈 길이 거부·배치. 범위 검사를 빼면, 또는
+  재바인딩의 꼬리 복사를 빼면 실패한다(변이 2개 확인). 기기 테스트 `HmxArenaSlotReuse.TailSwap` 추가(같은 칸을 두 번 지나는 stale 캐시 검사).
+  **`Swap`·`TailSwap` 둘 다 기기에서 아직 안 돌렸다.** `Swap`은 힙 참조에 bias가 있어 늘 실패했을 것이라 참조를 0 bias로 다시 등록하게 고쳤다.
+
+**2. 리더 폭을 배치 순서로 정한다(임계값 없음).**
+- `NNTR_MOE_PREFETCH_AHEAD_READERS`(기본 2): 층이 **다음에 물어볼 배치**(가장 오래된 것)의 expert는 리더 4개가 다 붙고, 그보다 앞선 배치는
+  2개까지만 동시에 읽는다. warm이면 다음 배치가 늘 먼저 끝나 있어 리더 2개로 돌고(k1r2의 +0.4 ms/콜), cold면 다음 배치가 늦어 4개가 붙는다(§10.26의 935 ms).
+  읽기 속도 임계값으로 warm/cold를 가르는 안은 버렸다: 리더 수에 따라 expert당 시간이 달라져(UFS 4.0에서 2개면 2.6 ms, page cache에서 4개면 ~1.3 ms) 경계가 얇다.
+- `=4`가 §10.28의 동작이다(A/B용). 프로파일에 `expert prefetch readers: X ms/expert on a reader, N for the next batch (full width), M further ahead` 행 추가.
+- 기대: warm prefill 639 → **약 590 ms**(상주 577 + 등록 ~7 + 콜 +0.4 × 23). cold는 930 유지.
+
+**측정(`tail.sh`).** 순서: 예열 → default(t, p) → ahead4(t, p) → off → cold default → cold ahead4 → 예열 → 상주(t, p). 볼 것: ppl 62.0916(꼬리 프로토콜의
+정확성 — 틀리면 dcinva가 L2에 안 닿은 것), prefill, `register rpc` ms, `readers` 행, 층 콜 host/dsp/transport. 그 전에 `HmxArenaSlotReuse.TailSwap`.
+
+**빌드.** skel 재빌드 필수(레지스트리·swap 변경). IDL 서명은 그대로라 stub 재생성은 불필요하지만, 브랜치를 오갔다면 §10.24의 규칙대로 둘 다 다시 만든다.

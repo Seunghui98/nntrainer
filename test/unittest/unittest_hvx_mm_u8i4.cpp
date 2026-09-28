@@ -2319,8 +2319,13 @@ protected:
   /** @param swap fill the slot the way the host's expert pool does since
    *  doc 52 section 10.12: overwrite it while the previous pair is still
    *  registered, then one weight_swap_u8i4_arena registers the new pair and
-   *  releases the old -- rather than release, overwrite, register. */
-  size_t Run(const char *path, bool swap = false) {
+   *  releases the old -- rather than release, overwrite, register.
+   *  @param tail (with swap) lay each weight's scales and column sums in
+   *  the slot after its WH bytes and send the swap empty sequences, as the
+   *  pool does since doc 52 section 10.30: the DSP fetches them from the
+   *  arena. A second pass through the same slot is the stale-cache case
+   *  the DSP-side invalidates exist for. */
+  size_t Run(const char *path, bool swap = false, bool tail = false) {
     const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
 
     auto alloc =
@@ -2341,16 +2346,39 @@ protected:
       MakeAndRegister(I, N, 0x5107B000u + e, dn[e]);
       if (::testing::Test::HasFatalFailure())
         return SIZE_MAX;
+      if (swap) {
+        // A swapped-in pair has a zero bias (rebind zeroes it, the register
+        // path passes zeros), so the heap references it is compared with
+        // need one too: re-register them with the bias cleared.
+        for (Weight *w : {&gu[e], &dn[e]}) {
+          nntr_hvx_weight_release_u8i4(handle_, w->handle);
+          std::fill(w->bias.begin(), w->bias.end(), 0.0f);
+          w->handle = 0xFFFFFFFFu;
+          const uint32_t k = w == &gu[e] ? K : I;
+          if (nntr_hvx_weight_register_u8i4(
+                handle_, k, w->N, w->q_w.data(), (int)w->q_w.size(),
+                w->d.data(), (int)w->d.size(), w->colsum.data(),
+                (int)w->colsum.size(), w->bias.data(), (int)w->bias.size(),
+                &w->handle) != AEE_SUCCESS) {
+            ADD_FAILURE() << path << ": zero-bias re-register failed";
+            return SIZE_MAX;
+          }
+        }
+      }
     }
 
     auto wh_bytes = [](uint32_t k, uint32_t n) {
       return (k / 32u) * (n / 32u) * 512u;
     };
     const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
-    const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
+    // With tail: N f32 scales and N i32 column sums after the WH bytes.
+    const uint32_t gu_tail = tail ? 8u * 2 * I : 0u,
+                   dn_tail = tail ? 8u * N : 0u;
+    const uint32_t stride_gu = (gu_len + gu_tail + 4095u) & ~4095u;
     // ONE expert slot, laid out as register_qs4cx_wh_expert_file lays it:
     // gate_up at 0, down at stride_gu.
-    const uint32_t arena_bytes = stride_gu + ((dn_len + 4095u) & ~4095u);
+    const uint32_t arena_bytes =
+      stride_gu + ((dn_len + dn_tail + 4095u) & ~4095u);
 
     void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
     if (buf == nullptr) {
@@ -2403,12 +2431,25 @@ protected:
       }
       std::memcpy(base, host_gu.data(), gu_len);
       std::memcpy(base + stride_gu, host_dn.data(), dn_len);
+      if (tail) {
+        std::memcpy(base + gu_len, gu[e].d.data(), 4u * 2 * I);
+        std::memcpy(base + gu_len + 4u * 2 * I, gu[e].colsum.data(),
+                    4u * 2 * I);
+        std::memcpy(base + stride_gu + dn_len, dn[e].d.data(), 4u * N);
+        std::memcpy(base + stride_gu + dn_len + 4u * N, dn[e].colsum.data(),
+                    4u * N);
+      }
       uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
       if (swap) {
-        const int err = nntr_hvx_weight_swap_u8i4_arena(
-          handle_, prev_gu, prev_dn, K, I, N, arena, 0, stride_gu,
-          gu[e].d.data(), (int)(2 * I), gu[e].colsum.data(), (int)(2 * I),
-          dn[e].d.data(), (int)N, dn[e].colsum.data(), (int)N, &a_gu, &a_dn);
+        const int err =
+          tail ? nntr_hvx_weight_swap_u8i4_arena(
+                   handle_, prev_gu, prev_dn, K, I, N, arena, 0, stride_gu,
+                   nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, &a_gu, &a_dn)
+               : nntr_hvx_weight_swap_u8i4_arena(
+                   handle_, prev_gu, prev_dn, K, I, N, arena, 0, stride_gu,
+                   gu[e].d.data(), (int)(2 * I), gu[e].colsum.data(),
+                   (int)(2 * I), dn[e].d.data(), (int)N, dn[e].colsum.data(),
+                   (int)N, &a_gu, &a_dn);
         if (err != AEE_SUCCESS) {
           ADD_FAILURE() << path
                         << ": weight_swap_u8i4_arena failed: " << hex(err);
@@ -2480,6 +2521,14 @@ TEST_F(HmxArenaSlotReuse, Swap) {
   EXPECT_EQ(Run("arena_slot_swap", /*swap=*/true), 0u)
     << "the slot refilled under a still-registered pair and swapped in "
        "differs from the heap weight";
+}
+
+TEST_F(HmxArenaSlotReuse, TailSwap) {
+  EXPECT_EQ(Run("arena_slot_tail_swap", /*swap=*/true, /*tail=*/true), 0u)
+    << "a pair whose scales and column sums the DSP fetched from the arena "
+       "(doc 52 section 10.30) differs from the heap weight: on pass 1 the "
+       "DSP read stale scales, and the invalidates around the tail DMA do "
+       "not reach the cache that held them";
 }
 
 TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
