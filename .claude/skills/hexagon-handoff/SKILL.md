@@ -19,7 +19,15 @@ Hard rules (user decisions 2026-09-21):
   tok/s.
 * Accuracy columns are mandatory: text identical to the CPU `q40` run
   (y/n, first differing token index), `NNTR_L2_DIFF` result when the
-  variant changes DSP arithmetic.
+  variant changes DSP arithmetic. **Handoffs that run the per-token entry
+  (`NNTR_HTP_FORWARD=1`, #130 onward; user decision 2026-09-28) add two
+  things:** a `PPL` column (`NNTR_PPL=1` on one extra run per variant and
+  G=64, the CPU `q40` PPL of the same prompt as the reference, fail above
+  +2 % unless the plan says otherwise) and a **text approval** section —
+  the filled handoff pastes A's and every variant's generated text (G=64,
+  run 1) in full, and the user marks `text approved: y/n` per variant.
+  Differing text is not a fail by itself; an unapproved text is not a
+  pass; the supervisor folds only approved rows.
 * Every artifact row has an md5 and the commit it was built from; the
   user copies the md5 the run prints or `md5sum` on the device shows.
 
@@ -63,6 +71,12 @@ Branch `htp/<issue#>-<slug>` @ `<sha>` — estimated device time: <N> min
 
 Reference: NPU now 20.8 / CPU now 48 decode tok/s, NPU prefill 523 (PR doc 49; replaced by the first handoff). Goal ≥ 50, prefill ≥ 497.
 
+## Text approval (per-token-entry handoffs only)
+| variant | PPL (NNTR_PPL, G=64) | generated text (G=64, run 1) | text approved (user: y/n) |
+|---|---|---|---|
+| A | | <paste> | (reference) |
+| B | | <paste> | |
+
 ## Notes from the run
 <thermal, first-run page faults, FARF/AEE errors, anything stale>
 ```
@@ -85,4 +99,8 @@ names the first call and side that differs (plan 84 §3.1 level (d)).
    silicon rule (device disagrees with host reasoning) go to
    `docs/htp_moe/LEDGER.md` before anything else.
 4. If the text differs from the CPU run, the variant failed the accuracy
-   gate: file it, do not average it in.
+   gate: file it, do not average it in. **Exception (per-token-entry
+   handoffs):** a differing text with `text approved: y` and PPL within
+   the threshold passes; with `text approved` empty the row is left
+   unfolded and the issue stays `state:measured` with a `needs-user` label
+   until the user fills it; with `n` or a PPL above the threshold it fails.
