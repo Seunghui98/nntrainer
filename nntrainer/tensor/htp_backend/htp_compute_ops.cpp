@@ -1480,6 +1480,10 @@ public:
       if (conv_next_pos_[op] != pos) {
         setParam(session, op, HTP_GRAPH_PARAM_CONV_STATE, state, state_len,
                  2u * rec->N, "conv state");
+        if (dumpAllDir() != nullptr)
+          dumpAllFile(std::string(dumpAllDir()) + "/convstate_" +
+                        std::to_string(op) + ".f32",
+                      state, state_len);
       }
       invokeForward(session, op, stretch_end_[op], pos, {}, {}, {}, in, in_len,
                     out, out_len, false);
@@ -1556,6 +1560,12 @@ public:
                                std::to_string(seed_ordinal_) + ", " +
                                std::to_string(n_rows) +
                                " rows: " + graphErr(err));
+    }
+    if (dumpAllDir() != nullptr) {
+      const std::string base =
+        std::string(dumpAllDir()) + "/kvseed_" + std::to_string(seed_ordinal_);
+      dumpAllFile(base + "_k.f32", k_rows, static_cast<size_t>(n));
+      dumpAllFile(base + "_v.f32", v_rows, static_cast<size_t>(n));
     }
     kv_len_[seed_ordinal_] = n_rows;
     seed_ordinal_ = HTP_GRAPH_NO_OP;
@@ -2295,7 +2305,9 @@ private:
   /** @brief [#84] NNTR_HTP_DUMP=<dir>: every MoE call's input (M x K f32)
    *  and output (M x N_out f32) as <dir>/moe_<call>_in.f32 / _out.f32, in
    *  call order, plus one line per call in <dir>/manifest.txt
-   *  (name entry M K inter N_out kind). Read once, off unless the
+   *  (name entry M K inter N_out kind r=<row_count per expert>, the
+   *  routing the ARM handed the call -- [#136] so the comparator can
+   *  tell a top-k flip at a near-tie from a fault). Read once, off unless the
    *  variable is set: with it unset this is one static load and a branch
    *  per call. tools/htp/htp_dump_eval.py compares two such directories;
    *  the first file that differs names the call, which is where a _det is
@@ -2304,7 +2316,8 @@ private:
   static void dumpMoeCall(const char *entry, const float *act, size_t act_n,
                           const float *out, size_t out_n, unsigned int M,
                           unsigned int K, unsigned int inter,
-                          unsigned int N_out, int kind) {
+                          unsigned int N_out, int kind,
+                          const std::vector<unsigned int> &row_count) {
     static const char *dir = std::getenv("NNTR_HTP_DUMP");
     if (dir == nullptr)
       return;
@@ -2327,8 +2340,61 @@ private:
     if (m == nullptr)
       throw std::runtime_error("NNTR_HTP_DUMP: cannot write the manifest");
     ++call;
-    std::fprintf(m, "%s %s %u %u %u %u %d\n", name, entry, M, K, inter, N_out,
+    std::fprintf(m, "%s %s %u %u %u %u %d r=", name, entry, M, K, inter, N_out,
                  kind);
+    for (size_t e = 0; e < row_count.size(); ++e)
+      std::fprintf(m, "%s%u", e ? "," : "", row_count[e]);
+    std::fprintf(m, "\n");
+    std::fclose(m);
+  }
+
+  /** @brief [#136] NNTR_HTP_DUMP_ALL=1 (next to NNTR_HTP_DUMP=<dir>): what
+   *  the ARM side hands the DSP between and inside the per-token
+   *  stretches, all of it -- every stretch's input / output as
+   *  <dir>/fwd_<call>_<kinds>_{in,out}.f32 with one line per call in
+   *  <dir>/forward_manifest.txt (name op resume pos K N_out kinds), the KV
+   *  seed rows as kvseed_<ordinal>_{k,v}.f32 and the conv state seed as
+   *  convstate_<op>.f32. Its own manifest, so the MoE goldens
+   *  (manifest.txt) stay byte-equal. The device handoff of #136 turns it
+   *  on for one run; the workstation replays the stretch inputs through
+   *  graph_host_check's emulation and names the first stretch whose
+   *  device output leaves it (plan 136 section 3.2). Never in a tok/s run. */
+  static const char *dumpAllDir() {
+    static const char *dir = std::getenv("NNTR_HTP_DUMP_ALL") != nullptr
+                               ? std::getenv("NNTR_HTP_DUMP")
+                               : nullptr;
+    return dir;
+  }
+  static void dumpAllFile(const std::string &path, const float *p, size_t n) {
+    FILE *f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr || std::fwrite(p, sizeof(float), n, f) != n)
+      throw std::runtime_error("NNTR_HTP_DUMP_ALL: cannot write " + path);
+    std::fclose(f);
+  }
+  void dumpForwardCall(uint32_t op, uint32_t resume, uint32_t pos,
+                       const float *act, size_t K, const float *out,
+                       size_t N_out) {
+    const char *dir = dumpAllDir();
+    if (dir == nullptr)
+      return;
+    static unsigned int call = 0;
+    std::string kinds;
+    for (uint32_t i = op; i < resume; ++i)
+      kinds +=
+        std::string(i == op ? "" : "-") + htp_graph_kind_name(graphOp(i)->kind);
+    char name[64];
+    std::snprintf(name, sizeof(name), "fwd_%05u_%s", call, kinds.c_str());
+    const std::string base = std::string(dir) + "/" + name;
+    dumpAllFile(base + "_in.f32", act, K);
+    dumpAllFile(base + "_out.f32", out, N_out);
+    FILE *m = std::fopen((std::string(dir) + "/forward_manifest.txt").c_str(),
+                         call == 0 ? "w" : "a");
+    if (m == nullptr)
+      throw std::runtime_error(
+        "NNTR_HTP_DUMP_ALL: cannot write the forward manifest");
+    ++call;
+    std::fprintf(m, "%s %u %u %u %zu %zu %s\n", name, op, resume, pos, K, N_out,
+                 kinds.c_str());
     std::fclose(m);
   }
 
@@ -2418,7 +2484,8 @@ private:
       ++fwd_tokens_;
     if (moe)
       dumpMoeCall("forward", act, static_cast<size_t>(act_len), out,
-                  static_cast<size_t>(out_len), 1u, K, 0u, N_out, 0);
+                  static_cast<size_t>(out_len), 1u, K, 0u, N_out, 0, row_count);
+    dumpForwardCall(op, expected_resume, pos, act, K, out, N_out);
     if (profile.level()) {
       uint64_t pcyc_sum = 0;
       for (uint32_t i = 0; i < n_limit; ++i) {
@@ -2542,7 +2609,8 @@ private:
     }
     stagedMemcpy(out, out_f32, static_cast<size_t>(out_len) * sizeof(float));
     dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
-                static_cast<size_t>(out_len), M, K, inter, N_out, kind);
+                static_cast<size_t>(out_len), M, K, inter, N_out, kind,
+                row_count);
     if (profile.level()) {
       // [#88] The bytes the stub hands the driver outside ION: the 48-byte
       // primitive block (_primIn[12] in generated/nntr_hvx_stub.c) and the

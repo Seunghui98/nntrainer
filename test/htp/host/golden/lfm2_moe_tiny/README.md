@@ -8,7 +8,10 @@ host ISA, run with prompt 16 (`ids[i] = 1 + 7i mod 30`) and 8 greedy tokens,
 `moe_engine: htp`, default flags (`NNTR_MOE_HTP_M1_GEMV` unset).
 
 * `manifest.txt`: one line per MoE call in call order,
-  `name entry M K inter N_out kind` (`entry` is `moe_layer` or `forward`).
+  `name entry M K inter N_out kind r=<row_count per expert>` (`entry` is
+  `moe_layer` or `forward`; `r=` is the routing the ARM side handed the
+  call, since #136 -- the comparator stops its SNR floor at the first call
+  whose routing differs, a top-k flip at a near-tie).
 * `moe_<call>_in.f32` (M x K) and `_out.f32` (M x N_out): the bytes the ARM
   side handed the call and got back.
 * `logits_<step>.f32`: the driver's per-step logits (step 0 = prefill).
