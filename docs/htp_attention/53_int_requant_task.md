@@ -1,9 +1,10 @@
 # 53 — arXiv 2511.11248: int32 → u8 직접 재양자화, 우리 커널에 되나 (별도 세션 과제, 자체 완결)
 
-상태: **닫힘 (2026-09-28, §8.5)** — 논문은 T-MAN(가중치 LUT 역양자화)이고 int32 → u8 재양자화 논문이
-아니다; 우리 세 커널에는 int32에서 u8로 직행할 텐서가 없고, 이득 산술은 게이트(−5 ms) 미달. 구현 안 함.
-기기 실측: MoE 에필로그 워커는 HMX 그림자의 64%(dense 95%)라 산술을 줄여도 노출은 안 준다; SDK에 좁은
-폭 acc_read는 없다.
+상태: **분석은 §8.5에서 닫혔고(속도 이득 ≈ 0), 구현은 §9에서 진행 중 — 기기 ppl 게이트 대기.** 논문은
+T-MAN(가중치 LUT 역양자화)이고 int32 → u8 재양자화 논문이 아니다(§4); 우리 커널에 int32 → u8 직행 텐서는
+없다(§8.1); 기기 실측으로 MoE 에필로그 워커는 HMX 그림자의 64%(dense 95%)라 산술을 줄여도 노출은 안
+준다(§8.5); SDK에 좁은 폭 acc_read는 없다(§8.3). 그 위에서 작성자의 결정으로 **f32 없는 에필로그를
+구현했다**(§9): 호스트에서 f32 격자와 같은 SNR, 커널 비트 동일 검증 통과, 기기 ppl은 미측정.
 §1~§3은 우리 커널 쪽 사실(측정·코드), §4는 논문에서 채운 것, §8이 판정.
 
 ## 0. 한 줄
@@ -309,3 +310,88 @@ ppl 62.0916 (그대로 -- 프로브는 산술 불변, 기기 확인)   prefill 1
 노출이 안 준다(§8.5), 좁은 acc_read 없음(§8.3). 커널에 남긴 것은 프로브 하나(c64be9d, 프로브 off면 0 비용) —
 MoE·dense 행이 이제 `swiglu(hidden)`으로 워커 점유율을 찍는다. 긴 프롬프트 측정 때 이 열이 95% 근처로
 올라가는지 보면 된다.
+
+## 9. 구현: f32 없는 gate_up 에필로그 (2026-09-28, 코드 + 호스트 검증, 기기 미측정)
+
+§8.5의 판정(벽시계 이득 ≈ 0)을 알고도 작성자가 구현을 택했다 — "float32를 지우는 것을 논문 방식대로". 그래서
+이 절의 게이트는 속도가 아니라 **ppl**(62.0916 기준 +0.5% 이내)이고, 첫 판은 HVX 벡터화 없이 **DSP에서 스칼라 C로**
+돌려 정확도만 본다(§5의 "호스트 스칼라 스텁 먼저" 순서 그대로, 스텁이 곧 DSP 코드다).
+
+### 9.1 무엇을 정수로 했나 — 단계별
+
+| 단계 | f32 경로 (지금) | 정수 경로 (`hvx_int_epilogue.c`) |
+|---|---|---|
+| 스케일 | s_r(f32), w_c(f32), b_c(f32)를 원소마다 곱함 | **bake**: w_c → 15비트 가수 + 지수(3 B/열), b_c → 30비트 가수 + 지수(bias가 0이 아닐 때만), 타일별 상한 지수. 가중치 등록 후 첫 사용 때 한 번(`hexkl_weight_u8i4::iq`, release가 해제). s_r → 가수·지수, 행마다 스칼라 |
+| dequant | cvt → −zp·cs → ×s → ×w → +b (f32 6 op) | A = acc − zp·cs(int32 정확), A ≪ sa, mulhi_q15(·, wm), mulhi_q15(·, ms), 열별 우시프트(라운딩), + bias 시프트 — **T-MAN의 2단계 bake**가 이 자리 |
+| 수 형식 | f32 | Q(F) 고정소수점, **F는 (행, 스테이지 배치)마다 데이터에서**: 배치 타일들의 max\|A\|와 열 상한으로 \|g\| < 2^B를 잡고 F = 30 − B. 정적 상한(2^23·s·w_max)은 2^7~2^11 느슨해 g·u에 9비트만 남긴다 — 이것이 §8.4에서 "16비트 곱셈기"가 걱정이던 이유이고, 데이터 기반 지수가 답이다 |
+| SwiGLU | `hvx_swiglu_det`(f32, ARM 비트 동일 계약) | **정수 시그모이드**: x를 Q24로(±16 클램프) → t = x·log2e(Q23) → 2^−frac 5차 다항식(Q30, 인자 15비트) ≫ n → 1/(1+e) 7차 다항식(Q30) → Q15. 최대 오차 6e-5. g·σ는 mulhi 1회, ·u는 u의 상·하 15비트로 mulhi 2회(32×32 상당) |
+| 저장 | gate_off f32 [64×1792] | 같은 448 KB에 int32 가수 + 행×배치 지수표(2 KB, 스크래치) |
+| requant | 행 스캔(min/max f32) → scale, zp → ×1/s, RNE, pack | 배치 지수를 행의 최소 F로 정규화하며 int32 min/max → R → 곱셈기 M = 255·2^(15+e)/R(14~15비트) → y = asr_rnd(mulhi(v ≪ ls, M), e), zp도 같은 식 → u8 AH 타일. 규약은 f32와 같다(범위에 0 포함, zp = round(−min/scale), x = scale·(u − zp)) |
+| down 이후 | f32 | **그대로** — residual이 f32라 int32 → u8 홉이 없다(§8.1). scale_r 하나만 `ldexpf`로 f32로 |
+
+원소마다 f32 연산은 0이다. 남은 float은 bake(가중치당 1회)와 행당 `frexpf`/`ldexpf` 하나.
+
+모든 연산이 HVX 명령 하나에 정확히 대응하는 정의로 쓰였다(`mulhi_q15` = `vmpyo(...):<<1:rnd:sat`, 라운딩 시프트 = vadd + vasr,
+시프트량은 [0, 30]으로 클램프 후 사용, nbits = 32 − clz). 이 C가 벡터판의 비트 동일 참조다.
+
+### 9.2 파일
+
+- `nntrainer/tensor/htp_backend/hvx/hvx_int_epilogue.{h,c}` — bake, `hvx_int_gu_worker`(행 분할 풀 잡), `hvx_int_rq_rows`,
+  `hvx_int_sigmoid_q15`. 인트린식 없음. 헤더에 `ponytail:` — DSP에서 스칼라로 돌며 f32 HVX 에필로그의 ~20배 워커 시간.
+- `hexkl_mm_u8i4_moe.c` — `#if HEXKL_MOE_INT_EPILOGUE`: gate_up 잡을 행 분할 정수 잡으로, rq 유닛을 `hvx_int_rq_rows`로, 스크래치에
+  지수표, 검증 루프에서 lazy bake. down·scatter·파이프라인 순서는 불변. 꼬리 경로(f32 전용)는 이 빌드에서 `#error`.
+- `hexkl_mm_u8i4_dma.{h,c}` — 슬롯에 `iq` 포인터, release가 해제.
+- `test/htp/build.sh` — `HEXKL_MOE_INT_EPILOGUE=1 ./test/htp/build.sh`. IDL 불변이라 **앱 재빌드 불필요**, skel만.
+- 호스트 체크: `int_epilogue_host_check.c`(수치), MoE 체크의 정수 참조(`#if`, 커널의 함수를 행마다 같은 배치 분할로 호출),
+  `-DCHECK_INTER=576`(블록당 배치 2개) 빌드 추가, 스텁에 `ref_mm_i32`.
+
+### 9.3 호스트 결과 (`bash test/htp/host/run_host_checks.sh`, 7개 전부 통과)
+
+| 검사 | 결과 |
+|---|---|
+| 시그모이드 Q15 vs 실수, x ∈ [−20, 20], F ∈ {8..40} | 최대 오차 **5.96e-5** |
+| LFM2 모양 합성 블록(64×1792, K=2048 급 누산기, 열 3% ×8 outlier, 행 ×16 outlier): 정확값 대비 SNR | f32 경로 32.39 dB, **정수 경로 32.36 dB**, 4배치 분할 32.39 dB — 같은 품질(둘 다 u8 격자 잡음이 바닥) |
+| 정수 격자 vs f32 격자 | 1스텝 차이 **0.83%**, 2스텝 이상 **0** |
+| 1배치 vs 4배치(지수 정규화) | 1스텝 차이 0.70%, 2스텝 0 |
+| 0행·패딩행 | scale 1, zp 0, 바이트 0 |
+| MoE 커널(정수 빌드) vs 행별 참조, inter=32(배치 1)와 **576(배치 2)** | **mismatches 0**, DMA·블록 수 일치 |
+| f32 빌드 MoE·conv·FC·풀 체크 | 변화 없음, 전부 통과 |
+
+즉 호스트에서 정수 경로는 f32 경로와 **같은 정확도의 다른 격자**다. ppl이 움직인다면 격자 차이(0.83%의 1 LSB)가
+22층에서 어떻게 쌓이느냐의 문제이고, 그건 기기만이 답한다(44 §L2: 1 LSB 뒤집힘이 토큰 스트림을 바꿨다 — 그때는 두
+경로가 *섞여서*였고, 지금은 경로 하나가 일관되게 바뀐다).
+
+### 9.4 기기 절차 (작성자) — ppl 게이트
+
+```bash
+cd ~/workspace/nntrainer            # 이 브랜치의 최신(§9 커밋)으로
+HEXKL_MOE_INT_EPILOGUE=1 ./test/htp/build.sh
+adb -s R3CY10WM83Y push test/htp/build/libnntr_hvx_skel.so /data/local/tmp/nntrainer/causallm/
+adb -s R3CY10WM83Y shell "cd /data/local/tmp/nntrainer/causallm && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. NNTR_NUM_THREADS=8 NNTR_HTP_PROFILE=2 NNTR_PPL=1 ./nntrainer_causallm ./models/lfm2.5-8b-a1b-q40-qs4cx-wh"
+# 되돌리기(f32 skel): ./test/htp/build.sh && adb push ... 같은 명령
+```
+
+- 앱은 그대로(IDL 불변). 전부 켬 config 그대로, expert 캐시 env 없이.
+- **느릴 것이 정상이다**: 스칼라 에필로그라 MoE 행의 `swiglu(hidden)`이 수백 ms/콜, dequant/requant 노출도 그만큼 오른다.
+  prefill 수 초, decode도 절반 이하. 이 판은 **ppl 한 줄**을 보는 판이다.
+- 볼 것: `[PPL] ... ppl=` (통과: ≤ 62.40), 그리고 첫 콜이 `AEE_EBADPARM`이나 크래시 없이 도는지. 출력 텍스트는 지표가
+  아니다(51 §2.9).
+- 판정: 통과면 9.5로. 실패(+0.5% 초과)면 9.6.
+
+### 9.5 통과 시 다음: HVX 벡터화 (그때 속도 측정)
+
+`hvx_int_epilogue.c`의 각 헬퍼가 명령 하나다: `MULHI` → `Q6_Vw_vmpyo_VwVh_s1_rnd_sat`(16비트 곱셈기는 상위 하프워드에:
+wm은 bake 때 `<< 16`으로 저장), 라운딩 시프트 → `Q6_Vw_vadd_VwVw` + `Q6_Vw_vasr_VwVw`(레인별 양은 `we`를 int8 → 워드로
+언팩, `Q6_Vw_vmin_VwVw`로 30 클램프), `nbits` → `Q6_Vw_vcl0_Vuw` + 레인 축소, 시그모이드는 워드 32레인으로 그대로. 행
+루프는 그대로 두고(행 분할이 지수 구조), 열 32개가 한 벡터. 기대 워커 시간은 f32 경로 대비 dequant −8 op, 시그모이드
++~15 op(f32 det의 ~40 대비 다항식 2개 ≈ 25) → **총합은 f32와 비슷하거나 약간 적다**; 벽시계 이득은 §8.5대로 ≤ 노출 0.33 ms/콜.
+벡터판의 검증은 이 C와 비트 동일(`unittest_hvx_*` 패턴의 기기 유닛 테스트 하나) → 그 다음 프로파일.
+
+### 9.6 실패 시 조정 손잡이 (기기 결과를 보고 고른다)
+
+1. 시그모이드 정밀도: 다항식 차수는 이미 5/7이라 6e-5의 바닥은 Q15 인자 라운딩이다 — 인자를 Q15 둘로 나눠(상·하) mulhi 2회로
+   ~1e-6까지 내릴 수 있다(원소당 +12 op).
+2. requant 라운딩: 지금은 mulhi의 반올림(half-up) 뒤 asr_rnd(half-up) 이중 라운딩. f32 경로의 RNE와 다른 경계. 이중 라운딩을
+   없애려면 M의 지수 e를 0으로(ls를 더 크게, v ≪ ls가 2^31을 넘지 않는 범위) — 격자가 f32 쪽으로 더 가까워진다.
+3. 배치 지수 정규화 손실: 작은 배치가 큰 배치의 F로 내려올 때 비트를 잃는다(행당 최대 1 LSB의 0.7%). 배치 지수 대신 행
+   지수를 **2패스**로(첫 배치들의 가수를 저장했다가 마지막 배치 뒤 재정규화)면 사라지지만 VTCM 재읽기 1회.
