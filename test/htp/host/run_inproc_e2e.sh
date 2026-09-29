@@ -99,6 +99,9 @@
 #                              timeouts=0/0 id_mismatch=0 ok
 #   E2E tokens e3-run==e1-run-lfm25 8/8 id_only=1      (run(): only the id
 #                              comes back, the CPU takes it)
+#   E2E tokens e3-run==e1-run-lfm25-ban 8/8 id_only=1  (bad_word_ids = the
+#                              token the unbanned run picks: S2's argmax
+#                              skips it, LM_BAN, as the CPU's -inf does)
 #   E2E ppl-decode e3==e1-hd64 steps=7 identical=1     (NNTR_PPL_DECODE
 #                              forced on E1's path: the logits come back)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
@@ -280,6 +283,14 @@ PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
   run_e2e q25-e1run "$OUT/htp25q" htp "$OUT/dump_25e1run" "$OUT/25e1run.log" --max-seq 2048 --run
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25-e3run "$OUT/htp25q" htp "$OUT/dump_25e3run" "$OUT/25e3run.log" --max-seq 2048 --run
+# the same model with the unbanned run's first decode pick as a bad word
+cp -a "$OUT/htp25q" "$OUT/htp25qb"
+ban="$(sed -n 's/^E2E gen [0-9]* \([0-9]*\).*/\1/p' "$OUT/25e1run.log")"
+sed -i "s/\"bad_word_ids\": \[\]/\"bad_word_ids\": [${ban:-0}]/" "$OUT/htp25qb/nntr_config.json"
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25-e1ban "$OUT/htp25qb" htp "$OUT/dump_25e1ban" "$OUT/25e1ban.log" --max-seq 2048 --run
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3ban "$OUT/htp25qb" htp "$OUT/dump_25e3ban" "$OUT/25e3ban.log" --max-seq 2048 --run
 rm -f "$OUT/e3.ids"
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
   run_e2e q64-e1ppl "$OUT/htp64q" htp "$OUT/dump_64e1ppl" "$OUT/64e1ppl.log" --max-seq 32 --run
@@ -478,14 +489,19 @@ for d in "hd64 64e3 64e1a 4.00" "lfm25 25e3 25e1a 8.00"; do
     echo "E2E FAIL $fx e3: calls/token=${calls:-none} close=[$close]"; fail=1
   fi
 done
-e1_gen="$(grep '^E2E gen ' "$OUT/25e1run.log")"
-e3_gen="$(grep '^E2E gen ' "$OUT/25e3run.log")"
-same=$(paste <(tr ' ' '\n' <<< "$e1_gen") <(tr ' ' '\n' <<< "$e3_gen") |
-  tail -n +3 | awk '$1==$2{n++} END{print n+0}')
-id_only=0
-grep -q '^\[HTP\] token driver: first token .* logits=0$' "$OUT/25e3run.log" && id_only=1
-echo "E2E tokens e3-run==e1-run-lfm25 $same/$STEPS id_only=$id_only"
-[ "$same" = "$STEPS" ] && [ $id_only = 1 ] || fail=1
+for d in "25e1run 25e3run lfm25" "25e1ban 25e3ban lfm25-ban"; do
+  read -r r1 r3 label <<< "$d"
+  e1_gen="$(grep '^E2E gen ' "$OUT/$r1.log")"
+  e3_gen="$(grep '^E2E gen ' "$OUT/$r3.log")"
+  same=$(paste <(tr ' ' '\n' <<< "$e1_gen") <(tr ' ' '\n' <<< "$e3_gen") |
+    tail -n +3 | awk '$1==$2{n++} END{print n+0}')
+  id_only=0
+  grep -q '^\[HTP\] token driver: first token .* logits=0$' "$OUT/$r3.log" && id_only=1
+  echo "E2E tokens e3-run==e1-run-$label $same/$STEPS id_only=$id_only"
+  [ "$same" = "$STEPS" ] && [ $id_only = 1 ] || fail=1
+done
+[ "$(grep '^E2E gen ' "$OUT/25e1ban.log")" != "$(grep '^E2E gen ' "$OUT/25e1run.log")" ] ||
+  { echo "E2E FAIL the ban changed no token (ban=${ban:-none})"; fail=1; }
 e3_steps() { grep -o '\[PPL\] decode step=.*' "$1" || true; }
 n="$(e3_steps "$OUT/64e3ppl.log" | wc -l)"
 if [ "$n" = $((STEPS - 1)) ] &&
