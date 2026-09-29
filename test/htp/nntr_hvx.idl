@@ -747,4 +747,17 @@ interface nntr_hvx : remote_handle64 {
    // Unmaps the page. res (5): [tokens served, hops, timeouts, stale
    // reads, wait us].
    AEEResult token_driver_stop(rout sequence<uint32> res);
+
+   // [#132 Part B E3] q4m1_register's arena form: the K x N Q4M1 weight
+   // the ARM side already wrote at byte off of an attached arena
+   // (arena_attach; off % 128 == 0, the weight inside the arena). No copy:
+   // h names those bytes until q4m1_release or close, and the arena cannot
+   // be detached while a slot borrows from it (AEE_EBADSTATE). The ARM
+   // writes the arena uncached and before this call, the DSP never writes
+   // it, so the FC's DMA reads it around the L2 as it reads a registered
+   // copy. Shapes and slots as q4m1_register (AEE_EINVALIDFORMAT,
+   // AEE_EBADITEM); an unknown arena or a weight past its end is
+   // AEE_EINVALIDFORMAT, never AEE_EBADPARM.
+   AEEResult q4m1_attach(in uint32 arena, in uint32 off, in uint32 K,
+                         in uint32 N, rout uint32 h);
 };
