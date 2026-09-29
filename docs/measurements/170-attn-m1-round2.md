@@ -1,4 +1,4 @@
-# Measurement 170 round 2 (S3): the round-2 ATTN_M1 against its speed gate, round 1 in the same sitting
+# Measurement 170 round 2 (S3): the round-2 ATTN_M1 on silicon — bit-identical, in-model cost −39 / −44 %, speed gate missed by 19 / 7 %
 
 Branch `htp/170-round2` @ `e079fec3` (plan `docs/plans/170-attn-m1-round2.md`,
 PR #179's plan); the new device set is built from `dev/attn-shadow-170-r2`
@@ -156,59 +156,137 @@ byte-reproducible.
 Stop rules: `0x8000040e` (stale skel) or a device md5 mismatch.
 Standing: every E2E cell's prefill within −5 % of A's (mirrored mean).
 
-## Results (fill in)
+## Results S3 (ran 2026-09-29 23:56 – 2026-09-30 00:26 KST on `R3CY10WM83Y`, logs `/local/mnt/workspace/htp_moe/170/s3/logs/`; filled from the logs)
 
-Reference (S2, same unit, 2026-09-29): A decode 52.46 / 50.84 / 48.26
-tok/s at G = 64 / 512 / 1024; round 1 (Q1 there) 42.13 / 43.71 / 42.31;
-round 1 `pcyc/op ATTN_M1` 394,501 / 700,449; round 1 cold pos 1023:
-append 96 k, scores 702 k, softmax 526 k, pv 1,542 k, busy_max 590 k,
-pool 619 k, `dsp_us` 340. Goal ≥ 50 tok/s decode; the gates 210 k / 350 k.
+Device md5 = `md5.txt` (`MD5 OK`). `expectation mismatches: 2`: the two
+G6 gates, nothing else. `G6a terms over their line: 6` (read, not gated).
+No `0x8000040e`. zone0 32.8 °C at start, 51.7 °C after the shadow cells,
+58–68 °C through the speed and G5 cells; battery 100 → 90 %.
+`HvxAttnM1.RejectsBadShapes` failed on `AEE_ERPC` (0x80000600) as
+expected (#137, not counted).
 
 | gate | line | value | pass |
 |---|---|---|---|
-| G3 | 8 L × `bad` / `bad_stats`, `append_chain`, F16Det, rope64 | | |
-| G4 | Q2 / RQ2 `tag3_heads`, `logits_equal_steps`, nll = An | | |
-| G5 | nll = A (Q2, RQ2 × 8), text = A (Q2, RQ2 × 8), Q2 = Q1 (× 8) | | |
-| G6 | Q2 `pcyc/op ATTN_M1` G = 64 / 1024 (Q1 same sitting) | | |
+| G3 | `ATTN_M1_FIELD` `bad` / `bad_stats` at 1 / 63 / 64 / 65 / 512 / 513 / 1024 / 1536; `append_chain`; `AttnM1F16Det` 513 / 1024 / 1536; rope64 ×5 | all 0 | **yes** |
+| G4 | shadow (G = 8, An reference) | Q2 `tag3_heads=1536/1536` `logits_equal_steps=8/8`; RQ2 the same (48 records, 6 layers, 8 positions, 0 zero records); nll = An for both | **yes** |
+| G5 | nll = A (Q2, RQ2 × p01–p08), A forced = A self; text = A (Q2, RQ2 × 8), Q2 = Q1 (× 8), G = 256 | all equal (16 + 1 nll, 24 text) | **yes** |
+| G6 | `pcyc/op ATTN_M1`, Q2 (Q1 same sitting) | G = 64: **250,289** (Q1 411,215, −39 %); G = 1024: **373,642** (Q1 668,528, −44 %) | **no**: 1.19× / 1.07× the gates 210 k / 350 k |
 
-| term, cold pos 1023 | line | round 2 | round 1 (same sitting) |
-|---|---|---|---|
-| append | ≤ 10 k | | |
-| scores | ≤ 550 k | | |
-| softmax | ≤ 160 k | | |
-| pv | ≤ 400 k | | |
-| busy_max | ≤ 200 k | | |
-| pool | ≤ 220 k | | |
-| dsp_us | ≤ 110 | | |
+`HvxAttnM1.PerLayerCost`, pos 1023, pcycles lane-summed over 6 lanes
+(G6a line; round 1 = the `q1` set in the same sitting):
 
-| probe, wall pcyc / 64-lane FMA | lanes 1 | 2 | 4 | 6 |
+| term | G6a line | round 2 warm | round 2 cold | round 1 warm | round 1 cold | cold, round 2 / round 1 |
+|---|---|---|---|---|---|---|
+| append | ≤ 10 k | 33.0 k | 32.9 k | 92.9 k | 95.2 k | 0.35 |
+| scores | ≤ 550 k | 636 k | 668 k | 581 k | 698 k | 0.96 (warm 1.10) |
+| softmax | ≤ 160 k | 526 k | 518 k | 511 k | 528 k | 0.98 |
+| pv | ≤ 400 k | 362 k | **386 k** | 1,098 k | 1,545 k | **0.25** |
+| busy_max | ≤ 200 k | 272 k | 278 k | 460 k | 595 k | 0.47 |
+| pool | ≤ 220 k | 307 k | 312 k | 493 k | 625 k | 0.50 |
+| dsp_us | ≤ 110 | 162 | 165 | 278 | 342 | 0.48 |
+
+Other positions (round 2, cold `dsp_us`): pos 511 90 (round 1 191),
+pos 1535 249 (round 1 487). The in-model line sits at 1.20× the cold
+gtest pool at G = 1024 (374 k / 312 k) and 1.5× at G = 64 (250 k against
+165 k at pos 511, L 512 vs a mean of 544.5).
+
+Probe cells (`probe_read.txt`; wall pcycles per 64-lane FMA, all lanes
+together; the lane-summed figure after the slash):
+
+| cell | lanes 1 | 2 | 4 | 6 |
 |---|---|---|---|---|
-| pv4 warm / cold / cold + 32 KiB lead | | | | |
-| scores1 warm / cold / cold + tile lead | | | | |
-| scores1 splat vectors / scalar splats | | | | |
+| pv4 warm | 6.28 | 3.35 | 1.68 | 1.26 / 6.9 |
+| pv4 cold, no lead | 37.8 | 19.9 | 11.0 | 7.55 / 40.9 |
+| pv4 cold, 32 KiB lead | **7.14** | 4.95 | 3.21 | **3.12** / 11.8 |
+| scores1 warm (splat vectors) | 11.2 | 6.34 | 3.28 | 2.49 / 12.4 |
+| scores1 cold, no lead | 57.0 | 31.7 | 16.8 | 11.8 / 60.2 |
+| scores1 cold, next-tile lead | **12.4** | 10.9 | 9.42 | **9.96** / 51.2 |
+| scores1, scalar-load splats | 9.11 | 5.16 | 2.80 | 4.19 / 22.5 |
 
 | variant | G | run 1 prefill / decode / last 64 | run 2 prefill / decode / last 64 | decode mean | text = A |
 |---|---|---|---|---|---|
-| A | 64 | | | | ref |
-| Q1 | 64 | | | | |
-| Q2 | 64 | | | | |
-| A | 512 | | | | ref |
-| Q1 | 512 | | | | |
-| Q2 | 512 | | | | |
-| A | 1024 | | | | ref |
-| Q1 | 1024 | | | | |
-| Q2 | 1024 | | | | |
+| A | 64 | 532.8 / 55.85 / 55.85 | 525.1 / 54.42 / 54.42 | **55.13** | ref |
+| Q1 | 64 | 533.3 / 45.20 / 45.20 | 533.9 / 44.23 / 44.23 | 44.71 | same |
+| Q2 | 64 | 537.3 / 44.88 / 44.88 | 468.0 / 44.11 / 44.11 | **44.49** | same |
+| A | 512 | 507.4 / 48.74 / 52.46 | 462.1 / 52.89 / 49.73 | **50.82** | ref |
+| Q1 | 512 | 458.8 / 44.55 / 44.57 | 460.0 / 45.65 / 44.98 | 45.10 | same |
+| Q2 | 512 | 463.3 / 46.31 / 46.44 | 463.8 / 46.22 / 46.14 | **46.26** | same |
+| A | 1024 | 461.3 / 52.05 / 49.81 | 420.4 / 50.76 / 49.19 | **51.40** | ref |
+| Q1 | 1024 | 426.3 / 44.24 / 42.67 | 425.2 / 43.90 / 40.92 | 44.07 | same |
+| Q2 | 1024 | 427.0 / 45.37 / 44.29 | 428.8 / 45.11 / 44.72 | **45.24** | same |
 
-skel md5 (device): `new` / `q1` as `md5.txt` (`MD5 OK` in `sitting.out`).
+All Q cells `calls/token=28.00` and `cache=24576 KiB`; every cell's text
+equals A run 1 of its G. Q2 vs Q1 decode: −0.5 / +2.6 / +2.6 %; Q2 vs A:
+−19.3 / −9.0 / −12.0 %. The profile's `dsp` per graph call: 420.7 → 371.0
+µs (G = 64), 428.6 → 390.1 µs (G = 1024). Prefill means against A's: Q1
++0.9 / −5.2 / −3.4 %, Q2 −5.0 / −4.4 / −2.9 % (G = 64 / 512 / 1024).
+Prefill runs no ATTN_M1 code, and Q1 is A's own binary, so the −5 %
+cells are run-to-run spread (Q2's run 2 at G = 64 read 468 against 537 in
+run 1).
+
+## Read S3
+
+* **Bit identity holds on silicon everywhere** (G3, G4, G5), with the
+  masked ET stores from six threads, the vector rounding and the vector
+  output: kernel = spec at every L, the model's attention = the CPU's for
+  every head, layer and step, nll and text = A on all 8 prompts.
+* **G6 missed narrowly**: 250 k / 374 k against 210 k / 350 k (1.19× /
+  1.07×), from 411 k / 669 k in the same sitting. The in-model attention
+  fell 39–44 %; decode moved +2.6 % at G 512 / 1024 (6 layers × 0.08–0.14 ms
+  out of ≈ 22 ms per token). The switch stays off: Q2 is still 9–19 %
+  below A.
+* **What landed.**
+  * **PV** 1,545 k → 386 k cold (0.25×), inside its line. The probe
+    shows why: at 6 lanes the 32 KiB window takes the cold pv4 cell from
+    7.55 to 3.12 pcycles per FMA (1 lane: 37.8 → 7.14, close to warm
+    6.28).
+  * **Lane balance**: busy_max 595 k → 278 k; the chain ranges and the
+    smaller PV term together.
+  * **Append** 95 k → 33 k, still 3.3× its 10 k line.
+* **What did not.**
+  * **softmax** 528 k → 518 k: unchanged, and now the largest term with
+    scores. The word lumps P2's exp16 + ET stores, the caller's max and
+    sum, and P3's divides, so S3 cannot say which part costs. The masked
+    stores and the ET lead removed nothing visible, so S2's estimate
+    that the scalar scatter cost ≈ 2.8 k per P2 unit (an inference, never
+    timed) was probably wrong.
+  * **scores** 698 k → 668 k cold, and **worse warm** (581 k → 636 k,
+    +9.5 %). At 6 lanes the next-tile lead buys little on its cold cell
+    (11.8 → 9.96, against 57.0 → 12.4 at one lane: the 6-lane tile fetch
+    is at the bus, not at latency). Warm, where the tile is in L2 already,
+    the lead, the k column merge (64 vmux + stores per last tile) and
+    the splat-vector loads (32 KiB of q per unit read from L2, 4× the
+    tile) are pure cost. The splat cell does not settle the source:
+    vectors win at 6 lanes (2.49 against 4.19) and lose at one (11.2
+    against 9.11).
+* **Round 3 must** (none of it changes arithmetic):
+  1. **Split the softmax word before acting**: time P2's exp16, P2's ET
+     stores, the caller's max, the caller's sum and P3's divides as
+     separate words (a measurement change, not a kernel change), then
+     cut the largest.
+  2. **scores**: compile the P1 lead out (`-DATTN_M1_P1_LEAD=0`) and try
+     the round-1 scalar splats against the splat vectors in the kernel's
+     own P1 (a gtest-only sitting with two skels); keep whichever reads
+     lower warm and cold.
+  3. **append** (33 k): most of it is presumably the 2048 splat-vector
+     stores (256 KiB). If round 3 drops the splat vectors this goes with
+     them; otherwise time the rounding and the stores apart.
+  The DMA-into-VTCM lever (plan §3.1, ≈ 45 L) stays unopened until the
+  compute terms above are at their lines.
 
 ## Text approval (per-token-entry handoff)
 
+The p01 text at G = 256 of A, Q1, Q2 and RQ2 is byte-identical (md5 of
+the stripped text `e377add566c09b7ef2a0698ed106b8be` for all four, the
+same as S2's); so are p02–p08 (G5). The decode PPL forced on A's
+continuation is equal to 17 digits.
+
 | variant | decode PPL (forced on A, p01, G = 256) | generated text (p01, G = 256) | text approved (user: y/n) |
 |---|---|---|---|
-| A | | <paste> | (reference) |
-| Q1 | (text only) | | |
-| Q2 | | | |
-| RQ2 | | | |
+| A | 1.42156 (nll_sum 90.048889370024341, source=self) | identical to S2's A text (md5 above) | (reference) |
+| Q1 | (text only) | identical to A (same md5) | |
+| Q2 | 1.42156 (nll_sum 90.048889370024341) | identical to A (same md5) | |
+| RQ2 | 1.42156 (nll_sum 90.048889370024341) | identical to A (same md5) | |
 
 ## Notes (S3 build)
 
@@ -243,4 +321,9 @@ skel md5 (device): `new` / `q1` as `md5.txt` (`MD5 OK` in `sitting.out`).
 
 ## Notes from the run (S3)
 
-<thermal, `mhz`, FARF / AEE errors, anything stale>
+`adb devices` listed three units (`R3CN80CW3FY`, `R3CY10WM83Y`,
+`R5KL20NFRCK`); every command used `-s R3CY10WM83Y`. Thermal: zone0 32.8
+°C at start, 38 °C after the gtests, 52 °C after the shadow cells, 58 → 68
+°C over the speed cells, 64–66 °C through G6 and G5. `mhz` in the phase
+lines 2096–2110. No FARF / AEE error besides rule 38's `AEE_ERPC` in
+`RejectsBadShapes`. Both expectation mismatches are the G6 gates.
