@@ -1039,24 +1039,31 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
     writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
                    prefix + "_ffn_down");
 
+    // The MoE half of the block, in the compiled graph's order (checked by
+    // unittest_causallm_gemma4_moe) that res/gemma4/weight_converter.py
+    // writes too: three norms (the router's scale and
+    // hidden^-0.5 folded into _router_norm), then the lfm2_moe layer's
+    // weights as writeLfm2Moe has them -- router gate and the [E] vector
+    // FP32 (Lfm2MoELayer::save never quantizes them), then per expert the
+    // fused gate|up and the down projection in the MoE dtype, which is what
+    // lets --moe_dtype QS4CX_WH stream them onto the HTP (doc 55).
     writer.copyFp32(model.hidden_size, prefix + "_post_ffn_norm_1");
     writer.copyFp32(model.hidden_size, prefix + "_pre_ffn_norm_2");
-    writer.copyFp32(tensorElements(model.hidden_size, model.num_experts,
-                                   prefix + "_sparse_moe router"),
-                    prefix + "_sparse_moe router");
-    writer.copyFp32(model.hidden_size, prefix + "_sparse_moe router_scale");
-    writer.copyFp32(model.num_experts,
-                    prefix + "_sparse_moe router_per_expert_scale");
+    writer.copyFp32(model.hidden_size, prefix + "_router_norm");
+    writer.copyFp32(
+      tensorElements(model.hidden_size, model.num_experts, prefix + "_router"),
+      prefix + "_router");
+    writer.copyFp32(model.num_experts, prefix + "_per_expert_scale");
 
     for (size_t expert = 0; expert < model.num_experts; ++expert) {
       const std::string expert_prefix =
         prefix + "_expert" + std::to_string(expert);
-      writer.writeFc(model.hidden_size, model.moe_intermediate_size,
-                     quant.fc_dtype, expert_prefix + "_gate");
-      writer.writeFc(model.hidden_size, model.moe_intermediate_size,
-                     quant.fc_dtype, expert_prefix + "_up");
+      writer.writeFc(
+        model.hidden_size,
+        checkedMultiply(2, model.moe_intermediate_size, expert_prefix),
+        quant.moe_dtype, expert_prefix + "_gate_up");
       writer.writeFc(model.moe_intermediate_size, model.hidden_size,
-                     quant.fc_dtype, expert_prefix + "_down");
+                     quant.moe_dtype, expert_prefix + "_down");
     }
 
     writer.copyFp32(model.hidden_size, prefix + "_post_ffn_norm_2");
@@ -1312,7 +1319,9 @@ void printUsage(const char *program) {
        "kernel can\n"
     << "read it, so a model using it runs its MoE experts on the HTP or "
        "not at all.\n"
-    << "Gemma4 MoE FC/expert weights currently support FP32 or Q4_0.\n";
+    << "Gemma4 MoE FC weights currently support FP32 or Q4_0; the experts "
+       "take\n"
+    << "--moe_dtype like LFM2 (QS4CX_WH for the HTP expert streaming).\n";
 }
 
 int run(int argc, char **argv) {
@@ -1443,8 +1452,7 @@ int run(int argc, char **argv) {
   }
   if (is_gemma4_moe && quant.fc_dtype != DType::FP32 &&
       quant.fc_dtype != DType::Q4_0) {
-    throw std::invalid_argument(
-      "Gemma4 MoE FC/expert dtype must be FP32 or Q4_0");
+    throw std::invalid_argument("Gemma4 MoE FC dtype must be FP32 or Q4_0");
   }
   const std::string input_bin =
     nntr_cfg.at("model_file_name").get<std::string>();
