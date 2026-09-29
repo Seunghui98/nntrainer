@@ -358,6 +358,15 @@ public:
     (void)eps;
     return 0;
   }
+  // [#132 Part B] True while the accelerator runs the whole decode row at
+  // pos (every kind resident: the token is one stretch, and its first
+  // hook has handed the row over): every CPU FC result of the row is then
+  // discarded, so the layers skip their GEMVs. False everywhere else, so
+  // the CPU path is unchanged.
+  virtual bool decode_row_resident(unsigned pos) {
+    (void)pos;
+    return false;
+  }
   virtual bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
                                    const float *v_rows) {
     (void)n_rows;

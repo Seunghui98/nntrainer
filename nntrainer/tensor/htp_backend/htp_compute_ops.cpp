@@ -972,6 +972,9 @@ public:
                                    static_cast<double>(fwd_tokens_)
                                : 0.0);
     }
+    if (cpu_fc_skipped_ != 0) // [#132 Part B] the harness's second line
+      std::fprintf(stderr, "[HTP] graph: cpu fc skipped=%llu\n",
+                   (unsigned long long)cpu_fc_skipped_);
   }
 
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
@@ -1803,6 +1806,18 @@ public:
     pending_ri_.clear();
     pending_rc_.clear();
     pending_rw_.clear();
+  }
+
+  /** [#132 Part B] compute_ops.h: with a Q4M1 kind resident every kind
+   *  is (set_decode_graph_desc's rule), so the token is one stretch; once
+   *  op 0's hook at @a pos has kept the row, the DSP owns the whole row
+   *  and the CPU's FC outputs until the lm_head hook are never read. */
+  bool decode_row_resident(unsigned pos) override {
+    const bool on = (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u &&
+                    row_bound_ && pos == cur_pos_ &&
+                    pending_op_ != HTP_GRAPH_NO_OP;
+    cpu_fc_skipped_ += on;
+    return on;
   }
 
   bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
@@ -4298,8 +4313,10 @@ private:
   std::vector<Q4Pending> q4_pending_;
   std::vector<uint32_t> q4m1_handles_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
-  uint64_t fwd_calls_ = 0;  /**< nntr_hvx_forward* calls */
-  uint64_t fwd_tokens_ = 0; /**< of them at the first resident op */
+  uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
+  uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */
+  uint64_t cpu_fc_skipped_ = 0; /**< [#132 Part B] decode_row_resident's
+                                     true answers: CPU FC calls skipped */
   StagingPool act_pool_;
   StagingPool out_pool_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
