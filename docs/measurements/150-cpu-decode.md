@@ -1,6 +1,6 @@
 # Measurement 150 (step 1b): where the ARM decode time goes between the MoE calls
 
-Branch `htp/150-cpu-decode`, code @ `25c8eb5c` (the T set below was built
+Branch `htp/150-cpu-decode`, code @ `56ba0835` (the T set below was built
 from that tree; later commits on the branch are docs only). Plan
 `docs/plans/150-cpu-decode.md` §4 step 1b. Estimated device time:
 **≈ 25 min**. Run by the orchestrator on the workstation (the phone stays
@@ -30,7 +30,7 @@ lever sitting (step 3).
 | | set on the phone | env (beyond `NNTR_NUM_THREADS=8`) | expected banners |
 |---|---|---|---|
 | **A0** (reference, first) | `$D/a0/` = the #141b set (`07fb1938`, dspq default off) | `NNTR_HTP_DSPQ=1` | `[HTP] dspq: on …` once; no `[OP-TIME]` line |
-| **T8** | `$D/` = this branch (`25c8eb5c`, dspq default on) | `NNTR_OP_TIME=1` | `dspq: on` once; `[OP-TIME] step` / `moe` / `node` lines at the end |
+| **T8** | `$D/` = this branch (`56ba0835`, dspq default on) | `NNTR_OP_TIME=1` | `dspq: on` once; `[OP-TIME] step` / `moe` / `node` lines at the end |
 | **T6** | same | `NNTR_OP_TIME=1 NNTR_NUM_THREADS=6` | same |
 | **T4** | same | `NNTR_OP_TIME=1 NNTR_NUM_THREADS=4` | same |
 
@@ -51,9 +51,9 @@ binary (sanity below).
 
 | file | md5 | built with |
 |---|---|---|
-| `libnntr_hvx_skel.so` | `37468a7fdbf2e469589849598ca860ff` | #141b's (`07fb1938`, `test/htp/build.sh`, v79, HexKL 6.4.0.1). No DSP source or IDL changed since (`git diff 07fb1938 25c8eb5c` touches no file under `test/htp/` outside `host/`), so no rung 2 |
-| `nntrainer_causallm` | `db0c4bc3129ef04ca9ec17d88d3092b7` | `build_android.sh --htp --cache` @ `25c8eb5c` (`jni/libs/arm64-v8a/`) |
-| `libcausallm_core.so` | `2b35451120c57b1e6f645cc740fa5cfa` | same (`NNTR_HTP_FORWARD_KINDS` count 2; `OP-TIME` count 2) |
+| `libnntr_hvx_skel.so` | `37468a7fdbf2e469589849598ca860ff` | #141b's (`07fb1938`, `test/htp/build.sh`, v79, HexKL 6.4.0.1). No DSP source or IDL changed since (`git diff 07fb1938 56ba0835` touches no file under `test/htp/` outside `host/`), so no rung 2 |
+| `nntrainer_causallm` | `db0c4bc3129ef04ca9ec17d88d3092b7` | `build_android.sh --htp --cache` @ `56ba0835` (`jni/libs/arm64-v8a/`) |
+| `libcausallm_core.so` | `44b60ecdc2a773048155864298aaea03` | same (`NNTR_HTP_FORWARD_KINDS` count 2; `OP-TIME` count 2) |
 | `libnntrainer.so` | `178b6e126e3a2aac8d1d83ad2f658250` | same (`jni/obj/local/arm64-v8a/`, after `ninja -C builddir install`; NEEDED `libsdkl.so`, `libcdsprpc.so`; `dspq: on` count 1; `OP-TIME` count 1; `U dspqueue_` count 0) |
 | `libccapi-nntrainer.so` | `e3f0a1243fbf28d8109e019e092288fc` | same (`jni/obj/local/arm64-v8a/`) |
 | `a0/nntrainer_causallm` | `b1be9a062ae702af9e52b45510093826` | the #141b set, `07fb1938` (`141b/md5.txt`) |
@@ -86,7 +86,7 @@ find $W -name 'libcdsprpc*' | wc -l                                          # 0
 ```
 
 Rebuild recipe if `$W` is not on the measuring workstation: `git checkout
-25c8eb5c`, `source tools/htp/env.sh`, `export HEXKL_ROOT=…` explicitly,
+56ba0835`, `source tools/htp/env.sh`, `export HEXKL_ROOT=…` explicitly,
 `git submodule update --init --depth 1`, copy
 `Applications/CausalLM/lib/libtokenizers_android_c.a` from another worktree,
 `(cd Applications/CausalLM && ./build_android.sh --htp)` (on a fresh
@@ -326,7 +326,8 @@ settles whether the FCs run at ≈ 38, 50 or near 67.9 GB/s.
 | FC conv out_proj | | | | | |
 | FC attn qkv (+q/k norm) | | | | | |
 | FC attn o | | | | | |
-| FC dense FFN | | | | | |
+| FC dense FFN (+swiglu) | | | | | |
+| conv block (fused; 0 unless a conv_block engine is set) | | | | | |
 | attention (mha_core) | | | | | |
 | conv1d + gate | | | | | |
 | RMSNorm | | | | | |
