@@ -706,4 +706,22 @@ interface nntr_hvx : remote_handle64 {
    // 7 scalar sffma a*b + 1. o = op(a, b); a multiple of 32 for 0..5.
    AEEResult sf_probe(in uint32 op, in sequence<float> a,
                       in sequence<float> b, rout sequence<float> o);
+
+   // [#132 Part B E2] The two-session token driver (nntr_hvx_token.c over
+   // hmx/hexkl_token.c; plan 132-part-b-two-session-e2e.md section 3.2).
+   // start maps the mailbox page the ARM side allocated and fastrpc_mmap'd
+   // into both sessions (mbox_fd; mbox_bytes >= 16896, HEXKL_MBOX_BYTES)
+   // and records the role: 0 = S2, the main session (op 0 to the argmax),
+   // 1 = S1, the MoE server (ROUTER_TOPK + MOE). A wait for the other
+   // session spins spin_us, then polls every 50 us, and fails the token
+   // with AEE_EEXPIRED 1 s later. The tokens themselves are dspqueue
+   // packets (HTP_DSPQ_OP_TOKEN, htp_dspq_wire.h) on the session's dspq
+   // thread. AEE_EBADSTATE: a driver is already running;
+   // AEE_EINVALIDFORMAT: role or page size. Never AEE_EBADPARM. close()
+   // stops a driver still running.
+   AEEResult token_driver_start(in int32 mbox_fd, in uint32 mbox_bytes,
+                                in uint32 role, in uint32 spin_us);
+   // Unmaps the page. res (5): [tokens served, hops, timeouts, stale
+   // reads, wait us].
+   AEEResult token_driver_stop(rout sequence<uint32> res);
 };
