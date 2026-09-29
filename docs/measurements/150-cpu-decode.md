@@ -288,7 +288,75 @@ Then fill the tables below, commit this file on the branch, push, and set
 | S4 | banners (rule 40) | `dspq: on` once in every log; `close calls=N served=N bad=0`, N = 22 × G; no `dspq: off`; no `OP-TIME` in any A0 log |
 | S5 | text in every tok/s cell (step 6) | T8 / T6 / T4 ≡ A0 of the same run |
 
-## Results (fill in)
+## Results
+
+Run 2026-09-29 10:50–11:05 KST by the orchestrator, unit `R3CY10WM83Y` (a
+second device `R3CN80CW3FY` on USB, never addressed). Device md5 = md5.txt
+(MD5 OK). Thermal (battery °C·10 / zone0 m°C): 311 / 41300 before the G=512
+cells, 336 / 61000 after. Every log: `dspq: on` once, `dspq: close
+calls=N served=N bad=0`; no `pinning` line.
+
+### tok/s, prompt 512, G=512 (mirrored A0 T8 T6 T4 | T4 T6 T8 A0)
+
+| variant | prefill r1 / r2 | decode r1 / r2 | decode mean |
+|---|---|---|---|
+| A0 (#141b set, dspq on) | 539.5 / 455.9 | 38.19 / 36.78 | 37.48 |
+| T8 (timer on, 8 threads) | 503.9 / 422.8 | 38.14 / 38.80 | 38.47 |
+| T6 | 412.6 / 380.4 | 39.27 / 38.67 | 38.97 |
+| T4 | 357.3 / 344.8 | 38.56 / 36.72 | 37.64 |
+
+Timer inertness: T8 is within A0's own r1/r2 spread (A0 spread 1.40 tok/s);
+**MoE dumps A0 vs T8 `bit_identical=1` (2862 files), null A0 vs A0' `=1`,
+the 64 decode nll lines of T8 and A0' equal A0's, texts T8 = A0 in both
+runs.** Thread count moves decode by at most ≈ 1–4 % inside the spread and
+costs prefill 8–35 %, as #150's first read said.
+
+### Per-op decode table (T8 run 1; run 2 agrees within 3 % on every row)
+
+```
+[OP-TIME] /local/mnt/workspace/htp_moe/150/logs1b/T8_G512_r1.log: tokens=512 token=26.220 ms (38.14 tok/s)
+kind                        ms/token   share  MB/token    GB/s  avg/min
+FC conv in_proj                2.491    9.5%     127.4    51.1     1.12
+FC conv out_proj               0.800    3.1%      42.5    53.1     1.10
+FC attn qkv (+q/k norm)        0.568    2.2%      21.2    37.4     1.15
+FC attn o                      0.264    1.0%      14.2    53.6     1.09
+FC dense FFN (+swiglu)         0.867    3.3%      49.5    57.2     1.12
+conv block (fused)             0.000    0.0%       0.0       -        -
+attention (mha_core)           1.473    5.6%       0.0       -     1.81
+conv1d + gate                  0.146    0.6%       0.4     3.0     1.34
+RMSNorm                        0.114    0.4%       0.4     3.5     1.34
+residual add                   0.104    0.4%       0.0       -     1.32
+MoE CPU part                   0.412    1.6%       5.8    14.0        -
+MoE wait                      16.077   61.3%       0.0       -        -
+lm_head                        2.401    9.2%     147.5    61.4     1.05
+embedding                      0.003    0.0%       0.0       -     1.33
+sampling                       0.107    0.4%       0.0       -        -
+register                       0.077    0.3%       0.0       -        -
+other                          0.036    0.1%       0.0       -     1.83
+unattributed                   0.280    1.1%       0.0       -        -
+total                         26.220  100.0%
+```
+
+**Reading.**
+* **The MoE wait is 16.0 ms of 26.2 (61 %)** — 484 MB of expert weights
+  at ≈ 30 GB/s in-app (rule 41). Everything the CPU does is the other 10 ms.
+* **The CPU already streams its weights at 51–63 GB/s**: conv in_proj
+  51–53, out_proj 53–54, attn o 54–55, dense FFN 57–60, lm_head 61–63 GB/s
+  (of an 85.3 GB/s LPDDR5X spec peak). FC + lm_head = 7.4 ms for 402 MB.
+  Only the fused qkv (+ q/k norm) is lower (37–41 GB/s, 0.56 ms).
+* Attention on the CPU is 1.43–1.47 ms/token at pos 512–1023 (fp16 KV,
+  avg/min 1.6–1.8: the cost grows with position).
+* Norms, adds, conv1d, sampling, register, embedding together ≈ 0.6 ms;
+  unattributed 0.28–0.29 ms.
+* During decode the CPU clocks sit at 2.0–2.7 GHz of 3.53 (cpus 0–5) and
+  2.0–3.1 of 4.47 GHz (cpus 6–7) (`freq.log`, 25 samples).
+
+**Consequence for #150's levers:** the CPU side is close to its byte floor
+(≈ 402 MB at 60 GB/s ≈ 6.7 ms vs 7.4 measured for FC + lm_head); the
+bit-preserving CPU headroom is ≈ 0.5–1 ms (the qkv row, attention,
+unattributed), not the 1.5–2.5 ms the plan estimated. The big term is the
+DSP's MoE read at ≈ 30 GB/s while the CPU reads at 55–63 GB/s.
+ (fill in)
 
 Unit, date, KST window: …; device `md5sum` = `md5.txt`? …; thermal
 checkpoints (battery °C·10 / zone0 m°C): 0 …, 1 …, 2 ….
