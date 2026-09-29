@@ -202,6 +202,7 @@ int nntr_hvx_close(remote_handle64 handle) {
     }
   }
   nntr_hvx_arenas_put_all(s);
+  nntr_hvx_q4m1_free_all(s);
   hexkl_moe_scratch_free(&s->moe_scratch);
   /* [#81] The attention cache borrows the pool, so it goes first. */
   hvx_attn_m1_free(s->attn_m1);

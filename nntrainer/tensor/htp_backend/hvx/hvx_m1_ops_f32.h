@@ -36,6 +36,8 @@
 
 #include <stdint.h>
 
+#include "hvx_worker_pool.h"
+
 /**
  * @brief y = (x * r) * gamma per chunk, r the Android CPU's RMSNorm scale
  *        RN(1 / RN(sqrt(s / chunk + eps))), s the sum of squares over 16
@@ -76,28 +78,31 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
                           float *out, uint32_t C);
 
 /**
- * @brief The MoE router of one token (m1_router_topk_det): logits, sigmoid,
- *        biased top-k with the lowest index winning a tie, and the
- *        normalized routing weights.
+ * @brief The MoE router of one token in the Android CPU's order
+ *        (m1_router_cpu_det, #132 PR 2): logits, sigmoid, biased top-k
+ *        with the lowest index winning a tie, and the normalized routing
+ *        weights.
  *
- * One weight row is one vector: four lane accumulators over k mod 4 give
- * the spec's summation order per expert. The weight read (K x 128 B, 256
- * KiB at LFM2.5) is direct HVX loads from DDR with an l2fetch of the next
- * 16 KiB ahead -- a hint that moves no bits.
+ * The logits are E fused chains over k in order, run on the scalar cores
+ * with sffma, 8 register-resident chains per pool lane (so up to 4 lanes
+ * at E = 32); the rest is the spec's own m1_router_cpu_sigmoid (in the lanes)
+ * and m1_router_cpu_pick. The weight read (K x 128 B, 256 KiB at LFM2.5) keeps
+ * an l2fetch of the next 16 KiB ahead -- a hint that moves no bits.
  *
  * @param x       K floats
  * @param w32     K x 32 floats: the [K][E] gate weight padded to 32 columns
- *                (lanes >= E are read and ignored)
+ *                (lanes >= E are read and ignored), 8-byte aligned
  * @param bias    E floats
- * @param K       a multiple of 4
+ * @param K       >= 1
  * @param E       1..32
  * @param top_k   1..E
  * @param logits  E floats out
  * @param sel     top_k expert indices out, in selection order
  * @param weight  top_k routing weights out, in selection order
+ * @param pool    the lanes for the chains (NULL: the caller alone)
  */
 void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                          uint32_t K, uint32_t E, uint32_t top_k, float *logits,
-                         uint32_t *sel, float *weight);
+                         uint32_t *sel, float *weight, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_M1_OPS_F32_H__ */

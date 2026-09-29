@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "../htp/host/q4_gemv_cases.h"
 #include "htp_act_quant.h"
 #include "htp_q4_0_convert.h"
 #include "htp_wh_layout.h"
@@ -24,6 +25,7 @@
 #include <random>
 #include <string>
 #include <tensor.h>
+#include <thread>
 #include <vector>
 
 #include <chrono>
@@ -2187,6 +2189,248 @@ TEST(RmsNormCpuOrder, ReplayNormShadow) {
               path, n_rms, bad_rms, n_qk, bad_qk);
   EXPECT_EQ(bad_rms + bad_qk, 0u);
   EXPECT_GT(n_rms + n_qk, 0u);
+#endif
+}
+
+/* ---- [#132 PR 2] G0: the CPU-order specs equal the shipped CPU ---------- */
+
+#if defined(__aarch64__)
+/** @brief Rows per G0 shape: NNTR_G0_ROWS, default 2000 (plan 132 G0). */
+static unsigned g0_rows(unsigned dflt = 2000u) {
+  const char *e = std::getenv("NNTR_G0_ROWS");
+  return e ? static_cast<unsigned>(std::atoi(e)) : dflt;
+}
+#endif
+
+/**
+ * @brief nntr_quantize_row_q8_0 (this libnntrainer.so) against
+ *        q8_0_quant_cpu_det, block for block: the stored f16 d and the 32
+ *        quants, on q4_gemv_cases.h's rows (block magnitudes 2^-20 ..
+ *        2^20, zero, tiny and quantizer-rounding blocks).
+ */
+TEST(Q8QuantCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned rows = g0_rows();
+  unsigned bad = 0, n = 0;
+  for (unsigned K : {2048u, 7168u}) {
+    std::vector<float> x(K);
+    std::vector<uint8_t> qb((K / 32u) * 34u);
+    std::vector<int8_t> q(K);
+    std::vector<uint16_t> d(K / 32u);
+    for (unsigned r = 0; r < rows; ++r, ++n) {
+      make_row(x.data(), K, static_cast<int>(r % 4u), static_cast<int>(r));
+      nntr_quantize_row_q8_0(x.data(), qb.data(), K);
+      q8_0_quant_cpu_det(x.data(), K, q.data(), d.data());
+      for (unsigned b = 0; b < K / 32u; ++b) {
+        const uint8_t *blk = qb.data() + b * 34u;
+        bad += std::memcmp(blk, &d[b], 2) != 0 ||
+               std::memcmp(blk + 2, q.data() + b * 32u, 32) != 0;
+      }
+    }
+  }
+  std::printf("Q8QuantCpuOrder rows=%u bad_blocks=%u\n", n, bad);
+  EXPECT_EQ(bad, 0u);
+#endif
+}
+
+/**
+ * @brief gemm_q4_0<float> at M = 1 (the decode FC and lm_head) against
+ *        q4_gemv_cpu_det on the same canonical weight, repacked by this
+ *        library's repack_q4_0: the five FC shapes, NNTR_G0_ROWS rows each.
+ *        Also q4_0_from_q4_0x4 inverts the repack (the shadow's reorder).
+ */
+TEST(Q4GemvCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned rows = g0_rows();
+  const unsigned shapes[5][2] = {{2048u, 6144u},
+                                 {2048u, 2048u},
+                                 {2048u, 512u},
+                                 {7168u, 2048u},
+                                 {2048u, 7168u}};
+  unsigned bad_total = 0;
+  for (const auto &sh : shapes) {
+    const unsigned K = sh[0], N = sh[1], nb = K / 32u;
+    const size_t bytes = static_cast<size_t>(N) * nb * 18u;
+    std::vector<uint8_t> w(bytes), x4(bytes), back(bytes);
+    make_weights(w.data(), K, N);
+    std::memcpy(x4.data(), w.data(), bytes);
+    nntrainer::repack_q4_0(x4.data(), w.data(), bytes, N, K);
+    q4_0_from_q4_0x4(x4.data(), K, N, back.data());
+    const bool layout_ok = std::memcmp(back.data(), w.data(), bytes) == 0;
+    std::vector<float> x(K), yc(N), ys(N);
+    std::vector<int8_t> q(K);
+    std::vector<uint16_t> d(nb);
+    unsigned bad = 0;
+    for (unsigned r = 0; r < rows; ++r) {
+      make_row(x.data(), K, static_cast<int>(r % 4u), static_cast<int>(r));
+      nntrainer::gemm_q4_0<float>(1, N, K, x.data(), K, x4.data(), N, yc.data(),
+                                  N);
+      q8_0_quant_cpu_det(x.data(), K, q.data(), d.data());
+      q4_gemv_cpu_det(w.data(), q.data(), d.data(), K, N, ys.data());
+      for (unsigned n = 0; n < N; ++n)
+        bad += std::memcmp(&yc[n], &ys[n], 4) != 0;
+    }
+    std::printf("Q4GemvCpuOrder K=%u N=%u rows=%u bad=%u layout=%s\n", K, N,
+                rows, bad, layout_ok ? "ok" : "BAD");
+    EXPECT_TRUE(layout_ok) << "q4_0_from_q4_0x4 does not invert repack_q4_0";
+    bad_total += bad;
+  }
+  EXPECT_EQ(bad_total, 0u);
+#endif
+}
+
+/**
+ * @brief nntrainer::swiglu (neon::swiglu, exp_ps) against
+ *        m1_swiglu_cpu_det at n = 7168 (the dense FFN), gate values over
+ *        the FFN range, the clamp, far tails, subnormals and every floor
+ *        boundary of exp_ps's fx.
+ */
+TEST(SwigluCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned N = 7168u, rows = g0_rows();
+  std::mt19937 rng(0x132u);
+  std::vector<float> y(N), z(N), oc(N), os(N);
+  unsigned bad = 0;
+  for (unsigned r = 0; r < rows; ++r) {
+    const float span = r % 3u == 0u ? 8.0f : r % 3u == 1u ? 100.0f : 1e4f;
+    std::uniform_real_distribution<float> yd(-span, span), zd(-4.0f, 4.0f);
+    for (unsigned i = 0; i < N; ++i) {
+      y[i] = yd(rng);
+      z[i] = zd(rng);
+    }
+    if (r == 1u)
+      for (unsigned i = 0; i < N; ++i)
+        y[i] = (i & 1u) ? -1e-39f : 1e-39f;
+    if (r == 2u)
+      for (unsigned i = 0; i < N; ++i) {
+        const int k = static_cast<int>(i / 56u) - 127;
+        const float x0 = static_cast<float>((static_cast<double>(k) - 0.5) /
+                                            1.4426950408889634);
+        y[i] = -cpu_det_float(cpu_det_bits(x0) + (i % 56u) - 28u);
+      }
+    nntrainer::swiglu(N, oc.data(), y.data(), z.data());
+    m1_swiglu_cpu_det(y.data(), z.data(), os.data(), N);
+    for (unsigned i = 0; i < N; ++i)
+      bad += std::memcmp(&oc[i], &os[i], 4) != 0;
+  }
+  std::printf("SwigluCpuOrder n=%u rows=%u bad=%u\n", N, rows, bad);
+  EXPECT_EQ(bad, 0u);
+#endif
+}
+
+/**
+ * @brief The router's logits: Tensor::dot of a 1 x 2048 row with the
+ *        2048 x 32 gate (Lfm2MoELayer's input.dot(gate_weights), OpenBLAS
+ *        sgemv_n) against m1_router_cpu_det's fused chains, magnitudes
+ *        2^-20 .. 2^20; and the selection of the same logits against a
+ *        copy of buildExpertAssignments' code (bionic expf, divides).
+ */
+TEST(SgemvNCpuOrder, MatchesRouter) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned K = 2048u, E = 32u, top_k = 4u, rows = g0_rows();
+  std::mt19937 rng(0x13232u);
+  std::uniform_real_distribution<float> wd(-0.05f, 0.05f), bd(-0.01f, 0.01f),
+    md(-2.0f, 2.0f);
+  nntrainer::Tensor in(1, 1, 1, K), gate(1, 1, K, E), out(1, 1, 1, E);
+  float *wp = gate.getData<float>();
+  for (unsigned i = 0; i < K * E; ++i)
+    wp[i] = wd(rng);
+  std::vector<float> bias(E), lg(E);
+  for (auto &b : bias)
+    b = bd(rng);
+  std::vector<uint32_t> sel(top_k);
+  std::vector<float> wt(top_k);
+  unsigned bad_logit = 0, bad_sel = 0;
+  for (unsigned r = 0; r < rows; ++r) {
+    float *x = in.getData<float>();
+    for (unsigned k = 0; k < K; ++k)
+      x[k] = std::ldexp(md(rng), static_cast<int>(r % 41u) - 20);
+    in.dot(gate, out);
+    m1_router_cpu_det(x, wp, bias.data(), K, E, top_k, lg.data(), sel.data(),
+                      wt.data());
+    const float *lc = out.getData<float>();
+    bad_logit += std::memcmp(lc, lg.data(), E * 4) != 0;
+    // buildExpertAssignments on the CPU's own logits
+    std::vector<std::pair<float, int>> sc(E);
+    for (unsigned e = 0; e < E; ++e) {
+      const float s = 1.0f / (1.0f + std::exp(-lc[e]));
+      sc[e] = {s + bias[e], static_cast<int>(e)};
+    }
+    std::partial_sort(
+      sc.begin(), sc.begin() + top_k, sc.end(),
+      [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+      });
+    for (unsigned k = 0; k < top_k; ++k)
+      bad_sel += sel[k] != static_cast<uint32_t>(sc[k].second);
+  }
+  std::printf("SgemvNCpuOrder K=%u E=%u rows=%u bad_logits=%u bad_sel=%u "
+              "(the weights' -ffast-math sum lives in libcausallm_core.so: "
+              "G2's router records hold it)\n",
+              K, E, rows, bad_logit, bad_sel);
+  EXPECT_EQ(bad_logit, 0u);
+  EXPECT_EQ(bad_sel, 0u);
+#endif
+}
+
+/**
+ * @brief m1_expf_bionic_det against this device's libm expf on all 2^32
+ *        inputs (NaNs skipped), eight threads. The first 16 differences are
+ *        printed: the plan's stop rule reads them.
+ */
+TEST(ExpfBionic, AllInputs) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "pins the port to bionic";
+#else
+  float (*volatile libm_expf)(float) = expf;
+  const unsigned T = 8u;
+  std::vector<uint64_t> bad(T, 0), n(T, 0);
+  std::vector<std::vector<uint32_t>> first(T);
+  std::vector<std::thread> th;
+  for (unsigned t = 0; t < T; ++t) {
+    th.emplace_back([&, t] {
+      const uint64_t lo = (1ull << 32) / T * t, hi = (1ull << 32) / T * (t + 1);
+      for (uint64_t u = lo; u < hi; ++u) {
+        const float x = cpu_det_float(static_cast<uint32_t>(u));
+        if (x != x)
+          continue;
+        const float a = m1_expf_bionic_det(x), b = libm_expf(x);
+        ++n[t];
+        if (std::memcmp(&a, &b, 4) != 0) {
+          ++bad[t];
+          if (first[t].size() < 16u)
+            first[t].push_back(static_cast<uint32_t>(u));
+        }
+      }
+    });
+  }
+  for (auto &t : th)
+    t.join();
+  uint64_t nb = 0, nn = 0;
+  for (unsigned t = 0; t < T; ++t) {
+    nb += bad[t];
+    nn += n[t];
+    for (uint32_t u : first[t]) {
+      if (u == 0u)
+        continue;
+      const float x = cpu_det_float(u);
+      std::printf("ExpfBionic diff x=%08x port=%08x libm=%08x\n", u,
+                  cpu_det_bits(m1_expf_bionic_det(x)),
+                  cpu_det_bits(libm_expf(x)));
+    }
+  }
+  std::printf("ExpfBionic inputs=%llu bad=%llu\n",
+              static_cast<unsigned long long>(nn),
+              static_cast<unsigned long long>(nb));
+  EXPECT_EQ(nb, 0u);
 #endif
 }
 

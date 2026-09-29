@@ -53,7 +53,18 @@
 #include <string.h>
 
 #include "attn_m1_det.h"
+#include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
+
+/** @brief A real pthread pool (hvx_worker_pool.c on stub/qurt.h) for the
+ *  env: since #132 PR 2 the router op runs its chains on it. */
+static hvx_worker_pool *real_pool(void) {
+  static hvx_worker_pool *p;
+  if (p == NULL) {
+    p = hvx_worker_pool_create(3u);
+  }
+  return p;
+}
 
 static int g_fail;
 #define CHECK(cond, ...)                                                       \
@@ -458,7 +469,7 @@ static void check_forward(void) {
   env.vtcm_base = g_vtcm;
   env.vtcm_size = sizeof(g_vtcm);
   env.config_off = 32u;
-  env.pool = (hvx_worker_pool *)&env; /* any non-NULL, only passed through */
+  env.pool = real_pool(); /* the stand-in passes it through */
   env.scratch = &g_scratch;
   for (i = 0; i < 64u; ++i) {
     act[i] = frand(&seed);
@@ -897,7 +908,9 @@ static void check_add_router(void) {
   env.vtcm_base = g_vtcm;
   env.vtcm_size = sizeof(g_vtcm);
   env.config_off = 32u;
-  env.pool = (hvx_worker_pool *)&env;
+  env.pool = real_pool(); /* ROUTER_TOPK hands it its chains (#132 PR 2;
+                            one group at E = 4: m1_ops_host_check runs
+                            the multi-lane split) */
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);
@@ -986,7 +999,7 @@ static void check_add_router(void) {
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], a2[i]);
   m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
-  m1_router_topk_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
   for (r = 0; r < HD64_TOP; ++r) {
     r_cnt[sel[r]] = 1u;
     by_e[sel[r]] = wt[r];

@@ -1280,6 +1280,22 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     the warm-start reading. The rule stands as the row's condition: a
     G=1024 number is quoted with its start temperature, and a warm-start
     A of this default reads 47–49 there.
+53. **The inline-asm IEEE HVX `.sf` forms do not execute on v79
+    silicon: `Vd.sf = vadd / vsub / vmpy(Vu.sf, Vv.sf)` (assembled with
+    `-mhvx-ieee-fp`) return `0x00000000` in every lane, while the ISS
+    runs them as IEEE ops; use the `Q6_Vsf_*` intrinsics (a qf32 op and a
+    conversion, which the compiler emits even with `-mhvx-ieee-fp`) or
+    the scalar `sffma`** (#132 PR 2 sitting S3, `R3CY10WM83Y`,
+    2026-09-30, `HvxFcQ4.SfProbe`: 256/256 random normal pairs and the
+    kernel's own operands, asm form `0x0`, intrinsics and scalar sffma
+    bad=0). This is rule 49's cause: `hvx_native` used the asm form for
+    every op, the sffma variants for their scale terms; #164's norm and
+    the router never did. A kernel that passes on the ISS with the asm
+    form proves nothing about silicon. Same sitting: the scalar
+    `sfrecipa / sffixup` divide equals the integer RN divide on every
+    mantissa of amax / 127 and 1 / d (50 331 648 divides); the
+    ISS-to-silicon pcycle ratio of scalar-heavy DSP code read ×1.3–1.4
+    (router 65 528 vs ≈ 50 k projected, quantizer ≈ 14.7 k vs 10.7 k).
 
 ## 2. Verdicts (measured, closed)
 
