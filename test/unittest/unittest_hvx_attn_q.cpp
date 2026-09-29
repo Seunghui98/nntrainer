@@ -528,6 +528,37 @@ TEST_F(HvxAttnQDecode, StepTiming) {
   }
 }
 
+/**
+ * A long prompt in one step: the whole prefill's rows appended and attended
+ * in a single call, the shape a 3k-token prompt hands the layer.
+ */
+TEST_F(HvxAttnQDecode, StepTimingLongPrefill) {
+  const uint32_t rows = 3072, n_kv = 8, hd = 128, n_q_heads = 16;
+  const uint32_t width = n_kv * hd;
+  std::vector<uint16_t> k(static_cast<size_t>(rows) * width), v(k.size());
+  fill_hf(k, 0x57E90011u, 1.0f);
+  fill_hf(v, 0x57E90012u, 1.0f);
+  std::vector<float> q(static_cast<size_t>(rows) * n_q_heads * hd);
+  fill_deterministic(q, 0x57E90013u, 3.0f);
+  std::vector<float> out(q.size());
+  std::vector<uint32_t> st(8, 0);
+  uint32_t h = 0;
+  ASSERT_EQ(nntr_hvx_kv_register_q(handle_, 0, rows + 64, n_kv, hd, &h),
+            AEE_SUCCESS);
+  const int err = nntr_hvx_attn_q_step(
+    handle_, h, 0, k.data(), static_cast<int>(k.size()), v.data(),
+    static_cast<int>(v.size()), rows, 0, rows, n_q_heads, 0, 0.0f, q.data(),
+    static_cast<int>(q.size()), nullptr, 0, out.data(),
+    static_cast<int>(out.size()), st.data(), 8);
+  std::cout << "ATTN_Q_FIELD path=step_prefill kind=0 rows=" << rows
+            << " err=" << hex(err) << " append_us=" << st[0]
+            << " attn_us=" << st[1] << " total_us=" << st[3]
+            << " quant_us=" << st[4] << " stage_us=" << st[5]
+            << " bake_us=" << st[6] << " appended=" << st[7] << "\n";
+  EXPECT_EQ(err, AEE_SUCCESS) << hex(err);
+  EXPECT_EQ(nntr_hvx_kv_release_q(handle_, h), AEE_SUCCESS);
+}
+
 TEST_F(HvxAttnQ, AccumulatorLayoutIsRowMajorStrided) {
   std::vector<uint32_t> layout(3, 0);
   const int err = nntr_hvx_probe_acc_i32_layout(handle_, layout.data(), 3);

@@ -27,6 +27,8 @@
 #include <htp_backend.h>
 #include <nntrainer_log.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <vector>
 
 #include <AEEStdErr.h>
@@ -37,6 +39,25 @@
 namespace nntrainer {
 
 namespace {
+
+/**
+ * @brief NNTR_HTP_ATTN_TRACE=1 logs every attention call with its host-side
+ *        wall time and the skel's stats, so a model run shows where a step
+ *        spends its time: in the kernel, or around the FastRPC call.
+ */
+bool attn_trace_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_HTP_ATTN_TRACE");
+    return e && *e && *e != '0';
+  }();
+  return on;
+}
+
+int64_t now_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
 
 /**
  * @brief llama.cpp's HMX-eligibility rule, inverted: fewer than five query
@@ -136,10 +157,19 @@ public:
     const int sinks_len = sinks ? static_cast<int>(n_head_q) : 0;
     const int rows_len = static_cast<int>(append_rows * kv_stride);
     uint32_t stats[8] = {0};
+    const int64_t t0 = now_us();
     const int err = nntr_hvx_attn_q_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q, q_len,
       sinks, sinks_len, out, q_len, stats, 8);
+    if (attn_trace_enabled()) {
+      ml_logi("HTP attn trace q: handle=%d n_q=%u cache=%u..%u append=%u "
+              "err=0x%x wall_us=%lld dsp_us=%u append_us=%u attn_us=%u "
+              "quant_us=%u stage_us=%u bake_us=%u",
+              handle, n_q, cache_from, cache_to, append_rows, err,
+              static_cast<long long>(now_us() - t0), stats[3], stats[0],
+              stats[1], stats[4], stats[5], stats[6]);
+    }
     if (err != AEE_SUCCESS) {
       ml_logw("HTP quantized attention step failed: 0x%x; CPU fallback", err);
       return false;
@@ -175,6 +205,7 @@ public:
     uint32_t stats[8] = {0};
 
     int err;
+    const int64_t t0 = now_us();
     if (n_q < kDecodeMaxRows && head_dim <= kDecodeMaxHeadDim) {
       err = nntr_hvx_attn_f16_decode(h, n_q, cache_from, cache_to, n_head_q,
                                      n_head_kv, head_dim, window, softcap, q,
@@ -185,6 +216,16 @@ public:
         h, n_q, cache_from, cache_to, n_head_q, n_head_kv, head_dim, window,
         /*br=*/0, /*bc=*/0, softcap, q, q_len, k_cache, kv_len, v_cache, kv_len,
         sinks, sinks_len, out, q_len, stats, 8);
+    }
+    if (attn_trace_enabled()) {
+      // stats: qprep, dma, tile, qk, softmax, pv, store microseconds and the
+      // block count (nntr_hvx_attn_f16.c).
+      ml_logi("HTP attn trace f16: n_q=%u cache=%u..%u err=0x%x wall_us=%lld "
+              "dsp_us: qprep=%u dma=%u tile=%u qk=%u softmax=%u pv=%u "
+              "store=%u blocks=%u",
+              n_q, cache_from, cache_to, err,
+              static_cast<long long>(now_us() - t0), stats[0], stats[1],
+              stats[2], stats[3], stats[4], stats[5], stats[6], stats[7]);
     }
     if (err != AEE_SUCCESS) {
       // AEE_EUNSUPPORTED is the skel saying this part has no fp16 HMX;
