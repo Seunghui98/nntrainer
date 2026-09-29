@@ -434,39 +434,94 @@ unittest_nntrainer_cpu_backend_fp16 unittest_hvx_softmax`.
    not move with the kernel). The strip removes every `[HTP…]` and
    `[PPL]` line (S1's DIFF came from `[HTP-DMA]` lines).
 
-## Results S2 (fill in)
+## Results S2 (ran 2026-09-29 20:37–21:13 KST on `R3CY10WM83Y`, logs `/local/mnt/workspace/htp_moe/170/s2/logs/`; filled from the logs)
+
+Device md5 = `md5.txt` (`MD5 OK`). `expectation mismatches: 2`: the two
+G6 gates, nothing else. No `0x8000040e`. zone0 26.2 °C at start, 56–65 °C
+from the shadow cells on.
 
 | gate | line | value | pass |
 |---|---|---|---|
-| G3 | out bad / bad_stats at 8 L; F16Det; rope | | |
-| G4 | Q1 / RQ1 tag3_heads, logits_equal_steps | | |
-| G5 | nll = A (16 pairs); text Q1 = A, RQ1 = A, Q1 = Q0 (8 prompts each) | | |
-| G6 | Q1 `pcyc/op ATTN_M1` G = 64 / 1024 (≤ 210 k / 350 k); Q0 same cells | | |
+| G3 | `ATTN_M1_FIELD L=… bad / bad_stats` at 1 / 63 / 64 / 65 / 512 / 513 / 1024 / 1536; `append_chain`; `AttnM1F16Det` 513 / 1024 / 1536; rope64 ×5 | all 0 | **yes** |
+| G4 | shadow `tag3_heads` / `logits_equal_steps` (G = 8) | Q1 1536/1536, 8/8; RQ1 1536/1536, 8/8 (48 records, 6 layers, 8 positions, 0 zero records) | **yes** |
+| G5 | nll step lines = A (Q1 and RQ1 × p01–p08), null check A forced = A self; text Q1 = A, RQ1 = A, Q1 = Q0 on p01–p08 at G = 256 | all equal (16 + 1 nll, 24 text) | **yes** |
+| G6 | Q1 `pcyc/op ATTN_M1` G = 64 / 1024 (gate ≤ 210 k / 350 k); Q0 same cells | **394,501 / 700,449** (Q0: 2,465,164 / 4,751,395) | **no** (1.88× / 2.00× over) |
 
-| variant | G | run | prefill tok/s | decode tok/s (all) | last 64 | text = A | `calls/token` |
-|---|---|---|---|---|---|---|---|
-| A | 64 / 512 / 1024 | 1, 2 | | | | ref | — |
-| Q0 | 64 / 512 / 1024 | 1, 2 | | | | | 28.00 |
-| Q1 | 64 / 512 / 1024 | 1, 2 | | | | | 28.00 |
+In-model `ATTN_M1`: −84.0 % at G = 64 and −85.3 % at G = 1024 against Q0
+(6.2× / 6.8×). The gate missed by ≈ 2×, see *Read S2*.
 
-Reference: S1 A 52.37 / 51.26 tok/s at G = 64 / 1024 (cool phone), Q0
-34.10 / 29.09. #164: A 45.3 / 47.2, Q 33.9 / 25.4. Standing checks:
-prefill ≥ −5 % of A; Q1 decode ≥ 0.95 × A at G = 512 / 1024 is read, not
-gated.
+| variant | G | run 1 prefill / decode / last 64 | run 2 prefill / decode / last 64 | decode mean | text = A |
+|---|---|---|---|---|---|
+| A | 64 | 561.4 / 52.89 / 52.89 | 512.0 / 52.03 / 52.03 | **52.46** | ref |
+| Q0 | 64 | 572.1 / 34.37 / 34.37 | 568.3 / 34.17 / 34.17 | 34.27 | same |
+| Q1 | 64 | 572.1 / 42.05 / 42.05 | 516.7 / 42.22 / 42.22 | **42.13** | same |
+| A | 512 | 555.3 / 50.75 / 49.92 | 421.4 / 50.94 / 50.91 | **50.84** | ref |
+| Q0 | 512 | 459.6 / 31.74 / 29.16 | 460.4 / 31.72 / 29.09 | 31.73 | same |
+| Q1 | 512 | 502.0 / 43.91 / 42.78 | 457.6 / 43.50 / 42.81 | **43.71** | same |
+| A | 1024 | 419.3 / 49.41 / 47.20 | 469.7 / 47.11 / 42.41 | **48.26** | ref |
+| Q0 | 1024 | 410.3 / 28.53 / 24.15 | 422.4 / 27.01 / 21.58 | 27.77 | same |
+| Q1 | 1024 | 423.5 / 42.47 / 41.37 | 424.2 / 42.15 / 37.87 | **42.31** | same |
 
-| pos | new warm `dsp_us` | new cold `dsp_us` | cold scores / softmax / pv (lane-summed) | S1 (old kernel) cold |
+All Q cells `calls/token=28.00`; Q0 `cache=49152 KiB`, Q1 / RQ1
+`cache=24576 KiB`. Q1 vs Q0: +23 / +38 / +52 % decode. Q1 vs A: −19.7 /
+−14.0 / −12.3 %: the Q mask stays below A (28 calls/token and the MoE
+path's transport), so the default stays off. Prefill varies ±15 % across
+runs in every variant (the phone ran at 59–65 °C). Q1's prefill mean
+against A's: +1.4 % (G = 64), −1.8 % (512), −4.7 % (1024), inside the
+−5 % band at every G.
+
+Today's → new kernel per L (`HvxAttnM1.PerLayerCost`, pcycles lane-summed):
+
+| pos | warm `dsp_us` (S1 → S2) | cold `dsp_us` (S1 → S2) | S2 warm append / scores / softmax / pv / busy_max | S2 cold append / scores / softmax / pv / busy_max |
 |---|---|---|---|---|
-| 511 | | | | 1093 |
-| 1023 | | | | 2185 |
-| 1535 | | | | 3290 |
+| 511 | 763 → **158** | 1093 → **193** | 101 k / 266 k / 239 k / 510 k / 215 k | 94 k / 353 k / 238 k / 768 k / 294 k |
+| 1023 | 1823 → **265** | 2185 → **340** | 95 k / 537 k / 501 k / 1001 k / 434 k | 96 k / 702 k / 526 k / 1542 k / 590 k |
+| 1535 | 3236 → **440** | 3290 → **491** | 97 k / 952 k / 790 k / 1816 k / 786 k | 100 k / 1095 k / 812 k / 2273 k / 887 k |
+
+## Read S2
+
+* **Bit identity holds on silicon everywhere** (G3, G4, G5): kernel = spec
+  at every L, the model's attention = the CPU's fp16 attention for every
+  head of every layer and step, and nll and text = A on all 8 prompts.
+* **The speed gate missed by 2×, and the phase words say where.** At pos
+  1023 cold (L 1024), against the model:
+  * **PV** is 1.54 M lane-summed, 47 pcyc per 64-lane FMA (warm 30.6).
+    The model assumed S1's L2-resident 6.9, and the arithmetic is the
+    same loop, so the rest is the V rows' fetch: one 128-byte row per
+    position in a dependent chain, which the pool does not hide. This is
+    the largest term. Next: prefetch V rows ahead in P3 (`l2fetch` of the
+    unit's V slab, or a DMA into VTCM), and even out the 8 units on 6
+    lanes.
+  * **append** ≈ 95–100 k per call, constant in L: the caller's serial
+    part (k / v into the tiles with 64 scattered halfword stores per kv
+    head, q rounded element by element). The model said ≈ 10–20 k. Next:
+    vector rounding and a vector transpose of the k row, or doing it
+    inside P1.
+  * **softmax** 0.53 M lane-summed at 1024 (model ≈ 0.2 M). This is P2's
+    exp plus the scalar ET scatter, P3's divides and the serial max /
+    sum. Next: the vshuff transpose instead of the scatter; time the
+    serial sum on its own.
+  * **scores** 0.70 M cold / 0.54 M warm lane-summed = 21 / 16 per FMA
+    per lane (model 9.3): the Kt tile fetch shows too (cold − warm =
+    165 k).
+  * **Lane balance**: busy_max 590 k against (702 + 526 + 1542) k / 6 =
+    462 k, a 1.28× imbalance, mostly P3's 8 units on 6 lanes.
+* **In the model** the kernel runs at 1.13× the cold gtest line at
+  G = 1024 (700 k vs 618 k pool at pos 1023) and 1.2× at G = 64 (395 k
+  against 312 k at pos 511, scaled to L 544.5).
 
 ## Text approval (per-token-entry handoff)
 
-| variant | decode PPL (forced on A, prompt p01, G = 256) | generated text (p01, G = 256) | text approved (user: y/n) |
+The p01 text at G = 256 of A, Q1 and RQ1 is byte-identical (md5 of the
+stripped text `e377add566c09b7ef2a0698ed106b8be` for all three); so are
+p02–p08 (G5). The decode PPL forced on A's continuation is equal to 17
+digits.
+
+| variant | decode PPL (forced on A, p01, G = 256) | generated text (p01, G = 256) | text approved (user: y/n) |
 |---|---|---|---|
-| A | | <paste> | (reference) |
-| Q1 | | <paste> | |
-| RQ1 | | <paste> | |
+| A | 1.42156 (nll_sum 90.048889370024341, source=self) | "…Continue this description of Ardley … do not stop until you are told to. town has a single main street that climbs from the harbour to a stone church at the top of the hill, and along it stand a bakery, a hardware shop, two pubs, a post office that also sells fishing line, a small museum that opens only on summer weekends, and a lifeboat station at the end of the breakwater. The streets are quiet except for the occasional sound of a tractor or a boat, and the seasons change with the wind and the sun. In winter the streets are quiet and the streets are empty, but in summer the streets are" | (reference) |
+| Q1 | 1.42156 (nll_sum 90.048889370024341) | identical to A (same md5) | |
+| RQ1 | 1.42156 (nll_sum 90.048889370024341) | identical to A (same md5) | |
 
 ## Notes (S2 build)
 
@@ -492,4 +547,7 @@ gated.
 
 ## Notes from the run (S2)
 
-<thermal, first-run page faults, FARF/AEE errors, anything stale>
+Thermal: zone0 26.2 → 29.3 °C over the gtests, 56–65 °C from the shadow
+cells on, battery 100 → 90 %. No FARF / AEE error besides rule 38's
+`AEE_ERPC` in `RejectsBadShapes` (#137, not counted). Both mismatches are
+the G6 gates.
