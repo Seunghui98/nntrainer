@@ -716,7 +716,8 @@ interface nntr_hvx : remote_handle64 {
    // session. role 0 posts seq 1..n in the ping word (after copying payload
    // bytes into its half, cache clean) and waits for the same seq in pong;
    // role 1 mirrors. A wait spins spin_us, then polls every 50 us until
-   // spin_us + 1 s, which counts a timeout and ends the run.
+   // spin_us + 1 s, which counts a timeout and ends the run. payload is 0
+   // or a multiple of 4 of at least 12 bytes; us_total is 0 when n_done is 0.
    // res (5): [us_total, n_done, n_timeouts, payload_checksum, n_bad].
    AEEResult mailbox_run(in int32 fd, in uint32 bytes, in uint32 role,
                          in uint32 n, in uint32 payload, in uint32 spin_us,
