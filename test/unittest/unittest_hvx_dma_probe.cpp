@@ -576,7 +576,13 @@ TEST_F(HvxDmaProbe, MoeChunkReplay) {
   }
 
   // --- the schedule: the plan, with the traced call's issue times ---------
+  // Pushes land strided, the kernel's VTCM layout (hexkl_mm_u8i4_moe.c
+  // push2d: dst_stride = src_stride); the replay default is packed, which
+  // overlaps the gate/up chunks and fails the footprint sum below (#99).
+  // weight_bytes is the in-situ `weight DMA:` basis; bytes_per_call also
+  // counts the activation and copy pushes.
   std::vector<uint32_t> sched;
+  uint32_t weight_bytes = 0;
   sched.reserve(n_plan * 8);
   {
     const uint32_t *pp = trace.data() + HEXKL_DMA_TRACE_HDR_WORDS;
@@ -589,7 +595,13 @@ TEST_F(HvxDmaProbe, MoeChunkReplay) {
         t_rel =
           it.op == NNTR_MOE_DMA_OP_PUSH ? pp[(ip++) * pw] : wp[(iw++) * ww];
       }
-      const uint32_t words[8] = {nntr_moe_dma_word0(&it),
+      const bool push = it.op == NNTR_MOE_DMA_OP_PUSH;
+      if (push && it.kind != NNTR_MOE_DMA_KIND_ACT &&
+          it.kind != NNTR_MOE_DMA_KIND_COPY) {
+        weight_bytes += it.row_size * it.nrows;
+      }
+      const uint32_t words[8] = {nntr_moe_dma_word0(&it) |
+                                   (push ? NNTR_MOE_DMA_DST_STRIDED << 16 : 0u),
                                  it.expert,
                                  it.src_off,
                                  it.dst_off,
@@ -624,7 +636,8 @@ TEST_F(HvxDmaProbe, MoeChunkReplay) {
               << "DMA_REPLAY workers=" << workers << " load=" << load
               << " pace=" << pace << " fresh=" << fresh << " gap_us=" << gap_us
               << " calls=" << calls << " us_per_call=" << us_per_call
-              << " bytes_per_call=" << res[2] << " gbs=" << gbs
+              << " bytes_per_call=" << res[2]
+              << " weight_bytes=" << weight_bytes << " gbs=" << gbs
               << " wait_us=" << res[3] / (double)calls << " blocked=" << res[4]
               << "/" << plan_wait * calls << " depth_max=" << res[5]
               << " busy_us=" << res[10] / (double)calls << ".."
@@ -679,7 +692,7 @@ TEST_F(HvxDmaProbe, MoeChunkReplay) {
         s.insert(s.end(), words, words + 8);
         if (it.op == NNTR_MOE_DMA_OP_PUSH) {
           ++n_push;
-          // flags 0 is the replay's default, packed until #99 lands
+          // flags 0 is the replay's default: packed
           modes |= (it.flags & NNTR_MOE_DMA_DST_STRIDED) ? 2u : 1u;
         }
       }
