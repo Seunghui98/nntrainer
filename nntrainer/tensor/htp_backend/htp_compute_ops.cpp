@@ -1742,7 +1742,8 @@ public:
                    "head_dim=%u max_seq=%u cache=%llu KiB\n",
                    n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq,
                    (unsigned long long)n_attn * rec->n_kv * rec->head_dim *
-                     max_seq * 2u * sizeof(uint16_t) / 1024u);
+                     ((max_seq + 63u) / 64u * 64u) * 2u * sizeof(uint16_t) /
+                     1024u);
     }
   }
 

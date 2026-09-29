@@ -291,7 +291,7 @@ $EVAL --label fwd-hd64 --allow-diff --snr-floor $SNR_FLOOR "$OUT/dump_64off" "$O
 $EVAL --label 'fwd==off' --tokens-policy "$OUT/dump_64off" "$OUT/dump_64fwd" | tail -1 || fail=1
 grep -q '^\[HTP\] graph: init n_ops=30 resident=RMSNORM|CONV1D_GATE|QK_NORM|ROPE|ATTN_M1|MOE ' "$OUT/64fwd.log" ||
   { echo "E2E FAIL hd64: no init line with every kind resident"; fail=1; }
-grep -q '^\[HTP\] attn_m1: registered layers=1 kv=1 gqa=2 head_dim=64 max_seq=32 cache=8 KiB' "$OUT/64fwd.log" ||
+grep -q '^\[HTP\] attn_m1: registered layers=1 kv=1 gqa=2 head_dim=64 max_seq=32 cache=16 KiB' "$OUT/64fwd.log" ||
   { echo "E2E FAIL hd64: no attn_m1 registration line"; fail=1; }
 # (g) [#136] the lfm25 fixture: its logits golden with the switch off; with
 # it on, 23 calls per token (the stretch count of the six-layer list with
