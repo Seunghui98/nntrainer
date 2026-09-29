@@ -68,6 +68,21 @@
 #                              carries it unchanged)
 #   E2E tokens d==off-tiny / -hd64 / -lfm25 8/8 expected_mismatch=0
 #   E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED
+# and, since #132 Part B E1, every kind resident in one session (the FC,
+# the dense FFN and the tied lm_head on the DSP too: one call per token;
+# logits only, the switch-on runs dump no MoE call):
+#   E2E fwd hd64 kinds=all calls/token=1.00 q4m1_handles=12
+#   E2E fwd lfm25 kinds=all calls/token=1.00 q4m1_handles=23
+#   E2E eval e1x86==d-hd64 / -lfm25 ... bit_identical=1 (the quantizer in
+#                              x86's id order, NNTR_INPROC_X86_Q8=1: every
+#                              logit and prefill MoE call equals D's)
+#   E2E eval e1-hd64 / e1-lfm25 ... min_snr_db=<x>     (printed: the
+#                              Android CPU's order against x86's D)
+#   E2E tokens e1==off-hd64 / -lfm25 8/8 expected_mismatch=0
+#   E2E eval e1-feed-l2 ... bit_identical=1            (NNTR_HTP_FC_FEED=l2:
+#                              the feed moves no bits)
+#   E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED   (head_dim 8:
+#                              no one-call token on the hd8 fixture)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
 # (NNTR_HTP_DSPQ=1, inproc/dspqueue_standin.c; plan 141-dspq-moe.md step 4),
 # each against the switch-off run's dumps, every call's bytes:
@@ -208,6 +223,39 @@ NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
 echo "== [#132] lfm25 htp, KINDS=<six>,ADD,ROUTER_TOPK, prompt 512"
 PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
   run_e2e lfm25-d "$OUT/htp25" htp "$OUT/dump_25d" "$OUT/25d.log" --max-seq 2048
+# [#132 Part B, E1] every kind resident: one call per token, VTCM feed and
+# L2 feed; the hd8 fixture refused (its attention kinds cannot be resident).
+# The lm_head on the DSP is the Q4_0 one, so these runs quantize the tied
+# embedding to Q4_0 (LFM2.5's file does; the fixtures default to FP32) and
+# carry their own switch-off and D references on that model.
+E1_KINDS=RMSNORM,FC,CONV1D_GATE,QK_NORM,ROPE,ATTN_M1,ADD,ROUTER_TOPK,MOE,DENSE_FFN,LM_HEAD
+"$Q" "$FIX64" -o "$OUT/htp64q" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_htp64q.log"
+"$Q" "$FIX25" -o "$OUT/htp25q" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_htp25q.log"
+# NNTR_INPROC_X86_Q8=1 runs the DSP quantizer in x86 nntrainer's id order
+# (hvx_q4_gemv_f32.c; the only op where the x86 CPU's Q4_0 FC differs from
+# the Android CPU's), so that run is held against D bit for bit; the
+# Android-order run (e1a) is the tokens policy and a printed SNR.
+echo "== [#132 Part B] hd64 / lfm25 htp, Q4_0 lm_head: off, D, KINDS=all (one call per token)"
+for fx in 64 25; do
+  if [ $fx = 64 ]; then p=$PROMPT; ms=32; else p=512; ms=2048; fi
+  PROMPT=$p run_e2e "q$fx-off" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}qoff" "$OUT/${fx}qoff.log" --max-seq $ms
+  PROMPT=$p NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
+    run_e2e "q$fx-d" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}qd" "$OUT/${fx}qd.log" --max-seq $ms
+  PROMPT=$p NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS NNTR_INPROC_X86_Q8=1 \
+    run_e2e "q$fx-e1" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}e1" "$OUT/${fx}e1.log" --max-seq $ms
+  PROMPT=$p NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+    run_e2e "q$fx-e1a" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}e1a" "$OUT/${fx}e1a.log" --max-seq $ms
+done
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS NNTR_HTP_FC_FEED=l2 \
+  NNTR_INPROC_X86_Q8=1 \
+  run_e2e hd64-e1l2 "$OUT/htp64q" htp "$OUT/dump_64e1l2" "$OUT/64e1l2.log" --max-seq 32
+rc_e1=0
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS "$E2E" --model "$OUT/htp" \
+  --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
+  --moe-engine htp > "$OUT/tiny_e1.log" 2>&1 || rc_e1=$?
+tail -1 "$OUT/tiny_e1.log"
 # [#141] the M==1 MoE calls over dspqueue: tiny (DSP spins between calls),
 # lfm25 at prompt 512 (DSP always blocks), the HMX loop at M = 1, and a
 # runtime without dspqueue (the off banner, FastRPC throughout)
@@ -341,6 +389,33 @@ for d in "tiny $D_TINY,ROUTER_TOPK d 7.00 ref_off dump_htp" \
   $EVAL --label "d-$fx" --allow-diff --snr-floor $SNR_FLOOR "$OUT/$ref" "$OUT/dump_$tag" | tail -1 || fail=1
   $EVAL --label "d==off-$fx" --tokens-policy "$OUT/$off" "$OUT/dump_$tag" | tail -1 || fail=1
 done
+# (h2) [#132 Part B, E1] one call per token with every kind resident, and
+# bit-identical to the D run on the same model (the prefill MoE calls and
+# every logit) once the quantizer takes x86's id order -- so the FC,
+# dense FFN and lm_head are the x86 CPU's bits end to end; the handles the
+# model bound; the Android-order run against off by the tokens policy
+# (its SNR printed: lfm25 reads ~15 dB at the first decode step, where the
+# x86-order run is bit-identical, so the quantizer's id rounding is the
+# whole difference); the L2 feed bit-identical to the VTCM feed
+for d in "hd64 64e1 12 dump_64qd dump_64qoff" "lfm25 25e1 23 dump_25qd dump_25qoff"; do
+  read -r fx tag nh ref off <<< "$d"
+  calls="$(calls_per_token "$OUT/$tag.log")"
+  handles="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) .*/\1/p' "$OUT/$tag.log")"
+  echo "E2E fwd $fx kinds=all calls/token=${calls:-none} q4m1_handles=${handles:-none}"
+  [ "$calls" = 1.00 ] && [ "$handles" = "$nh" ] || fail=1
+  [ "$(calls_per_token "$OUT/${tag}a.log")" = 1.00 ] || fail=1
+  $EVAL --label "e1x86==d-$fx" "$OUT/$ref" "$OUT/dump_$tag" | tail -1 || fail=1
+  $EVAL --label "e1-$fx" --allow-diff --snr-floor 0 "$OUT/$ref" "$OUT/dump_${tag}a" | tail -1 || fail=1
+  $EVAL --label "e1==off-$fx" --tokens-policy "$OUT/$off" "$OUT/dump_${tag}a" | tail -1 || fail=1
+done
+grep -q '^\[HTP\] graph: q4m1 weights=12 handles=12 feed=l2$' "$OUT/64e1l2.log" ||
+  { echo "E2E FAIL hd64 e1 l2: no feed=l2 line"; fail=1; }
+$EVAL --label e1-feed-l2 "$OUT/dump_64e1" "$OUT/dump_64e1l2" | tail -1 || fail=1
+if [ $rc_e1 = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ESCHEMENOTSUPPORTED' "$OUT/tiny_e1.log"; then
+  echo "E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED"
+else
+  echo "E2E FAIL all kinds at head_dim 8 not refused (rc=$rc_e1)"; fail=1
+fi
 if [ $rc_add = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ENOTALLOWED' "$OUT/add_nonorm.log"; then
   echo "E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED"
 else
