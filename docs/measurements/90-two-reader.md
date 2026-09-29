@@ -252,7 +252,66 @@ set #90 to `state:measured`.
 | G4 validity (rule 12) | whole log | `grep -c INVALID` = 0, no `FAILED` (an INVALID line fails its test by `EXPECT`) |
 | G5 standing | A logs | `dspq: on` once each; text at G=512 ≡ #150 T8 (hash); prefill within −5 % of #150 A0 |
 
-## Results (fill in)
+## Results
+
+Run 2026-09-29 11:07–11:10 KST by the orchestrator, unit `R3CY10WM83Y`,
+right after #150's sitting in the same `s150` dir (only the probe pushed;
+device md5 = md5.txt, MD5 OK). Cool start (battery 26.3 °C, zone0 27.8 °C);
+zone0 52.9 °C after the cold probe, 63.3 °C after the E2E cells. Logs:
+`/local/mnt/workspace/htp_moe/90/logs/`.
+
+**`MoeChunkReplay` FAILED with `checksum_ok=n`**: expected — this probe
+binary predates PR #154 (#99's fix, measured `checksum_ok=y` the same
+morning). TwoReaderDdr and PrefetchOverlap PASSED; `INVALID` count 0.
+
+### (1) Readers alone and together (cold probe)
+
+| reader | alone GB/s | with the other | aggregate |
+|---|---|---|---|
+| CPU 1 / 2 / 4 / 8 threads | 63.0 / 68.1 / 69.4 / 68.3 | — | — |
+| DSP DMA ring (`f2`, fresh, 168 MiB) | 37.3 (ref `f2` 40.3) | — | — |
+| DSP HVX direct (M=1 MoE, feed off) | 24.8 | — | — |
+| CPU 1 / 2 / 4 / 8 thr + ring | — | CPU 40.3 / 40.6 / 38.9 / 38.5, ring 31.0 / 30.9 / 31.3 / 31.0 | **71.2 / 71.5 / 70.2 / 69.5** |
+| CPU 2 / 8 thr + HVX | — | CPU 48.7 / 49.3, HVX 15.9 / 17.3 | 64.6 / 66.6 |
+
+Warm probe: CPU + ring aggregate 63.9–70.2 GB/s, same shape.
+
+**Reading.** The phone's DRAM tops out at **≈ 70 GB/s** for any mix of
+readers. The CPU alone already reaches 63–69 GB/s; adding the DSP ring
+raises the total by only ≈ 2–3 % (the CPU loses 36–44 %, the ring 16–17 %).
+So (b) does not add bandwidth on top of a CPU that already streams; it
+**redistributes** it. What it can buy is using the ≈ 70 GB/s during the
+MoE window, when today only the DSP reads (at ≈ 30–33 GB/s).
+
+### (2) Prefetch overlap (the bit-preserving form of (b))
+
+| S MiB | threads | DSP `mm` change cold / warm | net ms/token cold / warm |
+|---|---|---|---|
+| 4 | 1 / 2 / 7 | +0.7 / −0.5 / −0.9 % · +0.3 / +0.3 / −0.5 % | +0.72 / +0.91 / +1.23 · +0.88 / +0.95 / +1.39 |
+| 10 | 1 / 2 / 7 | +5.5 / +7.6 / +6.4 % · +1.5 / +0.8 / +1.5 % | −0.09 / −0.37 / +0.72 · +0.82 / +1.08 / +1.69 |
+| 20 | 1 / 2 / 7 | +18.4 / +17.4 / +15.0 % (cold) | −1.96 / −1.85 / −0.58 |
+| 32 | 1 / 2 / 7 | +31.2 / +30.5 / +28.3 % (cold) | −4.16 / −3.69 / −3.30 |
+
+Rule P (S=10: DSP slowdown ≤ 5 %, retention ≥ 0.5, net ≥ 1.0 ms/token):
+**fails cold, passes warm with 2 or 7 threads.** S=4 is positive in every
+cell (+0.7 to +1.4 ms/token, DSP unchanged). Up to ≈ 4–10 MiB per MoE call
+fits in the CPU caches without slowing the DSP; beyond that it costs more
+than it saves.
+
+### (3) Full E2E control A (NNTR_OP_TIME=1, dspq default)
+
+| G | prefill tok/s | decode tok/s | dspq close |
+|---|---|---|---|
+| 64 | 576.6 | **39.70** | 1408 / 1408, bad=0 |
+| 512 | 552.3 | **39.18** | 11264 / 11264, bad=0 |
+| 1024 | 561.4 | **36.53** | 22528 / 22528, bad=0 |
+
+Every log `dspq: on` once (rule 40). Text A G=512 = #150 T8 run 1 (identical).
+Per-op at G=1024: MoE wait 16.2 of 27.4 ms (59 %), attention 1.97 ms (grows
+with position), FC + lm_head 7.9 ms at 47–61 GB/s. **First G=1024 cell on
+the dspq default: 36.53 tok/s** (fills the "now" G=1024, previously 35.17
+from #120).
+ (fill in)
 
 Unit, date, KST window: …; device `md5sum` = `md5.txt`? …; thermal
 checkpoints (battery °C·10 / zone0 m°C): 0 …, 1 …, 2 …, 3 ….
