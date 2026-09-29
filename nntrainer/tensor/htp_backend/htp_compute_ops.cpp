@@ -52,6 +52,7 @@
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
 #include <htp_wh_layout.h>
+#include <q4_gemv_cpu_det.h>
 #include <swiglu_det.h>
 
 #include <algorithm>
@@ -1309,7 +1310,11 @@ public:
     HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |
     HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) |
     HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |
-    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK);
+    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KINDS_Q4M1;
+
+  /** [#132 Part B] Rows per lm_head slice (plan 132 section 3.2: 8 slices
+   *  of 16384 rows at LFM2.5, 18 MiB each). */
+  static constexpr uint32_t kLmHeadSliceRows = 16384u;
 
   bool set_decode_graph_desc(const std::vector<uint32_t> &words) override {
     std::lock_guard<std::mutex> lock(graph_mutex_);
@@ -1322,9 +1327,10 @@ public:
       throw std::invalid_argument(std::string("set_decode_graph_desc: ") +
                                   htp_graph_err_name(rc));
     }
-    uint32_t mask = 0;
+    uint32_t mask = 0, present = 0;
     for (uint32_t i = 0; i < n_ops; ++i) {
       const htp_graph_op *op = htp_graph_op_cat(words.data(), i);
+      present |= HTP_GRAPH_KIND_BIT(op->kind);
       if (op->resident)
         mask |= HTP_GRAPH_KIND_BIT(op->kind);
     }
@@ -1349,6 +1355,26 @@ public:
       throw std::invalid_argument("set_decode_graph_desc: ROUTER_TOPK "
                                   "resident without ADD");
     }
+    // [#132 Part B, E1] No CPU layer hooks an FC, the dense FFN or a
+    // projection, so a Q4M1 kind is resident only when every kind the
+    // list has is: the list is then one stretch per token, op 0's norm
+    // hook keeps the row and the lm_head hook runs it (one call per
+    // token). Its weights come from the model at load
+    // (add_decode_graph_q4_0).
+    if ((mask & HTP_GRAPH_KINDS_Q4M1) != 0u && mask != present) {
+      throw std::invalid_argument(
+        "set_decode_graph_desc: FC / DENSE_FFN / LM_HEAD resident without "
+        "every other kind (one session runs them only as the whole token)");
+    }
+    // [#132 Part B] NNTR_HTP_FC_FEED=l2 reads the Q4M1 kinds' weights
+    // through the L2 scratch even where VTCM would fit (the second
+    // session's feed, #178); unset or vtcm: VTCM when it fits
+    const char *feed_env = std::getenv("NNTR_HTP_FC_FEED");
+    const std::string feed_s = feed_env ? feed_env : "vtcm";
+    if (feed_s != "vtcm" && feed_s != "l2") {
+      throw std::invalid_argument("set_decode_graph_desc: NNTR_HTP_FC_FEED=" +
+                                  feed_s + " (want vtcm or l2)");
+    }
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     if (graph_inited_) {
@@ -1358,7 +1384,14 @@ public:
       if (attn_registered_)
         nntr_hvx_attn_m1_release(session);
     }
+    releaseQ4m1(session);
+    q4_pending_.clear();
     graph_words_ = words;
+    for (uint32_t i = 0; i < n_ops; ++i) {
+      htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
+      if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u)
+        op->feed = feed_s == "l2" ? 1u : 0u;
+    }
     resident_mask_ = mask;
     moe_ops_.clear();
     for (auto &v : kind_ops_)
@@ -1414,6 +1447,133 @@ public:
                  n_ops, htp_graph_kinds_str(mask, names, sizeof(names)),
                  moe_ops_.size());
     return true;
+  }
+
+  /** [#132 Part B] The model's Q4_0 weights of the decode list's FC,
+   *  DENSE_FFN and LM_HEAD ops, in list order (lfm2_moe_causallm.cpp at
+   *  load): kept as pointers here, converted and registered at graph init
+   *  (bindQ4m1). False when no such kind is resident. */
+  bool add_decode_graph_q4_0(const void *data, unsigned K, unsigned N,
+                             bool canonical) override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    if (graph_words_.empty() || (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) == 0u)
+      return false;
+    if (graph_inited_) {
+      throw std::runtime_error(
+        "add_decode_graph_q4_0: the graph is already initialised");
+    }
+    q4_pending_.push_back({data, K, N, canonical});
+    return true;
+  }
+
+  /** [#132 Part B] One weight's rows [r0, r0 + rows) as a Q4M1 handle:
+   *  canonical block_q4_0 (unpacked from the CPU's repack unless the
+   *  model says it is canonical already, as the tied lm_head is), the
+   *  Q4M1 reorder, q4m1_register. The same nibbles and scales the CPU
+   *  reads (plan 132 section 2), so no format tag moves. */
+  uint32_t registerQ4m1(remote_handle64 session, const uint8_t *canonical,
+                        uint32_t K, uint32_t r0, uint32_t rows) {
+    const size_t row_bytes = static_cast<size_t>(K / 32u) * Q4_CPU_BLOCK_BYTES;
+    std::vector<uint8_t> q4m1(q4m1_bytes(K, rows));
+    q4m1_from_q4_0(canonical + r0 * row_bytes, K, rows, q4m1.data());
+    uint32_t h = 0;
+    const int err = nntr_hvx_q4m1_register(session, K, rows, q4m1.data(),
+                                           static_cast<int>(q4m1.size()), &h);
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error("nntr_hvx_q4m1_register(K=" + std::to_string(K) +
+                               " N=" + std::to_string(rows) +
+                               ") failed: " + graphErr(err));
+    }
+    q4m1_handles_.push_back(h);
+    return h;
+  }
+
+  /** [#132 Part B] Frees every Q4M1 handle registered for the graph (after
+   *  graph_release, or when bindQ4m1 / graph_init failed half-way). */
+  void releaseQ4m1(remote_handle64 session) {
+    for (uint32_t h : q4m1_handles_)
+      nntr_hvx_q4m1_release(session, h);
+    q4m1_handles_.clear();
+  }
+
+  /** [#132 Part B] Binds q4_pending_ to the resident Q4M1 ops in list
+   *  order before graph_init checks them: an FC takes weights of its K
+   *  until their widths make its N (q | k | v are three), a DENSE_FFN up,
+   *  gate and down, the LM_HEAD the tied table in kLmHeadSliceRows slices.
+   *  Throws when the model's weights and the list disagree. */
+  void bindQ4m1(remote_handle64 session) {
+    size_t next = 0;
+    std::vector<uint8_t> canon;
+    auto take = [&](uint32_t op, uint32_t K, uint32_t N) -> const uint8_t * {
+      if (next >= q4_pending_.size())
+        throw std::runtime_error("set_decode_graph_desc: op " +
+                                 std::to_string(op) + " (" +
+                                 htp_graph_kind_name(graphOp(op)->kind) +
+                                 ") has no Q4_0 weight left "
+                                 "(the model handed " +
+                                 std::to_string(q4_pending_.size()) + ")");
+      const Q4Pending &p = q4_pending_[next++];
+      if (p.K != K || (N != 0u && p.N != N))
+        throw std::runtime_error(
+          "set_decode_graph_desc: op " + std::to_string(op) + " wants a " +
+          std::to_string(K) + " x " + (N ? std::to_string(N) : "*") +
+          " Q4_0 weight, the model's next is " + std::to_string(p.K) + " x " +
+          std::to_string(p.N));
+      const size_t bytes =
+        static_cast<size_t>(p.N) * (p.K / 32u) * Q4_CPU_BLOCK_BYTES;
+      if (p.canonical)
+        return static_cast<const uint8_t *>(p.data);
+      canon.resize(bytes);
+      nntrainer::unpack_q4_0(p.data, canon.data(), bytes, p.N, p.K);
+      return canon.data();
+    };
+    const uint32_t n_ops = static_cast<uint32_t>(stretch_start_.size());
+    for (uint32_t i = 0; i < n_ops; ++i) {
+      htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
+      if (!op->resident ||
+          (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u)
+        continue;
+      uint32_t parts = 0;
+      if (op->kind == HTP_OP_DENSE_FFN) {
+        op->h_gu[0] = registerQ4m1(session, take(i, op->K, op->N), op->K, 0u,
+                                   op->N); // up
+        op->h_gu[1] = registerQ4m1(session, take(i, op->K, op->N), op->K, 0u,
+                                   op->N); // gate
+        op->h_dn[0] = registerQ4m1(session, take(i, op->N, op->N_out), op->N,
+                                   0u, op->N_out);
+        parts = 3u;
+      } else if (op->kind == HTP_OP_LM_HEAD) {
+        const uint8_t *w = take(i, op->K, op->N);
+        for (uint32_t r0 = 0; r0 < op->N; r0 += kLmHeadSliceRows)
+          op->h_gu[parts++] = registerQ4m1(
+            session, w, op->K, r0, std::min(kLmHeadSliceRows, op->N - r0));
+      } else {
+        uint32_t sum = 0;
+        while (sum < op->N && parts < HTP_GRAPH_MAX_EXPERTS) {
+          const uint8_t *w = take(i, op->K, 0u);
+          const uint32_t n = q4_pending_[next - 1].N;
+          op->h_gu[parts++] = registerQ4m1(session, w, op->K, 0u, n);
+          sum += n;
+        }
+        if (sum != op->N)
+          throw std::runtime_error(
+            "set_decode_graph_desc: FC op " + std::to_string(i) +
+            " is N=" + std::to_string(op->N) + ", its weights sum to " +
+            std::to_string(sum));
+      }
+      op->n_experts = parts;
+    }
+    if (next != q4_pending_.size())
+      throw std::runtime_error(
+        "set_decode_graph_desc: the model handed " +
+        std::to_string(q4_pending_.size()) + " Q4_0 weights, the list's " +
+        "FC / DENSE_FFN / LM_HEAD ops took " + std::to_string(next));
+    std::fprintf(stderr, "[HTP] graph: q4m1 weights=%zu handles=%zu feed=%s\n",
+                 q4_pending_.size(), q4m1_handles_.size(),
+                 kind_ops_[HTP_OP_FC].empty() ||
+                     graphOp(kind_ops_[HTP_OP_FC][0])->feed == 0u
+                   ? "vtcm"
+                   : "l2");
   }
 
   /** [#130] The op record of @a op in the description (the words are
@@ -1552,6 +1712,7 @@ public:
       break;
     }
     case HTP_OP_ADD:
+    case HTP_OP_LM_HEAD: // [#132 Part B] weights bound at init
       break;
     case HTP_OP_ROUTER_TOPK:
       // [#132] the gate weight [K][E] and the expert bias, once
@@ -1710,11 +1871,20 @@ public:
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (graph_inited_)
       return;
+    if ((resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u) {
+      try {
+        bindQ4m1(session);
+      } catch (...) {
+        releaseQ4m1(session); // a retry registers them all again
+        throw;
+      }
+    }
     uint32_t n_ops = 0;
     const int err =
       nntr_hvx_graph_init(session, graph_words_.data(),
                           static_cast<int>(graph_words_.size()), &n_ops);
     if (err != AEE_SUCCESS) {
+      releaseQ4m1(session);
       throw std::runtime_error("nntr_hvx_graph_init failed: " + graphErr(err));
     }
     graph_inited_ = true;
@@ -4118,6 +4288,15 @@ private:
   // [#132] the routing a MOE op that starts a stretch was handed
   std::vector<unsigned int> pending_ri_, pending_rc_;
   std::vector<float> pending_rw_;
+  // [#132 Part B] the model's Q4_0 weights for the Q4M1 kinds, in list
+  // order, until bindQ4m1; the handles registered for them
+  struct Q4Pending {
+    const void *data;
+    uint32_t K, N;
+    bool canonical;
+  };
+  std::vector<Q4Pending> q4_pending_;
+  std::vector<uint32_t> q4m1_handles_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;  /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0; /**< of them at the first resident op */

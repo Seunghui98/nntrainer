@@ -293,16 +293,17 @@ public:
   // and baking. It is a flag rather than a colsum pointer because the sums
   // sit immediately after the scales and the callee already knows N.
   virtual bool supports_gemm_qs4cx_moe_layer_fp32() const { return false; }
-  virtual void gemm_qs4cx_moe_layer_fp32(
-    const std::vector<void *> &gate_up_data,
-    const std::vector<float *> &gate_up_scale,
-    const std::vector<void *> &down_data,
-    const std::vector<float *> &down_scale,
-    const std::vector<unsigned int> &row_index,
-    const std::vector<unsigned int> &row_count,
-    const std::vector<float> &row_weight, const float *act, float *out,
-    unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
-    bool weights_wh);
+  virtual void
+  gemm_qs4cx_moe_layer_fp32(const std::vector<void *> &gate_up_data,
+                            const std::vector<float *> &gate_up_scale,
+                            const std::vector<void *> &down_data,
+                            const std::vector<float *> &down_scale,
+                            const std::vector<unsigned int> &row_index,
+                            const std::vector<unsigned int> &row_count,
+                            const std::vector<float> &row_weight,
+                            const float *act, float *out, unsigned int M,
+                            unsigned int K, unsigned int inter,
+                            unsigned int N_out, bool weights_wh);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate
@@ -311,6 +312,20 @@ public:
   // per-token entry returns false and the model runs as before.
   virtual bool set_decode_graph_desc(const std::vector<uint32_t> &words) {
     (void)words;
+    return false;
+  }
+
+  // [#132 Part B] One Q4_0 weight of the decode list's FC, dense FFN or
+  // lm_head ops, handed by the model at load in list order: K x N as the
+  // FC reads it, canonical block_q4_0 rows when @a canonical (the tied
+  // embedding table), else this ISA's repack. The backend keeps the
+  // pointer until its graph init. Returns false when it takes none.
+  virtual bool add_decode_graph_q4_0(const void *data, unsigned K, unsigned N,
+                                     bool canonical) {
+    (void)data;
+    (void)K;
+    (void)N;
+    (void)canonical;
     return false;
   }
 
