@@ -73,7 +73,7 @@ for i in $(seq 1 40); do z=$(zone0); [ "$z" -le 35000 ] && break
 echo "start zone0=$(zone0)"
 
 # ---- 1. install and config (3 min)
-(cd $W/set && LC_ALL=C md5sum -c md5.txt | grep -vc ': OK$' | grep -qx 0) || stop "workstation set differs from set/md5.txt"
+[ "$(cd $W/set && LC_ALL=C md5sum -c md5.txt | grep -vc ': OK$')" = 0 ] || stop "workstation set differs from set/md5.txt"
 adb -s $S shell ls -l $C/models/q40-qs4cx-wh/nntr_lfm2_8b_a1b_q40_arm.bin
 adb -s $S shell "rm -rf $D $DD && mkdir -p $D $DD" && adb -s $S push $W/set/. $D/ > /dev/null
 adb -s $S shell "rm -f $D/md5.txt; chmod 755 $D/nntrainer_causallm $D/unittest_*"
