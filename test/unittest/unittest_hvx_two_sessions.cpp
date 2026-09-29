@@ -20,11 +20,16 @@
  * reason. Never FASTRPC_SESSION_CLOSE (it closes S1 too); a hung S2 open is
  * killed with FASTRPC_REMOTE_PROCESS_KILL on S2's effective domain only.
  *
- * S2's heap probe beside its held mapping ladder runs the PD's address
- * space dry, which took S2's shell down in the 2026-09-29 23:20 sitting
- * (crash in __wrap_malloc; every later S2 call AEE_ENOSUCH 0x27): it is
- * Q5's last S2 cell, Q1 probes S2's heap with nothing mapped and a
- * 1024 MiB cap, and every S2 test starts with a liveness check
+ * Growing S2's heap to the end of its address space is not done any more.
+ * Beside the held mapping ladder it took S2's shell down (2026-09-29 23:20
+ * sitting: crash in __wrap_malloc, every later S2 call AEE_ENOSUCH 0x27),
+ * and in the next sitting S2's close then failed to unmap a 2 MiB heap
+ * page (apps_mem remote_munmap64 0x80000441) and the cDSP lost ~256 MiB of
+ * mapping room for every later process until a reboot (the app then
+ * failed at 3584 MiB). Q1 probes S2's heap with nothing mapped up to
+ * 512 MiB (the design needs 495) and the Q4M1 set takes 383 more; Q1
+ * reports S1's ladder below 3840 MiB as S2_STOP rule=s1_ceiling_lost (a
+ * previous run leaked; reboot). Every S2 test starts with a liveness check
  * (S2_STOP rule=s2_dead).
  *
  * Stop rules (plan section 1): s2_reserve_rc = 0x73 (AEE_ENOSESSION) -> no
@@ -354,6 +359,12 @@ TEST_F(TwoSessions, Q1_SecondSession) {
     ladder(g.h1, CDSP_DOMAIN_ID, true, &g.s1_maps, &why, &rc);
   field("s1_mmap_mib", s1_mib);
   field("s1_mmap_stopped_by", why + ":" + hex(rc));
+  if (s1_mib < 3840) {
+    std::cout << "S2_STOP rule=s1_ceiling_lost s1_mmap_mib=" << s1_mib
+              << " (below the 3840 of a fresh boot: an earlier run left "
+                 "mappings on the cDSP; reboot)"
+              << std::endl;
+  }
   field("s1_heap_mib", heap_mib(g.h1));
   session_info(g.h1, g.s1_info, "s1_start");
   rc = hmx_smoke(g.h1, &g.s1_acc);
@@ -458,9 +469,9 @@ TEST_F(TwoSessions, Q1_SecondSession) {
   for (Mapped &m : s2_maps) {
     unmap_chunk(g.h2, &m);
   }
-  const uint32_t nomap = heap_mib(g.h2, 1024);
+  const uint32_t nomap = heap_mib(g.h2, 512);
   field("s2_heap_mib_nomap",
-        nomap == 1024 ? ">=1024 (cap)" : std::to_string(nomap));
+        nomap == 512 ? ">=512 (cap)" : std::to_string(nomap));
   if (!s2_alive("q1_after_ladder")) {
     return;
   }
@@ -904,22 +915,12 @@ TEST_F(TwoSessions, Q4_VtcmShare) {
 
 /** @brief Q5: S2 closes first; S1 keeps its HMX lock and VTCM. */
 TEST_F(TwoSessions, Q5_Teardown) {
-  if (s2_alive("q5_start")) {
-    // The one cell that may run S2's address space dry (and its shell with
-    // it): S2's heap with its whole mapping ladder held, beside S1's.
-    std::vector<Mapped> s2_maps;
-    std::string why;
-    int rc = 0;
-    const size_t mib =
-      ladder(g.h2, static_cast<int>(g.effdom2), true, &s2_maps, &why, &rc);
-    field("s2_mmap_mib_q5", mib);
-    field("s2_heap_mib", heap_mib(g.h2)); // with the ladder held
-    for (Mapped &m : s2_maps) {
-      unmap_chunk(g.h2, &m);
-    }
-    s2_alive("q5_after_heap_probe");
-  }
+  s2_alive("q5_start");
   if (g.s2_open) {
+    if (g.fc7168.h != ~0u) {
+      nntr_hvx_q4m1_release(g.h2, g.fc7168.h);
+      g.fc7168.h = ~0u;
+    }
     const int rc = nntr_hvx_close(g.h2);
     field("s2_close_rc", hex(rc));
     g.s2_open = false;
