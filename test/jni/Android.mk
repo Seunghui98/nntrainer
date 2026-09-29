@@ -1083,4 +1083,33 @@ LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
 LOCAL_STATIC_LIBRARIES := googletest_main
 
 include $(BUILD_EXECUTABLE)
+
+# [#178] Second cDSP session probe (plan docs/plans/178-second-dsp-session.md).
+# rpcmem, fastrpc_mmap and dspqueue_* resolved with dlsym (htp_rpcmem.h).
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_hvx_two_sessions
+LOCAL_CFLAGS := -Igoogletest/include -pthread -fexceptions -O3 -DNDK_BUILD=1 \
+	 -DENABLE_HEXKL=1
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_hvx_two_sessions.cpp \
+	 ../htp/generated/nntr_hvx_stub.c
+
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../unittest \
+	 $(LOCAL_PATH)/../../nntrainer/tensor \
+	 $(LOCAL_PATH)/../../nntrainer/tensor/htp_backend \
+	 $(LOCAL_PATH)/../htp/generated \
+	 $(HEXAGON_SDK_ROOT)/incs \
+	 $(HEXAGON_SDK_ROOT)/incs/stddef \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
+
+LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
+	 -lcdsprpc -ldl
+
+LOCAL_STATIC_LIBRARIES := googletest_main
+
+include $(BUILD_EXECUTABLE)
 endif
