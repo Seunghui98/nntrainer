@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace nntrainer {
@@ -90,6 +91,32 @@ public:
    */
   void atClose(std::function<void()> fn) { at_close_.push_back(std::move(fn)); }
 
+  /**
+   * @brief [#132 Part B E3] NNTR_HTP_E2E=1: decode runs end to end on two
+   *        cDSP sessions (plan docs/plans/132-part-b-two-session-e2e.md
+   *        section 3.2). Read once; off by default, and off opens nothing
+   *        more than before.
+   */
+  static bool e2eRequested();
+
+  /**
+   * @brief [#132 Part B E3] The second session S2 (reserved beside the
+   *        default one, lite-opened on its effective domain), opened by the
+   *        constructor when e2eRequested(); false otherwise or when any
+   *        step of the open failed (s2Error() says which).
+   */
+  bool enabled2() const { return enabled2_; }
+  /** @brief S2's remote_handle64; meaningful when enabled2(). */
+  uint64_t handle2() const { return handle2_; }
+  /** @brief S2's effective domain id: every fastrpc_mmap / dspqueue_create
+   *  for S2 names it (the default session's is CDSP_DOMAIN_ID). */
+  int effDomain2() const { return effdom2_; }
+  /** @brief S2's VTCM in bytes after its open (0: the lite open found
+   *  none, as on the S25 beside S1's M=1 feed). */
+  uint32_t vtcm2Bytes() const { return vtcm2_bytes_; }
+  /** @brief Why S2 did not open (empty when it did or was not asked for). */
+  const std::string &s2Error() const { return s2_error_; }
+
   ~HtpBackend();
 
   HtpBackend(const HtpBackend &) = delete;
@@ -98,12 +125,19 @@ public:
 private:
   HtpBackend();
 
+  void openSecond();
+
   bool enabled_ = false;
   uint64_t handle_ = 0; ///< remote_handle64 from nntr_hvx_open; opaque here
                         ///< so this header does not need <remote.h>.
   int qos_mode_ = 0;
   uint32_t poll_us_ = 0;
   std::vector<std::function<void()>> at_close_;
+  bool enabled2_ = false; ///< [#132 Part B E3] S2 open
+  uint64_t handle2_ = 0;
+  int effdom2_ = -1;
+  uint32_t vtcm2_bytes_ = 0;
+  std::string s2_error_;
 };
 
 } // namespace nntrainer

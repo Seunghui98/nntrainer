@@ -367,6 +367,19 @@ public:
     (void)pos;
     return false;
   }
+  // [#132 Part B E3] The two-session decode (NNTR_HTP_E2E=1). finish: the
+  // model handed its last add_decode_graph_q4_0 weight (the backend may
+  // register them now, at load). set_decode_logits(false): the caller
+  // takes each decode token's id (take_decode_token_id) instead of its
+  // logits, so only the id travels back; true (the default) keeps the
+  // logits. take_decode_token_id: the id of the last decode token whose
+  // logits did not come back, once; false when there is none.
+  virtual bool finish_decode_graph_q4_0() { return false; }
+  virtual void set_decode_logits(bool want) { (void)want; }
+  virtual bool take_decode_token_id(unsigned *id) {
+    (void)id;
+    return false;
+  }
   virtual bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
                                    const float *v_rows) {
     (void)n_rows;
