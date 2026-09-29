@@ -6,6 +6,53 @@ staged at `/local/mnt/workspace/htp_moe/132/set_e5b/` — estimated device
 time: **≈ 90 min** (phone rebooted first). set_e5 (below, `10bb91b7` /
 `d77a4bf2`) was read on 2026-09-30 06:13.
 
+## set_e5c as read, and the cause (2026-09-30 08:05–08:12)
+
+* **S** (`NNTR_HTP_FORWARD=1`, one session, CPU-driven) and **Ev** (two
+  sessions) left A at the **same step**: prompt512 step 25 (trace
+  `step24/pos536/L13.in`), korean step 5 (`step4/pos330/L17.in`), while
+  every shadow record was equal over 64 steps (fc 4744, add 3072, router
+  1408, swiglu 128, argmax 65, norm 3136 + q|k heads 15360, attention
+  heads 12288). So the two-session mechanism is not the cause.
+* L13 and L17 are **conv** layers, and CONV1D_GATE was the one resident op
+  with no shadow. Its spec `m1_conv_gate_det` was written in the HVX
+  kernel's order, `(w0*g + w1*s1) + w2*s0` with every op rounded, and
+  never held against the CPU. The phone's decode
+  (`neon::causal_depthwise_conv1d_k3_decode`) is `vmulq(w0, x)` and two
+  `vfmaq`: `fma(w2, s0, fma(w1, s1, w0*g))`. On the host check's inputs
+  the two differ by an ulp on 2075 and 2694 of 16 384 outputs; out_proj's
+  Q8 quantizer hides almost all of it, so the divergence is rare and
+  data-dependent.
+* Fix `a0bf121b`: the spec and `hvx_conv_gate_m1_f32` in the CPU's fused
+  order (vector `a*c` and `w0*g`, the two taps as scalar `sffma`, then
+  `b*y`); `m1_ops_host_check` now also holds the kernel against an
+  independent `fmaf` model of the CPU decode. Open item: the prefill
+  kernel `hvx_conv_gate_f32` is unfused too, while the CPU's prefill
+  also uses two `vfmaq` (+ bias) — only the HTP conv-block prefill engine
+  uses it, not the decode path.
+
+## set_e5e (staged): the conv fix on silicon, the E5c runner
+
+`/local/mnt/workspace/htp_moe/132/set_e5e/run_e5e.sh` (≈ 20 min, reboot
+first; e3 skel `554ca8cc…`; sh = `dev/e2e-shadow-132` @ `32fe486d`, skel
+`6d592879…`, which adds the conv shadow, tag 8). Expected: S and Ev logits
+== S0 for all 64 steps on both prompts, `E2E TRACE … first_diff=-`, every
+shadow record equal including `conv=n/n`.
+
+## set_e5d (staged): speed after the wait fix
+
+`376279fc` / `a7917394`: a paused spin of `NNTR_HTP_E2E_SPIN_US` (default
+20; also the token queues' DSP spin), then 20 µs sleeps, one read per wake;
+pools parked before every post; the token response carries each side's
+wall time and pcycles (the clock) and per-kind op cycles. Close lines:
+`graph[S1|S2] per-kind pcyc/token: … | wall_ms/token= mhz=`, `graph[S1]
+moe pcyc/round=… router pcyc/round=…; s2 fc+dense_ffn+lm_head
+ms/token=… (isolated #178: 8.06)`. Runner
+`/local/mnt/workspace/htp_moe/132/set_e5d/run_e5d.sh` (≈ 30 min, reboot
+first): canary (conv gate + exact FC gtests), A G=64, E at spin 0 / 20 /
+1000 G=64 (each with an A sanity and a text check against A), A and E at
+G=512 with the best spin, A last.
+
 ## set_e5b as read (2026-09-30 06:55–07:32, R3CY10WM83Y after a reboot)
 
 * **The two-session path loads and runs**: S1's arena first (3840), then S2
