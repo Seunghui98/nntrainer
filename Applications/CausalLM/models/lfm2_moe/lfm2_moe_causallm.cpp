@@ -68,7 +68,12 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
   // backend validates them with the same validator the skel runs. Off by
   // default, and only meaningful with the MoE FFN on the HTP.
   const char *fwd = std::getenv("NNTR_HTP_FORWARD");
-  if (fwd != nullptr && std::atoi(fwd) != 0 && MOE_ENGINE == "htp") {
+  // [#132 Part B E3] NNTR_HTP_E2E=1: every kind resident, run on two
+  // sessions (the backend splits the list; NNTR_HTP_FORWARD_KINDS is not
+  // read)
+  const char *e2e_env = std::getenv("NNTR_HTP_E2E");
+  const bool e2e = e2e_env != nullptr && std::atoi(e2e_env) != 0;
+  if (((fwd != nullptr && std::atoi(fwd) != 0) || e2e) && MOE_ENGINE == "htp") {
     htp_graph_lfm2_shape shape;
     shape.n_layers = static_cast<uint32_t>(NUM_LAYERS);
     shape.n_dense_layers = NUM_DENSE_LAYERS;
@@ -91,9 +96,10 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
     // so its recipes keep their meaning -- #132's ADD and ROUTER_TOPK are
     // opt-in (...,ADD,ROUTER_TOPK). The bit is the one source of truth for
     // both sides (plan 130 section 3.2).
-    const char *kinds = std::getenv("NNTR_HTP_FORWARD_KINDS");
+    const char *kinds = e2e ? nullptr : std::getenv("NNTR_HTP_FORWARD_KINDS");
     const uint32_t mask =
-      kinds != nullptr
+      e2e ? HTP_GRAPH_KINDS_ALL
+      : kinds != nullptr
         ? htp_graph_kinds_parse(kinds)
         : (HTP_GRAPH_KIND_BIT(HTP_OP_MOE) | HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) |
            HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) |
@@ -210,7 +216,8 @@ void Lfm2MoeCausalLM::load_weight(const std::string &weight_path) {
     if (!took)
       return; // the backend takes none: no Q4M1 kind is resident
   }
-  hand(first("output_of_causallm", "embedding0"), 1, true);
+  if (hand(first("output_of_causallm", "embedding0"), 1, true))
+    ops->finish_decode_graph_q4_0(); // [#132 Part B E3] S2's arena, now
 #endif
 }
 
