@@ -23,6 +23,14 @@
 ## - Tied word embeddings: the lm head shares embedding0, so the safetensors
 ##   path emits no separate output_of_causallm entry, while the .bin path keeps
 ##   the trailing duplicate that nntrainer's binary lm-head save expects.
+## - MoE checkpoints (enable_moe_block, e.g. gemma-4-26B-A4B): the router and
+##   the experts follow the dense MLP of every layer in the LFM2 expert file
+##   order nntrainer's lfm2_moe layer requests (router gate, the [E] scale,
+##   then per expert the fused gate|up and the down projection); the
+##   router's scale and hidden^-0.5 are folded into one rms_norm gamma
+##   (docs/htp_attention/55_gemma4_moe_htp_task.md section 6.2). With
+##   hidden_size_per_layer_input == 0 the per-layer input path is absent.
+## - attention_k_eq_v: full-attention layers have no v_proj (V is K).
 
 import argparse
 import glob
@@ -120,17 +128,26 @@ class LazyTensor:
 
     Exposes the shape without reading the payload (so the safetensors header
     can be built cheaply) and loads the actual data only on materialize().
+    Indexing ([e]) narrows it to one leading slice, read alone on
+    materialize(): one expert of a [E, ...] stack, not the whole stack.
     """
 
-    def __init__(self, handle, key):
+    def __init__(self, handle, key, index=None):
         self._handle = handle
         self._key = key
+        self._index = index
 
     @property
     def shape(self):
-        return tuple(self._handle.get_slice(self._key).get_shape())
+        shape = tuple(self._handle.get_slice(self._key).get_shape())
+        return shape[1:] if self._index is not None else shape
+
+    def __getitem__(self, index):
+        return LazyTensor(self._handle, self._key, index)
 
     def materialize(self):
+        if self._index is not None:
+            return self._handle.get_slice(self._key)[self._index]
         return self._handle.get_tensor(self._key)
 
 
@@ -207,6 +224,12 @@ def iter_gemma4_weight_specs(params, config):
     n_layers = text_config.num_hidden_layers
     num_kv_shared_layers = text_config.num_kv_shared_layers
     first_kv_shared_layer_idx = n_layers - num_kv_shared_layers
+    layer_types = getattr(text_config, "layer_types", None) or (
+        ["sliding_attention"] * n_layers)
+    k_eq_v = bool(getattr(text_config, "attention_k_eq_v", False))
+    per_layer_input = getattr(text_config, "hidden_size_per_layer_input", 0)
+    moe = bool(getattr(text_config, "enable_moe_block", False))
+    num_experts = text_config.num_experts if moe else 0
 
     resolve = make_param_resolver(params)
 
@@ -236,8 +259,10 @@ def iter_gemma4_weight_specs(params, config):
                    resolve(f"{lp}self_attn.k_proj.weight"), True)
             yield (f"layer{layer_idx}_k_norm", SUFFIX_GAMMA,
                    resolve(f"{lp}self_attn.k_norm.weight"), False)
-            yield (f"layer{layer_idx}_wv", SUFFIX_WEIGHT,
-                   resolve(f"{lp}self_attn.v_proj.weight"), True)
+            # attention_k_eq_v: a full-attention layer has no v_proj.
+            if not (k_eq_v and layer_types[layer_idx] == "full_attention"):
+                yield (f"layer{layer_idx}_wv", SUFFIX_WEIGHT,
+                       resolve(f"{lp}self_attn.v_proj.weight"), True)
 
         yield (f"layer{layer_idx}_attention_out", SUFFIX_WEIGHT,
                resolve(f"{lp}self_attn.o_proj.weight"), True)
@@ -254,25 +279,54 @@ def iter_gemma4_weight_specs(params, config):
         yield (f"layer{layer_idx}_ffn_down", SUFFIX_WEIGHT,
                resolve(f"{lp}mlp.down_proj.weight"), True)
 
+        if moe:
+            # Graph order (unittest_causallm_gemma4_moe checks it): the two
+            # norms of the residual come experts' first, router's second.
+            yield (f"layer{layer_idx}_post_ffn_norm_1", SUFFIX_GAMMA,
+                   resolve(f"{lp}post_feedforward_layernorm_1.weight"), False)
+            yield (f"layer{layer_idx}_pre_ffn_norm_2", SUFFIX_GAMMA,
+                   resolve(f"{lp}pre_feedforward_layernorm_2.weight"), False)
+            # Gemma4TextRouter: norm(x) * scale * hidden^-0.5, one rms_norm
+            # whose gamma carries both factors.
+            router_scale = resolve(f"{lp}router.scale")
+            if hasattr(router_scale, "materialize"):
+                router_scale = router_scale.materialize()
+            yield (f"layer{layer_idx}_router_norm", SUFFIX_GAMMA,
+                   router_scale.float() * text_config.hidden_size ** -0.5,
+                   False)
+            # The lfm2_moe layer's weights, in its request order.
+            moe_name = f"layer{layer_idx}_sparse_moe"
+            yield (moe_name, "gate", resolve(f"{lp}router.proj.weight"), True)
+            yield (moe_name, "expert_bias",
+                   resolve(f"{lp}router.per_expert_scale"), False)
+            gate_up = resolve(f"{lp}experts.gate_up_proj")  # [E, 2I, H]
+            down = resolve(f"{lp}experts.down_proj")  # [E, H, I]
+            for e in range(num_experts):
+                yield (moe_name, f"expert_gate_up_{e}", gate_up[e], True)
+                yield (moe_name, f"expert_down_{e}", down[e], True)
+            yield (f"layer{layer_idx}_post_ffn_norm_2", SUFFIX_GAMMA,
+                   resolve(f"{lp}post_feedforward_layernorm_2.weight"), False)
+
         yield (f"layer{layer_idx}_post_ffn_norm", SUFFIX_GAMMA,
                resolve(f"{lp}post_feedforward_layernorm.weight"), False)
 
-        yield (f"layer{layer_idx}_per_layer_input_gate", SUFFIX_WEIGHT,
-               resolve(f"{lp}per_layer_input_gate.weight"), True)
+        if per_layer_input:
+            yield (f"layer{layer_idx}_per_layer_input_gate", SUFFIX_WEIGHT,
+                   resolve(f"{lp}per_layer_input_gate.weight"), True)
 
-        # Global per-layer input weights live in the graph next to layer 0.
-        if layer_idx == 0:
-            yield ("per_layer_input_embedding", SUFFIX_EMBEDDING,
-                   resolve("embed_tokens_per_layer.weight"), False)
-            yield ("per_layer_input_projection", SUFFIX_WEIGHT,
-                   resolve("per_layer_model_projection.weight"), True)
-            yield ("per_layer_projection_norm", SUFFIX_GAMMA,
-                   resolve("per_layer_projection_norm.weight"), False)
+            # Global per-layer input weights live in the graph next to layer 0.
+            if layer_idx == 0:
+                yield ("per_layer_input_embedding", SUFFIX_EMBEDDING,
+                       resolve("embed_tokens_per_layer.weight"), False)
+                yield ("per_layer_input_projection", SUFFIX_WEIGHT,
+                       resolve("per_layer_model_projection.weight"), True)
+                yield ("per_layer_projection_norm", SUFFIX_GAMMA,
+                       resolve("per_layer_projection_norm.weight"), False)
 
-        yield (f"layer{layer_idx}_per_layer_input_proj", SUFFIX_WEIGHT,
-               resolve(f"{lp}per_layer_projection.weight"), True)
-        yield (f"layer{layer_idx}_post_per_layer_input_norm", SUFFIX_GAMMA,
-               resolve(f"{lp}post_per_layer_input_norm.weight"), False)
+            yield (f"layer{layer_idx}_per_layer_input_proj", SUFFIX_WEIGHT,
+                   resolve(f"{lp}per_layer_projection.weight"), True)
+            yield (f"layer{layer_idx}_post_per_layer_input_norm", SUFFIX_GAMMA,
+                   resolve(f"{lp}post_per_layer_input_norm.weight"), False)
         yield (f"layer{layer_idx}_layer_scalar", SUFFIX_SCALAR,
                resolve(f"{lp}layer_scalar"), False)
 
@@ -446,6 +500,10 @@ def main():
 
     print("\nModel configuration:")
     print(f"  Text layers: {text_config.num_hidden_layers}")
+    print(f"  MoE: {getattr(text_config, 'enable_moe_block', False)} "
+          f"(experts {getattr(text_config, 'num_experts', None)}, "
+          f"moe_intermediate_size "
+          f"{getattr(text_config, 'moe_intermediate_size', None)})")
     print(f"  Hidden size: {text_config.hidden_size}")
     print(f"  Vocab size: {text_config.vocab_size}")
     print(f"  KV shared layers: {text_config.num_kv_shared_layers}")
