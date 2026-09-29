@@ -133,11 +133,81 @@ LFM2의 warm 성능과 0.35 ms 미스(53 §5.3)는 OS page cache가 4.3 GB 모�
 | lm_head | 262144 × 2816, Q6_K 606 MB. 토큰마다 738 M MAC을 CPU에서 한다. decode 비용이 클 수 있다 | Phase 1에서 CPU 시간 분해로 확인 |
 | KV cache | sliding 층도 `max_seq_len` 전체를 잡아 2048에서 440 MiB | 예산에 포함. 창 크기로 줄이는 건 필요해질 때 |
 
-## 6. 다음 (Phase 1)
+## 6. 결정과 구현 계획 (2026-09-29, 사용자 합의)
 
-메모리 예산이 정해지면 C 범위가 정해진다. Phase 1은 C와 무관하게 CPU 참조부터 시작한다.
-1. gemma4에 MoE 블록(router, experts, dense와의 합)을 CPU로 구현하고 per-layer input 0을 허용한다.
-2. ppl 기준값 1개와 짧은 출력을 얻는다.
+**예산 3.2 GiB → C=16 기본.** §4 표에서 C=16은 물리 3.24 GiB(아레나 1408 MiB, 6청크, expert handle 960), cold prefill 바닥 3.37 s다. C는 환경변수로 바꿀 수 있어야 한다(§6.3).
+
+### 6.1 레포에 이미 있는 것 (Phase 0에서 추가로 확인)
+
+| 있는 것 | 위치 | 판정 |
+|---|---|---|
+| Gemma4 MoE 양자화 경로 | `quantize_stream.cpp` `Gemma4MoePlan`/`writeGemma4Moe` (fb55f88, PR #4255 포팅) | 텐서 순서가 "아직 없는 그래프"를 가정한 초안이다: expert가 gate/up/down **분리**, `fc_dtype`으로 양자화, router_scale [hidden]을 따로 둔다. HTP 커널은 fused gate_up WH를 원하므로 LFM2 식(`_gate_up`, `_down`, `moe_dtype`)으로 바꾼다. 그래프도 변환기도 아직 없어 순서는 자유롭게 정할 수 있다 |
+| Gemma4 변환기 | `res/gemma4/weight_converter.py` | MoE 없음. full 층 `attention_k_eq_v`(v_proj 없음)도 안 다룬다. 확장한다 |
+| Gemma4 모델 클래스 | `models/gemma4/gemma4_causallm.cpp` | MoE 없음. `hidden_size_per_layer_input == 0`이면 예외. 확장한다 |
+| MoE 층(CPU + HTP + 가상 expert·LRU·선읽기) | `models/lfm2_moe/lfm2_moe_layer.cpp` `Lfm2MoELayer` | 53의 최적화가 전부 이 층과 `htp_compute_ops.cpp`에 있다. **복사하지 않고 이 층을 그대로 쓴다** |
+| 활성화 | `props::MoEActivation` → `acti_func` | CPU는 `tanh_gelu`가 이미 있다(`ACT_TANH_GELU`). HTP 에필로그만 SwiGLU 고정 |
+| C 손잡이 | `NNTR_MOE_CACHE_EXPERTS` (`expertCacheFromEnv`) | 이미 환경변수. 미설정 = 상주인데 Gemma4는 상주가 불가능하므로 기본값을 모델 설정에서 받도록 한다 |
+
+### 6.2 LFM2 층을 Gemma4가 쓰기 위한 차이 (router만 다르다)
+
+| | LFM2 (`Lfm2MoELayer` 현재) | Gemma4 (`Gemma4TextRouter`) |
+|---|---|---|
+| router 입력 | expert 입력과 같은 텐서 | **다른 텐서**: `residual`을 norm(scale 없음)·`scale`·`hidden^-0.5` 한 것. expert 입력은 `pre_feedforward_layernorm_2(residual)` |
+| 점수 | sigmoid | softmax(fp32) |
+| top-k 선택 | sigmoid + `expert_bias` 로 선택, 가중치는 bias 없는 sigmoid | softmax 그대로 top-8 |
+| 가중치 정규화 | norm_topk_prob, `routed_scaling_factor` | 합 1로 정규화 후 `per_expert_scale[e]` 곱 |
+| [num_experts] 벡터 | `expert_bias` (선택에만 더함) | `per_expert_scale` (가중치에 곱함) |
+| expert 계산 | `act(gate)·up → down`, row_weight로 scatter | 같음 (활성화만 GELU) |
+
+설계: `Lfm2MoELayer`에 속성 `router_type = sigmoid_bias | softmax_scale` (기본 `sigmoid_bias`, LFM2 불변)과 **선택적 두 번째 입력**(router 입력)을 추가한다. `[num_experts]` 가중치 슬롯은 그대로 두고 `router_type`에 따라 bias/scale로 읽는다 → 파일 순서가 LFM2와 같아진다(router [hidden,E], [E], expert별 gate_up, down). router의 norm+scale은 층 밖의 `rms_norm` 한 개로 만들고 gamma에 `scale · hidden^-0.5`를 변환기에서 접어 넣는다(Gemma4RMSNorm은 `x·rsqrt(mean+eps)·weight`라 nntrainer `rms_norm`과 식이 같다). `per_expert_scale`은 호스트에서 row_weight에 곱하므로 DSP 커널은 건드리지 않는다.
+
+ponytail: 54 §3의 "공통 부분을 모델 무관한 곳으로 이동"은 하지 않는다. 복사가 없으므로 옮길 이유가 없다. 이름이 `lfm2_moe`인 채로 Gemma4가 쓰는 것이 한계이고, 세 번째 모델이 오면 `moe_layer`로 이름만 바꾸는 무동작 커밋이 업그레이드 경로다.
+
+### 6.3 C 손잡이
+
+- `nntr_config.json`에 `moe_cache_experts` 키(Gemma4 26B의 기본 설정 파일에 16). 모델 클래스가 읽어 층 속성 `cache_experts`로 넘긴다.
+- **환경변수 `NNTR_MOE_CACHE_EXPERTS`가 있으면 그것이 이긴다**(지금 `expertCacheFromEnv` 그대로). 키도 변수도 없으면 지금처럼 0(상주) — LFM2 동작 불변.
+- 다른 손잡이(`NNTR_MOE_PREFETCH`, `_READERS`, `NNTR_MOE_SPLIT`, `NNTR_HTP_PROFILE`, `NNTR_MOE_TRACE`)는 그대로 쓴다.
+
+### 6.4 단계별 커밋
+
+각 커밋은 `git commit -s`, `[component] 제목`, 한 주제. 코드 이동과 동작 변경을 섞지 않는다.
+
+**Phase 1 — CPU 참조 (PC x86에서 판정)**
+
+| # | 커밋 | 내용 | 검사 |
+|---|---|---|---|
+| 1a | `[CausalLM/MoE] Router type and optional router input on the MoE layer` | `router_type` 속성, 입력 1개 또는 2개 허용(2개면 `input[1]`이 router 입력), `softmax_scale` 경로: softmax → top-k → 합 1 정규화 → `per_expert_scale` 곱. `buildExpertAssignments`에 분기 하나 | x86 gtest 1개: 작은 E·k에서 스칼라 참조와 배정·가중치 비교. LFM2 기본 경로는 코드가 안 바뀌므로 기존 테스트로 충분 |
+| 1b | `[CausalLM/Gemma4] MoE block when enable_moe_block; per-layer input optional` | `setupParameters`: `enable_moe_block`, `num_experts`, `top_k_experts`, `moe_intermediate_size`, `moe_layer_dtype`, `moe_engine`, `moe_htp_layers`, `moe_cache_experts`. `hidden_size_per_layer_input == 0`이면 per-layer input 그래프 전체를 뺀다. 블록: `pre_ffn_norm → createMlp(dense)` 뒤에 `post_ffn_norm_1(mlp)`, `router_norm(post_attention)`, `pre_ffn_norm_2(post_attention)`, `moe({pre_ffn_norm_2, router_norm})`, `post_ffn_norm_2`, `addition` → 기존 `post_ffn_norm` → 잔차 합. `registerCustomLayers`가 `Lfm2MoELayer`를 등록(gemma4 meson에 `lfm2_moe_layer_dep`) | 그래프 이름이 1d의 텐서 순서와 일치하는지: 1d의 dry-run 크기 = 파일 크기 |
+| 1c | `[CausalLM/Gemma4] weight_converter: MoE tensors, K==V full layers` | 층마다 `post_feedforward_layernorm_1`, `router.scale · hidden^-0.5`(→ `_router_norm` gamma), `pre_feedforward_layernorm_2`, `router.proj.weight`ᵀ [hidden,E], `router.per_expert_scale` [E], expert e마다 `experts.gate_up_proj[e]`ᵀ [hidden, 2·inter](HF chunk 순서 gate‖up 그대로), `experts.down_proj[e]`ᵀ [inter, hidden], `post_feedforward_layernorm_2`. full 층에서 `attention_k_eq_v`면 `v_proj` 생략. per-layer input 0이면 생략. safetensors 경로는 expert별 `get_slice`로 한 expert씩 읽는다 | 텐서 수·바이트 수를 출력하고 §3의 파라미터 수(25.23 B)와 비교 |
+| 1d | `[CausalLM] quantize_stream: Gemma4 MoE in the LFM2 expert layout` | `writeGemma4Moe`를 1b·1c 순서로: `_router_norm` FP32, router FP32, `_per_expert_scale` FP32, expert별 `_gate_up`·`_down`을 `quant.moe_dtype`으로. `--moe_dtype` 도움말 문구 갱신. `moe_layer_dtype`·`moe_cache_experts`를 출력 config에 쓴다 | 호스트 dry-run: 예상 바이트 = FP32 .bin 크기 |
+
+Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --embd_dtype Q6_K` 양자화 → x86 `nntrainer_causallm`에 `NNTR_PPL=1`로 ppl 1개와 짧은 출력. HF bf16과 같은 프롬프트의 top-1 토큰 비교(`debug_dump_logits`). **기기 CPU 참조는 불가능하다**(expert 상주 11.5 GB). PC 조건: FP32 .bin **약 101 GB**(25.23 B × 4) 디스크, Q4_0 로드 RAM 약 14 GB.
+
+**Phase 2 — HTP용 모델 파일**
+
+같은 양자화기에 `--moe_dtype QS4CX_WH`. 파일 ≈ 11.56 GB(expert) + 1.5 GB ≈ **13.1 GB**. 로더가 읽는지만 본다(기기, C=16). 로드 로그의 `[HTP] arena chunk` 줄로 청크 6개·1408 MiB 확인.
+
+**Phase 3 — MoE를 HTP로 (cached-slim)**
+
+| # | 커밋 | 내용 | 검사 |
+|---|---|---|---|
+| 3a | `[HTP/MoE] GeGLU epilogue: act flag through the MoE layer call` | IDL `mm_u8i4_moe_layer`/`_timed`에 `in uint32 act`(0 silu, 1 gelu_tanh) → stub·skel 재생성. `hexkl_mm_u8i4_moe_layer_run` 인자, `hvx_dq_swiglu_job.act`, tail 경로 `hvx_swiglu_inplace_f32`도 같은 플래그. HVX 식: gelu_tanh(x) = x·σ(t), t = 2·√(2/π)·(x + 0.044715·x³) — 벡터 곱 3개 뒤 **기존 silu의 σ(det exp + recip) 그대로** 재사용. 호스트 스텁(`hvx_scalar_stubs.c`)과 `moe_layer_host_check.c`에 gelu 참조 비교 추가. 층은 `MoEActivation`(`tanh_gelu`)을 플래그로 바꿔 넘긴다 | `run_host_checks.sh` 통과; 기기 ppl로 최종 판정. ponytail: CPU `tanh_gelu`와 비트 동일은 보장하지 않는다(44의 SwiGLU는 L2 실패 뒤 비트 동일로 갔다). ppl이 어긋나면 `swiglu_det.h`처럼 `gelu_det` 쌍을 만드는 것이 업그레이드 경로 |
+| 3b | `[CausalLM/MoE] Expert cache size from nntr_config; the env var overrides` | §6.3 | LFM2: 키 없음 → 동작 불변(ppl 62.0916 재확인은 기기) |
+| 3c | 기기 가이드(54 §6.3 형식) | C=16 기본 → C=8 비교. 순서: 로드 확인 → `NNTR_PPL=1` ppl → `NNTR_HTP_PROFILE=2` 분해. **첫 실행은 C=5로**(R5) | 판정: C=16과 C=8의 ppl이 같음(스트리밍 정확성), PC CPU 참조와 같은 수준. 기대치(산술): cold prefill ≈ 3.4 s, 미스 1개 ≈ 1.0 ms, decode는 히트율 미측정이라 예측 안 함 |
+
+**Phase 4 — projection·dense FFN을 HTP로**
+
+- 엔진 키 `attn_proj_engine`, `dense_ffn_engine`(+`_htp_layers`)을 gemma4에 연결(lfm2 340~356행 방식). q/k/v/o: K=2816에서 N=4096/2048/8192/1024, o_proj K=4096·8192 → N=2816. dense FFN은 51 방식으로 MoE 커널에 inter 2112를 704×3 조각으로(§5 R3).
+- **예산 주의(산술):** FC WH 785 MiB가 아레나에 들어가면 C=16 기준 물리 3.24 → **약 4.0 GiB**로 예산을 넘는다. CPU Q4_0 복사본이 해제되지 않으면 그렇다. 선택지: (a) C=8로 내리고 FC 켬(2.55 + 0.77 = 3.32 GiB), (b) FC 중 이득이 큰 것만(50 §2: N ≥ 1300), (c) CPU 복사본 해제 구현. Phase 3 측정 뒤 결정.
+- DSP 주소공간: 1408 + 785 = 2193 MiB < 3840. handle 960 + ~300 < 2048.
+
+**Phase 5 — 튜닝·정리:** C 스윕(5/8/16), `NNTR_MOE_TRACE` + `tools/moe_expert_cache_sim.py`, 53 형식 결과 문서(56).
+
+### 6.5 열린 질문 (진행 중 확인)
+
+- PC x86 백엔드가 QS4CX(WH 아님)를 CPU에서 돌리는지. 되면 HTP와 같은 양자화의 CPU 참조 ppl을 얻을 수 있다. 안 되면 참조는 Q4_0이고, LFM2처럼 Q4_0↔QS4CX 차이(50.6 vs 62.1)를 감안해 비교한다.
+- 101 GB FP32 중간 파일이 PC에 부담이면, 변환기가 bf16을 쓰고 양자화기가 읽는 경로가 다음 손잡이다(지금은 만들지 않는다).
 
 ## 10. 측정 기록
 
