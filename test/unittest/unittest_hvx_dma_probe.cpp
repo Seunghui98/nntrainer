@@ -13,7 +13,10 @@
  * MoeChunkReplay (#87) replays the MoE layer call's own M=1 descriptor
  * list through dma_replay, next to one real traced call, then the 16 #100
  * cells (DMA_REPLAY_X lines, docs/plans/100-dma-chunk-list.md section 3.2)
- * with a content check that fails on a stale window.
+ * with a content check that fails on a stale window. TwoReaderDdr and
+ * PrefetchOverlap (#90, docs/plans/90-two-reader-ddr-probe.md) measure the
+ * CPU and the DSP reading DDR alone and at once, and what a CPU touch of
+ * the next layer's weights during the MoE call costs the DSP and stages.
  *
  * Runs on an Android device only. Requires libnntr_hvx_skel.so on
  * ADSP_LIBRARY_PATH; run once with the vote-on skel and once with the
@@ -26,14 +29,18 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <sched.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -327,128 +334,637 @@ TEST_F(HvxDmaProbe, DmaProbeShapes) {
   }
 }
 
+namespace {
+
+/** @brief [#90] The LFM2 expert shape and one M=1 call's weight bytes
+ *  (4 experts x (gate_up + down), 22 020 096 B), and the stage slots read
+ *  (test/htp/nntr_hvx_mm_u8i4.c's MOE_N_STAGES layout). */
+constexpr uint32_t kK = 2048, kI = 1792, kN = 2048, kE = 4;
+constexpr int kMoeStages = 31, kStDsp = 0, kStMm = 10, kStPath = 29,
+              kStFeed = 30;
+constexpr uint32_t kSetsPerChunkMax = 8;
+
+/** @brief moe_set_opts' word (unittest_hvx_mm_u8i4.cpp MoeGemvOpts):
+ *  GEMV path, lead / rows1 / feed authoritative, lead in 64 KB units. */
+uint32_t GemvOpts(uint32_t lead_kb, bool rows1, bool feed) {
+  return 1u | 0x80u | 0x40u | 0x20u | (((lead_kb / 64u) & 0xFFu) << 8) |
+         (rows1 ? 0x10000u : 0u) | (feed ? 0x20000u : 0u);
+}
+
+double Median(std::vector<double> v) {
+  if (v.empty()) {
+    return 0.0;
+  }
+  std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+  return v[v.size() / 2];
+}
+
+/** @brief Expert sets over the fixture's two arena chunks, each set four
+ *  consecutive regions (gate_up at 0, down at nntr_moe_dma_down_off), as
+ *  MoeChunkReplay registers them: the pattern bytes are nibbles to the
+ *  GEMV, and only the time is read. 8 sets a chunk (32 regions, 168 MiB)
+ *  at 256 MiB, 5 at 128 MiB. Released on destruction. */
+struct MoeSets {
+  remote_handle64 h = 0;
+  std::vector<uint32_t> gu, dn;
+  uint32_t n_sets = 0;
+  std::vector<float> act = std::vector<float>(kK), out = std::vector<float>(kN);
+  std::vector<uint32_t> stage = std::vector<uint32_t>(kMoeStages);
+  const std::vector<uint32_t> row_count = std::vector<uint32_t>(kE, 1u),
+                              row_index = std::vector<uint32_t>(kE, 0u);
+  const std::vector<float> row_weight = std::vector<float>(kE, 0.25f);
+
+  static uint64_t CallBytes() {
+    return static_cast<uint64_t>(kE) *
+           (nntr_moe_dma_gu_bytes(kK, kI) + nntr_moe_dma_dn_bytes(kI, kN));
+  }
+
+  int Register(remote_handle64 handle, const uint32_t arena[2],
+               uint32_t chunk_bytes) {
+    h = handle;
+    const uint32_t region = nntr_moe_dma_region_bytes(kK, kI, kN);
+    const uint32_t dn_off = nntr_moe_dma_down_off(kK, kI);
+    const uint32_t per_chunk =
+      std::min(kSetsPerChunkMax, (chunk_bytes / region - 1u) / kE);
+    std::vector<float> ws_gu(2 * kI, 0.01f), bias_gu(2 * kI, 0.f);
+    std::vector<int32_t> cs_gu(2 * kI, 0);
+    std::vector<float> ws_dn(kN, 0.01f), bias_dn(kN, 0.f);
+    std::vector<int32_t> cs_dn(kN, 0);
+    for (uint32_t i = 0; i < kK; ++i) {
+      act[i] = static_cast<float>((i * 7919u) % 1000u) / 500.f - 1.f;
+    }
+    for (uint32_t c = 0; c < 2; ++c) {
+      for (uint32_t r = 0; r < per_chunk * kE; ++r) {
+        uint32_t hg = 0, hd = 0;
+        int err = nntr_hvx_weight_register_u8i4_arena(
+          h, kK, 2 * kI, arena[c], r * region, ws_gu.data(), (int)(2 * kI),
+          cs_gu.data(), (int)(2 * kI), bias_gu.data(), (int)(2 * kI), &hg);
+        if (err != AEE_SUCCESS) {
+          return err;
+        }
+        gu.push_back(hg);
+        err = nntr_hvx_weight_register_u8i4_arena(
+          h, kI, kN, arena[c], r * region + dn_off, ws_dn.data(), (int)kN,
+          cs_dn.data(), (int)kN, bias_dn.data(), (int)kN, &hd);
+        if (err != AEE_SUCCESS) {
+          return err;
+        }
+        dn.push_back(hd);
+      }
+    }
+    n_sets = static_cast<uint32_t>(gu.size()) / kE;
+    return AEE_SUCCESS;
+  }
+
+  /** @brief One M=1 MoE call on set @a set mod n_sets; fills stage. */
+  int Call(uint32_t set) {
+    const uint32_t *g = gu.data() + (set % n_sets) * kE,
+                   *d = dn.data() + (set % n_sets) * kE;
+    std::fill(stage.begin(), stage.end(), 0u);
+    return nntr_hvx_mm_u8i4_moe_layer_timed(
+      h, 1, kK, kI, kN, g, (int)kE, d, (int)kE, row_index.data(), (int)kE,
+      row_count.data(), (int)kE, row_weight.data(), (int)kE, act.data(),
+      (int)kK, out.data(), (int)kN, stage.data(), kMoeStages);
+  }
+
+  ~MoeSets() {
+    for (size_t i = 0; i < gu.size(); ++i) {
+      nntr_hvx_weight_release_u8i4(h, gu[i]);
+    }
+    for (size_t i = 0; i < dn.size(); ++i) {
+      nntr_hvx_weight_release_u8i4(h, dn[i]);
+    }
+  }
+};
+
+/** @brief "a,b,c" of @a v. */
+std::string Join(const std::vector<int> &v) {
+  std::ostringstream os;
+  for (size_t i = 0; i < v.size(); ++i) {
+    os << (i ? "," : "") << v[i];
+  }
+  return os.str();
+}
+
+/** @brief CPU_CACHE lines from sysfs for cpu0 and cpu7 (the SLC is not
+ *  listed there; plan 90 section 3.1 infers it from PrefetchOverlap). */
+void PrintCpuCache() {
+  for (int cpu : {0, 7}) {
+    for (int idx = 0; idx < 8; ++idx) {
+      const std::string d = "/sys/devices/system/cpu/cpu" +
+                            std::to_string(cpu) + "/cache/index" +
+                            std::to_string(idx) + "/";
+      std::string level, size, shared, type;
+      std::ifstream(d + "level") >> level;
+      if (level.empty()) {
+        break;
+      }
+      std::ifstream(d + "size") >> size;
+      std::ifstream(d + "shared_cpu_list") >> shared;
+      std::ifstream(d + "type") >> type;
+      std::cout << "CPU_CACHE cpu=" << cpu << " index=" << idx
+                << " level=" << level << " type=" << type << " size=" << size
+                << " shared_cpu_list=" << shared << "\n";
+    }
+  }
+}
+
+/** @brief t threads streaming [base, base + t x slice) in 4 MiB steps until
+ *  Finish; the bytes are the steps completed inside the window. Each
+ *  thread records the CPU it ended on (unpinned, as the app's pool). */
+struct CpuStreamer {
+  using clock = std::chrono::steady_clock;
+  static constexpr size_t kStep = 4u << 20;
+  std::atomic<int> go{0}, stop{0};
+  std::atomic<uint64_t> bytes{0}, xr{0};
+  std::vector<std::thread> th;
+  std::vector<int> cpus;
+  clock::time_point t0;
+  void Start(const uint8_t *base, unsigned threads, size_t slice) {
+    cpus.assign(threads, -1);
+    for (unsigned t = 0; t < threads; ++t) {
+      th.emplace_back([this, t, p = base + t * slice, slice]() {
+        uint64_t x = 0, n = 0;
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        while (!stop.load(std::memory_order_relaxed)) {
+          for (size_t o = 0; o < slice && !stop.load(std::memory_order_relaxed);
+               o += kStep) {
+            x ^= stream_xor(p + o, kStep);
+            n += kStep;
+          }
+        }
+        cpus[t] = sched_getcpu();
+        bytes.fetch_add(n);
+        xr.fetch_xor(x);
+      });
+    }
+    t0 = clock::now();
+    go.store(1, std::memory_order_release);
+  }
+  /** @brief Stops the threads; prints DDR_CPU; returns GB/s. */
+  double Finish(unsigned threads, const char *tag) {
+    stop.store(1);
+    for (auto &t : th) {
+      t.join();
+    }
+    const double s = std::chrono::duration<double>(clock::now() - t0).count();
+    const uint64_t b = bytes.load();
+    const uint64_t us = static_cast<uint64_t>(s * 1e6);
+    const double gbs = b / s / 1e9;
+    const bool valid = nntr_ddr_rate_valid(b, us, NNTR_DDR_CEILING_GBS);
+    std::cout << std::fixed << std::setprecision(2)
+              << "DDR_CPU threads=" << threads << " phase=" << tag
+              << " bytes=" << b << " s=" << s << " gbs=" << gbs
+              << " valid=" << (valid ? "y" : "n INVALID")
+              << " cpus=" << Join(cpus) << " xor=" << std::hex << xr.load()
+              << std::dec << "\n";
+    EXPECT_TRUE(valid) << "DDR_CPU threads=" << threads << " " << tag;
+    return gbs;
+  }
+};
+
+/** @brief One DSP reader's stream: bytes over the DSP-side microseconds. */
+struct DspStream {
+  uint64_t bytes = 0, us = 0;
+  bool ok = false;
+  double gbs() const { return us ? static_cast<double>(bytes) / us / 1e3 : 0; }
+};
+
+} // namespace
+
 /**
- * @brief Section 3.5: CPU alone, DSP alone, both at once; aggregate is the
- *        sum of the two concurrent rates.
+ * @brief [#90, plan section 3.1] DDR read rates of the CPU and the DSP,
+ *        alone and at once.
+ *
+ * CPU: a 512 MiB stream at 1, 2, 4, 8 unpinned threads, 1.5 s each. DSP,
+ * two readers: "ring" is the MoE feed's own f2 list through dma_replay with
+ * fresh = 1 (32 regions x 5.25 MiB = 168 MiB of distinct DDR, 500-call
+ * chunks until 1.2 s, every chunk's res[12] tag held against the
+ * simulator); "hvx" is the real M=1 MoE call with the feed off (D192, the
+ * GEMV's direct arena read) over 16 expert sets, rate = bytes / mm_us.
+ * Then both at once: ring with 1/2/4/8 CPU threads, hvx with 2/8. Any DDR
+ * rate or aggregate above NNTR_DDR_CEILING_GBS prints INVALID and fails, as
+ * does a ring stream with a bad tag or off the f2 20-call reference by
+ * more than 20 % (alone; under contention only the upper side).
  */
 TEST_F(HvxDmaProbe, TwoReaderDdr) {
-  using clock = std::chrono::steady_clock;
-  const unsigned kThreads = 8;
   const size_t kCpuBytes = 512ull << 20;
-  const size_t kSlice = kCpuBytes / kThreads;
-  const double kSeconds = 2.0;
-
-  std::vector<uint8_t> cpu_buf;
-  cpu_buf.resize(kCpuBytes);
-  for (size_t i = 0; i < kCpuBytes; i += 4096) {
-    cpu_buf[i] = pattern(i); // pre-fault every page
-  }
+  const double kCpuSeconds = 1.5;
+  PrintCpuCache();
+  std::vector<uint8_t> cpu_buf(kCpuBytes);
   for (size_t i = 0; i < kCpuBytes; ++i) {
     cpu_buf[i] = pattern(i);
   }
 
-  // CPU side: each thread streams its slice until `stop`, counting whole
-  // passes; a pass that straddles `stop` is not counted, so the bytes
-  // are a lower bound inside the window.
-  struct CpuStreamer {
-    std::atomic<int> go{0}, stop{0};
-    std::atomic<uint64_t> passes{0}, xr{0};
-    std::vector<std::thread> th;
-    clock::time_point t0;
-    void Start(const uint8_t *base, unsigned threads, size_t slice) {
-      for (unsigned t = 0; t < threads; ++t) {
-        th.emplace_back([this, p = base + t * slice, slice]() {
-          uint64_t x = 0, n = 0;
-          while (!go.load(std::memory_order_acquire)) {
-          }
-          while (!stop.load(std::memory_order_relaxed)) {
-            x ^= stream_xor(p, slice);
-            ++n;
-          }
-          passes.fetch_add(n);
-          xr.fetch_xor(x);
-        });
-      }
-      t0 = clock::now();
-      go.store(1, std::memory_order_release);
-    }
-    double Finish(size_t slice) {
-      stop.store(1);
-      for (auto &t : th) {
-        t.join();
-      }
-      const double s = std::chrono::duration<double>(clock::now() - t0).count();
-      const double bytes = static_cast<double>(passes.load()) * slice;
-      const double gbs = bytes / s / 1e9;
-      std::cout << std::fixed << std::setprecision(2)
-                << "DDR_CPU passes=" << passes.load() << " bytes=" << bytes
-                << " s=" << s << " gbs=" << gbs << " xor=" << std::hex
-                << xr.load() << std::dec << "\n";
-      return gbs;
-    }
-  };
-
   // 1. CPU alone.
-  double cpu_alone = 0;
-  {
+  const unsigned kThreads[] = {1, 2, 4, 8};
+  double cpu_alone[9] = {0};
+  for (unsigned t : kThreads) {
     CpuStreamer run;
-    run.Start(cpu_buf.data(), kThreads, kSlice);
-    std::this_thread::sleep_for(std::chrono::duration<double>(kSeconds));
-    cpu_alone = run.Finish(kSlice);
+    run.Start(cpu_buf.data(), t, kCpuBytes / t);
+    std::this_thread::sleep_for(std::chrono::duration<double>(kCpuSeconds));
+    cpu_alone[t] = run.Finish(t, "alone");
   }
 
-  // 2. DSP alone: shape (i) with the best worker count of a quick sweep,
-  //    then passes sized for >= kSeconds over both chunks.
-  const Shape &lin = kShapes[0];
-  uint32_t best_w = 1;
-  double best_gbs = 0;
-  for (uint32_t w = 1; w <= 4; ++w) {
-    Probe r = Run(0, lin, w, PassesFor(lin, w, 256ull << 20));
-    if (r.err == AEE_SUCCESS && r.gbs > best_gbs) {
-      best_gbs = r.gbs;
-      best_w = w;
-    }
+  // 2. The ring reader and its in-run reference.
+  const Chunk &ch = chunks_[0];
+  const uint32_t region = nntr_moe_dma_region_bytes(kK, kI, kN);
+  static nntr_moe_dma_item items[NNTR_MOE_DMA_PLAN_MAX];
+  static uint8_t samples[(8u << 20) / 64u + 1u];
+  nntr_two_reader_spec spec;
+  const uint32_t n_items =
+    nntr_two_reader_cell(items, NNTR_MOE_DMA_PLAN_MAX, &spec);
+  ASSERT_NE(n_items, 0u);
+  std::vector<uint32_t> sched;
+  for (uint32_t k = 0; k < n_items; ++k) {
+    const nntr_moe_dma_item &it = items[k];
+    const uint32_t w[8] = {nntr_moe_dma_word0(&it),
+                           it.expert,
+                           it.src_off,
+                           it.dst_off,
+                           it.row_size,
+                           it.nrows,
+                           it.src_stride,
+                           0u};
+    sched.insert(sched.end(), w, w + 8);
   }
-  ASSERT_GT(best_gbs, 0.0) << "dma_probe failed on every worker count";
-  const uint64_t chunk_bytes = chunks_[0].bytes;
-  const uint32_t passes = PassesFor(
-    lin, best_w,
-    static_cast<uint64_t>(kSeconds / 2 * best_gbs * 1e9) + chunk_bytes);
-  auto dsp_stream = [&](double *gbs_out) {
-    uint64_t us = 0, bytes = 0;
-    for (uint32_t k = 0; k < 2; ++k) {
-      Probe r = Run(k, lin, best_w, passes);
-      ASSERT_EQ(r.err, AEE_SUCCESS) << hex(r.err);
-      EXPECT_TRUE(r.checksum_ok);
-      us += r.us;
-      bytes += r.bytes;
-    }
-    *gbs_out = us ? static_cast<double>(bytes) / us / 1e3 : 0.0;
-    std::cout << std::fixed << std::setprecision(2)
-              << "DDR_DSP workers=" << best_w << " passes=" << passes
-              << " bytes=" << bytes << " us=" << us << " gbs=" << *gbs_out
-              << "\n";
+  auto replay = [&](uint32_t fresh, uint32_t calls,
+                    std::vector<uint32_t> &res) {
+    res.assign(13, 0);
+    return nntr_hvx_dma_replay(handle_, ch.arena, region, sched.data(),
+                               (int)sched.size(), 1, 0, 0, fresh, 0, calls,
+                               res.data(), (int)res.size());
   };
-  double dsp_alone = 0;
-  dsp_stream(&dsp_alone);
+  std::vector<uint32_t> res;
+  ASSERT_EQ(replay(0, 20, res), AEE_SUCCESS) << "a skel without #100?";
+  const uint32_t n_regions = res[7];
+  const bool ref_ok =
+    res[12] ==
+    nntr_moe_dma_tag_sum(items, n_items, 20, 0, n_regions, region, samples);
+  const double ref_gbs = res[0] ? res[2] * 20.0 / res[0] / 1e3 : 0.0;
+  std::cout << std::fixed << std::setprecision(2)
+            << "DDR_DSP_REF name=f2 fresh=0 calls=20 us=" << res[0]
+            << " bytes_per_call=" << res[2] << " gbs=" << ref_gbs
+            << " checksum_ok=" << (ref_ok ? "y" : "n") << "\n";
+  EXPECT_TRUE(ref_ok) << "DDR_DSP_REF";
+  const uint32_t chunk_want =
+    nntr_moe_dma_tag_sum(items, n_items, spec.calls_per_chunk, spec.fresh,
+                         n_regions, region, samples);
+  auto ring = [&]() {
+    DspStream d;
+    d.ok = true;
+    std::vector<uint32_t> r;
+    for (uint32_t c = 0; c < spec.chunks_max && d.us < spec.min_us; ++c) {
+      const int err = replay(spec.fresh, spec.calls_per_chunk, r);
+      if (err != AEE_SUCCESS) {
+        ADD_FAILURE() << "ring replay err=" << hex(err);
+        d.ok = false;
+        break;
+      }
+      d.ok = d.ok && r[12] == chunk_want;
+      d.us += r[0];
+      d.bytes += static_cast<uint64_t>(r[2]) * r[1];
+    }
+    return d;
+  };
 
-  // 3. Both: CPU threads released just before the (blocking) DSP calls,
-  //    stopped as soon as they return.
-  double cpu_with = 0, dsp_with = 0;
+  // 3. The HVX-direct reader: the D192 GEMV, feed off.
+  MoeSets sets;
   {
+    const uint32_t arenas[2] = {chunks_[0].arena, chunks_[1].arena};
+    ASSERT_EQ(sets.Register(handle_, arenas, ch.bytes), AEE_SUCCESS);
+  }
+  uint32_t applied = 0;
+  const uint32_t d192 = GemvOpts(192, true, false);
+  ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, d192, &applied), AEE_SUCCESS);
+  ASSERT_EQ(applied, d192) << "the skel does not know #117's feed bit";
+  uint32_t hvx_call = 0;
+  for (uint32_t s = 0; s < sets.n_sets; ++s) { // page state
+    ASSERT_EQ(sets.Call(s), AEE_SUCCESS);
+  }
+  uint64_t hvx_dsp_us = 0, hvx_window_us = 0;
+  auto hvx = [&]() {
+    DspStream d;
+    d.ok = true;
+    hvx_dsp_us = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    // at most 10000 calls (~10 s): a skel that reports mm = 0 ends here
+    for (uint32_t n = 0; d.us < spec.min_us && n < 10000u; ++n) {
+      const int err = sets.Call(hvx_call++);
+      if (err != AEE_SUCCESS || sets.stage[kStPath] != 1u ||
+          sets.stage[kStFeed] != 0u) {
+        ADD_FAILURE() << "hvx reader err=" << hex(err)
+                      << " path=" << sets.stage[kStPath]
+                      << " feed=" << sets.stage[kStFeed];
+        d.ok = false;
+        break;
+      }
+      d.us += sets.stage[kStMm];
+      hvx_dsp_us += sets.stage[kStDsp];
+      d.bytes += MoeSets::CallBytes();
+    }
+    hvx_window_us =
+      static_cast<uint64_t>(std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count());
+    return d;
+  };
+
+  auto print_dsp = [&](const char *reader, const DspStream &d, bool valid) {
+    std::cout << std::fixed << std::setprecision(2)
+              << "DDR_DSP reader=" << reader << " bytes=" << d.bytes
+              << " us=" << d.us << " gbs=" << d.gbs()
+              << " checksum_ok=" << (d.ok ? "y" : "n");
+    if (std::strcmp(reader, "ring") == 0) {
+      std::cout << " ref_gbs=" << ref_gbs << " regions=" << n_regions
+                << " footprint_mib="
+                << (nntr_two_reader_footprint_bytes(n_regions, region) >> 20);
+    } else {
+      std::cout << " dsp_us=" << hvx_dsp_us << " window_us=" << hvx_window_us
+                << " duty="
+                << (hvx_window_us ? 1.0 * hvx_dsp_us / hvx_window_us : 0.0)
+                << " sets=" << sets.n_sets << " footprint_mib="
+                << (sets.n_sets * kE * static_cast<uint64_t>(region) >> 20);
+    }
+    std::cout << " chunk_bytes=" << ch.bytes
+              << " valid=" << (valid ? "y" : "n INVALID") << "\n";
+    EXPECT_TRUE(valid) << "DDR_DSP reader=" << reader;
+  };
+  const DspStream ring_alone = ring();
+  print_dsp("ring", ring_alone,
+            nntr_two_reader_verdict(ring_alone.gbs(), ref_gbs, ring_alone.ok));
+  const DspStream hvx_alone = hvx();
+  print_dsp("hvx", hvx_alone,
+            hvx_alone.ok && nntr_ddr_rate_valid(hvx_alone.bytes, hvx_alone.us,
+                                                NNTR_DDR_CEILING_GBS));
+
+  // 4. Both at once: the CPU threads released just before the (blocking)
+  //    DSP calls, stopped as soon as they return.
+  struct Pair {
+    const char *reader;
+    unsigned t;
+  };
+  const Pair pairs[] = {{"ring", 1}, {"ring", 2}, {"ring", 4},
+                        {"ring", 8}, {"hvx", 2},  {"hvx", 8}};
+  for (const Pair &p : pairs) {
+    const bool is_ring = std::strcmp(p.reader, "ring") == 0;
     CpuStreamer run;
-    run.Start(cpu_buf.data(), kThreads, kSlice);
-    dsp_stream(&dsp_with);
-    cpu_with = run.Finish(kSlice);
+    run.Start(cpu_buf.data(), p.t, kCpuBytes / p.t);
+    const DspStream d = is_ring ? ring() : hvx();
+    const double cpu_with = run.Finish(p.t, is_ring ? "with_ring" : "with_hvx");
+    const DspStream &alone = is_ring ? ring_alone : hvx_alone;
+    const double aggregate = cpu_with + d.gbs();
+    const bool valid =
+      d.ok && aggregate <= NNTR_DDR_CEILING_GBS &&
+      nntr_ddr_rate_valid(d.bytes, d.us, NNTR_DDR_CEILING_GBS) &&
+      (!is_ring || d.gbs() <= ref_gbs * (1.0 + NNTR_TWO_READER_REF_TOL));
+    std::cout << std::fixed << std::setprecision(2)
+              << "DDR_TWO_READER cpu_alone=" << cpu_alone[p.t]
+              << " dsp_alone=" << alone.gbs() << " cpu_with=" << cpu_with
+              << " dsp_with=" << d.gbs() << " aggregate=" << aggregate
+              << " cpu_threads=" << p.t << " chunk_bytes=" << ch.bytes
+              << " reader=" << p.reader
+              << " cpu_loss_pct=" << 100.0 * (1.0 - cpu_with / cpu_alone[p.t])
+              << " dsp_loss_pct=" << 100.0 * (1.0 - d.gbs() / alone.gbs())
+              << " checksum_ok=" << (d.ok ? "y" : "n")
+              << " valid=" << (valid ? "y" : "n INVALID") << "\n";
+    EXPECT_TRUE(valid) << "DDR_TWO_READER " << p.reader << " t=" << p.t;
+  }
+  EXPECT_EQ(nntr_hvx_moe_set_opts(handle_, 0u, &applied), AEE_SUCCESS);
+}
+
+namespace {
+
+/** @brief Workers that spin between jobs (a persistent pool like the
+ *  app's): Go(n, fn) runs fn(j) on workers j < n, Busy() says whether one
+ *  is still running, and each worker keeps the CPU it last ran a job on
+ *  and when it finished. */
+class SpinPool {
+public:
+  static constexpr unsigned kMax = 8;
+  using clock = std::chrono::steady_clock;
+  explicit SpinPool(unsigned n) : n_(n) {
+    for (unsigned j = 0; j < n_; ++j) {
+      th_.emplace_back([this, j]() { Loop(j); });
+    }
+  }
+  ~SpinPool() {
+    quit_.store(1);
+    for (unsigned j = 0; j < n_; ++j) {
+      go_[j].fetch_add(1, std::memory_order_release);
+    }
+    for (auto &t : th_) {
+      t.join();
+    }
+  }
+  void Go(unsigned n, std::function<void(unsigned)> fn) {
+    fn_ = std::move(fn);
+    left_.store(n, std::memory_order_relaxed);
+    for (unsigned j = 0; j < n; ++j) {
+      go_[j].fetch_add(1, std::memory_order_release);
+    }
+  }
+  bool Busy() const { return left_.load(std::memory_order_acquire) != 0; }
+  void Wait() const {
+    while (Busy()) {
+    }
+  }
+  int Cpu(unsigned j) const { return cpu_[j]; }
+  clock::time_point End(unsigned j) const { return end_[j]; }
+
+private:
+  void Loop(unsigned j) {
+    uint32_t seen = 0;
+    for (;;) {
+      uint32_t g;
+      while ((g = go_[j].load(std::memory_order_acquire)) == seen) {
+      }
+      seen = g;
+      if (quit_.load()) {
+        return;
+      }
+      fn_(j);
+      end_[j] = clock::now();
+      cpu_[j] = sched_getcpu();
+      left_.fetch_sub(1, std::memory_order_release);
+    }
+  }
+  unsigned n_;
+  std::vector<std::thread> th_;
+  std::atomic<uint32_t> go_[kMax] = {};
+  std::atomic<unsigned> left_{0};
+  std::atomic<int> quit_{0};
+  std::function<void(unsigned)> fn_;
+  int cpu_[kMax] = {};
+  clock::time_point end_[kMax];
+};
+
+} // namespace
+
+/**
+ * @brief [#90, plan section 3.2] What a CPU prefetch of the next layer's
+ *        FC weights during the MoE call costs the DSP, and what it stages.
+ *
+ * 8 readers (7 spinning workers + the main thread, NNTR_NUM_THREADS=8) and
+ * a ring of S MiB buffers, >= 192 MiB in all, so a buffer is cold when it
+ * comes round. Per S = 4, 10, 20, 32: COLD (one real M=1 MoE call with the
+ * app's default feed = 1, no touch; then the 8 readers re-read B), HOT at
+ * T = 1, 2, 7 (T workers touch B, no call; then the re-read) and OVERLAP
+ * at T = 1, 2, 7 (the call with T workers touching B, released as it is
+ * issued; then the re-read). 64 iterations a cell, medians. The re-read is
+ * a stream, not the Q4_0 GEMV, so saved_us is a byte saving. Cache re-read
+ * times are not DDR rates and carry no bound.
+ */
+TEST_F(HvxDmaProbe, PrefetchOverlap) {
+  using clock = std::chrono::steady_clock;
+  const unsigned kReaders = 8, kWorkers = kReaders - 1;
+  const int kIters = 64;
+  const size_t kRingBytes = 200ull << 20; // max over S of ceil(192 / S) x S
+  MoeSets sets;
+  {
+    const uint32_t arenas[2] = {chunks_[0].arena, chunks_[1].arena};
+    ASSERT_EQ(sets.Register(handle_, arenas, chunks_[0].bytes), AEE_SUCCESS);
+  }
+  uint32_t applied = 0;
+  const uint32_t feed = GemvOpts(192, true, true);
+  ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, feed, &applied), AEE_SUCCESS);
+  ASSERT_EQ(applied, feed) << "the skel does not know #117's feed bit";
+  uint32_t call_i = 0;
+  auto moe_call = [&](double *dsp_us, double *mm_us) {
+    const int err = sets.Call(call_i++);
+    ASSERT_EQ(err, AEE_SUCCESS) << hex(err);
+    ASSERT_EQ(sets.stage[kStPath], 1u) << "not the M=1 GEMV path";
+    ASSERT_EQ(sets.stage[kStFeed], 1u) << "not the VTCM feed";
+    *dsp_us = sets.stage[kStDsp];
+    *mm_us = sets.stage[kStMm];
+  };
+  for (uint32_t s = 0; s < sets.n_sets; ++s) { // page state
+    double a, b;
+    ASSERT_NO_FATAL_FAILURE(moe_call(&a, &b));
   }
 
-  std::cout << std::fixed << std::setprecision(2)
-            << "DDR_TWO_READER cpu_alone=" << cpu_alone
-            << " dsp_alone=" << dsp_alone << " cpu_with=" << cpu_with
-            << " dsp_with=" << dsp_with
-            << " aggregate=" << (cpu_with + dsp_with)
-            << " cpu_threads=" << kThreads << " dsp_workers=" << best_w
-            << " chunk_bytes=" << chunk_bytes << "\n";
+  std::vector<uint8_t> ring(kRingBytes, 0x5a); // written, so faulted in
+  std::atomic<uint64_t> sink{0};
+  SpinPool pool(kWorkers);
+  std::cout << "PREFETCH_CONFIG readers=" << kReaders << " workers=" << kWorkers
+            << " ring_mib=" << (kRingBytes >> 20) << " sets=" << sets.n_sets
+            << " opts=0x" << std::hex << feed << std::dec
+            << " chunk_bytes=" << chunks_[0].bytes << "\n";
+
+  size_t g = 0; // the ring position runs on across cells
+  for (uint32_t s_mib : {4u, 10u, 20u, 32u}) {
+    const size_t s_bytes = static_cast<size_t>(s_mib) << 20;
+    const size_t n_bufs = ((192ull << 20) + s_bytes - 1) / s_bytes;
+    const size_t slice = s_bytes / kReaders;
+    double cold_us = 0, mm_alone = 0, dsp_alone = 0;
+    double hot_us[kReaders] = {0};
+    for (int kind = 0; kind < 3; ++kind) { // COLD, HOT, OVERLAP
+      for (unsigned t : {1u, 2u, 7u}) {
+        if (kind == 0 && t != 1u) {
+          continue;
+        }
+        std::vector<double> dsp, mm, touch, reread, moved;
+        int late = 0;
+        for (int it = 0; it < kIters; ++it) {
+          const uint8_t *buf = ring.data() + ((g++) % n_bufs) * s_bytes;
+          auto touch_fn = [&sink, buf, t, slice](unsigned j) {
+            uint64_t x = 0;
+            for (unsigned k = j; k < kReaders; k += t) {
+              x ^= stream_xor(buf + k * slice, slice);
+            }
+            sink.fetch_xor(x, std::memory_order_relaxed);
+          };
+          // phase 1: the window
+          const auto t_go = clock::now();
+          if (kind != 0) {
+            pool.Go(t, touch_fn);
+          }
+          if (kind != 1) {
+            double d, m;
+            ASSERT_NO_FATAL_FAILURE(moe_call(&d, &m));
+            dsp.push_back(d);
+            mm.push_back(m);
+            late += kind == 2 && pool.Busy();
+          }
+          if (kind != 0) {
+            pool.Wait();
+            double us = 0;
+            for (unsigned j = 0; j < t; ++j) {
+              us = std::max(us, std::chrono::duration<double, std::micro>(
+                                  pool.End(j) - t_go)
+                                  .count());
+            }
+            touch.push_back(us);
+          }
+          int touch_cpu[kReaders];
+          for (unsigned j = 0; j < t && kind != 0; ++j) {
+            touch_cpu[j] = pool.Cpu(j);
+          }
+          // phase 2: the 8 readers re-read the buffer (the consumer)
+          const auto t0 = clock::now();
+          pool.Go(kWorkers, [&sink, buf, slice](unsigned j) {
+            sink.fetch_xor(stream_xor(buf + j * slice, slice),
+                           std::memory_order_relaxed);
+          });
+          sink.fetch_xor(stream_xor(buf + kWorkers * slice, slice),
+                         std::memory_order_relaxed);
+          pool.Wait();
+          reread.push_back(
+            std::chrono::duration<double, std::micro>(clock::now() - t0)
+              .count());
+          if (kind != 0) {
+            int n = 0;
+            for (unsigned k = 0; k < kReaders; ++k) {
+              const int cpu = k < kWorkers ? pool.Cpu(k) : sched_getcpu();
+              n += cpu != touch_cpu[k % t];
+            }
+            moved.push_back(n);
+          }
+        }
+        const double r_us = Median(reread);
+        std::cout << std::fixed << std::setprecision(1);
+        if (kind == 0) {
+          cold_us = r_us;
+          mm_alone = Median(mm);
+          dsp_alone = Median(dsp);
+          std::cout << "PREFETCH_COLD size_mib=" << s_mib << " bufs=" << n_bufs
+                    << " dsp_us=" << dsp_alone << " mm_us=" << mm_alone
+                    << " cold_us=" << cold_us
+                    << " cold_gbs=" << s_bytes / cold_us / 1e3 << "\n";
+          continue;
+        }
+        const double touch_us = Median(touch);
+        if (kind == 1) {
+          hot_us[t] = r_us;
+          std::cout << "PREFETCH_HOT size_mib=" << s_mib
+                    << " touch_threads=" << t << " touch_us=" << touch_us
+                    << " hot_us=" << r_us << " moved=" << Median(moved) << "\n";
+          continue;
+        }
+        const double dsp_us = Median(dsp), mm_us = Median(mm);
+        const double staged =
+          cold_us > hot_us[t] ? (cold_us - r_us) / (cold_us - hot_us[t]) : 0.0;
+        const double net =
+          22.0 * nntr_prefetch_net_us(cold_us, r_us, dsp_us, dsp_alone) / 1e3;
+        std::cout << "PREFETCH_OVERLAP size_mib=" << s_mib
+                  << " touch_threads=" << t << " dsp_us=" << dsp_us
+                  << " mm_us=" << mm_us << " mm_alone_us=" << mm_alone
+                  << " dmm_pct=" << 100.0 * (mm_us / mm_alone - 1.0)
+                  << " touch_us=" << touch_us
+                  << " touch_gbs=" << s_bytes / touch_us / 1e3
+                  << " touch_late=" << late << "/" << kIters
+                  << " cold_us=" << cold_us << " hot_us=" << hot_us[t]
+                  << " reread_us=" << r_us << std::setprecision(2)
+                  << " staged=" << staged << " staged_mib=" << staged * s_mib
+                  << std::setprecision(1) << " saved_us=" << cold_us - r_us
+                  << std::setprecision(3) << " net_ms_per_token=" << net
+                  << std::setprecision(1) << " moved=" << Median(moved) << "\n";
+      }
+    }
+  }
+  std::cout << "PREFETCH_SINK " << std::hex << sink.load() << std::dec << "\n";
+  EXPECT_EQ(nntr_hvx_moe_set_opts(handle_, 0u, &applied), AEE_SUCCESS);
 }
 
 /**
