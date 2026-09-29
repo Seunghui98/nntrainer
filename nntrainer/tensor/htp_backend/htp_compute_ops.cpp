@@ -2989,14 +2989,31 @@ private:
   /** @brief Creation, once, at the first M==1 MoE call (section 3.4); any
    *  failure prints one "dspq: off" line and is never retried. */
   void dspqCreate(remote_handle64 session) {
-    dspq_ = dspqMake(session, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES);
+    const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
+    dspq_ = dspqMake(
+      session, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES,
+      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
+               : 1000u);
+  }
+
+  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 20): how long a
+   *  waiting session spins (with a pause) before it sleeps -- at each hop
+   *  and on its dspqueue after a token. E5b's 1000 us kept one of the six
+   *  hardware threads busy through the other session's compute. */
+  static uint32_t e2eSpinUs() {
+    static const uint32_t us = [] {
+      const char *e = std::getenv("NNTR_HTP_E2E_SPIN_US");
+      return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 20u;
+    }();
+    return us;
   }
 
   /** @brief A queue on @a session in @a domain with an out buffer of
    *  @a out_bytes (S1's: HTP_DSPQ_BUF_BYTES; [#132 Part B E3] S2's holds
    *  the logits too). Its teardown is an HtpBackend close hook. */
   std::shared_ptr<DspqMoe> dspqMake(remote_handle64 session, int domain,
-                                    const char *tag, size_t out_bytes) {
+                                    const char *tag, size_t out_bytes,
+                                    uint32_t dsp_spin_us) {
     auto st = std::make_shared<DspqMoe>();
     st->state = DspqMoe::OFF;
     st->session = session;
@@ -3051,10 +3068,6 @@ private:
       if (e != 0)
         fail("fastrpc_mmap", e);
     }
-    const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
-    const uint32_t dsp_spin_us =
-      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-               : 1000;
     if (err == 0) {
       const int e = nntr_hvx_dspq_start(session, id, dsp_spin_us);
       if (e != AEE_SUCCESS)
@@ -3216,16 +3229,18 @@ private:
   void e2eStart() {
     E2eState &e = *e2e_st_;
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
-    if (!dspq_)
-      dspqCreate(e.h1);
+    if (!dspq_) // S1's queue: token packets only at decode, so the E2E spin
+      dspq_ =
+        dspqMake(e.h1, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES, e2eSpinUs());
     if (dspq_->state != DspqMoe::ON || dspq_->session != e.h1) {
       throw std::runtime_error("NNTR_HTP_E2E=1: S1's dspqueue is off (see "
                                "the dspq line; NNTR_HTP_DSPQ=0?): the token "
                                "packets ride it");
     }
     const size_t logits_bytes = static_cast<size_t>(graph_words_[5]) * 4u;
-    e.q2 = dspqMake(e.h2, e.dom2, "dspq[S2]",
-                    std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes));
+    e.q2 =
+      dspqMake(e.h2, e.dom2, "dspq[S2]",
+               std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes), e2eSpinUs());
     if (e.q2->state != DspqMoe::ON) {
       throw std::runtime_error("NNTR_HTP_E2E=1: S2's dspqueue is off (see "
                                "the dspq[S2] line)");
@@ -3251,10 +3266,7 @@ private:
                                "page failed: " +
                                std::to_string(rc));
     }
-    const char *spin_env = std::getenv("NNTR_HTP_HOP_SPIN_US");
-    const uint32_t spin_us =
-      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-               : 1000u;
+    const uint32_t spin_us = e2eSpinUs();
     rc = nntr_hvx_token_driver_start(
       e.h1, fd, static_cast<uint32_t>(e.mbox->size()), 1u, spin_us);
     e.drv1 = rc == AEE_SUCCESS;
@@ -3270,6 +3282,8 @@ private:
     uint32_t rounds = 0;
     for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size()); ++i)
       rounds += graphOp(i)->kind == HTP_OP_ROUTER_TOPK;
+    e.rounds = rounds;
+    e.spin_us = spin_us;
     std::fprintf(stderr,
                  "[HTP] token driver: on s1_effdom=%d s2_effdom=%d mbox=%zu "
                  "spin_us=%u rounds=%u hops/token=%u logits_buf=%zu\n",
@@ -3282,6 +3296,8 @@ private:
    *  arena, each buffer fastrpc_munmap'd before nntr_hvx_close (#178's
    *  rule). S1's arena and graph stay as on the one-session path. */
   static void e2eTeardown(E2eState &e) {
+    static_assert(HTP_OP_KIND_N == HTP_DSPQ_TOKEN_KINDS,
+                  "htp_dspq_wire.h's kind count is the graph's");
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
     if (e.q2)
       dspqTeardown(*e.q2);
@@ -3302,6 +3318,55 @@ private:
                    (unsigned long long)e.tokens,
                    static_cast<double>(e.pcyc2) / n,
                    static_cast<double>(e.wait2_us) / n);
+      // per side: the clock (pcycles over the token's wall time on that
+      // side) and the op pcycles per kind per token, with the ms they are
+      // at that clock; S1's MOE also per round
+      for (int k = 0; k < 2; ++k) {
+        const uint64_t *kp = k == 0 ? e.kind1 : e.kind2;
+        const double wus =
+          static_cast<double>(k == 0 ? e.wall1_us : e.wall2_us);
+        const double mhz =
+          wus > 0
+            ? static_cast<double>(k == 0 ? e.wall1_pcyc : e.wall2_pcyc) / wus
+            : 0.0;
+        std::string line;
+        char buf[96];
+        for (uint32_t kd = 0; kd < HTP_OP_KIND_N; ++kd) {
+          if (kp[kd] == 0)
+            continue;
+          const double pc = static_cast<double>(kp[kd]) / n;
+          std::snprintf(buf, sizeof(buf), " %s=%.0f(%.3fms)",
+                        htp_graph_kind_name(kd), pc,
+                        mhz > 0 ? pc / mhz / 1000.0 : 0.0);
+          line += buf;
+        }
+        std::fprintf(
+          stderr,
+          "[HTP] graph[S%d] per-kind pcyc/token:%s | wall_ms/token=%.3f "
+          "mhz=%.0f spin_us=%u\n",
+          k + 1, line.c_str(), wus / n / 1000.0, mhz, e.spin_us);
+      }
+      if (e.rounds != 0 && e.kind1[HTP_OP_MOE] != 0) {
+        const double mhz1 =
+          e.wall1_us ? static_cast<double>(e.wall1_pcyc) / e.wall1_us : 0.0;
+        const double moe = static_cast<double>(e.kind1[HTP_OP_MOE]) / n /
+                           static_cast<double>(e.rounds);
+        std::fprintf(
+          stderr,
+          "[HTP] graph[S1] moe pcyc/round=%.0f (%.3f ms) "
+          "router pcyc/round=%.0f; s2 fc+dense_ffn+lm_head "
+          "ms/token=%.3f (isolated #178: 8.06); arm token_ms=%.3f\n",
+          moe, mhz1 > 0 ? moe / mhz1 / 1000.0 : 0.0,
+          static_cast<double>(e.kind1[HTP_OP_ROUTER_TOPK]) / n /
+            static_cast<double>(e.rounds),
+          e.wall2_us
+            ? static_cast<double>(e.kind2[HTP_OP_FC] +
+                                  e.kind2[HTP_OP_DENSE_FFN] +
+                                  e.kind2[HTP_OP_LM_HEAD]) /
+                n / (static_cast<double>(e.wall2_pcyc) / e.wall2_us) / 1000.0
+            : 0.0,
+          static_cast<double>(e.token_us) / n / 1000.0);
+      }
       std::fprintf(stderr,
                    "[HTP] token driver: close tokens=%llu hops/token=%.2f "
                    "s1_served=%u s2_served=%u timeouts=%u/%u stale=%u/%u "
@@ -3461,6 +3526,15 @@ private:
     e.wait2_us += s2r.wait_us;
     e.pcyc1 += s1r.pcycles;
     e.pcyc2 += s2r.pcycles;
+    e.wall1_us += s1r.wall_us;
+    e.wall2_us += s2r.wall_us;
+    e.wall1_pcyc += s1r.wall_pcyc;
+    e.wall2_pcyc += s2r.wall_pcyc;
+    for (uint32_t k = 0; k < HTP_OP_KIND_N; ++k) {
+      e.kind1[k] += s1r.kind_pcyc[k];
+      e.kind2[k] += s2r.kind_pcyc[k];
+    }
+    e.token_us += us;
     ++fwd_calls_; // one ARM -> S2 packet per token: calls/token = 1.00
     ++fwd_tokens_;
     if (e.tokens == 1)
@@ -4854,6 +4928,10 @@ private:
     uint32_t tok = 0;
     uint64_t tokens = 0, hops = 0, wait1_us = 0, wait2_us = 0, pcyc1 = 0,
              pcyc2 = 0, id_checked = 0, id_mismatch = 0;
+    uint64_t wall1_us = 0, wall2_us = 0, wall1_pcyc = 0, wall2_pcyc = 0,
+             token_us = 0; /**< per side; token_us: the ARM's round trip */
+    uint64_t kind1[HTP_OP_KIND_N] = {0}, kind2[HTP_OP_KIND_N] = {0};
+    uint32_t rounds = 0, spin_us = 0;
   };
   /** @brief The mailbox page: HEXKL_MBOX_BYTES (16 896) rounded to the
    *  #178 probe's 64 KiB. */
