@@ -1034,7 +1034,7 @@ TEST(AttnM1F16Det, RopeMatchesNeonFp16) {
  *        ENABLE_FP16 branch calls it (copyData, compute_rotary_emb_value
  *        on q and on the new k row into the cache, compute_kcaches,
  *        softmax_row_inplace, compute_fp16vcache_transposed), against
- *        m1_rope64_det + attn_m1_det.h, bit for bit, at L = 1 .. 1024 with
+ *        m1_rope64_det + attn_m1_det.h, bit for bit, at L = 1 .. 1536 with
  *        attn_m1_cases.h's rows (the fused-FMA midpoint cases). Each L runs
  *        twice: RoPE at position 0 (the identity, so the adversarial rows
  *        survive it; the case counts are printed there only) and at
@@ -1042,7 +1042,7 @@ TEST(AttnM1F16Det, RopeMatchesNeonFp16) {
  */
 TEST(AttnM1F16Det, AttentionMatchesNeonFp16) {
   const size_t row = (size_t)kF16Kv * kF16Hd, nq = (size_t)kF16Nq * kF16Hd;
-  for (unsigned L : {1u, 2u, 63u, 64u, 65u, 512u, 513u, 1024u}) {
+  for (unsigned L : {1u, 2u, 63u, 64u, 65u, 512u, 513u, 1024u, 1536u}) {
     amc_rng rng{0x15200400u + L};
     std::vector<float> q(nq), k(L * row), v(L * row), cs(64);
     amc_fill_q(&rng, q.data(), kF16Nq, kF16Hd);

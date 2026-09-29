@@ -555,10 +555,11 @@ interface nntr_hvx : remote_handle64 {
                               rout sequence<float> state_out);
 
    // [#81] Decode attention at m=1 (hvx_attn_m1_f32.c) against the scalar
-   // spec nntrainer/tensor/attn_m1_det.h, with a session-owned f32 KV
-   // cache: Kt [layer][kv][head_dim][max_seq], V [layer][kv][max_seq]
-   // [head_dim], allocated at register for the whole shape (48 MiB at the
-   // LFM2.5 shape and max_seq 2048) and freed at release or close. layer
+   // spec nntrainer/tensor/attn_m1_det.h, with a session-owned fp16 KV
+   // cache (#170; rows stay f32 on the wire): Kt tiled [layer][kv][tile]
+   // [head_dim][64], V [layer][kv][max_seq][head_dim], allocated at
+   // register for the whole shape (24 MiB at the LFM2.5 shape and max_seq
+   // 2048) and freed at release or close. layer
    // is the attention-layer ordinal. Not wired into the model here: #85's
    // ATTN_M1 slot stays NULL. One cache per session: a second register
    // without a release is AEE_EBADSTATE. A bad shape or a position out
@@ -643,4 +644,17 @@ interface nntr_hvx : remote_handle64 {
    // Stops the thread and closes the queue.
    // res: [packets served, bad packets, empty polls, spin_us]
    AEEResult dspq_stop(rout sequence<uint32> res);
+
+   // [#170] DEBUG ONLY (no model path calls it): hvx_attn_m1_hf.h's
+   // fp16-lane primitives on silicon, and the cost of the kernel shapes
+   // plan 170 designs (test/htp/nntr_hvx_attn_m1_probe.c). op < 16: y[i] =
+   // f(a[i], b[i], c[i]) over n lanes (a, b, c, y all n long, n a multiple
+   // of 64), one thread. op >= 16: a kernel-shaped loop on lanes pool lanes,
+   // reps timed pool runs; a, b, c, y empty. Op codes and the prof words:
+   // test/htp/nntr_attn_m1_probe.h. A bad op, length, lane or rep count is
+   // AEE_EINVALIDFORMAT; never AEE_EBADPARM.
+   AEEResult attn_m1_probe(in uint32 op, in uint32 lanes, in uint32 reps,
+                           in sequence<uint16> a, in sequence<uint16> b,
+                           in sequence<uint16> c, rout sequence<uint16> y,
+                           rout sequence<uint32> prof);
 };

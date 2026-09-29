@@ -305,7 +305,7 @@ $EVAL --label fwd-lfm25 --allow-diff --snr-floor $SNR_FLOOR "$OUT/dump_25off" "$
 $EVAL --label 'fwd==off-lfm25' --tokens-policy "$OUT/dump_25off" "$OUT/dump_25fwd" | tail -1 || fail=1
 grep -q '^\[HTP\] graph: init n_ops=58 resident=RMSNORM|CONV1D_GATE|QK_NORM|ROPE|ATTN_M1|MOE ' "$OUT/25fwd.log" ||
   { echo "E2E FAIL lfm25: no init line with every kind resident"; fail=1; }
-grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=16384 KiB' "$OUT/25fwd.log" ||
+grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=8192 KiB' "$OUT/25fwd.log" ||
   { echo "E2E FAIL lfm25: no attn_m1 registration line"; fail=1; }
 # (h) [#132] ADD alone moves no bit (IEEE a + b on both sides) and takes
 # two calls per MoE layer off; ROUTER_TOPK takes one more (hd8 11 -> 9 ->
