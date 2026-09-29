@@ -74,6 +74,16 @@ mkdir -p generated build
     -I "$HEXAGON_SDK_ROOT/incs/stddef" \
     -mdll -o generated nntr_hvx.idl
 
+# [#132 PR 2] hvx_q4_gemv_f32.c issues the IEEE vadd/vsub/vmpy .sf
+# instructions, which need -mhvx-ieee-fp; the rest of the skel is built
+# without it (its Q6_Vsf_* intrinsics keep their qf32 lowering, A's bits),
+# so that one file is compiled on its own and linked in as an object.
+"$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
+    -m"$HEX_ARCH" -mhvx -mhvx-length=128B -mhvx-ieee-fp -G0 -O3 -fPIC \
+    -Wall -Werror ${HEX_EXTRA_CFLAGS:-} \
+    -I "$BACKEND/.." -I "$BACKEND/hvx" \
+    -c "$BACKEND/hvx/hvx_q4_gemv_f32.c" -o build/hvx_q4_gemv_f32.o
+
 SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c nntr_hvx_small_ops.c nntr_hvx_attn_m1.c nntr_hvx_dspq_bench.c nntr_hvx_dspq.c generated/nntr_hvx_skel.c"
 SRCS="$SRCS nntr_hvx_attn_m1_probe.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
@@ -90,6 +100,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_scale_add_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c $BACKEND/hvx/hvx_softmax_blocked_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
+SRCS="$SRCS nntr_hvx_fc_q4.c build/hvx_q4_gemv_f32.o"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
