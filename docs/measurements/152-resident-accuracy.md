@@ -470,3 +470,42 @@ after each G, 6 after the texts, 7 after the PPL runs):
 ```
 
 FARF / AEE errors, anything stale, the serial used.
+
+## Results (filled by the orchestrator, 2026-09-29 11:56–12:33 KST, `R3CY10WM83Y`)
+
+Device md5 = md5.txt for both sets (MD5 OK, MD5 D0 OK). Cool start 25.2 °C.
+
+**Gtests.** G0 `AttnM1F16Det.*`: every `ATTN_M1_F16 … bad=0` (21 lines), exp
+probe `bad_p0=0 bad_p1=0`, `[  PASSED  ] 3 tests` — the spec equals the
+phone's NEON fp16 CPU path. G1 `HvxAttnM1.*`: `bad=0 bad_stats=0` at
+L = 1 / 63 / 64 / 65 / 512 / 1024, `append_chain bad=0`; `RejectsBadShapes`
+FAILED with `0x80000600` on every case incl. the two new head_dim cases
+(rule 38: FastRPC marshalling rejects before the validator). Rope
+`HvxM1Ops.Rope64*`: `bad=0` at every position. **G3 (speed) fails**: pos 1023
+warm `dsp_us=1736.6` (cold 2193.5) vs the gate 940; host-timed 2007 µs.
+
+**Dumps (G=4, vs A1).** A2 and A0 `bit_identical=1`; **`N_attn` (MOE,ROPE,ATTN_M1)
+`bit_identical=1` — G2 passes**; `N_conv` `=1`; `N_qk` 28.68 dB; `N_rms`
+2.64 dB (routing flip); `O_attn` (old kernel) 2.72 dB. D1 / D0 / N_route
+dump no MoE file (the MoE runs inside the stretch) — judged by text + PPL.
+
+**Speed (decode tok/s, mirrored means).**
+
+| G | A | D0 (#134 set) | D1 (this set) |
+|---|---|---|---|
+| 64 | 38.87 | 28.57 | 25.91 |
+| 512 | 38.54 | 27.88 | 24.55 |
+| 1024 | 35.53 | 26.57 | 22.51 |
+
+**8 prompts at G=256 (D1 vs A).** Text identical on p05 / p06 / p08 only.
+Loop check (`loop_check.py --prompt`): A loops on p02 p03 p05 p06 p08; D1 on
+p02 p03 **p04** p05 p06 p08 — a new loop on p04 (Korean). Decode PPL (forced
+on A's continuation) within +0.9 % on every prompt; A self = A forced
+(`nll_sum=90.048889370024341`). The D0 text / PPL cells for p02–p08 are void:
+the D0 run dir had no bitset prompt files (`TensorDim <= 0`).
+
+**Approval (user, 2026-09-29): D1 `n` on all 8 prompts (repetition), D0 `n`.**
+
+**Verdict.** The resident ROPE + ATTN_M1 stretch is now bit-identical to the
+Android CPU (G0, G1, G2 pass); the remaining difference is the norms. The
+path fails G3 (speed) and the user's approval; it stays off by default.
