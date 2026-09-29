@@ -12,6 +12,7 @@
 #include "htp_q4_0_convert.h"
 #include "htp_wh_layout.h"
 #include "int4_utils.h"
+#include "m1_ops_det.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
 #include <cpu_backend.h>
@@ -21,9 +22,15 @@
 #include <nntr_ggml_impl.h>
 #include <numeric>
 #include <random>
+#include <string>
+#include <tensor.h>
 #include <vector>
 
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
@@ -2039,6 +2046,149 @@ DECLARE_transform_int4_test_K_N(1024, 648, 32);
 DECLARE_transform_int4_test_K_N(1024, 648, 64);
 DECLARE_transform_int4_test_K_N(1024, 648, 128);
 DECLARE_transform_int4_test_K_N(3072, 8192, 32);
+
+/* ---- [#164] the HTP RMSNorm spec equals the shipped CPU RMSNorm --------- */
+
+#if defined(__aarch64__)
+/**
+ * @brief The Android CPU's decode norm, call for call: the exported
+ *        rms_norm_wrt_width_fp32_intrinsic over @a rows rows of @a W, then
+ *        Tensor::multiply_i with a 1 x W gamma (RMSNormLayer at W = 2048,
+ *        QKVLayer's headNorm at W = 64).
+ */
+static void cpu_rmsnorm_rows(const float *x, const float *g, float *y,
+                             unsigned rows, unsigned W, float eps) {
+  nntrainer::Tensor out(1, 1, rows, W);
+  nntrainer::Tensor gamma(1, 1, 1, W);
+  std::memcpy(gamma.getData<float>(), g, W * sizeof(float));
+  nntrainer::rms_norm_wrt_width_fp32_intrinsic(x, out.getData<float>(), rows, W,
+                                               eps);
+  out.multiply_i(gamma);
+  std::memcpy(y, out.getData<float>(), (size_t)rows * W * sizeof(float));
+}
+
+/** @brief Elements of @a n rows that differ between the CPU and
+ *         m1_rmsnorm_det (chunk = W, one gamma). */
+static unsigned rmsnorm_cpu_vs_spec(const float *x, const float *g,
+                                    unsigned rows, unsigned W, float eps) {
+  std::vector<float> yc((size_t)rows * W), ys((size_t)rows * W);
+  cpu_rmsnorm_rows(x, g, yc.data(), rows, W, eps);
+  m1_rmsnorm_det(x, g, ys.data(), rows * W, W, eps, nullptr);
+  unsigned bad = 0;
+  for (size_t i = 0; i < yc.size(); ++i)
+    bad += std::memcmp(&yc[i], &ys[i], sizeof(float)) != 0;
+  return bad;
+}
+#endif
+
+/**
+ * @brief G0 of plan 164: m1_ops_det.h's RMSNorm (the HTP kernel's spec) is
+ *        bit-identical to the CPU function in this libnntrainer.so, at
+ *        W = 2048 (1 row a call) and W = 64 (40 rows a call), on 20 000
+ *        random rows whose magnitudes span 2^-20 .. 2^20 and the +-1e-39
+ *        row. The spec is the aarch64 order; the host's AVX2 order is not.
+ */
+TEST(RmsNormCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 NEON order";
+#else
+  const float eps = 1e-5f;
+  std::mt19937 rng(0x164u);
+  std::uniform_real_distribution<float> mant(0.5f, 1.0f), gd(0.5f, 1.5f);
+  std::vector<float> g(2048), x(2048 * 40);
+  for (auto &v : g)
+    v = gd(rng);
+  unsigned rows = 0, bad = 0;
+  const unsigned shapes[2][2] = {{2048u, 1u}, {64u, 40u}};
+  for (const auto &sh : shapes) {
+    const unsigned W = sh[0], R = sh[1];
+    /* 1 000 calls of each shape: 1 000 + 40 000 rows */
+    for (unsigned call = 0; call < 1000u; ++call, rows += R) {
+      for (unsigned r = 0; r < R; ++r) {
+        const int e = (int)((call * R + r) % 41u) - 20;
+        for (unsigned i = 0; i < W; ++i) {
+          const float m = mant(rng);
+          x[r * W + i] = std::ldexp((rng() & 1u) ? -m : m, e);
+        }
+      }
+      bad += rmsnorm_cpu_vs_spec(x.data(), g.data(), R, W, eps);
+    }
+    for (unsigned i = 0; i < W * R; ++i)
+      x[i] = (i & 1u) ? -1e-39f : 1e-39f;
+    const unsigned bad_sub = rmsnorm_cpu_vs_spec(x.data(), g.data(), R, W, eps);
+    std::printf("RmsNormCpuOrder W=%u rows/call=%u subnormal(+-1e-39) bad=%u\n",
+                W, R, bad_sub);
+    bad += bad_sub;
+    rows += R;
+  }
+  std::printf("RmsNormCpuOrder rows=%u bad=%u\n", rows, bad);
+  EXPECT_EQ(bad, 0u);
+#endif
+}
+
+/**
+ * @brief G0's replay: NNTR_NORM_REPLAY=<norm.bin> (a dev/norm-shadow dump)
+ *        with gamma_rms.f32 (49 x 2048) and gamma_qk.f32 (6 x (q 64 | k 64))
+ *        in the same directory; every record's input through the CPU and
+ *        the spec, bit for bit. Skipped when unset.
+ */
+TEST(RmsNormCpuOrder, ReplayNormShadow) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 NEON order";
+#else
+  const char *path = std::getenv("NNTR_NORM_REPLAY");
+  if (!path)
+    GTEST_SKIP() << "NNTR_NORM_REPLAY not set";
+  const std::string file(path);
+  const std::string dir = file.substr(0, file.find_last_of('/') + 1);
+  auto load = [](const std::string &p, size_t n) {
+    std::vector<float> v(n);
+    std::FILE *f = std::fopen(p.c_str(), "rb");
+    const size_t got = f ? std::fread(v.data(), sizeof(float), n, f) : 0;
+    if (f)
+      std::fclose(f);
+    return got == n ? v : std::vector<float>();
+  };
+  const std::vector<float> grms = load(dir + "gamma_rms.f32", 49u * 2048u);
+  const std::vector<float> gqk = load(dir + "gamma_qk.f32", 6u * 128u);
+  ASSERT_FALSE(grms.empty() || gqk.empty()) << "gammas next to " << file;
+  std::FILE *f = std::fopen(path, "rb");
+  ASSERT_NE(f, nullptr) << file;
+  const float eps = 1e-5f;
+  unsigned h[4], k_rms = 0, k_qk = 0, n_rms = 0, bad_rms = 0, n_qk = 0,
+                 bad_qk = 0;
+  std::vector<float> in(8192), cpu(8192), other(8192);
+  while (std::fread(h, sizeof(unsigned), 4, f) == 4) {
+    ASSERT_TRUE(h[2] <= 8192u && h[3] <= 8192u && h[3] <= h[2] &&
+                std::fread(in.data(), 4, h[2], f) == h[2] &&
+                std::fread(cpu.data(), 4, h[3], f) == h[3] &&
+                std::fread(other.data(), 4, h[3], f) == h[3]);
+    if (h[0] != 1u) {
+      ASSERT_EQ(h[2], 2048u);
+      ++n_rms;
+      bad_rms +=
+        rmsnorm_cpu_vs_spec(in.data(), grms.data() + (k_rms++ % 49u) * 2048u, 1,
+                            2048u, eps) != 0;
+    } else {
+      const unsigned wk = h[2] - h[3], wq = h[3] - wk;
+      ASSERT_TRUE(wk > 0u && wk <= h[3] - wk && wq % 64u == 0u &&
+                  wk % 64u == 0u)
+        << "QK_NORM record of " << h[2] << " / " << h[3];
+      const float *gq = gqk.data() + (k_qk++ % 6u) * 128u;
+      n_qk += h[3] / 64u;
+      bad_qk += rmsnorm_cpu_vs_spec(in.data(), gq, wq / 64u, 64u, eps) != 0;
+      bad_qk +=
+        rmsnorm_cpu_vs_spec(in.data() + wq, gq + 64, wk / 64u, 64u, eps) != 0;
+    }
+  }
+  std::fclose(f);
+  std::printf("RmsNormCpuOrder replay %s rms=%u bad=%u qk_heads=%u "
+              "bad_calls=%u\n",
+              path, n_rms, bad_rms, n_qk, bad_qk);
+  EXPECT_EQ(bad_rms + bad_qk, 0u);
+  EXPECT_GT(n_rms + n_qk, 0u);
+#endif
+}
 
 int main(int argc, char **argv) {
   int result = -1;
