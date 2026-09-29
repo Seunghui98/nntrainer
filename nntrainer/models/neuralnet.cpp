@@ -26,10 +26,12 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -105,6 +107,65 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
     return Tensor::Map<float>(buf, bytes, dim, 0);
   }
 }
+
+/**
+ * @brief [#150] NNTR_OP_TIME=1: wall time of every node's decode call
+ *        (to - from == 1), one line per node at exit, for
+ *        tools/htp/op_time_report.py. Off, it costs one predicted branch
+ *        per node and never touches a tensor. Unlike the --profile build it
+ *        builds no string per call and starts no sampler thread, so it can
+ *        ride the TPS binary.
+ *
+ * ponytail: indexed by execution order, one process-wide table. Two models
+ * in one process would add into the same rows; the CausalLM app runs one.
+ */
+struct OpTimeTable {
+  struct Row {
+    std::string name, type;
+    uint64_t calls = 0, sum_ns = 0, min_ns = UINT64_MAX, max_ns = 0;
+    size_t wbytes = 0;
+  };
+  std::vector<Row> rows;
+
+  static bool on() {
+    static const bool v = [] {
+      const char *e = std::getenv("NNTR_OP_TIME");
+      return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+  }
+
+  void add(size_t f, LayerNode &node, uint64_t ns) {
+    if (f >= rows.size())
+      rows.resize(f + 1);
+    Row &r = rows[f];
+    if (r.calls++ == 0) {
+      r.name = node.getName();
+      r.type = node.getType();
+      for (unsigned int i = 0; i < node.getNumWeights(); ++i)
+        r.wbytes += node.getWeight(i).getMemoryBytes();
+    }
+    r.sum_ns += ns;
+    r.min_ns = std::min(r.min_ns, ns);
+    r.max_ns = std::max(r.max_ns, ns);
+  }
+
+  ~OpTimeTable() {
+    for (size_t f = 0; f < rows.size(); ++f) {
+      const Row &r = rows[f];
+      if (r.calls == 0)
+        continue;
+      std::fprintf(stderr,
+                   "[OP-TIME] node f=%zu name=%s type=%s calls=%llu "
+                   "sum_us=%.3f min_us=%.3f max_us=%.3f wbytes=%zu\n",
+                   f, r.name.c_str(), r.type.c_str(),
+                   static_cast<unsigned long long>(r.calls), r.sum_ns / 1e3,
+                   r.min_ns / 1e3, r.max_ns / 1e3, r.wbytes);
+    }
+  }
+};
+
+OpTimeTable g_op_time;
 
 } // namespace
 
@@ -522,17 +583,17 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
-      // auto start_layer =
-      //      std::chrono::high_resolution_clock::now(); // log the
-      //      start_prefill time
       model_graph.flushCacheExcept(f);
-      node->incremental_forwarding(from, to, training);
-      // auto end_layer =
-      //  std::chrono::high_resolution_clock::now(); // log th
-      //   auto duration_ =
-      //   std::chrono::duration_cast<std::chrono::nanoseconds>(end_layer-start_layer);
-      // std::cout << node->getName() <<" : "<< duration_.count()<<"
-      // ns"<<std::endl;
+      if (to - from == 1 && OpTimeTable::on()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        node->incremental_forwarding(from, to, training);
+        g_op_time.add(f, *node,
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count());
+      } else {
+        node->incremental_forwarding(from, to, training);
+      }
     } else {
       model_graph.checkLoadComplete(f);
       node->incremental_forwarding(from, to, training);
