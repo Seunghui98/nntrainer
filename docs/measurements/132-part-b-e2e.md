@@ -6,6 +6,60 @@ staged at `/local/mnt/workspace/htp_moe/132/set_e5b/` — estimated device
 time: **≈ 90 min** (phone rebooted first). set_e5 (below, `10bb91b7` /
 `d77a4bf2`) was read on 2026-09-30 06:13.
 
+## set_e5b as read (2026-09-30 06:55–07:32, R3CY10WM83Y after a reboot)
+
+* **The two-session path loads and runs**: S1's arena first (3840), then S2
+  (`open_ms` 24.0, `attach_mib=383.6`, `load_ms` 684.9); startup E 15 049 vs
+  A 14 706 ms; every E run `calls/token=1.00`, `hops/token=44.00`, timeouts
+  0, stale 0, `id_mismatch=0`; no leak (every sanity generated). MoE dumps E
+  == A (prefill calls, 46 files) `bit_identical=1`. Shadows at G = 8: every
+  record equal; Ev logits == S0 every step; nll S0 / S / Ev == A (8 steps).
+* **Not bit-identical past 5–26 decode steps.** The 8-prompt block (G = 256,
+  forced on A's ids): E's nll differs from A on all 8 prompts, first
+  differing step p01 = 25, p04 = 5, p07 = 26 (targets equal: the logits
+  move before the argmax does); top1 255/256 (p01), 245/256 (p04); text ==
+  A on p02 p03 p05 p06 p08 only; the G = 512 free-run text differs too.
+  E5b's bit identity holds only for the first 5–25 steps.
+* **Host**: the in-process build does not reproduce it — lfm25 at prompt
+  512, E3 (two sessions) == E1 (one session) == D (hybrid) bit for bit
+  over **256** decode steps (every logit and every MoE call; x86
+  quantizer order). So the difference is a device reading: an op whose DSP
+  result leaves the Android CPU's on some input the 8-step shadows did not
+  meet, or something only two PDs on silicon do. set_e5c names the first
+  (step, layer, side).
+* **Speed**: E 16.7 / 16.0 / 15.2 tok/s at G 64 / 512 / 1024 against A
+  53.5–55.1 / 54.4–54.8 / 52.4–52.9. Per token (E_G64_r1): S1 46.7 M pcyc,
+  wait 24.3 ms; S2 61.7 M pcyc, wait 23.2 ms; first token 55.4 ms. The two
+  sessions strictly alternate, so their op cycles sum over the ≈ 59 ms
+  token: 108.4 M / 59 ms ≈ **1.8 GHz** — the clock is not the loss. S1's
+  22 MoE + router rounds take ≈ 2.7× the cycles of the isolated MoE
+  (≈ 17 M at 0.43 ms × 22). Leading suspect, from the code: the hop wait
+  (`tk_take`) spins for `spin_us` = 1000 µs **without a pause and with a
+  cache flush-invalidate each iteration** before it sleeps, and each wait
+  is ≈ 1.1 ms, so the waiting PD holds one of the six HW threads for almost
+  the whole of the other PD's compute; S1's MoE runs six lanes on a pool
+  barrier, so one starved lane stretches every call. The pools' own
+  post-job spin (≈ 100 µs, `HVX_WORKER_POOL_SPIN`) does the same at each
+  hop. The fix and its cells come after E5c (correctness first).
+* The runner's `attn cache on S2` pattern expected #170's 24576 KiB; the
+  banner is `layers=6 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=49152 KiB`
+  (fixed in the runner copy).
+
+## set_e5c (staged): the first step, layer and side where E leaves A
+
+`/local/mnt/workspace/htp_moe/132/set_e5c/` (`md5.txt`; runner
+`run_e5c.sh` `05644a61…`, ≈ 20 min, reboot first): e3 = set_e5b's A set
+(skel `293628eb…`); sh = `dev/e2e-shadow-132` @ `7d8bf780` with its own
+skel `149cf7d4…` (the hop trace: `libnntrainer.so` `78b76969…`). Per
+prompt (prompt512, bitset-04-korean), G = 64, forced on A's own ids: A
+(self), S0 (the CPU's MoE rows per decode layer, `NNTR_MOE_ROW_TRACE`), S
+(`NNTR_HTP_FORWARD=1` + every shadow, every step), Ev (`NNTR_HTP_E2E=1`,
+S2's hop rows per step, `NNTR_E2E_TRACE`), then an A sanity. Summary lines:
+`nll S0 == A`; `Ev: logits … first_differing_step=`; `E2E TRACE steps=64
+first_diff=step<s>/pos<p>/L<l>.in|out` (an `.in` first names S2's ops since
+the previous MoE, an `.out` with an equal `.in` names S1's router or MoE);
+the FC / norm / attention shadows' `first_diff`.
+
 ## set_e5 as read (2026-09-30 06:13–06:39, R3CY10WM83Y after a reboot)
 
 * Every E / Ev run died at load, before decode: S2 opened (`s2_session=1

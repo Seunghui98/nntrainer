@@ -85,7 +85,7 @@ vbanner() { # vbanner <variant> <log>: the variant's banners, else the log is vo
     want "$2 s2 fc arena 67 weights, 74 handles, feed=l2" "$(grep -c 's2: fc arena weights=67 handles=74 attach_mib=[0-9.]* chunks=[0-9]* mapped_mib=[0-9]* feed=l2 load_ms=[0-9.]* s1_arena_mib=3840$' $f)" 1
     want "$2 q4m1 banner feed=l2" "$(grep -c 'graph: q4m1 weights=67 handles=74 feed=l2$' $f)" 1
     want "$2 graph init all kinds" "$(grep -cF 'graph: init n_ops=228 resident=RMSNORM|FC|CONV1D_GATE|QK_NORM|ROPE|ATTN_M1|ADD|ROUTER_TOPK|MOE|DENSE_FFN|LM_HEAD moe_ops=22' $f)" 1
-    want "$2 attn cache on S2" "$(grep -cF 'max_seq=2048 cache=24576 KiB' $f)" 1
+    want "$2 attn cache on S2" "$(grep -cF 'layers=6 kv=8 gqa=4 head_dim=64 max_seq=2048 cache=49152 KiB' $f)" 1
     want "$2 dspq[S2]: on" "$(grep -c '\[HTP\] dspq\[S2\]: on .* domain=' $f)" 1
     want "$2 token driver on, 22 rounds, 44 hops" "$(grep -c 'token driver: on s1_effdom=[0-9]* s2_effdom=[0-9]* mbox=65536 spin_us=[0-9]* rounds=22 hops/token=44 ' $f)" 1
     want "$2 close hops/token=44.00, no timeout / stale, ids agree" "$(grep -c 'token driver: close tokens=[0-9]* hops/token=44.00 .* timeouts=0/0 stale=0/0 .* id_mismatch=0 stop_err=0x0/0x0' $f)" 1
