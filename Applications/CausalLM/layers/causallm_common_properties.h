@@ -49,6 +49,37 @@ public:
   static constexpr const char *key = "moe_activation";
 };
 /**
+ * @brief MoE router type: how logits become the top-k set and its weights.
+ *  "sigmoid_bias" (default) is LFM2's: sigmoid scores, a per-expert bias
+ *  added for selection only, weights normalised over the top-k.
+ *  "softmax_scale" is Gemma-4's: softmax scores, top-k, weights normalised
+ *  to sum 1, then multiplied by a per-expert scale. The layer's one
+ *  [num_experts] weight is the bias for the first and the scale for the
+ *  second.
+ */
+class RouterType : public nntrainer::Property<std::string> {
+public:
+  RouterType(const std::string &value = "sigmoid_bias") :
+    nntrainer::Property<std::string>(value) {}
+  static constexpr const char *key = "router_type";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
+ * @brief Per-layer expert cache size C for the streamed (virtual) expert
+ *  path, doc 52/55. 0 keeps the experts resident. NNTR_MOE_CACHE_EXPERTS in
+ *  the environment overrides it, so one device can sweep C without a
+ *  config edit.
+ */
+class CacheExperts : public nntrainer::Property<unsigned int> {
+public:
+  CacheExperts(unsigned int value = 0) :
+    nntrainer::Property<unsigned int>(value) {}
+  static constexpr const char *key = "cache_experts";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
  * @brief NumExperts,  Number of experts property
  */
 class NumExperts : public nntrainer::PositiveIntegerProperty {
