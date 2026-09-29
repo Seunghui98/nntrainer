@@ -365,3 +365,37 @@ Reference (not this sitting): #141 Q (the dspq default, `R3CY10WM83Y`)
   `moe_layer_host_check` (the bypassed bytes equal the arena weights'
   bytes exactly, on the M>1 path and on 80 M=1 cells, all output
   byte-compared) and by `moe_opts_host_check` (the word and the echo mask).
+
+## Filled results (orchestrator, 2026-09-29 12:33–12:49 KST, `R3CY10WM83Y`)
+
+Device md5 = md5.txt for all 15 staged files (the only diff line is an extra
+`sitting.out` the orchestrator wrote into `$W` before the push — not an
+artifact). Banners: A `applied=0x303e1 … dma_bypass=0`, B `applied=0x703e1 …
+dma_bypass=1`; every log `dspq: on` once and `dspq: close calls=22·G
+served=22·G bad=0`. Thermal: 33.1 °C / 39.7 at start, 34.8 / 61.7 at the end.
+
+| G | A decode r1 / r2 | B decode r1 / r2 | A mean | B mean | B vs A | prefill A r1/r2 · B r1/r2 |
+|---|---|---|---|---|---|---|
+| 64 | 38.67 / 38.55 | 51.78 / 51.86 | 38.61 | **51.82** | **+34.2 %** | 512.5 / 502.0 · 518.2 / 500.5 |
+| 512 | 38.10 / 36.69 | 50.66 / 50.56 | 37.40 | **50.61** | **+35.3 %** | 501.5 / 422.4 · 425.2 / 421.7 |
+| 1024 | 36.69 / 35.65 | 47.56 / 47.15 | 36.17 | **47.36** | **+30.9 %** | 422.4 / 383.8 · 426.0 / 385.0 |
+
+Prefill follows the phone's temperature in both variants (mirrored pairs
+agree within ±1 % except the first cell); level-2 M>1 `dsp` 15127 → 14724
+µs/call (−2.7 %).
+
+**Profile (G=64, level 2).** M==1: `dsp` **726.0 → 417.5 µs/call (−42.5 %)**,
+transport 12.6 / 13.1 µs; ring `engine 31.5..33.4 → 56.3..57.9 GB/s`,
+`first expert ready at 123 → 77 µs`. M>1 ring `engine 16.9..26.7 →
+25.9..73.6 GB/s`.
+
+**Accuracy.** MoE dumps (G=64): `a2 files=2862 bit_identical=1`, **`b files=2862
+bit_identical=1`**; decode nll lines (G=512): A2 == A, **B == A**; text
+identical on **8/8 prompts** and in **6/6 tok/s cells**.
+
+**Per-op (G=512 r1, B vs A):** MoE wait 16.07 → **9.85 ms** (−6.22), token
+26.0 → **19.74 ms**; the CPU rows unchanged within noise.
+
+**Verdict:** bit-preserving, all gates pass; decode ≥ 50 tok/s at G 64 / 512
+on this unit for the first time. Making `NNTR_MOE_DMA_BYPASS=1` the default is
+the user's decision (rule 33).
