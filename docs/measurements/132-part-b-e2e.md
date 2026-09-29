@@ -1,8 +1,35 @@
 # Measurement 132 Part B E5: the two-session NPU end-to-end decode on silicon
 
-Branch `htp/132-partb-e3` @ `10bb91b7` (app set **e3**) and
-`dev/e2e-shadow-132` @ `d77a4bf2` (app set **sh**, never merged) —
-estimated device time: **≈ 90 min** (phone rebooted first).
+**Current set: set_e5b** — branch `htp/132-partb-e3` @ `54a30c7f` (app set
+**e3**) and `dev/e2e-shadow-132` @ `e91737a2` (app set **sh**, never merged),
+staged at `/local/mnt/workspace/htp_moe/132/set_e5b/` — estimated device
+time: **≈ 90 min** (phone rebooted first). set_e5 (below, `10bb91b7` /
+`d77a4bf2`) was read on 2026-09-30 06:13.
+
+## set_e5 as read (2026-09-30 06:13–06:39, R3CY10WM83Y after a reboot)
+
+* Every E / Ev run died at load, before decode: S2 opened (`s2_session=1
+  s2_effdom=7 open_ms=21.2 open_path=1 hmx=0 vtcm_kib=0`), its FC arena
+  placed (`attach_mib=383.6 chunks=2 mapped_mib=448 load_ms=788.6`), then
+  S1's MoE arena failed: `fastrpc_mmap(64 MiB) failed: err=1 … mapped=3584
+  MiB in 14 chunks` (3696 needed). No logcat was kept.
+* The rule, from this and the #178 probe: S1 mapped **before** S2 opened
+  reaches 3840 MiB and S2 then maps 3584 beside it (probe Q1, set2 / set3);
+  S1 mapping **after** S2 was opened and had mapped stops at 3584, exactly
+  where the probe's S2 stopped. Whichever session maps while the other is
+  open and mapped gets 14 × 256 MiB. The driver-side cause is not known.
+  Fix (`ba486d16`, `54a30c7f`): S2 opens and places its FC set after
+  `repack_weight` has mapped S1's arena; the banner gains `s1_arena_mib`
+  (3840 expected) and each E run keeps its logcat's fastrpc lines.
+* A: fine (A_first 43.5, A_G64 55.5 tok/s); every sanity after an E run
+  generated (no leak).
+* S (shadows, `NNTR_HTP_FORWARD=1`, `calls/token=95`): **every per-op record
+  equal** — FC 600/600, ADD 384/384, router 176/176, SwiGLU 16/16, argmax
+  9/9; norm tag0 392/392, q|k heads 1920/1920; attention heads 1536/1536
+  (48 records, 6 layers, 8 positions); logits 8/8 == S0; nll S0 / S == A.
+* The `graph: q4m1 … feed=vtcm` banner on S2 was wrong (S2 is L2-fed): fixed.
+* The dump check compared E's dump against all of A's calls; set_e5b
+  compares A's first N calls (N = E's prefill calls).
 
 ## Why
 
@@ -19,7 +46,16 @@ build with nothing set.
 
 ## Artifacts (workstation, SDK 6.4.0.1, HexKL 6.4.0.1, NDK r30, v79)
 
-Staged at `/local/mnt/workspace/htp_moe/132/set_e5/` (`md5.txt` beside it).
+set_e5b at `/local/mnt/workspace/htp_moe/132/set_e5b/` (`md5.txt` beside it):
+e3 `nntrainer_causallm` `24fb37f84d5ac51ad084ff5ec891c920`, `libcausallm_core.so`
+`0429142211308ca47bdcd98c839aff67`, `libnntrainer.so` `f180cd9c0c3247af488cabaf8f98bbd5`,
+`libccapi-nntrainer.so` `8fb6c3598757b0127c02f49f51752c8b`; sh `nntrainer_causallm`
+`dfab27bd92d233d9fa2ef216ca9b7862`, `libcausallm_core.so` `e8e61c3146f85504fdbc1e316d0e0e57`,
+`libnntrainer.so` `128b283e95ed3a3432056cea3797e12a`, `libccapi-nntrainer.so`
+`eaf54d283563597dafb1ab125d590356`; the skel, gtests, libraries, prompts and
+tools are set_e5's files (no DSP source changed since `10bb91b7`; a rebuild of
+the same sources gives a byte-different skel, so set_e5's device-proven one is
+kept). The set_e5 table below is kept for reference.
 
 | file | md5 | built with |
 |---|---|---|
@@ -53,7 +89,7 @@ builds the app against the installed headers).
 
 1. **Reboot the phone** and let it settle (#178: a leaked cDSP mapping
    survives processes; only a reboot clears it).
-2. `bash /local/mnt/workspace/htp_moe/132/set_e5/run_e5.sh R3CY10WM83Y`
+2. `bash /local/mnt/workspace/htp_moe/132/set_e5b/run_e5.sh R3CY10WM83Y`
    (≈ 90 min; the copy on the branch is `docs/measurements/132-part-b-e2e-run.sh`).
    It checks the set's md5 on both ends, sets `do_sample false`,
    `bad_word_ids [124900]`, `moe_engine htp` (the #170 S4 config), waits for
@@ -87,7 +123,7 @@ an A run after E that does not generate (`LEAK`).
   `graph: init`.
 * **E** (and Ev), each once:
   `[HTP] s2: open s1_effdom=3 s2_session=<n> s2_effdom=<d> open_ms=<ms> info_rc=0x0 open_path=1 hmx=0 vtcm_kib=0 …`;
-  `[HTP] s2: fc arena weights=67 handles=74 attach_mib=<≈383> chunks=2 mapped_mib=<384 or 448: 256 MiB + what is left> feed=l2 load_ms=<ms>`;
+  `[HTP] s2: fc arena weights=67 handles=74 attach_mib=<≈383> chunks=2 mapped_mib=<384 or 448: 256 MiB + what is left> feed=l2 load_ms=<ms> s1_arena_mib=3840`; `[HTP] graph: q4m1 weights=67 handles=74 feed=l2`;
   `[HTP] graph: init n_ops=228 resident=RMSNORM|FC|CONV1D_GATE|QK_NORM|ROPE|ATTN_M1|ADD|ROUTER_TOPK|MOE|DENSE_FFN|LM_HEAD moe_ops=22`;
   `… max_seq=2048 cache=24576 KiB`; `[HTP] dspq: on …`, `[HTP] dspq[S2]: on … domain=<d>`;
   `[HTP] token driver: on s1_effdom=3 s2_effdom=<d> mbox=65536 spin_us=1000 rounds=22 hops/token=44 …`;

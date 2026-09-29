@@ -19,12 +19,15 @@
 # Every E run opens and tears down a second session, so each is followed
 # by an A run that must register its arena and generate (the #178 rule);
 # a missing generation line prints LEAK and stops.
-# Usage: bash /local/mnt/workspace/htp_moe/132/set_e5/run_e5.sh [serial]  (~90 min)
+# set_e5b (after set_e5, 06:13): S2 now opens after S1's MoE arena is
+# mapped (set_e5's E runs died at S1 3584 MiB with S2 opened and mapped
+# first); each E / Ev run keeps its logcat's fastrpc lines ($L/<log>.logcat).
+# Usage: bash /local/mnt/workspace/htp_moe/132/set_e5b/run_e5.sh [serial]  (~90 min)
 # Everything is logged to $L, the summary to $L/sitting.out.
 set -u -o pipefail
 WT=/home/j2z0-lee/nntrainer-132e3           # env.sh only
 S=${1:-R3CY10WM83Y}
-W=/local/mnt/workspace/htp_moe/132/set_e5; L=$W/logs; mkdir -p $L $W/shadow $W/dumps
+W=/local/mnt/workspace/htp_moe/132/set_e5b; L=$W/logs; mkdir -p $L $W/shadow $W/dumps
 C=/data/local/tmp/nntrainer/causallm; DE=$C/s132e5; DS=$C/s132e5s; M=../models/q40-qs4cx-wh
 cd $WT && { set +u; source tools/htp/env.sh > /dev/null 2>&1; set -u; }
 exec > >(tee -a $L/sitting.out) 2>&1
@@ -46,6 +49,7 @@ env_of() { case $1 in
 esac; }
 run() { # run <variant> <G> <log name> <prompt file> [extra env ...]
   local v=$1 g=$2 log=$3 p=$4 d; d=$(dir_of $1); shift 4
+  case $v in E|Ev) adb -s $S logcat -c;; esac
   adb -s $S shell "cd $d && \
     sed -i 's/\"num_to_generate\": [0-9]*/\"num_to_generate\": $g/' $M/nntr_config.json && \
     grep num_to_generate $M/nntr_config.json && md5sum libnntr_hvx_skel.so && \
@@ -53,12 +57,15 @@ run() { # run <variant> <G> <log name> <prompt file> [extra env ...]
     ./nntrainer_causallm $M \"\$(cat $p)\"" > $L/$log.log 2>&1
   stale $L/$log.log
   echo "$log: $(grep -h -E '^(prefill|generation):' $L/$log.log | grep -o '[0-9.]* TPS' | tr '\n' ' ')$(grep -h -o 'calls/token=[0-9.]*' $L/$log.log) $(grep -h -o '\[PPL\] decode tokens=.*' $L/$log.log | cut -c1-90)"
-  case $v in E|Ev) e2e_checks $log;; esac
+  case $v in E|Ev)
+    adb -s $S logcat -d | grep -iE 'adsprpc|fastrpc|apps_mem|remote_mmap|mmap|nntr_hvx|HAP_' > $L/$log.logcat || true
+    e2e_checks $log;; esac
 }
 e2e_checks() { # the stop rules of plan step E5 on one E / Ev log
   local f=$L/$1.log ms
   grep -q 'token driver: token .* failed' $f && stop "$1: $(grep -m1 -o 'token driver: token .* failed[^(]*' $f) (AEE_EEXPIRED = a hop timed out; the FARF names the side)"
   grep -q 's2: open FAILED' $f && stop "$1: $(grep -m1 's2: open FAILED' $f)"
+  grep -q 'FATAL' $f && stop "$1: $(grep -m1 'FATAL' $f | cut -c1-240) (logcat: $L/$1.logcat)"
   ms=$(grep -m1 -o 'open_ms=[0-9.]*' $f | cut -d= -f2)
   [ -n "$ms" ] && awk -v m="$ms" 'BEGIN{exit !(m > 2000)}' && stop "$1: s2 open_ms=$ms > 2000"
   true; }
@@ -75,7 +82,8 @@ vbanner() { # vbanner <variant> <log>: the variant's banners, else the log is vo
     want "$2 no s2 / graph" "$(grep -c 's2: open\|graph: init' $f)" 0;;
   E|Ev)
     want "$2 s2 open lite, 0 KiB VTCM" "$(grep -c 's2: open s1_effdom=[0-9]* s2_session=[0-9]* s2_effdom=[0-9]* open_ms=[0-9.]* info_rc=0x0 open_path=1 hmx=0 vtcm_kib=0 ' $f)" 1
-    want "$2 s2 fc arena 67 weights, 74 handles, feed=l2" "$(grep -c 's2: fc arena weights=67 handles=74 attach_mib=[0-9.]* chunks=[0-9]* mapped_mib=[0-9]* feed=l2 load_ms=' $f)" 1
+    want "$2 s2 fc arena 67 weights, 74 handles, feed=l2" "$(grep -c 's2: fc arena weights=67 handles=74 attach_mib=[0-9.]* chunks=[0-9]* mapped_mib=[0-9]* feed=l2 load_ms=[0-9.]* s1_arena_mib=3840$' $f)" 1
+    want "$2 q4m1 banner feed=l2" "$(grep -c 'graph: q4m1 weights=67 handles=74 feed=l2$' $f)" 1
     want "$2 graph init all kinds" "$(grep -cF 'graph: init n_ops=228 resident=RMSNORM|FC|CONV1D_GATE|QK_NORM|ROPE|ATTN_M1|ADD|ROUTER_TOPK|MOE|DENSE_FFN|LM_HEAD moe_ops=22' $f)" 1
     want "$2 attn cache on S2" "$(grep -cF 'max_seq=2048 cache=24576 KiB' $f)" 1
     want "$2 dspq[S2]: on" "$(grep -c '\[HTP\] dspq\[S2\]: on .* domain=' $f)" 1
@@ -144,7 +152,11 @@ done
 sanity sanity_dump
 # E's dump holds the prefill MoE calls only (the decode MoE runs inside S1
 # with no ARM call): E is the reference, so A's same calls are compared
-python3 $W/tools/htp_dump_eval.py --label moe-dump-E==A $W/dumps/d_E $W/dumps/d_A | tail -1 | tee $L/dump_eval.txt
+n=$(wc -l < $W/dumps/d_E/manifest.txt)
+rm -rf $W/dumps/d_A_pre && mkdir -p $W/dumps/d_A_pre && head -n $n $W/dumps/d_A/manifest.txt > $W/dumps/d_A_pre/manifest.txt
+for c in $(awk '{print $1}' $W/dumps/d_A_pre/manifest.txt); do cp $W/dumps/d_A/${c}_in.f32 $W/dumps/d_A/${c}_out.f32 $W/dumps/d_A_pre/; done
+want "E's dump = A's prefill calls ($n)" "$(cmp -s <(cut -d' ' -f2- $W/dumps/d_E/manifest.txt) <(cut -d' ' -f2- $W/dumps/d_A_pre/manifest.txt) && echo y || echo n)" y
+python3 $W/tools/htp_dump_eval.py --label moe-dump-E==A $W/dumps/d_E $W/dumps/d_A_pre | tail -1 | tee $L/dump_eval.txt
 want "MoE dumps E == A (prefill calls)" "$(grep -c 'bit_identical=1' $L/dump_eval.txt)" 1
 echo "startup_ms (e2e time - run total): A $(startup $L/dump_A.log)  E $(startup $L/dump_E.log)  | E $(grep -h -o 'open_ms=[0-9.]*' $L/dump_E.log) $(grep -h -o 'attach_mib=[0-9.]*' $L/dump_E.log) $(grep -h -o 'load_ms=[0-9.]*' $L/dump_E.log)" | tee $L/startup.txt
 therm t3
