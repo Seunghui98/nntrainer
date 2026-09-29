@@ -75,6 +75,7 @@ mkdir -p generated build
     -mdll -o generated nntr_hvx.idl
 
 SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c nntr_hvx_small_ops.c nntr_hvx_attn_m1.c nntr_hvx_dspq_bench.c nntr_hvx_dspq.c generated/nntr_hvx_skel.c"
+SRCS="$SRCS nntr_hvx_attn_m1_probe.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4_moe.c $BACKEND/hmx/hexkl_graph.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_conv_block.c"

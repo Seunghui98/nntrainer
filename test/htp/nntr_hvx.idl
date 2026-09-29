@@ -643,4 +643,17 @@ interface nntr_hvx : remote_handle64 {
    // Stops the thread and closes the queue.
    // res: [packets served, bad packets, empty polls, spin_us]
    AEEResult dspq_stop(rout sequence<uint32> res);
+
+   // [#170] DEBUG ONLY (no model path calls it): hvx_attn_m1_hf.h's
+   // fp16-lane primitives on silicon, and the cost of the kernel shapes
+   // plan 170 designs (test/htp/nntr_hvx_attn_m1_probe.c). op < 16: y[i] =
+   // f(a[i], b[i], c[i]) over n lanes (a, b, c, y all n long, n a multiple
+   // of 64), one thread. op >= 16: a kernel-shaped loop on lanes pool lanes,
+   // reps timed pool runs; a, b, c, y empty. Op codes and the prof words:
+   // test/htp/nntr_attn_m1_probe.h. A bad op, length, lane or rep count is
+   // AEE_EINVALIDFORMAT; never AEE_EBADPARM.
+   AEEResult attn_m1_probe(in uint32 op, in uint32 lanes, in uint32 reps,
+                           in sequence<uint16> a, in sequence<uint16> b,
+                           in sequence<uint16> c, rout sequence<uint16> y,
+                           rout sequence<uint32> prof);
 };
