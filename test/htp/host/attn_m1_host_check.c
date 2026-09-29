@@ -773,6 +773,36 @@ static void check_hf_prim(void) {
         "hvx_hf_store_sf differs from the fp16 value (%u of %u)", bad_wid,
         n_wid);
 
+  /* P1's q operand (#170 round 3): for random rows (a quarter of the
+     values +-0 or under 2^-14, so signed zeros and subnormals are in), the
+     vlut16 pair of every even d of the zipped row == Q6_Vh_vsplat_R of the
+     fp16 bits of rne16(x[d]) (lo) and of x[d + 1] (hi) in all 64 lanes. */
+  uint32_t n_spl = 0, bad_spl = 0;
+  for (uint32_t it = 0; it < 4000u; ++it) {
+    float x[64];
+    for (uint32_t i = 0; i < 64u; ++i) {
+      const uint32_t k = amc_next(&r) & 7u;
+      x[i] = k == 0u   ? (amc_next(&r) & 1u ? -0.0f : 0.0f)
+             : k == 1u ? amc_frand(&r, -1e-5f, 1e-5f)
+                       : amc_frand(&r, -8.0f, 8.0f);
+    }
+    const HVX_Vector row = hvx_hf_round_row_lut(x);
+    for (uint32_t d = 0; d < 64u; d += 2u) {
+      const HVX_VectorPair y = hvx_hf_splat2_lut(
+        Q6_Vh_vsplat_R((int)(d | (d + 1u) << 8)), row, (int)(d >> 4));
+      const HVX_Vector w0 = Q6_Vh_vsplat_R(hvx_hf_bits_rne(x[d]));
+      const HVX_Vector w1 = Q6_Vh_vsplat_R(hvx_hf_bits_rne(x[d + 1u]));
+      const HVX_Vector y0 = Q6_V_lo_W(y), y1 = Q6_V_hi_W(y);
+      bad_spl += memcmp(&y0, &w0, sizeof(w0)) != 0;
+      bad_spl += memcmp(&y1, &w1, sizeof(w1)) != 0;
+      n_spl += 2u;
+    }
+  }
+  printf("ATTN M1 HF PRIM vlut16 splat of the zipped q row: %u rows x d, "
+         "bad=%u\n",
+         n_spl, bad_spl);
+  CHECK(bad_spl == 0u, "the vlut16 q splat differs from vsplat(q[d])");
+
   /* The score tree on random fp16 accumulators. */
   uint32_t bad_tree = 0;
   for (uint32_t it = 0; it < 4000u; ++it) {
@@ -803,9 +833,38 @@ static void check_hf_prim(void) {
     }
   }
 
-  /* exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF. */
-  uint32_t n_exp = 0, bad_exp = 0;
+  /* exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF; since round 3
+     also the kernel's lookup there: hvx_hf_exp16_idx == the spec's index
+     and the fp16 table at it == exp16's bits (-inf included: 0xFC00). */
+  uint32_t n_exp = 0, bad_exp = 0, n_idx = 0, bad_idx = 0, bad_tab = 0;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  uint16_t *tab_h = malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
+  float *tab_f = malloc(ATTN_M1_DET_EXP_N * sizeof(float));
+  hvx_hf_exp16_fill(tab_h, tab_f);
+  for (uint32_t base = 0x7FFFu; base <= 0xFC00u; base += 64u) {
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < 64u; ++i) {
+      const uint32_t x = base + i;
+      a[i] = x == 0x7FFFu ? 0u : x <= 0xFC00u ? (uint16_t)x : 0x8000u;
+      live += x <= 0xFC00u;
+    }
+    const HVX_Vector ix = hvx_hf_exp16_idx(hf_load(a));
+    for (uint32_t i = 0; i < live; ++i) {
+      const float d = amc_h2f(a[i]);
+      const uint16_t got = hvx_emu_h(&ix, (int)i);
+      bad_idx += got != attn_m1_det_exp_index(d);
+      bad_tab +=
+        got >= ATTN_M1_DET_EXP_N || tab_h[got] != amc_f2h(attn_m1_det_exp16(d));
+      ++n_idx;
+    }
+  }
+  free(tab_f);
+  free(tab_h);
+  printf("ATTN M1 HF PRIM exp16 lookup at every fp16 d <= 0 (%u): vector "
+         "index bad=%u, tab[index] != exp16 bad=%u\n",
+         n_idx, bad_idx, bad_tab);
+  CHECK(n_idx == 31746u, "the exp16 lookup swept %u values", n_idx);
+  CHECK(bad_idx + bad_tab == 0u, "the exp16 lookup differs from the spec");
   for (uint32_t base = 0x7FFFu; base < 0xFC00u; base += 64u) {
     uint32_t live = 0;
     for (uint32_t i = 0; i < 64u; ++i) {
@@ -849,7 +908,7 @@ static void check_hf_prim(void) {
   CHECK(bad_tree + bad_exp + bad_div == 0u,
         "the hf tree, exp16 or divide differs from the spec");
   if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div + bad_cvt +
-          bad_vcvt + bad_wid ==
+          bad_vcvt + bad_wid + bad_idx + bad_tab + bad_spl ==
         0u &&
       bad_op[0] + bad_op[1] + bad_op[2] + bad_op[3] + bad_op[4] + bad_op[5] ==
         0u &&
@@ -895,8 +954,9 @@ static int g_prof_fail = 0;
  *        and the same row) with the words requested must give the same out
  *        and stats bytes, every pcycle word must have been taken (the host
  *        stub's counter is monotonic, so a bracket that ran reads > 0),
- *        LANES must be min(units, workers + 1) and POOL >= BUSY_MAX. The
- *        qtimer stub reads 0, so CALL_QT is a device-only word.
+ *        LANES must be min(units, workers + 1), POOL >= BUSY_MAX and
+ *        (#170 round 3) SOFTMAX >= EXP + ET + MAX + SUM + DIV. The qtimer
+ *        stub reads 0, so CALL_QT is a device-only word.
  * @return the number of failed conditions
  */
 static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
@@ -918,14 +978,20 @@ static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
   bad += count_bad(out, out_ref, (size_t)N_Q * HD) != 0u;
   bad += count_bad(stats, stats_ref, 2u * N_Q) != 0u;
   bad += w[ATTN_M1_PROF_LANES] != lanes;
-  static const uint32_t taken[] = {ATTN_M1_PROF_APPEND,   ATTN_M1_PROF_POOL,
-                                   ATTN_M1_PROF_SCORES,   ATTN_M1_PROF_SOFTMAX,
-                                   ATTN_M1_PROF_PV,       ATTN_M1_PROF_BUSY_MAX,
-                                   ATTN_M1_PROF_START_MAX};
+  static const uint32_t taken[] = {
+    ATTN_M1_PROF_APPEND,    ATTN_M1_PROF_POOL, ATTN_M1_PROF_SCORES,
+    ATTN_M1_PROF_SOFTMAX,   ATTN_M1_PROF_PV,   ATTN_M1_PROF_BUSY_MAX,
+    ATTN_M1_PROF_START_MAX, ATTN_M1_PROF_EXP,  ATTN_M1_PROF_ET,
+    ATTN_M1_PROF_MAX,       ATTN_M1_PROF_SUM,  ATTN_M1_PROF_DIV};
   for (size_t i = 0; i < sizeof(taken) / sizeof(taken[0]); ++i) {
     bad += w[taken[i]] == 0u;
   }
   bad += w[ATTN_M1_PROF_POOL] < w[ATTN_M1_PROF_BUSY_MAX];
+  /* round 3's split: SOFTMAX holds its five pieces (the brackets nest in
+     SOFTMAX's, and the counter only grows) */
+  bad += (uint64_t)w[ATTN_M1_PROF_SOFTMAX] <
+         (uint64_t)w[ATTN_M1_PROF_EXP] + w[ATTN_M1_PROF_ET] +
+           w[ATTN_M1_PROF_MAX] + w[ATTN_M1_PROF_SUM] + w[ATTN_M1_PROF_DIV];
   if (bad) {
     printf("  phase words L=%u workers=%u rc=%d:", L, workers, rc);
     for (uint32_t i = 0; i < ATTN_M1_PROF_WORDS; ++i) {

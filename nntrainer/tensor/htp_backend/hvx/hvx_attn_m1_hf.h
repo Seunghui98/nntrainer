@@ -48,6 +48,17 @@
  *                   plus exact f32 steps, so the sign of a zero and the
  *                   subnormals come through (no qf32 conversion on the
  *                   result; qf32 has no -0).
+ *   hvx_hf_round_row_lut / hvx_hf_splat_lut  (#170 round 3) P1's q
+ *                   operand without 64 stored splat vectors per head: the
+ *                   rounded row stored zipped (vshuffe for vpacke), q[d]
+ *                   and q[d + 1] splatted from it by one vlut16 -- a
+ *                   permute, no memory, no scalar -> vector transfer.
+ *   hvx_hf_exp16_fill / hvx_hf_exp16_idx  (#170 round 3) exp16 as a lookup:
+ *                   attn_m1_det_exp_table's values as fp16 bits, and the
+ *                   spec's attn_m1_det_exp_index as three integer ops on
+ *                   the hf lanes. The kernel gathers tab[idx(d)] with
+ *                   scalar loads; the host check proves tab[idx(d)] is
+ *                   exp16(d) bit for bit at every fp16 d <= 0.
  *
  * Widening and narrowing values already on the fp16 grid are exact both
  * ways. The host emulation (test/htp/host/hvx_emu) checks all of this
@@ -226,6 +237,29 @@ static inline HVX_Vector hvx_hf_exp16(HVX_Vector d, HVX_Vector one) {
                                         hvx_hf_exp16_sf(Q6_V_lo_W(w))));
 }
 
+/** @brief Fills ATTN_M1_DET_EXP_N fp16 bits of attn_m1_det_exp_table (the
+ *         entries are fp16 values, so the rounding is exact); @a tmp holds
+ *         ATTN_M1_DET_EXP_N floats. */
+static inline void hvx_hf_exp16_fill(uint16_t *tab, float *tmp) {
+  attn_m1_det_exp_table(tmp);
+  for (uint32_t i = 0; i < ATTN_M1_DET_EXP_N; ++i) {
+    tab[i] = hvx_hf_bits_rne(tmp[i]);
+  }
+}
+
+/**
+ * @brief attn_m1_det_exp_index on 64 hf lanes d <= 0. For a normal fp16
+ *        magnitude m (bits >= 0x400) the spec's (f32 bits >> 13) - BIAS is
+ *        m + 0x1C000 - 0x1C3FF = m - 1023; a zero or subnormal saturates to
+ *        0 (exp16 = 1), anything from 17.5 on clamps to LAST + 1 (0.0).
+ *        The sign bit is dropped (the domain is d <= 0, -0 gives 0).
+ */
+static inline HVX_Vector hvx_hf_exp16_idx(HVX_Vector d) {
+  const HVX_Vector mag = Q6_V_vand_VV(d, Q6_Vh_vsplat_R(0x7FFF));
+  return Q6_Vuh_vmin_VuhVuh(Q6_Vuh_vsub_VuhVuh_sat(mag, Q6_Vh_vsplat_R(1023)),
+                            Q6_Vh_vsplat_R((int)(ATTN_M1_DET_EXP_N - 1u)));
+}
+
 /**
  * @brief rne16(e / l) on 64 hf lanes, e >= 0 and l in [1, 2048] fp16 (the
  *        softmax's domain, hvx_div16_sf's comment): @a l the divisor
@@ -278,6 +312,33 @@ static inline HVX_Vector hvx_hf_bits_rne_w(HVX_Vector x) {
 static inline HVX_Vector hvx_hf_round_row(const float *x) {
   return Q6_Vh_vpacke_VwVw(hvx_hf_bits_rne_w(*(const HVX_UVector *)(x + 32)),
                            hvx_hf_bits_rne_w(*(const HVX_UVector *)x));
+}
+
+/**
+ * @brief hvx_hf_round_row's 64 fp16 lanes in vlut16's order: halfword
+ *        2 (d & 31) + (d >> 5) holds lane d. vshuffe of the two word
+ *        vectors is that zip (Vv's low halfwords to the even lanes, Vu's
+ *        to the odd), where vpacke would lay them end to end.
+ */
+static inline HVX_Vector hvx_hf_round_row_lut(const float *x) {
+  return Q6_Vh_vshuffe_VhVh(hvx_hf_bits_rne_w(*(const HVX_UVector *)(x + 32)),
+                            hvx_hf_bits_rne_w(*(const HVX_UVector *)x));
+}
+
+/**
+ * @brief Lanes d and d + 1 (d even) of a zipped row (hvx_hf_round_row_lut),
+ *        each in all 64 lanes of one half of the pair: @a idx holds byte d
+ *        in its even bytes and d + 1 in its odd ones, @a rt = d >> 4.
+ *        vlut16 in 128-byte mode reads, for index byte i, halfword 2 (i &
+ *        15) + 32 (Rt & 1) + ((Rt >> 1) & 1) of the row when i >> 4 == (Rt
+ *        & 15), else 0; output lane j of lo takes byte 2j, of hi byte 2j +
+ *        1 (hexagon-sim -mv79; hvx_emu is diffed against it). With i < 64
+ *        and Rt = i >> 4 that is halfword 2 (i & 31) + (i >> 5): lane i. So
+ *        one permute gives two splats (d and d + 1 share Rt for d even).
+ */
+static inline HVX_VectorPair hvx_hf_splat2_lut(HVX_Vector idx, HVX_Vector row,
+                                               int rt) {
+  return Q6_Wh_vlut16_VbVhR(idx, row, rt);
 }
 
 /**
