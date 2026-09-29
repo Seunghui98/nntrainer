@@ -217,3 +217,13 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 결과: §3, §4, §5.
 - 판정: C ≥ 5면 기존 층 콜 구조 그대로 된다. 새로 만들어야 하는 커널 작업은 GeGLU 에필로그(R1) 하나다. 성능은 flash 대역폭이 지배할 것으로 예상된다(R6, §4.1).
 - 다음: 메모리 예산 결정 → Phase 1.
+
+### 10.2 Phase 1 코드 (2026-09-29): 호스트 검사 통과, 기기·실제 체크포인트 미측정
+
+커밋 4개 (`claude/epic-hopper-occf31`): 11fefbb 층 `router_type`·router 입력·`cache_experts` → 1cffe5e Gemma4 MoE 블록·K==V·per-layer input 선택 → 228a026 변환기 → f714503 양자화기.
+
+- 호스트 x86 빌드(`meson build -Denable-transformer=true`, 이 환경에서 처음 빌드): `unittest_causallm_models` **85/85**, `run_host_checks.sh` 3/3.
+- 새 테스트 `unittest_causallm_gemma4_moe`(26B config 형상의 tiny 모델): 스케일 0이면 logits가 dense와 같음(softmax_scale 경로), 그리고 **가중치 저장 순서**를 컴파일된 그래프에서 읽어 변환기·양자화기 순서와 대조. 실제 순서는 생성 순서와 달랐다: `post_ffn_norm_1, pre_ffn_norm_2, router_norm, sparse_moe, post_ffn_norm_2` (router_norm이 pre_ffn_norm_2 뒤). 변환기·양자화기를 이 순서로 맞췄다.
+- 미확인: 실제 체크포인트 변환(HF 접근 불가), 양자화기 dry-run 바이트 수, ppl. 기대 FP32 `.bin` 크기 = 25,233,141,790 파라미터 × 4 + tied lm head 재기록 = **103,885,357,176 B (103.9 GB)**; 양자화기는 뒤의 embedding 중복을 버린다.
+- 다음: 사용자 PC에서 변환 → Q4_0 양자화 → x86 ppl (가이드는 세션 대화 기록).
+
