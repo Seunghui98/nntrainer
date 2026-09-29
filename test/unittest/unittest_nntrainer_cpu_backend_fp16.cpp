@@ -1036,8 +1036,9 @@ TEST(AttnM1F16Det, RopeMatchesNeonFp16) {
  *        softmax_row_inplace, compute_fp16vcache_transposed), against
  *        m1_rope64_det + attn_m1_det.h, bit for bit, at L = 1 .. 1024 with
  *        attn_m1_cases.h's rows (the fused-FMA midpoint cases). Each L runs
- *        twice: RoPE at position 0 (the identity, so the adversarial q
- *        heads survive it) and at position L - 1.
+ *        twice: RoPE at position 0 (the identity, so the adversarial rows
+ *        survive it; the case counts are printed there only) and at
+ *        position L - 1.
  */
 TEST(AttnM1F16Det, AttentionMatchesNeonFp16) {
   const size_t row = (size_t)kF16Kv * kF16Hd, nq = (size_t)kF16Nq * kF16Hd;
@@ -1094,7 +1095,8 @@ TEST(AttnM1F16Det, AttentionMatchesNeonFp16) {
                           kF16Hd, L, L, 0.125f, e.data(), out.data(), nullptr);
       const int bad = f16_count_bad(o16, out, "attention out");
       std::cout << "ATTN_M1_F16 L=" << L << " rope_pos=" << pos
-                << " out bad=" << bad << " of " << nq << " pv_cases=" << planted
+                << " out bad=" << bad << " of " << nq
+                << " pv_cases=" << (pos == 0u ? planted : 0u)
                 << " score_cases=" << (pos == 0u && L > 3u ? 2u * (L - 3u) : 0u)
                 << std::endl;
       EXPECT_EQ(bad, 0) << "L=" << L << " rope_pos=" << pos;
