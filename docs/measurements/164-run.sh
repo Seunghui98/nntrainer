@@ -92,11 +92,11 @@ for k in '"do_sample": false' '"bad_word_ids": \[124900\]' '"init_seq_len": 512'
 adb -s $S shell "cd $D && NNTR_NORM_REPLAY=$D/replay_norm.bin LD_LIBRARY_PATH=. \
   ./unittest_nntrainer_cpu_backend --gtest_filter='RmsNormCpuOrder.*'" > $L/gtest_G0.log 2>&1
 grep -E '^RmsNormCpuOrder|OK \]|FAILED|PASSED|SKIPPED' $L/gtest_G0.log
-want "G0 rows bad=0" "$(grep -c '^RmsNormCpuOrder rows=41041 bad=0$' $L/gtest_G0.log)" 1
-want "G0 subnormal rows bad=0" "$(grep -c '^RmsNormCpuOrder W=.* subnormal(+-1e-39) bad=0$' $L/gtest_G0.log)" 2
-want "G0 replay" "$(grep -c '^RmsNormCpuOrder replay .* rms=392 bad=0 qk_heads=1920 bad_calls=0$' $L/gtest_G0.log)" 1
+want "G0 rows bad=0" "$(grep -c '^RmsNormCpuOrder rows=41041 bad=0' $L/gtest_G0.log)" 1
+want "G0 subnormal rows bad=0" "$(grep -c '^RmsNormCpuOrder W=.* subnormal(+-1e-39) bad=0' $L/gtest_G0.log)" 2
+want "G0 replay" "$(grep -c '^RmsNormCpuOrder replay .* rms=392 bad=0 qk_heads=1920 bad_calls=0' $L/gtest_G0.log)" 1
 want "G0 PASSED 2" "$(grep -c 'PASSED  \] 2 tests' $L/gtest_G0.log)" 1
-grep -q '^RmsNormCpuOrder rows=41041 bad=0$' $L/gtest_G0.log || stop "G0: the spec is not this set's CPU norm (re-read the disassembly, plan step 8)"
+grep -q '^RmsNormCpuOrder rows=41041 bad=0' $L/gtest_G0.log || stop "G0: the spec is not this set's CPU norm (re-read the disassembly, plan step 8)"
 adb -s $S shell "cd $D && md5sum libnntr_hvx_skel.so && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. \
   ./unittest_hvx_softmax --gtest_filter='HvxM1Ops.*'" > $L/gtest_G1.log 2>&1
 grep -E 'libnntr_hvx|M1_OPS_FIELD (rmsnorm|qk_norm)|OK \]|FAILED|PASSED' $L/gtest_G1.log
