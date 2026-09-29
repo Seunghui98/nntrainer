@@ -721,10 +721,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto op_prev = op_now();
 
   // [#132 Part B E3] the two-session decode returns only the token id
-  // unless something reads the logits: NNTR_PPL_DECODE, sampling, the
-  // bad-words penalty, a logits processor, a batch
-  htpDecodeWantLogits(ppl_dec || do_sample || NUM_BADWORDS != 0 ||
-                      logits_processor != nullptr || BATCH_SIZE != 1);
+  // unless something reads the logits (NNTR_PPL_DECODE, sampling, a logits
+  // processor, a batch); the NPU's pick skips the bad words as
+  // applyBadWordsPenalty does
+  htpDecodeWantLogits(ppl_dec || do_sample || logits_processor != nullptr ||
+                      BATCH_SIZE != 1);
+  htpDecodeBan(BAD_WORD_IDS.data(),
+               BAD_WORD_IDS.size() != 0 ? NUM_BADWORDS : 0u);
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
        !stop_requested_.load(std::memory_order_acquire);
@@ -840,6 +843,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   global_token_len += (generation_cnt + init_len);
 
   htpDecodeWantLogits(true); // [#132 Part B E3] back to the default
+  htpDecodeBan(nullptr, 0u);
   auto finish_generation = std::chrono::high_resolution_clock::now();
   auto generation_duration =
     std::chrono::duration_cast<std::chrono::milliseconds>(finish_generation -
