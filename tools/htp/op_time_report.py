@@ -20,7 +20,8 @@ with this log's ms/token minus the base log's.
 
 Exit 1 when the log has no step line, the node call counts disagree with
 the step token count, or the timed rows exceed the token time by more
-than 2 % (a double count).
+than 2 % (a double count). A one-token prefill (a one-token prompt)
+reads as a decode call to the timer and trips the first check.
 """
 import re
 import sys
@@ -34,7 +35,8 @@ ROUTER_BYTES = 2048 * 32 * 4
 
 KINDS = [
     "FC conv in_proj", "FC conv out_proj", "FC attn qkv (+q/k norm)",
-    "FC attn o", "FC dense FFN", "attention (mha_core)", "conv1d + gate",
+    "FC attn o", "FC dense FFN (+swiglu)", "conv block (fused)",
+    "attention (mha_core)", "conv1d + gate",
     "RMSNorm", "residual add", "MoE CPU part", "MoE wait", "lm_head",
     "embedding", "sampling", "register", "other", "unattributed",
 ]
@@ -50,8 +52,12 @@ def kind_of(name, typ):
         if name.endswith("_attention_out"):
             return "FC attn o"
         if re.search(r"_ffn_(up|gate|down)$", name) or "dense_ffn" in name:
-            return "FC dense FFN"
+            return "FC dense FFN (+swiglu)"
         return "other"
+    if typ in ("dense_ffn", "swiglu"):
+        return "FC dense FFN (+swiglu)"
+    if typ == "conv_block":
+        return "conv block (fused)"
     if typ == "qkv_layer":
         return "FC attn qkv (+q/k norm)"
     if typ == "mha_core":
@@ -60,7 +66,7 @@ def kind_of(name, typ):
         return "conv1d + gate"
     if typ == "rms_norm":
         return "RMSNorm"
-    if typ == "addition":
+    if typ in ("addition", "residual_add"):
         return "residual add"
     if typ in ("tie_word_embeddings", "embedding_layer", "lm_head"):
         return "embedding" if name.startswith("embedding") else "lm_head"
