@@ -77,6 +77,10 @@
 #   E2E dspq on-lines tiny/lfm25/hmx calls=<n> ok      (on once, close
 #                              calls=N served=N bad=0, N = M==1 MoE calls)
 #   E2E dspq off-path banner=1 bit_identical=1         (NNTR_INPROC_NO_DSPQ=1)
+# and, since #150, the decode timer NNTR_OP_TIME=1 on the run() path, after
+# its op_time_report.py table (plan 150-cpu-decode.md step 1a):
+#   E2E eval op-time ... bit_identical=1               (vs the unset self run)
+#   E2E op-time inert bit_identical=1 nll=identical unset_lines=0 table=ok
 # NNTR_INPROC_GOLDEN=update rewrites test/htp/host/golden/lfm2_moe_tiny,
 # lfm2_moe_tiny_hd64 and lfm2_moe_tiny_lfm25 from this run's switch-off
 # HTP dumps (deliberate, like reference_logits.json).
@@ -408,6 +412,24 @@ same=$(paste <(tr ' ' '\n' <<< "$htp_gen") <(tr ' ' '\n' <<< "$run_gen") |
   tail -n +3 | awk '$1==$2{n++} END{print n+0}')
 echo "E2E tokens run==adapter $same/$STEPS"
 [ "$same" = "$STEPS" ] || fail=1
+# [#150] NNTR_OP_TIME=1 is inert (same dumps and nll lines as the unset
+# self run above) and its log makes a table; the unset log has no line.
+echo "== [#150] run() path, NNTR_OP_TIME=1 against the unset self run"
+NNTR_OP_TIME=1 NNTR_PPL_DECODE="$OUT/t.ids" \
+  run_e2e run-optime "$OUT/htp" htp "$OUT/dump_gtime" "$OUT/gtime.log" --run > /dev/null
+t_eval="$($EVAL --label op-time "$OUT/dump_gself" "$OUT/dump_gtime" | tail -1 || true)"
+echo "$t_eval"
+unset_lines="$(grep -c '\[OP-TIME\]' "$OUT/gself.log" || true)"
+if python3 "$ROOT/tools/htp/op_time_report.py" "$OUT/gtime.log" > "$OUT/gtime.txt" &&
+  grep -q '^unattributed ' "$OUT/gtime.txt" && [ "$unset_lines" = 0 ] &&
+  [ "$(dec_steps "$OUT/gself.log")" = "$(dec_steps "$OUT/gtime.log")" ] &&
+  grep -q 'bit_identical=1' <<< "$t_eval"; then
+  cat "$OUT/gtime.txt"
+  echo "E2E op-time inert bit_identical=1 nll=identical unset_lines=0 table=ok"
+else
+  cat "$OUT/gtime.txt"
+  echo "E2E FAIL op-time (unset_lines=$unset_lines, $t_eval)"; fail=1
+fi
 echo "== [#134] index check: forced non-greedy continuation vs prefill NNTR_PPL (cpu)"
 echo "23 30 7 14 21 28 5 12" > "$OUT/idx.ids"
 NNTR_PPL_DECODE="$OUT/idx.ids" "$E2E" --model "$OUT/cpu" --tokenizer "$FIX/tokenizer.json" \
