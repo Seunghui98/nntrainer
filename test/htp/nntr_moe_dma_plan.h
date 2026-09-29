@@ -255,6 +255,17 @@ nntr_moe_dma_plan_m1(uint32_t K, uint32_t inter, uint32_t N_out,
  *  every push (#99), the #100 traced* cells keep the default. */
 #define NNTR_MOE_DMA_DST_PACKED 1u
 #define NNTR_MOE_DMA_DST_STRIDED 2u
+/** @brief [#158] The push's descriptor reads its DDR source with
+ *  src_bypass = 1 (around the DSP L2) instead of the ring's 0. */
+#define NNTR_MOE_DMA_SRC_BYPASS 4u
+/** @brief [#158] workers > 1: every worker issues its own slice of the
+ *  push's rows on its own queue (rows [i n / W, (i + 1) n / W)), instead
+ *  of one worker the whole push by push ordinal. Each VTCM byte keeps one
+ *  writer per push kind, so the last write lands in list order and
+ *  nntr_moe_dma_tag_sum holds unchanged. workers == 1 ignores it. */
+#define NNTR_MOE_DMA_SPLIT_ROWS 8u
+/** @brief Every flag bit the skel's dma_replay accepts. */
+#define NNTR_MOE_DMA_FLAGS_ALL 15u
 
 /** @brief Largest payload of one replay descriptor: a whole gate_up matrix
  *  (57344 x 64 = 3.5 MiB, cell f2) fits; the struct's row_size is 24 bits
@@ -688,6 +699,37 @@ static inline int nntr_two_reader_verdict(double gbs, double ref_gbs,
                hi = ref_gbs * (1.0 + NNTR_TWO_READER_REF_TOL);
   return checksum_ok && gbs > 0.0 && gbs <= NNTR_DDR_CEILING_GBS && gbs >= lo &&
          gbs <= hi;
+}
+
+/** ======================================================================
+ * [#158] DMA engine settings: the #90 ring cell (f2, fresh = 1) with
+ * src_bypass 0/1 and 1/2/4 queues. Shared by unittest_hvx_dma_probe
+ * (DmaSettings) and two_reader_host_check.
+ * ====================================================================== */
+
+/** @brief A setting must beat the single-queue, src_bypass = 0 anchor of
+ *  the same run by this much (and pass its tag) before the M=1 feed gets
+ *  a knob for it. */
+#define NNTR_DMA_SETTINGS_MIN_GAIN 0.10
+
+/**
+ * @brief nntr_two_reader_cell with NNTR_MOE_DMA_SRC_BYPASS on every push
+ *        when @a bypass, and NNTR_MOE_DMA_SPLIT_ROWS always (a no-op for
+ *        one queue; the queue count is dma_replay's workers argument).
+ * @return items written, 0 if @a max is too small.
+ */
+static inline uint32_t nntr_dma_settings_cell(uint32_t bypass,
+                                              nntr_moe_dma_item *out,
+                                              uint32_t max,
+                                              nntr_two_reader_spec *spec) {
+  const uint32_t n = nntr_two_reader_cell(out, max, spec);
+  for (uint32_t k = 0; k < n; ++k) {
+    if (out[k].op == NNTR_MOE_DMA_OP_PUSH) {
+      out[k].flags |=
+        NNTR_MOE_DMA_SPLIT_ROWS | (bypass ? NNTR_MOE_DMA_SRC_BYPASS : 0u);
+    }
+  }
+  return n;
 }
 
 /** @brief One layer's net of the prefetch: the bytes the re-read no longer

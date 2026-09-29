@@ -17,6 +17,10 @@
  * source pages (256 MiB arena: 168 MiB; 128 MiB: 23 regions), that res[12]
  * equals the tag simulator for 1, 20 and 500 calls and that call 500's
  * tag differs from call 499's (a transfer landing a call late is caught).
+ * [#158] The settings cells on the same entry: src_bypass 0/1 x 1/2/4
+ * queues (real host threads, row slices landing concurrently), each with
+ * every byte landed once, the bypass bit on exactly the bypass cells'
+ * bytes, the workers used, and res[12] equal to the unchanged simulator.
  * Then the pure functions: #77's 3265.6 and 85.4 GB/s are refused, 67.9
  * and 37.3 accepted, the ring verdict's +-20 % edge, the net per token.
  * The device's DMA timing, caches and contention are not modelled.
@@ -149,6 +153,38 @@ int main(void) {
       }
     }
     replay_stub_meter.pages = NULL;
+
+    /* [#158] 3 x 2 settings cells, 20 and 500 calls each. */
+    static nntr_moe_dma_item set_items[NNTR_MOE_DMA_PLAN_MAX];
+    for (uint32_t bypass = 0; mib == 256u && bypass < 2u; ++bypass) {
+      nntr_two_reader_spec sp;
+      const uint32_t ns =
+        nntr_dma_settings_cell(bypass, set_items, NNTR_MOE_DMA_PLAN_MAX, &sp);
+      serialize(set_items, ns);
+      for (uint32_t q = 1u; q <= 4u; q *= 2u) {
+        for (uint32_t c = 20u; c <= 500u; c += 480u) {
+          const uint32_t want = nntr_moe_dma_tag_sum(set_items, ns, c, sp.fresh,
+                                                     res[7], region, samples);
+          memset(s.vtcm_base, 0x5a, s.vtcm_size);
+          replay_stub_meter.bytes_landed = 0;
+          replay_stub_meter.bypass_bytes = 0;
+          err = nntr_hvx_dma_replay(h, 0, region, sched, (int)(8u * ns), q, 0,
+                                    0, sp.fresh, 0, c, res, 13);
+          const uint64_t landed = replay_stub_meter.bytes_landed;
+          if (ns != n || err != AEE_SUCCESS || res[12] != want || res[8] != q ||
+              landed != (uint64_t)res[2] * c || res[2] != 22020096u ||
+              replay_stub_meter.bypass_bytes != (bypass ? landed : 0u)) {
+            printf("FAIL settings bypass=%u queues=%u calls=%u: err=%d "
+                   "tag=%u want=%u used=%u landed=%llu bypass_bytes=%llu\n",
+                   bypass, q, c, err, res[12], want, res[8],
+                   (unsigned long long)landed,
+                   (unsigned long long)replay_stub_meter.bypass_bytes);
+            fail = 1;
+          }
+        }
+      }
+    }
+    serialize(items, n);
     free(pages);
     free(s.arenas[0].va);
   }
@@ -184,6 +220,8 @@ int main(void) {
   }
   printf("TWO READER CELL SOUND (bytes=%llu footprint=%llu MiB)\n",
          24ull * 22020096ull, (unsigned long long)(footprint_256 >> 20));
+  printf("DMA SETTINGS CELLS SOUND (src_bypass 0/1 x queues 1/2/4, tag = "
+         "simulator)\n");
   printf("TWO READER BOUNDS OK (%.1f INVALID, 85.4 INVALID, 67.9 valid, "
          "net=%.2f ms/token)\n",
          (double)b77 / us77 / 1e3, per_token);
