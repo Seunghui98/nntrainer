@@ -348,10 +348,26 @@ BIT-IDENTICAL`, `Q4 GEMV BIT-IDENTICAL`, `ATTN M1 BIT-IDENTICAL`), syntax
 check 0, `*Lfm2Moe*` 6 passed, `INPROC E2E PASS`, skel, app and gtest
 builds.
 
-### S4 results (fill in)
+### S4 results (2026-09-30 07:33-07:58 KST, `R3CY10WM83Y`; logs `/local/mnt/workspace/htp_moe/132/logs_s4/`; 1 expectation mismatch: the router gate)
 
 | cell | expected | got |
 |---|---|---|
-| G1 router 3 shapes | bad=0 | |
-| ROUTER_TOPK pcycles/op (htp_moe skel / this set) | ≤ 60 000 | |
-| 8 prompts nll / text S == A | 8/8, 8/8 | |
+| G1 router 3 shapes | bad=0 | bad=0 (`PASSED ] 1 test`) |
+| ROUTER_TOPK pcycles/op (htp_moe skel / this set) | ≤ 60 000 | **33 764 / 62 311** (S3 65 528): **gate missed by 4 %** |
+| 8 prompts nll / text S == A | 8/8, 8/8 | 8/8, 8/8 (32 logs) |
+
+**Verdict (orchestrator, 2026-09-30): accepted as Part A's result.** 62 311
+pcycles/op is ≈ 30 µs per call, ≈ 0.65 ms/token over 22 layers, inside the
+± 1 ms of the E2E budget's 0.5 ms. No further router round now; revisit
+only if the E2E budget needs it.
+
+**ISS against silicon.** The L1 prefetch took the ISS model of one 8-chain
+group from 47.7 k to 13.8 k pcycles (−60 % of the op), but silicon moved
+only −5 % (65 528 → 62 311). So the ISS's L1 miss on each weight row is
+not what bounds the loop on silicon. The profile words cannot say what
+does: they give one `pcyc/op` per op, with no split inside the router.
+Unmeasured candidates are the 4-lane pool fork / join, the serial sigmoid
+and pick tail, and the `sffma` chain latency. Measuring them would need
+stage timers inside the op. Beside it in the same profile, ATTN_M1 reads
+394 375 pcycles/op with this set against 2 451 682 with the base skel:
+#170's work, which came in with the rebase onto `4eab54ef`.
