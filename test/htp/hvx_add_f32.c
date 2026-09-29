@@ -21,6 +21,9 @@
 #include <hvx_hexagon_protos.h>
 #include <qurt.h>
 
+#include <HAP_compute_res.h>
+#include <HAP_vtcm_mgr.h>
+
 #include "hexkl_micro.h"
 #include "hvx_worker_pool.h"
 #include "nntr_hvx.h"
@@ -37,6 +40,59 @@
 /** Kept as an int-casted expression (not the unsigned LANES form used
     elsewhere) because n_vec/i in this file's loops are int. */
 #define LANES ((int)(VLEN / sizeof(float)))
+
+/** [#178] Not every image exports it; the lite open then takes no VTCM. */
+#pragma weak HAP_query_avail_VTCM
+
+/**
+ * @brief [#178] The lite open's VTCM: the largest block the resource manager
+ *        has left (HAP_query_avail_VTCM), acquired with no HMX and a 100 ms
+ *        timeout; none at all is allowed (vtcm_size 0, feeds that need VTCM
+ *        refuse). config_off = vtcm_size: there is no HMX config block.
+ */
+static void lite_vtcm(nntr_hvx_session *s) {
+  unsigned int avail = 0, max_page = 0, n_pages = 0;
+  s->open_path = 1;
+  s->vtcm_base = NULL;
+  s->vtcm_size = 0;
+  if (HAP_query_avail_VTCM &&
+      HAP_query_avail_VTCM(&avail, &max_page, &n_pages) == 0 && avail > 0) {
+    compute_res_attr_t attr;
+    if (HAP_compute_res_attr_init(&attr) == 0 &&
+        HAP_compute_res_attr_set_vtcm_param(&attr, avail, 0) == 0) {
+      s->vtcm_ctx = HAP_compute_res_acquire(&attr, 100000);
+      if (s->vtcm_ctx) {
+        s->vtcm_base = (uint8_t *)HAP_compute_res_attr_get_vtcm_ptr(&attr);
+        s->vtcm_size = s->vtcm_base ? (uint32_t)avail : 0u;
+      }
+    }
+  }
+  FARF(HIGH, "nntr_hvx_open: lite VTCM avail=%u max_page=%u got=%u ctx=%u",
+       avail, max_page, (unsigned)s->vtcm_size, (unsigned)s->vtcm_ctx);
+  s->config_off = s->vtcm_size;
+}
+
+int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  unsigned int avail = 0, max_page = 0, n_pages = 0;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (resLen != 7) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (HAP_query_avail_VTCM) {
+    (void)HAP_query_avail_VTCM(&avail, &max_page, &n_pages);
+  }
+  res[0] = (uint32)s->hmx_locked;
+  res[1] = s->vtcm_size;
+  res[2] = (uint32)(avail >> 10);
+  res[3] = (uint32)(max_page >> 10);
+  res[4] = 0u; /* heap: mem_probe_dsp_heap is the probe, not this */
+  res[5] = s->open_path;
+  res[6] = (uint32)((qurt_hvx_get_units() >> 8) & 0xFF);
+  return AEE_SUCCESS;
+}
 
 int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   (void)uri;
@@ -75,34 +131,36 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   (void)hmx_fp16_rate;
 #endif
   if (res != AEE_SUCCESS) {
-    FARF(ERROR, "nntr_hvx_open: hexkl_micro_hw_init failed: 0x%08x", res);
-    free(s);
-    return res;
-  }
-  // config_off depends only on vtcm_size (see hexkl_mm_u8i4_plan), so it is
-  // computed once here rather than at every mm_u8i4_layer call.
-  const uint32_t config_size = hexkl_micro_hmx_config_size();
-  if (s->vtcm_size < config_size) {
-    free(s);
-    return AEE_ENOMEMORY;
-  }
-  s->config_off =
-    (s->vtcm_size - config_size) & ~(HEXKL_HMX_CONFIG_ALIGNMENT - 1u);
+    /* [#178] a second session (its own PD) beside one that holds the HMX
+       and most of VTCM: open without HMX instead of failing */
+    FARF(HIGH, "nntr_hvx_open: hexkl_micro_hw_init 0x%08x: lite open", res);
+    lite_vtcm(s);
+  } else {
+    // config_off depends only on vtcm_size (see hexkl_mm_u8i4_plan), so it
+    // is computed once here rather than at every mm_u8i4_layer call.
+    const uint32_t config_size = hexkl_micro_hmx_config_size();
+    if (s->vtcm_size < config_size) {
+      free(s);
+      return AEE_ENOMEMORY;
+    }
+    s->config_off =
+      (s->vtcm_size - config_size) & ~(HEXKL_HMX_CONFIG_ALIGNMENT - 1u);
 
-  res = hexkl_micro_hmx_lock();
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "nntr_hvx_open: hexkl_micro_hmx_lock failed: 0x%08x", res);
-    free(s);
-    return res;
-  }
-  s->hmx_locked = 1;
-
-  res = hexkl_micro_hmx_setup_acc_read_int32(s->vtcm_base, s->config_off);
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "nntr_hvx_open: setup_acc_read_int32 failed: 0x%08x", res);
-    hexkl_micro_hmx_unlock();
-    free(s);
-    return res;
+    res = hexkl_micro_hmx_lock();
+    if (res != AEE_SUCCESS) {
+      /* [#178] keep hw_init's VTCM below config_off, no HMX entries */
+      FARF(HIGH, "nntr_hvx_open: hexkl_micro_hmx_lock 0x%08x: lite open", res);
+      s->open_path = 1;
+    } else {
+      s->hmx_locked = 1;
+      res = hexkl_micro_hmx_setup_acc_read_int32(s->vtcm_base, s->config_off);
+      if (res != AEE_SUCCESS) {
+        FARF(ERROR, "nntr_hvx_open: setup_acc_read_int32 failed: 0x%08x", res);
+        hexkl_micro_hmx_unlock();
+        free(s);
+        return res;
+      }
+    }
   }
 
   // Sized from the real HVX context count (bits 15:8, same decode
@@ -118,7 +176,12 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   s->quant_pool = hvx_worker_pool_create(n_hvx > 1 ? n_hvx - 1 : 0);
   if (!s->quant_pool) {
     FARF(ERROR, "nntr_hvx_open: hvx_worker_pool_create failed");
-    hexkl_micro_hmx_unlock();
+    if (s->hmx_locked) {
+      hexkl_micro_hmx_unlock();
+    }
+    if (s->vtcm_ctx) {
+      HAP_compute_res_release(s->vtcm_ctx);
+    }
     free(s);
     return AEE_ENOMEMORY;
   }
@@ -210,6 +273,10 @@ int nntr_hvx_close(remote_handle64 handle) {
   hvx_attn_m1_free(s->attn_m1);
   s->attn_m1 = NULL;
   hvx_worker_pool_destroy(s->quant_pool);
+  free(s->fc_l2);
+  if (s->vtcm_ctx) {
+    HAP_compute_res_release(s->vtcm_ctx);
+  }
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {
     res = hexkl_micro_hmx_unlock();
