@@ -1764,11 +1764,13 @@ public:
       const char *rows1_env = std::getenv("NNTR_MOE_HTP_GEMV_ROWS1");
       const char *feed_env = std::getenv("NNTR_MOE_HTP_GEMV_FEED");
       const uint32_t flags =
-        htp_moe_opts_flags(env, lead_env, rows1_env, feed_env);
+        htp_moe_opts_flags(env, lead_env, rows1_env, feed_env) |
+        htp_moe_opts_dma_bypass(std::getenv("NNTR_MOE_DMA_BYPASS"));
       const char *source = env != nullptr ? "env" : "default";
       uint32_t applied = 0;
       const int err = nntr_hvx_moe_set_opts(session, flags, &applied);
-      if ((flags & HTP_MOE_FLAG_M1_GEMV) == 0u && err != AEE_SUCCESS) {
+      if (htp_moe_opts_must_match(flags) == HTP_MOE_FLAG_M1_GEMV &&
+          err != AEE_SUCCESS) {
         // The opt-out was asked for, and a skel that predates moe_set_opts
         // runs the HMX loop, which is what "off" means: say so and go on.
         std::fprintf(stderr,
@@ -1777,11 +1779,11 @@ public:
                      static_cast<unsigned>(err), source);
         return;
       }
-      // Off: only bit 0 has to be echoed. The tune bits are always sent
-      // (htp_moe_opts_flags) but mean nothing on the HMX loop, so a skel
-      // that predates them must not fail an opt-out run.
-      const uint32_t must_match =
-        (flags & HTP_MOE_FLAG_M1_GEMV) != 0u ? ~0u : HTP_MOE_FLAG_M1_GEMV;
+      // Off: only bit 0 (and #158's bypass bit, if asked for) has to be
+      // echoed. The tune bits are always sent (htp_moe_opts_flags) but mean
+      // nothing on the HMX loop, so a skel that predates them must not fail
+      // an opt-out run.
+      const uint32_t must_match = htp_moe_opts_must_match(flags);
       if (err != AEE_SUCCESS || ((applied ^ flags) & must_match) != 0u) {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
@@ -1803,12 +1805,13 @@ public:
       std::fprintf(
         stderr,
         "[HTP] moe m1 gemv: %s (applied=0x%x) lead=%uKB rows1=%u "
-        "feed=%s source=%s\n",
+        "feed=%s dma_bypass=%u source=%s\n",
         (flags & HTP_MOE_FLAG_M1_GEMV) != 0u ? "on" : "off", applied,
         ((flags >> HTP_MOE_GEMV_LEAD_SHIFT) & HTP_MOE_GEMV_LEAD_BITS) *
           HTP_MOE_GEMV_LEAD_KB_UNIT,
         (flags & HTP_MOE_FLAG_GEMV_ROWS1) != 0u ? 1u : 0u,
-        htp_moe_opts_feed_name(flags), source);
+        htp_moe_opts_feed_name(flags),
+        (applied & HTP_MOE_FLAG_DMA_BYPASS) != 0u ? 1u : 0u, source);
     });
   }
 
