@@ -249,13 +249,12 @@ public:
     prefetch_reader_cpus_ |= reader_cpus;
   }
 
-  /** @brief One expert a reader thread read: how long, and whether it was
-   *  for the batch the layer asks for next (read at full width) or a later
-   *  one (doc 52 section 10.30). */
-  void addPrefetchRead(uint64_t read_us, bool next) {
+  /** @brief One expert a reader thread read, and how long it took (doc 52
+   *  section 10.30). */
+  void addPrefetchRead(uint64_t read_us) {
     std::lock_guard<std::mutex> lock(mutex_);
     prefetch_read_us_ += read_us;
-    ++(next ? prefetch_read_next_ : prefetch_read_ahead_);
+    ++prefetch_reads_;
   }
 
   void addInvoke(unsigned M, unsigned K, unsigned N, uint64_t host_us,
@@ -646,19 +645,15 @@ private:
                    100.0 * prefetch_done_on_entry_ / prefetch_n_,
                    cpus(prefetch_caller_cpus_).c_str(),
                    cpus(prefetch_reader_cpus_).c_str());
-      // [doc 52 section 10.30] How the readers spent their time: the
-      // per-expert read on a reader thread (page cache 0.5-1 ms, flash
-      // 4-5 ms), and how many experts were read for the next batch at full
-      // width against how many further ahead at the narrower width.
-      const uint64_t reads = prefetch_read_next_ + prefetch_read_ahead_;
-      if (reads != 0)
+      // [doc 52 section 10.30] The per-expert read on a reader thread: page
+      // cache 1.4 ms with 2 readers and 2.1 with 4 (they share the write
+      // bandwidth), flash several times that.
+      if (prefetch_reads_ != 0)
         std::fprintf(stderr,
                      "[HTP-PROFILE] expert prefetch readers: %.2f ms/expert on "
-                     "a reader, %llu experts read for the next batch (full "
-                     "width), %llu further ahead (ahead width)\n\n",
-                     ms(prefetch_read_us_) / reads,
-                     (unsigned long long)prefetch_read_next_,
-                     (unsigned long long)prefetch_read_ahead_);
+                     "a reader, %llu experts\n\n",
+                     ms(prefetch_read_us_) / prefetch_reads_,
+                     (unsigned long long)prefetch_reads_);
     }
   }
 
@@ -677,8 +672,7 @@ private:
   uint64_t miss_total_ = 0, miss_read_total_us_ = 0, miss_rpc_total_us_ = 0;
   uint64_t prefetch_n_ = 0, prefetch_wait_us_ = 0, prefetch_rpc_us_ = 0;
   uint64_t prefetch_done_on_entry_ = 0;
-  uint64_t prefetch_read_us_ = 0, prefetch_read_next_ = 0,
-           prefetch_read_ahead_ = 0;
+  uint64_t prefetch_read_us_ = 0, prefetch_reads_ = 0;
   uint32_t prefetch_caller_cpus_ = 0, prefetch_reader_cpus_ = 0;
   /** (K, N, M == 1, kind): kind 0 is every layer call, 1 the dense FFN
    *  through the MoE layer kernel (doc 51). */
@@ -1217,7 +1211,6 @@ public:
       batch = std::move(prefetch_batches_.front());
       prefetch_batches_.pop_front();
     }
-    prefetch_cv_.notify_all(); // the next batch is now the one to widen on
     const uint64_t t_wait = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(handle_mutex_);
     std::exception_ptr first;
@@ -2796,31 +2789,17 @@ private:
       });
   }
 
-  /** @brief Takes the oldest unread expert and reads it. An expert of the
-   *  oldest batch -- the one _end will ask for next -- is taken at once;
-   *  one of a later batch only while fewer than ahead_readers are busy
-   *  (PrefetchKnobs). */
   void prefetchReaderLoop() {
-    const size_t ahead = prefetchKnobs().ahead_readers;
     for (;;) {
       std::pair<PrefetchBatch *, size_t> job;
-      bool next = false;
       {
         std::unique_lock<std::mutex> lock(prefetch_mutex_);
-        prefetch_cv_.wait(lock, [this, ahead, &next] {
-          if (prefetch_stop_)
-            return true;
-          if (prefetch_jobs_.empty())
-            return false;
-          next =
-            prefetch_jobs_.front().first == prefetch_batches_.front().get();
-          return next || prefetch_active_ < ahead;
-        });
+        prefetch_cv_.wait(
+          lock, [this] { return prefetch_stop_ || !prefetch_jobs_.empty(); });
         if (prefetch_stop_)
           return;
         job = prefetch_jobs_.front();
         prefetch_jobs_.pop_front();
-        ++prefetch_active_;
       }
       prefetch_reader_cpus_.fetch_or(cpuBit());
       const uint64_t t0 = HtpProfile::nowUs();
@@ -2828,14 +2807,12 @@ private:
       st.rc = readExpert(st, /*use_pool=*/false);
       HtpProfile &profile = HtpProfile::global();
       if (profile.level() != 0)
-        profile.addPrefetchRead(HtpProfile::nowUs() - t0, next);
+        profile.addPrefetchRead(HtpProfile::nowUs() - t0);
       {
         std::lock_guard<std::mutex> lock(prefetch_mutex_);
-        --prefetch_active_;
         ++job.first->done;
       }
       prefetch_done_cv_.notify_all();
-      prefetch_cv_.notify_all(); // a reader held back by ahead may go
     }
   }
 
@@ -3408,7 +3385,6 @@ private:
   std::condition_variable prefetch_cv_, prefetch_done_cv_;
   std::deque<std::unique_ptr<PrefetchBatch>> prefetch_batches_;
   std::deque<std::pair<PrefetchBatch *, size_t>> prefetch_jobs_;
-  size_t prefetch_active_ = 0; /**< readers inside readExpert */
   bool prefetch_stop_ = false;
   std::vector<std::thread> prefetch_readers_;
   std::atomic<uint32_t> prefetch_reader_cpus_{0};
@@ -3421,20 +3397,11 @@ private:
    *        grows by 7 ms; section 10.19 traced that to the readers
    *        sharing the caller's core. Not defaults.
    *  - NNTR_MOE_PREFETCH_READERS=<n>: reader threads (4)
-   *  - NNTR_MOE_PREFETCH_AHEAD_READERS=<n>: how many of them may work on a
-   *    batch that is not the next one the layer will ask for (2). Doc 52
-   *    section 10.30: readers writing into the arena slow the layer call
-   *    that runs meanwhile (DDR), four of them by 1.7 ms a call and two by
-   *    0.4; four are needed only when the reads come from flash and the
-   *    next batch is late. So the full width goes to the next batch and
-   *    the rest is read narrower. Set equal to READERS for the old
-   *    behaviour.
    *  - NNTR_MOE_PREFETCH_CPUS=<a,b,..>: pin the readers to these cores
    *    (default: every core but the caller's)
    */
   struct PrefetchKnobs {
     size_t readers = 4;
-    size_t ahead_readers = 2;
     std::vector<int> cpus;
   };
   static const PrefetchKnobs &prefetchKnobs() {
@@ -3442,9 +3409,6 @@ private:
       PrefetchKnobs r;
       if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
         r.readers = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
-      if (const char *v = std::getenv("NNTR_MOE_PREFETCH_AHEAD_READERS"))
-        r.ahead_readers = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
-      r.ahead_readers = std::min(r.ahead_readers, r.readers);
       if (const char *v = std::getenv("NNTR_MOE_PREFETCH_CPUS")) {
         for (const char *p = v; *p != '\0';) {
           char *end = nullptr;
