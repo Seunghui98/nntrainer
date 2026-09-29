@@ -81,6 +81,10 @@
 #   E2E tokens e1==off-hd64 / -lfm25 8/8 expected_mismatch=0
 #   E2E eval e1-feed-l2 ... bit_identical=1            (NNTR_HTP_FC_FEED=l2:
 #                              the feed moves no bits)
+#   E2E fwd hd64 / lfm25 cpu-fc-skipped=<n> per_token=7 / 14 ok  (E2: the CPU
+#                              skips every FC GEMV of a resident row -- the
+#                              core FC, qkv and conv block hooks; the
+#                              bit_identical lines above hold with it)
 #   E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED   (head_dim 8:
 #                              no one-call token on the hd8 fixture)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
@@ -407,6 +411,20 @@ for d in "hd64 64e1 12 dump_64qd dump_64qoff" "lfm25 25e1 23 dump_25qd dump_25qo
   $EVAL --label "e1x86==d-$fx" "$OUT/$ref" "$OUT/dump_$tag" | tail -1 || fail=1
   $EVAL --label "e1-$fx" --allow-diff --snr-floor 0 "$OUT/$ref" "$OUT/dump_${tag}a" | tail -1 || fail=1
   $EVAL --label "e1==off-$fx" --tokens-policy "$OUT/$off" "$OUT/dump_${tag}a" | tail -1 || fail=1
+done
+# [#132 Part B E2] the CPU skips the FC layers of every resident row: per
+# decode token hd64 (C A C, layer 0 dense) asks 7 times (two conv blocks,
+# qkv, attention_out, the dense FFN's three), lfm25 (C C A C A C, two
+# dense) 14; the first decode token after the prefill is a resident row too
+for d in "hd64 64e1 7" "lfm25 25e1 14"; do
+  read -r fx tag per <<< "$d"
+  skipped="$(sed -n 's/^\[HTP\] graph: cpu fc skipped=\([0-9]*\)$/\1/p' "$OUT/$tag.log")"
+  toks="$(sed -n 's/.*forward calls=[0-9]* tokens=\([0-9]*\) .*/\1/p' "$OUT/$tag.log")"
+  if [ -n "$skipped" ] && [ -n "$toks" ] && [ "$skipped" = $((per * toks)) ]; then
+    echo "E2E fwd $fx cpu-fc-skipped=$skipped per_token=$per ok"
+  else
+    echo "E2E FAIL $fx cpu fc skipped=${skipped:-none} tokens=${toks:-none} (want $per per token)"; fail=1
+  fi
 done
 grep -q '^\[HTP\] graph: q4m1 weights=12 handles=12 feed=l2$' "$OUT/64e1l2.log" ||
   { echo "E2E FAIL hd64 e1 l2: no feed=l2 line"; fail=1; }
