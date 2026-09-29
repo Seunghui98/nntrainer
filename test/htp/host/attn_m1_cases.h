@@ -73,9 +73,12 @@ static inline uint32_t amc_next(amc_rng *r) {
   return r->s;
 }
 
-/** @brief A float uniform in [lo, hi), not rounded. */
+/** @brief A float uniform in [lo, hi), not rounded. The product is stored
+ *  through a volatile so an ARM build's default -ffp-contract=on cannot
+ *  fuse it with the add: every platform draws the same rows. */
 static inline float amc_frand(amc_rng *r, float lo, float hi) {
-  return lo + (hi - lo) * ((float)(amc_next(r) >> 8) / 16777216.0f);
+  volatile float t = (hi - lo) * ((float)(amc_next(r) >> 8) / 16777216.0f);
+  return lo + t;
 }
 
 /**

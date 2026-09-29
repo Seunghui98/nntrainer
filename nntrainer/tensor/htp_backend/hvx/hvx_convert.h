@@ -142,7 +142,7 @@ static inline HVX_Vector hvx_fma16_sf(HVX_Vector c, HVX_Vector a,
  * hu / 2 when c0 is a power of two above 2^-14 (the grid halves there).
  * attn_m1_host_check.c runs every quotient of the attention domain (l in
  * [1, 2048] -- an fp16 sum of values <= 1 cannot pass 2048 -- and e in
- * [0, l]) whose c0 is off or which is a tie: 7881 and 125325 of them. The
+ * [0, l]) whose c0 is off or which is a tie: 7881 and 27049 of them. The
  * power-of-two branch is never taken there (no c0 = 2^E is one too high);
  * it stays so the function is right for any fp16 e and l.
  */

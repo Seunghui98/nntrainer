@@ -31,9 +31,12 @@
  * round-to-odd fix-up in word ops, then hvx_rne16_sf -- about 20 vector
  * ops where the f32 kernel had 2 (plan 152 section 3.3's cost).
  * Rule 24: plain Vsf add / sub / mul and word ops, no qf32, no hf, no
- * flush-to-zero; every sf operand is a normal f32 or zero (fp16 values are
- * >= 2^-24, their products >= 2^-48). The masked lanes of the last block
- * are filled with -FLT_MAX for the max rather than -inf, and zeroed
+ * flush-to-zero; after the entry rounding every sf operand is a normal f32
+ * or zero (fp16 values are >= 2^-24, their products >= 2^-48). The one
+ * exception is the caller's raw q / k / v entering hvx_rne16_sf, which may
+ * be f32 subnormals: C absorbs them, so the result is the same +-0
+ * whether the hardware flushes that input or not. The masked lanes of the last
+ * block are filled with -FLT_MAX for the max rather than -inf, and zeroed
  * before the divide.
  *
  * ponytail: the q splats are re-formed per block (a scalar load and a

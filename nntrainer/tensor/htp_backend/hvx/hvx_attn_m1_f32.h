@@ -24,8 +24,10 @@
  * append; the CPU's seed rows already are), 128-byte aligned, zero-filled
  * at create so the lanes past the context in the last block read finite
  * values (they are masked out of every reduction). head_dim is 64 only.
- * The q heads of a unit share the Kt stream, then the V stream -- each q
- * head's sequence is the spec's.
+ * The q heads of a unit share each V row in PV; the score loop reads a
+ * block's 64 Kt vectors once per q head (the kernel is compute-bound
+ * since #152, and sharing them would need 16 live accumulators) -- each
+ * q head's sequence is the spec's.
  *
  * ADDRESS BUDGET (doc 46 section 41: 3840 MiB arena + about 182 MiB heap).
  * The cache is n_layers * n_kv * head_dim * max_seq * 2 * 4 bytes: at the

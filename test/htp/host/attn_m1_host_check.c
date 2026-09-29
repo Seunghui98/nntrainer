@@ -543,9 +543,14 @@ static void check_prim_div16(void) {
       if (ef <= l && !last) {
         want[lane] = attn_m1_det_rne16(attn_m1_det_div(ef, l));
         const float c0 = attn_m1_det_rne16(attn_m1_det_mul(ef, r));
+        /* A tie: e / l exactly on an fp16 midpoint -- 1 + 12 bits with the
+           last set above 2^-14, an odd multiple of 2^-25 below. */
         const double q = (double)ef / (double)l;
+        const float qf = (float)q;
         const int tie =
-          (double)(float)q == q && attn_m1_det_rne16((float)q) != (float)q;
+          (double)qf == q && attn_m1_det_rne16(qf) != qf &&
+          (qf >= ldexpf(1.0f, -14) ? (attn_m1_det_bits(qf) & 0x1FFFu) == 0x1000u
+                                   : fmod(q * 33554432.0, 2.0) == 1.0);
         off += c0 != want[lane];
         ties += (uint64_t)tie;
         hard |= (c0 != want[lane]) | tie;

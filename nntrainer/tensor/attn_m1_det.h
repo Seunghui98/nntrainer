@@ -77,6 +77,14 @@
  * unittest_nntrainer_cpu_backend_fp16.cpp compares this header with those
  * exported functions on the device.
  *
+ * WHICH CPU. This is the CPU path of an Android build with enable-fp16
+ * (tools/package_android.sh's default, and every set measured so far).
+ * A build with -Denable-fp16=false, or the host, runs mha_core's f32
+ * attention instead; against that CPU this spec is as far off as the f32
+ * one was from the fp16 CPU (plan 152's table, the other way round), and
+ * the host E2E's resident attention lines read against it (#152's
+ * fwd-hd64 39.18 -> 37.17 dB).
+ *
  * DOMAIN. Every fp16 value finite: |q|, |k|, |v| < 65520 and no score, sum
  * or output past 65504 (the CPU's own softmax turns an overflow into NaN,
  * so nothing outside this domain is worth matching). rne16 does not
