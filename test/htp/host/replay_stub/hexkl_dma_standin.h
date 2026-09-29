@@ -30,6 +30,7 @@ typedef struct {
   const uint8_t *base;
   uint8_t *pages;
   size_t n_pages;
+  uint64_t bypass_bytes; /**< [#158] of bytes_landed, src_bypass = 1 */
 } replay_stub_meter_t;
 __attribute__((weak)) replay_stub_meter_t replay_stub_meter;
 
@@ -50,7 +51,13 @@ static inline void replay_stub_dma_run(void *p) {
       memset(m->pages + lo, 1, hi - lo + 1);
     }
   }
-  m->bytes_landed += (uint64_t)n * d->row_size;
+  /* atomic: the replay's workers land their descriptors concurrently */
+  __atomic_fetch_add(&m->bytes_landed, (uint64_t)n * d->row_size,
+                     __ATOMIC_RELAXED);
+  if (d->src_bypass) {
+    __atomic_fetch_add(&m->bypass_bytes, (uint64_t)n * d->row_size,
+                       __ATOMIC_RELAXED);
+  }
   d->done = 1;
 }
 /** @brief dmstart. */

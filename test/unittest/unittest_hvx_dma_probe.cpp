@@ -17,6 +17,8 @@
  * PrefetchOverlap (#90, docs/plans/90-two-reader-ddr-probe.md) measure the
  * CPU and the DSP reading DDR alone and at once, and what a CPU touch of
  * the next layer's weights during the MoE call costs the DSP and stages.
+ * DmaSettings (#158) runs the same ring cell with src_bypass 0/1 and 1/2/4
+ * UDMA queues.
  *
  * Runs on an Android device only. Requires libnntr_hvx_skel.so on
  * ADSP_LIBRARY_PATH; run once with the vote-on skel and once with the
@@ -732,6 +734,132 @@ TEST_F(HvxDmaProbe, TwoReaderDdr) {
     EXPECT_TRUE(valid) << "DDR_TWO_READER " << p.reader << " t=" << p.t;
   }
   EXPECT_EQ(nntr_hvx_moe_set_opts(handle_, 0u, &applied), AEE_SUCCESS);
+}
+
+/**
+ * @brief [#158] DMA engine settings on the #90 ring cell (f2, fresh = 1,
+ *        168 MiB of distinct DDR): src_bypass 0/1 x 1/2/4 queues, one
+ *        worker thread and its own UDMA queue each, every push split into
+ *        per-queue row slices (NNTR_MOE_DMA_SPLIT_ROWS). Queues 1 is the
+ *        production ring. Two rounds, the second in reverse order; a cell's
+ *        rate is the mean. A cell whose tag misses, whose pool gave fewer
+ *        threads than asked, or whose rate is above NNTR_DDR_CEILING_GBS
+ *        prints INVALID and fails. The DECISION line names the best valid
+ *        cell and whether it beats the bypass=0 queues=1 anchor by
+ *        NNTR_DMA_SETTINGS_MIN_GAIN (the M=1 feed gets a knob only then).
+ */
+TEST_F(HvxDmaProbe, DmaSettings) {
+  const Chunk &ch = chunks_[0];
+  const uint32_t region = nntr_moe_dma_region_bytes(kK, kI, kN);
+  static nntr_moe_dma_item items[2][NNTR_MOE_DMA_PLAN_MAX];
+  static uint8_t samples[(8u << 20) / 64u + 1u];
+  std::vector<uint32_t> sched[2];
+  uint32_t n_items[2] = {0, 0};
+  nntr_two_reader_spec spec;
+  for (uint32_t b = 0; b < 2u; ++b) {
+    n_items[b] =
+      nntr_dma_settings_cell(b, items[b], NNTR_MOE_DMA_PLAN_MAX, &spec);
+    ASSERT_NE(n_items[b], 0u);
+    for (uint32_t k = 0; k < n_items[b]; ++k) {
+      const nntr_moe_dma_item &it = items[b][k];
+      const uint32_t w[8] = {nntr_moe_dma_word0(&it),
+                             it.expert,
+                             it.src_off,
+                             it.dst_off,
+                             it.row_size,
+                             it.nrows,
+                             it.src_stride,
+                             0u};
+      sched[b].insert(sched[b].end(), w, w + 8);
+    }
+  }
+  std::vector<uint32_t> res(13, 0);
+  auto replay = [&](uint32_t b, uint32_t q, uint32_t calls) {
+    return nntr_hvx_dma_replay(handle_, ch.arena, region, sched[b].data(),
+                               (int)sched[b].size(), q, 0, 0, spec.fresh, 0,
+                               calls, res.data(), (int)res.size());
+  };
+  // Warm-up (page tables, clocks), not reported.
+  ASSERT_EQ(replay(0, 1, spec.calls_per_chunk), AEE_SUCCESS)
+    << "a skel without #158's flags?";
+  const uint32_t n_regions = res[7];
+  const uint32_t want[2] = {
+    nntr_moe_dma_tag_sum(items[0], n_items[0], spec.calls_per_chunk, spec.fresh,
+                         n_regions, region, samples),
+    nntr_moe_dma_tag_sum(items[1], n_items[1], spec.calls_per_chunk, spec.fresh,
+                         n_regions, region, samples)};
+
+  const uint32_t kQueues[] = {1, 2, 4};
+  struct Cell {
+    uint32_t b, q;
+    double gbs_sum = 0;
+    bool valid = true;
+  };
+  std::vector<Cell> cells;
+  for (uint32_t b = 0; b < 2u; ++b) {
+    for (uint32_t q : kQueues) {
+      cells.push_back({b, q});
+    }
+  }
+  for (int round = 0; round < 2; ++round) {
+    for (size_t j = 0; j < cells.size(); ++j) {
+      Cell &c = cells[round == 0 ? j : cells.size() - 1 - j];
+      DspStream d;
+      d.ok = true;
+      uint32_t used = 0;
+      for (uint32_t k = 0; k < spec.chunks_max && d.us < spec.min_us; ++k) {
+        const int err = replay(c.b, c.q, spec.calls_per_chunk);
+        if (err != AEE_SUCCESS) {
+          ADD_FAILURE() << "DMA_SETTINGS replay err=" << hex(err);
+          d.ok = false;
+          break;
+        }
+        d.ok = d.ok && res[12] == want[c.b];
+        d.us += res[0];
+        d.bytes += static_cast<uint64_t>(res[2]) * res[1];
+        used = res[8];
+      }
+      const bool valid =
+        d.ok && used == c.q &&
+        nntr_ddr_rate_valid(d.bytes, d.us, NNTR_DDR_CEILING_GBS);
+      c.gbs_sum += d.gbs();
+      c.valid = c.valid && valid;
+      std::cout << std::fixed << std::setprecision(2)
+                << "DMA_SETTINGS round=" << round << " src_bypass=" << c.b
+                << " queues=" << c.q << " workers_used=" << used
+                << " gbs=" << d.gbs() << " us=" << d.us << " bytes=" << d.bytes
+                << " regions=" << n_regions << " footprint_mib="
+                << (nntr_two_reader_footprint_bytes(n_regions, region) >> 20)
+                << " chunk_bytes=" << ch.bytes
+                << " checksum_ok=" << (d.ok ? "y" : "n")
+                << " valid=" << (valid ? "y" : "n INVALID") << "\n";
+      EXPECT_TRUE(valid) << "DMA_SETTINGS src_bypass=" << c.b
+                         << " queues=" << c.q;
+    }
+  }
+  const double anchor = cells[0].gbs_sum / 2.0;
+  const Cell *best = nullptr;
+  for (const Cell &c : cells) {
+    const double gbs = c.gbs_sum / 2.0;
+    std::cout << std::fixed << std::setprecision(2)
+              << "DMA_SETTINGS_MEAN src_bypass=" << c.b << " queues=" << c.q
+              << " gbs=" << gbs << " anchor_gbs=" << anchor << " gain_pct="
+              << (anchor > 0 ? 100.0 * (gbs / anchor - 1.0) : 0.0)
+              << " valid=" << (c.valid ? "y" : "n INVALID") << "\n";
+    if (&c != &cells[0] && c.valid && (!best || c.gbs_sum > best->gbs_sum)) {
+      best = &c;
+    }
+  }
+  const double best_gbs = best ? best->gbs_sum / 2.0 : 0.0;
+  const bool knob = best && cells[0].valid &&
+                    best_gbs >= anchor * (1.0 + NNTR_DMA_SETTINGS_MIN_GAIN);
+  std::cout << std::fixed << std::setprecision(2)
+            << "DMA_SETTINGS_DECISION best_src_bypass=" << (best ? best->b : 0)
+            << " best_queues=" << (best ? best->q : 0)
+            << " best_gbs=" << best_gbs << " anchor_gbs=" << anchor
+            << " gain_pct="
+            << (anchor > 0 ? 100.0 * (best_gbs / anchor - 1.0) : 0.0)
+            << " knob=" << (knob ? "yes" : "no") << "\n";
 }
 
 namespace {
