@@ -20,6 +20,13 @@
  * reason. Never FASTRPC_SESSION_CLOSE (it closes S1 too); a hung S2 open is
  * killed with FASTRPC_REMOTE_PROCESS_KILL on S2's effective domain only.
  *
+ * S2's heap probe beside its held mapping ladder runs the PD's address
+ * space dry, which took S2's shell down in the 2026-09-29 23:20 sitting
+ * (crash in __wrap_malloc; every later S2 call AEE_ENOSUCH 0x27): it is
+ * Q5's last S2 cell, Q1 probes S2's heap with nothing mapped and a
+ * 1024 MiB cap, and every S2 test starts with a liveness check
+ * (S2_STOP rule=s2_dead).
+ *
  * Stop rules (plan section 1): s2_reserve_rc = 0x73 (AEE_ENOSESSION) -> no
  * second session, Q2-Q4 skip; s2_mmap_mib < 512 -> the 4 GiB is per HLOS
  * process (printed as S2_STOP, the remaining cells still run: the heap may
@@ -97,7 +104,9 @@ struct FcWeight {
  *  start and after S2's close, the two must be equal (HMX + VTCM intact);
  *  on a lite S2 it must be AEE_EUNSUPPORTED. */
 int hmx_smoke(remote_handle64 h, std::vector<int32_t> *acc) {
-  const uint32_t M = 1, K = 256, N = 256, m_pad = 32;
+  // m_pad: HEXKL_HMX_INT8_BLOCK_N_ROW (64); a wrong length is the skel's
+  // AEE_EBADPARM, which reads like a stale skel (the 23:20 sitting)
+  const uint32_t M = 1, K = 256, N = 256, m_pad = 64;
   std::vector<float> x(K), d(N, 0.01f), bias(N, 0.0f), scale(m_pad), out(N);
   std::vector<int8_t> w(static_cast<size_t>(K) * N);
   std::vector<int32_t> colsum(N, 0), zp(m_pad);
@@ -198,11 +207,14 @@ size_t ladder(remote_handle64 h, int domain, bool attach,
   return total >> 20;
 }
 
-/** @brief 1 MiB heap probe (allocates until refused, frees). */
-uint32_t heap_mib(remote_handle64 h) {
+/** @brief 1 MiB heap probe: allocates until refused or @a cap_mib, frees.
+ *  A probe that runs the PD's address space dry can take the PD's own
+ *  shell down with it (S2 crashed in __wrap_malloc right after one, the
+ *  23:20 sitting), so every S2 probe that can reach the end runs last. */
+uint32_t heap_mib(remote_handle64 h, uint32_t cap_mib = 4096) {
   uint32_t n = 0;
   uint64 sum = 0;
-  const int rc = nntr_hvx_mem_probe_dsp_heap(h, 1, 4096, &n, 1, &sum, 1);
+  const int rc = nntr_hvx_mem_probe_dsp_heap(h, 1, cap_mib, &n, 1, &sum, 1);
   return rc == AEE_SUCCESS ? n : 0u;
 }
 
@@ -216,6 +228,25 @@ bool session_info(remote_handle64 h, uint32_t info[7], const char *who) {
   EXPECT_EQ(rc, AEE_SUCCESS)
     << who << ": session_info (0x8000040e = stale skel, rule 3)";
   return rc == AEE_SUCCESS;
+}
+
+/** @brief S2 still answers (session_info); a dead PD (AEE_ENOSUCH 0x27
+ *  from the framework) ends the S2 cells with an S2_STOP line. */
+bool s2_alive(const char *where) {
+  if (!g.s2_open) {
+    return false;
+  }
+  uint32_t info[7] = {};
+  const int rc = nntr_hvx_session_info(g.h2, info, 7);
+  if (rc == AEE_SUCCESS) {
+    return true;
+  }
+  std::cout << "S2_STOP rule=s2_dead where=" << where << " rc=" << hex(rc)
+            << std::endl;
+  g.s2_open = false;
+  nntr_hvx_close(g.h2);
+  g.h2 = 0;
+  return false;
 }
 
 int fc_register(remote_handle64 h, uint32_t K, uint32_t N, FcWeight *w) {
@@ -416,17 +447,23 @@ TEST_F(TwoSessions, Q1_SecondSession) {
   }
   session_info(g.h1, info, "s1_after_s2_open");
 
-  // S2's own mapping ladder with S1's held, then its heap beside it.
+  // S2's own mapping ladder with S1's held (released at once; the heap
+  // beside a held ladder runs the space dry and is Q5's last cell), then
+  // its heap up to 1024 MiB with nothing mapped (the design needs 495).
   std::vector<Mapped> s2_maps;
   const size_t s2_mib =
     ladder(g.h2, static_cast<int>(g.effdom2), true, &s2_maps, &why, &rc);
   field("s2_mmap_mib", s2_mib);
   field("s2_mmap_stopped_by", why + ":" + hex(rc));
-  field("s2_heap_mib", heap_mib(g.h2)); // with S2's mappings held
   for (Mapped &m : s2_maps) {
     unmap_chunk(g.h2, &m);
   }
-  field("s2_heap_mib_nomap", heap_mib(g.h2));
+  const uint32_t nomap = heap_mib(g.h2, 1024);
+  field("s2_heap_mib_nomap",
+        nomap == 1024 ? ">=1024 (cap)" : std::to_string(nomap));
+  if (!s2_alive("q1_after_ladder")) {
+    return;
+  }
   if (s2_mib < 512) {
     std::cout << "S2_STOP rule=s2_mmap_lt_512 (the 4 GiB is per HLOS "
                  "process; heap cells still decide the weights)"
@@ -465,6 +502,7 @@ TEST_F(TwoSessions, Q1_SecondSession) {
   for (uint32_t h : held) {
     nntr_hvx_q4m1_release(g.h2, h);
   }
+  s2_alive("q1_end");
 }
 
 /** @brief One ARM-brokered hop row: echo on q1, then q2, alternating; each
@@ -561,8 +599,8 @@ double s2_fc_us(uint32_t reps, int *bad) {
 /** @brief Q2: what one DSP-to-DSP hop costs, through the ARM (two
  *  dspqueues) and through a shared page both PDs poll. */
 TEST_F(TwoSessions, Q2_HopCost) {
-  if (!g.s2_open) {
-    GTEST_SKIP() << "S2 not open (Q1's stop rule)";
+  if (!s2_alive("start")) {
+    GTEST_SKIP() << "S2 not open or dead (an S2_STOP line says which)";
   }
   // S2's FC weight for Q2's thread-cost cell and Q3; its feed: VTCM if it
   // fits 6 lanes, else the L2 feed.
@@ -674,7 +712,7 @@ TEST_F(TwoSessions, Q2_HopCost) {
 /** @brief Q3: S1's MoE-shaped DMA (#158 cell: bypass, fresh, 1 queue) and
  *  S2's FC weight DMA alone, concurrent and sequential. */
 TEST_F(TwoSessions, Q3_DdrShare) {
-  if (!g.s2_open || g.fc7168.h == ~0u || g.s1_maps.empty()) {
+  if (!s2_alive("q3_start") || g.fc7168.h == ~0u || g.s1_maps.empty()) {
     GTEST_SKIP() << "needs S2, Q2's FC weight and S1's arena";
   }
   static nntr_moe_dma_item items[NNTR_MOE_DMA_PLAN_MAX];
@@ -780,8 +818,8 @@ TEST_F(TwoSessions, Q3_DdrShare) {
 /** @brief Q4: S2's VTCM beside S1's feed, and the exact FC's rate from
  *  VTCM, the L2 scratch and DDR directly -> the FC set's ms per token. */
 TEST_F(TwoSessions, Q4_VtcmShare) {
-  if (!g.s2_open) {
-    GTEST_SKIP() << "S2 not open (Q1's stop rule)";
+  if (!s2_alive("start")) {
+    GTEST_SKIP() << "S2 not open or dead (an S2_STOP line says which)";
   }
   uint32_t info[7] = {};
   session_info(g.h2, info, "s2_q4");
@@ -866,6 +904,21 @@ TEST_F(TwoSessions, Q4_VtcmShare) {
 
 /** @brief Q5: S2 closes first; S1 keeps its HMX lock and VTCM. */
 TEST_F(TwoSessions, Q5_Teardown) {
+  if (s2_alive("q5_start")) {
+    // The one cell that may run S2's address space dry (and its shell with
+    // it): S2's heap with its whole mapping ladder held, beside S1's.
+    std::vector<Mapped> s2_maps;
+    std::string why;
+    int rc = 0;
+    const size_t mib =
+      ladder(g.h2, static_cast<int>(g.effdom2), true, &s2_maps, &why, &rc);
+    field("s2_mmap_mib_q5", mib);
+    field("s2_heap_mib", heap_mib(g.h2)); // with the ladder held
+    for (Mapped &m : s2_maps) {
+      unmap_chunk(g.h2, &m);
+    }
+    s2_alive("q5_after_heap_probe");
+  }
   if (g.s2_open) {
     const int rc = nntr_hvx_close(g.h2);
     field("s2_close_rc", hex(rc));
