@@ -216,8 +216,17 @@ void Lfm2MoeCausalLM::load_weight(const std::string &weight_path) {
     if (!took)
       return; // the backend takes none: no Q4M1 kind is resident
   }
-  if (hand(first("output_of_causallm", "embedding0"), 1, true))
-    ops->finish_decode_graph_q4_0(); // [#132 Part B E3] S2's arena, now
+  hand(first("output_of_causallm", "embedding0"), 1, true);
+#endif
+}
+
+void Lfm2MoeCausalLM::repack_weight() {
+  Lfm2CausalLM::repack_weight();
+#ifdef ENABLE_HEXKL
+  // [#132 Part B E3] NNTR_HTP_E2E=1: open S2 and place the FC set in its
+  // arena now, at load, and only after the walk above has mapped S1's MoE
+  // arena (the E5 sitting: S2 mapped first left S1 at 3584 MiB)
+  nntrainer::get_htp_ops()->finish_decode_graph_q4_0();
 #endif
 }
 

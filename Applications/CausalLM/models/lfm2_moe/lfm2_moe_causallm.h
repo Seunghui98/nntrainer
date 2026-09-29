@@ -51,6 +51,12 @@ public:
    */
   void load_weight(const std::string &weight_path) override;
 
+  /**
+   * @brief Lfm2CausalLM::repack_weight (S1's MoE arena), then (#132 Part B
+   *        E3, NNTR_HTP_E2E=1) the second session and its FC arena.
+   */
+  void repack_weight() override;
+
 protected:
   unsigned int NUM_EXPERTS = 0;
   unsigned int NUM_EXPERTS_PER_TOK = 0;
