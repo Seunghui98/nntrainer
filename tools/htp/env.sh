@@ -14,7 +14,9 @@
 # Overrides: HEXAGON_SDK_ROOT (default 6.4.0.1 under /local/mnt/workspace),
 # HEXKL_ROOT (the HexKL package root that holds lib/<sdk version>/...),
 # HEXKL_SDK_VER (the lib/ subdirectory to use), ANDROID_NDK, NNTR_MODEL_DIR,
-# HEX_ARCH (v79, the S25 Ultra).
+# HEX_ARCH (v79 = the S25 Ultra, the default; v81 = the S26 Ultra). Export
+# HEX_ARCH=v81 *before* sourcing: this file exports the default, so a later
+# bare ./test/htp/build.sh in the same shell otherwise builds v79.
 
 _nntr_sdk="${HEXAGON_SDK_ROOT:-/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1}"
 if [ ! -f "$_nntr_sdk/setup_sdk_env.source" ]; then

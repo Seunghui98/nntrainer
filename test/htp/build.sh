@@ -6,7 +6,7 @@
 # Prerequisite: source $HEXAGON_SDK_ROOT/setup_sdk_env.source
 #   The SDK must be 6.1.1.0 or newer: HexKL ships libhexkl_micro.a for v79
 #   only from lib/6.1.1.0 up. 6.4.0.1 is the verified combination.
-# Override the target with: HEX_ARCH=v75 ./build.sh
+# Override the target with: HEX_ARCH=v81 ./build.sh (the S26 Ultra; v79 = S25)
 # Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
 
 set -eu
@@ -53,7 +53,7 @@ if [ ! -f "$HEXKL_LIB" ]; then
     else
         echo "That version exists but has no ${HEXKL_TOOLS_VARIANT}_${HEX_ARCH} build. Available:" >&2
         ls -1 "$HEXKL_ROOT/lib/$HEXKL_SDK_VER" 2>/dev/null | sed 's/^/  /' >&2
-        echo "HexKL provides v79 only for lib/6.1.1.0 and newer." >&2
+        echo "Pick an HEX_ARCH (or HEXKL_SDK_VER) from the list above." >&2
     fi
     exit 1
 fi
@@ -172,6 +172,14 @@ if [ -n "$STRONG_DSPQ" ]; then
     exit 1
 fi
 echo "UNDEFINED SYMBOLS OK ($(echo "$UND" | wc -l) runtime imports)"
+# Both arches write the same file name (the phone loads it by name), so the
+# ELF e_flags are the only thing that tells a v79 skel from a v81 one.
+if ! "$READELF" -h build/libnntr_hvx_skel.so | grep -q "Flags:.*0x${HEX_ARCH#v}\b"; then
+    echo "Error: skel ELF flags do not say $HEX_ARCH:" >&2
+    "$READELF" -h build/libnntr_hvx_skel.so | grep Flags: >&2
+    exit 1
+fi
+echo "ARCH OK ($(echo "$HEX_ARCH" | tr v V))"
 
 echo "built: $SCRIPT_DIR/build/libnntr_hvx_skel.so ($HEX_ARCH, hexkl $HEXKL_SDK_VER)"
 echo "NOTE: this is the DSP skel only. If nntr_hvx.idl changed, the ARM client"
