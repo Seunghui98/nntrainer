@@ -376,6 +376,12 @@ public:
   // logits did not come back, once; false when there is none.
   virtual bool finish_decode_graph_q4_0() { return false; }
   virtual void set_decode_logits(bool want) { (void)want; }
+  // [#132 Part B E3] The ids the caller's greedy pick sets to -inf (its
+  // bad words): an id taken with take_decode_token_id skips them too.
+  virtual void set_decode_ban(const unsigned *ids, unsigned n) {
+    (void)ids;
+    (void)n;
+  }
   virtual bool take_decode_token_id(unsigned *id) {
     (void)id;
     return false;

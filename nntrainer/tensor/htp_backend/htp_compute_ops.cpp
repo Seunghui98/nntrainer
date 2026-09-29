@@ -1990,6 +1990,8 @@ public:
         releaseQ4m1(fc_session); // a retry registers them all again
         throw;
       }
+      // [#132 Part B E3] S2's arena is placed once: a retry keeps it
+      q4m1_bound_ = e2e_;
     }
     uint32_t n_ops = 0;
     if (e2e_) {
@@ -2004,6 +2006,8 @@ public:
         const int err =
           nntr_hvx_graph_init(h, w.data(), static_cast<int>(w.size()), &n_ops);
         if (err != AEE_SUCCESS) {
+          if (k == 1)
+            nntr_hvx_graph_release(e2e_st_->h1); // a retry inits both again
           throw std::runtime_error(std::string("nntr_hvx_graph_init[") +
                                    (k == 0 ? "S1" : "S2") +
                                    "] failed: " + graphErr(err));
@@ -3239,6 +3243,9 @@ private:
     if (!e.mbox->isIon() || e.mbox->fd() < 0 || mem.mmap == nullptr) {
       throw std::runtime_error("NNTR_HTP_E2E=1: no ION page for the mailbox");
     }
+    // zeroed before either side maps it, as the #178 probe's page: no
+    // sequence word or header a first read could take for a post
+    std::memset(e.mbox->data(), 0, e.mbox->size());
     const int fd = e.mbox->fd();
     int rc = mem.mmap(CDSP_DOMAIN_ID, fd, e.mbox->data(), 0, e.mbox->size(),
                       FASTRPC_MAP_FD);
@@ -3347,6 +3354,9 @@ private:
   void tokenForward(uint32_t pos, const float *act, unsigned K, float *out,
                     unsigned N_out) {
     E2eState &e = *e2e_st_;
+    if (!e.drv1 || !e.drv2 || !e.q2 || !dspq_)
+      throw std::runtime_error("token driver: not started (its start threw "
+                               "at graph init)");
     DspqMoe &q1 = *dspq_, &q2 = *e.q2;
     if (q1.broken || q2.broken)
       throw std::runtime_error("token driver: a queue failed on an earlier "
@@ -3357,12 +3367,25 @@ private:
       throw std::runtime_error("token driver: row " + std::to_string(K) +
                                " / logits " + std::to_string(N_out) +
                                " do not fit S2's buffers");
-    if (!want_logits_ && have_id_)
+    if (have_id_)
       throw std::runtime_error("token driver: the previous token's id was "
                                "never taken (take_decode_token_id)");
+    // [#132 Part B E3] the bad-word ids S2's argmax skips (LM_BAN), sent
+    // when they change; more than the DSP holds, or none after some (an
+    // empty sequence may reach the skel as NULL, the stale-skel code) ->
+    // the logits come back and the CPU picks
+    const bool logits = want_logits_ || ban_.size() > HTP_GRAPH_MAX_BAN ||
+                        (ban_.empty() && !ban_sent_.empty());
+    if (!logits && ban_sent_ != ban_) {
+      std::vector<float> words(ban_.size());
+      std::memcpy(words.data(), ban_.data(), ban_.size() * sizeof(uint32_t));
+      setParam(e.h2, kind_ops_[HTP_OP_LM_HEAD][0], HTP_GRAPH_PARAM_LM_BAN,
+               words.data(), static_cast<unsigned>(ban_.size()),
+               static_cast<unsigned>(ban_.size()), "LM_BAN");
+      ban_sent_ = ban_;
+    }
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     std::memcpy(q2.act->data(), act, act_bytes);
-    const bool logits = want_logits_;
     const uint32_t tok = e.tok++;
     const htp_dspq_token_req r1 = {HTP_DSPQ_OP_TOKEN, tok, 0u, pos};
     const htp_dspq_token_req r2 = {HTP_DSPQ_OP_TOKEN, tok,
@@ -3425,8 +3448,18 @@ private:
     }
     if (logits) {
       std::memcpy(out, q2.out->data(), out_bytes);
-      ++e.id_checked; // S2's argmax against the logits it returned
-      e.id_mismatch += m1_argmax_first(out, N_out) != s2r.id;
+      // S2's argmax against the logits it returned, the ids LM_BAN held at
+      // the time masked as S2 masked them
+      std::vector<float> keep(ban_sent_.size());
+      for (size_t i = 0; i < ban_sent_.size(); ++i) {
+        keep[i] = out[ban_sent_[i]];
+        out[ban_sent_[i]] = -INFINITY;
+      }
+      const uint32_t pick = m1_argmax_first(out, N_out);
+      for (size_t i = ban_sent_.size(); i-- > 0;)
+        out[ban_sent_[i]] = keep[i];
+      ++e.id_checked;
+      e.id_mismatch += pick != s2r.id;
     } else {
       pending_id_ = s2r.id;
       have_id_ = true;
@@ -3453,6 +3486,12 @@ private:
   /** [#132 Part B E3] compute_ops.h: whether the next decode tokens must
    *  bring their logits back (else only the id travels). */
   void set_decode_logits(bool want) override { want_logits_ = want; }
+
+  /** [#132 Part B E3] compute_ops.h: the bad-word ids the caller's pick
+   *  sets to -inf; S2's argmax skips them (LM_BAN) on the id-only path. */
+  void set_decode_ban(const unsigned *ids, unsigned n) override {
+    ban_.assign(ids, ids + n);
+  }
 
   /** [#132 Part B E3] compute_ops.h: the id S2's argmax picked for the
    *  last decode token, once, when its logits did not come back. */
@@ -4813,7 +4852,8 @@ private:
   bool q4m1_bound_ = false; /**< the Q4M1 weights registered at load (E3) */
   size_t q4m1_left_ = 0;    /**< S2 arena bytes still to place */
   bool want_logits_ = true; /**< set_decode_logits */
-  bool have_id_ = false;    /**< take_decode_token_id */
+  std::vector<uint32_t> ban_, ban_sent_; /**< set_decode_ban, S2's LM_BAN */
+  bool have_id_ = false;                 /**< take_decode_token_id */
   uint32_t pending_id_ = 0;
   /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
   std::unique_ptr<HtpRpcBuffer> conv_buf_;
