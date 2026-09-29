@@ -65,13 +65,104 @@ be on USB). Config as #136: `do_sample: false`, `bad_word_ids: [124900]`,
 
 ## Results (fill in)
 
+Unit `R3CY10WM83Y` (SM-S938N), 2026-09-28 20:11–20:22 KST, run by the
+orchestrator. Start cool (battery 26.9 °C, zone0 28.5 °C), warm by the end
+(34.0 °C / 58.3 °C). Device `md5sum` = the table (MD5 OK). Every C / B / D log
+printed its `graph: init` banner and `calls/token` 22.00 / 95.00 / 51.00.
+
+### tok/s (mirrored: A C B D run 1, D B C A run 2)
+
+| variant | G | prefill r1 / r2 | decode r1 / r2 | decode mean | vs A |
+|---|---|---|---|---|---|
+| A | 64 | 564.5 / 536.1 | 36.87 / 36.93 | **36.90** | — |
+| C | 64 | 567.6 / 541.2 | 36.80 / 36.61 | 36.71 | −0.5 % |
+| B | 64 | 568.3 / 562.0 | 26.96 / 26.78 | 26.87 | −27.2 % |
+| D | 64 | 549.4 / 554.1 | 28.33 / 28.89 | **28.61** | −22.5 % |
+| A | 512 | 540.7 / 418.6 | 36.60 / 36.30 | **36.45** | — |
+| C | 512 | 504.9 / 422.4 | 36.45 / 35.62 | 36.03 | −1.2 % |
+| B | 512 | 458.4 / 456.3 | 25.68 / 25.59 | 25.63 | −29.7 % |
+| D | 512 | 457.6 / 421.1 | 28.09 / 28.23 | **28.16** | −22.7 % |
+
+**D vs B: +6.5 % (G=64), +9.9 % (G=512)** — the 44 fewer calls, as #132's
+plan estimated (≈ +10 %). Prefill falls through the sitting with the phone's
+temperature in every variant (mirrored pairs agree), so no prefill verdict
+beyond "no variant sits outside the mirrored band".
+
+### Decode PPL (G = 512, forced on A's own continuation, 512 tokens)
+
+| variant | nll/token | ppl | top1 | Δ vs A (paired, 2·SE) | gate (≤ +2 %) |
+|---|---|---|---|---|---|
+| A self | 0.216411 | 1.24161 | 512/512 | (reference) | — |
+| A forced | 0.216411 | 1.24161 | 512/512 | 0 (nll_sum equal to 17 digits) | null check **ok** |
+| C | 0.216411 | 1.24161 | 512/512 | 0 (equal to 17 digits) | null check **ok** |
+| B | 0.215527 | 1.24052 | 506/512 | −0.088 % (±0.35 %) | **pass** |
+| D | 0.214190 | 1.23886 | 509/512 | −0.222 % (±0.37 %) | **pass** |
+
+### Text (every cell against A of the same G and run)
+
+C = A in all 4 cells. B ≠ A and D ≠ A in all 4 cells each; both leave A at
+the first generated word (`town` → `final`) and settle into a repeating
+sentence (texts below).
+
+### Ride-along: router gtest (`HvxM1Ops.*`)
+
+`router_topk` K=2048 E=32 / K=128 E=4 / K=64 E=4: **bad_logits=0 bad_sel=0
+bad_weight=0** — bit-exact on silicon. The other five failures are #137's
+known rows (rmsnorm kind=2 subnormal, qk_norm 64, rope64 10–18, conv_gate 229,
+RejectsBadShapes `0x80000600`), unchanged from #130.
+
+### Ride-along: #141 dspqueue microbench (PR #147, own dir and skel)
+
+| row | median µs | p90 µs |
+|---|---|---|
+| F0 (bare FastRPC invoke) | 37.2 | 38.0 |
+| F12 (FastRPC, 12 KiB ION) | **87.1** | 88.8 |
+| QSS12 (queue, both sides spin, 12 KiB) | **16.7** | 17.0 |
+| QBS12 (DSP blocks, ARM spins) | 28.9 | 29.8 |
+| QBB12 (both block) | 76.9 | 90.4 |
+| QSS0 / QBS0 (message only) | 3.7 / 19.5 | 3.8 / 20.2 |
+| F12p (F12 with the spinner parked) | 91.1 | 100.5 |
+
+`verdict delta_us=70.4 s95_ms=6.68 s51_ms=3.59 rule=adopt`; all rows `bad=0`,
+`served=4400 arm_answered=4400` in both modes. Even with the DSP thread
+blocking (QBS12) the gap is 58 µs, above the 50 µs adopt line.
+
+### Ride-along: #146 attention gtest (PR #148, own dir, skels prof → o1 → o13 → prof)
+
+| skel | bad / bad_stats at L 1…1024 | pos 1023 warm us (host) | dsp_us | pos 511 warm us | cold pos 1023 us |
+|---|---|---|---|---|---|
+| prof (run 1) | 0 / 1 at 63, 512, 1024 | 1165.2 | 941.0 | 539.8 | 1407.1 |
+| o1 | **same as prof** | 646.9 | 459.6 | 302.8 | 799.4 |
+| o13 | **same as prof** | **627.5** | **386.6** | 332.6 | 688.0 |
+| prof (run 4) | same | 1197.5 | 959.1 | 619.9 | 1390.5 |
+
+Bit identity holds on silicon for O1 and O13 (every `bad` and `bad_stats`
+equal to the reference skel's). Kernel time at pos 1023: **941–959 → 387 µs
+dsp (2.4–2.5×)**, 1165–1198 → 628 µs host-timed. The gtest's
+`us − dsp_us` is ≈ 240 µs of call overhead, so by the plan's rule the gate
+reads `dsp_us ≤ 300`: **not met yet (387)**. Plan rules: O3 keep (warm us
+627.5 vs 0.9 × 646.9 = 582 → *not* met by `us`, but dsp_us −16 %);
+O4 do ((scores + pv) / 8192 = 495 pcycles > 250); O2 not needed
+(scores 2.07 M vs 1.3 × pv 2.58 M).
+
 ## Text approval
 
 | variant | decode PPL (G=512, forced on A) | generated text (G=64, run 1) | text approved (user: y/n) |
 |---|---|---|---|
-| A | | | (reference) |
-| C | | | |
-| B | | | |
-| D | | | |
+| A | 1.24161 | …town has a single main street that climbs from the harbour to a stone church at the top of the hill, and along it stand a bakery, a hardware shop, two pubs, a post office that also sells fishing line, a small museum that opens only on summer weekends, and a lifeboat station | **y** (user, 2026-09-28; reference) |
+| C | 1.24161 | (byte-identical to A) | |
+| B | 1.24052 (−0.088 %) | …final answer should be the same as the original, but you must not stop until you are told to. The original description is the same as the original, but you must not stop until you are told to. The final answer should be the same as the original, but you must not stop until you are told to. | **n** (user, 2026-09-28) |
+| D | 1.23886 (−0.222 %) | …final answer should be the description of Ardley in the same style, with the final instruction. The user wants to know about the town, and the description should be the same style, with the final instruction. The user wants to know about the town, and the description should be the same style, with the final instruction | **n** (user, 2026-09-28) |
 
 ## Notes from the run
+
+Thermal (battery °C·10 / zone0 m°C): 269 / 28500 at start, 314 / 59000 after G=64, 336 / 61000 after G=512, 340 / 58300 after the PPL cells; zone0 40900 before the dspqueue bench, 39000 before the attention gtest. Logs: `/local/mnt/workspace/htp_moe/134-132/logs/`, `/local/mnt/workspace/htp_moe/146/logs/`.
+
+**Approval (user, 2026-09-28): A `y`, B `n`, D `n`.** Why the texts part at
+the first word: at decode step 1 A gives `town` (id 4386) only p = 0.134
+(nll 2.010); in B and D `town` is at nll 2.103 / 2.113 and another token
+(id 2023, `final`) is the argmax. The prompt's first step is a near-tie
+between two ~13 % tokens, so any last-bit perturbation (rule 39) picks
+either; after `final` the greedy path runs into a one-sentence loop. The
+decode PPL (teacher-forced on A's path) cannot see how bad the free-running
+continuation after a flip is — which is what the approval caught.
