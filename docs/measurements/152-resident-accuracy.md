@@ -1,8 +1,11 @@
 # Measurement 152: a CPU-exact resident attention — gtests, dumps, speed, 8-prompt re-judge
 
-Branch `htp/152-resident-accuracy`, code @ `632873e0` (the set below was
-built from that tree; `80ae1522` adds the gtests, `7ffaa8d2`
-`tools/htp/loop_check.py`, the rest is docs). Plan
+Branch `htp/152-resident-accuracy`, code @ `5e11c102`: the skel and the
+three gtests below were built from that tree, the app set from `632873e0`
+(no source the app compiles changed after it: `git diff --stat 632873e0
+5e11c102 -- nntrainer Applications` lists only DSP files and
+`attn_m1_det.h`, which the app does not include). `7ffaa8d2` adds
+`tools/htp/loop_check.py`. Plan
 `docs/plans/152-resident-accuracy.md` §4 step 7. Estimated device time:
 **≈ 55 min** (state + install 4, gtests 5, dumps 8, speed 12, text + PPL
 21, checks 4; the plan said ≈ 50 — D0's 16 text / PPL runs are the part
@@ -46,14 +49,14 @@ New set `/local/mnt/workspace/htp_moe/152/set/`, `md5.txt` next to it:
 
 | file | md5 | built with |
 |---|---|---|
-| `libnntr_hvx_skel.so` | `27ec3add0bcff7a93b55134eb9d42ffc` | `test/htp/build.sh` (v79, HexKL 6.4.0.1): `UNDEFINED SYMBOLS OK (51 runtime imports)` |
+| `libnntr_hvx_skel.so` | `f51125995a129afa2a00e610775c9e30` | `test/htp/build.sh` (v79, HexKL 6.4.0.1): `UNDEFINED SYMBOLS OK (51 runtime imports)` |
 | `nntrainer_causallm` | `03f4e3c32519e58692d183b861f3ca42` | `build_android.sh --htp --cache` (`jni/libs/arm64-v8a/`) |
 | `libcausallm_core.so` | `ffc2b166602a0a4ba318b0603e715ad2` | same (`NNTR_HTP_FORWARD_KINDS` count 2, `NNTR_PPL_DECODE` present) |
 | `libnntrainer.so` | `fd764a268d163244507f68bb58331119` | same (`jni/obj/local/arm64-v8a/`; NEEDED `libsdkl.so`, `libcdsprpc.so`; `dspq: on` 1; `U dspqueue_` 0) |
 | `libccapi-nntrainer.so` | `8599efcf0a501eeaded611a8faf722ed` | same (`jni/obj/local/arm64-v8a/`) |
-| `unittest_nntrainer_cpu_backend_fp16` | `97f754965325d74b2fe6cd40acc6f0fd` | `test/jni` ndk-build (links the `libnntrainer.so` above: `AttnM1F16Det.*`, G0) |
-| `unittest_hvx_attn` | `b3fa93a8d4b7f78198c35dd013260275` | same (`HvxAttnM1.*`, G1 + G3) |
-| `unittest_hvx_softmax` | `4d79d7336369eb7150420fd3b8090f72` | same (`HvxM1Ops.Rope64*`, G1) |
+| `unittest_nntrainer_cpu_backend_fp16` | `e358c08fdd8e141a9246f9a11940b620` | `test/jni` ndk-build (links the `libnntrainer.so` above: `AttnM1F16Det.*`, G0) |
+| `unittest_hvx_attn` | `deea69837a1c40b70817cc8bf0159e4b` | same (`HvxAttnM1.*`, G1 + G3) |
+| `unittest_hvx_softmax` | `6ad3026e84fe5a0f34aead9d69a7b24c` | same (`HvxM1Ops.Rope64*`, G1) |
 | `libc++_shared.so` | `b1586b9b512712800fd36a24abac1c0a` | NDK r30 sysroot |
 | `libsdkl.so` | `0ad4e22a70e4f135bce38ad8fd1e001b` | HexKL 6.4.0.1 (from `134-132/set/`) |
 | `prompt512.txt` (p01), `bitset-02-code.txt` … `bitset-08-short.txt` (p02–p08) | as `docs/measurements/prompts/README.md` (p01 `fc65c158…`) | from `141b/set/`; 512 / 207 / 117 / 326 / 207 / 276 / 402 / 24 tokens |
@@ -91,7 +94,7 @@ showed the fused `fx` step does not matter for any fp16 input: the
 fusing it would not move a bit.)
 
 Rebuild recipe if `$W` is not on the measuring workstation: `git checkout
-632873e0`, `source tools/htp/env.sh`, `export HEXKL_ROOT=…` explicitly,
+5e11c102`, `source tools/htp/env.sh`, `export HEXKL_ROOT=…` explicitly,
 `git submodule update --init --depth 1`, copy
 `Applications/CausalLM/lib/libtokenizers_android_c.a` from another
 worktree, `./test/htp/build.sh`, `(cd Applications/CausalLM &&
@@ -445,7 +448,7 @@ D0's texts stay in `$W/logs/` (not for approval; D0 is the before).
   RoPE, attention at L 1 … 1024 with adversarial rows; `no_rto`,
   `hf_nonfused`, `sum32`, `rope_f32` caught; `unfused_fx` equivalent),
   `ATTN M1 PRIM rne16 / fma16 / div16 … bad=0` (div16 on every quotient of
-  the domain that is hard: 7881 off-by-one products and 125325 ties),
+  the domain that is hard: 7881 off-by-one products and 27049 exact ties),
   `ATTN M1 BIT-IDENTICAL`, `ATTN M1 PHASES OK`, `M1 OPS BIT-IDENTICAL`,
   `GRAPH CHECKS PASS`.
 * `run_inproc_e2e.sh`: `INPROC E2E PASS`. The host CPU attention is f32
