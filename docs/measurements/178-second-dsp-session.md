@@ -13,6 +13,36 @@ second PD with its own 4 GiB, what a DSP-to-DSP hop costs, and whether that
 PD gets VTCM or must feed the exact FC through L2 decide between building the
 two-session E2E plan, recommendation (c) of #132, or the §3.5 fallback.
 
+## Sitting 1 (2026-09-29 23:20, R3CY10WM83Y, set) and set2
+
+Sitting 1 stopped at P cold on the runner's `0x8000040e` rule. What it
+answered: canary `HvxFcQ4.MatchesSpecBitExact` FAILED (total bad 1146880,
+all in hvx_native / sffma*, #132's G1 finding; hvx_intrin 10/10 cells
+bad=0); A G=64 53.07 / 53.07, G=512 54.36 / 54.39 tok/s, banner
+`0x703e1` OK; `s1_mmap_mib=3840`, `s1_heap_mib=144`; `s2_reserve_rc=0`,
+session 1, effdom 7; `s2_open_rc=0` in 22.4 ms, `open_path=1` (lite),
+`vtcm_size=0`; S1 keeps `hmx_locked=1`; `s2_hmx_call_rc=0x80000414`;
+**`s2_mmap_mib=3584` with S1 holding 3840 (the 4 GiB is per PD)**; S2 heap
+beside its held ladder 334 MiB.
+
+Then S2's shell crashed (`__wrap_malloc`, logcat) right after that heap
+probe ran its address space dry; every later S2 call returned AEE_ENOSUCH
+(`0x27` = 39), so `s2_q4m1_n=0` was the dead PD, not the registration.
+`s1_hmx_smoke_rc=0x8000040e` was the test's own wrong `m_pad` (32, the
+block is 64): the skel returns AEE_EBADPARM for a bad length. Fixed in
+`706f1eed`; set2 = set with the new `unittest_hvx_two_sessions` (skel and
+app set unchanged, same md5), runner `run_178_set2.sh`
+(`docs/measurements/178-run-set2.sh`): the probe's rc never stops the
+sitting, the canary expects hvx_intrin only (10 cells bad=0), logs in
+`/local/mnt/workspace/htp_moe/178/logs2/`. The heap-beside-the-ladder cell
+is now Q5's last S2 cell (`s2_heap_mib`), Q1 has `s2_heap_mib_nomap`
+(cap 1024).
+
+| set2 file | md5 |
+|---|---|
+| `unittest_hvx_two_sessions` | `e8d5c98e8fc996d714726e951bdcb325` |
+| every other file | as in the table below |
+
 ## Artifacts (built on the workstation, SDK 6.4.0.1, HexKL 6.4.0.1, NDK r30, v79)
 
 Staged in `/local/mnt/workspace/htp_moe/178/set/` with `md5.txt`; every file
@@ -38,7 +68,7 @@ switch, no weight format); the skel's S1 path is the full open as before
 
 ## Steps (the orchestrator, phone on USB)
 
-1. `bash /local/mnt/workspace/htp_moe/178/run_178.sh R3CY10WM83Y` (≈ 35 min;
+1. `bash /local/mnt/workspace/htp_moe/178/run_178_set2.sh R3CY10WM83Y` (≈ 35 min;
    log and summary in `/local/mnt/workspace/htp_moe/178/logs/sitting.out`).
    It checks the set's md5 on both ends, waits for zone0 ≤ 35 °C before each
    block, and runs, in order:
@@ -90,7 +120,7 @@ Reference (A of the #158 sitting, S25 Ultra): 50.6 decode tok/s at G = 512.
 | 1 | `s2_reserve_rc`, `s2_session_id`, `s2_effdom` | | | `0x73` stop |
 | 1 | `s2_open_rc`, `s2_open_us`, S2 `open_path` / `hmx_locked` / `vtcm_size` (`session_info who=s2_open`) | | | rc 0, ≤ 2 s |
 | 1 | `s2_hmx_call_rc` (lite: `0x80000414`) | | | — |
-| 1 | `s2_mmap_mib` with S1 held, `s2_heap_mib` (maps held), `s2_heap_mib_nomap` | | | `s2_mmap_mib < 512` stop |
+| 1 | `s2_mmap_mib` with S1 held, `s2_heap_mib_nomap` (cap 1024) | | | `s2_mmap_mib < 512` stop |
 | 1 | `s2_q4m1_n` / `s2_q4m1_mib` (74 / ≈ 385 = all fit) | | | ≥ 383 + 48 + 64 |
 | 2 | `hop_arm_spin_us_0b` / `_12k` (median, p90) | | | — |
 | 2 | `hop_arm_block_us_0b` / `_12k` | | | — |
@@ -102,6 +132,7 @@ Reference (A of the #158 sitting, S25 Ultra): 50.6 decode tok/s at G = 512.
 | 4 | `s2_vtcm_avail_kib`, `s2_vtcm_max_page_kib`, `s2_vtcm_size_kib` | | | — |
 | 4 | `s2_fc_rate_vtcm_us` / `_l2_us` / `_direct_us` (K = 7168, N = 2048, best lanes) | | | — |
 | 4 | `s2_fc_ms_per_token` per feed, `s2_fc_ms_per_token_best`, `s2_fc_bad_total` | | | > 13 ms stop; bad 0 |
+| 5 | `s2_mmap_mib_q5`, `s2_heap_mib` (ladder held; may end S2: `S2_STOP rule=s2_dead where=q5_after_heap_probe`) | | | — |
 | 5 | `s2_close_rc`, `s1_keeps_hmx`, `s1_keeps_vtcm`, `vtcm_avail_kib_start_end` | | | yes / yes |
 
 ### §3.4 projection with the blanks filled
