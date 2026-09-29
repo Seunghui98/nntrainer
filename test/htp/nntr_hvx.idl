@@ -480,7 +480,8 @@ interface nntr_hvx : remote_handle64 {
    // [#85] One FastRPC call per token, the skeleton. graph_init takes the
    // decode step's op list (htp_graph_desc.h words: header, layer kinds,
    // one 80-word record per op with its kind, shapes, activation slots,
-   // next_mm and, for a MoE op, its 32 + 32 registered weight handles),
+   // next_mm and, for a MoE op, its 32 + 32 registered weight handles;
+   // since #132 Part B an FC / DENSE_FFN / LM_HEAD op's Q4M1 handles),
    // validates it once and keeps it; n_ops echoes the count. A second init
    // without a release is AEE_EBADSTATE; a handle a resident op names
    // cannot be released while the graph lives (AEE_EBADSTATE from
@@ -664,16 +665,20 @@ interface nntr_hvx : remote_handle64 {
    // m1_ops_det.h. Test entries: no model path calls them. A bad shape is
    // AEE_EINVALIDFORMAT, a bad handle AEE_EBADITEM; never AEE_EBADPARM.
    //
-   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 128 == 0,
+   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 64 == 0,
    // K <= 8192, N % 32 == 0), copied to the DSP heap: h names it until
-   // q4m1_release or close. At most 8 at once (AEE_EBADITEM past that).
+   // q4m1_release or close. At most 80 at once (AEE_EBADITEM past that).
+   // [#132 Part B] A resident graph op may name h (graph_init's FC,
+   // DENSE_FFN and LM_HEAD records): release is then AEE_EBADSTATE until
+   // graph_release.
    AEEResult q4m1_register(in uint32 K, in uint32 N, in sequence<uint8> w,
                            rout uint32 h);
    AEEResult q4m1_release(in uint32 h);
 
    // y (N) = the CPU's Q4_0 FC of x (K) with weight h, reps times (y from
    // the last). variant: bit 16 the VTCM feed (per-lane DMA, src_bypass),
-   // every other bit 0. lanes: pool threads, 1..8 (capped at the pool). stats
+   // bit 17 the same double buffer in a 2 MiB DSP heap scratch through the
+   // L2 (#178; not both), every other bit 0. lanes: pool threads, 1..8 (capped at the pool). stats
    // (8): [0] GEMV us over the reps, [1] quantizer us, [2..3] GEMV
    // pcycles lo | hi, [4] lanes used, [5] reps, [6] K, [7] N.
    AEEResult fc_q4m1_f32(in uint32 h, in uint32 variant, in uint32 lanes,
@@ -682,7 +687,7 @@ interface nntr_hvx : remote_handle64 {
                          rout sequence<uint32> stats);
 
    // The FC's vector quantizer (hvx_q4m1_prep, = q8_0_quant_cpu_det, the
-   // CPU's nntr_quantize_row_q8_0): xLen % 128 == 0, <= 8192 floats into
+   // CPU's nntr_quantize_row_q8_0): xLen % 64 == 0, <= 8192 floats into
    // xLen int8 and xLen/32 f16 scales.
    AEEResult q8_quant_f32(in sequence<float> x, rout sequence<int8> q,
                           rout sequence<uint16> d);
