@@ -540,7 +540,13 @@ comment and the `dev/norm-shadow` analysis), `170-attn-m1-hf.md` (S1 + S2),
 `170-attn-m1-round2.md` (S3), `132-pr2-exact-fc.md` (+ PR #175's comment),
 `178-second-dsp-session.md` (+ issue #178's comments). **BENCHMARK's "now"
 stays #158 B (51.82 / 50.61 / 47.36)**; the pending unset-banner device
-check is done; the G=1024 ≥ 50 verdict is temperature-bound (rule 52). New
+check is done; the G=1024 ≥ 50 verdict is temperature-bound (rule 52).
+**Record sitting 2026-09-30 (after the fold, PR #184 merged):** the
+mirrored cool control was taken (`record-2026-09-30-cool-a.md`,
+`R3CY10WM83Y`, 02:48–02:53 KST, `90d88e2b`, nothing set, each G block at
+zone0 ≤ 35 °C) and read **53.97 / 52.16 / 51.41** — the "now" moves there
+(§2 row), #158 B stays as the warm-start reading; rule 52's band is now the
+row's stated condition. New
 rules 47–52; §2 rows #164, norm shadow, #170 R1, #170 R2, #162, #132 Part A,
 #178; ㉙ closed, ㉗ / ㉓ (#132) updated, ㉚ (#178 decision) added. Queue:
 **#170 round 3 (softmax word split, P1 lead, append; on the issue) → the
@@ -1267,6 +1273,13 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     unset-banner check of the bypass flip is done: every cycle-23 A log
     printed `applied=0x703e1 … dma_bypass=1 source=default` with nothing
     set.
+    **Resolved 2026-09-30 by the record sitting** (`record-2026-09-30-cool-a.md`):
+    A twice per G, nothing set, each G block started at zone0 ≤ 35 °C →
+    **53.97 / 52.16 / 51.41** (G=1024 51.54 / 51.29, ending 64.5–65.6 °C);
+    the row of record moved there, #158 B's 51.82 / 50.61 / 47.36 stays as
+    the warm-start reading. The rule stands as the row's condition: a
+    G=1024 number is quoted with its start temperature, and a warm-start
+    A of this default reads 47–49 there.
 
 ## 2. Verdicts (measured, closed)
 
@@ -1322,6 +1335,7 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | **#162: G=1024 by bit-preserving CPU-side levers — step 0 sizing (`19fb142a`, 16:21) and the prefetch A/B (PR #172 `47494ee1`, 17:37–17:51; `R3CY10WM83Y`, 2026-09-29)** | **Both levers void; #162 closed, PR #172 closed by the user.** (a) attention microbench: no speedup at L 1024 / 1536, coverage 0.50 → not built; (b) prefetch 4 MiB: probe P′ pass (+1.0…+1.6 ms/token cold under the bypass), **in-app +1.30 / −0.43 / −1.30 % vs A (53.11 / 52.88 / 49.11), inside A's spread**, dumps `=1`, nll = A, text ≡ A 8/8 — G1 (G=1024 ≥ 50) fails. Step 0's A at G=1024 with `NNTR_OP_TIME=1`: 52.36 / 50.90 (token 19.1–19.6 ms: MoE wait 9.5, FC + lm_head 6.8, attention 1.7–1.9). G=1024 ≥ 50 moves to the end-to-end track (PR #169) and to rule 52's reading (rule 51) | `162/logs0/sitting.out`, `162/logs_b/speed.txt`; issue #162 |
 | **#132 PR 2 Part A: CPU-exact Q4_0 FC, router, SwiGLU, quantizer, argmax specs + DSP kernels (PR #175 `e5e579b3`, open; `R3CY10WM83Y`, 2026-09-29 21:13–22:0x; A / S mirrored + P / Pb profiles)** | **G0 ✓ G2 ✓; G1 ✓ for `hvx_intrin` only** (native `.sf` and `sffma*` bad=2048 per row on silicon); **Part A's arithmetic closes on the intrinsics variant; decision D pending (user).** G3: exact FC + lm_head VTCM-fed **7.88 ms/token** vs CPU 7.4 (direct 30; quantizer +4.8 scalar; router 427 784 vs 34 100 pcyc/op ≈ 4.4 ms/token); G4: **113 MiB** free vs 383 needed. A 53.24 / 51.18 / 50.86; S ≡ A (text 8/8, nll) (rule 49) | PR #175 comment; `132/logs/`; `132-pr2-exact-fc.md` (branch) |
 | **#178: a second cDSP session for the FC set + lm_head (decision D option (a) probe; `htp/178-probe` @ `bc3c52a8`, plan PR #180; `R3CY10WM83Y`, set2 2026-09-29 23:28, set3 2026-09-30 00:26 after a reboot; A + P cold / warm)** | **Q1–Q5 all `[OK]` cold and warm, both sets; by the numbers option (a) is not faster than A: projected ≈ 21–22 ms/token (≈ 45–46 tok/s) vs the hybrid's 18.4–19.7 (50.6–54.3), because S2 gets 0 VTCM (L2-fed exact FC 8.06 ms/token vs CPU 7.4) and concurrent S1 + S2 reads already sum to the 70 GB/s ceiling (S1 −17 %).** Mechanism facts (rule 50): open 22 ms lite, per-PD 4 GiB (3584 beside 3840), 383 MiB fit, mailbox hop 0.33 / 2.4 µs, dspqueue spin 2.8 / 12.7. Set2's heap-to-the-end cell leaked a 2 MiB mapping across processes until reboot; set3 fixed. A set3 (cool) 52.85 / 53.5 / 51.59. **Next step is the user's: build the two-session E2E plan, take (c) of #132, or the §3.5 fallback (㉚)** | issue #178 comments; `178-second-dsp-session.md` (branch) |
+| **Record sitting 2026-09-30: cool-start A control for the row of record (`record-2026-09-30-cool-a.md`; `R3CY10WM83Y`, 02:48–02:53 KST, `htp_moe` @ `90d88e2b`, device dir `s170r2q`, nothing set, A twice per G, each G block at zone0 ≤ 35 °C)** | **The "now" moves to 53.97 / 52.16 / 51.41** (r1 / r2 53.51 / 54.42, 54.75 / 49.56, 51.54 / 51.29; prefill 574.0 / 482.1, 542.4 / 526.2, 579.8 / 426.0; zone0 after 59.0 / 55.2, 62.1 / 62.9, 64.5 / 65.6 °C; text r1 = r2; banners `applied=0x703e1 … dma_bypass=1 source=default`, `dspq` close `bad=0`). Decode ≥ 50 at all three G on a cool start; #158 B's 51.82 / 50.61 / 47.36 is kept as the warm-start reading (+4.1 / +3.1 / +8.6 % cool over warm), so the goal holds under the stated condition and rule 52 is the row's condition, not an open question. Not a lever; no CPU cell ("above the CPU" still unread on this unit). | `record-2026-09-30-cool-a.md`, BENCHMARK Goals + Method (record-sitting paragraph), contract §1 |
 ## 3. Open items (candidates for issues; the supervisor promotes them)
 
 | # | item | expected | depends on |
