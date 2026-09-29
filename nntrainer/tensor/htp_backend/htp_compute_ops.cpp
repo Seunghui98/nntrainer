@@ -1403,11 +1403,6 @@ public:
           "set_decode_graph_desc: NNTR_HTP_E2E=1 needs every kind of the "
           "list resident");
       }
-      if (!HtpBackend::global().enabled2()) {
-        throw std::runtime_error(
-          "NNTR_HTP_E2E=1: the second session did not open (" +
-          HtpBackend::global().s2Error() + ")");
-      }
       if (graph_inited_) {
         // ponytail: one description per process on the two-session path
         // (the model sets it once); a reload would re-map S2's arena
@@ -1444,10 +1439,7 @@ public:
     e2e_ = e2e;
     if (e2e && !e2e_st_) {
       e2e_st_ = std::make_shared<E2eState>();
-      e2e_st_->h1 = session;
-      e2e_st_->h2 =
-        static_cast<remote_handle64>(HtpBackend::global().handle2());
-      e2e_st_->dom2 = HtpBackend::global().effDomain2();
+      e2e_st_->h1 = session; // S2's handle and domain once it opens
       std::shared_ptr<E2eState> st = e2e_st_;
       HtpBackend::global().atClose([st] { e2eTeardown(*st); });
     }
@@ -1668,10 +1660,7 @@ public:
     std::fprintf(stderr, "[HTP] graph: q4m1 weights=%zu handles=%zu feed=%s\n",
                  q4_pending_.size(),
                  e2e_ ? e2e_st_->q4m1.size() : q4m1_handles_.size(),
-                 kind_ops_[HTP_OP_FC].empty() ||
-                     graphOp(kind_ops_[HTP_OP_FC][0])->feed == 0u
-                   ? "vtcm"
-                   : "l2");
+                 q4m1FeedName());
   }
 
   /** [#130] The op record of @a op in the description (the words are
@@ -1982,6 +1971,8 @@ public:
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (graph_inited_)
       return;
+    if (e2e_ && !q4m1_bound_)
+      e2ePlaceFc(); // a caller that never ran finish_decode_graph_q4_0
     const remote_handle64 fc_session = sessionFor(HTP_OP_FC);
     if ((resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u && !q4m1_bound_) {
       try {
@@ -3510,7 +3501,24 @@ private:
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (!e2e_ || q4_pending_.empty() || q4m1_bound_ || graph_inited_)
       return false;
+    e2ePlaceFc();
+    return true;
+  }
+
+  /** [#132 Part B E3] Opens S2 and places the Q4M1 set in its arena: at
+   *  load after S1's MoE arena (the model calls finish_decode_graph_q4_0
+   *  after repack_weight), else at graph init. Caller holds graph_mutex_.
+   *  The banner's s1_arena_mib is what S1 had mapped when S2 opened. */
+  void e2ePlaceFc() {
     E2eState &e = *e2e_st_;
+    HtpBackend &b = HtpBackend::global();
+    const size_t s1_mib = arenaBytes() >> 20;
+    if (!b.openSecond())
+      throw std::runtime_error("NNTR_HTP_E2E=1: the second session did not "
+                               "open (" +
+                               b.s2Error() + ")");
+    e.h2 = static_cast<remote_handle64>(b.handle2());
+    e.dom2 = b.effDomain2();
     const uint64_t t0 = HtpProfile::nowUs();
     try {
       bindQ4m1(e.h2);
@@ -3523,19 +3531,22 @@ private:
     size_t mapped = 0;
     for (const ArenaChunk &c : e.arena)
       mapped += c.buf->size();
-    const uint32_t vtcm2 = HtpBackend::global().vtcm2Bytes();
     std::fprintf(stderr,
                  "[HTP] s2: fc arena weights=%zu handles=%zu attach_mib=%.1f "
-                 "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f\n",
+                 "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
+                 "s1_arena_mib=%zu\n",
                  q4_pending_.size(), e.q4m1.size(),
                  static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0),
-                 e.arena.size(), mapped >> 20,
-                 vtcm2 == 0u || kind_ops_[HTP_OP_FC].empty() ||
-                     graphOp(kind_ops_[HTP_OP_FC][0])->feed != 0u
-                   ? "l2"
-                   : "vtcm-if-it-fits",
-                 ms);
-    return true;
+                 e.arena.size(), mapped >> 20, q4m1FeedName(), ms, s1_mib);
+  }
+
+  /** [#132 Part B E3] The feed the FC kinds take: the op's l2, or VTCM only
+   *  where their session has some (S2 opens lite with none on the S25). */
+  const char *q4m1FeedName() const {
+    if (kind_ops_[HTP_OP_FC].empty() ||
+        graphOp(kind_ops_[HTP_OP_FC][0])->feed != 0u)
+      return "l2";
+    return e2e_ && HtpBackend::global().vtcm2Bytes() == 0u ? "l2" : "vtcm";
   }
 
   /** @brief [doc 46] One call for the whole layer.

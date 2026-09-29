@@ -368,8 +368,9 @@ public:
     return false;
   }
   // [#132 Part B E3] The two-session decode (NNTR_HTP_E2E=1). finish: the
-  // model handed its last add_decode_graph_q4_0 weight (the backend may
-  // register them now, at load). set_decode_logits(false): the caller
+  // model handed its Q4_0 weights and mapped everything else it maps at
+  // load (after repack_weight): the backend may open its second session
+  // and register them now. set_decode_logits(false): the caller
   // takes each decode token's id (take_decode_token_id) instead of its
   // logits, so only the id travels back; true (the default) keeps the
   // logits. take_decode_token_id: the id of the last decode token whose

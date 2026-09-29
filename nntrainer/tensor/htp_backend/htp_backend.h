@@ -100,11 +100,16 @@ public:
   static bool e2eRequested();
 
   /**
-   * @brief [#132 Part B E3] The second session S2 (reserved beside the
-   *        default one, lite-opened on its effective domain), opened by the
-   *        constructor when e2eRequested(); false otherwise or when any
-   *        step of the open failed (s2Error() says which).
+   * @brief [#132 Part B E3] Opens the second session S2 (reserved beside
+   *        the default one, lite-opened on its effective domain) once, when
+   *        e2eRequested(); later calls return the first answer. Called only
+   *        after S1's MoE arena is mapped: the E5 sitting (2026-09-30) saw
+   *        S1 stop at 3584 MiB when S2 was open and mapped first, where the
+   *        #178 probe (S1's 3840 mapped before S2 opened) did not.
+   * @return enabled2()
    */
+  bool openSecond();
+  /** @brief S2 is open (openSecond succeeded); s2Error() says why not. */
   bool enabled2() const { return enabled2_; }
   /** @brief S2's remote_handle64; meaningful when enabled2(). */
   uint64_t handle2() const { return handle2_; }
@@ -125,7 +130,7 @@ public:
 private:
   HtpBackend();
 
-  void openSecond();
+  void openSecondNow();
 
   bool enabled_ = false;
   uint64_t handle_ = 0; ///< remote_handle64 from nntr_hvx_open; opaque here
@@ -134,6 +139,7 @@ private:
   uint32_t poll_us_ = 0;
   std::vector<std::function<void()>> at_close_;
   bool enabled2_ = false; ///< [#132 Part B E3] S2 open
+  bool tried2_ = false;
   uint64_t handle2_ = 0;
   int effdom2_ = -1;
   uint32_t vtcm2_bytes_ = 0;

@@ -52,11 +52,22 @@ bool HtpBackend::e2eRequested() {
  * nntr_hvx_open on the URI -- which takes the lite path there, because S1
  * already holds the HMX and the VTCM. Never FASTRPC_SESSION_CLOSE: the
  * destructor closes the handle only (plan section 4 step E3).
+ * Called from openSecond(), after S1's arena is in place (see the header).
  * ponytail: the open is synchronous (no watchdog thread as in the probe,
  * whose 10 s kill never fired in three sittings); a hang here hangs the
  * app at load, and the handoff's s2_open > 2 s stop rule reads open_ms.
  */
-void HtpBackend::openSecond() {
+bool HtpBackend::openSecond() {
+  if (!tried2_ && enabled_ && e2eRequested()) {
+    tried2_ = true;
+    openSecondNow();
+    if (!enabled2_)
+      std::fprintf(stderr, "[HTP] s2: open FAILED (%s)\n", s2_error_.c_str());
+  }
+  return enabled2_;
+}
+
+void HtpBackend::openSecondNow() {
   char dom[] = "cdsp", sname[] = "nntr_s2";
   char err[160];
   remote_rpc_reserve_new_session_t rs;
@@ -213,11 +224,6 @@ HtpBackend::HtpBackend() {
             "transport will pay the interrupt-wake tail (34_fc_measured.md "
             "section4 item F).",
             qos_err);
-  }
-  if (e2eRequested()) {
-    openSecond();
-    if (!enabled2_)
-      std::fprintf(stderr, "[HTP] s2: open FAILED (%s)\n", s2_error_.c_str());
   }
 }
 
