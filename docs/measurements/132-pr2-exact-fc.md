@@ -183,3 +183,113 @@ steps); its prefill is (the shadow does not run at M > 1).
 * G0 ✗: the CPU is not what §0 read; the printed differences name the
   function. ExpfBionic ✗ on exactly the two glibc-corrected inputs: the
   port needs those two as exceptions (a two-entry table).
+
+## Sitting 1 as read (2026-09-29 21:13-22:0x, `R3CY10WM83Y`; logs `/local/mnt/workspace/htp_moe/132/logs/`)
+
+Reported by the orchestrator; the numbers below are copied from the logs.
+
+| cell | result |
+|---|---|
+| G0 (quantizer, Q4 GEMV 5 shapes, SwiGLU, sgemv_n router, expf over all 4 278 190 082 inputs) | all bad=0 |
+| G1 `hvx_intrin` | bad=0 in all 10 cells (5 shapes x 2 feeds) |
+| G1 `hvx_native`, `sffma8/16/32` | every output `0x0` (`bad=N` per call in every cell): not a rounding difference |
+| G1 router (3 shapes), small ops | bad=0 |
+| G2 | add 96/96, router 176/176; fc 0/600 (the shadow's `fc_q4m1_f32` variant 0 was `hvx_native`) |
+| G3 at 6 lanes, VTCM feed | `hvx_intrin` 7.88 ms/token (fc 5.14 + lm_head 2.74; K 7168 N 2048: 181 µs/call, 45.5 GB/s) vs the CPU's 7.4; direct feed 30.5; `hvx_native` 7.30; sffma 18.4-22.7; quant_ms ≈ 4.8 |
+| G4 | heap probe 113 MiB (1 MiB chunks) |
+| S vs A | tokens, nll and logits equal; 8 prompts nll and text equal |
+| resident ROUTER_TOPK | 427 784 pcycles/op (CPU-order scalar chains) vs 34 100 (the old HVX router) |
+
+The runner's 8-prompt loop wrote its logs as `*_p03` / `*_p04`: `cool()`
+reused the loop's `i`. Fixed (`local t z`) in both runners.
+
+## Sitting S3 (after sitting 1)
+
+Branch `htp/132-exact-fc`; set `/local/mnt/workspace/htp_moe/132/set2/`
+from `dev/fc-shadow`; runner
+`bash /local/mnt/workspace/htp_moe/132/run_132s3.sh R3CY10WM83Y`
+(≈ 35 min; copy `docs/measurements/132-pr2-run-s3.sh`); logs
+`/local/mnt/workspace/htp_moe/132/logs_s3/`. What changed since sitting 1:
+
+1. **One kernel.** `hvx_q4_gemv_f32.c` is the intrinsics kernel only;
+   `hvx_native` and the sffma tail are gone from the entry (`fc_q4m1_f32`'s
+   variant word is the feed bit alone), so the shadow's call is the
+   intrinsics kernel: G2 must read **fc 600/600**.
+2. **Why native / sffma read 0.** Both used the inline-asm IEEE
+   `vadd / vsub / vmpy (.sf = .sf op .sf)` instructions (the sffma tail
+   for its `d_w * d_a` terms); `hvx_intrin` uses only the `Q6_Vsf_*`
+   intrinsics, which the compiler lowers to a `qf32` op and a conversion
+   even with `-mhvx-ieee-fp`. #164's norm and the router passed because
+   they use the scalar `sffma` and the intrinsics, never the asm form. So
+   the difference is not the rounding of any op: it is that instruction
+   form, which the v79 ISS executes and the phone returns 0 for.
+   `HvxFcQ4.SfProbe` confirms it on silicon: each op on 256 random normal
+   pairs and on the operands of the kernel's first failing step (group 0,
+   block 0: P1 = F1 * S1, P2 = F2 * S2, uh = P1 + P2), asm form vs
+   intrinsics vs scalar sffma, against the host's IEEE result.
+3. **Vector quantizer** (`hvx_q4m1_prep`): amax by a word max of the
+   sign-cleared bits, d and 1/d by the scalar divide (`sfrecipa` /
+   `sffixup`, IEEE RN: `HvxFcQ4.ScalarDivide` sweeps every mantissa of
+   both divides on silicon, the ISS sweep is below), q by the 1.5 * 2^23
+   magic add (ties to even), bytes by `vpacke`, sums by a rotate-add
+   tree; blocks under 2^-100 run the scalar spec. Host:
+   `Q8 QUANT HVX rows=3000 bad_rows=0`. ISS, K = 2048: **10 738** pcycles
+   per call against the scalar spec's 105 609 (G3 reads the silicon
+   `quant_ms`; target < 0.5 ms/token).
+4. **Router**: 8 register-resident sffma chains per pool lane (4 lanes at
+   E = 32), each lane also computing its experts' sigmoids; the pick is
+   serial. ISS, one lane: 41 k pcycles per 8-chain group plus ≈ 4 k of
+   sigmoids per lane; ≈ 50 k projected at 4 lanes (target ≤ 60 k). The
+   graph's ROUTER_TOPK passes `env->pool`, the test entry the session's.
+
+### S3 artifacts
+
+Set `/local/mnt/workspace/htp_moe/132/set2/` (`md5.txt` inside), built from
+`dev/fc-shadow` @ `19af4eea` (PR code `b8037431` + the shadow commit):
+
+| file | md5 | note |
+|---|---|---|
+| `libnntr_hvx_skel.so` | `eaba476cbec5840004445f4613abcf9a` | `test/htp/build.sh`, `UNDEFINED SYMBOLS OK (52 runtime imports)` |
+| `libnntr_hvx_skel_base.so` | `b07eb8a699c7e4fbee6c15cd1cba3bd3` | `htp_moe` @ `aaafd0c4`, the router profile's Pb |
+| `libnntrainer.so` | `9e8b91267dfa02bef6ec70e5c3f1ae02` | the new IDL's stub; NEEDED `libsdkl.so`, `libcdsprpc.so` |
+| `libcausallm_core.so` / `nntrainer_causallm` / `libccapi-nntrainer.so` | `5ddac9a4…` / `7797dd80…` / `02d314e5…` | unchanged since sitting 1 |
+| `unittest_hvx_softmax` | `90507ccd9e23d2b1fc3b4f5d3c94684f` | G1, G3 |
+| `unittest_nntrainer_cpu_backend` | `17afcad382e5a8be7b758d367deacfa9` | relinked, not run in S3 |
+| `libc++_shared.so`, `libsdkl.so`, prompts | as sitting 1 | |
+
+Workstation, S3 tree: `run_host_checks.sh` (`ALL CHECKS PASS` x3,
+`WORKER POOL LANES OK`, `Q8 QUANT HVX BIT-IDENTICAL`, `Q4 GEMV
+BIT-IDENTICAL`, `ROUTER TOPK BIT-IDENTICAL`, `GRAPH STRETCH
+BIT-IDENTICAL` with ROUTER_TOPK on a real pool), syntax check 0,
+`*Lfm2Moe*` 6 passed, `INPROC E2E PASS` (same fixture lines as before);
+the ISS sweep of the scalar divide at exponent 0: `a/127 bad=0 1/a bad=0`
+over all 8 388 608 mantissas; the kernel's code carries 72 qf32 ops and no
+asm IEEE .sf, the quantizer's divides are inline sfrecipa sequences.
+
+### S3 expected lines
+
+* G1: `SF_PROBE … op=intrin_* bad=0/…` and `scalar_sffma bad=0/256`, the
+  `asm_ieee_*` lines as they come (the finding), `SF_PROBE
+  intrinsics+sffma bad=0`, `SCALAR_DIV divides=50331648 bad=0`,
+  `FC_Q4_FIELD … variant=hvx_intrin … rows=8 bad=0` x10, `FC_Q4_FIELD
+  total bad=0`, `FC_Q4_FIELD small ops: q8_quant bad_rows=0 swiglu_cpu
+  bad=0 argmax bad=0` (the quantizer now on 500 rows), router x3, `PASSED
+  ] 5 tests`.
+* G3: `FC_RATE_PROJ variant=hvx_intrin …` direct / vtcm x 1/2/4/6 lanes,
+  `quant_ms` now the vector quantizer's; `FC_RATE bad_total=0`.
+* G2: `FC SHADOW … fc=600/600 add=96/96 router=176/176`; nll S == A.
+* Router: `ROUTER_TOPK pcyc/op: htp_moe skel … this set … (target <= 60000)`.
+* 8 prompts: S nll == A and S text identical, 32 logs present.
+
+### S3 results (fill in)
+
+| cell | expected | got |
+|---|---|---|
+| SfProbe asm_ieee_vadd / vsub / vmpy (random, step) | the finding | |
+| SfProbe intrinsics + sffma | bad=0 | |
+| ScalarDivide | bad=0 | |
+| G1 FC 10 cells, quantizer 500 rows, router | bad=0 | |
+| G3 ms/token at 6 lanes, vtcm / direct; quant_ms | reported | |
+| G2 fc / add / router | 600/600, 96/96, 176/176 | |
+| ROUTER_TOPK pcycles/op | ≤ 60 000 | |
+| 8 prompts nll / text S == A | 8/8, 8/8 | |

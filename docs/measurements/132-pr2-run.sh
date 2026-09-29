@@ -24,8 +24,8 @@ want() { # want <label> <got> <expected>
   if [ "$2" = "$3" ]; then echo "OK  $1 = $2"; else echo "BAD $1: got '$2' want '$3'"; MIS=$((MIS + 1)); fi; }
 therm() { echo "$1 $(date +%H:%M:%S) $(adb -s $S shell 'dumpsys battery | grep -E "^  (level|temperature)"; cat /sys/class/thermal/thermal_zone0/temp' | tr -d '\r' | tr '\n' ' ')" | tee -a $L/therm.log; }
 zone0() { adb -s $S shell cat /sys/class/thermal/thermal_zone0/temp | tr -d '\r'; }
-cool() { for i in $(seq 1 40); do z=$(zone0); [ "$z" -le 35000 ] && break
-  echo "zone0=$z > 35000, waiting 30 s ($i/40)"; sleep 30; done; echo "zone0=$(zone0)"; }
+cool() { local t z; for t in $(seq 1 40); do z=$(zone0); [ "$z" -le 35000 ] && break
+  echo "zone0=$z > 35000, waiting 30 s ($t/40)"; sleep 30; done; echo "zone0=$(zone0)"; }
 F="NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1,ADD,ROUTER_TOPK NNTR_HTP_PROFILE=2"
 env_of() { case $1 in
   A*) echo "";;
