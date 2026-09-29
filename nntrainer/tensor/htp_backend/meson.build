@@ -80,6 +80,7 @@ if get_option('htp-inproc')
     htp_test_dir / 'nntr_hvx_attn_m1.c',
     htp_test_dir / 'nntr_hvx_dspq.c',
     htp_test_dir / 'nntr_hvx_fc_q4.c',
+    htp_test_dir / 'nntr_hvx_sf_probe.c',
     'hmx/hexkl_mm_u8i4.c',
     'hmx/hexkl_mm_u8i4_dma.c',
     'hmx/hexkl_mm_u8i4_moe.c',

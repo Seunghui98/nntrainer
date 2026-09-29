@@ -664,7 +664,7 @@ interface nntr_hvx : remote_handle64 {
    // m1_ops_det.h. Test entries: no model path calls them. A bad shape is
    // AEE_EINVALIDFORMAT, a bad handle AEE_EBADITEM; never AEE_EBADPARM.
    //
-   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 64 == 0,
+   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 128 == 0,
    // K <= 8192, N % 32 == 0), copied to the DSP heap: h names it until
    // q4m1_release or close. At most 8 at once (AEE_EBADITEM past that).
    AEEResult q4m1_register(in uint32 K, in uint32 N, in sequence<uint8> w,
@@ -672,10 +672,8 @@ interface nntr_hvx : remote_handle64 {
    AEEResult q4m1_release(in uint32 h);
 
    // y (N) = the CPU's Q4_0 FC of x (K) with weight h, reps times (y from
-   // the last). variant: bits 0-7 the kernel (0 HVX native sf, 1 HVX
-   // Q6_Vsf intrinsics, 2 scalar sffma chains), bits 8-15 the columns in
-   // flight for 2 (8, 16 or 32), bit 16 the VTCM feed (per-lane DMA,
-   // src_bypass). lanes: pool threads, 1..8 (capped at the pool). stats
+   // the last). variant: bit 16 the VTCM feed (per-lane DMA, src_bypass),
+   // every other bit 0. lanes: pool threads, 1..8 (capped at the pool). stats
    // (8): [0] GEMV us over the reps, [1] quantizer us, [2..3] GEMV
    // pcycles lo | hi, [4] lanes used, [5] reps, [6] K, [7] N.
    AEEResult fc_q4m1_f32(in uint32 h, in uint32 variant, in uint32 lanes,
@@ -683,8 +681,9 @@ interface nntr_hvx : remote_handle64 {
                          rout sequence<float> y,
                          rout sequence<uint32> stats);
 
-   // q8_0_quant_cpu_det: xLen % 32 == 0 floats into xLen int8 and xLen/32
-   // f16 scales (the CPU's nntr_quantize_row_q8_0).
+   // The FC's vector quantizer (hvx_q4m1_prep, = q8_0_quant_cpu_det, the
+   // CPU's nntr_quantize_row_q8_0): xLen % 128 == 0, <= 8192 floats into
+   // xLen int8 and xLen/32 f16 scales.
    AEEResult q8_quant_f32(in sequence<float> x, rout sequence<int8> q,
                           rout sequence<uint16> d);
 
@@ -695,4 +694,11 @@ interface nntr_hvx : remote_handle64 {
 
    // m1_argmax_first: the index of the first maximum (std::max_element).
    AEEResult argmax_f32(in sequence<float> x, rout uint32 idx);
+
+   // One f32 operation per element on the DSP (nntr_hvx_sf_probe.c), to
+   // name the operation a kernel disagrees on: op 0/1/2 the inline-asm
+   // IEEE vadd/vsub/vmpy .sf, 3/4/5 the Q6_Vsf_* intrinsics, 6 scalar a/b,
+   // 7 scalar sffma a*b + 1. o = op(a, b); a multiple of 32 for 0..5.
+   AEEResult sf_probe(in uint32 op, in sequence<float> a,
+                      in sequence<float> b, rout sequence<float> o);
 };
