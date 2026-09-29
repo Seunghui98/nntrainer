@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <engine.h>
 #include <filesystem>
 #include <fstream>
@@ -700,6 +701,21 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   std::vector<std::chrono::high_resolution_clock::time_point> token_done_ts;
   token_done_ts.reserve(NUM_TO_GENERATE + 1);
   token_done_ts.push_back(start_generation);
+  // [#150] NNTR_OP_TIME=1: the decode loop's split beside the per-node
+  // [OP-TIME] lines (neuralnet.cpp). Unset, no clock is read.
+  static const bool op_time = [] {
+    const char *e = std::getenv("NNTR_OP_TIME");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  std::chrono::steady_clock::duration op_infer{}, op_sample{}, op_register{},
+    op_token{};
+  auto op_now = [] {
+    return op_time ? std::chrono::steady_clock::now()
+                   : std::chrono::steady_clock::time_point{};
+  };
+  // token_us runs from one token's end to the next, like token_done_ts, so
+  // whatever no stage timer covers lands in the report's unattributed row
+  auto op_prev = op_now();
 
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
@@ -710,11 +726,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       break; // the continuation is used up
 
     allocateAndBindKVCache();
+    const auto op_t0 = op_now();
     auto output_interval =
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,
                                    token_generation_idx + global_token_len);
+    const auto op_t1 = op_now();
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+    const auto op_t2 = op_now();
     if (ppl_dec) {
       // Scored after generate(), on the logits the pick is taken from (the
       // bad-word ids are -inf there), so the self and the forced run score
@@ -742,10 +761,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
         static_cast<float>(ids_list[b]);
     }
+    const auto op_t3 = op_now();
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
     token_done_ts.push_back(std::chrono::high_resolution_clock::now());
+    if (op_time) {
+      const auto op_t4 = std::chrono::steady_clock::now();
+      op_infer += op_t1 - op_t0;
+      op_sample += op_t2 - op_t1;
+      op_register += op_t4 - op_t3;
+      op_token += op_t4 - op_prev;
+      op_prev = op_t4;
+    }
 
     // output should be deallocated after use
     for (auto out : output_interval) {
@@ -843,6 +871,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::cout << "total: " << total_duration.count() << " ms\n";
     std::cout << "peak memory: " << peak_memory << " KB\n";
     std::cout << "==========================================================\n";
+  }
+
+  if (op_time) {
+    using us = std::chrono::duration<double, std::micro>;
+    std::fprintf(stderr,
+                 "[OP-TIME] step tokens=%u infer_us=%.3f sample_us=%.3f "
+                 "register_us=%.3f token_us=%.3f\n",
+                 generation_cnt, us(op_infer).count(), us(op_sample).count(),
+                 us(op_register).count(), us(op_token).count());
   }
 
   performance_metrics.prefill_tokens = init_len;
