@@ -281,15 +281,77 @@ asm IEEE .sf, the quantizer's divides are inline sfrecipa sequences.
 * Router: `ROUTER_TOPK pcyc/op: htp_moe skel … this set … (target <= 60000)`.
 * 8 prompts: S nll == A and S text identical, 32 logs present.
 
-### S3 results (fill in)
+### S3 results (2026-09-30 02:22-02:47 KST, `R3CY10WM83Y`, zone0 27.8-29.7 °C at start; logs `/local/mnt/workspace/htp_moe/132/logs_s3/`; 1 expectation mismatch: the router gate)
 
 | cell | expected | got |
 |---|---|---|
-| SfProbe asm_ieee_vadd / vsub / vmpy (random, step) | the finding | |
-| SfProbe intrinsics + sffma | bad=0 | |
-| ScalarDivide | bad=0 | |
-| G1 FC 10 cells, quantizer 500 rows, router | bad=0 | |
-| G3 ms/token at 6 lanes, vtcm / direct; quant_ms | reported | |
-| G2 fc / add / router | 600/600, 96/96, 176/176 | |
-| ROUTER_TOPK pcycles/op | ≤ 60 000 | |
+| SfProbe `asm_ieee_vadd / vsub / vmpy`, 256 random normal pairs | the finding | **256/256 bad, every result `0x00000000`** (e.g. `431a663d + 3828cf8f`: dsp `00000000`, host `431a6640`) |
+| SfProbe asm on the failing step's operands (P1 = F1·S1, P2 = F2·S2) | the finding | vadd / vsub 32/32 bad (`0x00000000`); vmpy 0/32 only because those lanes' exact products are 0 |
+| SfProbe `intrin_vadd / vsub / vmpy`, `scalar_sffma` | bad=0 | 0/256 and 0/32 each; `SF_PROBE intrinsics+sffma bad=0` |
+| ScalarDivide (6 x 2^23 divides) | bad=0 | `SCALAR_DIV divides=50331648 bad=0` |
+| G1 FC 10 cells, quantizer 500 rows, SwiGLU, argmax, router 3 shapes | bad=0 | all bad=0, `PASSED ] 5 tests` |
+| G3 at 6 lanes, VTCM feed | reported | **7.844 ms/token** (fc 5.089 + lm_head 2.755), **quant_ms 0.527**; K 7168 N 2048: 173.7 µs/call, 47.6 GB/s; lm_head slice 352.7 µs, 53.5 GB/s |
+| G3 direct feed | reported | 30.601 ms/token (quant_ms 0.864); 1 / 2 / 4 lanes VTCM 44.3 / 22.3 / 11.3 |
+| G2 | 600/600, 96/96, 176/176 | **fc 600/600, add 96/96, router 176/176**; nll S == A |
+| G4 (heap probe, A) | reported | 109 MiB (sitting 1: 113) |
+| ROUTER_TOPK pcycles/op | ≤ 60 000 | **65 528** (htp_moe skel 33 755): missed by 9 % |
+| 8 prompts nll / text S == A | 8/8, 8/8 | 8/8, 8/8 (p01-p08, 32 logs) |
+
+**Confirmed cause of sitting 1's hvx_native / sffma failure.** The
+inline-asm IEEE HVX `.sf` forms (`Vd.sf = vadd / vsub / vmpy(Vu.sf,
+Vv.sf)`, assembled with `-mhvx-ieee-fp`) return `0x00000000` in every lane
+on this v79 silicon, while the ISS executes them as IEEE ops. The
+`Q6_Vsf_*` intrinsics (a qf32 op and a conversion) and the scalar
+`sffma` are exact on the same operands. No rounding differs: the asm form
+does not execute. `hvx_native` used it for every add, sub and mul, and the
+sffma tail for its `d_w * d_a` terms. #164's norm and the router passed
+because they never used it. LEDGER rule 53.
+
+Quantizer: 7.0 µs per K = 2048 call on silicon (≈ 14.7 k pcycles at the
+≈ 2.1 GHz G3 implies) against 10.7 k on the ISS (x1.37). Scalar spec in
+sitting 1: ≈ 60 µs; quant_ms 4.8 → 0.53.
+
+## Sitting S4 (router only, after S3)
+
+The router missed its gate by 9 %. On the ISS the chain loop ran at about
+20 cycles per k whether it held 8 or 16 chains: it was bound by the row
+load (each k reads a new 128-byte line of the gate weight, an L1 miss),
+not by `sffma`. `38dd1626` prefetches the row 8 ahead into L1 (`dcfetch`),
+in a loop split so the last 8 rows do not prefetch. ISS, one 8-chain
+group at K = 2048: **47.7 k → 13.8 k pcycles** (4 / 16 ahead the same, 32
+worse; a clamped prefetch address inside the loop 24.1 k). ISS against
+silicon: S3's 65 528 on the phone against the ISS model's ≈ 50 k
+projection for the same code (x1.3; the quantizer x1.37); the ISS now
+projects ≈ 19 k (13.8 k per lane + 17.4 k / 4 of sigmoids and pick +
+dispatch), so ≈ 25-27 k on silicon if the ratio holds. Host checks all
+pass (`ROUTER TOPK BIT-IDENTICAL`, `GRAPH STRETCH BIT-IDENTICAL`).
+
+Set `/local/mnt/workspace/htp_moe/132/set3/`, runner
+`bash /local/mnt/workspace/htp_moe/132/run_132s4.sh R3CY10WM83Y` (≈ 15 min,
+logs `logs_s4/`; copy `docs/measurements/132-pr2-run-s4.sh`): G1 router
+cells (3 shapes), the router profile (htp_moe skel vs this set, gate ≤
+60 000), and the 8 prompts (S nll and text == A). The set is rebuilt from
+the tree rebased on `htp_moe` @ `4eab54ef` (#170's ATTN_M1 work landed
+between S3 and S4); md5s in `set3/md5.txt`.
+
+| file (`set3/`, built at `dev/fc-shadow` @ `a8a00d54`) | md5 |
+|---|---|
+| `libnntr_hvx_skel.so` (`UNDEFINED SYMBOLS OK (52 runtime imports)`, 2 `dcfetch` in `router_lane`) | `63c372ec42abd5a38ff8ab7f34f90917` |
+| `libnntr_hvx_skel_base.so` (htp_moe @ `aaafd0c4`, Pb) | `b07eb8a699c7e4fbee6c15cd1cba3bd3` |
+| `libnntrainer.so` (NEEDED `libsdkl.so`, `libcdsprpc.so`) | `6d0116785f3aba951671a26288599192` |
+| `libcausallm_core.so` / `nntrainer_causallm` / `libccapi-nntrainer.so` | `5ddac9a4…` / `7797dd80…` / `02d314e5…` (no app change upstream) |
+| `unittest_hvx_softmax` | `3160d2343655477a67bda33641a56ced` |
+
+Gates on the rebased tree: `run_host_checks.sh` (`ALL CHECKS PASS` x3,
+`WORKER POOL LANES OK`, `ROUTER TOPK BIT-IDENTICAL`, `Q8 QUANT HVX
+BIT-IDENTICAL`, `Q4 GEMV BIT-IDENTICAL`, `ATTN M1 BIT-IDENTICAL`), syntax
+check 0, `*Lfm2Moe*` 6 passed, `INPROC E2E PASS`, skel, app and gtest
+builds.
+
+### S4 results (fill in)
+
+| cell | expected | got |
+|---|---|---|
+| G1 router 3 shapes | bad=0 | |
+| ROUTER_TOPK pcycles/op (htp_moe skel / this set) | ≤ 60 000 | |
 | 8 prompts nll / text S == A | 8/8, 8/8 | |
