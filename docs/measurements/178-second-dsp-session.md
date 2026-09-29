@@ -1,6 +1,6 @@
 # Measurement 178: a second cDSP session beside the loaded app (probe Q1–Q5)
 
-Branch `htp/178-probe` @ `55e9a6ca` (stacked on `htp/132-exact-fc` @ `e5e579b3`,
+Branch `htp/178-probe` @ `bc3c52a8` (stacked on `htp/132-exact-fc` @ `e5e579b3`,
 PR #175; plan `docs/plans/178-second-dsp-session.md` on `htp/178-plan`, PR #180)
 — estimated device time: **35 min**
 
@@ -38,10 +38,14 @@ sitting, the canary expects hvx_intrin only (10 cells bad=0), logs in
 is now Q5's last S2 cell (`s2_heap_mib`), Q1 has `s2_heap_mib_nomap`
 (cap 1024).
 
-| set2 file | md5 |
-|---|---|
-| `unittest_hvx_two_sessions` | `e8d5c98e8fc996d714726e951bdcb325` |
-| every other file | as in the table below |
+| file | set2 md5 | set3 md5 |
+|---|---|---|
+| `unittest_hvx_two_sessions` | `e8d5c98e8fc996d714726e951bdcb325` | `43e22f378062c1a88d6c5dd4a4c3dc9d` (`bc3c52a8`) |
+| every other file | as in the table below | same |
+
+Set3 (`/local/mnt/workspace/htp_moe/178/set3/`) = set2 with the probe
+that no longer grows S2's heap to the end of its address space; see
+"Finding" below.
 
 ## Artifacts (built on the workstation, SDK 6.4.0.1, HexKL 6.4.0.1, NDK r30, v79)
 
@@ -66,97 +70,151 @@ The app set is A's: the probe changes no product code (no default, no env
 switch, no weight format); the skel's S1 path is the full open as before
 (hw_init + HMX lock succeed in S1, so the lite branch is not taken).
 
-## Steps (the orchestrator, phone on USB)
+## Steps (set3; the orchestrator, phone on USB, **rebooted first**)
 
-1. `bash /local/mnt/workspace/htp_moe/178/run_178_set2.sh R3CY10WM83Y` (≈ 35 min;
-   log and summary in `/local/mnt/workspace/htp_moe/178/logs/sitting.out`).
-   It checks the set's md5 on both ends, waits for zone0 ≤ 35 °C before each
+1. `bash /local/mnt/workspace/htp_moe/178/run_178_set3.sh R3CY10WM83Y` (≈ 35 min;
+   `docs/measurements/178-run-set3.sh`; logs in
+   `/local/mnt/workspace/htp_moe/178/logs3/`, summary `sitting.out`). It
+   checks set3's md5 on both ends, waits for zone0 ≤ 35 °C before each
    block, and runs, in order:
-   * the stale-skel canary `unittest_hvx_softmax --gtest_filter='HvxFcQ4.MatchesSpecBitExact'`
-     (`FC_Q4_FIELD total bad=0`; it also covers this branch's change to the
-     VTCM feed's DMA call);
+   * the canary `unittest_hvx_softmax --gtest_filter='HvxFcQ4.MatchesSpecBitExact'`:
+     the hvx_intrin cells (5 shapes × 2 feeds, the kernel the probe runs)
+     must read `bad=0`; the test itself fails on hvx_native / sffma*
+     (#132's G1 finding) and that is not a stale skel;
    * **A** (nothing set), prompt 512 (`prompt512.txt` = `docs/measurements/77-prompt512.txt`),
-     G = 64 and 512, twice each;
-   * **P cold**: `unittest_hvx_two_sessions --gtest_filter='TwoSessions.*'`;
-   * **A** at G = 1024 twice, then **P warm** at once.
-2. Expected lines: every A log `[HTP] moe m1 gemv: on (applied=0x703e1) … dma_bypass=1`
-   once, `dspq: on` once, `dspq: close calls=N served=N bad=0`, no
-   `calls/token` (rule 36); every P log five `TwoSessions.Q[1-5]_` results
-   and the `S2_FIELD` lines below. `0x8000040e` anywhere stops the run
-   (stale skel). The plan's stop rules print `S2_STOP rule=…` and are
-   reported, not enforced (the remaining cells still run where they can).
+     G = 64 / 512 / 1024, twice each — **all before any probe**;
+   * **P cold** (`unittest_hvx_two_sessions --gtest_filter='TwoSessions.*'`),
+     then **sanity_1** (A at G = 8);
+   * **P warm** at once, then **sanity_2**.
+2. Expected lines: every A log (sanity included)
+   `[HTP] moe m1 gemv: on (applied=0x703e1) … dma_bypass=1` once, `dspq: on`
+   once, `dspq: close calls=N served=N bad=0`, no `calls/token` (rule 36);
+   each sanity also one `generation:` line — a sanity without it (the
+   banner alone is printed even when the arena then fails, set2's A_G1024)
+   means the probe run before it left the cDSP short and prints `LEAK:`.
+   Every P log: five `TwoSessions.Q[1-5]_` results and the `S2_FIELD`
+   lines; `S2_STOP rule=s1_ceiling_lost` means the phone was not rebooted
+   after a leak. A probe-internal rc is reported, never a stop; `0x8000040e`
+   in the canary or an A log stops the run (stale skel).
 3. Paste the summary below, commit this file on the branch, push, set #178
    to `state:measured`.
 
-Stop rules on the day (plan §4 step 4):
-* `s2_reserve_rc=0x00000073` (AEE_ENOSESSION): no second session; Q2–Q4
-  skip, Q5 checks S1. The §3.5 fallback is then the only option (a) cost.
-* `S2_STOP rule=s2_open_hang`: the gtest killed S2's PD after 10 s
-  (`FASTRPC_REMOTE_PROCESS_KILL` on S2's effective domain only; never
-  `FASTRPC_SESSION_CLOSE`); read `P_*.logcat` for S2's `hexkl_micro_hw_init`.
-* `S2_STOP rule=s2_mmap_lt_512`: the 4 GiB is per HLOS process, not per PD.
-* `S2_STOP rule=fc_set_over_13ms`: the FC set on S2 cannot beat A.
+Stop rules on the day (plan §4 step 4), reported by the gtest as `S2_STOP`:
+`s2_reserve_rc=0x00000073` (no second session), `s2_open_hang` (killed on
+S2's effective domain only), `s2_mmap_lt_512` (the 4 GiB would be per
+process), `fc_set_over_13ms`, `s2_dead`, `s1_ceiling_lost`.
 
-## Results (fill in)
+## Results — set2 (2026-09-29 23:28–23:32, R3CY10WM83Y, 100 % battery, zone0 29.7 → 65.6 °C)
+
+`expectation mismatches: 5` — all from the leak below (A_G1024 r1 / r2
+have no `dspq: on` / `close` because the app died at arena registration;
+their text differs). `plan stop rules hit: 0`.
 
 ### A (the sitting's control)
 
 | G | run | prefill tok/s | decode tok/s (all) | decode tok/s (last 64) | text = run 1 | banner (0x703e1, dma_bypass=1, dspq on) |
 |---|---|---|---|---|---|---|
-| 64 | 1 | | | | (ref) | |
-| 64 | 2 | | | | | |
-| 512 | 1 | | | | (ref) | |
-| 512 | 2 | | | | | |
-| 1024 | 1 | | | | (ref) | |
-| 1024 | 2 | | | | | |
+| 64 | 1 | 559.6 | 52.59 | 52.59 | (ref) | y |
+| 64 | 2 | 559.0 | 52.33 | 52.33 | y | y |
+| 512 | 1 | 531.7 | 54.64 | 54.01 | (ref) | y |
+| 512 | 2 | 518.7 | 53.89 | 53.60 | y | y |
+| 1024 | 1 | — | — | — | void: after P cold, `HTP arena: … fastrpc_mmap(64 MiB) failed: err=1 … mapped=3584 MiB in 14 chunks` | banner only |
+| 1024 | 2 | — | — | — | void, same | banner only |
 
-Reference (A of the #158 sitting, S25 Ultra): 50.6 decode tok/s at G = 512.
+Sitting 1 (same unit, 23:20): A G = 64 53.07 / 53.07, G = 512 54.36 / 54.39.
+Reference (#158 B, S25 Ultra): 50.6 decode tok/s at G = 512.
 
-### P (Q1–Q5), cold / warm
+### P (Q1–Q5), cold / warm — all five `[OK]` in both
 
 | Q | cell | cold | warm | pass / stop |
 |---|---|---|---|---|
-| 1 | `s1_mmap_mib` (expect 3840), `s1_heap_mib` (≈ 113–182) | | | — |
-| 1 | `s2_reserve_rc`, `s2_session_id`, `s2_effdom` | | | `0x73` stop |
-| 1 | `s2_open_rc`, `s2_open_us`, S2 `open_path` / `hmx_locked` / `vtcm_size` (`session_info who=s2_open`) | | | rc 0, ≤ 2 s |
-| 1 | `s2_hmx_call_rc` (lite: `0x80000414`) | | | — |
-| 1 | `s2_mmap_mib` with S1 held, `s2_heap_mib_nomap` (cap 1024) | | | `s2_mmap_mib < 512` stop |
-| 1 | `s2_q4m1_n` / `s2_q4m1_mib` (74 / ≈ 385 = all fit) | | | ≥ 383 + 48 + 64 |
-| 2 | `hop_arm_spin_us_0b` / `_12k` (median, p90) | | | — |
-| 2 | `hop_arm_block_us_0b` / `_12k` | | | — |
-| 2 | `hop_mbox_us_0b` / `_8k` (timeouts 0, bad 0) | | | > 100 µs on both transports flagged |
-| 2 | `hop_mbox_thread_cost_pct` (S2 FC with S1 spinning vs parked) | | | — |
-| 3 | `ddr_s1_alone_gbs` (≈ 69), `ddr_s2_alone_gbs` (≈ 45) | | | — |
-| 3 | `ddr_concurrent_aggregate_gbs` (and `_pinned_cpu0_cpu1`) | | | vs ≈ 70 ceiling |
-| 3 | `ddr_sequential_gbs` | | | the design's number |
-| 4 | `s2_vtcm_avail_kib`, `s2_vtcm_max_page_kib`, `s2_vtcm_size_kib` | | | — |
-| 4 | `s2_fc_rate_vtcm_us` / `_l2_us` / `_direct_us` (K = 7168, N = 2048, best lanes) | | | — |
-| 4 | `s2_fc_ms_per_token` per feed, `s2_fc_ms_per_token_best`, `s2_fc_bad_total` | | | > 13 ms stop; bad 0 |
-| 5 | `s2_mmap_mib_q5`, `s2_heap_mib` (ladder held; may end S2: `S2_STOP rule=s2_dead where=q5_after_heap_probe`) | | | — |
-| 5 | `s2_close_rc`, `s1_keeps_hmx`, `s1_keeps_vtcm`, `vtcm_avail_kib_start_end` | | | yes / yes |
+| 1 | `s1_mmap_mib`, `s1_heap_mib` | 3840, 140 | **3584** (the leak), 334 | — |
+| 1 | `s1_hmx_smoke_rc` | 0 | 0 | — |
+| 1 | `s2_reserve_rc`, `s2_session_id`, `s2_effdom`, URI | 0, 1, 7, `…&_dom=cdsp&_session=1` | same | **pass** |
+| 1 | `s2_open_rc`, `s2_open_us`, S2 `open_path` / `hmx_locked` / `vtcm_size` | 0, 22 359, 1 / 0 / 0 | 0, 22 291, same | **pass** (lite, 22 ms) |
+| 1 | `s2_hmx_call_rc`; S1 after S2's open | `0x80000414`; `hmx_locked=1`, VTCM 8 MiB | same | as designed |
+| 1 | `s2_mmap_mib` with S1 at 3840 / 3584 held; `s2_heap_mib_nomap` | **3584**; ≥ 1024 (cap) | 3584; ≥ 1024 | **pass: the 4 GiB is per PD** |
+| 1 | `s2_q4m1_n` / `s2_q4m1_mib` | **74 / 383, all fit** | 74 / 383 | **pass** (≥ 383 + 48 + 64 with the heap) |
+| 2 | `hop_arm_spin_us_0b` / `_12k` (median; p90) | 2.8 (3.0) / 12.7 (12.9) | 2.9 / 13.1 | — |
+| 2 | `hop_arm_block_us_0b` / `_12k` | 35.6 (68.8) / 46.6 (57.2) | 36.8 / 48.2 | — |
+| 2 | `hop_mbox_us_0b` / `_8k` | **0.33 / 2.42**, 10 000 each, timeouts 0, bad 0 | 0.34 / 2.43 | none > 100 µs |
+| 2 | `hop_mbox_thread_cost_pct` (S2 FC L2-fed, 402 µs) | −1.2 | +2.1 | noise |
+| 3 | `ddr_s1_alone_gbs` / `ddr_s2_alone_gbs` (S2 L2-fed, 6 lanes) | 70 / 20 | 70 / 20 | — |
+| 3 | concurrent: S1 / S2 own rates (ARM-window aggregate) | **58.2 / 15.4** (37.3) | 57.8 / 16.0 (38.5) | S1 −17 %; sum 73.6 ≈ the 70 GB/s ceiling |
+| 3 | same, ARM threads pinned cpu0 / cpu1 | 58.6 / 14.8 (34.2) | 57.8 / 16.1 (38.5) | pinning changes nothing |
+| 3 | `ddr_sequential_gbs` (ARM window; DSP-only) | 27.2 (42.4) | 26.5 (41.6) | — |
+| 4 | S2 `vtcm_avail_kib` / `max_page` / `size` | **0 / 0 / 0** | 0 / 0 / 0 | S1 holds all 8 MiB |
+| 4 | K 7168 N 2048: VTCM / L2 / direct (best lanes) | refused (rc `0x80000600`) / **316 µs, 26.1 GB/s @ 3 lanes** (17.5 @ 6) / 700 µs, 11.8 @ 6 | same | — |
+| 4 | K 2048 N 6144: L2 / direct | **136 µs, 51.9 GB/s @ 6** / 575 µs, 12.3 | same | — |
+| 4 | `s2_fc_ms_per_token` L2 / direct; `bad_total` | **8.06** / 32.7; 0 | 8.06 / 34.7; 0 | ≤ 13 → no stop; vs CPU 7.4 |
+| 5 | `s2_mmap_mib_q5`, `s2_heap_mib` beside it (cell removed in set3) | 3072, 764 | 3072, 764 | — |
+| 5 | `s2_close_rc`, `s1_keeps_hmx`, `s1_keeps_vtcm` (HMX smoke before == after) | 0, yes, yes | 0, yes, yes | **pass** |
+
+The VTCM feed on a session with 0 bytes of VTCM returned `AEE_ERPC`
+(`0x80000600`) instead of the skel's `AEE_EINVALIDFORMAT`; not followed
+up (the feed cannot run there either way).
+
+### Finding: set2 leaked cDSP mapping room across processes
+
+After P cold every later process lost ≈ 192–256 MiB of fastrpc mapping
+room on the cDSP: A_G1024 r1 / r2 (and a fresh sanity run by the
+orchestrator) died at `fastrpc_mmap(64 MiB) … mapped=3584 MiB in 14
+chunks` (3696 needed), and P warm's own S1 ladder read 3584 instead of
+3840. It persists across processes (kernel / DSP side), so only a reboot
+clears it. The one driver error on the way out (P_cold.logcat,
+23:31:39.224, S2's close): `apps_mem_imp.c:203 remote_munmap64 failed for
+size 2097152 (vaddrout 0x50a000000) … 0x80000441` — the HLOS-side unmap of
+a 2 MiB page of S2's **grown DSP heap** failed. Q5 had just grown S2's
+heap to the end of its address space (764 MiB beside a 3072 MiB mapping
+ladder); sitting 1's S2 had crashed after the same kind of probe. A 2 MiB
+map stuck in the session's address space would block one 256 MiB chunk,
+which fits the loss. Every buffer the test maps itself (both ladders, the
+mailbox page, the dspqueue payloads) is `fastrpc_munmap`'d before
+`nntr_hvx_close`; the Q4M1 weights are DSP heap and `q4m1_register` keeps
+no mapping (it copies the FastRPC argument into `memalign`, freed by
+`q4m1_release` / close). **Not verified**: that the heap-to-the-end probe
+is the cause; set3 removes it (`bc3c52a8`), caps Q1's S2 heap probe at
+512 MiB, and brackets each probe run with an A sanity, so the next
+sitting names the run that leaks if one still does. For the E2E design
+this is a rule to carry: a session must never grow its DSP heap to the
+end of its address space, and a second session's teardown is checked
+with an app run after it.
 
 ### §3.4 projection with the blanks filled
 
 | term | ms/token | source |
 |---|---|---|
 | MoE, 22 × 0.418–0.43 | 9.2–9.5 | rule 43 |
-| FC + lm_head on S2, best feed | | Q4 |
-| activation quantizer (HVX, assumed) | 0.3 | #132 ponytail |
-| router (multi-chain, assumed) | 1.0 | #132 |
+| FC + lm_head on S2, L2-fed (VTCM: 0 KiB) | **8.06** | Q4 (CPU does it in 7.4) |
+| activation quantizer (HVX) | 0.3 **pending** (assumed; 4.8 scalar today) | #132 ponytail |
+| router (multi-chain) | 1.0 **pending** (assumed; 4.4 scalar today) | #132 |
 | ATTN_M1, 6 layers | 2.0 | #170 |
-| small ops | 0.9 | contract §12 |
-| hops, 44 × best transport + 2 ends | | Q2 |
-| **total** | | |
+| norms and small ops | 0.9 | contract §12 |
+| hops, 44 DSP↔DSP + 2 ends | **0.1–0.6** (dspq spin 2.8–12.7 µs; mailbox 0.33–2.4 µs ≈ 0.02–0.1) | Q2 |
+| **total** | **≈ 20.3–21.1 without the pending two; ≈ 21.6–22.4 with them → ≈ 45–46 tok/s** | |
+| A, hybrid (#158 B / this sitting G = 512) | 19.7 → 50.6 / 18.4 → 54.3 | |
 
-## Recommendation (fill in after the table)
+Overlap does not rescue it: concurrent S1 + S2 reads already sum to the
+≈ 70 GB/s ceiling and cost S1's MoE feed 17 %.
 
-<build the two-session E2E plan as a new issue / stop at (c) of #132 / the
-§3.5 fallback — with the session split, hops per token and the projected
-ms/token>
+## Recommendation (supervisor, after set3 confirms the leak fix)
+
+The mechanism works: a second session exists, opens lite in 22 ms, has its
+own 4 GiB (3584 MiB mapped beside S1's 3840; the whole 383 MiB FC set +
+lm_head on its heap), hops cost 0.3–13 µs, and S1 keeps its HMX and VTCM.
+But S2 gets no VTCM, the L2-fed exact FC runs at 8.06 ms/token (above the
+CPU's 7.4), and the projected end-to-end path is ≈ 21–22 ms/token
+(≈ 45–46 tok/s) against the hybrid A's 18.4–19.7 (50.6–54.3). By the
+numbers, option (a) is not faster than A. What would change that: an L2
+feed at the K = 2048 rate for K = 7168 as well (≈ −1 ms), or VTCM for S2
+(S1's M=1 feed leaves none). Next steps (build the two-session E2E plan as
+a new issue, stop at (c) of #132, or the §3.5 fallback) are the user's
+call.
 
 ## Notes from the run
 
-<serial, battery, zone0 log, S2's FARF lines from `P_*.logcat`, anything stale>
+Sitting 1 and set2 as above. Set3: after a reboot; `logs3/` keeps each
+probe's logcat (`nntr_hvx_open|lite|hexkl_micro|AEE|fastrpc|apps_mem|munmap`).
 
 ## Rebuild recipe (fresh worktree)
 
