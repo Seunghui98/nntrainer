@@ -269,7 +269,7 @@ for g in 64 512 1024; do
   pa=$(grep "^G=$g A " $L/speed.txt | awk '{s += $4} END {print s / NR}')
   for v in Q2 Q3; do
     pv=$(grep "^G=$g $v " $L/speed.txt | awk '{s += $4} END {print s / NR}')
-    echo "G=$g $v prefill $pv vs A $pa: $(awk -v a=$pv -v b=$pa 'BEGIN{d = 100 * (a / b - 1); printf "%+.1f %% %s", d, d >= -5 ? "ok" : "BELOW -5 %"}')"
+    echo "G=$g $v prefill $pv vs A $pa: $(awk -v a=$pv -v b=$pa 'BEGIN{d = 100 * (a / b - 1); printf "%+.1f %% %s", d, (d >= -5 ? "ok" : "BELOW -5 %")}')"
   done
 done | tee $L/prefill.txt
 echo "--- reads (the split and the three A/B reads)"; cat $L/reads.txt

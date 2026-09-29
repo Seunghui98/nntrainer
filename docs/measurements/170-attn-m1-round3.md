@@ -1,4 +1,4 @@
-# Measurement 170 round 3 (S4): the split softmax, exp16 by the checked table, q by vlut16 — speed gate G6 on silicon
+# Measurement 170 round 3 (S4): the split softmax, exp16 by the checked table, q by vlut16 — G6 passes at G = 64 and 1024, bit-identical
 
 Branch `htp/170-round3` @ `0a6aea4f` (plan `docs/plans/170-attn-m1-round3.md`,
 PR #189's plan; stacks on PR #182 = `htp/170-round2` @ `72c42079`). The new
@@ -14,7 +14,8 @@ waits extra). Run by the orchestrator:
 bash /local/mnt/workspace/htp_moe/170/s4/run_s4.sh R3CY10WM83Y
 ```
 
-(a byte-identical copy is `docs/measurements/170-s4-run.sh`; it sources
+(`docs/measurements/170-s4-run.sh` is the copy, byte-identical until the
+post-sitting `prefill.txt` fix; it sources
 `tools/htp/env.sh` between `set +u` and `set -u`). Logs go to
 `/local/mnt/workspace/htp_moe/170/s4/logs/`, the summary to
 `logs/sitting.out`. The script waits for zone0 ≤ 35 °C, stops on
@@ -218,50 +219,126 @@ sysroot if `jni/obj/local` lacks it.
 Stop rules: `0x8000040e` (stale skel), a device md5 mismatch (install or
 skel swap), `bad ≠ 0` in (d).
 
-## Results S4 (fill in)
+## Results S4 (ran 2026-09-30 04:40:48 – 05:07:18 KST on `R3CY10WM83Y`, logs `/local/mnt/workspace/htp_moe/170/s4/logs/`; filled from the logs)
 
-Device md5 = `md5.txt`: | expectation mismatches: | G6a over: | zone0 at start: | W =
+Device md5 = `md5.txt` (`MD5 OK`, and every skel swap's md5 matched).
+`expectation mismatches: 1`: G6b's ratio (below). `G6a terms over their
+line: 8` (read, not gated). No `0x8000040e`. **W = r3e.** zone0 27.8 °C
+at start, 30.8 °C after the gtest half, 52.5 °C after the shadow, 59–69
+°C through the speed cells, 64–65 °C through G6 and G5; battery 100 → 91
+%. `mhz` 2091–2108 in every phase line. `HvxAttnM1.RejectsBadShapes`
+failed on `AEE_ERPC` (0x80000600) as expected (#137, not counted). The
+whole sitting took 26.5 min, not 75: the gtest half ran in ≈ 10 s.
 
-| skel | cold pos 1023: append / scores / softmax / exp / et / max / sum / div / pv / busy_max / pool / dsp_us / mhz | cold pos 511 pool |
-|---|---|---|
-| q2 (round 2, 9 words) | | |
-| r2w | | |
-| r3 | | |
-| r3n | | |
-| r3e | | |
+`HvxAttnM1.PerLayerCost`, cold pos 1023, pcycles lane-summed over 6 lanes
+(q2 = round 2's skel and gtest in this sitting, 9 words):
+
+| skel | append | scores | softmax | exp | et | max | sum | div | pv | busy_max | pool | dsp_us | pos 511 pool |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q2 (round 2) | 35.2 k | 670.1 k | 513.9 k | – | – | – | – | – | 363.4 k | 268.8 k | 307.0 k | 163.1 | 164.5 k |
+| r2w | 34.1 k | 680.7 k | 536.0 k | **272.0 k** | 73.4 k | 15.8 k | 10.3 k | 139.7 k | 383.4 k | 279.2 k | 316.1 k | 167.4 | 171.9 k |
+| r3 | 24.5 k | **391.6 k** | 643.5 k | **389.4 k** | 73.9 k | 15.8 k | 9.6 k | 132.6 k | 367.0 k | 243.9 k | 283.5 k | 146.5 | 148.7 k |
+| r3n | 29.2 k | 648.7 k | 616.6 k | 371.3 k | 73.3 k | 14.5 k | 10.1 k | 129.8 k | 353.4 k | 282.4 k | 318.4 k | 166.6 | 166.9 k |
+| **r3e = W** | 28.5 k | 386.9 k | 637.3 k | 386.7 k | 73.2 k | 14.9 k | 9.2 k | 128.2 k | 368.2 k | 242.2 k | **280.9 k** | 148.1 | 152.1 k |
+
+W's own G3 run (`per_l.txt`, the G6a line) read `append` 26.7 k, `scores`
+385 k, `softmax` 614 k (`exp` 373 k, `et` 71 k, `max` 13 k, `sum` 9 k,
+`div` 123 k), `pv` 384 k, `busy_max` 242 k, `pool` 276 k, `dsp_us` 144.9;
+pos 511 `pool` 148.8 k.
 
 | gate | line | value | pass |
 |---|---|---|---|
-| G6b | r2w exp / softmax; pieces ≤ softmax; drift vs q2 | | |
-| G3 | W: `ATTN_M1_FIELD` 8 L, `append_chain`, F16Det, rope64 | | |
-| G4 | shadow Q3 / RQ3, nll = A | | |
-| G5 | nll = A (Q3, RQ3 × 8), A forced = A self; text = A (Q3, RQ3 × 8), Q3 = Q2 (× 8) | | |
-| G6 | Q3 `pcyc/op ATTN_M1` (Q2 same sitting) | G 64: / G 1024: | |
+| G6b | r2w `exp / softmax`; pieces ≤ softmax; drift vs q2 | **0.507** (window 0.55–0.75); 511.2 k ≤ 536.0 k; 1,600 k vs q2 1,547 k (+3.4 %) | ratio **no** (see Read), identity yes, no drift |
+| G3 | W: `ATTN_M1_FIELD` `bad` / `bad_stats` at the 8 L, `append_chain`, `AttnM1F16Det` 513 / 1024 / 1536, rope64 ×5 | all 0 (22 lines) | **yes** |
+| G4 | shadow (G = 8, A reference) | Q3 and RQ3 `tag3_heads=1536/1536 records=48 layers=6 positions=8 zero_records=0 logits_equal_steps=8/8`; nll = A for both | **yes** |
+| G5 | nll = A (Q3, RQ3 × p01–p08), A forced = A self; text = A (Q3, RQ3 × 8), Q3 = Q2 (× 8), G = 256 | all equal (16 + 1 nll, 24 text) | **yes** |
+| G6 | `pcyc/op ATTN_M1`, Q3 (Q2 same sitting) | G = 64: **193,838** (Q2 254,869, −23.9 %); G = 1024: **313,747** (Q2 379,551, −17.3 %) | **yes**: 0.92× / 0.90× the gates 210 k / 350 k |
+
+G6a (read, W): within its line `pv` 384 k ≤ 400 k, `busy_max` 242 k ≤ 245
+k, `dsp_us` 144.9 ≤ 145, `scores` (best of three) 387 k ≤ 600 k; over it
+`append` 26.7 k (8 k), `exp` 373 k (150 k), `div` 123 k (120 k), `et` 71 k
+(55 k), `softmax` 614 k (300 k), `max + sum` 22.7 k (20 k), `pool` 276 k
+(275 k), pos 511 `pool` 148.8 k (148 k).
 
 | variant | G | run 1 prefill / decode / last 64 | run 2 prefill / decode / last 64 | decode mean | text = A |
 |---|---|---|---|---|---|
-| A | 64 | | | | ref |
-| Q2 | 64 | | | | |
-| Q3 | 64 | | | | |
-| A | 512 | | | | ref |
-| Q2 | 512 | | | | |
-| Q3 | 512 | | | | |
-| A | 1024 | | | | ref |
-| Q2 | 1024 | | | | |
-| Q3 | 1024 | | | | |
+| A | 64 | 560.8 / 53.96 / 53.96 | 503.4 / 53.92 / 53.92 | **53.94** | ref |
+| Q2 | 64 | 562.6 / 44.11 / 44.11 | 532.8 / 43.99 / 43.99 | 44.05 | same |
+| Q3 | 64 | 544.7 / 44.38 / 44.38 | 555.3 / 44.60 / 44.60 | **44.49** | same |
+| A | 512 | 538.9 / 54.57 / 50.16 | 425.2 / 51.70 / 50.24 | **53.13** | ref |
+| Q2 | 512 | 541.8 / 45.71 / 44.85 | 422.4 / 45.31 / 44.85 | 45.51 | same |
+| Q3 | 512 | 528.9 / 46.36 / 46.04 | 423.5 / 45.71 / 45.75 | **46.04** | same |
+| A | 1024 | 416.6 / 50.60 / 48.56 | 369.7 / 50.06 / 48.30 | **50.33** | ref |
+| Q2 | 1024 | 426.0 / 44.73 / 43.99 | 425.6 / 43.26 / 39.65 | 43.99 | same |
+| Q3 | 1024 | 385.5 / 44.82 / 44.17 | 424.5 / 44.16 / 44.20 | **44.49** | same |
 
-Reference (S3, same unit): A 55.13 / 50.82 / 51.40, Q2 44.49 / 46.26 /
-45.24 decode tok/s at G = 64 / 512 / 1024; Q2 `pcyc/op ATTN_M1` 250,289 /
-373,642. Goal ≥ 50 decode.
+All Q cells `calls/token=28.00` and `cache=24576 KiB`; every cell's text
+equals A run 1 of its G. Q3 vs Q2 decode: +1.0 / +1.2 / +1.1 %; Q3 vs A:
+−17.5 / −13.3 / −11.6 %. The profile's `dsp` per graph call: Q2 419.1 →
+Q3 372.4 µs (G = 64), 421.9 → 419.9 µs (G = 1024). Prefill means against
+A's (computed by hand: the script's verdict column printed empty -- a
+bare `>` in awk's `printf` arguments is an output redirection; fixed in
+`170-s4-run.sh` after the sitting): Q2 +2.9 / +0.0 / +8.3 %, Q3 +3.4 / −1.2 /
++3.0 % (G = 64 / 512 / 1024): within the −5 % band.
+
+## Read S4
+
+* **Both speed gates pass**, bit identity held everywhere (G3, G4, G5):
+  in-model `ATTN_M1` 193.8 k / 313.7 k against 210 k / 350 k, from round
+  2's 254.9 k / 379.6 k in the same sitting. Decode moved +1 % (6 layers ×
+  0.03–0.06 ms out of ≈ 22 ms per token): the resident path is still 28
+  DSP calls per token, and Q3 stays 12–18 % under A. **The default stays
+  off**; removing the round trips is the end-to-end track (#132), not this
+  kernel.
+* **What landed: the vlut16 q operand.** Cold `scores` 681 k (r2w) →
+  392 k (r3), warm 601 k → 314 k; `append` 34 k → 24–28 k. The P1 lead is
+  worth 649 k → 387 k with the lut (r3n vs r3e); the ET lead is neutral
+  (r3e within 1 % of r3), so W = r3e and the fold removes it.
+* **What did not: the exp table.** On silicon the gather reads **387 k**
+  cold (r3), the exp16 compute it replaced **272 k** (r2w): the table is a
+  115 k lane-summed loss (≈ 19 k pcycles wall, 9 µs per call). The ISS
+  priced the compute right (271 k, 1.0×) and the gather 3× low (124 k):
+  six threads issuing scalar loads after HVX stores is what it cannot
+  model. `pool` still fell 307 k → 276–281 k because scores fell more.
+  **Round 4's first term is `exp`**: a gtest-only cell of W with
+  `-DATTN_M1_EXP_TAB=0` (kept for that; host bit-identical) would, if
+  exp16 costs there what it cost in r2w, read `softmax` ≈ 510 k and `pool`
+  ≈ 257 k (an estimate: 115 k lane-summed / 6 lanes off W's busy lane);
+  then `vgather` from a VTCM
+  carve-out (plan §3.5).
+* **G6b's ratio missed (0.507 vs 0.55–0.75)** because silicon's other
+  softmax pieces are larger than the ISS's, not because exp is smaller:
+  `exp` 272 k = the ISS's 271 k, but `div` 140 k (ISS 90 k), `et` 73 k
+  (ISS 41 k), `max + sum` 26 k (ISS 15 k). The split itself holds (pieces
+  511 k ≤ softmax 536 k); the sitting did not drift (+3.4 % vs q2).
+* **Round-4 order by size (W, cold pos 1023, lane-summed):** `exp` 373 k,
+  `scores` 385 k, `pv` 384 k (at the DDR line, plan §3.5's DMA lever),
+  `div` 123 k, `et` 71 k.
 
 ## Text approval (per-token-entry handoff)
 
+The p01 text at G = 256 of A, Q2, Q3 and RQ3 is byte-identical (md5 of
+the stripped text `e377add566c09b7ef2a0698ed106b8be` for all four, the
+same as S2's and S3's); so are p02–p08 (G5). The decode PPL forced on A's
+continuation is equal to 17 digits.
+
 | variant | decode PPL (forced on A, p01, G = 256) | generated text (p01, G = 256) | text approved (user: y/n) |
 |---|---|---|---|
-| A | | | (reference) |
-| Q2 | (text only) | | |
-| Q3 | | | |
-| RQ3 | | | |
+| A | 1.42156 (nll_sum 90.048889370024341, source=self) | md5 above | (reference) |
+| Q2 | (text only) | identical to A (same md5) | |
+| Q3 | 1.42156 (nll_sum 90.048889370024341) | identical to A (same md5) | |
+| RQ3 | 1.42156 (nll_sum 90.048889370024341) | identical to A (same md5) | |
+
+## Fold (plan step 7, commit `653a619d`)
+
+`ATTN_M1_Q_LUT` and round 2's splat vectors removed (the lut won); the
+ET lead removed (W = r3e); the P1 and PV leads kept. The folded default
+compiles to r3e's instructions exactly (`-S` diff empty outside debug
+info), so S4's skel is the PR's kernel. `ATTN_M1_EXP_TAB` stays, default
+1 (the configuration G3–G6 were read on), with the S4 reading beside it;
+`-DATTN_M1_EXP_TAB=0` passes the host check. After the fold: `ALL CHECKS
+PASS`, `ATTN M1 BIT-IDENTICAL`, `INPROC E2E PASS` with the 203 lines
+byte-equal, both skels `UNDEFINED SYMBOLS OK (51 runtime imports)`.
 
 ## Notes (S4 build)
 
@@ -284,4 +361,10 @@ Reference (S3, same unit): A 55.13 / 50.82 / 51.40, Q2 44.49 / 46.26 /
 
 ## Notes from the run (S4)
 
-<thermal, `mhz` per phase line, FARF / AEE errors, anything stale>
+`adb -s R3CY10WM83Y` throughout. Thermal and `mhz` as in Results; no
+FARF / AEE error besides rule 38's `AEE_ERPC` in `RejectsBadShapes`. The
+single expectation mismatch is G6b's ratio. `run_s4.sh` defect for the
+next copy: the `prefill.txt` verdict column is empty (mawk parsed the
+unparenthesised `d >= -5 ? …` in `printf` as a redirection; the copy in
+the repo is fixed, `run_s4.sh` in the set is the one that ran); the
+numbers above are from `speed.txt`.
