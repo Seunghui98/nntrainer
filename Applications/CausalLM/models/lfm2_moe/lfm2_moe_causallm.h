@@ -44,6 +44,13 @@ public:
 
   void registerCustomLayers() override;
 
+  /**
+   * @brief Lfm2CausalLM::load_weight, then (#132 Part B, HTP builds) hand
+   *        the decode list's FC, dense FFN and lm_head Q4_0 weights to the
+   *        HTP backend in list order when those kinds are resident.
+   */
+  void load_weight(const std::string &weight_path) override;
+
 protected:
   unsigned int NUM_EXPERTS = 0;
   unsigned int NUM_EXPERTS_PER_TOK = 0;
@@ -68,7 +75,8 @@ protected:
 
   /**
    * @brief Create the variant-specific MoE layer for a given layer id.
-   * @note Overridden by the Slim / CachedSlim variants to emit their layer type.
+   * @note Overridden by the Slim / CachedSlim variants to emit their layer
+   * type.
    */
   virtual Tensor createMoeLayer(const int layer_id, Tensor input);
 };

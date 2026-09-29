@@ -14,8 +14,11 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <layer_context.h>
 #include <llm_util.hpp>
 #include <model.h>
+
+#include <map>
 
 #ifdef ENABLE_HEXKL
 #include <compute_ops.h>
@@ -39,7 +42,8 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
       "Lfm2Moe: num_experts, num_experts_per_tok and moe_intermediate_size "
       "must be specified in the config file");
   }
-  // Layers [0, num_dense_layers) keep the dense SwiGLU FFN. Optional (default 0).
+  // Layers [0, num_dense_layers) keep the dense SwiGLU FFN. Optional (default
+  // 0).
   NUM_DENSE_LAYERS = cfg.value("num_dense_layers", 0);
 
   // MoE expert FFN weight dtype. Defaults to FC_LAYER_DTYPE (set by
@@ -141,6 +145,75 @@ Tensor Lfm2MoeCausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
   return createMoeLayer(layer_id, input);
 }
 
+void Lfm2MoeCausalLM::load_weight(const std::string &weight_path) {
+  Lfm2CausalLM::load_weight(weight_path);
+#ifdef ENABLE_HEXKL
+  // [#132 Part B] The resident FC kinds' weights, in the decode list's
+  // order (htp_graph_lfm2_build): per layer the attention's q, k, v and o
+  // or the conv block's in_proj and out_proj, then a dense layer's up,
+  // gate and down; last the tied lm_head. Looked up by layer name (the
+  // names createAttention / createConvBlock / createMlp give), so the
+  // walk's order does not matter; the backend checks every shape. The
+  // first refusal means no such kind is resident, and nothing is kept.
+  std::map<std::string, std::vector<nntrainer::Tensor *>> q4;
+  model->forEachLayer(
+    [&q4](ml::train::Layer &l, nntrainer::RunLayerContext &rc, void *) {
+      for (auto *w : rc.getWeights()) {
+        auto &t = w->getVariableRef();
+        if (t.getDataType() == ml::train::TensorDim::DataType::Q4_0)
+          q4[l.getName()].push_back(&t);
+      }
+    },
+    nullptr);
+  auto *ops = nntrainer::get_htp_ops();
+  size_t handed = 0;
+  auto hand = [&](const std::string &name, size_t n, bool tied) {
+    auto it = q4.find(name);
+    if (it == q4.end() || it->second.size() != n) {
+      if (handed == 0)
+        return false; // not a Q4_0 model: the backend's init says so if
+                      // it wanted these weights
+      throw std::runtime_error("Lfm2Moe: NNTR_HTP_FORWARD: layer " + name +
+                               " has no " + std::to_string(n) +
+                               " Q4_0 weights for the resident FC kinds");
+    }
+    for (auto *t : it->second) {
+      const unsigned K = tied ? t->width() : t->height();
+      const unsigned N = tied ? t->height() : t->width();
+      if (!ops->add_decode_graph_q4_0(t->getData<char>(), K, N, tied))
+        return false;
+      ++handed;
+    }
+    return true;
+  };
+  auto first = [&](const std::string &a, const std::string &b) {
+    return q4.count(a) ? a : b;
+  };
+  for (int l = 0; l < NUM_LAYERS; ++l) {
+    const std::string p = "layer" + std::to_string(l);
+    bool took;
+    if (layer_types_.at(l) != "conv") {
+      took = hand(p + "_qkv", 3, false) && hand(p + "_attention_out", 1, false);
+    } else if (q4.count(p + "_conv_block")) {
+      took = hand(p + "_conv_block", 2, false);
+    } else {
+      took = hand(p + "_conv_in_proj", 1, false) &&
+             hand(p + "_conv_out_proj", 1, false);
+    }
+    if (took && l < static_cast<int>(NUM_DENSE_LAYERS)) {
+      const std::string f = first(p + "_ffn", p + "_ffn_up");
+      took = f == p + "_ffn" ? hand(f, 3, false)
+                             : hand(p + "_ffn_up", 1, false) &&
+                                 hand(p + "_ffn_gate", 1, false) &&
+                                 hand(p + "_ffn_down", 1, false);
+    }
+    if (!took)
+      return; // the backend takes none: no Q4M1 kind is resident
+  }
+  hand(first("output_of_causallm", "embedding0"), 1, true);
+#endif
+}
+
 void Lfm2MoeCausalLM::registerCustomLayers() {
 
   Lfm2CausalLM::registerCustomLayers();
@@ -149,7 +222,8 @@ void Lfm2MoeCausalLM::registerCustomLayers() {
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::Lfm2MoELayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::Lfm2MoELayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register Lfm2MoELayer factory, reason: " << e.what()
               << std::endl;
