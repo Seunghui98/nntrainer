@@ -104,6 +104,10 @@
 #                              skips it, LM_BAN, as the CPU's -inf does)
 #   E2E ppl-decode e3==e1-hd64 steps=7 identical=1     (NNTR_PPL_DECODE
 #                              forced on E1's path: the logits come back)
+#   E2E teardown 25off / 25e3 arena chunks unmapped n/n mapped_kib=0
+#                              freed_while_mapped=0  (E5i: the S1 arena
+#                              released on the DSP, then unmapped, before
+#                              the close; one session and two)
 #   E2E arena retry cap=100 refused=2 bit_identical=1  (E5g: a boot whose
 #                              last 256 MiB window is taken; the stand-in
 #                              refuses maps past 100 MiB and keeps a refused
@@ -503,6 +507,23 @@ if grep -q 'bit_identical=1' <<< "$cap_eval" && [ "$refused" -ge 1 ]; then
 else
   echo "E2E FAIL arena retry under a cap: refused=$refused [$cap_eval]"; fail=1
 fi
+# [#132 Part B E5i] every S1 arena chunk unmapped before the session
+# closes, on the one-session path and on E's; nothing mapped at exit and no
+# buffer freed while mapped (the stand-in refuses an unmap the DSP side
+# still holds)
+for t in 25off 25e3; do
+  un="$(sed -n 's/.*arena: chunks unmapped \([0-9]*\)\/\([0-9]*\) .*/\1 \2/p' "$OUT/$t.log")"
+  ex="$(grep -o 'INPROC rpc exit: .*' "$OUT/$t.log" | head -1)"
+  # the arena goes after the other hooks (E: after S2's close line)
+  late="$(grep -n 'arena: chunks unmapped\|s2: close' "$OUT/$t.log" | tail -1)"
+  if read -r a b <<< "$un" && [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" -gt 0 ] &&
+    [ "$ex" = "INPROC rpc exit: mapped_kib=0 freed_while_mapped=0" ] &&
+    grep -q 'arena: chunks unmapped' <<< "$late"; then
+    echo "E2E teardown $t arena chunks unmapped $a/$b mapped_kib=0 freed_while_mapped=0"
+  else
+    echo "E2E FAIL teardown $t: unmapped=[${un:-none}] [$ex]"; fail=1
+  fi
+done
 for d in "25e1run 25e3run lfm25" "25e1ban 25e3ban lfm25-ban"; do
   read -r r1 r3 label <<< "$d"
   e1_gen="$(grep '^E2E gen ' "$OUT/$r1.log")"
