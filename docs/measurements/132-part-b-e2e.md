@@ -6,6 +6,54 @@ staged at `/local/mnt/workspace/htp_moe/132/set_e5b/` — estimated device
 time: **≈ 90 min** (phone rebooted first). set_e5 (below, `10bb91b7` /
 `d77a4bf2`) was read on 2026-09-30 06:13.
 
+## set_e5f as read (2026-09-30 09:26–10:2x), and the leak
+
+* MoE dumps E == A `bit_identical=1` (46 files). Lanes ladder (G = 64):
+  3,3 → 27.1, **6,3 → 29.5**, 8,3 → 29.4 tok/s (6,3 is the default).
+* Speed, A E E A: E 29.38 / 29.25, 30.88 / 30.80, 30.80 / 30.95 tok/s at
+  G 64 / 512 / 1024 against A 53.96 / 54.28, 53.57 / 53.49, 51.49 / 51.80.
+  E is flat across G: #170 round 3's ATTN_M1 is 0.61 ms a token.
+* Per kind (6,3): S1 router 0.80 + MoE 10.46 ms (0.475 a round), wall
+  22.5; S2 RMSNORM 0.40, FC 6.06, CONV 0.52, QK 0.10, ROPE 0.03, ATTN 0.61,
+  ADD 0.13, DENSE_FFN 2.24, LM_HEAD 3.49 (the Q4M1 kinds 11.8 ms against the
+  isolated 8.06), wall 26.0; the ARM's token 29.8 ms. S1 waits 11.2 ms and
+  S2 12.2 ms a token: the sessions strictly alternate.
+* **Stopped by the mapping leak.** Every E run up to ppl_E_p04 registered
+  S1 to 3840 (`s1_arena_mib=3840`), and so did the A runs between them;
+  text_A_p04, the run right after ppl_E_p04, stopped at `mapped=3584 MiB in
+  14 chunks` (`fastrpc_mmap(64 MiB) failed: err=1`). ppl_E_p04's logcat
+  (and ppl_E_p01's, a clean one) show the same close sequence and no
+  `remote_munmap64` / `apps_mem` failure; its own close lines are clean
+  (timeouts 0, stale 0, both queues `bad=0`). So one two-session run in
+  about 12 lost 256 MiB of the next process's room, and the device logs do
+  not say how.
+* Changes for set_e5g: the teardown stops both queues and both token
+  drivers before any munmap and unmaps in the reverse of the mapping order;
+  a `[HTP] s2: close mapped_mib / unmap_fail / detach_fail / heap_used_kib`
+  line (both sessions' heap from `HAP_mem_get_stats`); a
+  `TwoSessions.S1Ceiling` cell the runner reads after every run, so the
+  run that loses room is named at once.
+
+## set_e5g (staged)
+
+`/local/mnt/workspace/htp_moe/132/set_e5g/run_e5g.sh` (reboot first,
+≈ 100 min; skel `30a1ffd7…`, `libnntrainer.so` `1fee6b5c…`,
+`unittest_hvx_two_sessions` `fec2960d…`, runner `fa3b5b9b…`): E5f's cells
+(canary, warm-up, dumps, startup, lanes ladder, speed A E E A, 8 prompts)
+with S1's ceiling read before the sitting and after every run (below 3840:
+`STOP: LEAK … after <run>`), an A sanity after every E run, each E run's
+close line and logcat kept.
+
+## Follow-up after the leak: weight prefetch across the alternation
+
+The data dependence leaves one overlap: while S1 runs a layer's MoE round,
+S2 is idle, and DRAM has ≈ 12–15 GB/s of headroom beside the MoE feed. A
+prefetch lane on S2 (l2fetch or DMA into its L2 scratch) that pulls the
+next layer's FC weights during S1's round covers ≈ 130–150 MB of the
+≈ 400 MB S2 reads a token — ≈ −3 ms; S1 can prefetch the next layer's
+router weights (256 KiB) during S2's stretch. Cell: E at G = 64 / 512 with
+the prefetch on and off, per-kind lines, text against A.
+
 ## set_e5e and set_e5d as read (2026-09-30 08:40–09:2x, after reboots)
 
 * **E5e: bit-identical over 64 steps on both prompts** — S and Ev
