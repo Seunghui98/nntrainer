@@ -4216,7 +4216,9 @@ private:
         unmap_fail += dspqRelease(*q);
       }
     }
-    if (e.graph2)
+    // [plan 201 S1] one PD: S1's one graph names the FC slots below, so it
+    // goes first (the graph's other close finds none left)
+    if (e.graph2 || (e.one_pd && e.h2 != 0))
       nntr_hvx_graph_release(e.h2);
     e.graph2 = false;
     for (uint32_t h : e.q4m1)

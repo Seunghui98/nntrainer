@@ -121,7 +121,8 @@
 #                              all-resident E run of the same fixture)
 #   E2E e3 pds=1 pool C=2 lfm25 == e3 bit_identical=1 ... (one PD, a pool)
 #   E2E e3 pds=1 hd64 / lfm25 == pds=2 bit_identical=1 calls/token=1.00
-#                              hops/token=0.00 timeouts=0/0  (plan 201 S1:
+#                              hops/token=0.00 timeouts=0/0 unmap_fail=0
+#                              (plan 201 S1:
 #                              NNTR_HTP_E2E_PDS=1, every kind and the FC set
 #                              on S1, one packet a token)
 # and, since #194 S1 (htp_moe_ppl), the same two-session token with lever
@@ -454,8 +455,9 @@ for d in "64e3 64pd1 hd64" "25e3 25pd1 lfm25"; do
   close="$(grep -o 'token driver: close .*' "$OUT/$2.log")"
   if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
      grep -q 'hops/token=0.00 .* timeouts=0/0 stale=0/0' <<< "$close" &&
-     grep -q 'token driver: on .* pds=1' "$OUT/$2.log"; then
-    echo "E2E e3 pds=1 $3 == pds=2 bit_identical=1 calls/token=1.00 hops/token=0.00 timeouts=0/0"
+     grep -q 'token driver: on .* pds=1' "$OUT/$2.log" &&
+     grep -q 's2: close .* unmap_fail=0 detach_fail=0 ' "$OUT/$2.log"; then
+    echo "E2E e3 pds=1 $3 == pds=2 bit_identical=1 calls/token=1.00 hops/token=0.00 timeouts=0/0 unmap_fail=0"
   else
     echo "E2E FAIL e3 pds=1 $3: [$ev] calls/token=${calls:-none} close=[$close]"; fail=1
   fi
