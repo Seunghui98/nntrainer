@@ -104,6 +104,11 @@
 #                              skips it, LM_BAN, as the CPU's -inf does)
 #   E2E ppl-decode e3==e1-hd64 steps=7 identical=1     (NNTR_PPL_DECODE
 #                              forced on E1's path: the logits come back)
+#   E2E arena retry cap=100 refused=2 bit_identical=1  (E5g: a boot whose
+#                              last 256 MiB window is taken; the stand-in
+#                              refuses maps past 100 MiB and keeps a refused
+#                              fd, as the driver did; S1's chunk halves to
+#                              64 MiB and the run equals the uncapped one)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
 # (NNTR_HTP_DSPQ=1, inproc/dspqueue_standin.c; plan 141-dspq-moe.md step 4),
 # each against the switch-off run's dumps, every call's bytes:
@@ -296,6 +301,8 @@ NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KIND
   run_e2e q64-e1ppl "$OUT/htp64q" htp "$OUT/dump_64e1ppl" "$OUT/64e1ppl.log" --max-seq 32 --run
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
+PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
 rc_e1=0
 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS "$E2E" --model "$OUT/htp" \
   --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
@@ -489,6 +496,13 @@ for d in "hd64 64e3 64e1a 4.00" "lfm25 25e3 25e1a 8.00"; do
     echo "E2E FAIL $fx e3: calls/token=${calls:-none} close=[$close]"; fail=1
   fi
 done
+cap_eval="$($EVAL --label e3cap "$OUT/dump_25e3" "$OUT/dump_25e3cap" | tail -1 || true)"
+refused=$(grep -c 'arena: [0-9]* MiB refused' "$OUT/25e3cap.log" || true)
+if grep -q 'bit_identical=1' <<< "$cap_eval" && [ "$refused" -ge 1 ]; then
+  echo "E2E arena retry cap=100 refused=$refused bit_identical=1"
+else
+  echo "E2E FAIL arena retry under a cap: refused=$refused [$cap_eval]"; fail=1
+fi
 for d in "25e1run 25e3run lfm25" "25e1ban 25e3ban lfm25-ban"; do
   read -r r1 r3 label <<< "$d"
   e1_gen="$(grep '^E2E gen ' "$OUT/$r1.log")"
