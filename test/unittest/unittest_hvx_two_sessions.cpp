@@ -85,8 +85,9 @@ double us_since(Clock::time_point t0) {
 }
 
 constexpr size_t kStep = size_t(256) << 20; /**< ladder step, 256 MiB */
-constexpr uint32_t FC_INTRIN = 1u, FC_FEED_VTCM = 1u << 16,
-                   FC_FEED_L2 = 1u << 17; /**< fc_q4m1_f32's variant word */
+/** @brief fc_q4m1_f32's variant word: the feed bits only (#132 PR 2 kept
+ *  the intrinsics kernel alone; any other bit is AEE_EINVALIDFORMAT). */
+constexpr uint32_t FC_FEED_VTCM = 1u << 16, FC_FEED_L2 = 1u << 17;
 constexpr uint32_t kMbxBytes = 64u * 1024u;
 
 /** @brief One rpcmem buffer mapped into a session (and maybe attached). */
@@ -597,8 +598,7 @@ double s2_fc_us(uint32_t reps, int *bad) {
   std::vector<double> s;
   for (int i = 0; i < 3; ++i) {
     double us = 0;
-    const int rc =
-      fc_call(g.h2, g.fc7168, FC_INTRIN | g.fc_feed, 6u, reps, x, &y, &us);
+    const int rc = fc_call(g.h2, g.fc7168, g.fc_feed, 6u, reps, x, &y, &us);
     EXPECT_EQ(rc, AEE_SUCCESS) << "S2 fc_q4m1_f32";
     s.push_back(us / reps);
   }
@@ -621,7 +621,7 @@ TEST_F(TwoSessions, Q2_HopCost) {
     make_row(x.data(), 7168u, 0, 1);
     double us = 0;
     g.fc_feed = FC_FEED_VTCM;
-    if (fc_call(g.h2, g.fc7168, FC_INTRIN | FC_FEED_VTCM, 6u, 1u, x, &y, &us) !=
+    if (fc_call(g.h2, g.fc7168, FC_FEED_VTCM, 6u, 1u, x, &y, &us) !=
         AEE_SUCCESS) {
       g.fc_feed = FC_FEED_L2;
     }
@@ -768,8 +768,7 @@ TEST_F(TwoSessions, Q3_DdrShare) {
   auto s2_run = [&](Side *s) {
     std::vector<float> yy;
     s->t0 = Clock::now();
-    s->rc = fc_call(g.h2, g.fc7168, FC_INTRIN | g.fc_feed, 6u, reps, x, &yy,
-                    &s->dsp_us);
+    s->rc = fc_call(g.h2, g.fc7168, g.fc_feed, 6u, reps, x, &yy, &s->dsp_us);
     s->t1 = Clock::now();
     s->bytes = fc_bytes(g.fc7168) * reps;
   };
@@ -854,7 +853,7 @@ TEST_F(TwoSessions, Q4_VtcmShare) {
     for (int fi = 0; fi < 3; ++fi) {
       for (uint32_t lanes = 1; lanes <= 6; ++lanes) {
         double us = 0;
-        const uint32_t v = FC_INTRIN | feeds[fi];
+        const uint32_t v = feeds[fi];
         int rc = fc_call(g.h2, w, v, lanes, 1u, x, &y, &us);
         if (rc == AEE_SUCCESS) {
           rc = fc_call(g.h2, w, v, lanes, 3u, x, &y, &us);
