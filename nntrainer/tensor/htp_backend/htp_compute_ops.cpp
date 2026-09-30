@@ -1619,10 +1619,26 @@ public:
                                     " (want <small>,<large>, 1..8 each)");
       fc_lanes = (a << 8) | (b << 12);
     }
+    // [#194, htp_moe_ppl] NNTR_HTP_PPL_LEVERS=<mask>: the non-bit-exact
+    // levers of plan 194 section 3.1, bit n = lever Ln (0x2: L1, the native
+    // FC / DENSE_FFN / LM_HEAD kernels). Unset or 0 = the CPU-exact kernels
+    // (E0, bit-identical to htp_moe); a bit no lever owns yet is refused.
+    uint32_t levers = 0;
+    if (const char *l = std::getenv("NNTR_HTP_PPL_LEVERS")) {
+      char *end = nullptr;
+      const unsigned long v = std::strtoul(l, &end, 0);
+      if (end == l || *end != '\0' || (v & ~0x2ul) != 0)
+        throw std::invalid_argument("NNTR_HTP_PPL_LEVERS=" + std::string(l) +
+                                    " (known: 0x2 = L1 native FC)");
+      levers = static_cast<uint32_t>(v);
+    }
+    std::fprintf(stderr, "[HTP] ppl levers=0x%x L1=%s\n", levers,
+                 (levers & 0x2u) ? "native_fc" : "exact");
     for (uint32_t i = 0; i < n_ops; ++i) {
       htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
       if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u)
-        op->feed = (feed_s == "l2" ? HTP_GRAPH_FEED_L2 : 0u) | fc_lanes;
+        op->feed = (feed_s == "l2" ? HTP_GRAPH_FEED_L2 : 0u) | fc_lanes |
+                   ((levers & 0x2u) ? HTP_GRAPH_FEED_NATIVE : 0u);
     }
     resident_mask_ = mask;
     moe_ops_.clear();
