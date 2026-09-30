@@ -155,11 +155,11 @@ no per-layer input embedding, no shared-KV layers.
 | router | sigmoid + bias top-k (`hvx_m1_ops_f32.c:238-300`) | RMS-norm (no gamma) × scale / √H → dot → softmax → top-8 → renormalise × per-expert scale, fed by the un-normed stream | yes (S4) |
 | norm | `hvx_rmsnorm_f32` **returns without computing** unless the width is a power of two (`:64-67`); 55 norms a token | width 2816; ≈ 10 norms a layer incl. q / k / **v** | yes (S4; §3.7's N1 fits here) |
 | dense FFN | SwiGLU, layers 0–1 | GeGLU in every layer beside the MoE, two branches added then normed (`HTP_GRAPH_N_SLOTS 3` too few) | yes (S4) |
-| attention | `ROPE` / `ATTN_M1` admit head_dim 64 (`htp_graph_desc.h:497`), full causal | head_dim 256 / 512, sliding window, proportional RoPE (partial 0.25), K = V in full layers | spec yes; speed needs silicon (S6) |
+| attention | `ROPE` / `ATTN_M1` admit head_dim 64 (`htp_graph_desc.h:497`), full causal | head_dim 256 / 512, sliding window, proportional RoPE (partial 0.25), K = V in full layers | spec yes (S4); speed needs silicon (S5 / S6) |
 | head | vocab 128 000, 8 slices of 16 384 rows; `NNTR_HVX_Q4M1_SLOTS 80` | 262 144 rows (16 slices), ≈ 230 Q4_0 handles; logit soft-cap (argmax-invariant), embedding × √H | yes (S4) |
 | conv kinds | `CONV1D_GATE`, conv projections | none | — |
-| "every kind resident" | the FC kinds are resident only when every kind is (`htp_compute_ops.cpp:1541-1551`) | holds for Gemma only when attention has a kernel (S6) | — |
-| graph builder, load hand-over | `htp_graph_lfm2_build` (`:594`), `lfm2_moe_causallm.cpp:154-231` | a Gemma builder and hand-over | yes (S5) |
+| "every kind resident" | the FC kinds are resident only when every kind is (`htp_compute_ops.cpp:1541-1551`) | holds for Gemma only when attention has a kernel (S4) | — |
+| graph builder, load hand-over | `htp_graph_lfm2_build` (`:594`), `lfm2_moe_causallm.cpp:154-231` | a Gemma builder and hand-over | yes (S4) |
 | fixtures | `lfm2_moe_tiny{,_hd64,_lfm25}`, `*Lfm2Moe*` | PR #4296's `gemma4_moe_tiny` (CPU) | — |
 
 **Consumers that move with a changed contract** (S1): the IDL
@@ -183,8 +183,10 @@ check do not move until S5 (Gemma's `QS4CX_WH` writer: same tile layout).
 3. With the pool smaller than "all experts", place the FC set and the
    lm_head beside it and run **one PD**; read one PD against two in the
    same sitting (S2). That is the structural gain FSU offers the E2E path.
-4. Gemma's kernels, host-gated on PR #4296's tiny fixture (S4), the model
-   when its files arrive (S5), attention last (S6).
+4. Gemma's kernels — attention included — and its end-to-end graph,
+   host-gated on PR #4296's tiny fixture (S4); the model end to end on the
+   device when its files arrive (S5, no hybrid stage); then its levers
+   (S6).
 
 **Rejected alternative** (revision 1): run Gemma as a hybrid first and
 leave the E2E path parked. It measures the new model early but builds
@@ -421,21 +423,32 @@ Each ends in a rung of `.claude/skills/hexagon-gates`.
   says they still read above 1 ms): L0 re-derived on the new token entry,
   the native FC default under D2's gate, the first-token one-time moved to
   the end of the prefill.
-* **S4. Gemma's kernels, host-gated on PR #4296's tiny fixture (no
-  device, no 26B files).** In the order the structure needs them: the
-  GeGLU epilogue of the MoE M=1 path and its spec; the Gemma router and
-  its spec; the norm at any width (N1 as the candidate) incl. the v norm;
-  the GeGLU dense FFN and the two-branch add; the 262 144-row head with
-  the soft-cap. Gate: rung 1 (each `bit-exact n/n` against its spec, SNR
-  against the CPU layer on the fixture), rung 2.
-* **S5. Gemma on the device, hybrid first** (when the files exist; PR
+* **S4. Gemma's kernels and its end-to-end graph, host-gated on PR
+  #4296's tiny fixture (no device, no 26B files).** Every decode kind
+  Gemma needs gets a resident kernel, so the token entry is one call per
+  token from the first device run (user, 2026-09-30: Gemma runs end to
+  end, no hybrid stage). In the order the structure needs them: the GeGLU
+  epilogue of the MoE M=1 path and its spec; the Gemma router and its
+  spec; the norm at any width (N1 as the candidate) incl. the v norm; the
+  GeGLU dense FFN and the two-branch add; **attention for head_dim 256 /
+  512 (sliding window, proportional RoPE with the partial factor, K = V in
+  full layers) and its spec**; the 262 144-row head with the soft-cap;
+  then the Gemma graph builder and load hand-over on S1 / S2's token
+  entry. Gate: rung 1 (each `bit-exact n/n` against its spec, SNR against
+  the CPU layer on the fixture, and an in-process E2E line on the tiny
+  Gemma fixture with the pool on: calls/token = 1.00, text / SNR against
+  the CPU run), rung 2.
+* **S5. Gemma on the device, end to end** (when the files exist; PR
   #4296 merged per §0): converter, `nntr_quantize_stream` incl. the
-  `QS4CX_WH` writer for its experts, the graph builder and load hand-over.
-  Sitting: **A** = CPU run with `moe_cache_size`, **H** = MoE on the HTP
-  through the pool, the C sweep warm / cold, the routing trace — the first
-  Gemma breakdown; §3.2 / §3.4's Gemma columns become measured.
-* **S6. Gemma end to end**: attention kernels for head_dim 256 / 512 with
-  the sliding window; then the token entry of S1 / S2's winner on Gemma.
+  `QS4CX_WH` writer for its experts. Sitting: **A** = CPU run with
+  `moe_cache_size` (the text / PPL reference), **E** = `NNTR_HTP_E2E=1`
+  through the pool, the C sweep warm / cold, the routing trace, one timed
+  run for the per-kind lines — the first Gemma breakdown; §3.2 / §3.4's
+  Gemma columns become measured. A hybrid run is a diagnostic only (to
+  split a wrong text between the MoE and the rest), never a deliverable.
+* **S6. Gemma's levers from S5's breakdown**: the attention kernels'
+  speed on silicon first (S4 gates their arithmetic, not their time), then
+  one issue per lever that reads above 1 ms a token.
 
 ## 5. Risks
 
