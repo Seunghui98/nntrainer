@@ -708,9 +708,9 @@ interface nntr_hvx : remote_handle64 {
    // length (AEE_EINVALIDFORMAT), which stays the stale-skel symptom.
    //
    // res (7): [hmx_locked, vtcm_size bytes, vtcm_avail_kib, vtcm_max_page_kib
-   // (HAP_query_avail_VTCM now), heap_free_probe_mib (0: not run here, see
-   // mem_probe_dsp_heap), open_path (0 full, 1 lite: no HMX lock, VTCM from
-   // HAP_compute_res), hvx_units].
+   // (HAP_query_avail_VTCM now), heap_used_kib ([#132 Part B E5g] the PD's
+   // heap in use, HAP_mem_get_stats; 0 without it), open_path (0 full, 1
+   // lite: no HMX lock, VTCM from HAP_compute_res), hvx_units].
    AEEResult session_info(rout sequence<uint32> res);
 
    // One side of a DSP-to-DSP hop through a shared page (nntr_hvx_mailbox.c):

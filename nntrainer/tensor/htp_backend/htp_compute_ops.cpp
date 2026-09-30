@@ -2967,22 +2967,34 @@ private:
   }
 
   /** @brief Undoes whatever creation got through, in reverse. */
-  static void dspqRelease(DspqMoe &st) {
+  static uint32_t dspqRelease(DspqMoe &st) {
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    uint32_t fail = 0; // [#132 Part B] fastrpc_munmap refusals
     if (st.act_mapped)
-      mem.munmap(st.domain, st.act->fd(), st.act->data(), st.act->size());
+      fail += mem.munmap(st.domain, st.act->fd(), st.act->data(),
+                         st.act->size()) != 0;
     if (st.out_mapped)
-      mem.munmap(st.domain, st.out->fd(), st.out->data(), st.out->size());
+      fail += mem.munmap(st.domain, st.out->fd(), st.out->data(),
+                         st.out->size()) != 0;
     st.act_mapped = st.out_mapped = false;
     if (st.q != nullptr)
       st.api->close(st.q);
     st.q = nullptr;
+    return fail;
   }
 
   /** @brief The close hook: QUIT, stop the DSP thread, close, unmap. */
   static void dspqTeardown(DspqMoe &st) {
+    if (dspqStop(st))
+      dspqRelease(st);
+  }
+
+  /** @brief QUIT and the DSP thread joined, nothing unmapped yet (the
+   *  two-session teardown unmaps in its own order). @return whether the
+   *  queue was on. */
+  static bool dspqStop(DspqMoe &st) {
     if (st.state != DspqMoe::ON)
-      return;
+      return false;
     st.state = DspqMoe::OFF;
     const uint32_t quit[2] = {HTP_DSPQ_OP_QUIT, 0};
     st.api->write(st.q, 0, 0, nullptr, sizeof(quit),
@@ -2994,7 +3006,7 @@ private:
                  "empty_polls=%u dsp_spin_us=%u stop_err=0x%x\n",
                  st.tag, (unsigned long long)st.calls, res[0], res[1], res[2],
                  res[3], static_cast<unsigned>(err));
-    dspqRelease(st);
+    return true;
   }
 
   /** @brief Creation, once, at the first M==1 MoE call (section 3.4); any
@@ -3249,6 +3261,7 @@ private:
                                "the dspq line; NNTR_HTP_DSPQ=0?): the token "
                                "packets ride it");
     }
+    e.q1 = dspq_;
     const size_t logits_bytes = static_cast<size_t>(graph_words_[5]) * 4u;
     e.q2 =
       dspqMake(e.h2, e.dom2, "dspq[S2]",
@@ -3311,8 +3324,17 @@ private:
     static_assert(HTP_OP_KIND_N == HTP_DSPQ_TOKEN_KINDS,
                   "htp_dspq_wire.h's kind count is the graph's");
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    // [#132 Part B E5g] every DSP thread stopped before any munmap: both
+    // queues (QUIT, joined), then both token drivers (their HAP_mmap_put);
+    // then the mappings in the reverse of their order (S2 arena at load; S1
+    // queue, S2 queue, the page into S1 then S2 at graph init). The close
+    // line counts what was mapped, what fastrpc_munmap / arena_detach
+    // refused, and both sessions' DSP heap (E5f: one E run in ~12 left the
+    // next process 256 MiB short of S1's 3840).
     if (e.q2)
-      dspqTeardown(*e.q2);
+      dspqStop(*e.q2);
+    if (e.q1)
+      dspqStop(*e.q1);
     uint32_t r1[5] = {0, 0, 0, 0, 0}, r2[5] = {0, 0, 0, 0, 0};
     const int s2 = e.drv2 ? nntr_hvx_token_driver_stop(e.h2, r2, 5) : 0;
     const int s1 = e.drv1 ? nntr_hvx_token_driver_stop(e.h1, r1, 5) : 0;
@@ -3390,13 +3412,30 @@ private:
                    static_cast<unsigned>(s2));
     }
     e.drv1 = e.drv2 = false;
+    uint32_t info1[7] = {0}, info2[7] = {0};
+    const int i1 = e.h1 ? nntr_hvx_session_info(e.h1, info1, 7) : -1;
+    const int i2 = e.h2 ? nntr_hvx_session_info(e.h2, info2, 7) : -1;
+    size_t mapped = 0;
+    uint32_t unmap_fail = 0, detach_fail = 0;
     if (e.mbox) {
-      if (e.mbox2)
-        mem.munmap(e.dom2, e.mbox->fd(), e.mbox->data(), e.mbox->size());
-      if (e.mbox1)
-        mem.munmap(CDSP_DOMAIN_ID, e.mbox->fd(), e.mbox->data(),
-                   e.mbox->size());
+      if (e.mbox2) {
+        unmap_fail +=
+          mem.munmap(e.dom2, e.mbox->fd(), e.mbox->data(), e.mbox->size()) != 0;
+        mapped += e.mbox->size();
+      }
+      if (e.mbox1) {
+        unmap_fail += mem.munmap(CDSP_DOMAIN_ID, e.mbox->fd(), e.mbox->data(),
+                                 e.mbox->size()) != 0;
+        mapped += e.mbox->size();
+      }
       e.mbox1 = e.mbox2 = false;
+    }
+    for (const std::shared_ptr<DspqMoe> &q : {e.q2, e.q1}) {
+      if (q && q->q != nullptr) {
+        mapped += (q->act_mapped ? q->act->size() : 0u) +
+                  (q->out_mapped ? q->out->size() : 0u);
+        unmap_fail += dspqRelease(*q);
+      }
     }
     if (e.graph2)
       nntr_hvx_graph_release(e.h2);
@@ -3404,12 +3443,21 @@ private:
     for (uint32_t h : e.q4m1)
       nntr_hvx_q4m1_release(e.h2, h);
     e.q4m1.clear();
-    for (ArenaChunk &c : e.arena) {
-      nntr_hvx_arena_detach(e.h2, c.dsp_id);
+    for (auto c = e.arena.rbegin(); c != e.arena.rend(); ++c) {
+      detach_fail += nntr_hvx_arena_detach(e.h2, c->dsp_id) != AEE_SUCCESS;
       if (mem.munmap != nullptr)
-        mem.munmap(e.dom2, c.buf->fd(), c.buf->data(), c.buf->size());
+        unmap_fail +=
+          mem.munmap(e.dom2, c->buf->fd(), c->buf->data(), c->buf->size()) != 0;
+      mapped += c->buf->size();
     }
     e.arena.clear();
+    std::fprintf(stderr,
+                 "[HTP] s2: close mapped_mib=%.2f unmap_fail=%u "
+                 "detach_fail=%u heap_used_kib s1=%u s2=%u (info rc "
+                 "0x%x/0x%x)\n",
+                 static_cast<double>(mapped) / (1024.0 * 1024.0), unmap_fail,
+                 detach_fail, info1[4], info2[4], static_cast<unsigned>(i1),
+                 static_cast<unsigned>(i2));
   }
 
   /** @brief [#132 Part B E3] One decode token on the two sessions: the
@@ -4940,7 +4988,7 @@ private:
     std::unique_ptr<HtpRpcBuffer> mbox; /**< the page both sessions map */
     bool mbox1 = false, mbox2 = false, drv1 = false, drv2 = false;
     bool graph2 = false;
-    std::shared_ptr<DspqMoe> q2; /**< S2's queue; S1's is dspq_ */
+    std::shared_ptr<DspqMoe> q1, q2; /**< S1's (dspq_) and S2's queues */
     uint32_t tok = 0;
     uint64_t tokens = 0, hops = 0, wait1_us = 0, wait2_us = 0, pcyc1 = 0,
              pcyc2 = 0, id_checked = 0, id_mismatch = 0;

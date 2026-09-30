@@ -22,6 +22,7 @@
 #include <qurt.h>
 
 #include <HAP_compute_res.h>
+#include <HAP_mem.h>
 #include <HAP_vtcm_mgr.h>
 
 #include "hexkl_micro.h"
@@ -43,6 +44,7 @@
 
 /** [#178] Not every image exports it; the lite open then takes no VTCM. */
 #pragma weak HAP_query_avail_VTCM
+#pragma weak HAP_mem_get_stats
 
 /**
  * @brief [#178] The lite open's VTCM: the largest block the resource manager
@@ -88,7 +90,14 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
   res[1] = s->vtcm_size;
   res[2] = (uint32)(avail >> 10);
   res[3] = (uint32)(max_page >> 10);
-  res[4] = 0u; /* heap: mem_probe_dsp_heap is the probe, not this */
+  {
+    /* [#132 Part B E5g] the PD's heap in use, KiB (HAP_mem_get_stats; 0
+       where the image lacks it) -- the E path's close line prints it */
+    struct HAP_mem_stats st;
+    res[4] = (HAP_mem_get_stats && HAP_mem_get_stats(&st) == 0)
+               ? (uint32)(st.bytes_used >> 10)
+               : 0u;
+  }
   res[5] = s->open_path;
   res[6] = (uint32)((qurt_hvx_get_units() >> 8) & 0xFF);
   return AEE_SUCCESS;
