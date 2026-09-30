@@ -2318,6 +2318,9 @@ public:
           a.evict[a.n_evict++][1] = w.second;
         });
       // the ARM's pool and S1's table must agree on what is missing
+      for (uint32_t i = 0; i < r.n_miss; ++i)
+        if (r.miss[i] >= d.size())
+          throw std::runtime_error("token driver: missed expert out of range");
       bool same = loads.size() == r.n_miss;
       for (uint32_t i = 0; same && i < r.n_miss; ++i)
         same = std::find(loads.begin(), loads.end(), d[r.miss[i]].key_gu) !=
@@ -2429,12 +2432,17 @@ public:
       p.active = false;
       p.cv.wait(lock, [&p] { return p.idle; });
     }
-    poolHarvest(e2e_st_->mbox->data());
-    if (p.err) {
-      std::exception_ptr err = p.err;
-      p.err = nullptr;
+    // the round's own error first: a failed answer leaves its loads unfiled
+    std::exception_ptr err = p.err;
+    p.err = nullptr;
+    if (err) {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      for (StagedExpert &st : p.pending)
+        free_expert_slots_.push_back(st.slot);
+      p.pending.clear();
       std::rethrow_exception(err);
     }
+    poolHarvest(e2e_st_->mbox->data());
   }
   void poolRefresh(const htp_dspq_token_resp &s1r) {
     size_t at = 0;
@@ -4320,8 +4328,19 @@ private:
     }
     const uint64_t us = HtpProfile::nowUs() - t0;
     const uint32_t c2 = sysCounterUs(); // after both reads: S1 answered first
-    if (!pool_descs_.empty())
-      poolDisarm(); // S1 answered (or the token failed): no round in flight
+    if (!pool_descs_.empty()) {
+      // S1 answered (or the token failed): no round in flight. A failed
+      // round leaves the ARM's pool and S1's tables apart, so the driver
+      // stops here for good, as after a transport failure.
+      try {
+        poolDisarm();
+      } catch (...) {
+        q1.broken = q2.broken = true;
+        throw;
+      }
+      if (s1r.rc != AEE_SUCCESS || s2r.rc != AEE_SUCCESS)
+        q1.broken = q2.broken = true;
+    }
     const int cb = q1.cb_err.load() != 0 ? q1.cb_err.load() : q2.cb_err.load();
     if (err != AEE_SUCCESS || cb != 0 || len2 != sizeof(s2r) ||
         len1 != sizeof(s1r) || s2r.seq != tok || s1r.seq != tok ||
