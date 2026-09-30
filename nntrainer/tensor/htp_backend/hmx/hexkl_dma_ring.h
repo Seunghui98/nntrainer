@@ -117,4 +117,15 @@ void hexkl_dma_ring_drain(void);
  */
 int hexkl_dma_ring_is_done(uint32_t idx);
 
+/**
+ * @brief Invalidates the data cache lines covering [p, p + bytes), L1 and
+ *        L2 (the dc*a instructions act on both), so the next load sees
+ *        what memory holds. What a DDR-to-DDR transfer needs on both
+ *        ends: a source line the core or a previous transfer left cached,
+ *        and a destination line the core read before the transfer
+ *        overwrote it in memory. VTCM needs neither, which is why the
+ *        weight prefetches never call this.
+ */
+void hexkl_dcache_inva(const void *p, uint32_t bytes);
+
 #endif /* __NNTRAINER_HEXKL_DMA_RING_H__ */

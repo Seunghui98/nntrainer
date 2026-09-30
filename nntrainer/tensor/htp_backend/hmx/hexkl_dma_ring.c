@@ -110,3 +110,13 @@ int hexkl_dma_ring_is_done(uint32_t idx) {
   return ((volatile hexkl_dma_desc2d *)&g_ring[idx & (HEXKL_DMA_RING_N - 1)])
     ->done;
 }
+
+void hexkl_dcache_inva(const void *p, uint32_t bytes) {
+  const uintptr_t line = 32u; /* L1 line; L2's 64 B lines cover it */
+  uintptr_t a = (uintptr_t)p & ~(line - 1u);
+  const uintptr_t end = (uintptr_t)p + bytes;
+  for (; a < end; a += line) {
+    Q6_dcinva_A((void *)a);
+  }
+  asm volatile("" ::: "memory");
+}

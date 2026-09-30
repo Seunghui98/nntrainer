@@ -1439,6 +1439,188 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
   }
 }
 
+/**
+ * Doc 52 section 10.16: the model's C=1 path splits a prefill layer call into
+ * expert groups and adds the outputs on the host, and its ppl moved 1.5% --
+ * deterministically, and differently for 22+10 than for 16+16. At the
+ * model's scale (32 experts, M=444, top-4), this asks the two questions the
+ * ppl cannot: does a row's output depend on which OTHER experts share the
+ * call (it must not -- a row only one group touches has to come back
+ * bit-identical), and which of the whole and the split call matches the
+ * per-expert two-call reference.
+ */
+TEST_F(HmxMmU8I4Layer, MoeLayerSplitMatchesWhole) {
+  const uint32_t K = 2048, I = 1792, N = 2048, M = 444, NE = 32, TOPK = 4;
+  // Four distinct weight pairs, cycled: neighbouring experts always differ,
+  // which is what the kernel's weight pipeline sees, and 32 distinct pairs
+  // would need 168 MiB of DSP heap for no extra coverage.
+  const uint32_t NW = 4;
+  std::vector<Weight> gu(NW), dn(NW);
+  for (uint32_t w = 0; w < NW; ++w) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xB1E00000u + w, gu[w]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xD1000000u + w, dn[w]));
+    gu[w].w_f32 = std::vector<float>();
+    dn[w].w_f32 = std::vector<float>();
+  }
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    h_gu[e] = gu[e % NW].handle;
+    h_dn[e] = dn[e % NW].handle;
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0010u);
+
+  // Top-4 routing: every token to 4 distinct experts, rows in token order
+  // within an expert, experts in expert order -- the layer's layout.
+  std::vector<std::vector<std::pair<uint32_t, float>>> rows_of(NE);
+  std::vector<uint32_t> expert_mask(M, 0); // bit e: token routed to e
+  {
+    uint32_t st = 0xFEEDu;
+    for (uint32_t t = 0; t < M; ++t) {
+      for (uint32_t k = 0; k < TOPK; ++k) {
+        uint32_t e;
+        do {
+          st = st * 1664525u + 1013904223u;
+          e = (st >> 8) % NE;
+        } while (expert_mask[t] & (1u << e));
+        expert_mask[t] |= 1u << e;
+        st = st * 1664525u + 1013904223u;
+        rows_of[e].push_back({t, 0.05f + 0.45f * ((st >> 8) % 1000u) / 1000.f});
+      }
+    }
+  }
+  // One call over experts [e0, e1), into out.
+  auto run = [&](uint32_t e0, uint32_t e1, std::vector<float> &out) {
+    std::vector<uint32_t> ri, rc, hg(h_gu.begin() + e0, h_gu.begin() + e1),
+      hd(h_dn.begin() + e0, h_dn.begin() + e1);
+    std::vector<float> rw;
+    for (uint32_t e = e0; e < e1; ++e) {
+      rc.push_back(static_cast<uint32_t>(rows_of[e].size()));
+      for (const auto &p : rows_of[e]) {
+        ri.push_back(p.first);
+        rw.push_back(p.second);
+      }
+    }
+    out.assign(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
+    return nntr_hvx_mm_u8i4_moe_layer(
+      handle_, M, K, I, N, hg.data(), static_cast<int>(hg.size()), hd.data(),
+      static_cast<int>(hd.size()), ri.data(), static_cast<int>(ri.size()),
+      rc.data(), static_cast<int>(rc.size()), rw.data(),
+      static_cast<int>(rw.size()), x.data(), static_cast<int>(x.size()),
+      out.data(), static_cast<int>(out.size()));
+  };
+
+  // Reference: each expert through the two calls, scatter-added on the host
+  // in expert order (MoeLayerMatchesTwoCallReference's loop).
+  std::vector<float> want(static_cast<size_t>(M) * N, 0.0f);
+  for (uint32_t e = 0; e < NE; ++e) {
+    const uint32_t n_e = static_cast<uint32_t>(rows_of[e].size());
+    if (n_e == 0)
+      continue;
+    std::vector<float> xe(static_cast<size_t>(n_e) * K);
+    for (uint32_t i = 0; i < n_e; ++i)
+      std::memcpy(&xe[static_cast<size_t>(i) * K],
+                  &x[static_cast<size_t>(rows_of[e][i].first) * K],
+                  sizeof(float) * K);
+    const uint32_t m_pad = (n_e + 63) / 64 * 64;
+    std::vector<uint8_t> mid_ah(static_cast<size_t>(m_pad) * I, 0);
+    std::vector<float> mid_scale(m_pad, 1.0f);
+    std::vector<int32_t> mid_zp(m_pad, 0);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_gate_up_swiglu(
+                handle_, n_e, K, h_gu[e], xe.data(),
+                static_cast<int>(xe.size()), mid_ah.data(),
+                static_cast<int>(mid_ah.size()), mid_scale.data(),
+                static_cast<int>(mid_scale.size()), mid_zp.data(),
+                static_cast<int>(mid_zp.size())),
+              AEE_SUCCESS);
+    std::vector<float> ye(static_cast<size_t>(n_e) * N, 0.0f);
+    const uint32_t dh[1] = {h_dn[e]};
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer_u8in(
+                handle_, n_e, I, dh, 1, mid_ah.data(),
+                static_cast<int>(mid_ah.size()), mid_scale.data(),
+                static_cast<int>(mid_scale.size()), mid_zp.data(),
+                static_cast<int>(mid_zp.size()), ye.data(),
+                static_cast<int>(ye.size())),
+              AEE_SUCCESS);
+    for (uint32_t i = 0; i < n_e; ++i) {
+      float *dst = &want[static_cast<size_t>(rows_of[e][i].first) * N];
+      const float *src = &ye[static_cast<size_t>(i) * N];
+      const float w = rows_of[e][i].second;
+      for (uint32_t c = 0; c < N; ++c) {
+        const float p = src[c] * w; // rounded before the add, as on the DSP
+        dst[c] = dst[c] + p;
+      }
+    }
+  }
+  float big = 0.0f;
+  for (float v : want)
+    big = std::max(big, std::fabs(v));
+
+  // a vs b over the rows @a pick selects: elements not ==, and the worst
+  // difference against the output's largest magnitude.
+  auto compare = [&](const char *what, const std::vector<float> &a,
+                     const std::vector<float> &b,
+                     const std::function<bool(uint32_t)> &pick) {
+    size_t bad = 0, n = 0;
+    uint32_t bad_rows = 0;
+    double worst = 0.0;
+    for (uint32_t r = 0; r < M; ++r) {
+      if (!pick(r))
+        continue;
+      bool row_bad = false;
+      for (uint32_t c = 0; c < N; ++c) {
+        const size_t i = static_cast<size_t>(r) * N + c;
+        ++n;
+        if (!(a[i] == b[i])) {
+          ++bad;
+          row_bad = true;
+          worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]));
+        }
+      }
+      bad_rows += row_bad;
+    }
+    std::cout << "U8I4_FIELD path=moe_split field=" << what
+              << " bad_elems=" << bad << " of " << n << " bad_rows=" << bad_rows
+              << " worst_rel=" << worst / big << std::endl;
+    return bad;
+  };
+  auto all = [](uint32_t) { return true; };
+
+  std::vector<float> whole;
+  ASSERT_EQ(run(0, NE, whole), AEE_SUCCESS);
+  const size_t whole_bad = compare("whole_vs_ref", whole, want, all);
+
+  for (uint32_t g : {22u, 16u}) {
+    std::vector<float> split, part;
+    ASSERT_EQ(run(0, g, split), AEE_SUCCESS);
+    ASSERT_EQ(run(g, NE, part), AEE_SUCCESS);
+    for (size_t i = 0; i < split.size(); ++i)
+      split[i] += part[i]; // what lfm2_moe_layer.cpp does
+    const uint32_t lo = (1u << g) - 1u;
+    auto one_group = [&](uint32_t r) {
+      return (expert_mask[r] & lo) == 0u || (expert_mask[r] & ~lo) == 0u;
+    };
+    auto both = [&](uint32_t r) { return !one_group(r); };
+    const std::string tag = "split" + std::to_string(g);
+    const size_t one_bad = compare((tag + "_vs_whole_one_group_rows").c_str(),
+                                   split, whole, one_group);
+    compare((tag + "_vs_whole_two_group_rows").c_str(), split, whole, both);
+    compare((tag + "_vs_ref").c_str(), split, want, all);
+    // x + 0.0f == x, so a row only one group wrote must come back as the
+    // whole call wrote it; anything else means a row's output depends on
+    // the rest of the call.
+    EXPECT_EQ(one_bad, 0u) << tag << ": rows one group touched changed";
+  }
+  EXPECT_EQ(whole_bad, 0u)
+    << "the whole call at 32 experts differs from the two-call reference";
+
+  for (uint32_t w = 0; w < NW; ++w) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu[w].handle), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn[w].handle), AEE_SUCCESS);
+  }
+}
+
 TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
   const uint32_t K = 2048, I = 1792, N = 2048;
 
@@ -2205,6 +2387,242 @@ TEST_F(HmxMmU8I4Layer, ArenaUncachedWriteAfterMap) {
  * rule that keeps a borrowed slot safe -- an arena cannot be detached while
  * a weight still points into it.
  */
+/**
+ * [doc 52] The sequence the expert LRU makes: the DSP reads an arena slot,
+ * the host overwrites the slot with another expert's bytes, the DSP reads it
+ * again. The weight DMA reads DDR through L2 (src_bypass = 0), so a
+ * cacheable DSP-side mapping could serve the first expert's stale lines on
+ * the second pass; each pass is compared bit for bit with the same weight
+ * registered on the DSP heap.
+ *
+ * The slot is filled by the CPU (bake_export into a heap vector, then
+ * memcpy), as pread fills it. Filling it by bake_export straight into the
+ * ION buffer, as this test first did, has the DSP write the bytes and never
+ * exercises a host write at all.
+ *
+ * A cached arena with a DC CVAC clean was tried and dropped (doc 52 section
+ * 10.11): it made the DSP's weight reads slower and bought no copy speed.
+ */
+class HmxArenaSlotReuse : public HmxMmU8I4Layer {
+protected:
+  /** @return bad elements on the reuse pass (pass 1), or SIZE_MAX if the
+   *  run could not get that far. */
+  /** @param swap fill the slot the way the host's expert pool does since
+   *  doc 52 section 10.12: overwrite it while the previous pair is still
+   *  registered, then one weight_swap_u8i4_arena registers the new pair and
+   *  releases the old -- rather than release, overwrite, register.
+   *  @param tail (with swap) lay each weight's scales and column sums in
+   *  the slot after its WH bytes and send the swap empty sequences, as the
+   *  pool does since doc 52 section 10.30: the DSP fetches them from the
+   *  arena. A second pass through the same slot is the stale-cache case
+   *  the DSP-side invalidates exist for. */
+  size_t Run(const char *path, bool swap = false, bool tail = false) {
+    const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
+
+    auto alloc =
+      (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+    auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+    auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+    using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+    auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+    if (!alloc || !rfree || !to_fd || !fmmap) {
+      std::cout << "U8I4_FIELD path=" << path
+                << " field=skipped value=no_rpcmem" << std::endl;
+      return SIZE_MAX;
+    }
+
+    std::vector<Weight> gu(NE), dn(NE);
+    for (uint32_t e = 0; e < NE; ++e) {
+      MakeAndRegister(K, 2 * I, 0x5107A000u + e, gu[e]);
+      MakeAndRegister(I, N, 0x5107B000u + e, dn[e]);
+      if (::testing::Test::HasFatalFailure())
+        return SIZE_MAX;
+      if (swap) {
+        // A swapped-in pair has a zero bias (rebind zeroes it, the register
+        // path passes zeros), so the heap references it is compared with
+        // need one too: re-register them with the bias cleared.
+        for (Weight *w : {&gu[e], &dn[e]}) {
+          nntr_hvx_weight_release_u8i4(handle_, w->handle);
+          std::fill(w->bias.begin(), w->bias.end(), 0.0f);
+          w->handle = 0xFFFFFFFFu;
+          const uint32_t k = w == &gu[e] ? K : I;
+          if (nntr_hvx_weight_register_u8i4(
+                handle_, k, w->N, w->q_w.data(), (int)w->q_w.size(),
+                w->d.data(), (int)w->d.size(), w->colsum.data(),
+                (int)w->colsum.size(), w->bias.data(), (int)w->bias.size(),
+                &w->handle) != AEE_SUCCESS) {
+            ADD_FAILURE() << path << ": zero-bias re-register failed";
+            return SIZE_MAX;
+          }
+        }
+      }
+    }
+
+    auto wh_bytes = [](uint32_t k, uint32_t n) {
+      return (k / 32u) * (n / 32u) * 512u;
+    };
+    const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
+    // With tail: N f32 scales and N i32 column sums after the WH bytes.
+    const uint32_t gu_tail = tail ? 8u * 2 * I : 0u,
+                   dn_tail = tail ? 8u * N : 0u;
+    const uint32_t stride_gu = (gu_len + gu_tail + 4095u) & ~4095u;
+    // ONE expert slot, laid out as register_qs4cx_wh_expert_file lays it:
+    // gate_up at 0, down at stride_gu.
+    const uint32_t arena_bytes =
+      stride_gu + ((dn_len + dn_tail + 4095u) & ~4095u);
+
+    void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+    if (buf == nullptr) {
+      ADD_FAILURE() << path << ": uncached rpcmem_alloc failed";
+      return SIZE_MAX;
+    }
+    const int fd = to_fd(buf);
+    uint32_t arena = 0xFFFFFFFFu;
+    if (fd < 0 ||
+        fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+              static_cast<int>(FASTRPC_MAP_FD)) != 0 ||
+        nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena) !=
+          AEE_SUCCESS) {
+      ADD_FAILURE() << path << ": could not map and attach the slot";
+      rfree(buf);
+      return SIZE_MAX;
+    }
+    auto *base = static_cast<uint8_t *>(buf);
+
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0052u);
+    // One expert takes every row: the call is [e] alone, so the slot's
+    // contents are the only thing that can differ between runs.
+    std::vector<uint32_t> row_index(M);
+    std::vector<float> row_weight(M);
+    for (uint32_t r = 0; r < M; ++r) {
+      row_index[r] = r;
+      row_weight[r] = 0.25f + 0.5f * (r % 7u) / 7.0f;
+    }
+    const std::vector<uint32_t> row_count = {M};
+    auto run = [&](uint32_t hg, uint32_t hd, std::vector<float> &out) {
+      out.assign(static_cast<size_t>(M) * N, 1.0f);
+      return nntr_hvx_mm_u8i4_moe_layer(
+        handle_, M, K, I, N, &hg, 1, &hd, 1, row_index.data(),
+        (int)row_index.size(), row_count.data(), (int)row_count.size(),
+        row_weight.data(), (int)row_weight.size(), x.data(), (int)x.size(),
+        out.data(), (int)out.size());
+    };
+
+    size_t reuse_bad = SIZE_MAX;
+    uint32_t prev_gu = 0xFFFFFFFFu, prev_dn = 0xFFFFFFFFu;
+    std::vector<uint8_t> host_gu(gu_len), host_dn(dn_len);
+    for (uint32_t e = 0; e < NE; ++e) {
+      if (nntr_hvx_weight_bake_export(handle_, gu[e].handle, host_gu.data(),
+                                      (int)gu_len) != AEE_SUCCESS ||
+          nntr_hvx_weight_bake_export(handle_, dn[e].handle, host_dn.data(),
+                                      (int)dn_len) != AEE_SUCCESS) {
+        ADD_FAILURE() << path << ": bake_export failed";
+        break;
+      }
+      std::memcpy(base, host_gu.data(), gu_len);
+      std::memcpy(base + stride_gu, host_dn.data(), dn_len);
+      if (tail) {
+        std::memcpy(base + gu_len, gu[e].d.data(), 4u * 2 * I);
+        std::memcpy(base + gu_len + 4u * 2 * I, gu[e].colsum.data(),
+                    4u * 2 * I);
+        std::memcpy(base + stride_gu + dn_len, dn[e].d.data(), 4u * N);
+        std::memcpy(base + stride_gu + dn_len + 4u * N, dn[e].colsum.data(),
+                    4u * N);
+      }
+      uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
+      if (swap) {
+        const int err =
+          tail ? nntr_hvx_weight_swap_u8i4_arena(
+                   handle_, prev_gu, prev_dn, K, I, N, arena, 0, stride_gu,
+                   nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, &a_gu, &a_dn)
+               : nntr_hvx_weight_swap_u8i4_arena(
+                   handle_, prev_gu, prev_dn, K, I, N, arena, 0, stride_gu,
+                   gu[e].d.data(), (int)(2 * I), gu[e].colsum.data(),
+                   (int)(2 * I), dn[e].d.data(), (int)N, dn[e].colsum.data(),
+                   (int)N, &a_gu, &a_dn);
+        if (err != AEE_SUCCESS) {
+          ADD_FAILURE() << path
+                        << ": weight_swap_u8i4_arena failed: " << hex(err);
+          break;
+        }
+        if (prev_gu != 0xFFFFFFFFu) {
+          // Same shape, so (doc 52 section 10.25) the swap rebinds the old
+          // pair in place and hands the same numbers back. Releasing
+          // prev_* here, as this check did before the rebind, released the
+          // live new pair and failed the pass-1 call it exists to test.
+          EXPECT_EQ(a_gu, prev_gu) << path << ": gate_up was not rebound";
+          EXPECT_EQ(a_dn, prev_dn) << path << ": down was not rebound";
+        }
+      } else if (nntr_hvx_weight_register_u8i4_arena(
+                   handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
+                   gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
+                   (int)(2 * I), &a_gu) != AEE_SUCCESS ||
+                 nntr_hvx_weight_register_u8i4_arena(
+                   handle_, I, N, arena, stride_gu, dn[e].d.data(), (int)N,
+                   dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
+                   &a_dn) != AEE_SUCCESS) {
+        ADD_FAILURE() << path << ": register_arena failed";
+        break;
+      }
+      std::vector<float> from_heap, from_slot;
+      const int e1 = run(gu[e].handle, dn[e].handle, from_heap);
+      const int e2 = run(a_gu, a_dn, from_slot);
+      if (swap) { // the next pass's swap releases them
+        prev_gu = a_gu;
+        prev_dn = a_dn;
+      } else {
+        nntr_hvx_weight_release_u8i4(handle_, a_gu);
+        nntr_hvx_weight_release_u8i4(handle_, a_dn);
+      }
+      if (e1 != AEE_SUCCESS || e2 != AEE_SUCCESS) {
+        ADD_FAILURE() << path << ": moe_layer failed";
+        break;
+      }
+      size_t bad = 0;
+      for (size_t i = 0; i < from_heap.size(); ++i)
+        if (std::memcmp(&from_slot[i], &from_heap[i], sizeof(float)) != 0)
+          ++bad;
+      std::cout << "U8I4_FIELD path=" << path << " pass=" << e
+                << " field=bad_elems value=" << bad << " of "
+                << from_heap.size() << std::endl;
+      reuse_bad = bad;
+    }
+
+    if (prev_gu != 0xFFFFFFFFu) {
+      nntr_hvx_weight_release_u8i4(handle_, prev_gu);
+      nntr_hvx_weight_release_u8i4(handle_, prev_dn);
+    }
+    nntr_hvx_arena_detach(handle_, arena);
+    for (uint32_t e = 0; e < NE; ++e) {
+      nntr_hvx_weight_release_u8i4(handle_, gu[e].handle);
+      nntr_hvx_weight_release_u8i4(handle_, dn[e].handle);
+    }
+    rfree(buf);
+    return reuse_bad;
+  }
+};
+
+TEST_F(HmxArenaSlotReuse, Uncached) {
+  EXPECT_EQ(Run("arena_slot_reuse"), 0u)
+    << "a reused uncached slot differs from the heap weight: the DSP read "
+       "stale bytes, and register_arena needs an L2 invalidate";
+}
+
+TEST_F(HmxArenaSlotReuse, Swap) {
+  EXPECT_EQ(Run("arena_slot_swap", /*swap=*/true), 0u)
+    << "the slot refilled under a still-registered pair and swapped in "
+       "differs from the heap weight";
+}
+
+TEST_F(HmxArenaSlotReuse, TailSwap) {
+  EXPECT_EQ(Run("arena_slot_tail_swap", /*swap=*/true, /*tail=*/true), 0u)
+    << "a pair whose scales and column sums the DSP fetched from the arena "
+       "(doc 52 section 10.30) differs from the heap weight: on pass 1 the "
+       "DSP read stale scales, and the invalidates around the tail DMA do "
+       "not reach the cache that held them";
+}
+
 TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
   const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
 

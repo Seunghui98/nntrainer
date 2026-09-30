@@ -424,6 +424,29 @@ void nntr_hvx_arenas_put_all(nntr_hvx_session *s) {
 #endif
 }
 
+/** @brief The address of a K x N weight at @a wh_off in arena @a arena, or
+ *  NULL when the arena is unknown or the weight runs past its end. With
+ *  @a tail, the 8*N bytes of scales and column sums after it must fit too
+ *  (doc 52 section 10.30). The extent check is here and not only in the
+ *  registry: the registry sees a pointer, this is the one place that knows
+ *  how big the mapping behind it is. Overflow-safe in 64-bit. */
+static const uint8_t *arena_weight_at(nntr_hvx_session *s, uint32 arena,
+                                      uint32 wh_off, uint32 K, uint32 N,
+                                      int tail) {
+  const nntr_hvx_arena *a = nntr_hvx_arena_slot(s, arena);
+  const uint64_t bytes =
+    (uint64_t)(K / 32u) * (N / 32u) * 512u + (tail ? 8u * (uint64_t)N : 0u);
+  if (!a) {
+    return NULL;
+  }
+  if ((uint64_t)wh_off + bytes > a->bytes) {
+    FARF(ERROR, "weight arena: off=%u + %u past arena %u", (unsigned)wh_off,
+         (unsigned)bytes, (unsigned)a->bytes);
+    return NULL;
+  }
+  return a->va + wh_off;
+}
+
 int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
                                         uint32 N, uint32 arena, uint32 wh_off,
                                         const float *w_scale, int w_scaleLen,
@@ -431,8 +454,7 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
                                         const float *bias, int biasLen,
                                         uint32 *w_handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  const nntr_hvx_arena *a;
-  uint32 wh_bytes;
+  const uint8_t *wh;
   if (!s || !w_handle) {
     return AEE_EBADPARM;
   }
@@ -442,22 +464,192 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
          (unsigned)K, (unsigned)N);
     return AEE_EBADPARM;
   }
-  a = nntr_hvx_arena_slot(s, arena);
-  if (!a) {
-    return AEE_EBADPARM;
-  }
-  /* The extent check is here and not only in the registry: the registry
-     sees a pointer, this is the one place that knows how big the mapping
-     behind it is. Overflow-safe in 64-bit. */
-  wh_bytes = (K / 32u) * (N / 32u) * 512u;
-  if ((uint64_t)wh_off + wh_bytes > a->bytes) {
-    FARF(ERROR, "weight_register_u8i4_arena: off=%u + %u past arena %u",
-         (unsigned)wh_off, (unsigned)wh_bytes, (unsigned)a->bytes);
+  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0);
+  if (!wh) {
     return AEE_EBADPARM;
   }
   return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
-                                          a->va + wh_off, w_scale, colsum_w,
-                                          bias, w_handle);
+                                          wh, w_scale, colsum_w, bias,
+                                          w_handle);
+}
+
+/** @brief One weight of a swap: registered from the arena with the given
+ *  arrays, or, when @a w_scale is NULL, with the scales and column sums
+ *  that follow it there and a zero bias. */
+static int swap_register_one(nntr_hvx_session *s, uint32 K, uint32 N,
+                             uint32 arena, uint32 wh_off, const float *w_scale,
+                             const int32 *colsum_w, const float *bias,
+                             uint32 *out) {
+  const uint8_t *wh = arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL);
+  if (!wh) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
+                                          wh, w_scale, colsum_w, bias, out);
+}
+
+/** @brief The IDL's "nothing to release" for weight_swap_u8i4_arena. */
+#define NNTR_HVX_NO_HANDLE 0xFFFFFFFFu
+
+/** @brief True for a live handle whose bytes are borrowed from an arena --
+ *  the only kind weight_swap_u8i4_arena may release, since the host's
+ *  expert pool never owns a heap-baked weight. */
+static int swap_releasable(const hexkl_weight_u8i4_table *tbl, uint32 h) {
+  return h < HEXKL_MM_U8I4_MAX_WEIGHTS && tbl->slots[h].in_use &&
+         tbl->slots[h].borrowed;
+}
+
+int nntr_hvx_weight_swap_u8i4_arena(
+  remote_handle64 handle, uint32 old_gu, uint32 old_dn, uint32 K, uint32 inter,
+  uint32 N_out, uint32 arena, uint32 off_gu, uint32 off_dn,
+  const float *gu_scale, int gu_scaleLen, const int32 *gu_colsum,
+  int gu_colsumLen, const float *dn_scale, int dn_scaleLen,
+  const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu, uint32 *h_dn) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint32 n_gu = 2u * inter;
+  const int release_old =
+    !(old_gu == NNTR_HVX_NO_HANDLE && old_dn == NNTR_HVX_NO_HANDLE);
+  /* [doc 52 section 10.30] Empty sequences: the scales and column sums are
+     in the arena after each weight's WH bytes, and the registry takes them
+     from there. The host's expert pool always sends them that way now; the
+     arrays stay accepted for the tests and for an older host. */
+  const int tail = gu_scaleLen == 0 && gu_colsumLen == 0 && dn_scaleLen == 0 &&
+                   dn_colsumLen == 0;
+  float *bias = NULL;
+  uint32 g = NNTR_HVX_NO_HANDLE, d = NNTR_HVX_NO_HANDLE;
+  int rc;
+  if (!s || !h_gu || !h_dn) {
+    return AEE_EBADPARM;
+  }
+  if (!tail &&
+      ((uint32_t)gu_scaleLen != n_gu || (uint32_t)gu_colsumLen != n_gu ||
+       (uint32_t)dn_scaleLen != N_out || (uint32_t)dn_colsumLen != N_out)) {
+    FARF(ERROR, "weight_swap_u8i4_arena: bad lengths (K=%u inter=%u N=%u)",
+         (unsigned)K, (unsigned)inter, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  if (tail) {
+    gu_scale = dn_scale = NULL;
+    gu_colsum = dn_colsum = NULL;
+  }
+  /* Checked before anything is registered, so a bad pair costs nothing:
+     both or neither, both arena-borrowed, and not the same handle twice. */
+  if (release_old &&
+      (old_gu == old_dn || !swap_releasable(&s->weights_u8i4, old_gu) ||
+       !swap_releasable(&s->weights_u8i4, old_dn))) {
+    FARF(ERROR, "weight_swap_u8i4_arena: old pair %u/%u is not releasable",
+         (unsigned)old_gu, (unsigned)old_dn);
+    return AEE_EBADPARM;
+  }
+  /* [doc 52 section 10.25] The retired pair has the new expert's shape --
+     every swap in the expert pool -- so rebind both handles in place: no
+     allocation, no free, no slot search, which were most of a swap's DSP
+     time. Everything that can refuse is checked before either is touched,
+     so a refusal still leaves the old pair as it was. */
+  if (release_old && s->weights_u8i4.slots[old_gu].K == K &&
+      s->weights_u8i4.slots[old_gu].N == n_gu &&
+      s->weights_u8i4.slots[old_dn].K == inter &&
+      s->weights_u8i4.slots[old_dn].N == N_out) {
+    const uint8_t *wg = arena_weight_at(s, arena, off_gu, K, n_gu, tail);
+    const uint8_t *wd = arena_weight_at(s, arena, off_dn, inter, N_out, tail);
+    /* 512: the registry's WEIGHT_TILE_BYTES_U8I4, which rebind also checks
+       -- checked here too so the second rebind cannot refuse after the
+       first has landed. */
+    if (!wg || !wd || ((uintptr_t)wg % 512u) != 0u ||
+        ((uintptr_t)wd % 512u) != 0u) {
+      return AEE_EBADPARM;
+    }
+    rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu, wg,
+                                        gu_scale, gu_colsum);
+    if (rc == AEE_SUCCESS) {
+      rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
+                                          N_out, wd, dn_scale, dn_colsum);
+    }
+    if (rc != AEE_SUCCESS) { /* unreachable after the checks above */
+      return rc;
+    }
+    *h_gu = old_gu;
+    *h_dn = old_dn;
+    return AEE_SUCCESS;
+  }
+  if (!tail) {
+    bias = (float *)calloc(n_gu > N_out ? n_gu : N_out, sizeof(float));
+    if (!bias) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  rc =
+    swap_register_one(s, K, n_gu, arena, off_gu, gu_scale, gu_colsum, bias, &g);
+  if (rc == AEE_SUCCESS) {
+    rc = swap_register_one(s, inter, N_out, arena, off_dn, dn_scale, dn_colsum,
+                           bias, &d);
+    if (rc != AEE_SUCCESS) {
+      hexkl_weight_u8i4_release(&s->weights_u8i4, g);
+    }
+  }
+  free(bias);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* Last, and validated above, so these cannot fail. */
+  if (release_old) {
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_gu);
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_dn);
+  }
+  *h_gu = g;
+  *h_dn = d;
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_swap_batch_u8i4_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, const float *gu_scale, int gu_scaleLen,
+  const int32 *gu_colsum, int gu_colsumLen, const float *dn_scale,
+  int dn_scaleLen, const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu,
+  int h_guLen, uint32 *h_dn, int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  const uint32 n_gu = 2u * inter;
+  /* Empty sequences for all four: every expert's tail is in the arena. */
+  const int tail = gu_scaleLen == 0 && gu_colsumLen == 0 && dn_scaleLen == 0 &&
+                   dn_colsumLen == 0;
+  int i, rc = AEE_SUCCESS;
+  if (!handle || !n_done || !err) {
+    return AEE_EBADPARM;
+  }
+  *n_done = 0;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (!tail && ((uint64_t)gu_scaleLen != (uint64_t)n * n_gu ||
+                 (uint64_t)gu_colsumLen != (uint64_t)n * n_gu ||
+                 (uint64_t)dn_scaleLen != (uint64_t)n * N_out ||
+                 (uint64_t)dn_colsumLen != (uint64_t)n * N_out))) {
+    FARF(ERROR, "weight_swap_batch_u8i4_arena: bad lengths (n=%d)", n);
+    return AEE_EBADPARM;
+  }
+  /* One expert at a time through the single call, so each keeps its
+     all-or-nothing guarantee and the batch stops at the first refusal. */
+  for (i = 0; i < n; ++i) {
+    rc = tail
+           ? nntr_hvx_weight_swap_u8i4_arena(handle, old_gu[i], old_dn[i], K,
+                                             inter, N_out, arena[i], off_gu[i],
+                                             off_dn[i], NULL, 0, NULL, 0, NULL,
+                                             0, NULL, 0, &h_gu[i], &h_dn[i])
+           : nntr_hvx_weight_swap_u8i4_arena(
+               handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+               off_gu[i], off_dn[i], gu_scale + (size_t)i * n_gu, (int)n_gu,
+               gu_colsum + (size_t)i * n_gu, (int)n_gu,
+               dn_scale + (size_t)i * N_out, (int)N_out,
+               dn_colsum + (size_t)i * N_out, (int)N_out, &h_gu[i], &h_dn[i]);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS; /* a partial batch reports through n_done and err */
 }
 
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,

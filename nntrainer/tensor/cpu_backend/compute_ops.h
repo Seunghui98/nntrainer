@@ -425,6 +425,74 @@ public:
     return false;
   }
 
+  // A QS4CX_WH expert pair the loader never read (a virtual weight, doc
+  // 52), and where its bytes are: gate_up [K, 2 * inter] at off_gu and down
+  // [inter, N_out] at off_dn in the model file behind fd, each laid out as
+  // QS4CX_WH_Tensor writes it -- [WH nibbles][N scales][N column sums].
+  // The keys are what the caller passes as gate_up_data / down_data, with
+  // a null scale, to gemm_qs4cx_moe_layer_fp32 once the expert is in.
+  struct ExpertFileDesc {
+    const void *key_gu;
+    const void *key_dn;
+    int fd;
+    size_t off_gu, off_dn;
+    unsigned int K, inter, N_out;
+  };
+
+  // How many expert slots the caller will ever hold at once (the LRU's
+  // capacity), so the backend can size its memory to that instead of to a
+  // fixed chunk. Advisory; call before the first register. Doc 52 section
+  // 10.14: at NNTR_MOE_CACHE_EXPERTS=1 the pool is 116 MiB, and a 256 MiB
+  // chunk would hide the saving.
+  virtual void reserve_qs4cx_wh_expert_slots(size_t n) { (void)n; }
+
+  // Reads one expert from the model file into a slot the backend owns and
+  // registers it. Idempotent for a key already resident. at_load says
+  // whether the profile counts it as load-time registration or as a cache
+  // miss. A backend without a slot pool returns false.
+  virtual bool register_qs4cx_wh_expert_file(const ExpertFileDesc &d,
+                                             bool at_load) {
+    (void)d;
+    (void)at_load;
+    return false;
+  }
+
+  // The same for several experts, none at load (doc 52 section 10.23): a
+  // backend with a batched register makes one round trip for all of them.
+  virtual bool
+  register_qs4cx_wh_expert_files(const std::vector<ExpertFileDesc> &ds) {
+    for (const ExpertFileDesc &d : ds)
+      if (!register_qs4cx_wh_expert_file(d, /*at_load=*/false))
+        return false;
+    return true;
+  }
+
+  // The same, split so the file reads overlap other work (doc 52 sections
+  // 10.10, 10.20): _begin queues one batch -- a slot per expert, read in the
+  // background -- and returns; several batches may be in flight. _end waits
+  // for the OLDEST batch, registers it, and returns the key_gu of each of
+  // its experts now resident (empty when none is queued). The caller must
+  // _end a batch before any ComputeOps call that touches its experts, only
+  // between accelerator calls, and must have made room -- _begin takes
+  // only free or new slots. False / empty from a backend without a slot
+  // pool.
+  virtual bool
+  prefetch_qs4cx_wh_experts_begin(const std::vector<ExpertFileDesc> &ds) {
+    (void)ds;
+    return false;
+  }
+  virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() {
+    return {};
+  }
+
+  // Undoes the above for one expert: both handles released, the slot back
+  // in the pool for the next register_qs4cx_wh_expert_file. False when the
+  // key is not resident.
+  virtual bool release_qs4cx_wh_expert(const void *key_gu) {
+    (void)key_gu;
+    return false;
+  }
+
   // The dense SwiGLU FFN as ONE accelerator call (doc 51): up and gate
   // [K x I] and down [I x N], all Q4_0x4 as loaded; act [M x K] f32 ->
   // out [M x N] f32 = (silu(act . gate) * (act . up)) . down. The HTP
