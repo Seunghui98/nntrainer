@@ -21,11 +21,10 @@
 # after any STOP (LEAK, 0x8000040e, a failed token, FATAL) reboot the phone
 # and run the same command again.
 set -u -o pipefail
-S=${1:-}
+S=${1:-R3CY10WM83Y} # the S25; never the first `adb devices` entry (a Note20 is attached too)
 W=$(cd "$(dirname "$0")" && pwd); L=$W/logs; mkdir -p $L/done
 C=/data/local/tmp/nntrainer/causallm; D=$C/s201s0; M=../models/q40-qs4cx-wh
 MF=$M/nntr_lfm2_8b_a1b_q40_arm.bin
-[ -n "$S" ] || S=$(adb devices | awk 'NR > 1 && $2 == "device" {print $1; exit}')
 AD="adb -s $S"
 exec > >(tee -a $L/sitting.out) 2>&1
 MIS=0
@@ -35,7 +34,6 @@ therm() { echo "$1 $(date +%H:%M:%S) $($AD shell 'dumpsys battery | grep -E "^  
 zone0() { $AD shell cat /sys/class/thermal/thermal_zone0/temp | tr -d '\r'; }
 cool() { local i z; for i in $(seq 1 40); do z=$(zone0); [ "$z" -le 35000 ] && break
     echo "zone0=$z > 35000, waiting 30 s ($i/40)"; sleep 30; done; echo "block start zone0=$(zone0)"; }
-cached_mb() { $AD shell "grep '^Cached:' /proc/meminfo" | tr -d '\r' | awk '{print int($2 / 1024)}'; }
 ceil() {
   $AD shell "cd $D && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ./unittest_hvx_two_sessions \
     --gtest_filter=TwoSessions.S1Ceiling" > $L/ceil_$1.log 2>&1
@@ -95,9 +93,13 @@ $AD shell "cd $D/$M && sed -i 's/\"do_sample\": true/\"do_sample\": false/' gene
 
 if [ ! -f $L/done/evict_check ]; then
   cool; run A 64 warmup
-  c0=$(cached_mb); $AD shell "cd $D && ./page_cache_evict $MF"; c1=$(cached_mb)
-  echo "evict check: Cached ${c0} -> ${c1} MB (dropped $((c0 - c1)) MB; the file is $(( $($AD shell "stat -c %s $D/$MF" | tr -d '\r') >> 20 )) MB)" | tee $L/evict_check.txt
-  [ $((c0 - c1)) -ge 2000 ] || { echo "BAD evict check: less than 2000 MB dropped; the F16c cells are not cold"; MIS=$((MIS + 1)); }
+  # the model file's own pages (mincore), not /proc/meminfo's Cached: the
+  # file is a symlink and the phone never holds all of it (S0: 2613 of 4116)
+  r=$($AD shell "cd $D && ./page_cache_evict $MF" | tr -d '\r')
+  echo "evict check: $r" | tee $L/evict_check.txt
+  set -- $r # resident <a> -> <b> MiB of <c> MiB
+  [ "${2:-0}" -gt 0 ] && [ $(( ${4:-1} * 100 )) -lt "${7:-0}" ] ||
+    { echo "BAD evict check: the file's pages did not leave the page cache"; MIS=$((MIS + 1)); }
   touch $L/done/evict_check
 fi
 
