@@ -1443,10 +1443,21 @@ public:
       std::shared_ptr<E2eState> st = e2e_st_;
       HtpBackend::global().atClose([st] { e2eTeardown(*st); });
     }
+    // [#132 Part B E5f] NNTR_HTP_FC_LANES=<small>,<large>: the L2 feed's
+    // lanes for K <= 2048 / larger K (1..8 each; unset: the DSP's 6 / 3)
+    uint32_t fc_lanes = 0;
+    if (const char *l = std::getenv("NNTR_HTP_FC_LANES")) {
+      unsigned a = 0, b = 0;
+      if (std::sscanf(l, "%u,%u", &a, &b) != 2 || a < 1 || a > 8 || b < 1 ||
+          b > 8)
+        throw std::invalid_argument("NNTR_HTP_FC_LANES=" + std::string(l) +
+                                    " (want <small>,<large>, 1..8 each)");
+      fc_lanes = (a << 8) | (b << 12);
+    }
     for (uint32_t i = 0; i < n_ops; ++i) {
       htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
       if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u)
-        op->feed = feed_s == "l2" ? 1u : 0u;
+        op->feed = (feed_s == "l2" ? HTP_GRAPH_FEED_L2 : 0u) | fc_lanes;
     }
     resident_mask_ = mask;
     moe_ops_.clear();
@@ -3608,17 +3619,21 @@ private:
     std::fprintf(stderr,
                  "[HTP] s2: fc arena weights=%zu handles=%zu attach_mib=%.1f "
                  "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
-                 "s1_arena_mib=%zu\n",
+                 "lanes=%s s1_arena_mib=%zu\n",
                  q4_pending_.size(), e.q4m1.size(),
                  static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0),
-                 e.arena.size(), mapped >> 20, q4m1FeedName(), ms, s1_mib);
+                 e.arena.size(), mapped >> 20, q4m1FeedName(), ms,
+                 std::getenv("NNTR_HTP_FC_LANES")
+                   ? std::getenv("NNTR_HTP_FC_LANES")
+                   : "6,3",
+                 s1_mib);
   }
 
   /** [#132 Part B E3] The feed the FC kinds take: the op's l2, or VTCM only
    *  where their session has some (S2 opens lite with none on the S25). */
   const char *q4m1FeedName() const {
     if (kind_ops_[HTP_OP_FC].empty() ||
-        graphOp(kind_ops_[HTP_OP_FC][0])->feed != 0u)
+        (graphOp(kind_ops_[HTP_OP_FC][0])->feed & HTP_GRAPH_FEED_L2) != 0u)
       return "l2";
     return e2e_ && HtpBackend::global().vtcm2Bytes() == 0u ? "l2" : "vtcm";
   }
