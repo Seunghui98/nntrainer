@@ -6,6 +6,42 @@ staged at `/local/mnt/workspace/htp_moe/194/s1/` — estimated device time:
 `docs/plans/194-htp-moe-ppl.md`): no bit-preserving rule; the accuracy gate
 is plan 194 section 1 (P1–P4), read against this sitting's A.
 
+## State at pause (2026-09-30)
+
+**htp_moe_ppl is paused** (user decision 2026-09-30: FSU will shrink the
+MoE's DRAM residency, which changes the two-session premise). No sitting
+runs, no PR. Branches: `htp/194-s1` (this file; everything below is on it)
+and `htp/194-s3-wip` @ `d8599531` (L2 / L3 kernels, compiles, unchecked).
+
+**Measured on silicon** (sitting 1, partial, G = 64 unless stated; details
+in the next section): canary 3 PASSED incl. `FC_Q4_NATIVE total bad=0`
+(the native FC equals its spec on the phone); decode tok/s A 57.25 / 53.69,
+E0 30.35 / 28.91, E1 31.73 / 31.70 (E1 ≈ +6 % over E0, −1.5 ms a token
+against L1's projected −3.8: FC −0.95, DENSE_FFN −0.65, LM_HEAD 0; all three
+now feed-bound at 32–45 GB/s); E0 30.83 at G = 512; E0 text = A, E1 text
+one word apart at G = 64. **L0 split** of E0's 32.95 ms token: kernels
+24.1 (S2 13.17 + S1 10.93), in-DSP non-kernel 1.15 (hops 0.64), wake
+(ARM ↔ S2, outside both DSP walls) 3.0–3.8, ARM between tokens 1.67 (≈ 1.5
+of it the layer walk), a one-time first decode token of ≈ 140 ms (2.2 ms a
+token at G = 64). Not measured: any PPL (P1 / P2), mc-40 (P3), loops (P4),
+G = 1024, the lane ladder, the wake's dispatch / return split.
+
+**Host-verified only** (never on the phone): the native pair's SNR
+against the CPU order (149.4 dB natural rows) and its 11.5-packet static
+count; the in-process PPL delta (hd64 −0.009 %) and lfm25 32.7 dB; the
+wake-split line (`1ba5ae06`: closes to 0.0 µs in-process; whether
+cntvct_el0 and the DSP QTimer agree on the phone is its first reading);
+`NNTR_PPL_DECODE_ALTS`, `mc_ids.py` / `mc_score.py` (self-test) and the
+mc-40 ids; sitting 1b's resumable runner (dry-run with a fake adb only).
+On `htp/194-s3-wip`: the L2 / L3 kernels and their spec compile and leave
+the existing host checks green, but nothing holds them to the spec yet;
+L4 and the L0 fixes (bounded spins, one-call step) are not started.
+
+**If resumed:** rebase `htp/194-s1` onto the teardown fix and whatever
+FSU changes in the two-session layout, re-stage 1b with
+`/local/mnt/workspace/htp_moe/194/s1b/stage_s1b.sh`, and re-read plan
+194 §3.4 against FSU's MoE bytes before building L5 / L6.
+
 ## Sitting 1 as read (2026-09-30 11:01–11:2x, R3CY10WM83Y, after a reboot)
 
 Logs `/local/mnt/workspace/htp_moe/194/s1/logs/`. **Stopped** at
