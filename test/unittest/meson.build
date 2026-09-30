@@ -240,6 +240,21 @@ test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
   suite: 'unittests'
 )
 
+# The CPU A8W8 attention over that registry (libnntrainer's CPU side of
+# attention_kv_dtype), against an exact f32 reference.
+unittest_cpu_kv_q_attention_exe = executable(
+  'unittest_cpu_kv_q_attention',
+  'unittest_cpu_kv_q_attention.cpp',
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_cpu_kv_q_attention', unittest_cpu_kv_q_attention_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cpu_kv_q_attention')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')
