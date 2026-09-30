@@ -41,7 +41,7 @@ ceil() {
   echo "ceiling after $1: ${c:-?} MiB" | tee -a $L/ceiling.txt
   [ "${c:-0}" -ge 3840 ] || stop "LEAK: S1 ceiling ${c:-?} MiB after $1"; }
 strip() { sed -n '/^=====/q;p' "$1" | perl -0pe 's/\[HTP[^\]\n]*\] [^\n]*\n//g; s/\[PPL\] [^\n]*\n//g' |
-  grep -v 'moe m1 gemv\|libnntr_hvx_skel\|nntrainer_causallm\|num_to_generate'; }
+  grep -v 'moe m1 gemv\|libnntr_hvx_skel\|nntrainer_causallm\|num_to_generate\|^resident [0-9]* MiB'; }
 run() { # run <A|E0|P<C>|P16c> <G> <log> [env ...]
   local v=$1 g=$2 log=$3 e="" pre="" post=""; shift 3
   [ -f $L/done/$log ] && { echo "$log: done earlier, skipped"; return 0; }
