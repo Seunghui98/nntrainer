@@ -6,6 +6,33 @@ staged at `/local/mnt/workspace/htp_moe/132/set_e5b/` — estimated device
 time: **≈ 90 min** (phone rebooted first). set_e5 (below, `10bb91b7` /
 `d77a4bf2`) was read on 2026-09-30 06:13.
 
+## set_e5g as read (2026-09-30 10:02–10:3x): not a leak, a refused retry
+
+* S1's ceiling read 3840 after every run, including right before E_G64_r1;
+  every E close read `mapped_mib=448.80 unmap_fail=0 detach_fail=0`
+  (heap S1 ≈ 69.9 MiB, S2 ≈ 29.9 MiB). E_G64_r1 then died at its own S1
+  arena: the driver log reads `fastrpc_mmap … length 0x10000000 … ioctl ret
+  0x80000465` (AEE_EMMAP: the DSP found no 256 MiB window for the 15th
+  chunk) and the retries at 128 and 64 MiB `0x8000041a` (AEE_EALREADY) on
+  the **same fd 62** — the refused buffer was freed, the retry's allocation
+  got its fd number back, and the driver still held it. So the app sits
+  close to the 3840 limit, the 15th 256 MiB window is sometimes taken, and
+  the halving retry that should have caught it never ran at a smaller size.
+* Fixes (set_e5g2): a refused map is unmapped and its buffer kept until the
+  next chunk's exists (a fresh fd per retry), the halving goes down to
+  16 MiB; the MoE warm-up at load (the M=512 scratch on S1's heap) runs
+  after every MoE chunk is mapped instead of between the first layer's
+  chunks and the rest; the arena banner adds `s1_heap_kib`. Host: the
+  stand-in models the refusal and the stale fd (`NNTR_INPROC_MMAP_CAP_MIB`);
+  `E2E arena retry cap=100 refused=2 bit_identical=1`.
+* The attention cache is on S2 in E (24 MiB fp16 since round 3 — S2's heap
+  reads 29.9 MiB; the ARM banner's `cache=49152 KiB` counts f32 and is
+  twice the real size), so it does not touch S1's room. S1's 62–70 MiB of
+  heap is the MoE's prefill scratch, as in A.
+* set_e5g2: `/local/mnt/workspace/htp_moe/132/set_e5g2/run_e5g2.sh`
+  (reboot first), E5g's runner on this build (`libnntrainer.so`
+  `2885233d…`, skel unchanged `30a1ffd7…`, runner `589823b1…`).
+
 ## set_e5f as read (2026-09-30 09:26–10:2x), and the leak
 
 * MoE dumps E == A `bit_identical=1` (46 files). Lanes ladder (G = 64):
