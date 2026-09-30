@@ -680,7 +680,9 @@ interface nntr_hvx : remote_handle64 {
    // y (N) = the CPU's Q4_0 FC of x (K) with weight h, reps times (y from
    // the last). variant: bit 16 the VTCM feed (per-lane DMA, src_bypass),
    // bit 17 the same double buffer in a 2 MiB DSP heap scratch through the
-   // L2 (#178; not both), every other bit 0. lanes: pool threads, 1..8
+   // L2 (#178; not both), [#194 L1] bit 18 the native quantizer and GEMV
+   // (q4_gemv_native_det.h, not the CPU's order), every other bit 0.
+   // lanes: pool threads, 1..8
    // (capped at the pool). stats
    // (8): [0] GEMV us over the reps, [1] quantizer us, [2..3] GEMV
    // pcycles lo | hi, [4] lanes used, [5] reps, [6] K, [7] N.
