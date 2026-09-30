@@ -3007,14 +3007,15 @@ private:
                : 1000u);
   }
 
-  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 20): how long a
+  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 0): how long a
    *  waiting session spins (with a pause) before it sleeps -- at each hop
    *  and on its dspqueue after a token. E5b's 1000 us kept one of the six
-   *  hardware threads busy through the other session's compute. */
+   *  hardware threads busy through the other session's compute; E5d read
+   *  20.8 / 20.2 / 16.5 tok/s at 0 / 20 / 1000. */
   static uint32_t e2eSpinUs() {
     static const uint32_t us = [] {
       const char *e = std::getenv("NNTR_HTP_E2E_SPIN_US");
-      return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 20u;
+      return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
     }();
     return us;
   }
