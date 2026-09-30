@@ -113,6 +113,18 @@
 #                              refuses maps past 100 MiB and keeps a refused
 #                              fd, as the driver did; S1's chunk halves to
 #                              64 MiB and the run equals the uncapped one)
+# and, since #194 S1 (htp_moe_ppl), the same two-session token with lever
+# L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
+# q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
+#   E2E ppl-decode hd64 levers=0x2 e0=<ppl> l1=<ppl> delta=<%> ok   (|delta|
+#                              <= 2 % gated: a random-weight fixture's PPL,
+#                              the pipeline and the numerics' order of
+#                              magnitude, not the 8B's)
+#   E2E eval l1-lfm25 ... min_snr_db=<x>               (x >= 30 gated, vs E0;
+#                              bit_identical=0, else the lever is not wired)
+#   E2E levers banner e0=0x0 l1=0x2 ok
+#   E2E ppl-decode alts steps=7 ok                     (NNTR_PPL_DECODE_ALTS:
+#                              the step lines gain the ids' logits)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
 # (NNTR_HTP_DSPQ=1, inproc/dspqueue_standin.c; plan 141-dspq-moe.md step 4),
 # each against the switch-off run's dumps, every call's bytes:
@@ -307,6 +319,11 @@ NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
 PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
+# [#194 S1] lever L1 on the same two-session token
+NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
+  run_e2e q64-l1ppl "$OUT/htp64q" htp "$OUT/dump_64l1ppl" "$OUT/64l1ppl.log" --max-seq 32 --run
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
+  run_e2e q25-l1 "$OUT/htp25q" htp "$OUT/dump_25l1" "$OUT/25l1.log" --max-seq 2048
 rc_e1=0
 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS "$E2E" --model "$OUT/htp" \
   --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
@@ -689,6 +706,29 @@ if [ "$(dec_field "$OUT/g64fwd.log" source)" = file ] &&
   [ "$top1" = "$((STEPS - 1))/$((STEPS - 1))" ] || fail=1
 else
   echo "E2E FAIL $line (not finite, or not forced)"; fail=1
+fi
+
+# (j) [#194 S1] lever L1: the hd64 PPL forced on E1's path against E0's
+# (the unset run, q64-e3ppl), lfm25's logits against E0's by SNR (and not
+# bit-identical: an unwired lever would read 999 dB), the banners
+e0="$(dec_field "$OUT/64e3ppl.log" ppl)"
+l1="$(dec_field "$OUT/64l1ppl.log" ppl)"
+if [ "$(dec_field "$OUT/64l1ppl.log" source)" = file ] &&
+  awk -v a="$e0" -v b="$l1" 'BEGIN{d = (b / a - 1) * 100; if (d < 0) d = -d;
+    exit !(a + 0 > 0 && b + 0 > 0 && d <= 2)}'; then
+  echo "E2E ppl-decode hd64 levers=0x2 e0=$e0 l1=$l1 delta=$(awk -v a="$e0" -v b="$l1" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') ok"
+else
+  echo "E2E FAIL ppl-decode hd64 levers=0x2 e0=${e0:-none} l1=${l1:-none}"; fail=1
+fi
+l1_line="$($EVAL --label l1-lfm25 --allow-diff --snr-floor 30 "$OUT/dump_25e3" "$OUT/dump_25l1" | tail -1)" || fail=1
+echo "$l1_line"
+grep -q 'bit_identical=0' <<< "$l1_line" ||
+  { echo "E2E FAIL l1-lfm25 bit-identical to E0: the lever is not wired"; fail=1; }
+if grep -q '^\[HTP\] ppl levers=0x0 L1=exact$' "$OUT/64e3.log" &&
+  grep -q '^\[HTP\] ppl levers=0x2 L1=native_fc$' "$OUT/25l1.log"; then
+  echo "E2E levers banner e0=0x0 l1=0x2 ok"
+else
+  echo "E2E FAIL levers banner"; fail=1
 fi
 
 # The comparator's own check: identical -> 1; one byte flipped -> 0 with a
