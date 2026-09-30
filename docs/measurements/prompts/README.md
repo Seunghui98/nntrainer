@@ -22,3 +22,18 @@ the final newline and does not change the count). Every prompt is at most
 | p06 | `bitset-06-dialogue.txt` | multi-turn chat, the assistant's next turn | 276 | `6efd387197d6078366152f83a9b72a69` |
 | p07 | `bitset-07-facts.txt` | encyclopedic article (the transistor) | 402 | `db0251e1bc57f072f815802cd93c260d` |
 | p08 | `bitset-08-short.txt` | "List ten fruits", a short prefill | 24 | `67b657c1261c2c12022907c2117a9a54` |
+
+## mc-40: the multiple-choice benchmark of `htp_moe_ppl` (plan 194 P3)
+
+`mc-40.tsv` holds 40 four-option general-knowledge, arithmetic and
+reading questions written for this repo (id, question, options A-D, the
+right letter; 10 answers per letter). `tools/htp/mc_ids.py` renders each as
+`<question>\nA. ..\nB. ..\nC. ..\nD. ..\nAnswer:` with the same tokenizer
+(no special tokens) and writes `mc-40/qNN.txt` (the rendering without its
+last token, `:`) and `mc-40/qNN.ids` (that token, then the right letter's
+token: ` A` 334, ` B` 378, ` C` 340, ` D` 388; `mc-40/alts.txt`). One app
+run per question, G = 1, `NNTR_PPL_DECODE=qNN.ids
+NNTR_PPL_DECODE_ALTS=$(cat alts.txt)`, scores P(letter | rendering);
+`tools/htp/mc_score.py` picks the first maximum of the four logits and
+sums the right letter's nll. A homemade set: it catches a systematic break
+(wrong routing, a dead head), not a 1 % drift, which the decode PPL sees.

@@ -1,0 +1,6 @@
+Anna is older than Ben, and Ben is older than Carl. Who is the youngest?
+A. Anna
+B. Ben
+C. Carl
+D. They are the same age
+Answer

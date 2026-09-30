@@ -1,0 +1,6 @@
+Tom has 3 apples and buys 5 more. How many apples does he have?
+A. 7
+B. 8
+C. 9
+D. 15
+Answer

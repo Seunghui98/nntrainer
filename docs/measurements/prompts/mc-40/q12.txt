@@ -1,0 +1,6 @@
+Which is the largest mammal?
+A. Elephant
+B. Giraffe
+C. Hippopotamus
+D. Blue whale
+Answer
