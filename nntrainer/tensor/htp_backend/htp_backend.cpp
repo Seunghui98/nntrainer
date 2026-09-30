@@ -232,6 +232,9 @@ HtpBackend::~HtpBackend() {
     for (auto &fn : at_close_) {
       fn();
     }
+    for (auto &fn : at_close_last_) {
+      fn();
+    }
     // [#132 Part B E3] S2 first, after the hooks have unmapped every buffer
     // it had (#178's rule); the handle only, never FASTRPC_SESSION_CLOSE
     if (enabled2_) {

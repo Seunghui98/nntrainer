@@ -90,6 +90,14 @@ public:
    *        what it touches; HtpComputeOps may already be destroyed.
    */
   void atClose(std::function<void()> fn) { at_close_.push_back(std::move(fn)); }
+  /**
+   * @brief [#132 Part B E5i] As atClose, but after every atClose hook:
+   *        for what the others' DSP threads use (S1's arena, released on
+   *        the DSP and unmapped before the session closes).
+   */
+  void atCloseLast(std::function<void()> fn) {
+    at_close_last_.push_back(std::move(fn));
+  }
 
   /**
    * @brief [#132 Part B E3] NNTR_HTP_E2E=1: decode runs end to end on two
@@ -137,7 +145,7 @@ private:
                         ///< so this header does not need <remote.h>.
   int qos_mode_ = 0;
   uint32_t poll_us_ = 0;
-  std::vector<std::function<void()>> at_close_;
+  std::vector<std::function<void()>> at_close_, at_close_last_;
   bool enabled2_ = false; ///< [#132 Part B E3] S2 open
   bool tried2_ = false;
   uint64_t handle2_ = 0;

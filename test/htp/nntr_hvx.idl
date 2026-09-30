@@ -762,4 +762,14 @@ interface nntr_hvx : remote_handle64 {
    // AEE_EINVALIDFORMAT, never AEE_EBADPARM.
    AEEResult q4m1_attach(in uint32 arena, in uint32 off, in uint32 K,
                          in uint32 N, rout uint32 h);
+
+   // [#132 Part B E5i] The release half of close(), so the ARM side can
+   // fastrpc_munmap every arena chunk before it closes the handle (the
+   // S1Ceiling probe's order; E5f-E5h lost one 256 MiB window per ~20 app
+   // runs that left their arena mapped to process exit): stops a dspq
+   // thread and a token driver still running, frees the graph, releases
+   // every registered weight and Q4M1 slot, and puts every attached arena.
+   // n = the arenas it put. The session stays open; close() after it
+   // finds nothing of these left.
+   AEEResult arenas_release(rout uint32 n);
 };

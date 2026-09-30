@@ -4770,6 +4770,11 @@ private:
       return false;
     }
     chunks.push_back(ArenaChunk{std::move(buf), dsp_id, 0});
+    if (&chunks == &arena_chunks_ && chunks.size() == 1) {
+      std::shared_ptr<std::vector<ArenaChunk>> a = s1_arena_;
+      HtpBackend::global().atCloseLast(
+        [a, session] { s1ArenaTeardown(session, *a); });
+    }
     if (HtpProfile::global().level() != 0) {
       size_t total = 0;
       for (const ArenaChunk &c : chunks)
@@ -4781,6 +4786,47 @@ private:
                   domain == CDSP_DOMAIN_ID ? "" : " (S2)");
     }
     return true;
+  }
+
+  /**
+   * @brief [#132 Part B E5i] The S1 arena's close hook, after the queues and
+   *        the token drivers (atCloseLast: after every atClose hook): the
+   *        skel releases the graph, the weights and every arena
+   *        (arenas_release), then each chunk is fastrpc_munmap'd, every rc
+   *        checked, before the session closes -- the S1Ceiling probe's
+   *        order. E5f-E5h: about one app run in 20, A or E, left the next
+   *        process one 256 MiB window short when the arena was left mapped
+   *        to process exit (and its buffers rpcmem_free'd, still mapped, by
+   *        whichever singleton died first).
+   */
+  static void s1ArenaTeardown(remote_handle64 session,
+                              std::vector<ArenaChunk> &chunks) {
+    if (chunks.empty())
+      return;
+    const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    uint32_t put = 0, unmapped = 0;
+    size_t bytes = 0;
+    const int rc = nntr_hvx_arenas_release(session, &put);
+    for (auto c = chunks.rbegin(); c != chunks.rend(); ++c) {
+      bytes += c->buf->size();
+      const int u = mem.munmap != nullptr
+                      ? mem.munmap(CDSP_DOMAIN_ID, c->buf->fd(), c->buf->data(),
+                                   c->buf->size())
+                      : -1;
+      if (u == 0)
+        ++unmapped;
+      else
+        std::fprintf(stderr,
+                     "[HTP] arena: fastrpc_munmap(chunk dsp_id=%u, %zu MiB) "
+                     "failed: 0x%x\n",
+                     c->dsp_id, c->buf->size() >> 20, static_cast<unsigned>(u));
+    }
+    std::fprintf(stderr,
+                 "[HTP] arena: chunks unmapped %u/%zu mib=%zu (release rc=0x%x "
+                 "put=%u)\n",
+                 unmapped, chunks.size(), bytes >> 20,
+                 static_cast<unsigned>(rc), put);
+    chunks.clear(); // rpcmem_free, each buffer unmapped first
   }
 
   /**
@@ -4913,7 +4959,11 @@ private:
   /** Conv blocks by their in_proj's pointer; see get_or_register_conv. */
   std::unordered_map<const void *, ConvHandles> conv_cache_;
 
-  std::vector<ArenaChunk> arena_chunks_;
+  /** S1's arena, shared with its close hook (s1ArenaTeardown): the two
+   *  singletons' destruction order is not fixed. */
+  std::shared_ptr<std::vector<ArenaChunk>> s1_arena_ =
+    std::make_shared<std::vector<ArenaChunk>>();
+  std::vector<ArenaChunk> &arena_chunks_ = *s1_arena_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
   /** Why the last newChunk refused, in words, for the throw that follows. */
@@ -4924,13 +4974,10 @@ private:
    *  next one is allocated (tryChunkOn). */
   std::unique_ptr<HtpRpcBuffer> last_failed_;
 
-  // Deliberately never fastrpc_munmap'd: the DSP's close() puts every arena
-  // back, and the kernel reclaims the ION buffers at process exit. The
-  // destruction order of HtpBackend's singleton and this one is not fixed,
-  // so unmapping here could touch a session that is already closed.
-  // ponytail: a process that loads and unloads models would leak an arena
-  // per model. The fix is an explicit shutdown hook on HtpBackend that runs
-  // before it closes the session, not a destructor here.
+  // [#132 Part B E5i] Unmapped by the close hook s1ArenaTeardown (it was
+  // left mapped to process exit until E5h). ponytail: a process that loads
+  // and unloads models still keeps every arena to its end; a reload would
+  // need the same hook at model teardown.
 
   // ION-backed activation/output scratch, reused across calls, one buffer
   // per size class (stage) -- see invokeLayer's comment. Guarded by the

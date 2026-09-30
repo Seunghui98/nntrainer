@@ -253,10 +253,10 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   return AEE_SUCCESS;
 }
 
-int nntr_hvx_close(remote_handle64 handle) {
+int nntr_hvx_arenas_release(remote_handle64 handle, uint32 *n) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s) {
-    return AEE_SUCCESS;
+  if (!s || !n) {
+    return AEE_EBADPARM;
   }
   /* [#141] The queue thread runs kernels on this session: it stops first. */
   nntr_hvx_dspq_shutdown(s);
@@ -275,8 +275,24 @@ int nntr_hvx_close(remote_handle64 handle) {
       hexkl_weight_u8i8_release(&s->weights_u8i8, i);
     }
   }
-  nntr_hvx_arenas_put_all(s);
+  /* the slots borrow from the arenas, so they go before the puts */
   nntr_hvx_q4m1_free_all(s);
+  *n = 0;
+  for (uint32_t i = 0; i < NNTR_HVX_MAX_ARENAS; ++i) {
+    *n += s->arenas[i].va != NULL;
+  }
+  nntr_hvx_arenas_put_all(s);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_close(remote_handle64 handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint32 n = 0;
+  if (!s) {
+    return AEE_SUCCESS;
+  }
+  /* [#132 Part B E5i] a no-op when the ARM side ran it before its munmaps */
+  (void)nntr_hvx_arenas_release(handle, &n);
   hexkl_moe_scratch_free(&s->moe_scratch);
   /* [#81] The attention cache borrows the pool, so it goes first. */
   hvx_attn_m1_free(s->attn_m1);
