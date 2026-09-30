@@ -1506,7 +1506,8 @@ public:
   remote_handle64 sessionFor(uint32_t kind) const {
     const HtpBackend &b = HtpBackend::global();
     return static_cast<remote_handle64>(
-      e2e_ && (HTP_GRAPH_KINDS_S1 & HTP_GRAPH_KIND_BIT(kind)) == 0u
+      e2e_ && !e2e_st_->one_pd &&
+          (HTP_GRAPH_KINDS_S1 & HTP_GRAPH_KIND_BIT(kind)) == 0u
         ? b.handle2()
         : b.handle());
   }
@@ -1645,6 +1646,14 @@ public:
     if (e2e && !e2e_st_) {
       e2e_st_ = std::make_shared<E2eState>();
       e2e_st_->h1 = session; // S2's handle and domain once it opens
+      // [plan 201 S1] NNTR_HTP_E2E_PDS=1: one PD -- every kind, the FC set
+      // on its own arena chunks and the expert pool all in S1, one token
+      // packet, no hops (the FC feed takes S1's VTCM in turn with the MoE)
+      const char *pds = std::getenv("NNTR_HTP_E2E_PDS");
+      e2e_st_->one_pd = pds != nullptr && std::strcmp(pds, "1") == 0;
+      if (pds != nullptr && !e2e_st_->one_pd && std::strcmp(pds, "2") != 0)
+        throw std::invalid_argument("NNTR_HTP_E2E_PDS=" + std::string(pds) +
+                                    " (want 1 or 2)");
       std::shared_ptr<E2eState> st = e2e_st_;
       HtpBackend::global().atClose([st] { e2eTeardown(*st); });
     }
@@ -2489,7 +2498,7 @@ public:
       q4m1_bound_ = e2e_;
     }
     uint32_t n_ops = 0;
-    if (e2e_) {
+    if (e2e_ && !e2e_st_->one_pd) {
       // [#132 Part B E3] each session its copy of the list: S1 resident for
       // ROUTER_TOPK | MOE (the MoE handles bound at prefill), S2 for the
       // rest (the Q4M1 handles on its arena)
@@ -3971,20 +3980,24 @@ private:
   void e2eStart() {
     E2eState &e = *e2e_st_;
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    const size_t logits_bytes = static_cast<size_t>(graph_words_[5]) * 4u;
     if (!dspq_) // S1's queue: token packets only at decode, so the E2E spin
       dspq_ =
-        dspqMake(e.h1, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES, e2eSpinUs());
+        dspqMake(e.h1, CDSP_DOMAIN_ID, "dspq",
+                 e.one_pd ? std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes)
+                          : HTP_DSPQ_BUF_BYTES,
+                 e2eSpinUs());
     if (dspq_->state != DspqMoe::ON || dspq_->session != e.h1) {
       throw std::runtime_error("NNTR_HTP_E2E=1: S1's dspqueue is off (see "
                                "the dspq line; NNTR_HTP_DSPQ=0?): the token "
                                "packets ride it");
     }
     e.q1 = dspq_;
-    const size_t logits_bytes = static_cast<size_t>(graph_words_[5]) * 4u;
-    e.q2 =
-      dspqMake(e.h2, e.dom2, "dspq[S2]",
-               std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes), e2eSpinUs());
-    if (e.q2->state != DspqMoe::ON) {
+    if (!e.one_pd)
+      e.q2 = dspqMake(e.h2, e.dom2, "dspq[S2]",
+                      std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
+                      e2eSpinUs());
+    if (!e.one_pd && e.q2->state != DspqMoe::ON) {
       throw std::runtime_error("NNTR_HTP_E2E=1: S2's dspqueue is off (see "
                                "the dspq[S2] line)");
     }
@@ -3999,7 +4012,7 @@ private:
     int rc = mem.mmap(CDSP_DOMAIN_ID, fd, e.mbox->data(), 0, e.mbox->size(),
                       FASTRPC_MAP_FD);
     e.mbox1 = rc == 0;
-    if (rc == 0) {
+    if (rc == 0 && !e.one_pd) {
       rc =
         mem.mmap(e.dom2, fd, e.mbox->data(), 0, e.mbox->size(), FASTRPC_MAP_FD);
       e.mbox2 = rc == 0;
@@ -4010,13 +4023,15 @@ private:
                                std::to_string(rc));
     }
     const uint32_t spin_us = e2eSpinUs();
-    rc = nntr_hvx_token_driver_start(
-      e.h1, fd, static_cast<uint32_t>(e.mbox->size()), 1u, spin_us);
+    // [plan 201 S1] one PD: S1 is the main side (role 0) and nobody serves
+    rc = nntr_hvx_token_driver_start(e.h1, fd,
+                                     static_cast<uint32_t>(e.mbox->size()),
+                                     e.one_pd ? 0u : 1u, spin_us);
     e.drv1 = rc == AEE_SUCCESS;
-    if (rc == AEE_SUCCESS)
+    if (rc == AEE_SUCCESS && !e.one_pd)
       rc = nntr_hvx_token_driver_start(
         e.h2, fd, static_cast<uint32_t>(e.mbox->size()), 0u, spin_us);
-    e.drv2 = e.drv1 && rc == AEE_SUCCESS;
+    e.drv2 = e.drv1 && rc == AEE_SUCCESS && !e.one_pd;
     if (rc != AEE_SUCCESS) {
       throw std::runtime_error("nntr_hvx_token_driver_start[" +
                                std::string(e.drv1 ? "S2" : "S1") +
@@ -4025,13 +4040,14 @@ private:
     uint32_t rounds = 0;
     for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size()); ++i)
       rounds += graphOp(i)->kind == HTP_OP_ROUTER_TOPK;
-    e.rounds = rounds;
+    e.rounds = e.one_pd ? 0u : rounds;
     e.spin_us = spin_us;
     std::fprintf(stderr,
                  "[HTP] token driver: on s1_effdom=%d s2_effdom=%d mbox=%zu "
-                 "spin_us=%u rounds=%u hops/token=%u logits_buf=%zu\n",
+                 "spin_us=%u rounds=%u hops/token=%u logits_buf=%zu pds=%d\n",
                  static_cast<int>(CDSP_DOMAIN_ID), e.dom2, e.mbox->size(),
-                 spin_us, rounds, 2u * rounds, logits_bytes);
+                 spin_us, e.rounds, 2u * e.rounds, logits_bytes,
+                 e.one_pd ? 1 : 2);
   }
 
   /** @brief [#132 Part B E3] The close hook, before the sessions close:
@@ -4254,10 +4270,11 @@ private:
       e.arm_us += entry_us - e.last_exit_us;
       ++e.arm_n;
     }
-    if (!e.drv1 || !e.drv2 || !e.q2 || !dspq_)
+    if (!e.drv1 || (!e.one_pd && (!e.drv2 || !e.q2)) || !dspq_)
       throw std::runtime_error("token driver: not started (its start threw "
                                "at graph init)");
-    DspqMoe &q1 = *dspq_, &q2 = *e.q2;
+    // [plan 201 S1] one PD: S1's queue takes the row packet, alone
+    DspqMoe &q1 = *dspq_, &q2 = e.one_pd ? *dspq_ : *e.q2;
     if (q1.broken || q2.broken)
       throw std::runtime_error("token driver: a queue failed on an earlier "
                                "token");
@@ -4307,9 +4324,10 @@ private:
     const uint32_t nb2 = logits ? 2u : 1u;
     const uint32_t c0 = sysCounterUs();
     const uint64_t t0 = HtpProfile::nowUs();
-    int err =
-      q1.api->write(q1.q, 0, 0, nullptr, sizeof(r1),
-                    reinterpret_cast<const uint8_t *>(&r1), kDspqTimeoutUs);
+    int err = e.one_pd ? AEE_SUCCESS
+                       : q1.api->write(q1.q, 0, 0, nullptr, sizeof(r1),
+                                       reinterpret_cast<const uint8_t *>(&r1),
+                                       kDspqTimeoutUs);
     if (err == AEE_SUCCESS)
       err =
         q2.api->write(q2.q, 0, nb2, b, sizeof(r2),
@@ -4322,9 +4340,18 @@ private:
       struct dspqueue_buffer rb[2] = {};
       err = q2.api->read(q2.q, &flags, 2, &rnb2, rb, sizeof(s2r), &len2,
                          reinterpret_cast<uint8_t *>(&s2r), kDspqTimeoutUs);
-      if (err == AEE_SUCCESS)
+      if (err == AEE_SUCCESS && !e.one_pd)
         err = q1.api->read(q1.q, &flags, 2, &rnb1, rb, sizeof(s1r), &len1,
                            reinterpret_cast<uint8_t *>(&s1r), kDspqTimeoutUs);
+      if (e.one_pd) { // the one answer carries S1's pool fields too
+        s1r.seq = s2r.seq;
+        s1r.t_in_us = s2r.t_in_us;
+        s1r.misses = s2r.misses;
+        s1r.miss_us = s2r.miss_us;
+        s1r.route_n = std::min<uint32_t>(s2r.route_n, HTP_DSPQ_TOKEN_ROUTE);
+        std::memcpy(s1r.route, s2r.route, s1r.route_n);
+        len1 = sizeof(s1r);
+      }
     }
     const uint64_t us = HtpProfile::nowUs() - t0;
     const uint32_t c2 = sysCounterUs(); // after both reads: S1 answered first
@@ -4464,12 +4491,17 @@ private:
     const size_t s1_mib = arenaBytes() >> 20;
     uint32_t info1[7] = {0}; // res[4]: S1's heap in use, KiB
     nntr_hvx_session_info(e.h1, info1, 7);
-    if (!b.openSecond())
-      throw std::runtime_error("NNTR_HTP_E2E=1: the second session did not "
-                               "open (" +
-                               b.s2Error() + ")");
-    e.h2 = static_cast<remote_handle64>(b.handle2());
-    e.dom2 = b.effDomain2();
+    if (e.one_pd) { // [plan 201 S1] the FC set into S1's own new chunks
+      e.h2 = e.h1;
+      e.dom2 = CDSP_DOMAIN_ID;
+    } else {
+      if (!b.openSecond())
+        throw std::runtime_error("NNTR_HTP_E2E=1: the second session did not "
+                                 "open (" +
+                                 b.s2Error() + ")");
+      e.h2 = static_cast<remote_handle64>(b.handle2());
+      e.dom2 = b.effDomain2();
+    }
     const uint64_t t0 = HtpProfile::nowUs();
     try {
       bindQ4m1(e.h2);
@@ -4485,14 +4517,14 @@ private:
     std::fprintf(stderr,
                  "[HTP] s2: fc arena weights=%zu handles=%zu attach_mib=%.1f "
                  "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
-                 "lanes=%s s1_arena_mib=%zu s1_heap_kib=%u\n",
+                 "lanes=%s s1_arena_mib=%zu s1_heap_kib=%u%s\n",
                  q4_pending_.size(), e.q4m1.size(),
                  static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0),
                  e.arena.size(), mapped >> 20, q4m1FeedName(), ms,
                  std::getenv("NNTR_HTP_FC_LANES")
                    ? std::getenv("NNTR_HTP_FC_LANES")
                    : "6,3",
-                 s1_mib, info1[4]);
+                 s1_mib, info1[4], e.one_pd ? " pds=1" : "");
   }
 
   /** [#132 Part B E3] The feed the FC kinds take: the op's l2, or VTCM only
@@ -4501,7 +4533,9 @@ private:
     if (kind_ops_[HTP_OP_FC].empty() ||
         (graphOp(kind_ops_[HTP_OP_FC][0])->feed & HTP_GRAPH_FEED_L2) != 0u)
       return "l2";
-    return e2e_ && HtpBackend::global().vtcm2Bytes() == 0u ? "l2" : "vtcm";
+    return e2e_ && !e2e_st_->one_pd && HtpBackend::global().vtcm2Bytes() == 0u
+             ? "l2"
+             : "vtcm";
   }
 
   /** @brief [doc 46] One call for the whole layer.
@@ -6372,6 +6406,7 @@ private:
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */
     uint64_t misses = 0, miss_us = 0, pool_rounds = 0, pool_read_us = 0;
+    bool one_pd = false; /**< [plan 201 S1] NNTR_HTP_E2E_PDS=1 */
   };
   /** @brief The mailbox page: HEXKL_MBOX_BYTES (16 896) rounded to the
    *  #178 probe's 64 KiB. */
