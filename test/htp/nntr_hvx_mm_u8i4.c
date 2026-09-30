@@ -56,6 +56,9 @@ int nntr_hvx_mm_u8i4_from_f32(
   if (!s) {
     return AEE_EBADPARM;
   }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
 
   const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
 
@@ -392,8 +395,9 @@ int nntr_hvx_arena_detach(remote_handle64 handle, uint32 arena) {
   if (!a) {
     return AEE_EBADPARM;
   }
-  if (hexkl_weight_u8i4_borrows(&s->weights_u8i4, a->va, a->bytes)) {
-    return AEE_EBADSTATE;
+  if (hexkl_weight_u8i4_borrows(&s->weights_u8i4, a->va, a->bytes) ||
+      nntr_hvx_q4m1_borrows(s, a->va, a->bytes)) {
+    return AEE_EBADSTATE; /* [#132 Part B E3] q4m1_attach borrows too */
   }
 #ifndef NNTR_HAVE_HAP_MMAP
   return AEE_EUNSUPPORTED;
@@ -536,6 +540,9 @@ static int check_layer_args(const nntr_hvx_session *s, uint32 M, uint32 K,
   if (!s || w_handlesLen <= 0) {
     return AEE_EBADPARM;
   }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
   if ((uint32_t)act_f32Len != M * K) {
     FARF(ERROR, "mm_u8i4_layer: bad act_f32Len (M=%u K=%u)", (unsigned)M,
          (unsigned)K);
@@ -625,6 +632,9 @@ static int check_layer_args_u8in(const nntr_hvx_session *s, uint32 M, uint32 K,
   const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
   if (!s || w_handlesLen <= 0) {
     return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
   }
   if ((uint32_t)act_ahLen != m_pad * K || (uint32_t)act_scaleLen != m_pad ||
       (uint32_t)act_zpLen != m_pad) {
@@ -739,6 +749,9 @@ static int check_layer_args_fused(const nntr_hvx_session *s, uint32 M, uint32 K,
   if (!s || w_handlesLen != 2) {
     return AEE_EBADPARM;
   }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
   if ((uint32_t)act_f32Len != M * K) {
     FARF(ERROR, "mm_u8i4_layer_fused: bad act_f32Len (M=%u K=%u)", (unsigned)M,
          (unsigned)K);
@@ -843,6 +856,9 @@ static int check_gate_up_swiglu_args(const nntr_hvx_session *s, uint32 M,
                                      int out_scaleLen, int out_zpLen) {
   if (!s) {
     return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
   }
   if ((uint32_t)act_f32Len != M * K) {
     FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad act_f32Len (M=%u K=%u)",
@@ -950,6 +966,9 @@ static int check_moe_layer_args(const nntr_hvx_session *s, uint32 M, uint32 K,
                                 int out_f32Len) {
   if (!s || M == 0 || K == 0 || inter == 0 || N_out == 0) {
     return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
   }
   if (h_guLen <= 0 || h_dnLen != h_guLen || row_countLen != h_guLen) {
     FARF(ERROR, "moe_layer: expert count mismatch (gu=%d dn=%d count=%d)",
@@ -1073,6 +1092,9 @@ static int check_conv_block_args(const nntr_hvx_session *s, uint32 M, uint32 K,
                                  int state_f32Len) {
   if (!s || M == 0 || K == 0 || C == 0 || N_out == 0) {
     return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
   }
   if (h_inLen != 3) {
     FARF(ERROR, "conv_block: h_in has %d handles, want 3 (a, b, c)", h_inLen);

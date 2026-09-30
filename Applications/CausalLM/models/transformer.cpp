@@ -388,9 +388,22 @@ void Transformer::repack_weight() {
     unsigned int K, C, N;
   };
   std::vector<PendingConv> conv_pending;
+  // [#132 Part B E5g] the MoE warm-up call, kept until every MoE weight is
+  // mapped: it grows the session's DSP heap by the M=512 scratch, and a heap
+  // growth between two arena chunk mappings strands the space up to the next
+  // chunk boundary (the note above). In the walk it landed between the first
+  // MoE layer's chunks and the rest, and the two-session sittings saw S1's
+  // last chunk refused (AEE_EMMAP) on some boots.
+  struct PendingMoeWarm {
+    nntrainer::ComputeOps *ops = nullptr;
+    std::vector<void *> gu_data, dn_data;
+    std::vector<float *> gu_scale, dn_scale;
+    unsigned int K = 0, inter = 0, N_out = 0;
+    bool weights_wh = false;
+  } moe_warm;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&fc_pending, &dense_pending, &conv_pending](
+    fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm](
            ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       // The tied lm_head's blocked twin (tie_word_embedding.h) is built
       // here, with every weight loaded, rather than on the first lm_head
@@ -524,34 +537,45 @@ void Transformer::repack_weight() {
       // enough, since all of that is per session, not per layer. Zero
       // input, output discarded. Skipped, harmlessly, when the shapes do
       // not read as an expert pair.
-      static bool moe_warmed = false;
-      if (ops && !moe_warmed && l.getType() == "lfm2_moe" &&
+      if (ops && moe_warm.ops == nullptr && l.getType() == "lfm2_moe" &&
           ops->supports_gemm_qs4cx_moe_layer_fp32() && !gu_data.empty() &&
-          gu_data.size() == dn_data.size()) {
-        if (gu_w == 2 * dn_h && gu_h == dn_w) {
-          moe_warmed = true;
-          const unsigned int M = 512, K = gu_h, inter = dn_h, N_out = dn_w;
-          const unsigned int E = static_cast<unsigned int>(gu_data.size());
-          const unsigned int per = 64; // one 64-row block per expert
-          std::vector<unsigned int> row_index, row_count(E, per);
-          std::vector<float> row_weight;
-          for (unsigned int e = 0; e < E; ++e) {
-            for (unsigned int r = 0; r < per; ++r) {
-              row_index.push_back((e * per + r) % M);
-              row_weight.push_back(0.0f);
-            }
-          }
-          std::vector<float> act(static_cast<size_t>(M) * K, 0.0f);
-          std::vector<float> out(static_cast<size_t>(M) * N_out, 0.0f);
-          ops->gemm_qs4cx_moe_layer_fp32(
-            gu_data, gu_scale, dn_data, dn_scale, row_index, row_count,
-            row_weight, act.data(), out.data(), M, K, inter, N_out, weights_wh);
-          ml_logd("MoE HTP kernel warmed up at load (M=%u, %u experts)", M, E);
-        }
+          gu_data.size() == dn_data.size() && gu_w == 2 * dn_h &&
+          gu_h == dn_w) {
+        moe_warm.ops = ops;
+        moe_warm.gu_data = gu_data;
+        moe_warm.gu_scale = gu_scale;
+        moe_warm.dn_data = dn_data;
+        moe_warm.dn_scale = dn_scale;
+        moe_warm.K = gu_h;
+        moe_warm.inter = dn_h;
+        moe_warm.N_out = dn_w;
+        moe_warm.weights_wh = weights_wh;
       }
     };
   try {
     model->forEachLayer(fn, nullptr);
+    // The MoE warm-up (doc 47 section 20.1, lever 6): one call through the
+    // layer kernel at load, now after the walk (see PendingMoeWarm).
+    if (moe_warm.ops != nullptr) {
+      const unsigned int M = 512, K = moe_warm.K, N_out = moe_warm.N_out;
+      const unsigned int E = static_cast<unsigned int>(moe_warm.gu_data.size());
+      const unsigned int per = 64; // one 64-row block per expert
+      std::vector<unsigned int> row_index, row_count(E, per);
+      std::vector<float> row_weight;
+      for (unsigned int e = 0; e < E; ++e) {
+        for (unsigned int r = 0; r < per; ++r) {
+          row_index.push_back((e * per + r) % M);
+          row_weight.push_back(0.0f);
+        }
+      }
+      std::vector<float> act(static_cast<size_t>(M) * K, 0.0f);
+      std::vector<float> out(static_cast<size_t>(M) * N_out, 0.0f);
+      moe_warm.ops->gemm_qs4cx_moe_layer_fp32(
+        moe_warm.gu_data, moe_warm.gu_scale, moe_warm.dn_data,
+        moe_warm.dn_scale, row_index, row_count, row_weight, act.data(),
+        out.data(), M, K, moe_warm.inter, N_out, moe_warm.weights_wh);
+      ml_logd("MoE HTP kernel warmed up at load (M=%u, %u experts)", M, E);
+    }
     // The deferred FC registrations (see fc_pending above). A CPU-engine
     // layer's ops answer false and cost nothing. One warm-up call per
     // session after the first accelerated one, like the MoE one: the first

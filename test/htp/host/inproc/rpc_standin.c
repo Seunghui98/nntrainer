@@ -47,10 +47,34 @@ EXPORT int rpcmem_to_fd(void *p);
 typedef struct {
   void *ptr;
   size_t bytes;
-  int mapped; /**< fastrpc_mmap'd: only then does the DSP side see it */
+  int mapped; /**< fastrpc_mmap'd, a bit per domain (the mailbox is in two):
+                   only then does the DSP side see it */
+  int stale;  /**< a refused map the "driver" still holds (see below) */
+  int refs;   /**< HAP_mmap_get minus HAP_mmap_put on the DSP side */
 } rpc_buf;
+/* [#132 Part B E5g] NNTR_INPROC_MMAP_CAP_MIB=<n>: refuse a map that takes
+   a domain past n MiB (the device's AEE_EMMAP), and keep the fd's entry
+   after the refusal until it is unmapped, as the device's driver did
+   (a re-map of that fd number is AEE_EALREADY). 0 / unset: no cap. */
+static size_t g_mapped_by_dom[16];
 static rpc_buf g_bufs[RPC_MAX_BUFS];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+/* [#132 Part B E5i] buffers rpcmem_free'd while still fastrpc_mmap'd:
+   E5f-E5h's lost 256 MiB windows came after runs that left the S1 arena
+   mapped to process exit. Printed with what is still mapped at exit. */
+static unsigned g_freed_mapped;
+
+__attribute__((destructor)) static void rpc_standin_exit_report(void) {
+  size_t live = 0;
+  for (int d = 0; d < 16; ++d)
+    live += g_mapped_by_dom[d];
+  fprintf(stderr, "INPROC rpc exit: mapped_kib=%zu freed_while_mapped=%u\n",
+          live >> 10, g_freed_mapped);
+  for (int i = 0; i < RPC_MAX_BUFS; ++i)
+    if (g_bufs[i].ptr && g_bufs[i].mapped)
+      fprintf(stderr, "INPROC rpc exit: still mapped fd=%d kib=%zu refs=%d\n",
+              RPC_FD_BASE + i, g_bufs[i].bytes >> 10, g_bufs[i].refs);
+}
 
 static int buf_find(const void *p) {
   for (int i = 0; i < RPC_MAX_BUFS; ++i)
@@ -92,8 +116,11 @@ EXPORT void rpcmem_free(void *p) {
     return;
   pthread_mutex_lock(&g_mu);
   const int slot = buf_find(p);
-  if (slot >= 0)
+  if (slot >= 0) {
+    g_freed_mapped += g_bufs[slot].mapped != 0;
     g_bufs[slot].ptr = NULL;
+    g_bufs[slot].mapped = g_bufs[slot].stale = g_bufs[slot].refs = 0;
+  }
   pthread_mutex_unlock(&g_mu);
   free(p);
 }
@@ -130,19 +157,40 @@ EXPORT int remote_handle64_control(remote_handle64 h, uint32_t req, void *data,
 }
 EXPORT int fastrpc_mmap(int domain, int fd, void *addr, int offset,
                         size_t length, enum fastrpc_map_flags flags) {
-  (void)domain, (void)addr, (void)offset, (void)length, (void)flags;
+  (void)addr, (void)offset, (void)flags;
   rpc_buf *b = buf_of_fd(fd);
   if (!b)
     return AEE_EBADPARM;
-  b->mapped = 1;
+  if (b->stale)
+    return AEE_EALREADY;
+  static long cap_mib = -1;
+  if (cap_mib < 0) {
+    const char *c = getenv("NNTR_INPROC_MMAP_CAP_MIB");
+    cap_mib = c ? atol(c) : 0;
+  }
+  const int d = domain & 15;
+  if (cap_mib > 0 && g_mapped_by_dom[d] + length > (size_t)cap_mib << 20) {
+    b->stale = 1;
+    return AEE_EMMAP;
+  }
+  g_mapped_by_dom[d] += length;
+  b->mapped |= 1 << d;
   return AEE_SUCCESS;
 }
 EXPORT int fastrpc_munmap(int domain, int fd, void *addr, size_t length) {
-  (void)domain, (void)addr, (void)length;
+  (void)addr;
   rpc_buf *b = buf_of_fd(fd);
   if (!b)
     return AEE_EBADPARM;
-  b->mapped = 0;
+  /* modelled: the DSP side still holds it (HAP_mmap_get without its put;
+     an attached arena), so it is not the ARM side's to unmap yet */
+  if (b->refs > 0)
+    return AEE_EBADSTATE;
+  if ((b->mapped & (1 << (domain & 15))) &&
+      g_mapped_by_dom[domain & 15] >= length)
+    g_mapped_by_dom[domain & 15] -= length;
+  b->mapped &= ~(1 << (domain & 15));
+  b->stale = 0;
   return AEE_SUCCESS;
 }
 
@@ -150,16 +198,21 @@ EXPORT int fastrpc_munmap(int domain, int fd, void *addr, size_t length) {
    not fastrpc_mmap'd is refused, as the device refuses it, so a dropped
    or reordered mapping fails here and not on the phone. ---- */
 EXPORT int HAP_mmap_get(int fd, void **vaddr, uint64 *paddr) {
-  const rpc_buf *b = buf_of_fd(fd);
+  rpc_buf *b = buf_of_fd(fd);
   if (!b || !b->mapped)
     return AEE_EBADPARM;
+  ++b->refs;
   *vaddr = b->ptr;
   if (paddr)
     *paddr = (uint64)(uintptr_t)b->ptr;
   return AEE_SUCCESS;
 }
 EXPORT int HAP_mmap_put(int fd) {
-  return buf_of_fd(fd) ? AEE_SUCCESS : AEE_EBADPARM;
+  rpc_buf *b = buf_of_fd(fd);
+  if (!b || b->refs <= 0)
+    return AEE_EBADPARM;
+  --b->refs;
+  return AEE_SUCCESS;
 }
 /* The probe entries' explicit mapping: not a model path, refused. */
 EXPORT void *HAP_mmap(void *addr, int len, int prot, int flags, int fd,

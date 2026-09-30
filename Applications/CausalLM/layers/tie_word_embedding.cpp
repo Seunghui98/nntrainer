@@ -12,6 +12,7 @@
  */
 
 #include <cpu_backend.h>
+#include <htp_decode_hook.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -514,6 +515,15 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+    // [#132 Part B] a decode row's lm_head on the HTP (no bias there)
+    if (b_size == 1 && to - from == 1 &&
+        input_step.getDataType() == nntrainer::TensorDim::DataType::FP32 &&
+        !std::get<nntrainer::props::DisableBias>(*layer_impl_props).empty() &&
+        std::get<nntrainer::props::DisableBias>(*layer_impl_props).get() &&
+        causallm::htpDecodeLmHead(
+          from, input_step.getData<float>(), input_step.width(),
+          hidden_step.getData<float>(), hidden_step.width()))
+      continue;
     logits_of(input_step, hidden_step);
   }
 

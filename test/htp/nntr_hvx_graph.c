@@ -34,11 +34,34 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     FARF(ERROR, "graph_init: a graph is already live; release it first");
     return AEE_EBADSTATE;
   }
-  rc = hexkl_graph_init(desc, (uint32_t)descLen, &s->weights_u8i4, &s->graph);
+  {
+    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles */
+    hexkl_graph_q4m1_shape q4m1[NNTR_HVX_Q4M1_SLOTS];
+    uint32_t i;
+    for (i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
+      q4m1[i].K = s->q4m1[i].w ? s->q4m1[i].K : 0u;
+      q4m1[i].N = s->q4m1[i].w ? s->q4m1[i].N : 0u;
+    }
+    rc = hexkl_graph_init(desc, (uint32_t)descLen, &s->weights_u8i4, q4m1,
+                          NNTR_HVX_Q4M1_SLOTS, &s->graph);
+  }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "graph_init: %s (0x%08x), %d words", htp_graph_err_name(rc),
          (unsigned)rc, descLen);
     return rc;
+  }
+  if (!s->hmx_locked) {
+    /* [#178, #132 Part B E3] the lite open (S2) has no HMX: its graph may
+       hold every kind but MOE resident (HTP_GRAPH_KINDS_S2) */
+    uint32_t i;
+    for (i = 0; i < s->graph->n_ops; ++i) {
+      if (s->graph->ops[i].resident && s->graph->ops[i].kind == HTP_OP_MOE) {
+        FARF(ERROR, "graph_init: a resident MOE op on a session without HMX");
+        hexkl_graph_free(s->graph);
+        s->graph = NULL;
+        return AEE_EUNSUPPORTED;
+      }
+    }
   }
   *n_ops = s->graph->n_ops;
   {
@@ -107,7 +130,7 @@ static int graph_check_args(const nntr_hvx_session *s, int row_indexLen,
   return AEE_SUCCESS;
 }
 
-static void graph_env_of(const nntr_hvx_session *s, hexkl_graph_env *env) {
+void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->tbl = (hexkl_weight_u8i4_table *)&s->weights_u8i4;
   env->vtcm_base = s->vtcm_base;
   env->vtcm_size = s->vtcm_size;
@@ -115,7 +138,9 @@ static void graph_env_of(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->pool = s->quant_pool;
   env->scratch = (hexkl_moe_scratch *)&s->moe_scratch;
   env->moe_flags = s->moe_flags;
-  env->attn_m1 = s->attn_m1; /* [#130] borrowed; NULL until registered */
+  env->attn_m1 = s->attn_m1;        /* [#130] borrowed; NULL until registered */
+  env->fc = nntr_hvx_fc_q4m1_graph; /* [#132 Part B] */
+  env->fc_ctx = (void *)s;
 }
 
 /** @brief One FARF line per call (HIGH: silent unless the mask enables
@@ -155,7 +180,7 @@ int nntr_hvx_forward(remote_handle64 handle, uint32 start_op, uint32 pos,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  graph_env_of(s, &env);
+  nntr_hvx_graph_env(s, &env);
   routing.row_index = row_index;
   routing.row_count = row_count;
   routing.row_weight = row_weight;
@@ -206,7 +231,7 @@ int nntr_hvx_forward_debug(remote_handle64 handle, uint32 start_op,
          (unsigned)nntr_hvx_moe_stage_count());
     return AEE_EBADPARM;
   }
-  graph_env_of(s, &env);
+  nntr_hvx_graph_env(s, &env);
   routing.row_index = row_index;
   routing.row_count = row_count;
   routing.row_weight = row_weight;

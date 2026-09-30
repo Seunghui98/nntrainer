@@ -66,7 +66,10 @@ std::string projEngine(const std::string &engine, const std::set<int> &ids,
  *  none. Its CPU path folds the four layers byte for byte (doc 51). */
 bool htpForwardSwitch() {
   const char *env = std::getenv("NNTR_HTP_FORWARD");
-  return env != nullptr && std::atoi(env) != 0;
+  // [#132 Part B E3] NNTR_HTP_E2E=1 is the per-token entry too
+  const char *e2e = std::getenv("NNTR_HTP_E2E");
+  return (env != nullptr && std::atoi(env) != 0) ||
+         (e2e != nullptr && std::atoi(e2e) != 0);
 }
 } // namespace
 

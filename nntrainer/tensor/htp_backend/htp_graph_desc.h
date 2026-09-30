@@ -68,6 +68,22 @@ enum {
   HTP_OP_KIND_N
 };
 #define HTP_GRAPH_KIND_BIT(k) (1u << (k))
+/** @brief Every kind: the one-session all-resident mask (#132 Part B E1). */
+#define HTP_GRAPH_KINDS_ALL ((1u << HTP_OP_KIND_N) - 1u)
+/** @brief #132 Part B's two sessions get the same description with
+ *  complementary masks: S1 (the MoE session: the arena, HMX, the M=1
+ *  feed's VTCM) the router and the experts, S2 everything else. Each
+ *  mask validates on its own (ROUTER_TOPK's MOE is in S1, every RMSNORM
+ *  with the ADDs in S2), and the stretch rule cuts the list at the hops:
+ *  S2 runs [0, r1), S1 [r1, r1 + 2), S2 [r1 + 2, r2), ... */
+#define HTP_GRAPH_KINDS_S1                                                     \
+  (HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KIND_BIT(HTP_OP_MOE))
+#define HTP_GRAPH_KINDS_S2 (HTP_GRAPH_KINDS_ALL & ~HTP_GRAPH_KINDS_S1)
+/** @brief The kinds whose weights are Q4M1 handles (#132 Part B): the
+ *  CPU-exact Q4_0 FC and its two compositions. */
+#define HTP_GRAPH_KINDS_Q4M1                                                   \
+  (HTP_GRAPH_KIND_BIT(HTP_OP_FC) | HTP_GRAPH_KIND_BIT(HTP_OP_DENSE_FFN) |      \
+   HTP_GRAPH_KIND_BIT(HTP_OP_LM_HEAD))
 
 /** @brief The kind's name, for log lines and NNTR_HTP_FORWARD_KINDS. */
 static inline const char *htp_graph_kind_name(uint32_t k) {
@@ -137,7 +153,12 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
  *  position) with op == HTP_GRAPH_NO_OP; ROUTER_W is K x n_experts
  *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
- *  ROUTER_TOPK (#132). Append, never reorder. */
+ *  ROUTER_TOPK (#132). [#132 Part B E3] LM_BAN is 0..HTP_GRAPH_MAX_BAN
+ *  token ids (u32 bits in the f32 words, each < N; 0 clears) for LM_HEAD:
+ *  its argmax
+ *  skips them, as the CPU's bad-words penalty sets those logits to -inf
+ *  before its first-maximum pick; the logits themselves stay raw. A later
+ *  LM_BAN replaces the list. Append, never reorder. */
 enum {
   HTP_GRAPH_PARAM_GAMMA = 0,
   HTP_GRAPH_PARAM_CONV_W,
@@ -145,8 +166,11 @@ enum {
   HTP_GRAPH_PARAM_ROPE_TABLE,
   HTP_GRAPH_PARAM_ROUTER_W,
   HTP_GRAPH_PARAM_ROUTER_BIAS,
+  HTP_GRAPH_PARAM_LM_BAN,
   HTP_GRAPH_PARAM_N
 };
+/** @brief LM_BAN's longest list. */
+#define HTP_GRAPH_MAX_BAN 32u
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
 enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
@@ -155,14 +179,25 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * @brief One op record, HTP_GRAPH_OP_WORDS words on the wire.
  *
  * K is the input width, N the output width (inter for MOE / DENSE_FFN,
- * whose output width is N_out). in_slot / out_slot name the session's
+ * whose output width is N_out; vocab for LM_HEAD). in_slot / out_slot name
+ * the session's
  * activation slots (plan 85 section 3.1); ADD reads slot 0 as its second
  * operand implicitly. next_mm names the next weight-streaming op (FC,
  * MOE, DENSE_FFN, LM_HEAD) or HTP_GRAPH_NO_OP; nothing consumes it yet
  * (the cross-op prefetch hook is a later issue), the validator only
  * requires it to point forward. h_gu / h_dn are the MoE op's registered
- * weight handles, bound by the ARM before graph_init; other kinds leave
- * them 0. n_kv / gqa / head_dim describe the attention kinds (QK_NORM,
+ * weight handles, bound by the ARM before graph_init. [#132 Part B] The
+ * Q4M1 kinds use them too, with n_experts the part count: an FC's parts
+ * are h_gu[0..n_experts), K x N_p each, their outputs concatenated (q | k
+ * | v: three parts, one quantization), an LM_HEAD's are its vocab slices
+ * likewise, and a DENSE_FFN has h_gu[0] = up, h_gu[1] = gate (K x N each)
+ * and h_dn[0] = down (N x N_out), n_experts 3. feed says how those
+ * kinds' weights reach the vector unit: 0 VTCM by DMA when the session
+ * has 2 groups per lane of it, else the L2 scratch; 1 the L2 scratch
+ * (hexkl_graph.h); [#132 Part B E5f] bits 8-11 / 12-15 the L2 feed's
+ * lanes for a part with K <= 2048 / K > 2048, 0 = the runner's default
+ * (HTP_GRAPH_FEED_*). Other kinds leave all of these 0. n_kv / gqa /
+ * head_dim describe the attention kinds (QK_NORM,
  * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
  * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
  * QK_NORM); both are 0 elsewhere.
@@ -179,7 +214,8 @@ typedef struct {
   uint32_t in_slot;
   uint32_t out_slot;
   uint32_t next_mm;
-  uint32_t rsv;
+  uint32_t feed; /**< Q4M1 kinds: bit 0 the L2 feed (else VTCM if it
+                     fits); bits 8-11 / 12-15 the L2 lanes, small / large K */
   uint32_t n_kv;
   uint32_t gqa;
   uint32_t head_dim;
@@ -188,6 +224,10 @@ typedef struct {
   uint32_t h_dn[HTP_GRAPH_MAX_EXPERTS];
 } htp_graph_op;
 #define HTP_GRAPH_OP_WORDS (16u + 2u * HTP_GRAPH_MAX_EXPERTS)
+/** @brief The Q4M1 kinds' feed word (htp_graph_op.feed). */
+#define HTP_GRAPH_FEED_L2 1u
+#define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
+#define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
 typedef char
   htp_graph_op_size_check[sizeof(htp_graph_op) == HTP_GRAPH_OP_WORDS * 4u ? 1
                                                                           : -1];
@@ -303,7 +343,12 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         across calls only if op 0 seeds it each token and no CPU norm
  *         leaves a stretch start that would re-seed it); a resident
  *         ROUTER_TOPK needs the next op, its MOE, resident (NOTALLOWED:
- *         the routing has no other consumer)
+ *         the routing has no other consumer). #132 Part B's rules for
+ *         the Q4M1 kinds: n_experts (the part count) at most 32 and feed
+ *         0 or 1 (INVALIDFORMAT); a resident one needs K % 64 == 0 and K
+ *         <= 8192, a DENSE_FFN also N (the down weight's K) % 64 == 0 and
+ *         N <= 8192 -- the Q4M1 layout's pair and the quantizer's scratch
+ *         (SCHEMENOTSUPPORTED)
  */
 static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
                                           uint32_t resident_ok,
@@ -411,6 +456,17 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     default:
       break;
     }
+    if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(k)) != 0u) {
+      if (op->n_experts > HTP_GRAPH_MAX_EXPERTS ||
+          (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u)) != 0u ||
+          HTP_GRAPH_FEED_LANES_SMALL(op->feed) > 8u ||
+          HTP_GRAPH_FEED_LANES_LARGE(op->feed) > 8u)
+        return HTP_GRAPH_E_INVALIDFORMAT;
+      if (op->resident != 0u &&
+          (op->K % 64u != 0u || op->K > 8192u ||
+           (k == HTP_OP_DENSE_FFN && (op->N % 64u != 0u || op->N > 8192u))))
+        return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
+    }
     /* v2: the attention record, its in-layer order and the norm epsilon */
     if (k == HTP_OP_QK_NORM || k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) {
       if (op->n_kv == 0u || op->gqa == 0u || op->head_dim == 0u ||
@@ -467,6 +523,18 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
   if (n_ops_out != NULL)
     *n_ops_out = n_ops;
   return 0u;
+}
+
+/** @brief Sets every op's resident bit to whether @a mask names its kind:
+ *  how one description becomes a session's (#132 Part B: the same list,
+ *  HTP_GRAPH_KINDS_S1 for the MoE session, HTP_GRAPH_KINDS_S2 for the
+ *  other). The caller validates the result. */
+static inline void htp_graph_set_resident(uint32_t *w, uint32_t mask) {
+  uint32_t i;
+  for (i = 0; i < w[3]; ++i) {
+    htp_graph_op *op = htp_graph_op_at(w, i);
+    op->resident = (mask & HTP_GRAPH_KIND_BIT(op->kind)) != 0u;
+  }
 }
 
 /** @brief The LFM2 decode step's shape, from config.json / nntr_config.json. */

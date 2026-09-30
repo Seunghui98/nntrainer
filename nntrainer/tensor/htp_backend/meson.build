@@ -79,6 +79,7 @@ if get_option('htp-inproc')
     htp_test_dir / 'nntr_hvx_small_ops.c',
     htp_test_dir / 'nntr_hvx_attn_m1.c',
     htp_test_dir / 'nntr_hvx_dspq.c',
+    htp_test_dir / 'nntr_hvx_token.c',
     htp_test_dir / 'nntr_hvx_fc_q4.c',
     htp_test_dir / 'nntr_hvx_sf_probe.c',
     'hmx/hexkl_mm_u8i4.c',
@@ -87,6 +88,7 @@ if get_option('htp-inproc')
     'hmx/hexkl_mm_u8i8_dma.c',
     'hmx/hexkl_conv_block.c',
     'hmx/hexkl_graph.c',
+    'hmx/hexkl_token.c',
     'hmx/hexkl_dma_ring.c',
     'hmx/hexkl_dma_trace.c',
     'hmx/hexkl_probe.c',
@@ -110,6 +112,8 @@ if get_option('htp-inproc')
   # kernels round every f32 op on its own, as the device does.
   # -include malloc.h: the m=1 attention cache is memalign(128), which the
   # Hexagon libc declares in stdlib.h and glibc in malloc.h.
+  # -DNNTR_Q4M1_HOST_ID: the Q4M1 quantizer's x86-order switch
+  # (NNTR_INPROC_X86_Q8, hvx_q4_gemv_f32.c; #132 Part B E1).
   nntr_hvx_inproc = static_library('nntr_hvx_inproc',
     inproc_sources,
     include_directories: include_directories(
@@ -118,7 +122,7 @@ if get_option('htp-inproc')
       'generated', 'hmx', 'hvx', '.', '..'),
     dependencies: [hexkl_dep, thread_dep, libm_dep],
     c_args: ['-ffp-contract=off', '-include', 'malloc.h',
-             '-Wno-format-truncation'],
+             '-Wno-format-truncation', '-DNNTR_Q4M1_HOST_ID'],
     pic: true,
     build_by_default: false,
   )

@@ -249,7 +249,11 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   std::vector<nntrainer::Tensor *> Outputs(
     {&Qhidden_step, &Khidden_step, &Vhidden_step});
 
-  input_step.dot(Weights, Outputs);
+  // [#132 Part B] every kind resident: the HTP projects this row itself
+  // and the rows below are never read (the QK_NORM hook still binds its
+  // gammas)
+  if (!(to - from == 1 && input_dim.batch() == 1 && htpDecodeRowResident(from)))
+    input_step.dot(Weights, Outputs);
 
   if (feature_size) {
     const float epsilon = std::get<nntrainer::props::Epsilon>(qkv_props).get();

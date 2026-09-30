@@ -68,6 +68,51 @@
 #                              carries it unchanged)
 #   E2E tokens d==off-tiny / -hd64 / -lfm25 8/8 expected_mismatch=0
 #   E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED
+# and, since #132 Part B E1, every kind resident in one session (the FC,
+# the dense FFN and the tied lm_head on the DSP too: one call per token;
+# logits only, the switch-on runs dump no MoE call):
+#   E2E fwd hd64 kinds=all calls/token=1.00 q4m1_handles=12
+#   E2E fwd lfm25 kinds=all calls/token=1.00 q4m1_handles=23
+#   E2E eval e1x86==d-hd64 / -lfm25 ... bit_identical=1 (the quantizer in
+#                              x86's id order, NNTR_INPROC_X86_Q8=1: every
+#                              logit and prefill MoE call equals D's)
+#   E2E eval e1-hd64 / e1-lfm25 ... min_snr_db=<x>     (printed: the
+#                              Android CPU's order against x86's D)
+#   E2E tokens e1==off-hd64 / -lfm25 8/8 expected_mismatch=0
+#   E2E eval e1-feed-l2 ... bit_identical=1            (NNTR_HTP_FC_FEED=l2:
+#                              the feed moves no bits)
+#   E2E fwd hd64 / lfm25 cpu-fc-skipped=<n> per_token=7 / 14 ok  (E2: the CPU
+#                              skips every FC GEMV of a resident row -- the
+#                              core FC, qkv and conv block hooks; the
+#                              bit_identical lines above hold with it)
+#   E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED   (head_dim 8:
+#                              no one-call token on the hd8 fixture)
+# and, since #132 Part B E3, the same token on two sessions in this process
+# (NNTR_HTP_E2E=1: S1 the router and the experts, S2 the rest on a lite
+# open with no VTCM, its FC set in an attached arena, the MoE rounds over
+# the mailbox page; one dspqueue packet per session per token). Not the
+# device's two PDs -- one address space, no cache maintenance, no transport
+# time -- but every ARM-side step of the device path:
+#   E2E eval e3==e1-hd64 / -lfm25 ... bit_identical=1  (logits, the Android-
+#                              order E1 run of the same model)
+#   E2E fwd hd64 / lfm25 e3 calls/token=1.00 hops/token=4.00 / 8.00
+#                              timeouts=0/0 id_mismatch=0 ok
+#   E2E tokens e3-run==e1-run-lfm25 8/8 id_only=1      (run(): only the id
+#                              comes back, the CPU takes it)
+#   E2E tokens e3-run==e1-run-lfm25-ban 8/8 id_only=1  (bad_word_ids = the
+#                              token the unbanned run picks: S2's argmax
+#                              skips it, LM_BAN, as the CPU's -inf does)
+#   E2E ppl-decode e3==e1-hd64 steps=7 identical=1     (NNTR_PPL_DECODE
+#                              forced on E1's path: the logits come back)
+#   E2E teardown 25off / 25e3 arena chunks unmapped n/n mapped_kib=0
+#                              freed_while_mapped=0  (E5i: the S1 arena
+#                              released on the DSP, then unmapped, before
+#                              the close; one session and two)
+#   E2E arena retry cap=100 refused=2 bit_identical=1  (E5g: a boot whose
+#                              last 256 MiB window is taken; the stand-in
+#                              refuses maps past 100 MiB and keeps a refused
+#                              fd, as the driver did; S1's chunk halves to
+#                              64 MiB and the run equals the uncapped one)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
 # (NNTR_HTP_DSPQ=1, inproc/dspqueue_standin.c; plan 141-dspq-moe.md step 4),
 # each against the switch-off run's dumps, every call's bytes:
@@ -208,6 +253,65 @@ NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
 echo "== [#132] lfm25 htp, KINDS=<six>,ADD,ROUTER_TOPK, prompt 512"
 PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
   run_e2e lfm25-d "$OUT/htp25" htp "$OUT/dump_25d" "$OUT/25d.log" --max-seq 2048
+# [#132 Part B, E1] every kind resident: one call per token, VTCM feed and
+# L2 feed; the hd8 fixture refused (its attention kinds cannot be resident).
+# The lm_head on the DSP is the Q4_0 one, so these runs quantize the tied
+# embedding to Q4_0 (LFM2.5's file does; the fixtures default to FP32) and
+# carry their own switch-off and D references on that model.
+E1_KINDS=RMSNORM,FC,CONV1D_GATE,QK_NORM,ROPE,ATTN_M1,ADD,ROUTER_TOPK,MOE,DENSE_FFN,LM_HEAD
+"$Q" "$FIX64" -o "$OUT/htp64q" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_htp64q.log"
+"$Q" "$FIX25" -o "$OUT/htp25q" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_htp25q.log"
+# NNTR_INPROC_X86_Q8=1 runs the DSP quantizer in x86 nntrainer's id order
+# (hvx_q4_gemv_f32.c; the only op where the x86 CPU's Q4_0 FC differs from
+# the Android CPU's), so that run is held against D bit for bit; the
+# Android-order run (e1a) is the tokens policy and a printed SNR.
+echo "== [#132 Part B] hd64 / lfm25 htp, Q4_0 lm_head: off, D, KINDS=all (one call per token)"
+for fx in 64 25; do
+  if [ $fx = 64 ]; then p=$PROMPT; ms=32; else p=512; ms=2048; fi
+  PROMPT=$p run_e2e "q$fx-off" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}qoff" "$OUT/${fx}qoff.log" --max-seq $ms
+  PROMPT=$p NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$ALL_KINDS,ADD,ROUTER_TOPK \
+    run_e2e "q$fx-d" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}qd" "$OUT/${fx}qd.log" --max-seq $ms
+  PROMPT=$p NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS NNTR_INPROC_X86_Q8=1 \
+    run_e2e "q$fx-e1" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}e1" "$OUT/${fx}e1.log" --max-seq $ms
+  PROMPT=$p NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+    run_e2e "q$fx-e1a" "$OUT/htp${fx}q" htp "$OUT/dump_${fx}e1a" "$OUT/${fx}e1a.log" --max-seq $ms
+done
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS NNTR_HTP_FC_FEED=l2 \
+  NNTR_INPROC_X86_Q8=1 \
+  run_e2e hd64-e1l2 "$OUT/htp64q" htp "$OUT/dump_64e1l2" "$OUT/64e1l2.log" --max-seq 32
+# [#132 Part B E3] the two-session token (NNTR_HTP_E2E=1; its packets ride
+# dspqueue, so these runs set NNTR_HTP_DSPQ=1)
+echo "== [#132 Part B E3] hd64 / lfm25, NNTR_HTP_E2E=1 (two sessions)"
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q64-e3 "$OUT/htp64q" htp "$OUT/dump_64e3" "$OUT/64e3.log" --max-seq 32
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3 "$OUT/htp25q" htp "$OUT/dump_25e3" "$OUT/25e3.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25-e1run "$OUT/htp25q" htp "$OUT/dump_25e1run" "$OUT/25e1run.log" --max-seq 2048 --run
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3run "$OUT/htp25q" htp "$OUT/dump_25e3run" "$OUT/25e3run.log" --max-seq 2048 --run
+# the same model with the unbanned run's first decode pick as a bad word
+cp -a "$OUT/htp25q" "$OUT/htp25qb"
+ban="$(sed -n 's/^E2E gen [0-9]* \([0-9]*\).*/\1/p' "$OUT/25e1run.log")"
+sed -i "s/\"bad_word_ids\": \[\]/\"bad_word_ids\": [${ban:-0}]/" "$OUT/htp25qb/nntr_config.json"
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25-e1ban "$OUT/htp25qb" htp "$OUT/dump_25e1ban" "$OUT/25e1ban.log" --max-seq 2048 --run
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3ban "$OUT/htp25qb" htp "$OUT/dump_25e3ban" "$OUT/25e3ban.log" --max-seq 2048 --run
+rm -f "$OUT/e3.ids"
+NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q64-e1ppl "$OUT/htp64q" htp "$OUT/dump_64e1ppl" "$OUT/64e1ppl.log" --max-seq 32 --run
+NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
+PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
+rc_e1=0
+NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS "$E2E" --model "$OUT/htp" \
+  --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
+  --moe-engine htp > "$OUT/tiny_e1.log" 2>&1 || rc_e1=$?
+tail -1 "$OUT/tiny_e1.log"
 # [#141] the M==1 MoE calls over dspqueue: tiny (DSP spins between calls),
 # lfm25 at prompt 512 (DSP always blocks), the HMX loop at M = 1, and a
 # runtime without dspqueue (the off banner, FastRPC throughout)
@@ -341,6 +445,111 @@ for d in "tiny $D_TINY,ROUTER_TOPK d 7.00 ref_off dump_htp" \
   $EVAL --label "d-$fx" --allow-diff --snr-floor $SNR_FLOOR "$OUT/$ref" "$OUT/dump_$tag" | tail -1 || fail=1
   $EVAL --label "d==off-$fx" --tokens-policy "$OUT/$off" "$OUT/dump_$tag" | tail -1 || fail=1
 done
+# (h2) [#132 Part B, E1] one call per token with every kind resident, and
+# bit-identical to the D run on the same model (the prefill MoE calls and
+# every logit) once the quantizer takes x86's id order -- so the FC,
+# dense FFN and lm_head are the x86 CPU's bits end to end; the handles the
+# model bound; the Android-order run against off by the tokens policy
+# (its SNR printed: lfm25 reads ~15 dB at the first decode step, where the
+# x86-order run is bit-identical, so the quantizer's id rounding is the
+# whole difference); the L2 feed bit-identical to the VTCM feed
+for d in "hd64 64e1 12 dump_64qd dump_64qoff" "lfm25 25e1 23 dump_25qd dump_25qoff"; do
+  read -r fx tag nh ref off <<< "$d"
+  calls="$(calls_per_token "$OUT/$tag.log")"
+  handles="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) .*/\1/p' "$OUT/$tag.log")"
+  echo "E2E fwd $fx kinds=all calls/token=${calls:-none} q4m1_handles=${handles:-none}"
+  [ "$calls" = 1.00 ] && [ "$handles" = "$nh" ] || fail=1
+  [ "$(calls_per_token "$OUT/${tag}a.log")" = 1.00 ] || fail=1
+  $EVAL --label "e1x86==d-$fx" "$OUT/$ref" "$OUT/dump_$tag" | tail -1 || fail=1
+  $EVAL --label "e1-$fx" --allow-diff --snr-floor 0 "$OUT/$ref" "$OUT/dump_${tag}a" | tail -1 || fail=1
+  $EVAL --label "e1==off-$fx" --tokens-policy "$OUT/$off" "$OUT/dump_${tag}a" | tail -1 || fail=1
+done
+# [#132 Part B E2] the CPU skips the FC layers of every resident row: per
+# decode token hd64 (C A C, layer 0 dense) asks 7 times (two conv blocks,
+# qkv, attention_out, the dense FFN's three), lfm25 (C C A C A C, two
+# dense) 14; the first decode token after the prefill is a resident row too
+for d in "hd64 64e1 7" "lfm25 25e1 14"; do
+  read -r fx tag per <<< "$d"
+  skipped="$(sed -n 's/^\[HTP\] graph: cpu fc skipped=\([0-9]*\)$/\1/p' "$OUT/$tag.log")"
+  toks="$(sed -n 's/.*forward calls=[0-9]* tokens=\([0-9]*\) .*/\1/p' "$OUT/$tag.log")"
+  if [ -n "$skipped" ] && [ -n "$toks" ] && [ "$skipped" = $((per * toks)) ]; then
+    echo "E2E fwd $fx cpu-fc-skipped=$skipped per_token=$per ok"
+  else
+    echo "E2E FAIL $fx cpu fc skipped=${skipped:-none} tokens=${toks:-none} (want $per per token)"; fail=1
+  fi
+done
+grep -q '^\[HTP\] graph: q4m1 weights=12 handles=12 feed=l2$' "$OUT/64e1l2.log" ||
+  { echo "E2E FAIL hd64 e1 l2: no feed=l2 line"; fail=1; }
+$EVAL --label e1-feed-l2 "$OUT/dump_64e1" "$OUT/dump_64e1l2" | tail -1 || fail=1
+# (h3) [#132 Part B E3] two sessions: every logit equal to the one-session
+# E1 run (Android order) of the same model, one packet per token, 2 hops
+# per MoE layer, no timeout, S2's argmax equal to the logits' first
+# maximum; run() with only the id back equals E1's run(); the PPL decode
+# step lines (17 digits) equal E1's
+for d in "hd64 64e3 64e1a 4.00" "lfm25 25e3 25e1a 8.00"; do
+  read -r fx tag ref hops <<< "$d"
+  $EVAL --label "e3==e1-$fx" "$OUT/dump_$ref" "$OUT/dump_$tag" | tail -1 || fail=1
+  close="$(grep '^\[HTP\] token driver: close ' "$OUT/$tag.log" || true)"
+  calls="$(calls_per_token "$OUT/$tag.log")"
+  if [ "$calls" = 1.00 ] && grep -q " hops/token=$hops " <<< "$close" &&
+    grep -q ' timeouts=0/0 stale=0/0 ' <<< "$close" &&
+    grep -q ' id_mismatch=0 ' <<< "$close" &&
+    grep -q '^\[HTP\] s2: fc arena weights=' "$OUT/$tag.log"; then
+    echo "E2E fwd $fx e3 calls/token=$calls hops/token=$hops timeouts=0/0 id_mismatch=0 ok"
+  else
+    echo "E2E FAIL $fx e3: calls/token=${calls:-none} close=[$close]"; fail=1
+  fi
+done
+cap_eval="$($EVAL --label e3cap "$OUT/dump_25e3" "$OUT/dump_25e3cap" | tail -1 || true)"
+refused=$(grep -c 'arena: [0-9]* MiB refused' "$OUT/25e3cap.log" || true)
+if grep -q 'bit_identical=1' <<< "$cap_eval" && [ "$refused" -ge 1 ]; then
+  echo "E2E arena retry cap=100 refused=$refused bit_identical=1"
+else
+  echo "E2E FAIL arena retry under a cap: refused=$refused [$cap_eval]"; fail=1
+fi
+# [#132 Part B E5i] every S1 arena chunk unmapped before the session
+# closes, on the one-session path and on E's; nothing mapped at exit and no
+# buffer freed while mapped (the stand-in refuses an unmap the DSP side
+# still holds)
+for t in 25off 25e3; do
+  un="$(sed -n 's/.*arena: chunks unmapped \([0-9]*\)\/\([0-9]*\) .*/\1 \2/p' "$OUT/$t.log")"
+  ex="$(grep -o 'INPROC rpc exit: .*' "$OUT/$t.log" | head -1)"
+  # the arena goes after the other hooks (E: after S2's close line)
+  late="$(grep -n 'arena: chunks unmapped\|s2: close' "$OUT/$t.log" | tail -1)"
+  if read -r a b <<< "$un" && [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" -gt 0 ] &&
+    [ "$ex" = "INPROC rpc exit: mapped_kib=0 freed_while_mapped=0" ] &&
+    grep -q 'arena: chunks unmapped' <<< "$late"; then
+    echo "E2E teardown $t arena chunks unmapped $a/$b mapped_kib=0 freed_while_mapped=0"
+  else
+    echo "E2E FAIL teardown $t: unmapped=[${un:-none}] [$ex]"; fail=1
+  fi
+done
+for d in "25e1run 25e3run lfm25" "25e1ban 25e3ban lfm25-ban"; do
+  read -r r1 r3 label <<< "$d"
+  e1_gen="$(grep '^E2E gen ' "$OUT/$r1.log")"
+  e3_gen="$(grep '^E2E gen ' "$OUT/$r3.log")"
+  same=$(paste <(tr ' ' '\n' <<< "$e1_gen") <(tr ' ' '\n' <<< "$e3_gen") |
+    tail -n +3 | awk '$1==$2{n++} END{print n+0}')
+  id_only=0
+  grep -q '^\[HTP\] token driver: first token .* logits=0$' "$OUT/$r3.log" && id_only=1
+  echo "E2E tokens e3-run==e1-run-$label $same/$STEPS id_only=$id_only"
+  [ "$same" = "$STEPS" ] && [ $id_only = 1 ] || fail=1
+done
+[ "$(grep '^E2E gen ' "$OUT/25e1ban.log")" != "$(grep '^E2E gen ' "$OUT/25e1run.log")" ] ||
+  { echo "E2E FAIL the ban changed no token (ban=${ban:-none})"; fail=1; }
+e3_steps() { grep -o '\[PPL\] decode step=.*' "$1" || true; }
+n="$(e3_steps "$OUT/64e3ppl.log" | wc -l)"
+if [ "$n" = $((STEPS - 1)) ] &&
+  [ "$(e3_steps "$OUT/64e1ppl.log")" = "$(e3_steps "$OUT/64e3ppl.log")" ]; then
+  echo "E2E ppl-decode e3==e1-hd64 steps=$n identical=1"
+else
+  echo "E2E FAIL ppl-decode e3 vs e1 (steps=$n)"; fail=1
+fi
+if [ $rc_e1 = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ESCHEMENOTSUPPORTED' "$OUT/tiny_e1.log"; then
+  echo "E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED"
+else
+  echo "E2E FAIL all kinds at head_dim 8 not refused (rc=$rc_e1)"; fail=1
+fi
 if [ $rc_add = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ENOTALLOWED' "$OUT/add_nonorm.log"; then
   echo "E2E fwd tiny ADD-without-RMSNORM refused: AEE_ENOTALLOWED"
 else

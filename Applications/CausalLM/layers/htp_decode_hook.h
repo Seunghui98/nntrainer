@@ -50,6 +50,7 @@ inline int htpDecodeOp(unsigned, unsigned, const float *, unsigned, float *,
 #define HTP_OP_ATTN_M1 5
 #define HTP_OP_ADD 6
 #define HTP_OP_ROUTER_TOPK 7
+#define HTP_OP_LM_HEAD 10
 #endif
 
 /** @brief RMSNorm of one row of W: y = norm(x) * gamma. */
@@ -105,6 +106,63 @@ inline int htpDecodeRouter(unsigned pos, const float *x, unsigned K,
                            const float *gate_w, unsigned E, const float *bias) {
   return htpDecodeOp(HTP_OP_ROUTER_TOPK, pos, x, K, nullptr, 0, gate_w, K * E,
                      bias, E, 0.0f);
+}
+
+/** @brief [#132 Part B] The tied lm_head of one row: x (K floats, the
+ *  final-normed row), logits (vocab floats). Resident only with every
+ *  kind (one stretch per token): this hook is its last op, so on 1 the
+ *  DSP ran the whole token and @a logits holds its output. The weight was
+ *  bound at load. */
+inline int htpDecodeLmHead(unsigned pos, const float *x, unsigned K,
+                           float *logits, unsigned vocab) {
+  return htpDecodeOp(HTP_OP_LM_HEAD, pos, x, K, logits, vocab, nullptr, 0,
+                     nullptr, 0, 0.0f);
+}
+
+/** @brief [#132 Part B] Whether the HTP runs the whole decode row at
+ *  @a pos (every kind resident, the row handed over): a layer's FC GEMVs
+ *  are then discarded work and it skips them. False without HTP. */
+inline bool htpDecodeRowResident(unsigned pos) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_row_resident(pos);
+#else
+  (void)pos;
+  return false;
+#endif
+}
+
+/** @brief [#132 Part B E3] Whether the decode tokens bring their logits
+ *  back; false when the caller takes the id (htpDecodeTokenId) and nothing
+ *  reads the logits. No-op without HTP. */
+inline void htpDecodeWantLogits(bool want) {
+#ifdef ENABLE_HEXKL
+  nntrainer::get_htp_ops()->set_decode_logits(want);
+#else
+  (void)want;
+#endif
+}
+
+/** @brief [#132 Part B E3] The bad-word ids the greedy pick sets to -inf;
+ *  the NPU's pick (htpDecodeTokenId) skips them too. No-op without HTP. */
+inline void htpDecodeBan(const unsigned *ids, unsigned n) {
+#ifdef ENABLE_HEXKL
+  nntrainer::get_htp_ops()->set_decode_ban(ids, n);
+#else
+  (void)ids;
+  (void)n;
+#endif
+}
+
+/** @brief [#132 Part B E3] The id the NPU picked for the last decode token
+ *  (its argmax, first maximum) when its logits did not come back; false
+ *  otherwise, and always without HTP. */
+inline bool htpDecodeTokenId(unsigned *id) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->take_decode_token_id(id);
+#else
+  (void)id;
+  return false;
+#endif
 }
 
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,

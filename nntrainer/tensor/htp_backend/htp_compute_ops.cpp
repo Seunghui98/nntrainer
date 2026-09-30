@@ -52,6 +52,8 @@
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
 #include <htp_wh_layout.h>
+#include <m1_ops_det.h>
+#include <q4_gemv_cpu_det.h>
 #include <swiglu_det.h>
 
 #include <algorithm>
@@ -971,6 +973,9 @@ public:
                                    static_cast<double>(fwd_tokens_)
                                : 0.0);
     }
+    if (cpu_fc_skipped_ != 0) // [#132 Part B] the harness's second line
+      std::fprintf(stderr, "[HTP] graph: cpu fc skipped=%llu\n",
+                   (unsigned long long)cpu_fc_skipped_);
   }
 
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
@@ -1282,9 +1287,23 @@ public:
   static bool forwardSwitch() {
     static const bool on = [] {
       const char *env = std::getenv("NNTR_HTP_FORWARD");
-      return env != nullptr && std::atoi(env) != 0;
+      // [#132 Part B E3] NNTR_HTP_E2E=1 is the per-token entry with every
+      // kind resident, on two sessions
+      return (env != nullptr && std::atoi(env) != 0) ||
+             HtpBackend::e2eRequested();
     }();
     return on;
+  }
+
+  /** [#132 Part B E3] The session that runs @a kind: with NNTR_HTP_E2E=1
+   *  S1 (the default session) keeps ROUTER_TOPK and MOE and S2 runs every
+   *  other kind (plan section 3.2); otherwise the one session. */
+  remote_handle64 sessionFor(uint32_t kind) const {
+    const HtpBackend &b = HtpBackend::global();
+    return static_cast<remote_handle64>(
+      e2e_ && (HTP_GRAPH_KINDS_S1 & HTP_GRAPH_KIND_BIT(kind)) == 0u
+        ? b.handle2()
+        : b.handle());
   }
 
   /** The graph entries' error, named: 0x8000040E from them means the
@@ -1309,7 +1328,11 @@ public:
     HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |
     HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) |
     HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |
-    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK);
+    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KINDS_Q4M1;
+
+  /** [#132 Part B] Rows per lm_head slice (plan 132 section 3.2: 8 slices
+   *  of 16384 rows at LFM2.5, 18 MiB each). */
+  static constexpr uint32_t kLmHeadSliceRows = 16384u;
 
   bool set_decode_graph_desc(const std::vector<uint32_t> &words) override {
     std::lock_guard<std::mutex> lock(graph_mutex_);
@@ -1322,9 +1345,10 @@ public:
       throw std::invalid_argument(std::string("set_decode_graph_desc: ") +
                                   htp_graph_err_name(rc));
     }
-    uint32_t mask = 0;
+    uint32_t mask = 0, present = 0;
     for (uint32_t i = 0; i < n_ops; ++i) {
       const htp_graph_op *op = htp_graph_op_cat(words.data(), i);
+      present |= HTP_GRAPH_KIND_BIT(op->kind);
       if (op->resident)
         mask |= HTP_GRAPH_KIND_BIT(op->kind);
     }
@@ -1349,6 +1373,56 @@ public:
       throw std::invalid_argument("set_decode_graph_desc: ROUTER_TOPK "
                                   "resident without ADD");
     }
+    // [#132 Part B, E1] No CPU layer hooks an FC, the dense FFN or a
+    // projection, so a Q4M1 kind is resident only when every kind the
+    // list has is: the list is then one stretch per token, op 0's norm
+    // hook keeps the row and the lm_head hook runs it (one call per
+    // token). Its weights come from the model at load
+    // (add_decode_graph_q4_0).
+    if ((mask & HTP_GRAPH_KINDS_Q4M1) != 0u && mask != present) {
+      throw std::invalid_argument(
+        "set_decode_graph_desc: FC / DENSE_FFN / LM_HEAD resident without "
+        "every other kind (one session runs them only as the whole token)");
+    }
+    // [#132 Part B] NNTR_HTP_FC_FEED=l2 reads the Q4M1 kinds' weights
+    // through the L2 scratch even where VTCM would fit (the second
+    // session's feed, #178); unset or vtcm: VTCM when it fits
+    const char *feed_env = std::getenv("NNTR_HTP_FC_FEED");
+    const std::string feed_s = feed_env ? feed_env : "vtcm";
+    if (feed_s != "vtcm" && feed_s != "l2") {
+      throw std::invalid_argument("set_decode_graph_desc: NNTR_HTP_FC_FEED=" +
+                                  feed_s + " (want vtcm or l2)");
+    }
+    // [#132 Part B E3] NNTR_HTP_E2E=1: the same description on two
+    // sessions, S1 resident for ROUTER_TOPK | MOE and S2 for the rest; each
+    // session's copy must pass the validator on its own (plan section 3.2).
+    const bool e2e = HtpBackend::e2eRequested();
+    if (e2e) {
+      if (mask != present) {
+        throw std::invalid_argument(
+          "set_decode_graph_desc: NNTR_HTP_E2E=1 needs every kind of the "
+          "list resident");
+      }
+      if (graph_inited_) {
+        // ponytail: one description per process on the two-session path
+        // (the model sets it once); a reload would re-map S2's arena
+        throw std::runtime_error("set_decode_graph_desc: a second "
+                                 "description with NNTR_HTP_E2E=1");
+      }
+      for (const uint32_t m : {HTP_GRAPH_KINDS_S1, HTP_GRAPH_KINDS_S2}) {
+        std::vector<uint32_t> w = words;
+        htp_graph_set_resident(w.data(), m);
+        uint32_t n = 0;
+        const uint32_t rc2 = htp_graph_validate(
+          w.data(), static_cast<uint32_t>(w.size()), kArmKinds, &n);
+        if (rc2 != 0u) {
+          throw std::invalid_argument(
+            std::string("set_decode_graph_desc: the ") +
+            (m == HTP_GRAPH_KINDS_S1 ? "S1" : "S2") +
+            " mask: " + htp_graph_err_name(rc2));
+        }
+      }
+    }
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     if (graph_inited_) {
@@ -1358,7 +1432,33 @@ public:
       if (attn_registered_)
         nntr_hvx_attn_m1_release(session);
     }
+    releaseQ4m1(session);
+    q4_pending_.clear();
+    q4m1_bound_ = false;
     graph_words_ = words;
+    e2e_ = e2e;
+    if (e2e && !e2e_st_) {
+      e2e_st_ = std::make_shared<E2eState>();
+      e2e_st_->h1 = session; // S2's handle and domain once it opens
+      std::shared_ptr<E2eState> st = e2e_st_;
+      HtpBackend::global().atClose([st] { e2eTeardown(*st); });
+    }
+    // [#132 Part B E5f] NNTR_HTP_FC_LANES=<small>,<large>: the L2 feed's
+    // lanes for K <= 2048 / larger K (1..8 each; unset: the DSP's 6 / 3)
+    uint32_t fc_lanes = 0;
+    if (const char *l = std::getenv("NNTR_HTP_FC_LANES")) {
+      unsigned a = 0, b = 0;
+      if (std::sscanf(l, "%u,%u", &a, &b) != 2 || a < 1 || a > 8 || b < 1 ||
+          b > 8)
+        throw std::invalid_argument("NNTR_HTP_FC_LANES=" + std::string(l) +
+                                    " (want <small>,<large>, 1..8 each)");
+      fc_lanes = (a << 8) | (b << 12);
+    }
+    for (uint32_t i = 0; i < n_ops; ++i) {
+      htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
+      if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u)
+        op->feed = (feed_s == "l2" ? HTP_GRAPH_FEED_L2 : 0u) | fc_lanes;
+    }
     resident_mask_ = mask;
     moe_ops_.clear();
     for (auto &v : kind_ops_)
@@ -1414,6 +1514,164 @@ public:
                  n_ops, htp_graph_kinds_str(mask, names, sizeof(names)),
                  moe_ops_.size());
     return true;
+  }
+
+  /** [#132 Part B] The model's Q4_0 weights of the decode list's FC,
+   *  DENSE_FFN and LM_HEAD ops, in list order (lfm2_moe_causallm.cpp at
+   *  load): kept as pointers here, converted and registered at graph init
+   *  (bindQ4m1). False when no such kind is resident. */
+  bool add_decode_graph_q4_0(const void *data, unsigned K, unsigned N,
+                             bool canonical) override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    if (graph_words_.empty() || (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) == 0u)
+      return false;
+    if (graph_inited_) {
+      throw std::runtime_error(
+        "add_decode_graph_q4_0: the graph is already initialised");
+    }
+    q4_pending_.push_back({data, K, N, canonical});
+    return true;
+  }
+
+  /** [#132 Part B] One weight's rows [r0, r0 + rows) as a Q4M1 handle:
+   *  canonical block_q4_0 (unpacked from the CPU's repack unless the
+   *  model says it is canonical already, as the tied lm_head is), the
+   *  Q4M1 reorder, q4m1_register. The same nibbles and scales the CPU
+   *  reads (plan 132 section 2), so no format tag moves. */
+  uint32_t registerQ4m1(remote_handle64 session, const uint8_t *canonical,
+                        uint32_t K, uint32_t r0, uint32_t rows) {
+    const size_t row_bytes = static_cast<size_t>(K / 32u) * Q4_CPU_BLOCK_BYTES;
+    std::vector<uint8_t> q4m1(q4m1_bytes(K, rows));
+    q4m1_from_q4_0(canonical + r0 * row_bytes, K, rows, q4m1.data());
+    uint32_t h = 0;
+    if (e2e_) {
+      // [#132 Part B E3] into S2's arena (the S1 path's place / tryChunk /
+      // arena_attach on S2's handle and effective domain), written before
+      // the attach; S2's heap holds no weight (the #178 heap rule)
+      E2eState &e = *e2e_st_;
+      const uint32_t bytes = static_cast<uint32_t>(q4m1.size());
+      uint32_t chunk = 0, off = 0;
+      if (!placeOn(e.h2, e.dom2, e.arena, e.arena_cap, bytes, q4m1_left_,
+                   &chunk, &off)) {
+        throw std::runtime_error("S2 FC arena: " + arena_fail_);
+      }
+      std::memcpy(e.arena[chunk].buf->data() + off, q4m1.data(), bytes);
+      q4m1_left_ = q4m1_left_ > bytes ? q4m1_left_ - bytes : 0u;
+      e.attach_bytes += bytes;
+      const int err =
+        nntr_hvx_q4m1_attach(e.h2, e.arena[chunk].dsp_id, off, K, rows, &h);
+      if (err != AEE_SUCCESS) {
+        throw std::runtime_error("nntr_hvx_q4m1_attach(K=" + std::to_string(K) +
+                                 " N=" + std::to_string(rows) +
+                                 " off=" + std::to_string(off) +
+                                 ") failed: " + graphErr(err));
+      }
+      e.q4m1.push_back(h);
+      return h;
+    }
+    const int err = nntr_hvx_q4m1_register(session, K, rows, q4m1.data(),
+                                           static_cast<int>(q4m1.size()), &h);
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error("nntr_hvx_q4m1_register(K=" + std::to_string(K) +
+                               " N=" + std::to_string(rows) +
+                               ") failed: " + graphErr(err));
+    }
+    q4m1_handles_.push_back(h);
+    return h;
+  }
+
+  /** [#132 Part B] Frees every Q4M1 handle registered for the graph (after
+   *  graph_release, or when bindQ4m1 / graph_init failed half-way). */
+  void releaseQ4m1(remote_handle64 session) {
+    for (uint32_t h : q4m1_handles_)
+      nntr_hvx_q4m1_release(session, h);
+    q4m1_handles_.clear();
+    if (e2e_st_) { // [#132 Part B E3] S2's slots (the arena stays mapped)
+      for (uint32_t h : e2e_st_->q4m1)
+        nntr_hvx_q4m1_release(e2e_st_->h2, h);
+      e2e_st_->q4m1.clear();
+    }
+  }
+
+  /** [#132 Part B] Binds q4_pending_ to the resident Q4M1 ops in list
+   *  order before graph_init checks them: an FC takes weights of its K
+   *  until their widths make its N (q | k | v are three), a DENSE_FFN up,
+   *  gate and down, the LM_HEAD the tied table in kLmHeadSliceRows slices.
+   *  Throws when the model's weights and the list disagree. */
+  void bindQ4m1(remote_handle64 session) {
+    size_t next = 0;
+    std::vector<uint8_t> canon;
+    q4m1_left_ = 0; // [#132 Part B E3] what S2's arena chunks are sized for
+    for (const Q4Pending &p : q4_pending_)
+      q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
+    auto take = [&](uint32_t op, uint32_t K, uint32_t N) -> const uint8_t * {
+      if (next >= q4_pending_.size())
+        throw std::runtime_error("set_decode_graph_desc: op " +
+                                 std::to_string(op) + " (" +
+                                 htp_graph_kind_name(graphOp(op)->kind) +
+                                 ") has no Q4_0 weight left "
+                                 "(the model handed " +
+                                 std::to_string(q4_pending_.size()) + ")");
+      const Q4Pending &p = q4_pending_[next++];
+      if (p.K != K || (N != 0u && p.N != N))
+        throw std::runtime_error(
+          "set_decode_graph_desc: op " + std::to_string(op) + " wants a " +
+          std::to_string(K) + " x " + (N ? std::to_string(N) : "*") +
+          " Q4_0 weight, the model's next is " + std::to_string(p.K) + " x " +
+          std::to_string(p.N));
+      const size_t bytes =
+        static_cast<size_t>(p.N) * (p.K / 32u) * Q4_CPU_BLOCK_BYTES;
+      if (p.canonical)
+        return static_cast<const uint8_t *>(p.data);
+      canon.resize(bytes);
+      nntrainer::unpack_q4_0(p.data, canon.data(), bytes, p.N, p.K);
+      return canon.data();
+    };
+    const uint32_t n_ops = static_cast<uint32_t>(stretch_start_.size());
+    for (uint32_t i = 0; i < n_ops; ++i) {
+      htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
+      if (!op->resident ||
+          (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u)
+        continue;
+      uint32_t parts = 0;
+      if (op->kind == HTP_OP_DENSE_FFN) {
+        op->h_gu[0] = registerQ4m1(session, take(i, op->K, op->N), op->K, 0u,
+                                   op->N); // up
+        op->h_gu[1] = registerQ4m1(session, take(i, op->K, op->N), op->K, 0u,
+                                   op->N); // gate
+        op->h_dn[0] = registerQ4m1(session, take(i, op->N, op->N_out), op->N,
+                                   0u, op->N_out);
+        parts = 3u;
+      } else if (op->kind == HTP_OP_LM_HEAD) {
+        const uint8_t *w = take(i, op->K, op->N);
+        for (uint32_t r0 = 0; r0 < op->N; r0 += kLmHeadSliceRows)
+          op->h_gu[parts++] = registerQ4m1(
+            session, w, op->K, r0, std::min(kLmHeadSliceRows, op->N - r0));
+      } else {
+        uint32_t sum = 0;
+        while (sum < op->N && parts < HTP_GRAPH_MAX_EXPERTS) {
+          const uint8_t *w = take(i, op->K, 0u);
+          const uint32_t n = q4_pending_[next - 1].N;
+          op->h_gu[parts++] = registerQ4m1(session, w, op->K, 0u, n);
+          sum += n;
+        }
+        if (sum != op->N)
+          throw std::runtime_error(
+            "set_decode_graph_desc: FC op " + std::to_string(i) +
+            " is N=" + std::to_string(op->N) + ", its weights sum to " +
+            std::to_string(sum));
+      }
+      op->n_experts = parts;
+    }
+    if (next != q4_pending_.size())
+      throw std::runtime_error(
+        "set_decode_graph_desc: the model handed " +
+        std::to_string(q4_pending_.size()) + " Q4_0 weights, the list's " +
+        "FC / DENSE_FFN / LM_HEAD ops took " + std::to_string(next));
+    std::fprintf(stderr, "[HTP] graph: q4m1 weights=%zu handles=%zu feed=%s\n",
+                 q4_pending_.size(),
+                 e2e_ ? e2e_st_->q4m1.size() : q4m1_handles_.size(),
+                 q4m1FeedName());
   }
 
   /** [#130] The op record of @a op in the description (the words are
@@ -1477,6 +1735,8 @@ public:
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     ensureGraphInit(session);
+    // [#132 Part B E3] a kind's parameters go to the session that runs it
+    const remote_handle64 psess = sessionFor(kind);
     const std::vector<uint32_t> &ops = kind_ops_[kind];
     if (kind_next_[kind] >= ops.size()) {
       throw std::runtime_error(std::string("decode_op_fp32: more ") +
@@ -1497,14 +1757,14 @@ public:
     switch (kind) {
     case HTP_OP_RMSNORM:
       if (!param_bound_[op]) {
-        setParam(session, op, HTP_GRAPH_PARAM_GAMMA, param, param_len, rec->K,
+        setParam(psess, op, HTP_GRAPH_PARAM_GAMMA, param, param_len, rec->K,
                  "gamma");
         param_bound_[op] = 1;
       }
       break;
     case HTP_OP_CONV1D_GATE:
       if (!param_bound_[op]) {
-        setParam(session, op, HTP_GRAPH_PARAM_CONV_W, param, param_len,
+        setParam(psess, op, HTP_GRAPH_PARAM_CONV_W, param, param_len,
                  3u * rec->N, "conv_w");
         param_bound_[op] = 1;
       }
@@ -1512,7 +1772,7 @@ public:
       // after any jump (the first token after a prefill, which refreshed
       // it; plan 130 section 3.3).
       if (conv_next_pos_[op] != pos) {
-        setParam(session, op, HTP_GRAPH_PARAM_CONV_STATE, state, state_len,
+        setParam(psess, op, HTP_GRAPH_PARAM_CONV_STATE, state, state_len,
                  2u * rec->N, "conv state");
         if (dumpAllDir() != nullptr)
           dumpAllFile(std::string(dumpAllDir()) + "/convstate_" +
@@ -1523,7 +1783,7 @@ public:
       break;
     case HTP_OP_QK_NORM:
       if (!param_bound_[op]) {
-        setParam(session, op, HTP_GRAPH_PARAM_GAMMA, param, param_len,
+        setParam(psess, op, HTP_GRAPH_PARAM_GAMMA, param, param_len,
                  2u * rec->head_dim, "q | k gamma");
         param_bound_[op] = 1;
       }
@@ -1536,7 +1796,7 @@ public:
     case HTP_OP_ATTN_M1: {
       const uint32_t ord = attn_ordinal_[op];
       if (!rope_bound_) {
-        setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, param,
+        setParam(psess, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, param,
                  param_len, graph_words_[6] * 64u, "RoPE table");
         rope_bound_ = true;
       }
@@ -1552,13 +1812,14 @@ public:
       break;
     }
     case HTP_OP_ADD:
+    case HTP_OP_LM_HEAD: // [#132 Part B] weights bound at init
       break;
     case HTP_OP_ROUTER_TOPK:
       // [#132] the gate weight [K][E] and the expert bias, once
       if (!param_bound_[op]) {
-        setParam(session, op, HTP_GRAPH_PARAM_ROUTER_W, param, param_len,
+        setParam(psess, op, HTP_GRAPH_PARAM_ROUTER_W, param, param_len,
                  rec->K * rec->n_experts, "router weight");
-        setParam(session, op, HTP_GRAPH_PARAM_ROUTER_BIAS, state, state_len,
+        setParam(psess, op, HTP_GRAPH_PARAM_ROUTER_BIAS, state, state_len,
                  rec->n_experts, "router bias");
         param_bound_[op] = 1;
       }
@@ -1644,14 +1905,25 @@ public:
     pending_rw_.clear();
   }
 
+  /** [#132 Part B] compute_ops.h: with a Q4M1 kind resident every kind
+   *  is (set_decode_graph_desc's rule), so the token is one stretch; once
+   *  op 0's hook at @a pos has kept the row, the DSP owns the whole row
+   *  and the CPU's FC outputs until the lm_head hook are never read. */
+  bool decode_row_resident(unsigned pos) override {
+    const bool on = (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u &&
+                    row_bound_ && pos == cur_pos_ &&
+                    pending_op_ != HTP_GRAPH_NO_OP;
+    cpu_fc_skipped_ += on;
+    return on;
+  }
+
   bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
                            const float *v_rows) override {
     if (seed_ordinal_ == HTP_GRAPH_NO_OP) {
       throw std::runtime_error(
         "decode_kv_seed_fp32: no attention hook asked for a seed");
     }
-    const remote_handle64 session =
-      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const remote_handle64 session = sessionFor(HTP_OP_ATTN_M1);
     const htp_graph_op *rec = graphOp(kind_ops_[HTP_OP_ATTN_M1][0]);
     const int n = static_cast<int>(n_rows * rec->n_kv * rec->head_dim);
     const int err = nntr_hvx_attn_m1_kv_append(session, seed_ordinal_, 0u,
@@ -1710,12 +1982,50 @@ public:
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (graph_inited_)
       return;
+    if (e2e_ && !q4m1_bound_)
+      e2ePlaceFc(); // a caller that never ran finish_decode_graph_q4_0
+    const remote_handle64 fc_session = sessionFor(HTP_OP_FC);
+    if ((resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u && !q4m1_bound_) {
+      try {
+        bindQ4m1(fc_session);
+      } catch (...) {
+        releaseQ4m1(fc_session); // a retry registers them all again
+        throw;
+      }
+      // [#132 Part B E3] S2's arena is placed once: a retry keeps it
+      q4m1_bound_ = e2e_;
+    }
     uint32_t n_ops = 0;
-    const int err =
-      nntr_hvx_graph_init(session, graph_words_.data(),
-                          static_cast<int>(graph_words_.size()), &n_ops);
-    if (err != AEE_SUCCESS) {
-      throw std::runtime_error("nntr_hvx_graph_init failed: " + graphErr(err));
+    if (e2e_) {
+      // [#132 Part B E3] each session its copy of the list: S1 resident for
+      // ROUTER_TOPK | MOE (the MoE handles bound at prefill), S2 for the
+      // rest (the Q4M1 handles on its arena)
+      for (int k = 0; k < 2; ++k) {
+        std::vector<uint32_t> w = graph_words_;
+        htp_graph_set_resident(w.data(), k == 0 ? HTP_GRAPH_KINDS_S1
+                                                : HTP_GRAPH_KINDS_S2);
+        const remote_handle64 h = k == 0 ? e2e_st_->h1 : e2e_st_->h2;
+        const int err =
+          nntr_hvx_graph_init(h, w.data(), static_cast<int>(w.size()), &n_ops);
+        if (err != AEE_SUCCESS) {
+          if (k == 1)
+            nntr_hvx_graph_release(e2e_st_->h1); // a retry inits both again
+          throw std::runtime_error(std::string("nntr_hvx_graph_init[") +
+                                   (k == 0 ? "S1" : "S2") +
+                                   "] failed: " + graphErr(err));
+        }
+        if (k == 1)
+          e2e_st_->graph2 = true;
+      }
+    } else {
+      const int err =
+        nntr_hvx_graph_init(session, graph_words_.data(),
+                            static_cast<int>(graph_words_.size()), &n_ops);
+      if (err != AEE_SUCCESS) {
+        releaseQ4m1(session);
+        throw std::runtime_error("nntr_hvx_graph_init failed: " +
+                                 graphErr(err));
+      }
     }
     graph_inited_ = true;
     char names[128];
@@ -1730,8 +2040,9 @@ public:
       const uint32_t n_attn =
         static_cast<uint32_t>(kind_ops_[HTP_OP_ATTN_M1].size());
       const uint32_t max_seq = graph_words_[6];
-      const int rc = nntr_hvx_attn_m1_register(
-        session, n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq);
+      const int rc =
+        nntr_hvx_attn_m1_register(sessionFor(HTP_OP_ATTN_M1), n_attn, rec->n_kv,
+                                  rec->gqa, rec->head_dim, max_seq);
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
@@ -1745,6 +2056,8 @@ public:
                      ((max_seq + 63u) / 64u * 64u) * 2u * sizeof(uint16_t) /
                      1024u);
     }
+    if (e2e_)
+      e2eStart();
   }
 
   /** [#80] The M=1 GEMV switch, read once from NNTR_MOE_HTP_M1_GEMV and
@@ -2515,6 +2828,17 @@ private:
                      const std::vector<unsigned int> &row_count,
                      const std::vector<float> &row_weight, const float *act,
                      unsigned int K, float *out, unsigned int N_out, bool moe) {
+    if (e2e_) {
+      // [#132 Part B E3] with every kind resident the token is the one
+      // stretch [0, n_ops), run by the token driver on the two sessions
+      if (op != 0u || expected_resume != stretch_start_.size() ||
+          act == nullptr || out == nullptr)
+        throw std::runtime_error(
+          "token driver: stretch [" + std::to_string(op) + ", " +
+          std::to_string(expected_resume) + ") is not the whole token");
+      tokenForward(pos, act, K, out, N_out);
+      return;
+    }
     const int act_len = static_cast<int>(K);
     const int out_len = static_cast<int>(N_out);
     const uint32_t n_limit = expected_resume - op;
@@ -2625,6 +2949,8 @@ private:
     const HtpDspqApi *api = nullptr;
     dspqueue_t q = nullptr;
     remote_handle64 session = 0;
+    int domain = CDSP_DOMAIN_ID; /**< [#132 Part B E3] S2's effective one */
+    const char *tag = "dspq";    /**< log prefix: "dspq" (S1), "dspq[S2]" */
     std::unique_ptr<HtpRpcBuffer> act, out;
     bool act_mapped = false, out_mapped = false;
     uint32_t seq = 0;
@@ -2641,22 +2967,34 @@ private:
   }
 
   /** @brief Undoes whatever creation got through, in reverse. */
-  static void dspqRelease(DspqMoe &st) {
+  static uint32_t dspqRelease(DspqMoe &st) {
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    uint32_t fail = 0; // [#132 Part B] fastrpc_munmap refusals
     if (st.act_mapped)
-      mem.munmap(CDSP_DOMAIN_ID, st.act->fd(), st.act->data(), st.act->size());
+      fail += mem.munmap(st.domain, st.act->fd(), st.act->data(),
+                         st.act->size()) != 0;
     if (st.out_mapped)
-      mem.munmap(CDSP_DOMAIN_ID, st.out->fd(), st.out->data(), st.out->size());
+      fail += mem.munmap(st.domain, st.out->fd(), st.out->data(),
+                         st.out->size()) != 0;
     st.act_mapped = st.out_mapped = false;
     if (st.q != nullptr)
       st.api->close(st.q);
     st.q = nullptr;
+    return fail;
   }
 
   /** @brief The close hook: QUIT, stop the DSP thread, close, unmap. */
   static void dspqTeardown(DspqMoe &st) {
+    if (dspqStop(st))
+      dspqRelease(st);
+  }
+
+  /** @brief QUIT and the DSP thread joined, nothing unmapped yet (the
+   *  two-session teardown unmaps in its own order). @return whether the
+   *  queue was on. */
+  static bool dspqStop(DspqMoe &st) {
     if (st.state != DspqMoe::ON)
-      return;
+      return false;
     st.state = DspqMoe::OFF;
     const uint32_t quit[2] = {HTP_DSPQ_OP_QUIT, 0};
     st.api->write(st.q, 0, 0, nullptr, sizeof(quit),
@@ -2664,20 +3002,47 @@ private:
     uint32_t res[4] = {0, 0, 0, 0};
     const int err = nntr_hvx_dspq_stop(st.session, res, 4);
     std::fprintf(stderr,
-                 "[HTP] dspq: close calls=%llu served=%u bad=%u "
+                 "[HTP] %s: close calls=%llu served=%u bad=%u "
                  "empty_polls=%u dsp_spin_us=%u stop_err=0x%x\n",
-                 (unsigned long long)st.calls, res[0], res[1], res[2], res[3],
-                 static_cast<unsigned>(err));
-    dspqRelease(st);
+                 st.tag, (unsigned long long)st.calls, res[0], res[1], res[2],
+                 res[3], static_cast<unsigned>(err));
+    return true;
   }
 
   /** @brief Creation, once, at the first M==1 MoE call (section 3.4); any
    *  failure prints one "dspq: off" line and is never retried. */
   void dspqCreate(remote_handle64 session) {
+    const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
+    dspq_ = dspqMake(
+      session, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES,
+      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
+               : 1000u);
+  }
+
+  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 0): how long a
+   *  waiting session spins (with a pause) before it sleeps -- at each hop
+   *  and on its dspqueue after a token. E5b's 1000 us kept one of the six
+   *  hardware threads busy through the other session's compute; E5d read
+   *  20.8 / 20.2 / 16.5 tok/s at 0 / 20 / 1000. */
+  static uint32_t e2eSpinUs() {
+    static const uint32_t us = [] {
+      const char *e = std::getenv("NNTR_HTP_E2E_SPIN_US");
+      return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+    }();
+    return us;
+  }
+
+  /** @brief A queue on @a session in @a domain with an out buffer of
+   *  @a out_bytes (S1's: HTP_DSPQ_BUF_BYTES; [#132 Part B E3] S2's holds
+   *  the logits too). Its teardown is an HtpBackend close hook. */
+  std::shared_ptr<DspqMoe> dspqMake(remote_handle64 session, int domain,
+                                    const char *tag, size_t out_bytes,
+                                    uint32_t dsp_spin_us) {
     auto st = std::make_shared<DspqMoe>();
-    dspq_ = st;
     st->state = DspqMoe::OFF;
     st->session = session;
+    st->domain = domain;
+    st->tag = tag;
     char why[96] = "";
     int err = 0;
     auto fail = [&](const char *step, int e) {
@@ -2693,7 +3058,7 @@ private:
       err = -1;
     }
     if (err == 0) {
-      const int e = api.create(CDSP_DOMAIN_ID, 0, HTP_DSPQ_REQ_QUEUE_BYTES,
+      const int e = api.create(domain, 0, HTP_DSPQ_REQ_QUEUE_BYTES,
                                HTP_DSPQ_RESP_QUEUE_BYTES, nullptr, dspqErrorCb,
                                st.get(), &st->q);
       if (e != AEE_SUCCESS) {
@@ -2709,28 +3074,24 @@ private:
     }
     if (err == 0) {
       st->act = std::make_unique<HtpRpcBuffer>(HTP_DSPQ_BUF_BYTES);
-      st->out = std::make_unique<HtpRpcBuffer>(HTP_DSPQ_BUF_BYTES);
+      st->out = std::make_unique<HtpRpcBuffer>(out_bytes);
       if (!st->act->isIon() || !st->out->isIon() || st->act->fd() < 0 ||
           st->out->fd() < 0 || mem.mmap == nullptr) {
         fail("ion", 0);
       }
     }
     if (err == 0) {
-      int e = mem.mmap(CDSP_DOMAIN_ID, st->act->fd(), st->act->data(), 0,
+      int e = mem.mmap(domain, st->act->fd(), st->act->data(), 0,
                        st->act->size(), FASTRPC_MAP_FD);
       st->act_mapped = (e == 0);
       if (e == 0) {
-        e = mem.mmap(CDSP_DOMAIN_ID, st->out->fd(), st->out->data(), 0,
-                     st->out->size(), FASTRPC_MAP_FD);
+        e = mem.mmap(domain, st->out->fd(), st->out->data(), 0, st->out->size(),
+                     FASTRPC_MAP_FD);
         st->out_mapped = (e == 0);
       }
       if (e != 0)
         fail("fastrpc_mmap", e);
     }
-    const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
-    const uint32_t dsp_spin_us =
-      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-               : 1000;
     if (err == 0) {
       const int e = nntr_hvx_dspq_start(session, id, dsp_spin_us);
       if (e != AEE_SUCCESS)
@@ -2741,18 +3102,27 @@ private:
     }
     if (err != 0) {
       dspqRelease(*st);
-      std::fprintf(stderr,
-                   "[HTP] dspq: off (%s) -- MoE calls stay on FastRPC\n", why);
-      return;
+      std::fprintf(stderr, "[HTP] %s: off (%s) -- MoE calls stay on FastRPC\n",
+                   tag, why);
+      return st;
     }
     st->state = DspqMoe::ON;
     st->arm_spin_us = HtpBackend::global().pollUs();
-    std::fprintf(stderr,
-                 "[HTP] dspq: on queue=0x%llx dsp_spin_us=%u arm_spin_us=%u "
-                 "buffers=2x%u ion=y\n",
-                 (unsigned long long)id, dsp_spin_us, st->arm_spin_us,
-                 static_cast<unsigned>(HTP_DSPQ_BUF_BYTES));
+    if (out_bytes == HTP_DSPQ_BUF_BYTES)
+      std::fprintf(stderr,
+                   "[HTP] %s: on queue=0x%llx dsp_spin_us=%u arm_spin_us=%u "
+                   "buffers=2x%u ion=y\n",
+                   tag, (unsigned long long)id, dsp_spin_us, st->arm_spin_us,
+                   static_cast<unsigned>(HTP_DSPQ_BUF_BYTES));
+    else
+      std::fprintf(stderr,
+                   "[HTP] %s: on queue=0x%llx dsp_spin_us=%u arm_spin_us=%u "
+                   "buffers=%u+%zu ion=y domain=%d\n",
+                   tag, (unsigned long long)id, dsp_spin_us, st->arm_spin_us,
+                   static_cast<unsigned>(HTP_DSPQ_BUF_BYTES), out_bytes,
+                   domain);
     HtpBackend::global().atClose([st] { dspqTeardown(*st); });
+    return st;
   }
 
   /** @brief Whether this call can ride the queue; creates it on first use.
@@ -2872,6 +3242,451 @@ private:
       std::memcpy(stage_us, resp.stage_us, sizeof(resp.stage_us));
     }
     return resp.rc;
+  }
+
+  struct E2eState; // [#132 Part B E3] defined with the members below
+
+  /** @brief [#132 Part B E3] The two-session decode's ARM side (plan
+   *  section 3.2): the token driver on both sessions over one mailbox page,
+   *  S1's token packets on its MoE dspqueue, S2's on its own queue. Created
+   *  at graph init; the HtpBackend close hook e2eTeardown undoes it. */
+  void e2eStart() {
+    E2eState &e = *e2e_st_;
+    const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    if (!dspq_) // S1's queue: token packets only at decode, so the E2E spin
+      dspq_ =
+        dspqMake(e.h1, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES, e2eSpinUs());
+    if (dspq_->state != DspqMoe::ON || dspq_->session != e.h1) {
+      throw std::runtime_error("NNTR_HTP_E2E=1: S1's dspqueue is off (see "
+                               "the dspq line; NNTR_HTP_DSPQ=0?): the token "
+                               "packets ride it");
+    }
+    e.q1 = dspq_;
+    const size_t logits_bytes = static_cast<size_t>(graph_words_[5]) * 4u;
+    e.q2 =
+      dspqMake(e.h2, e.dom2, "dspq[S2]",
+               std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes), e2eSpinUs());
+    if (e.q2->state != DspqMoe::ON) {
+      throw std::runtime_error("NNTR_HTP_E2E=1: S2's dspqueue is off (see "
+                               "the dspq[S2] line)");
+    }
+    e.mbox = std::make_unique<HtpRpcBuffer>(kMboxBytes, HTP_RPC_FLAGS_UNCACHED);
+    if (!e.mbox->isIon() || e.mbox->fd() < 0 || mem.mmap == nullptr) {
+      throw std::runtime_error("NNTR_HTP_E2E=1: no ION page for the mailbox");
+    }
+    // zeroed before either side maps it, as the #178 probe's page: no
+    // sequence word or header a first read could take for a post
+    std::memset(e.mbox->data(), 0, e.mbox->size());
+    const int fd = e.mbox->fd();
+    int rc = mem.mmap(CDSP_DOMAIN_ID, fd, e.mbox->data(), 0, e.mbox->size(),
+                      FASTRPC_MAP_FD);
+    e.mbox1 = rc == 0;
+    if (rc == 0) {
+      rc =
+        mem.mmap(e.dom2, fd, e.mbox->data(), 0, e.mbox->size(), FASTRPC_MAP_FD);
+      e.mbox2 = rc == 0;
+    }
+    if (rc != 0) {
+      throw std::runtime_error("NNTR_HTP_E2E=1: fastrpc_mmap of the mailbox "
+                               "page failed: " +
+                               std::to_string(rc));
+    }
+    const uint32_t spin_us = e2eSpinUs();
+    rc = nntr_hvx_token_driver_start(
+      e.h1, fd, static_cast<uint32_t>(e.mbox->size()), 1u, spin_us);
+    e.drv1 = rc == AEE_SUCCESS;
+    if (rc == AEE_SUCCESS)
+      rc = nntr_hvx_token_driver_start(
+        e.h2, fd, static_cast<uint32_t>(e.mbox->size()), 0u, spin_us);
+    e.drv2 = e.drv1 && rc == AEE_SUCCESS;
+    if (rc != AEE_SUCCESS) {
+      throw std::runtime_error("nntr_hvx_token_driver_start[" +
+                               std::string(e.drv1 ? "S2" : "S1") +
+                               "] failed: " + graphErr(rc));
+    }
+    uint32_t rounds = 0;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size()); ++i)
+      rounds += graphOp(i)->kind == HTP_OP_ROUTER_TOPK;
+    e.rounds = rounds;
+    e.spin_us = spin_us;
+    std::fprintf(stderr,
+                 "[HTP] token driver: on s1_effdom=%d s2_effdom=%d mbox=%zu "
+                 "spin_us=%u rounds=%u hops/token=%u logits_buf=%zu\n",
+                 static_cast<int>(CDSP_DOMAIN_ID), e.dom2, e.mbox->size(),
+                 spin_us, rounds, 2u * rounds, logits_bytes);
+  }
+
+  /** @brief [#132 Part B E3] The close hook, before the sessions close:
+   *  S2's queue, both drivers, the mailbox, then S2's graph, slots and
+   *  arena, each buffer fastrpc_munmap'd before nntr_hvx_close (#178's
+   *  rule). S1's arena and graph stay as on the one-session path. */
+  static void e2eTeardown(E2eState &e) {
+    static_assert(HTP_OP_KIND_N == HTP_DSPQ_TOKEN_KINDS,
+                  "htp_dspq_wire.h's kind count is the graph's");
+    const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    // [#132 Part B E5g] every DSP thread stopped before any munmap: both
+    // queues (QUIT, joined), then both token drivers (their HAP_mmap_put);
+    // then the mappings in the reverse of their order (S2 arena at load; S1
+    // queue, S2 queue, the page into S1 then S2 at graph init). The close
+    // line counts what was mapped, what fastrpc_munmap / arena_detach
+    // refused, and both sessions' DSP heap (E5f: one E run in ~12 left the
+    // next process 256 MiB short of S1's 3840).
+    if (e.q2)
+      dspqStop(*e.q2);
+    if (e.q1)
+      dspqStop(*e.q1);
+    uint32_t r1[5] = {0, 0, 0, 0, 0}, r2[5] = {0, 0, 0, 0, 0};
+    const int s2 = e.drv2 ? nntr_hvx_token_driver_stop(e.h2, r2, 5) : 0;
+    const int s1 = e.drv1 ? nntr_hvx_token_driver_stop(e.h1, r1, 5) : 0;
+    if (e.drv1 || e.drv2) {
+      const double n = e.tokens ? static_cast<double>(e.tokens) : 1.0;
+      std::fprintf(stderr,
+                   "[HTP] graph[S1]: tokens=%llu pcyc/token=%.0f "
+                   "wait_us/token=%.1f\n",
+                   (unsigned long long)e.tokens,
+                   static_cast<double>(e.pcyc1) / n,
+                   static_cast<double>(e.wait1_us) / n);
+      std::fprintf(stderr,
+                   "[HTP] graph[S2]: tokens=%llu pcyc/token=%.0f "
+                   "wait_us/token=%.1f\n",
+                   (unsigned long long)e.tokens,
+                   static_cast<double>(e.pcyc2) / n,
+                   static_cast<double>(e.wait2_us) / n);
+      // per side: the clock (pcycles over the token's wall time on that
+      // side) and the op pcycles per kind per token, with the ms they are
+      // at that clock; S1's MOE also per round
+      for (int k = 0; k < 2; ++k) {
+        const uint64_t *kp = k == 0 ? e.kind1 : e.kind2;
+        const double wus =
+          static_cast<double>(k == 0 ? e.wall1_us : e.wall2_us);
+        const double mhz =
+          wus > 0
+            ? static_cast<double>(k == 0 ? e.wall1_pcyc : e.wall2_pcyc) / wus
+            : 0.0;
+        std::string line;
+        char buf[96];
+        for (uint32_t kd = 0; kd < HTP_OP_KIND_N; ++kd) {
+          if (kp[kd] == 0)
+            continue;
+          const double pc = static_cast<double>(kp[kd]) / n;
+          std::snprintf(buf, sizeof(buf), " %s=%.0f(%.3fms)",
+                        htp_graph_kind_name(kd), pc,
+                        mhz > 0 ? pc / mhz / 1000.0 : 0.0);
+          line += buf;
+        }
+        std::fprintf(
+          stderr,
+          "[HTP] graph[S%d] per-kind pcyc/token:%s | wall_ms/token=%.3f "
+          "mhz=%.0f spin_us=%u\n",
+          k + 1, line.c_str(), wus / n / 1000.0, mhz, e.spin_us);
+      }
+      if (e.rounds != 0 && e.kind1[HTP_OP_MOE] != 0) {
+        const double mhz1 =
+          e.wall1_us ? static_cast<double>(e.wall1_pcyc) / e.wall1_us : 0.0;
+        const double moe = static_cast<double>(e.kind1[HTP_OP_MOE]) / n /
+                           static_cast<double>(e.rounds);
+        std::fprintf(
+          stderr,
+          "[HTP] graph[S1] moe pcyc/round=%.0f (%.3f ms) "
+          "router pcyc/round=%.0f; s2 fc+dense_ffn+lm_head "
+          "ms/token=%.3f (isolated #178: 8.06); arm token_ms=%.3f\n",
+          moe, mhz1 > 0 ? moe / mhz1 / 1000.0 : 0.0,
+          static_cast<double>(e.kind1[HTP_OP_ROUTER_TOPK]) / n /
+            static_cast<double>(e.rounds),
+          e.wall2_us
+            ? static_cast<double>(e.kind2[HTP_OP_FC] +
+                                  e.kind2[HTP_OP_DENSE_FFN] +
+                                  e.kind2[HTP_OP_LM_HEAD]) /
+                n / (static_cast<double>(e.wall2_pcyc) / e.wall2_us) / 1000.0
+            : 0.0,
+          static_cast<double>(e.token_us) / n / 1000.0);
+      }
+      std::fprintf(stderr,
+                   "[HTP] token driver: close tokens=%llu hops/token=%.2f "
+                   "s1_served=%u s2_served=%u timeouts=%u/%u stale=%u/%u "
+                   "id_checked=%llu id_mismatch=%llu stop_err=0x%x/0x%x\n",
+                   (unsigned long long)e.tokens,
+                   static_cast<double>(e.hops) / n, r1[0], r2[0], r1[2], r2[2],
+                   r1[3], r2[3], (unsigned long long)e.id_checked,
+                   (unsigned long long)e.id_mismatch, static_cast<unsigned>(s1),
+                   static_cast<unsigned>(s2));
+    }
+    e.drv1 = e.drv2 = false;
+    uint32_t info1[7] = {0}, info2[7] = {0};
+    const int i1 = e.h1 ? nntr_hvx_session_info(e.h1, info1, 7) : -1;
+    const int i2 = e.h2 ? nntr_hvx_session_info(e.h2, info2, 7) : -1;
+    size_t mapped = 0;
+    uint32_t unmap_fail = 0, detach_fail = 0;
+    if (e.mbox) {
+      if (e.mbox2) {
+        unmap_fail +=
+          mem.munmap(e.dom2, e.mbox->fd(), e.mbox->data(), e.mbox->size()) != 0;
+        mapped += e.mbox->size();
+      }
+      if (e.mbox1) {
+        unmap_fail += mem.munmap(CDSP_DOMAIN_ID, e.mbox->fd(), e.mbox->data(),
+                                 e.mbox->size()) != 0;
+        mapped += e.mbox->size();
+      }
+      e.mbox1 = e.mbox2 = false;
+    }
+    for (const std::shared_ptr<DspqMoe> &q : {e.q2, e.q1}) {
+      if (q && q->q != nullptr) {
+        mapped += (q->act_mapped ? q->act->size() : 0u) +
+                  (q->out_mapped ? q->out->size() : 0u);
+        unmap_fail += dspqRelease(*q);
+      }
+    }
+    if (e.graph2)
+      nntr_hvx_graph_release(e.h2);
+    e.graph2 = false;
+    for (uint32_t h : e.q4m1)
+      nntr_hvx_q4m1_release(e.h2, h);
+    e.q4m1.clear();
+    for (auto c = e.arena.rbegin(); c != e.arena.rend(); ++c) {
+      detach_fail += nntr_hvx_arena_detach(e.h2, c->dsp_id) != AEE_SUCCESS;
+      if (mem.munmap != nullptr)
+        unmap_fail +=
+          mem.munmap(e.dom2, c->buf->fd(), c->buf->data(), c->buf->size()) != 0;
+      mapped += c->buf->size();
+    }
+    e.arena.clear();
+    std::fprintf(stderr,
+                 "[HTP] s2: close mapped_mib=%.2f unmap_fail=%u "
+                 "detach_fail=%u heap_used_kib s1=%u s2=%u (info rc "
+                 "0x%x/0x%x)\n",
+                 static_cast<double>(mapped) / (1024.0 * 1024.0), unmap_fail,
+                 detach_fail, info1[4], info2[4], static_cast<unsigned>(i1),
+                 static_cast<unsigned>(i2));
+  }
+
+  /** @brief [#132 Part B E3] One decode token on the two sessions: the
+   *  embedding row into S2's act buffer, OP_TOKEN to S1 (serve every MoE
+   *  round) and to S2 (op 0 to the argmax), both responses. Only the id
+   *  comes back unless set_decode_logits asked for the logits (the
+   *  NNTR_PPL_DECODE / sampling / bad-words runs), which S2 writes into its
+   *  out buffer. Any failure throws; a transport failure marks both
+   *  queues broken (the DSP may still hold a packet). */
+  void tokenForward(uint32_t pos, const float *act, unsigned K, float *out,
+                    unsigned N_out) {
+    E2eState &e = *e2e_st_;
+    if (!e.drv1 || !e.drv2 || !e.q2 || !dspq_)
+      throw std::runtime_error("token driver: not started (its start threw "
+                               "at graph init)");
+    DspqMoe &q1 = *dspq_, &q2 = *e.q2;
+    if (q1.broken || q2.broken)
+      throw std::runtime_error("token driver: a queue failed on an earlier "
+                               "token");
+    const size_t act_bytes = static_cast<size_t>(K) * sizeof(float);
+    const size_t out_bytes = static_cast<size_t>(N_out) * sizeof(float);
+    if (act_bytes > q2.act->size() || out_bytes > q2.out->size())
+      throw std::runtime_error("token driver: row " + std::to_string(K) +
+                               " / logits " + std::to_string(N_out) +
+                               " do not fit S2's buffers");
+    if (have_id_)
+      throw std::runtime_error("token driver: the previous token's id was "
+                               "never taken (take_decode_token_id)");
+    // [#132 Part B E3] the bad-word ids S2's argmax skips (LM_BAN), sent
+    // when they change; more than the DSP holds, or none after some (an
+    // empty sequence may reach the skel as NULL, the stale-skel code) ->
+    // the logits come back and the CPU picks
+    const bool logits = want_logits_ || ban_.size() > HTP_GRAPH_MAX_BAN ||
+                        (ban_.empty() && !ban_sent_.empty());
+    if (!logits && ban_sent_ != ban_) {
+      std::vector<float> words(ban_.size());
+      std::memcpy(words.data(), ban_.data(), ban_.size() * sizeof(uint32_t));
+      setParam(e.h2, kind_ops_[HTP_OP_LM_HEAD][0], HTP_GRAPH_PARAM_LM_BAN,
+               words.data(), static_cast<unsigned>(ban_.size()),
+               static_cast<unsigned>(ban_.size()), "LM_BAN");
+      ban_sent_ = ban_;
+    }
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    std::memcpy(q2.act->data(), act, act_bytes);
+    const uint32_t tok = e.tok++;
+    const htp_dspq_token_req r1 = {HTP_DSPQ_OP_TOKEN, tok, 0u, pos};
+    const htp_dspq_token_req r2 = {HTP_DSPQ_OP_TOKEN, tok,
+                                   logits ? HTP_DSPQ_TOKEN_LOGITS : 0u, pos};
+    struct dspqueue_buffer b[2] = {};
+    b[0].fd = static_cast<uint32_t>(q2.act->fd());
+    b[0].size = static_cast<uint32_t>(act_bytes);
+    b[0].flags = DSPQUEUE_BUFFER_FLAG_REF | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER |
+                 DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
+    b[0].ptr = q2.act->data();
+    b[1].fd = static_cast<uint32_t>(q2.out->fd());
+    b[1].size = static_cast<uint32_t>(out_bytes);
+    b[1].flags = DSPQUEUE_BUFFER_FLAG_REF;
+    b[1].ptr = q2.out->data();
+    const uint32_t nb2 = logits ? 2u : 1u;
+    const uint64_t t0 = HtpProfile::nowUs();
+    int err =
+      q1.api->write(q1.q, 0, 0, nullptr, sizeof(r1),
+                    reinterpret_cast<const uint8_t *>(&r1), kDspqTimeoutUs);
+    if (err == AEE_SUCCESS)
+      err =
+        q2.api->write(q2.q, 0, nb2, b, sizeof(r2),
+                      reinterpret_cast<const uint8_t *>(&r2), kDspqTimeoutUs);
+    htp_dspq_token_resp s1r = {}, s2r = {};
+    uint32_t len2 = 0, len1 = 0, rnb2 = 0, rnb1 = 0;
+    if (err == AEE_SUCCESS) {
+      // blocking reads (the token is ~20 ms; S1 answers before S2 ends)
+      uint32_t flags = 0;
+      struct dspqueue_buffer rb[2] = {};
+      err = q2.api->read(q2.q, &flags, 2, &rnb2, rb, sizeof(s2r), &len2,
+                         reinterpret_cast<uint8_t *>(&s2r), kDspqTimeoutUs);
+      if (err == AEE_SUCCESS)
+        err = q1.api->read(q1.q, &flags, 2, &rnb1, rb, sizeof(s1r), &len1,
+                           reinterpret_cast<uint8_t *>(&s1r), kDspqTimeoutUs);
+    }
+    const uint64_t us = HtpProfile::nowUs() - t0;
+    const int cb = q1.cb_err.load() != 0 ? q1.cb_err.load() : q2.cb_err.load();
+    if (err != AEE_SUCCESS || cb != 0 || len2 != sizeof(s2r) ||
+        len1 != sizeof(s1r) || s2r.seq != tok || s1r.seq != tok ||
+        rnb2 != nb2 || rnb1 != 0u) {
+      q1.broken = q2.broken = true;
+      char msg[200];
+      std::snprintf(msg, sizeof(msg),
+                    "token driver: token %u pos %u transport failed: "
+                    "err=0x%x cb_err=0x%x len=%u/%u seq=%u/%u nb=%u/%u",
+                    tok, pos, static_cast<unsigned>(err),
+                    static_cast<unsigned>(cb), len1, len2, s1r.seq, s2r.seq,
+                    rnb1, rnb2);
+      throw std::runtime_error(msg);
+    }
+    ++q1.calls;
+    ++q2.calls;
+    if (s1r.rc != AEE_SUCCESS || s2r.rc != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "token driver: token " + std::to_string(tok) + " pos " +
+        std::to_string(pos) + " failed: S1 " + graphErr(s1r.rc) + ", S2 " +
+        graphErr(s2r.rc) +
+        " (AEE_EEXPIRED: a hop timed out; the FARF names "
+        "the side)");
+    }
+    if (logits) {
+      std::memcpy(out, q2.out->data(), out_bytes);
+      // S2's argmax against the logits it returned, the ids LM_BAN held at
+      // the time masked as S2 masked them
+      std::vector<float> keep(ban_sent_.size());
+      for (size_t i = 0; i < ban_sent_.size(); ++i) {
+        keep[i] = out[ban_sent_[i]];
+        out[ban_sent_[i]] = -INFINITY;
+      }
+      const uint32_t pick = m1_argmax_first(out, N_out);
+      for (size_t i = ban_sent_.size(); i-- > 0;)
+        out[ban_sent_[i]] = keep[i];
+      ++e.id_checked;
+      e.id_mismatch += pick != s2r.id;
+    } else {
+      pending_id_ = s2r.id;
+      have_id_ = true;
+    }
+    ++e.tokens;
+    e.hops += s2r.hops;
+    e.wait1_us += s1r.wait_us;
+    e.wait2_us += s2r.wait_us;
+    e.pcyc1 += s1r.pcycles;
+    e.pcyc2 += s2r.pcycles;
+    e.wall1_us += s1r.wall_us;
+    e.wall2_us += s2r.wall_us;
+    e.wall1_pcyc += s1r.wall_pcyc;
+    e.wall2_pcyc += s2r.wall_pcyc;
+    for (uint32_t k = 0; k < HTP_OP_KIND_N; ++k) {
+      e.kind1[k] += s1r.kind_pcyc[k];
+      e.kind2[k] += s2r.kind_pcyc[k];
+    }
+    e.token_us += us;
+    ++fwd_calls_; // one ARM -> S2 packet per token: calls/token = 1.00
+    ++fwd_tokens_;
+    if (e.tokens == 1)
+      std::fprintf(stderr,
+                   "[HTP] token driver: first token pos=%u id=%u hops=%u "
+                   "us=%llu logits=%d\n",
+                   pos, s2r.id, s2r.hops, (unsigned long long)us, logits);
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvokeForward(static_cast<unsigned>(stretch_start_.size()), 0,
+                               uint64_t(s1r.pcycles) + s2r.pcycles);
+  }
+
+  /** [#132 Part B E3] compute_ops.h: whether the next decode tokens must
+   *  bring their logits back (else only the id travels). */
+  void set_decode_logits(bool want) override { want_logits_ = want; }
+
+  /** [#132 Part B E3] compute_ops.h: the bad-word ids the caller's pick
+   *  sets to -inf; S2's argmax skips them (LM_BAN) on the id-only path. */
+  void set_decode_ban(const unsigned *ids, unsigned n) override {
+    ban_.assign(ids, ids + n);
+  }
+
+  /** [#132 Part B E3] compute_ops.h: the id S2's argmax picked for the
+   *  last decode token, once, when its logits did not come back. */
+  bool take_decode_token_id(unsigned *id) override {
+    if (!have_id_)
+      return false;
+    *id = pending_id_;
+    have_id_ = false;
+    return true;
+  }
+
+  /** [#132 Part B E3] compute_ops.h: the model handed its last Q4_0
+   *  weight. On the two-session path the FC set goes into S2's arena now,
+   *  at load (the startup cell), not at the first decode token. */
+  bool finish_decode_graph_q4_0() override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    if (!e2e_ || q4_pending_.empty() || q4m1_bound_ || graph_inited_)
+      return false;
+    e2ePlaceFc();
+    return true;
+  }
+
+  /** [#132 Part B E3] Opens S2 and places the Q4M1 set in its arena: at
+   *  load after S1's MoE arena (the model calls finish_decode_graph_q4_0
+   *  after repack_weight), else at graph init. Caller holds graph_mutex_.
+   *  The banner's s1_arena_mib is what S1 had mapped when S2 opened. */
+  void e2ePlaceFc() {
+    E2eState &e = *e2e_st_;
+    HtpBackend &b = HtpBackend::global();
+    const size_t s1_mib = arenaBytes() >> 20;
+    uint32_t info1[7] = {0}; // res[4]: S1's heap in use, KiB
+    nntr_hvx_session_info(e.h1, info1, 7);
+    if (!b.openSecond())
+      throw std::runtime_error("NNTR_HTP_E2E=1: the second session did not "
+                               "open (" +
+                               b.s2Error() + ")");
+    e.h2 = static_cast<remote_handle64>(b.handle2());
+    e.dom2 = b.effDomain2();
+    const uint64_t t0 = HtpProfile::nowUs();
+    try {
+      bindQ4m1(e.h2);
+    } catch (...) {
+      releaseQ4m1(e.h2);
+      throw;
+    }
+    q4m1_bound_ = true;
+    const double ms = static_cast<double>(HtpProfile::nowUs() - t0) / 1000.0;
+    size_t mapped = 0;
+    for (const ArenaChunk &c : e.arena)
+      mapped += c.buf->size();
+    std::fprintf(stderr,
+                 "[HTP] s2: fc arena weights=%zu handles=%zu attach_mib=%.1f "
+                 "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
+                 "lanes=%s s1_arena_mib=%zu s1_heap_kib=%u\n",
+                 q4_pending_.size(), e.q4m1.size(),
+                 static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0),
+                 e.arena.size(), mapped >> 20, q4m1FeedName(), ms,
+                 std::getenv("NNTR_HTP_FC_LANES")
+                   ? std::getenv("NNTR_HTP_FC_LANES")
+                   : "6,3",
+                 s1_mib, info1[4]);
+  }
+
+  /** [#132 Part B E3] The feed the FC kinds take: the op's l2, or VTCM only
+   *  where their session has some (S2 opens lite with none on the S25). */
+  const char *q4m1FeedName() const {
+    if (kind_ops_[HTP_OP_FC].empty() ||
+        (graphOp(kind_ops_[HTP_OP_FC][0])->feed & HTP_GRAPH_FEED_L2) != 0u)
+      return "l2";
+    return e2e_ && HtpBackend::global().vtcm2Bytes() == 0u ? "l2" : "vtcm";
   }
 
   /** @brief [doc 46] One call for the whole layer.
@@ -3785,12 +4600,21 @@ private:
    */
   bool place(remote_handle64 session, uint32_t bytes, size_t want,
              uint32_t *chunk, uint32_t *off) {
-    if (placeExisting(bytes, chunk, off))
+    return placeOn(session, CDSP_DOMAIN_ID, arena_chunks_, chunk_cap_, bytes,
+                   want, chunk, off);
+  }
+
+  /** @brief place() on any session's chunk list: [#132 Part B E3] S2's FC
+   *  arena is the same path on S2's handle and effective domain. */
+  bool placeOn(remote_handle64 session, int domain,
+               std::vector<ArenaChunk> &chunks, size_t &cap, uint32_t bytes,
+               size_t want, uint32_t *chunk, uint32_t *off) {
+    if (placeExistingOn(chunks, bytes, chunk, off))
       return true;
-    if (!newChunk(session, bytes, want))
+    if (!newChunkOn(session, domain, chunks, cap, bytes, want))
       return false;
-    arena_chunks_.back().used = bytes;
-    *chunk = static_cast<uint32_t>(arena_chunks_.size() - 1);
+    chunks.back().used = bytes;
+    *chunk = static_cast<uint32_t>(chunks.size() - 1);
     *off = 0;
     return true;
   }
@@ -3799,13 +4623,17 @@ private:
    *  nothing. What the FC slices use (get_or_register_fc), so that they
    *  never map address space the remaining heap registrations need. */
   bool placeExisting(uint32_t bytes, uint32_t *chunk, uint32_t *off) {
-    for (size_t c = 0; c < arena_chunks_.size(); ++c) {
+    return placeExistingOn(arena_chunks_, bytes, chunk, off);
+  }
+  bool placeExistingOn(std::vector<ArenaChunk> &chunks, uint32_t bytes,
+                       uint32_t *chunk, uint32_t *off) {
+    for (size_t c = 0; c < chunks.size(); ++c) {
       // 4 KB rather than the 512 the DSP requires: a weight that starts on
       // a page boundary is one the DMA never splits across a page for
       // alignment reasons alone, and the waste is under a part in 400.
-      const size_t at = (arena_chunks_[c].used + 4095u) & ~size_t(4095u);
-      if (at + bytes <= arena_chunks_[c].buf->size()) {
-        arena_chunks_[c].used = at + bytes;
+      const size_t at = (chunks[c].used + 4095u) & ~size_t(4095u);
+      if (at + bytes <= chunks[c].buf->size()) {
+        chunks[c].used = at + bytes;
         *chunk = static_cast<uint32_t>(c);
         *off = static_cast<uint32_t>(at);
         return true;
@@ -3875,6 +4703,10 @@ private:
    *         DSP's address space, arena_attach is the DSP's own arena table.
    */
   bool tryChunk(remote_handle64 session, size_t size) {
+    return tryChunkOn(session, CDSP_DOMAIN_ID, arena_chunks_, size);
+  }
+  bool tryChunkOn(remote_handle64 session, int domain,
+                  std::vector<ArenaChunk> &chunks, size_t size) {
     const unsigned long long rss_before = rssKb();
     // Uncached, because the DSP maps this once and the host keeps writing
     // into it afterwards -- with an uncached CPU mapping those writes reach
@@ -3884,6 +4716,11 @@ private:
     // one thing section 34 rests on that the probe did not show; the
     // ArenaUncachedWriteAfterMap test is what answers it.
     auto buf = std::make_unique<HtpRpcBuffer>(size, HTP_RPC_FLAGS_UNCACHED);
+    // [#132 Part B E5g] the buffer of a refused mapping lives until this
+    // one exists, so the retry gets another fd: E5g's retries at 128 and 64
+    // MiB after a refused 256 were refused AEE_EALREADY on the freed
+    // buffer's fd number, which the driver still held
+    last_failed_.reset();
     if (!buf->isIon()) {
       arena_fail_ = "rpcmem_alloc(" + std::to_string(size >> 20) +
                     " MiB) failed -- the HOST ION heap is out, so the ARM "
@@ -3901,9 +4738,12 @@ private:
     // mapping for a buffer passed as a call argument and is not tagged with
     // the fd, so HAP_mmap_get on the DSP refuses it. Three device runs went
     // on that (doc 46 section 32.10).
-    const int merr =
-      api.mmap(CDSP_DOMAIN_ID, fd, buf->data(), 0, size, FASTRPC_MAP_FD);
+    const int merr = api.mmap(domain, fd, buf->data(), 0, size, FASTRPC_MAP_FD);
     if (merr != 0) {
+      // the driver may keep the fd's entry after a refused map: drop it
+      if (api.munmap != nullptr)
+        api.munmap(domain, fd, buf->data(), size);
+      last_failed_ = std::move(buf);
       arena_fail_ =
         "fastrpc_mmap(" + std::to_string(size >> 20) +
         " MiB) failed: err=" + std::to_string(merr) +
@@ -3926,17 +4766,67 @@ private:
                     " -- mapped, but the DSP refused it; NNTR_HVX_MAX_ARENAS "
                     "or HAP_mmap_get";
       if (api.munmap != nullptr)
-        api.munmap(CDSP_DOMAIN_ID, fd, buf->data(), size);
+        api.munmap(domain, fd, buf->data(), size);
       return false;
     }
-    arena_chunks_.push_back(ArenaChunk{std::move(buf), dsp_id, 0});
+    chunks.push_back(ArenaChunk{std::move(buf), dsp_id, 0});
+    if (&chunks == &arena_chunks_ && chunks.size() == 1) {
+      std::shared_ptr<std::vector<ArenaChunk>> a = s1_arena_;
+      HtpBackend::global().atCloseLast(
+        [a, session] { s1ArenaTeardown(session, *a); });
+    }
     if (HtpProfile::global().level() != 0) {
+      size_t total = 0;
+      for (const ArenaChunk &c : chunks)
+        total += c.buf->size();
       std::printf("[HTP] arena chunk %zu: %zu MiB, dsp_id=%u, mapped total "
-                  "%zu MiB, RSS %llu -> %llu MB\n",
-                  arena_chunks_.size() - 1, size >> 20, dsp_id,
-                  arenaBytes() >> 20, rss_before >> 10, rssKb() >> 10);
+                  "%zu MiB, RSS %llu -> %llu MB%s\n",
+                  chunks.size() - 1, size >> 20, dsp_id, total >> 20,
+                  rss_before >> 10, rssKb() >> 10,
+                  domain == CDSP_DOMAIN_ID ? "" : " (S2)");
     }
     return true;
+  }
+
+  /**
+   * @brief [#132 Part B E5i] The S1 arena's close hook, after the queues and
+   *        the token drivers (atCloseLast: after every atClose hook): the
+   *        skel releases the graph, the weights and every arena
+   *        (arenas_release), then each chunk is fastrpc_munmap'd, every rc
+   *        checked, before the session closes -- the S1Ceiling probe's
+   *        order. E5f-E5h: about one app run in 20, A or E, left the next
+   *        process one 256 MiB window short when the arena was left mapped
+   *        to process exit (and its buffers rpcmem_free'd, still mapped, by
+   *        whichever singleton died first).
+   */
+  static void s1ArenaTeardown(remote_handle64 session,
+                              std::vector<ArenaChunk> &chunks) {
+    if (chunks.empty())
+      return;
+    const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+    uint32_t put = 0, unmapped = 0;
+    size_t bytes = 0;
+    const int rc = nntr_hvx_arenas_release(session, &put);
+    for (auto c = chunks.rbegin(); c != chunks.rend(); ++c) {
+      bytes += c->buf->size();
+      const int u = mem.munmap != nullptr
+                      ? mem.munmap(CDSP_DOMAIN_ID, c->buf->fd(), c->buf->data(),
+                                   c->buf->size())
+                      : -1;
+      if (u == 0)
+        ++unmapped;
+      else
+        std::fprintf(stderr,
+                     "[HTP] arena: fastrpc_munmap(chunk dsp_id=%u, %zu MiB) "
+                     "failed: 0x%x\n",
+                     c->dsp_id, c->buf->size() >> 20, static_cast<unsigned>(u));
+    }
+    std::fprintf(stderr,
+                 "[HTP] arena: chunks unmapped %u/%zu mib=%zu (release rc=0x%x "
+                 "put=%u)\n",
+                 unmapped, chunks.size(), bytes >> 20,
+                 static_cast<unsigned>(rc), put);
+    chunks.clear(); // rpcmem_free, each buffer unmapped first
   }
 
   /**
@@ -3954,13 +4844,21 @@ private:
    * host buffer is allocated and released each time.
    */
   bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
+    return newChunkOn(session, CDSP_DOMAIN_ID, arena_chunks_, chunk_cap_, bytes,
+                      want);
+  }
+  bool newChunkOn(remote_handle64 session, int domain,
+                  std::vector<ArenaChunk> &chunks, size_t &cap, uint32_t bytes,
+                  size_t want) {
     static constexpr size_t kGrain = size_t(64) << 20;
     /** Below this a chunk holds too few weights to be worth an arena slot,
-     *  and the DSP's table is not unbounded. */
-    static constexpr size_t kFloor = size_t(64) << 20;
+     *  and the DSP's table is not unbounded. [#132 Part B E5g] 16 MiB (was
+     *  64): the tail of the MoE arena, ~112 MiB above 14 x 256, may have
+     *  to go in pieces on a boot whose last 256 MiB window is taken. */
+    static constexpr size_t kFloor = size_t(16) << 20;
 
     size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
-    size = std::min(std::max(size, kGrain), chunk_cap_);
+    size = std::min(std::max(size, kGrain), cap);
     if (size < bytes) {
       arena_fail_ = "a weight is larger than a whole chunk";
       return false; // not this model
@@ -3968,7 +4866,7 @@ private:
 
     while (true) {
       arena_fail_.clear();
-      if (tryChunk(session, size))
+      if (tryChunkOn(session, domain, chunks, size))
         return true;
       const size_t half = size / 2;
       if (half < kFloor || half < bytes)
@@ -3978,7 +4876,7 @@ private:
                     size >> 20, half >> 20, arena_fail_.c_str());
       }
       size = half;
-      chunk_cap_ = size;
+      cap = size;
     }
   }
 
@@ -4061,21 +4959,25 @@ private:
   /** Conv blocks by their in_proj's pointer; see get_or_register_conv. */
   std::unordered_map<const void *, ConvHandles> conv_cache_;
 
-  std::vector<ArenaChunk> arena_chunks_;
+  /** S1's arena, shared with its close hook (s1ArenaTeardown): the two
+   *  singletons' destruction order is not fixed. */
+  std::shared_ptr<std::vector<ArenaChunk>> s1_arena_ =
+    std::make_shared<std::vector<ArenaChunk>>();
+  std::vector<ArenaChunk> &arena_chunks_ = *s1_arena_;
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
   /** Why the last newChunk refused, in words, for the throw that follows. */
   std::string arena_fail_;
   /** Largest chunk still worth asking for; only ever shrinks. */
   size_t chunk_cap_ = kArenaChunkMax;
+  /** [#132 Part B E5g] The last refused chunk's buffer, freed after the
+   *  next one is allocated (tryChunkOn). */
+  std::unique_ptr<HtpRpcBuffer> last_failed_;
 
-  // Deliberately never fastrpc_munmap'd: the DSP's close() puts every arena
-  // back, and the kernel reclaims the ION buffers at process exit. The
-  // destruction order of HtpBackend's singleton and this one is not fixed,
-  // so unmapping here could touch a session that is already closed.
-  // ponytail: a process that loads and unloads models would leak an arena
-  // per model. The fix is an explicit shutdown hook on HtpBackend that runs
-  // before it closes the session, not a destructor here.
+  // [#132 Part B E5i] Unmapped by the close hook s1ArenaTeardown (it was
+  // left mapped to process exit until E5h). ponytail: a process that loads
+  // and unloads models still keeps every arena to its end; a reload would
+  // need the same hook at model teardown.
 
   // ION-backed activation/output scratch, reused across calls, one buffer
   // per size class (stage) -- see invokeLayer's comment. Guarded by the
@@ -4118,14 +5020,57 @@ private:
   // [#132] the routing a MOE op that starts a stretch was handed
   std::vector<unsigned int> pending_ri_, pending_rc_;
   std::vector<float> pending_rw_;
+  // [#132 Part B] the model's Q4_0 weights for the Q4M1 kinds, in list
+  // order, until bindQ4m1; the handles registered for them
+  struct Q4Pending {
+    const void *data;
+    uint32_t K, N;
+    bool canonical;
+  };
+  std::vector<Q4Pending> q4_pending_;
+  std::vector<uint32_t> q4m1_handles_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
-  uint64_t fwd_calls_ = 0;  /**< nntr_hvx_forward* calls */
-  uint64_t fwd_tokens_ = 0; /**< of them at the first resident op */
+  uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
+  uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */
+  uint64_t cpu_fc_skipped_ = 0; /**< [#132 Part B] decode_row_resident's
+                                     true answers: CPU FC calls skipped */
   StagingPool act_pool_;
   StagingPool out_pool_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
       unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
+  /** [#132 Part B E3] The two-session path's state, shared with its
+   *  HtpBackend close hook (which runs after this object is gone). */
+  struct E2eState {
+    remote_handle64 h1 = 0, h2 = 0;
+    int dom2 = -1;
+    std::vector<ArenaChunk> arena; /**< S2's FC arena (Q4M1, attached) */
+    size_t arena_cap = kArenaChunkMax;
+    size_t attach_bytes = 0;
+    std::vector<uint32_t> q4m1;         /**< S2's q4m1_attach handles */
+    std::unique_ptr<HtpRpcBuffer> mbox; /**< the page both sessions map */
+    bool mbox1 = false, mbox2 = false, drv1 = false, drv2 = false;
+    bool graph2 = false;
+    std::shared_ptr<DspqMoe> q1, q2; /**< S1's (dspq_) and S2's queues */
+    uint32_t tok = 0;
+    uint64_t tokens = 0, hops = 0, wait1_us = 0, wait2_us = 0, pcyc1 = 0,
+             pcyc2 = 0, id_checked = 0, id_mismatch = 0;
+    uint64_t wall1_us = 0, wall2_us = 0, wall1_pcyc = 0, wall2_pcyc = 0,
+             token_us = 0; /**< per side; token_us: the ARM's round trip */
+    uint64_t kind1[HTP_OP_KIND_N] = {0}, kind2[HTP_OP_KIND_N] = {0};
+    uint32_t rounds = 0, spin_us = 0;
+  };
+  /** @brief The mailbox page: HEXKL_MBOX_BYTES (16 896) rounded to the
+   *  #178 probe's 64 KiB. */
+  static constexpr size_t kMboxBytes = size_t(64) << 10;
+  bool e2e_ = false; /**< NNTR_HTP_E2E=1 and a description set */
+  std::shared_ptr<E2eState> e2e_st_;
+  bool q4m1_bound_ = false; /**< the Q4M1 weights registered at load (E3) */
+  size_t q4m1_left_ = 0;    /**< S2 arena bytes still to place */
+  bool want_logits_ = true; /**< set_decode_logits */
+  std::vector<uint32_t> ban_, ban_sent_; /**< set_decode_ban, S2's LM_BAN */
+  bool have_id_ = false;                 /**< take_decode_token_id */
+  uint32_t pending_id_ = 0;
   /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
   std::unique_ptr<HtpRpcBuffer> conv_buf_;
 

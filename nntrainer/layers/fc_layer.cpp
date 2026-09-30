@@ -29,6 +29,9 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <util_func.h>
+#ifdef ENABLE_HEXKL
+#include <compute_ops.h>
+#endif
 
 #include <iostream>
 
@@ -263,6 +266,15 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
+
+#ifdef ENABLE_HEXKL
+  // [#132 Part B] The HTP runs this whole decode row (NNTR_HTP_FORWARD with
+  // every kind resident): nothing reads this layer's output before the
+  // lm_head hook, so its GEMV is skipped. False in every other run.
+  if (to - from == 1 && hidden_.batch() == 1 &&
+      get_htp_ops()->decode_row_resident(from))
+    return;
+#endif
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);

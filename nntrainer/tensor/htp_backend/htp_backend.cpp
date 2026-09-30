@@ -16,9 +16,12 @@
 
 #include <nntrainer_log.h>
 
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // remote_handle64, CDSP_DOMAIN_ID, remote_session_control -- Hexagon SDK,
 // not the HexKL addon. nntr_hvx.h is generated from test/htp/nntr_hvx.idl by
@@ -32,6 +35,118 @@ namespace nntrainer {
 HtpBackend &HtpBackend::global() {
   static HtpBackend instance;
   return instance;
+}
+
+bool HtpBackend::e2eRequested() {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_HTP_E2E");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+/**
+ * [#132 Part B E3] S2, the #178 probe's sequence (unittest_hvx_two_sessions
+ * Q1, set3: rc 0 in 22 ms): reserve a new session on "cdsp", its effective
+ * domain and its URI, the unsigned-PD control on that domain, then
+ * nntr_hvx_open on the URI -- which takes the lite path there, because S1
+ * already holds the HMX and the VTCM. Never FASTRPC_SESSION_CLOSE: the
+ * destructor closes the handle only (plan section 4 step E3).
+ * Called from openSecond(), after S1's arena is in place (see the header).
+ * ponytail: the open is synchronous (no watchdog thread as in the probe,
+ * whose 10 s kill never fired in three sittings); a hang here hangs the
+ * app at load, and the handoff's s2_open > 2 s stop rule reads open_ms.
+ */
+bool HtpBackend::openSecond() {
+  if (!tried2_ && enabled_ && e2eRequested()) {
+    tried2_ = true;
+    openSecondNow();
+    if (!enabled2_)
+      std::fprintf(stderr, "[HTP] s2: open FAILED (%s)\n", s2_error_.c_str());
+  }
+  return enabled2_;
+}
+
+void HtpBackend::openSecondNow() {
+  char dom[] = "cdsp", sname[] = "nntr_s2";
+  char err[160];
+  remote_rpc_reserve_new_session_t rs;
+  std::memset(&rs, 0, sizeof(rs));
+  rs.domain_name = dom;
+  rs.domain_name_len = std::strlen(dom);
+  rs.session_name = sname;
+  rs.session_name_len = std::strlen(sname);
+  int rc = remote_session_control(FASTRPC_RESERVE_NEW_SESSION, &rs, sizeof(rs));
+  if (rc != AEE_SUCCESS) {
+    std::snprintf(err, sizeof(err), "reserve rc=0x%x%s", (unsigned)rc,
+                  rc == 0x73 ? " (no second session on this device)" : "");
+    s2_error_ = err;
+    return;
+  }
+  remote_rpc_effective_domain_id_t ed;
+  std::memset(&ed, 0, sizeof(ed));
+  ed.domain_name = dom;
+  ed.domain_name_len = rs.domain_name_len;
+  ed.session_id = rs.session_id;
+  rc = remote_session_control(FASTRPC_GET_EFFECTIVE_DOMAIN_ID, &ed, sizeof(ed));
+  if (rc != AEE_SUCCESS) {
+    std::snprintf(err, sizeof(err), "effective domain rc=0x%x", (unsigned)rc);
+    s2_error_ = err;
+    return;
+  }
+  std::string mod(nntr_hvx_URI);
+  std::vector<char> uri(mod.size() + 64, '\0');
+  remote_rpc_get_uri_t gu;
+  std::memset(&gu, 0, sizeof(gu));
+  gu.domain_name = dom;
+  gu.domain_name_len = rs.domain_name_len;
+  gu.session_id = rs.session_id;
+  gu.module_uri = &mod[0];
+  gu.module_uri_len = mod.size();
+  gu.uri = uri.data();
+  gu.uri_len = uri.size();
+  rc = remote_session_control(FASTRPC_GET_URI, &gu, sizeof(gu));
+  if (rc != AEE_SUCCESS) {
+    std::snprintf(err, sizeof(err), "get uri rc=0x%x", (unsigned)rc);
+    s2_error_ = err;
+    return;
+  }
+  remote_rpc_control_unsigned_module up = {
+    static_cast<int>(ed.effective_domain_id), 1};
+  rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &up, sizeof(up));
+  if (rc != AEE_SUCCESS) {
+    std::snprintf(err, sizeof(err), "unsigned PD rc=0x%x", (unsigned)rc);
+    s2_error_ = err;
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  remote_handle64 h2 = 0;
+  rc = nntr_hvx_open(uri.data(), &h2);
+  const double open_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+  if (rc != AEE_SUCCESS) {
+    std::snprintf(err, sizeof(err), "nntr_hvx_open rc=0x%x after %.1f ms",
+                  (unsigned)rc, open_ms);
+    s2_error_ = err;
+    return;
+  }
+  handle2_ = static_cast<uint64_t>(h2);
+  effdom2_ = static_cast<int>(ed.effective_domain_id);
+  enabled2_ = true;
+  // res: [hmx_locked, vtcm_size, vtcm_avail_kib, max_page_kib, -, open_path,
+  // hvx_units]; 0x8000040e here is a skel older than session_info
+  uint32_t info[7] = {0, 0, 0, 0, 0, 0, 0};
+  const int irc = nntr_hvx_session_info(h2, info, 7);
+  vtcm2_bytes_ = irc == AEE_SUCCESS ? info[1] : 0u;
+  std::fprintf(stderr,
+               "[HTP] s2: open s1_effdom=%d s2_session=%u s2_effdom=%d "
+               "open_ms=%.1f info_rc=0x%x open_path=%u hmx=%u vtcm_kib=%u "
+               "hvx_units=%u uri=%s\n",
+               static_cast<int>(CDSP_DOMAIN_ID),
+               static_cast<unsigned>(rs.session_id), effdom2_, open_ms,
+               static_cast<unsigned>(irc), info[5], info[0], info[1] >> 10,
+               info[6], uri.data());
 }
 
 HtpBackend::HtpBackend() {
@@ -116,6 +231,15 @@ HtpBackend::~HtpBackend() {
   if (enabled_) {
     for (auto &fn : at_close_) {
       fn();
+    }
+    for (auto &fn : at_close_last_) {
+      fn();
+    }
+    // [#132 Part B E3] S2 first, after the hooks have unmapped every buffer
+    // it had (#178's rule); the handle only, never FASTRPC_SESSION_CLOSE
+    if (enabled2_) {
+      nntr_hvx_close(static_cast<remote_handle64>(handle2_));
+      enabled2_ = false;
     }
     nntr_hvx_close(static_cast<remote_handle64>(handle_));
     enabled_ = false;

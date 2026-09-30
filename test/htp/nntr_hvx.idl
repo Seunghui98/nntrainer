@@ -480,7 +480,8 @@ interface nntr_hvx : remote_handle64 {
    // [#85] One FastRPC call per token, the skeleton. graph_init takes the
    // decode step's op list (htp_graph_desc.h words: header, layer kinds,
    // one 80-word record per op with its kind, shapes, activation slots,
-   // next_mm and, for a MoE op, its 32 + 32 registered weight handles),
+   // next_mm and, for a MoE op, its 32 + 32 registered weight handles;
+   // since #132 Part B an FC / DENSE_FFN / LM_HEAD op's Q4M1 handles),
    // validates it once and keeps it; n_ops echoes the count. A second init
    // without a release is AEE_EBADSTATE; a handle a resident op names
    // cannot be released while the graph lives (AEE_EBADSTATE from
@@ -599,7 +600,9 @@ interface nntr_hvx : remote_handle64 {
    // q | k gamma of 2 x head_dim for QK_NORM), a conv op's weights (3N)
    // or its state seed (2N, re-sendable), the RoPE table (max_seq x 64
    // with op == HTP_GRAPH_NO_OP), or a ROUTER_TOPK op's gate weight
-   // (K x n_experts, [K][E]) and bias (n_experts) (#132). The copy lives on the DSP heap for
+   // (K x n_experts, [K][E]) and bias (n_experts) (#132), or [#132 Part
+   // B E3] an LM_HEAD op's banned ids (LM_BAN: 1..32 u32 in the f32
+   // words, the argmax skips them). The copy lives on the DSP heap for
    // the graph's life (plan 130 section 3.1), so the per-token calls
    // carry activations only. A wrong length or a kind that does not take
    // which is AEE_EINVALIDFORMAT, an op or which out of range
@@ -664,16 +667,21 @@ interface nntr_hvx : remote_handle64 {
    // m1_ops_det.h. Test entries: no model path calls them. A bad shape is
    // AEE_EINVALIDFORMAT, a bad handle AEE_EBADITEM; never AEE_EBADPARM.
    //
-   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 128 == 0,
+   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 64 == 0,
    // K <= 8192, N % 32 == 0), copied to the DSP heap: h names it until
-   // q4m1_release or close. At most 8 at once (AEE_EBADITEM past that).
+   // q4m1_release or close. At most 80 at once (AEE_EBADITEM past that).
+   // [#132 Part B] A resident graph op may name h (graph_init's FC,
+   // DENSE_FFN and LM_HEAD records): release is then AEE_EBADSTATE until
+   // graph_release.
    AEEResult q4m1_register(in uint32 K, in uint32 N, in sequence<uint8> w,
                            rout uint32 h);
    AEEResult q4m1_release(in uint32 h);
 
    // y (N) = the CPU's Q4_0 FC of x (K) with weight h, reps times (y from
    // the last). variant: bit 16 the VTCM feed (per-lane DMA, src_bypass),
-   // every other bit 0. lanes: pool threads, 1..8 (capped at the pool). stats
+   // bit 17 the same double buffer in a 2 MiB DSP heap scratch through the
+   // L2 (#178; not both), every other bit 0. lanes: pool threads, 1..8
+   // (capped at the pool). stats
    // (8): [0] GEMV us over the reps, [1] quantizer us, [2..3] GEMV
    // pcycles lo | hi, [4] lanes used, [5] reps, [6] K, [7] N.
    AEEResult fc_q4m1_f32(in uint32 h, in uint32 variant, in uint32 lanes,
@@ -682,7 +690,7 @@ interface nntr_hvx : remote_handle64 {
                          rout sequence<uint32> stats);
 
    // The FC's vector quantizer (hvx_q4m1_prep, = q8_0_quant_cpu_det, the
-   // CPU's nntr_quantize_row_q8_0): xLen % 128 == 0, <= 8192 floats into
+   // CPU's nntr_quantize_row_q8_0): xLen % 64 == 0, <= 8192 floats into
    // xLen int8 and xLen/32 f16 scales.
    AEEResult q8_quant_f32(in sequence<float> x, rout sequence<int8> q,
                           rout sequence<uint16> d);
@@ -695,10 +703,73 @@ interface nntr_hvx : remote_handle64 {
    // m1_argmax_first: the index of the first maximum (std::max_element).
    AEEResult argmax_f32(in sequence<float> x, rout uint32 idx);
 
+   // [#178] Second-session probe (plan docs/plans/178-second-dsp-session.md).
+   // Test entries: no model path calls them. Never AEE_EBADPARM for a bad
+   // length (AEE_EINVALIDFORMAT), which stays the stale-skel symptom.
+   //
+   // res (7): [hmx_locked, vtcm_size bytes, vtcm_avail_kib, vtcm_max_page_kib
+   // (HAP_query_avail_VTCM now), heap_used_kib ([#132 Part B E5g] the PD's
+   // heap in use, HAP_mem_get_stats; 0 without it), open_path (0 full, 1
+   // lite: no HMX lock, VTCM from HAP_compute_res), hvx_units].
+   AEEResult session_info(rout sequence<uint32> res);
+
+   // One side of a DSP-to-DSP hop through a shared page (nntr_hvx_mailbox.c):
+   // fd is an ION buffer of bytes the caller fastrpc_mmap'd for this
+   // session. role 0 posts seq 1..n in the ping word (after copying payload
+   // bytes into its half, cache clean) and waits for the same seq in pong;
+   // role 1 mirrors. A wait spins spin_us, then polls every 50 us until
+   // spin_us + 1 s, which counts a timeout and ends the run. payload is 0
+   // or a multiple of 4 of at least 12 bytes; us_total is 0 when n_done is 0.
+   // res (5): [us_total, n_done, n_timeouts, payload_checksum, n_bad].
+   AEEResult mailbox_run(in int32 fd, in uint32 bytes, in uint32 role,
+                         in uint32 n, in uint32 payload, in uint32 spin_us,
+                         rout sequence<uint32> res);
+
    // One f32 operation per element on the DSP (nntr_hvx_sf_probe.c), to
    // name the operation a kernel disagrees on: op 0/1/2 the inline-asm
    // IEEE vadd/vsub/vmpy .sf, 3/4/5 the Q6_Vsf_* intrinsics, 6 scalar a/b,
    // 7 scalar sffma a*b + 1. o = op(a, b); a multiple of 32 for 0..5.
    AEEResult sf_probe(in uint32 op, in sequence<float> a,
                       in sequence<float> b, rout sequence<float> o);
+
+   // [#132 Part B E2] The two-session token driver (nntr_hvx_token.c over
+   // hmx/hexkl_token.c; plan 132-part-b-two-session-e2e.md section 3.2).
+   // start maps the mailbox page the ARM side allocated and fastrpc_mmap'd
+   // into both sessions (mbox_fd; mbox_bytes >= 16896, HEXKL_MBOX_BYTES)
+   // and records the role: 0 = S2, the main session (op 0 to the argmax),
+   // 1 = S1, the MoE server (ROUTER_TOPK + MOE). A wait for the other
+   // session spins spin_us, then polls every 50 us, and fails the token
+   // with AEE_EEXPIRED 1 s later. The tokens themselves are dspqueue
+   // packets (HTP_DSPQ_OP_TOKEN, htp_dspq_wire.h) on the session's dspq
+   // thread. AEE_EBADSTATE: a driver is already running;
+   // AEE_EINVALIDFORMAT: role or page size. Never AEE_EBADPARM. close()
+   // stops a driver still running.
+   AEEResult token_driver_start(in int32 mbox_fd, in uint32 mbox_bytes,
+                                in uint32 role, in uint32 spin_us);
+   // Unmaps the page. res (5): [tokens served, hops, timeouts, stale
+   // reads, wait us].
+   AEEResult token_driver_stop(rout sequence<uint32> res);
+
+   // [#132 Part B E3] q4m1_register's arena form: the K x N Q4M1 weight
+   // the ARM side already wrote at byte off of an attached arena
+   // (arena_attach; off % 128 == 0, the weight inside the arena). No copy:
+   // h names those bytes until q4m1_release or close, and the arena cannot
+   // be detached while a slot borrows from it (AEE_EBADSTATE). The ARM
+   // writes the arena uncached and before this call, the DSP never writes
+   // it, so the FC's DMA reads it around the L2 as it reads a registered
+   // copy. Shapes and slots as q4m1_register (AEE_EINVALIDFORMAT,
+   // AEE_EBADITEM); an unknown arena or a weight past its end is
+   // AEE_EINVALIDFORMAT, never AEE_EBADPARM.
+   AEEResult q4m1_attach(in uint32 arena, in uint32 off, in uint32 K,
+                         in uint32 N, rout uint32 h);
+
+   // [#132 Part B E5i] The release half of close(), so the ARM side can
+   // fastrpc_munmap every arena chunk before it closes the handle (the
+   // S1Ceiling probe's order; E5f-E5h lost one 256 MiB window per ~20 app
+   // runs that left their arena mapped to process exit): stops a dspq
+   // thread and a token driver still running, frees the graph, releases
+   // every registered weight and Q4M1 slot, and puts every attached arena.
+   // n = the arenas it put. The session stays open; close() after it
+   // finds nothing of these left.
+   AEEResult arenas_release(rout uint32 n);
 };
