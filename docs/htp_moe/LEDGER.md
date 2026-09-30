@@ -620,6 +620,53 @@ user) → #187 (`in-progress`) → #132 Part B → #170 round 4 → #178 re-targ
 → #157 (on hold) → #137 → #197 → #198; #110 parked (`needs-user`); #122
 docs track; #168 / #177 / #185 `htp_moe_v81` in review.**
 
+**Cycle 26 (seen 2026-09-30, night): PR head unchanged at `f923bf29`**
+(last commit 2026-09-29 04:20 UTC; the PR's `updatedAt` moved to 2026-09-30
+05:24 UTC without a new commit). Nothing to decide upstream; the 18 commits
+after `4ae1ebd7` stay unmerged. Not on this watch: upstream #4383 (FSU,
+open draft, head `5a84c05d`) and #4343 (open), both merged into the new
+base by the user.
+
+On our side (cycle 26): **the user re-planned the project on a new base,
+`htp_decode`** = `htp_first_version` @ `d4a898430` (contract §12,
+2026-09-30): `htp_moe` @ `70e0f0b0` + #132 Part B + upstream #4383 + #4343
++ upstream main @ `aad932ce` + plan 194 and #194's E1 commits. Docs and PRs
+target `htp_decode` from this cycle. **#201 filed** (`state:needs-plan`,
+p0): review the whole decode NPU end-to-end path (`NNTR_HTP_E2E`) with FSU
+in the tree and optimize it; plan first; its targets and gates are open
+questions for the user, none invented. **#194 sitting 1b read, not folded
+as BENCHMARK rows** (`194-sitting-1.md` on `htp_decode`, `R3CY10WM83Y`,
+14:38–17:12 KST, from `htp/194-s3` @ `b0248a63`; `MD5 OK` ×10 in
+`sitting.out`, 0 mismatches): nulls hold (E0 ≡ A on nll 8/8, mc 8/8, text
+at G 512 / 1024), P1 1.0025 / P2 max 1.0110 / P3 pass, **P4 FAIL (p04)**;
+A 56.21 / 54.89 and 52.89 / 51.93, E0 32.19 / 30.94 and 32.25 / 31.19, E1
+33.83 / 33.10 and 33.80 / 32.91 tok/s at G 512 / 1024; nine `LEAK` stops
+(S1 ceiling 3584), after A runs too. Not folded because E1's text differs
+from A (one word) with the `text approved` column empty, and the handoff's
+four user decisions (P4 on p04, the mapping loss, the PR, §3.4) are open;
+the sitting predates FSU, so it is #201's documented starting breakdown,
+not its baseline. A G = 64
+device check at `d4a898430` (A 54.8–55.9, E0 29.5, E1 31.3, S1 ceiling
+3840) was reported by the orchestrator; no handoff file or log for it is in
+the tree (`/local/mnt/workspace/htp_moe/first_version/logs/` is empty), so
+it is not a row. **Branch state on `origin`:** `htp_moe_ppl`, `htp_moe_v81`
+and every `htp/194-*`, `htp/168-*`, `htp/177-*`, `htp/187-*` branch are
+gone; they survive as local tags `archive/*` on the workstation only
+(`archive/htp/194-s3` @ `e7f8660e`, `archive/htp_moe_v81` @ `5300f695`,
+`archive/htp_moe_ppl` @ `62b7bbd2`, …). `origin/htp/185-m1-schedule-overlap`
+@ `25764b23` remains. PRs #173 (#168), #181 (#177), #191 (#185) are closed
+unmerged with their base; no PR is open. **The 2026-09-30 cleanup (user
+decision; done outside the supervisor, 10:09–10:10 UTC, during this
+cycle) closed twelve issues as `not_planned`** with a closing comment
+each: #122, #132, #157, #168, #170, #177, #178, #185, #187, #194, #197,
+#198 — "the remaining work is to be re-planned later on the new base";
+their `state:*` labels were left as they were (#194 still reads
+`state:measured`, #187 / #132 `state:in-progress`), which the supervisor
+did not touch. Open `hexagon` issues after it: **#201** (`needs-plan`,
+p0), #137 (`needs-plan`, p2), #110 (`needs-plan`, `needs-user`, parked),
+#76 (tracker, still titled "htp_moe tracker"). Queue: **#201 (plan) →
+the rest waits for the re-plan.**
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
