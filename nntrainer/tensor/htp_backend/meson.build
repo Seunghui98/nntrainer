@@ -93,6 +93,10 @@ if get_option('htp-inproc')
     'hmx/hexkl_dma_trace.c',
     'hmx/hexkl_probe.c',
     'hmx/hexkl_acc_tile.c',
+    # the session's close() releases the two KV tables of nntrainer#4343;
+    # the attention entries that fill them are device-only (see above)
+    'hmx/hexkl_kv_tiles_f16.c',
+    'hmx/hexkl_kv_q.c',
     'hvx/hvx_worker_pool.c',
     'hvx/hvx_gather_ah_u8.c',
     'hvx/hvx_scale_add_f32.c',

@@ -51,9 +51,9 @@
 #include <htp_moe_opts.h>
 #include <htp_q4_0_convert.h>
 #include <htp_rpcmem.h>
-#include <nntrainer_log.h>
 #include <htp_wh_layout.h>
 #include <m1_ops_det.h>
+#include <nntrainer_log.h>
 #include <q4_gemv_cpu_det.h>
 #include <swiglu_det.h>
 #include <thread_manager.h>
@@ -1079,6 +1079,8 @@ inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
 } // namespace
 
 // --- nntrainer/nntrainer#4343: fp16 and quantized KV-cache attention ---
+// Not in the in-process host twin: see the ops at the end of HtpComputeOps.
+#ifndef NNTR_HTP_INPROC
 namespace {
 
 /**
@@ -1109,14 +1111,23 @@ constexpr unsigned int kDecodeMaxRows = 5;
 constexpr unsigned int kDecodeMaxHeadDim = 128;
 
 } // namespace
+#endif /* NNTR_HTP_INPROC */
 
 class HtpComputeOps : public CpuComputeOps {
 public:
   /** [#130] The per-token entry's call count at close, the one line the
    *  host E2E harness reads (plan 130 section 3.5): tokens are the calls
    *  that started at the list's first resident op. No RPC here: the
-   *  session may already be closed. */
-  ~HtpComputeOps() {
+   *  session may already be closed. The expert prefetch readers (doc 52)
+   *  are stopped first. */
+  ~HtpComputeOps() override {
+    {
+      std::lock_guard<std::mutex> lock(prefetch_mutex_);
+      prefetch_stop_ = true;
+    }
+    prefetch_cv_.notify_all();
+    for (std::thread &t : prefetch_readers_)
+      t.join();
     if (fwd_calls_ != 0) {
       std::fprintf(stderr,
                    "[HTP] graph: forward calls=%llu tokens=%llu "
@@ -2464,16 +2475,6 @@ public:
     if (first)
       std::rethrow_exception(first);
     return keys;
-  }
-
-  ~HtpComputeOps() override {
-    {
-      std::lock_guard<std::mutex> lock(prefetch_mutex_);
-      prefetch_stop_ = true;
-    }
-    prefetch_cv_.notify_all();
-    for (std::thread &t : prefetch_readers_)
-      t.join();
   }
 
   void reserve_qs4cx_wh_expert_slots(size_t n) override {
