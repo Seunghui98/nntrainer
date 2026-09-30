@@ -113,6 +113,10 @@
 #                              refuses maps past 100 MiB and keeps a refused
 #                              fd, as the driver did; S1's chunk halves to
 #                              64 MiB and the run equals the uncapped one)
+#   E2E e3 pool C=2 refused: the expert pool is not in the per-token entry
+#                              (plan 201 S1)  (NNTR_MOE_CACHE_EXPERTS with
+#                              NNTR_HTP_E2E=1 throws at the first MoE call
+#                              instead of binding handles the LRU retires)
 # and, since #194 S1 (htp_moe_ppl), the same two-session token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -320,6 +324,13 @@ NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
 PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
+# [plan 201 S1] the expert pool (NNTR_MOE_CACHE_EXPERTS) is not inside the
+# per-token entry yet: the E path refuses it instead of reading a handle the
+# ARM's LRU has retired
+rc_pool=0
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 "$E2E" --model "$OUT/htp64q" \
+  --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
+  --moe-engine htp --max-seq 32 > "$OUT/64e3pool.log" 2>&1 || rc_pool=$?
 # [#194 S1] lever L1 on the same two-session token
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
   run_e2e q64-l1ppl "$OUT/htp64q" htp "$OUT/dump_64l1ppl" "$OUT/64l1ppl.log" --max-seq 32 --run
@@ -402,6 +413,11 @@ if [ $rc = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ESCHEMENOTSUPPOR
   echo "E2E fwd tiny-all-kinds refused: AEE_ESCHEMENOTSUPPORTED"
 else
   echo "E2E FAIL all kinds at head_dim 8 not refused (rc=$rc)"; fail=1
+fi
+if [ $rc_pool = 1 ] && grep -q '^E2E FAIL NNTR_HTP_FORWARD / NNTR_HTP_E2E with NNTR_MOE_CACHE_EXPERTS' "$OUT/64e3pool.log"; then
+  echo "E2E e3 pool C=2 refused: the expert pool is not in the per-token entry (plan 201 S1)"
+else
+  echo "E2E FAIL e3 with NNTR_MOE_CACHE_EXPERTS=2 not refused (rc=$rc_pool)"; fail=1
 fi
 # (f) the hd64 fixture: its own golden with the switch off; with it on, 12
 # calls per token, the SNR floor, the token policy, and the init lines

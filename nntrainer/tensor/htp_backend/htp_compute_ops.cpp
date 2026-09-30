@@ -1419,6 +1419,15 @@ public:
     // (contract section 2): a fallback to mm_u8i4_moe_layer would report
     // per-layer numbers as the graph's.
     if (forwardSwitch() && !graph_words_.empty()) {
+      // [plan 201 section 2.3] a virtual expert (NNTR_MOE_CACHE_EXPERTS: a
+      // null scale) is resident only until the ARM's LRU evicts it, and
+      // the per-token entry would keep reading its handle after that
+      if (std::find(gate_up_scale.begin(), gate_up_scale.end(), nullptr) !=
+          gate_up_scale.end())
+        throw std::runtime_error(
+          "NNTR_HTP_FORWARD / NNTR_HTP_E2E with NNTR_MOE_CACHE_EXPERTS: the "
+          "expert pool is not inside the per-token entry yet (plan 201 S1); "
+          "unset one of them");
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
       // [#132] A sole MOE stretch runs here; with ADD resident the stretch
       // is [MOE ADD RMSNORM] and the next layer's norm hook runs it, so a
@@ -1694,6 +1703,7 @@ public:
     attn_registered_ = false;
     moe_bound_ = 0;
     moe_op_by_handle_.clear();
+    moe_tables_.assign(moe_ops_.size(), {});
     graph_inited_ = false;
     HtpProfile::global().setGraphResident(mask);
     char names[128];
@@ -1838,7 +1848,7 @@ public:
             session, w, op->K, r0, std::min(kLmHeadSliceRows, op->N - r0));
       } else {
         uint32_t sum = 0;
-        while (sum < op->N && parts < HTP_GRAPH_MAX_EXPERTS) {
+        while (sum < op->N && parts < HTP_GRAPH_MAX_PARTS) {
           const uint8_t *w = take(i, op->K, 0u);
           const uint32_t n = q4_pending_[next - 1].N;
           op->h_gu[parts++] = registerQ4m1(session, w, op->K, 0u, n);
@@ -2160,8 +2170,13 @@ public:
         std::to_string(h_gu.size()) + "/" + std::to_string(K) + "/" +
         std::to_string(inter) + "/" + std::to_string(N_out));
     }
-    std::copy(h_gu.begin(), h_gu.end(), op->h_gu);
-    std::copy(h_dn.begin(), h_dn.end(), op->h_dn);
+    // [plan 201 S1] the handles go to the op's EXPERTS table, bound after
+    // graph_init (ensureGraphInit), not into the record
+    std::vector<float> &t = moe_tables_[moe_bound_];
+    t.resize(2 * h_gu.size());
+    std::memcpy(t.data(), h_gu.data(), h_gu.size() * sizeof(uint32_t));
+    std::memcpy(t.data() + h_gu.size(), h_dn.data(),
+                h_dn.size() * sizeof(uint32_t));
     moe_op_by_handle_.emplace(h_gu[0], idx);
     ++moe_bound_;
     return idx;
@@ -2215,6 +2230,27 @@ public:
         throw std::runtime_error("nntr_hvx_graph_init failed: " +
                                  graphErr(err));
       }
+    }
+    // [plan 201 S1] each resident MoE op's EXPERTS table, on the session
+    // that runs MOE; a refusal releases the graph(s), so a retry inits again
+    const remote_handle64 moe_session = e2e_ ? e2e_st_->h1 : session;
+    try {
+      for (size_t m = 0; m < moe_ops_.size(); ++m) {
+        const std::vector<float> &t = moe_tables_[m];
+        if (!t.empty() && (e2e_ || graphOp(moe_ops_[m])->resident))
+          setParam(moe_session, moe_ops_[m], HTP_GRAPH_PARAM_EXPERTS, t.data(),
+                   static_cast<unsigned>(t.size()),
+                   2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
+      }
+    } catch (...) {
+      nntr_hvx_graph_release(moe_session);
+      if (e2e_) {
+        nntr_hvx_graph_release(e2e_st_->h2);
+        e2e_st_->graph2 = false;
+      } else {
+        releaseQ4m1(session);
+      }
+      throw;
     }
     graph_inited_ = true;
     char names[128];
@@ -5926,6 +5962,9 @@ private:
   std::vector<uint32_t> moe_ops_;
   size_t moe_bound_ = 0;
   std::unordered_map<uint32_t, uint32_t> moe_op_by_handle_;
+  /** [plan 201 S1] per MoE op (moe_ops_ order) its EXPERTS table as the
+   *  f32 words graph_set_param carries: h_gu[0..E) then h_dn[0..E) */
+  std::vector<std::vector<float>> moe_tables_;
   bool graph_inited_ = false;
   bool graph_short_warned_ = false;
   // [#130] The stretch tables of section 3.2: per op the maximal resident
