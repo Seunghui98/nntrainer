@@ -123,6 +123,7 @@
 #   E2E eval l1-lfm25 ... min_snr_db=<x>               (x >= 30 gated, vs E0;
 #                              bit_identical=0, else the lever is not wired)
 #   E2E levers banner e0=0x0 l1=0x2 ok
+#   E2E L0 wake split closes: disp s1=.. s2=.. s2_pkt=.. ret s2=.. clk_resid=..
 #   E2E ppl-decode alts steps=7 ok                     (NNTR_PPL_DECODE_ALTS:
 #                              the step lines gain the ids' logits)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
@@ -724,6 +725,17 @@ l1_line="$($EVAL --label l1-lfm25 --allow-diff --snr-floor 30 "$OUT/dump_25e3" "
 echo "$l1_line"
 grep -q 'bit_identical=0' <<< "$l1_line" ||
   { echo "E2E FAIL l1-lfm25 bit-identical to E0: the lever is not wired"; fail=1; }
+# [#194 L0] the wake split closes on one clock: disp + S2's packet time +
+# ret = the ARM's round trip, to within 50 us a token, nothing negative
+wk="$(grep -h 'L0 wake us/token' "$OUT/25e3.log" || true)"
+if awk -v l="$wk" 'BEGIN{n = split(l, f, "[ =]"); ok = n > 0; for (i = 1; i < n; ++i) {
+    if (f[i] == "clk_resid") { r = f[i + 1]; if (r < 0) r = -r; ok = ok && r < 50; seen = 1 }
+    if (f[i] == "s1" || f[i] == "s2" || f[i] == "s2_pkt") ok = ok && f[i + 1] + 0 >= 0 }
+    exit !(ok && seen)}'; then
+  echo "E2E L0 wake split closes: ${wk#*us/token }"
+else
+  echo "E2E FAIL L0 wake split [$wk]"; fail=1
+fi
 if grep -q '^\[HTP\] ppl levers=0x0 L1=exact$' "$OUT/64e3.log" &&
   grep -q '^\[HTP\] ppl levers=0x2 L1=native_fc$' "$OUT/25l1.log"; then
   echo "E2E levers banner e0=0x0 l1=0x2 ok"

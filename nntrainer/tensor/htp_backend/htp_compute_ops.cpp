@@ -3780,7 +3780,23 @@ private:
       // to wake-up (hop_us, inside its wall), tokenForward on the ARM
       // (arm_fwd, rt plus its copies) and the ARM between two tokenForward
       // calls (arm_us: the layer walk, sampler, tokenizer, print)
+      // wake split: disp = post -> the DSP thread's read, ret = S2's write
+      // -> the ARM's read, s2_pkt = S2's handling outside its token wall;
+      // rt = disp_s2 + s2_pkt + ret_s2 when the two clocks are one counter
+      // (else these three read nonsense and clk_resid says by how much)
       const double an = e.arm_n ? static_cast<double>(e.arm_n) : 1.0;
+      std::fprintf(
+        stderr,
+        "[HTP] token driver: L0 wake us/token disp s1=%.1f s2=%.1f "
+        "s2_pkt=%.1f ret s2=%.1f clk_resid=%.1f\n",
+        static_cast<double>(e.disp1_us) / n,
+        static_cast<double>(e.disp2_us) / n,
+        (static_cast<double>(e.inout2_us) - static_cast<double>(e.wall2_us)) /
+          n,
+        static_cast<double>(e.ret2_us) / n,
+        (static_cast<double>(e.token_us) -
+         static_cast<double>(e.disp2_us + e.inout2_us + e.ret2_us)) /
+          n);
       std::fprintf(
         stderr,
         "[HTP] token driver: L0 us/token rt=%.1f s2_wall=%.1f s1_wall=%.1f "
@@ -3852,6 +3868,22 @@ private:
                  static_cast<unsigned>(i2));
   }
 
+  /** @brief [#194 L0] The system counter in us (low 32 bits): the ARM's
+   *  cntvct_el0, the counter the DSP's QTimer reads; off aarch64 (the
+   *  in-process build, whose DSP clock is CLOCK_MONOTONIC) steady_clock. */
+  static uint32_t sysCounterUs() {
+#if defined(__aarch64__)
+    uint64_t c, f;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(c));
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return f ? static_cast<uint32_t>(static_cast<unsigned __int128>(c) *
+                                     1000000u / f)
+             : 0u;
+#else
+    return static_cast<uint32_t>(HtpProfile::nowUs());
+#endif
+  }
+
   /** @brief [#132 Part B E3] One decode token on the two sessions: the
    *  embedding row into S2's act buffer, OP_TOKEN to S1 (serve every MoE
    *  round) and to S2 (op 0 to the argmax), both responses. Only the id
@@ -3914,6 +3946,7 @@ private:
     b[1].flags = DSPQUEUE_BUFFER_FLAG_REF;
     b[1].ptr = q2.out->data();
     const uint32_t nb2 = logits ? 2u : 1u;
+    const uint32_t c0 = sysCounterUs();
     const uint64_t t0 = HtpProfile::nowUs();
     int err =
       q1.api->write(q1.q, 0, 0, nullptr, sizeof(r1),
@@ -3935,6 +3968,7 @@ private:
                            reinterpret_cast<uint8_t *>(&s1r), kDspqTimeoutUs);
     }
     const uint64_t us = HtpProfile::nowUs() - t0;
+    const uint32_t c2 = sysCounterUs(); // after both reads: S1 answered first
     const int cb = q1.cb_err.load() != 0 ? q1.cb_err.load() : q2.cb_err.load();
     if (err != AEE_SUCCESS || cb != 0 || len2 != sizeof(s2r) ||
         len1 != sizeof(s1r) || s2r.seq != tok || s1r.seq != tok ||
@@ -3994,6 +4028,10 @@ private:
     e.token_us += us;
     e.hop1_us += s1r.hop_us;
     e.hop2_us += s2r.hop_us;
+    e.disp1_us += static_cast<int32_t>(s1r.t_in_us - c0);
+    e.disp2_us += static_cast<int32_t>(s2r.t_in_us - c0);
+    e.ret2_us += static_cast<int32_t>(c2 - s2r.t_out_us);
+    e.inout2_us += static_cast<int32_t>(s2r.t_out_us - s2r.t_in_us);
     ++fwd_calls_; // one ARM -> S2 packet per token: calls/token = 1.00
     ++fwd_tokens_;
     if (e.tokens == 1)
@@ -5938,6 +5976,10 @@ private:
      *  arm_n intervals) */
     uint64_t hop1_us = 0, hop2_us = 0, fwd_us = 0, arm_us = 0, arm_n = 0,
              last_exit_us = 0;
+    /** [#194 L0] wake split on the shared system counter: ARM post to the
+     *  DSP thread's read (per session), S2's write to the ARM's read, S2's
+     *  packet handling around its token (out - in) */
+    int64_t disp1_us = 0, disp2_us = 0, ret2_us = 0, inout2_us = 0;
     uint64_t kind1[HTP_OP_KIND_N] = {0}, kind2[HTP_OP_KIND_N] = {0};
     uint32_t rounds = 0, spin_us = 0;
   };
