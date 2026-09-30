@@ -1456,9 +1456,11 @@ int run(int argc, char **argv) {
   }
   const std::string input_bin =
     nntr_cfg.at("model_file_name").get<std::string>();
-  if (std::filesystem::path(input_bin).extension() != ".bin") {
-    throw std::invalid_argument(
-      "Streaming quantization currently requires an NNTrainer .bin input");
+  const std::string input_ext =
+    std::filesystem::path(input_bin).extension().string();
+  if (input_ext != ".bin" && input_ext != ".safetensors") {
+    throw std::invalid_argument("Streaming quantization requires an NNTrainer "
+                                ".bin or .safetensors input");
   }
   if (output_dir.empty())
     output_dir = defaultOutputDirectory(model_dir, quant);
@@ -1479,6 +1481,30 @@ int run(int argc, char **argv) {
   std::ifstream input(input_path, std::ios::binary);
   if (!input.is_open())
     throw std::runtime_error("Failed to open " + input_path.string());
+  // A converter-written .safetensors is the .bin with a header in front:
+  // weight_converter.py assigns data_offsets in the same walk that writes
+  // the .bin, so past the header the bytes are in the .bin's order (the
+  // tied lm head's trailing copy is the one thing the .bin has that this
+  // does not, and hasRemainingBytes already allows for that). Skip
+  // [8-byte little-endian header length][header JSON] and read on.
+  // ponytail: the order is trusted, not checked against the header's
+  // names; the byte-count check below still catches a shape mismatch.
+  uintmax_t data_start = 0;
+  if (input_ext == ".safetensors") {
+    unsigned char len_bytes[8];
+    input.read(reinterpret_cast<char *>(len_bytes), sizeof(len_bytes));
+    if (!input)
+      throw std::runtime_error("Failed to read the safetensors header of " +
+                               input_path.string());
+    uint64_t header_len = 0;
+    for (int i = 7; i >= 0; --i)
+      header_len = (header_len << 8) | len_bytes[i];
+    data_start = 8 + header_len;
+    if (data_start >= std::filesystem::file_size(input_path))
+      throw std::runtime_error("safetensors header length is past the end of " +
+                               input_path.string());
+    input.seekg(static_cast<std::streamoff>(data_start));
+  }
   std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
   if (!output.is_open())
     throw std::runtime_error("Failed to open " + output_path.string());
@@ -1509,7 +1535,8 @@ int run(int argc, char **argv) {
   // otherwise dies on an EOF tens of GB and tens of minutes in, naming a
   // tensor that is not itself the problem. Walk the layout first with the
   // same code, consuming nothing, and compare the total against the file.
-  const uintmax_t source_bytes = std::filesystem::file_size(input_path);
+  const uintmax_t source_bytes =
+    std::filesystem::file_size(input_path) - data_start;
   TensorWriter probe(input, output, quant.target_isa,
                      static_cast<size_t>(source_bytes), /*dry_run=*/true);
   walk(probe);
