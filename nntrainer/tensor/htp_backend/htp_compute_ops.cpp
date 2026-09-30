@@ -3758,6 +3758,25 @@ private:
             : 0.0,
           static_cast<double>(e.token_us) / n / 1000.0);
       }
+      // [#194 L0] where the token's time goes outside the kernels: the
+      // ARM's round trip (rt) against S2's own wall (wake = the dspqueue
+      // transport and the ARM read's wake-up), each side's hops from post
+      // to wake-up (hop_us, inside its wall), tokenForward on the ARM
+      // (arm_fwd, rt plus its copies) and the ARM between two tokenForward
+      // calls (arm_us: the layer walk, sampler, tokenizer, print)
+      const double an = e.arm_n ? static_cast<double>(e.arm_n) : 1.0;
+      std::fprintf(
+        stderr,
+        "[HTP] token driver: L0 us/token rt=%.1f s2_wall=%.1f s1_wall=%.1f "
+        "wake=%.1f hop_us s1=%.1f s2=%.1f arm_fwd=%.1f arm_us=%.1f "
+        "arm_n=%llu\n",
+        static_cast<double>(e.token_us) / n,
+        static_cast<double>(e.wall2_us) / n,
+        static_cast<double>(e.wall1_us) / n,
+        (static_cast<double>(e.token_us) - static_cast<double>(e.wall2_us)) / n,
+        static_cast<double>(e.hop1_us) / n, static_cast<double>(e.hop2_us) / n,
+        static_cast<double>(e.fwd_us) / n, static_cast<double>(e.arm_us) / an,
+        (unsigned long long)e.arm_n);
       std::fprintf(stderr,
                    "[HTP] token driver: close tokens=%llu hops/token=%.2f "
                    "s1_served=%u s2_served=%u timeouts=%u/%u stale=%u/%u "
@@ -3827,6 +3846,11 @@ private:
   void tokenForward(uint32_t pos, const float *act, unsigned K, float *out,
                     unsigned N_out) {
     E2eState &e = *e2e_st_;
+    const uint64_t entry_us = HtpProfile::nowUs();
+    if (e.last_exit_us != 0) {
+      e.arm_us += entry_us - e.last_exit_us;
+      ++e.arm_n;
+    }
     if (!e.drv1 || !e.drv2 || !e.q2 || !dspq_)
       throw std::runtime_error("token driver: not started (its start threw "
                                "at graph init)");
@@ -3952,6 +3976,8 @@ private:
       e.kind2[k] += s2r.kind_pcyc[k];
     }
     e.token_us += us;
+    e.hop1_us += s1r.hop_us;
+    e.hop2_us += s2r.hop_us;
     ++fwd_calls_; // one ARM -> S2 packet per token: calls/token = 1.00
     ++fwd_tokens_;
     if (e.tokens == 1)
@@ -3963,6 +3989,8 @@ private:
     if (profile.level())
       profile.addInvokeForward(static_cast<unsigned>(stretch_start_.size()), 0,
                                uint64_t(s1r.pcycles) + s2r.pcycles);
+    e.last_exit_us = HtpProfile::nowUs();
+    e.fwd_us += e.last_exit_us - entry_us;
   }
 
   /** [#132 Part B E3] compute_ops.h: whether the next decode tokens must
@@ -5888,6 +5916,12 @@ private:
              pcyc2 = 0, id_checked = 0, id_mismatch = 0;
     uint64_t wall1_us = 0, wall2_us = 0, wall1_pcyc = 0, wall2_pcyc = 0,
              token_us = 0; /**< per side; token_us: the ARM's round trip */
+    /** [#194 L0] the hops' own latency per side (post to wake-up), the
+     *  ARM's time inside tokenForward, and between one tokenForward's end
+     *  and the next one's start (the layer walk, sampler, tokenizer, print;
+     *  arm_n intervals) */
+    uint64_t hop1_us = 0, hop2_us = 0, fwd_us = 0, arm_us = 0, arm_n = 0,
+             last_exit_us = 0;
     uint64_t kind1[HTP_OP_KIND_N] = {0}, kind2[HTP_OP_KIND_N] = {0};
     uint32_t rounds = 0, spin_us = 0;
   };
