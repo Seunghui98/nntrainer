@@ -109,11 +109,13 @@ ppl 트레이드: attn proj −88 ms에 +4.5%, dense −10 ms에 +4.2% → dense
 
 ### 3.3 결과 (ppl 전부 62.0916)
 
-| 구성 | 물리 메모리 | prefill warm | prefill cold | decode | decode 히트 |
+| 구성 | 보장 메모리 | **prefill cold** (= 오프로딩 정의) | prefill warm (page cache 있을 때) | decode | decode 히트 |
 |---|---|---|---|---|---|
-| **C=8** | **1.79 GiB** | 606 ms / 733 TPS | 1018 ms / 436 TPS | 17.9 TPS | 57% |
-| **C=16** | **2.73 GiB** | 592 ms / 750 TPS | 718 ms / 618 TPS | 21.7 TPS | 85% |
-| 상주 | 4.54 GiB | 597 ms / 744 TPS | — | 24.0 TPS | 100% |
+| **C=8** | **1.79 GiB** | **1018 ms / 436 TPS** | 606 ms / 733 TPS | 17.9 TPS | 57% |
+| **C=16** | **2.73 GiB** | **718 ms / 618 TPS** | 592 ms / 750 TPS | 21.7 TPS | 85% |
+| 상주 | 4.54 GiB | — | 597 ms / 744 TPS | 24.0 TPS | 100% |
+
+cold가 오프로딩의 정의(expert가 flash에만 있음)다. warm은 직전 실행이 OS page cache에 남긴 모델 파일 사본(≤4.3 GB, 회수 가능)에서 읽는 상태라 실제 DRAM 사용은 ≈6 GB이고, 상주와 같은 조건이다. 대표 수치는 cold.
 
 - warm prefill은 C와 무관하게 상주와 같다(읽기 0.18 s가 계산 0.6 s 뒤에 숨음).
 - cold prefill은 **flash 대역폭(실측 3.0 GB/s) 바닥**에 붙어 있다(§5.3).
