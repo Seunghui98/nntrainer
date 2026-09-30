@@ -6,6 +6,52 @@ staged at `/local/mnt/workspace/htp_moe/132/set_e5b/` — estimated device
 time: **≈ 90 min** (phone rebooted first). set_e5 (below, `10bb91b7` /
 `d77a4bf2`) was read on 2026-09-30 06:13.
 
+## set_e5e and set_e5d as read (2026-09-30 08:40–09:2x, after reboots)
+
+* **E5e: bit-identical over 64 steps on both prompts** — S and Ev
+  `first_differing_step=-`, `E2E TRACE first_diff=-`, every shadow record
+  equal including conv 1152 / 1152; 0 mismatches. The conv fix holds; the
+  bit identity E5b read only for the first 5–25 steps is now whole.
+* **E5d: spin 0 is best** — E 20.79 / 20.20 / 16.51 tok/s at G = 64 with
+  spin 0 / 20 / 1000 (text == A at all three and at G = 512, 19.55); A
+  53.9 at G = 512 (the first A after a reboot read 30.8: set_e5f warms up).
+  Per kind at spin 0 (G = 64, 2.1 GHz): S1 router 0.79 + MoE 9.67 ms
+  (0.44 ms a round, the isolated rate), wall 35.4; S2 wall 41.3 — RMSNORM
+  0.35, FC 8.75, CONV 0.52, QK 0.09, ROPE 0.03, **ATTN_M1 8.33**, ADD 0.12,
+  **DENSE_FFN 5.60**, **LM_HEAD 5.97**; S2's Q4M1 kinds 20.3 ms against the
+  isolated 8.06; the ARM's token 44.7 ms.
+* Readings, and what changed for set_e5f:
+  * ATTN_M1 at 2.9 M pcyc a layer is the pre-#170 kernel: the branch
+    stacked on the old #175 base. Rebased linearly onto `htp_moe` @
+    `e3aad2ce` (#175, #170 round 3, both plans): ≈ 314 k pcyc a layer at
+    G = 1024, ≈ 1.2 ms for six layers.
+  * Every graph FC ran the L2 feed at 3 lanes, the best at K = 7168 but
+    half of K = 2048's 52 GB/s at 6 (#178's ladder): now 6 lanes for
+    K ≤ 2048 and 3 above (`NNTR_HTP_FC_LANES` for a ladder).
+  * DENSE_FFN's SwiGLU ran the spec's integer division on one thread: now
+    the scalar IEEE divide over the pool (`HvxFcQ4.ScalarDivide` gains
+    general pairs), and the lm_head's argmax is one vector pass. The
+    activation quantizer was already Part A's vector one.
+  * The spin default is 0.
+* **The budget this design reaches**, re-read with E5d's per-kind line and
+  the fixes above: S1 ≈ 10.5 ms (MoE 9.7 + router 0.8); S2 ≈ FC 6 + dense
+  FFN 2 + lm_head 3 + ATTN_M1 1.2 + small ops 1.5 ≈ 13.7 ms; hops and the
+  ARM ≈ 0.5–1 ms: **≈ 25 ms a token, ≈ 40 tok/s** — below A (≈ 54) and the
+  goal (50), because the two sessions alternate (the MoE and the rest never
+  overlap) and S2's FC reads its weights at 26–52 GB/s. What closes the rest
+  is the FC loop's rate (plan §3.5's ≈ 1 ms toward the 57 GB/s floor) and
+  overlap between the sessions, not the transport (44 hops cost ≈ 0.1 ms).
+
+## set_e5f (staged)
+
+`/local/mnt/workspace/htp_moe/132/set_e5f/run_e5f.sh` (≈ 60 min, reboot
+first; skel `6632315f…`, `libnntrainer.so` `bd2c6ab9…`, `unittest_hvx_softmax`
+`bd9965bb…`, runner `cb83e480…`): canary gtests (exact FC, the SwiGLU /
+argmax / quantizer small ops, the scalar divide with the general pairs, the
+conv gate); a warm-up A; MoE dumps and the startup cell; a lanes ladder at
+G = 64 (3,3 / 6,3 / 8,3); speed A E E A at G 64 / 512 / 1024; 8 prompts at
+G = 256 (nll forced on A's ids, text). Per-kind lines from every E run.
+
 ## set_e5c as read, and the cause (2026-09-30 08:05–08:12)
 
 * **S** (`NNTR_HTP_FORWARD=1`, one session, CPU-driven) and **Ev** (two
