@@ -13,6 +13,16 @@ NNTRAINER_ROOT := $(LOCAL_PATH)/../../..
 endif
 
 # Common Includes Definition
+#
+# The last entry is TEMPORARY and app-local: four layer TUs here (mha_core,
+# reshaped_rms_norm, rms_norm_gpu, per_layer_slice_gpu) still include the raw
+# OpenCL kernel wrappers <blas_kernels.h> / <attention_kernels.h> instead of
+# going through the ComputeOps table. Those two headers are private to
+# libnntrainer and are deliberately not installed, so the ndk build reaches
+# them through the nntrainer source dir rather than through the prebuilt
+# include export. Delete that entry together with the last raw
+# nntrainer::*_cl(...) call site under ../layers; it exists to keep the bypass
+# visible and app-local, never to make it ABI.
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
     $(LOCAL_PATH)/../layers \
@@ -34,6 +44,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2_moe \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
     $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend
 # htp_backend is here for one header: swiglu_det.h, the deterministic SwiGLU
 # the MoE layer shares with the DSP. It is header-only and builds on any

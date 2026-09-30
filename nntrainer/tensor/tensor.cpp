@@ -1671,7 +1671,11 @@ void Tensor::activate() {
 #else
 
   auto file_offset = getFileOffset();
-  size_t off = (file_offset / 4096) * 4096;
+  const long system_page_size = sysconf(_SC_PAGESIZE);
+  NNTR_THROW_IF(system_page_size <= 0, std::runtime_error)
+    << "[activate] failed to query the system page size";
+  const size_t page_size = static_cast<size_t>(system_page_size);
+  size_t off = (file_offset / page_size) * page_size;
   size_t diff = file_offset - off;
   size_t len = getMemoryBytes() + diff;
 
@@ -1683,14 +1687,15 @@ void Tensor::activate() {
     << "' has no backing fd; the model file fd was not propagated at "
        "read-time";
 
-  mapped_ptr = mmap(NULL, len, PROT_READ, MAP_PRIVATE, this->fd, off);
-#ifdef __ANDROID__
-  if (mapped_ptr != MAP_FAILED)
-    madvise(mapped_ptr, len, MADV_WILLNEED);
+  void *new_mapped_ptr = mmap(NULL, len, PROT_READ, MAP_PRIVATE, this->fd, off);
+#if defined(__ANDROID__) || defined(__linux__)
+  if (new_mapped_ptr != MAP_FAILED)
+    madvise(new_mapped_ptr, len, MADV_WILLNEED);
 #endif
-  NNTR_THROW_IF(mapped_ptr == MAP_FAILED, std::runtime_error)
+  NNTR_THROW_IF(new_mapped_ptr == MAP_FAILED, std::runtime_error)
     << "[activate] mmap failed for virtual tensor '" << getName()
     << "': " << strerror(errno);
+  mapped_ptr = new_mapped_ptr;
   itensor_->activate((void *)&((uint8_t *)mapped_ptr)[diff]);
 #endif
 }
@@ -1709,7 +1714,11 @@ void Tensor::deactivate() {
   };
 
   auto file_offset = getFileOffset();
-  size_t off = (file_offset / 4096) * 4096;
+  const long system_page_size = sysconf(_SC_PAGESIZE);
+  NNTR_THROW_IF(system_page_size <= 0, std::runtime_error)
+    << "[deactivate] failed to query the system page size";
+  const size_t page_size = static_cast<size_t>(system_page_size);
+  size_t off = (file_offset / page_size) * page_size;
   size_t diff = file_offset - off;
   size_t len = getMemoryBytes() + diff;
 

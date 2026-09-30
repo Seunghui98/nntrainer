@@ -146,7 +146,6 @@ private:
 
   // Intermediate tensor indices
   unsigned int router_logits_idx;
-  unsigned int expert_mask_idx;
   /**
    * @brief expert forward computation without memory copies
    * @param input Input tensor (reshaped to [total_tokens, 1, 1, hidden_size])

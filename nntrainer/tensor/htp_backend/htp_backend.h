@@ -34,6 +34,7 @@
 #ifdef __cplusplus
 #ifdef ENABLE_HEXKL
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -82,6 +83,22 @@ public:
    *        dspqueue MoE call spins its response wait for the same window.
    */
   uint32_t pollUs() const { return poll_us_; }
+
+  /**
+   * @brief DSP-visible memory: an rpcmem block, i.e. a dma-buf the rpcmem
+   *        library registers with FastRPC as it allocates. Any range of it
+   *        passed as a FastRPC buffer argument is then mapped into the DSP
+   *        and cache-maintained instead of copied -- the KV cache goes
+   *        here so attention never copies the used cache per call.
+   * @return the block, or nullptr when the backend is disabled, @a bytes
+   *         is 0 or above the rpcmem limit, or the allocation failed
+   */
+  void *alloc_shared(size_t bytes);
+
+  /**
+   * @brief Frees a block from alloc_shared(); nullptr is a no-op.
+   */
+  void free_shared(void *block);
 
   /**
    * @brief [#141] Runs fn in ~HtpBackend, in registration order, before

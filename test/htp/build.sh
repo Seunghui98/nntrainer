@@ -111,6 +111,12 @@ SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c $BACKEND/hvx/hvx_softmax_blocked_f32.
 SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
 SRCS="$SRCS nntr_hvx_fc_q4.c build/hvx_q4_gemv_f32.o build/nntr_hvx_sf_probe.o"
 SRCS="$SRCS nntr_hvx_mailbox.c"
+# nntrainer/nntrainer#4343: fp16 and quantized (int8 / int4) KV-cache attention
+SRCS="$SRCS nntr_hvx_attn_f16.c nntr_hvx_attn_q.c"
+SRCS="$SRCS $BACKEND/hmx/hexkl_attn_f16.c $BACKEND/hmx/hexkl_kv_tiles_f16.c"
+SRCS="$SRCS $BACKEND/hmx/hexkl_attn_q.c $BACKEND/hmx/hexkl_kv_q.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_attn_decode_f16.c $BACKEND/hvx/hvx_attn_decode_q.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_kv_quant.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
@@ -137,6 +143,8 @@ READELF="$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-readelf"
 # __register_frame_info_bases) and libc. Anything else -- in particular a
 # hexkl_*/hvx_*/nntr_* function -- is a project file missing from SRCS; the
 # linker accepts it, the on-device loader does not (#97: 0x80000406).
+# rintf, sqrtf, memcmp and __truncsfhf2 (the sibling of __extendhfsf2) came in
+# with the fp16 / quantized attention kernels of nntrainer/nntrainer#4343.
 UND=$("$READELF" --dyn-syms build/libnntr_hvx_skel.so | awk '$7=="UND" && $8!="" {print $8}')
 # A real skel always imports HAP_*/qurt_*: an empty list means readelf is
 # missing or its column layout changed, and the check below would pass
@@ -145,7 +153,7 @@ if [ -z "$UND" ]; then
     echo "Error: $READELF returned no undefined symbols; guard cannot run" >&2
     exit 1
 fi
-BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|dspqueue_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$)' || true)
+BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|dspqueue_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$|rintf$|sqrtf$|memcmp$|__truncsfhf2$)' || true)
 if [ -n "$BAD" ]; then
     echo "Error: skel has undefined symbols the DSP image will not provide:" >&2
     echo "$BAD" | sed 's/^/  /' >&2

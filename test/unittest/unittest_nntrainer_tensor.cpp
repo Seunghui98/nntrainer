@@ -13,8 +13,10 @@
 
 #include "nntrainer_test_util.h"
 #include "util_func.h"
+#include <array>
 #include <cmath>
 #include <cpu_backend.h>
+#include <cstdio>
 #include <float_tensor.h>
 #include <fp16.h>
 #include <fstream>
@@ -23,6 +25,10 @@
 #include <tensor.h>
 #include <tensor_dim.h>
 #include <thread_manager.h>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 TEST(nntrainer_TensorDim, ctor_initializer_p) {
   unsigned int b = 3;
@@ -224,6 +230,38 @@ TEST(nntrainer_Tensor, Tensor_04_p) {
 
   EXPECT_EQ(status, ML_ERROR_NONE);
 }
+
+#if !defined(_WIN32)
+TEST(nntrainer_Tensor, virtual_tensor_unaligned_offset_lifecycle_p) {
+  FILE *backing_file = tmpfile();
+  ASSERT_NE(backing_file, nullptr);
+  const int fd = fileno(backing_file);
+  ASSERT_NE(fd, -1);
+
+  const long system_page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(system_page_size, 0);
+  const size_t file_offset = static_cast<size_t>(system_page_size) +
+                             static_cast<size_t>(system_page_size) / 2 +
+                             sizeof(float);
+  const std::array<float, 4> expected = {1.0f, -2.0f, 3.5f, 4.25f};
+  ASSERT_EQ(pwrite(fd, expected.data(), sizeof(expected), file_offset),
+            static_cast<ssize_t>(sizeof(expected)));
+
+  nntrainer::Tensor tensor(nntrainer::TensorDim({1, 1, 1, 4}), false,
+                           nntrainer::Initializer::NONE, "virtual_unaligned",
+                           nntrainer::QScheme::PER_TENSOR_AFFINE, true);
+  tensor.setFileOffset(file_offset);
+  std::ifstream unused_stream;
+  tensor.read(unused_stream, file_offset, true, fd);
+
+  tensor.activate();
+  for (size_t i = 0; i < expected.size(); ++i)
+    EXPECT_FLOAT_EQ(tensor.getValue<float>(0, 0, 0, i), expected[i]);
+  tensor.deactivate();
+
+  EXPECT_EQ(fclose(backing_file), 0);
+}
+#endif
 
 TEST(nntrainer_Tensor, Tensor_07_n) {
   int status = ML_ERROR_NONE;

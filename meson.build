@@ -325,6 +325,8 @@ elif get_option('enable-htp')
     hexkl_root / 'include',
     hexagon_sdk_root / 'incs',
     hexagon_sdk_root / 'incs' / 'stddef',
+    hexagon_sdk_root / 'ipc' / 'fastrpc' / 'incs',
+    hexagon_sdk_root / 'ipc' / 'fastrpc' / 'rpcmem' / 'inc',
     is_system: true)
   libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
   hexkl_dep = declare_dependency(

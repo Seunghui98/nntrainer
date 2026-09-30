@@ -129,15 +129,15 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   // built against took two. The header carries no version macro to branch
   // on, so this defaults to the three-arg form -- what hxkl-beta2 ships --
   // and leaves -DNNTR_HEXKL_HW_INIT_2ARG as the escape hatch for the older
-  // one. Nothing here wants hmx_fp16_rate: this skel's HMX use is int8/int4
-  // only. If a future drop changes the arity again, this is the one line to
-  // touch.
+  // one. hmx_fp16_rate stays on the session: the f16 attention entries
+  // gate on it (0, which is also what the two-arg form and the lite open
+  // leave, means "no fp16 HMX here"). If a future drop changes the arity
+  // again, this is the one line to touch.
 #ifdef NNTR_HEXKL_HW_INIT_2ARG
   int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size);
 #else
-  uint32_t hmx_fp16_rate = 0; /* unused: int8/int4 HMX only */
-  int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size, &hmx_fp16_rate);
-  (void)hmx_fp16_rate;
+  int res =
+    hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size, &s->hmx_fp16_rate);
 #endif
   if (res != AEE_SUCCESS) {
     /* [#178] a second session (its own PD) beside one that holds the HMX
@@ -297,6 +297,16 @@ int nntr_hvx_close(remote_handle64 handle) {
   /* [#81] The attention cache borrows the pool, so it goes first. */
   hvx_attn_m1_free(s->attn_m1);
   s->attn_m1 = NULL;
+  for (uint32_t i = 0; i < HEXKL_KV_TILES_MAX; ++i) {
+    if (s->kv_tiles.slots[i].in_use) {
+      hexkl_kv_tiles_f16_release(&s->kv_tiles, i);
+    }
+  }
+  for (uint32_t i = 0; i < HEXKL_KV_Q_MAX; ++i) {
+    if (s->kv_q.slots[i].in_use) {
+      hexkl_kv_q_release(&s->kv_q, i);
+    }
+  }
   hvx_worker_pool_destroy(s->quant_pool);
   free(s->fc_l2);
   if (s->vtcm_ctx) {

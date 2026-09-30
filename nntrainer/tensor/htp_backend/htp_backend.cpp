@@ -30,6 +30,10 @@
 
 #include <nntr_hvx.h>
 
+#include <climits>
+
+#include <htp_rpcmem.h>
+
 namespace nntrainer {
 
 HtpBackend &HtpBackend::global() {
@@ -224,6 +228,33 @@ HtpBackend::HtpBackend() {
             "transport will pay the interrupt-wake tail (34_fc_measured.md "
             "section4 item F).",
             qos_err);
+  }
+}
+
+void *HtpBackend::alloc_shared(size_t bytes) {
+  // rpcmem_alloc takes an int, and no single KV cache slab approaches
+  // 2 GiB. The default flags are the cached mapping: the CPU writes new K/V
+  // rows into this memory every token, and FastRPC cleans the passed range
+  // before each call. rpcmem comes through HtpRpcMemApi (dlsym) like every
+  // other rpcmem user here, so libnntrainer.so gains no import for it.
+  const HtpRpcMemApi &api = HtpRpcMemApi::get();
+  if (!enabled_ || api.alloc == nullptr || bytes == 0 ||
+      bytes > static_cast<size_t>(INT_MAX)) {
+    return nullptr;
+  }
+  void *block = api.alloc(HTP_RPC_HEAP_ID_SYSTEM, HTP_RPC_FLAGS_DEFAULT,
+                          static_cast<int>(bytes));
+  if (!block) {
+    ml_logw("rpcmem_alloc(%zu bytes) failed; this buffer stays on the heap "
+            "and FastRPC copies it per call",
+            bytes);
+  }
+  return block;
+}
+
+void HtpBackend::free_shared(void *block) {
+  if (block) {
+    HtpRpcMemApi::get().free_(block);
   }
 }
 

@@ -53,8 +53,7 @@ CachedSlimMoELayer::CachedSlimMoELayer() :
   loaded_expert_deque({}),
   need_load({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
-  router_logits_idx(std::numeric_limits<unsigned>::max()),
-  expert_mask_idx(std::numeric_limits<unsigned>::max()) {}
+  router_logits_idx(std::numeric_limits<unsigned>::max()) {}
 
 void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
 
@@ -160,12 +159,6 @@ void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
     context.requestTensor({total_tokens, 1, 1, num_experts}, "router_logits",
                           nntrainer::Initializer::NONE, false,
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
-
-  // Expert mask: [num_experts, batch*seq]
-  expert_mask_idx =
-    context.requestTensor({num_experts, 1, topk, total_tokens}, "expert_mask",
-                          nntrainer::Initializer::ZEROS, false,
-                          nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
 void CachedSlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
@@ -194,11 +187,12 @@ inline void CachedSlimMoELayer::compute_expert_forward(
   nntrainer::Tensor gate_out(intermediate_dim);
   nntrainer::Tensor acti_out(intermediate_dim);
   nntrainer::Tensor up_out(intermediate_dim);
-  nntrainer::Tensor token_input(token_input_dim);
+  nntrainer::Tensor token_input;
   const unsigned token_idx = token_assignments[0].first;
 
   if (num_tokens > 1) {
     /** if prefill, copy data to make a batch */
+    token_input = nntrainer::Tensor(token_input_dim);
     {
       auto &tm = nntrainer::ThreadManager::Global();
       tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
