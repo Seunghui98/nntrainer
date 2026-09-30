@@ -351,6 +351,23 @@ protected:
   }
 };
 
+/** @brief [#132 Part B E5g] S1's mapping ceiling on this boot: 256 MiB
+ *  fastrpc_mmap steps (no attach) until refused, then all unmapped. The
+ *  runner reads it before and after every app run: E5f lost 256 MiB of it
+ *  across one two-session run. Alone (--gtest_filter=TwoSessions.S1Ceiling)
+ *  it opens S1 only. */
+TEST_F(TwoSessions, S1Ceiling) {
+  std::vector<Mapped> maps;
+  std::string why;
+  int rc = 0;
+  const size_t mib = ladder(g.h1, CDSP_DOMAIN_ID, false, &maps, &why, &rc);
+  for (Mapped &m : maps)
+    unmap_chunk(g.h1, &m);
+  std::cout << "CEILING s1_mmap_mib=" << mib << " stop=" << why << ":"
+            << hex(rc) << std::endl;
+  EXPECT_GE(mib, 3840u) << "below the 3840 MiB of a fresh boot";
+}
+
 /** @brief Q1: S1 at the loaded app's mapping, then a reserved S2: does it
  *  open, and what can it map and allocate beside S1's 3840 MiB? */
 TEST_F(TwoSessions, Q1_SecondSession) {
