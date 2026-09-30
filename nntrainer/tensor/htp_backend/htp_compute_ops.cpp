@@ -3647,6 +3647,8 @@ private:
     E2eState &e = *e2e_st_;
     HtpBackend &b = HtpBackend::global();
     const size_t s1_mib = arenaBytes() >> 20;
+    uint32_t info1[7] = {0}; // res[4]: S1's heap in use, KiB
+    nntr_hvx_session_info(e.h1, info1, 7);
     if (!b.openSecond())
       throw std::runtime_error("NNTR_HTP_E2E=1: the second session did not "
                                "open (" +
@@ -3668,14 +3670,14 @@ private:
     std::fprintf(stderr,
                  "[HTP] s2: fc arena weights=%zu handles=%zu attach_mib=%.1f "
                  "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
-                 "lanes=%s s1_arena_mib=%zu\n",
+                 "lanes=%s s1_arena_mib=%zu s1_heap_kib=%u\n",
                  q4_pending_.size(), e.q4m1.size(),
                  static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0),
                  e.arena.size(), mapped >> 20, q4m1FeedName(), ms,
                  std::getenv("NNTR_HTP_FC_LANES")
                    ? std::getenv("NNTR_HTP_FC_LANES")
                    : "6,3",
-                 s1_mib);
+                 s1_mib, info1[4]);
   }
 
   /** [#132 Part B E3] The feed the FC kinds take: the op's l2, or VTCM only
@@ -4714,6 +4716,11 @@ private:
     // one thing section 34 rests on that the probe did not show; the
     // ArenaUncachedWriteAfterMap test is what answers it.
     auto buf = std::make_unique<HtpRpcBuffer>(size, HTP_RPC_FLAGS_UNCACHED);
+    // [#132 Part B E5g] the buffer of a refused mapping lives until this
+    // one exists, so the retry gets another fd: E5g's retries at 128 and 64
+    // MiB after a refused 256 were refused AEE_EALREADY on the freed
+    // buffer's fd number, which the driver still held
+    last_failed_.reset();
     if (!buf->isIon()) {
       arena_fail_ = "rpcmem_alloc(" + std::to_string(size >> 20) +
                     " MiB) failed -- the HOST ION heap is out, so the ARM "
@@ -4733,6 +4740,10 @@ private:
     // on that (doc 46 section 32.10).
     const int merr = api.mmap(domain, fd, buf->data(), 0, size, FASTRPC_MAP_FD);
     if (merr != 0) {
+      // the driver may keep the fd's entry after a refused map: drop it
+      if (api.munmap != nullptr)
+        api.munmap(domain, fd, buf->data(), size);
+      last_failed_ = std::move(buf);
       arena_fail_ =
         "fastrpc_mmap(" + std::to_string(size >> 20) +
         " MiB) failed: err=" + std::to_string(merr) +
@@ -4795,8 +4806,10 @@ private:
                   size_t want) {
     static constexpr size_t kGrain = size_t(64) << 20;
     /** Below this a chunk holds too few weights to be worth an arena slot,
-     *  and the DSP's table is not unbounded. */
-    static constexpr size_t kFloor = size_t(64) << 20;
+     *  and the DSP's table is not unbounded. [#132 Part B E5g] 16 MiB (was
+     *  64): the tail of the MoE arena, ~112 MiB above 14 x 256, may have
+     *  to go in pieces on a boot whose last 256 MiB window is taken. */
+    static constexpr size_t kFloor = size_t(16) << 20;
 
     size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
     size = std::min(std::max(size, kGrain), cap);
@@ -4907,6 +4920,9 @@ private:
   std::string arena_fail_;
   /** Largest chunk still worth asking for; only ever shrinks. */
   size_t chunk_cap_ = kArenaChunkMax;
+  /** [#132 Part B E5g] The last refused chunk's buffer, freed after the
+   *  next one is allocated (tryChunkOn). */
+  std::unique_ptr<HtpRpcBuffer> last_failed_;
 
   // Deliberately never fastrpc_munmap'd: the DSP's close() puts every arena
   // back, and the kernel reclaims the ION buffers at process exit. The
