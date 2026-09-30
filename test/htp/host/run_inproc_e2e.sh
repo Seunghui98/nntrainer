@@ -616,6 +616,18 @@ if [ "$n" = $((STEPS - 1)) ] && [ "$(dec_field "$OUT/gself.log" source)" = self 
 else
   echo "E2E FAIL ppl-decode self vs forced (steps=$n)"; fail=1
 fi
+# [#194] NNTR_PPL_DECODE_ALTS=16,23: the forced run's step lines gain
+# alts=16:<logit>,23:<logit> and are otherwise the same; 16 is the greedy
+# pick at every step here, so its logit is the larger (the index is right)
+NNTR_PPL_DECODE="$OUT/g.ids" NNTR_PPL_DECODE_ALTS=16,23 \
+  run_e2e run-alts "$OUT/htp" htp "$OUT/dump_galts" "$OUT/galts.log" --run > /dev/null
+n_alts="$(dec_steps "$OUT/galts.log" | awk '$NF ~ /^alts=16:[^,]*,23:/ {split(substr($NF, 6), a, "[:,]"); n += (a[2] + 0 >= a[4] + 0)} END {print n + 0}')"
+if [ "$n_alts" = $((STEPS - 1)) ] &&
+  [ "$(dec_steps "$OUT/galts.log" | sed 's/ alts=.*//')" = "$(dec_steps "$OUT/gforced.log")" ]; then
+  echo "E2E ppl-decode alts steps=$n_alts ok"
+else
+  echo "E2E FAIL ppl-decode alts (steps with alts, 16 >= 23: $n_alts)"; fail=1
+fi
 run_gen="$(grep '^E2E gen ' "$OUT/gself.log")"
 same=$(paste <(tr ' ' '\n' <<< "$htp_gen") <(tr ' ' '\n' <<< "$run_gen") |
   tail -n +3 | awk '$1==$2{n++} END{print n+0}')

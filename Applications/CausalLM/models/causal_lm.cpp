@@ -32,6 +32,8 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -479,6 +481,26 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       }
     }
   }
+  // [#194] NNTR_PPL_DECODE_ALTS=<id,...> (at most 8, with NNTR_PPL_DECODE):
+  // each step line also prints those ids' logits (the 40-question multiple
+  // choice of plan 194 P3 reads the four answer letters); off by default,
+  // never set in a tok/s run.
+  std::vector<unsigned int> ppl_alts;
+  if (const char *a = std::getenv("NNTR_PPL_DECODE_ALTS")) {
+    std::stringstream ss(a);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      char *end = nullptr;
+      const unsigned long id = std::strtoul(tok.c_str(), &end, 10);
+      if (tok.empty() || *end != '\0' || id >= NUM_VOCAB ||
+          ppl_alts.size() == 8)
+        throw std::invalid_argument(
+          std::string("NNTR_PPL_DECODE_ALTS: want at most 8 comma-separated "
+                      "ids below the vocab size: ") +
+          a);
+      ppl_alts.push_back(static_cast<unsigned int>(id));
+    }
+  }
 
   /**
    * INPUT PREPARATION
@@ -784,8 +806,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       ppl_dec_nll += nll;
       ++ppl_dec_n;
       ppl_dec_top1 += top1 == target;
-      std::fprintf(stderr, "[PPL] decode step=%u target=%u nll=%.17g top1=%u\n",
-                   ppl_dec_n, target, nll, top1);
+      std::string alts;
+      for (size_t i = 0; i < ppl_alts.size(); ++i) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s%u:%.9g",
+                      i ? "," : " alts=", ppl_alts[i],
+                      output_interval[0][ppl_alts[i]]);
+        alts += buf;
+      }
+      std::fprintf(stderr,
+                   "[PPL] decode step=%u target=%u nll=%.17g top1=%u%s\n",
+                   ppl_dec_n, target, nll, top1, alts.c_str());
       if (ppl_forced)
         ids_list[0] = target;
       else
