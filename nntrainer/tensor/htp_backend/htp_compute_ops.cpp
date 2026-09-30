@@ -1129,6 +1129,14 @@ public:
    *  session may already be closed. The expert prefetch readers (doc 52)
    *  are stopped first. */
   ~HtpComputeOps() override {
+    if (pool_srv_) { // [plan 201 S1] idle between tokens: nothing in flight
+      {
+        std::lock_guard<std::mutex> lock(pool_srv_->mu);
+        pool_srv_->stop = true;
+      }
+      pool_srv_->cv.notify_all();
+      pool_srv_->th.join();
+    }
     {
       std::lock_guard<std::mutex> lock(prefetch_mutex_);
       prefetch_stop_ = true;
@@ -1423,11 +1431,26 @@ public:
       // null scale) is resident only until the ARM's LRU evicts it, and
       // the per-token entry would keep reading its handle after that
       if (std::find(gate_up_scale.begin(), gate_up_scale.end(), nullptr) !=
-          gate_up_scale.end())
-        throw std::runtime_error(
-          "NNTR_HTP_FORWARD / NNTR_HTP_E2E with NNTR_MOE_CACHE_EXPERTS: the "
-          "expert pool is not inside the per-token entry yet (plan 201 S1); "
-          "unset one of them");
+          gate_up_scale.end()) {
+        // [plan 201 S1] with NNTR_HTP_E2E=1 the token driver serves the
+        // misses (poolServe) and the tables follow the pool at the next
+        // token (poolSync); these calls (the prefill's) stay per layer
+        if (!e2e_)
+          throw std::runtime_error(
+            "NNTR_HTP_FORWARD with NNTR_MOE_CACHE_EXPERTS: the expert pool "
+            "is served only by the two-session token (NNTR_HTP_E2E=1)");
+        {
+          std::lock_guard<std::mutex> lock(graph_mutex_);
+          // the layers hand their experts at their first calls, in order:
+          // once all have, decode's rows go to the token entry
+          if (pool_descs_.size() == moe_ops_.size())
+            moe_bound_ = moe_ops_.size();
+          pool_dirty_ = true;
+        }
+        invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight,
+                       act, out, M, K, inter, N_out);
+        return;
+      }
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
       // [#132] A sole MOE stretch runs here; with ADD resident the stretch
       // is [MOE ADD RMSNORM] and the next layer's norm hook runs it, so a
@@ -2180,6 +2203,264 @@ public:
     moe_op_by_handle_.emplace(h_gu[0], idx);
     ++moe_bound_;
     return idx;
+  }
+
+  /** [plan 201 S1] compute_ops.h: a MoE layer's experts, layer order. */
+  void set_decode_moe_experts(const std::vector<ExpertFileDesc> &all,
+                              const ExpertPoolFn &pool) override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    const uint32_t m = static_cast<uint32_t>(pool_descs_.size());
+    for (uint32_t e = 0; e < all.size(); ++e)
+      pool_where_[all[e].key_gu] = {m, e};
+    pool_descs_.push_back(all);
+    pool_fn_ = pool;
+  }
+
+  /** [plan 201 S1] Re-sends S1's EXPERTS tables when a prefill touched the
+   *  pool since the last token: each expert's pair as the ARM files it
+   *  (handle_cache_), HTP_GRAPH_NO_HANDLE for one the pool does not hold. */
+  void poolSync() {
+    if (!pool_dirty_)
+      return;
+    E2eState &e = *e2e_st_;
+    if (pool_descs_.size() != moe_ops_.size())
+      throw std::runtime_error(
+        "token driver: " + std::to_string(pool_descs_.size()) +
+        " MoE layers gave their experts (set_decode_moe_experts), the list "
+        "has " +
+        std::to_string(moe_ops_.size()));
+    std::vector<std::vector<float>> tabs(pool_descs_.size());
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      for (size_t m = 0; m < pool_descs_.size(); ++m) {
+        const std::vector<ExpertFileDesc> &d = pool_descs_[m];
+        if (d.size() != graphOp(moe_ops_[m])->n_experts)
+          throw std::runtime_error(
+            "token driver: MoE layer " + std::to_string(m) + " gave " +
+            std::to_string(d.size()) + " experts, its op has " +
+            std::to_string(graphOp(moe_ops_[m])->n_experts));
+        tabs[m].resize(2 * d.size());
+        for (size_t x = 0; x < d.size(); ++x) {
+          auto g = handle_cache_.find(d[x].key_gu);
+          auto h = handle_cache_.find(d[x].key_dn);
+          const bool in = g != handle_cache_.end() && h != handle_cache_.end();
+          const uint32_t hg = in ? g->second : kNoHandle;
+          const uint32_t hd = in ? h->second : kNoHandle;
+          std::memcpy(&tabs[m][x], &hg, 4);
+          std::memcpy(&tabs[m][d.size() + x], &hd, 4);
+        }
+      }
+    }
+    for (size_t m = 0; m < tabs.size(); ++m)
+      setParam(e.h1, moe_ops_[m], HTP_GRAPH_PARAM_EXPERTS, tabs[m].data(),
+               static_cast<unsigned>(tabs[m].size()),
+               static_cast<unsigned>(tabs[m].size()), "EXPERTS");
+    pool_dirty_ = false;
+  }
+
+  /** [plan 201 S1] Files the last answer's loads under the pairs S1 wrote
+   *  back after its rebinds (called once S1 has moved past that answer:
+   *  at its next request, or when the token is done). */
+  void poolHarvest(uint8_t *page) {
+    PoolServer &p = *pool_srv_;
+    const volatile htp_miss_ans *a =
+      reinterpret_cast<const volatile htp_miss_ans *>(page + HTP_MBOX_MISS_ANS);
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    std::exception_ptr first;
+    for (size_t i = 0; i < p.pending.size(); ++i) {
+      const uint32_t hg = a->load[i].h_gu, hd = a->load[i].h_dn;
+      if (hg == kNoHandle || hd == kNoHandle) { // S1's rebind failed
+        free_expert_slots_.push_back(p.pending[i].slot);
+        if (!first)
+          first = std::make_exception_ptr(
+            std::runtime_error("token driver: S1 did not rebind a pool load"));
+        continue;
+      }
+      fileRegistered(p.pending[i], hg, hd);
+    }
+    p.pending.clear();
+    if (first)
+      std::rethrow_exception(first);
+  }
+
+  /** [plan 201 S1] One miss request of S1 (protocol P-A): the layer's
+   *  policy picks the victims (never a routed expert) and names the loads,
+   *  each load is read into a free slot -- the victim's, with its pair --
+   *  and the answer names both; S1 rebinds the pairs and fills them in. */
+  void poolAnswer(uint8_t *page, const htp_miss_req &r) {
+    PoolServer &p = *pool_srv_;
+    htp_miss_ans a;
+    std::memset(&a, 0, sizeof(a));
+    a.rc = AEE_SUCCESS;
+    const uint64_t t0 = HtpProfile::nowUs();
+    try {
+      poolHarvest(page);
+      const auto it = std::find(moe_ops_.begin(), moe_ops_.end(), r.op);
+      if (it == moe_ops_.end() || r.n_routed > HTP_MBOX_MISS_MAX ||
+          r.n_miss > r.n_routed)
+        throw std::runtime_error("token driver: a miss request for op " +
+                                 std::to_string(r.op) + " is malformed");
+      const std::vector<ExpertFileDesc> &d = pool_descs_[it - moe_ops_.begin()];
+      std::vector<const void *> need, loads;
+      for (uint32_t i = 0; i < r.n_routed; ++i) {
+        if (r.routed[i] >= d.size())
+          throw std::runtime_error("token driver: routed expert out of range");
+        need.push_back(d[r.routed[i]].key_gu);
+      }
+      pool_fn_(
+        need, [&](const void *k) { loads.push_back(k); },
+        [&](const void *k) {
+          const std::pair<uint32_t, uint32_t> w = pool_where_.at(k);
+          if (a.n_evict == HTP_MBOX_MISS_MAX || !release_qs4cx_wh_expert(k))
+            throw std::runtime_error("token driver: the pool evicted an "
+                                     "expert it does not hold");
+          a.evict[a.n_evict][0] = moe_ops_[w.first];
+          a.evict[a.n_evict++][1] = w.second;
+        });
+      // the ARM's pool and S1's table must agree on what is missing
+      bool same = loads.size() == r.n_miss;
+      for (uint32_t i = 0; same && i < r.n_miss; ++i)
+        same = std::find(loads.begin(), loads.end(), d[r.miss[i]].key_gu) !=
+               loads.end();
+      if (!same)
+        throw std::runtime_error(
+          "token driver: S1 misses " + std::to_string(r.n_miss) +
+          " experts, the pool loads " + std::to_string(loads.size()));
+      const remote_handle64 session =
+        static_cast<remote_handle64>(HtpBackend::global().handle());
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      for (uint32_t i = 0; i < r.n_miss; ++i) {
+        const ExpertFileDesc &x = d[r.miss[i]];
+        StagedExpert st = stageExpert(session, x);
+        st.rc = readExpert(st, /*use_pool=*/true);
+        if (st.rc != 0) {
+          free_expert_slots_.push_back(st.slot);
+          throwPread(st.rc, "expert weight (miss)");
+        }
+        htp_miss_load &l = a.load[a.n_load++];
+        l.e = r.miss[i];
+        l.old_gu = st.slot.h_gu;
+        l.old_dn = st.slot.h_dn;
+        l.arena = arena_chunks_[st.slot.chunk].dsp_id;
+        l.off_gu = st.gu.off;
+        l.off_dn = st.dn.off;
+        l.h_gu = l.h_dn = kNoHandle;
+        p.pending.push_back(st);
+      }
+    } catch (...) {
+      if (!p.err)
+        p.err = std::current_exception();
+      a.rc = AEE_EBADSTATE; // S1 fails the token now, not after its window
+      a.n_load = 0;
+    }
+    const uint64_t read_us = HtpProfile::nowUs() - t0;
+    e2e_st_->pool_read_us += read_us;
+    e2e_st_->pool_rounds += 1;
+    if (HtpProfile::global().level() != 0 && a.n_load != 0)
+      HtpProfile::global().addExpertLoad(read_us, 0, a.n_load);
+    // the body, then seq last: S1 reads seq, then the rest
+    a.seq2 = r.seq;
+    uint8_t *dst = page + HTP_MBOX_MISS_ANS;
+    std::memcpy(dst + 4, reinterpret_cast<const uint8_t *>(&a) + 4,
+                sizeof(a) - 4);
+    std::atomic_thread_fence(std::memory_order_release);
+    *reinterpret_cast<volatile uint32_t *>(dst) = r.seq;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
+
+  /** [plan 201 S1] The pool server: a thread that, while a token is in
+   *  flight, polls the page's request word and answers each miss round.
+   *  ponytail: it spins (with a yield) on one ARM core for the whole token,
+   *  ~20 ms at LFM's rate, whether or not a miss comes; a sleep between
+   *  polls is the upgrade if S2's reading says the core is wanted. */
+  void poolServe() {
+    PoolServer &p = *pool_srv_;
+    uint8_t *page = e2e_st_->mbox->data();
+    const volatile htp_miss_req *q =
+      reinterpret_cast<const volatile htp_miss_req *>(page + HTP_MBOX_MISS_REQ);
+    for (;;) {
+      uint32_t tok;
+      {
+        std::unique_lock<std::mutex> lock(p.mu);
+        p.idle = true;
+        p.cv.notify_all();
+        p.cv.wait(lock, [&p] { return p.active.load() || p.stop; });
+        if (p.stop)
+          return;
+        p.idle = false;
+        tok = p.tok;
+      }
+      for (uint32_t k = 0; k < 255u;) {
+        const uint32_t seq = tok * 256u + k + 1u; // hexkl_token_seq
+        if (q->seq == seq) {
+          std::atomic_thread_fence(std::memory_order_acquire);
+          htp_miss_req r;
+          std::memcpy(&r, const_cast<const htp_miss_req *>(q), sizeof(r));
+          if (r.seq2 == seq) {
+            poolAnswer(page, r);
+            ++k;
+            continue;
+          }
+        }
+        if (!p.active.load())
+          break;
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  /** [plan 201 S1] Around one token: arm the server, then disarm it once
+   *  both sessions answered, file the last loads and refresh the pool's
+   *  recency from S1's routed sets. */
+  void poolArm(uint32_t tok) {
+    if (!pool_srv_) {
+      pool_srv_ = std::make_unique<PoolServer>();
+      pool_srv_->th = std::thread([this] { poolServe(); });
+    }
+    std::lock_guard<std::mutex> lock(pool_srv_->mu);
+    pool_srv_->tok = tok;
+    pool_srv_->active = true;
+    pool_srv_->cv.notify_all();
+  }
+  void poolDisarm() {
+    PoolServer &p = *pool_srv_;
+    {
+      std::unique_lock<std::mutex> lock(p.mu);
+      p.active = false;
+      p.cv.wait(lock, [&p] { return p.idle; });
+    }
+    poolHarvest(e2e_st_->mbox->data());
+    if (p.err) {
+      std::exception_ptr err = p.err;
+      p.err = nullptr;
+      std::rethrow_exception(err);
+    }
+  }
+  void poolRefresh(const htp_dspq_token_resp &s1r) {
+    size_t at = 0;
+    for (size_t m = 0; m < pool_descs_.size() && at < s1r.route_n; ++m) {
+      const uint32_t n = s1r.route[at++];
+      std::vector<const void *> need;
+      {
+        // a later layer's miss may have evicted an earlier layer's routed
+        // expert within the token: only the resident ones are touched
+        std::lock_guard<std::mutex> lock(handle_mutex_);
+        for (uint32_t i = 0; i < n && at < s1r.route_n; ++i) {
+          const void *k = pool_descs_[m].at(s1r.route[at++]).key_gu;
+          if (experts_.count(k) != 0)
+            need.push_back(k);
+        }
+      }
+      pool_fn_(
+        need,
+        [](const void *) {
+          throw std::logic_error("token driver: a routed expert is not in "
+                                 "the pool after its token");
+        },
+        [](const void *) {
+          throw std::logic_error("token driver: the pool's refresh evicted");
+        });
+    }
   }
 
   void ensureGraphInit(remote_handle64 session) {
@@ -3865,6 +4146,16 @@ private:
         static_cast<double>(e.hop1_us) / n, static_cast<double>(e.hop2_us) / n,
         static_cast<double>(e.fwd_us) / n, static_cast<double>(e.arm_us) / an,
         (unsigned long long)e.arm_n);
+      if (e.pool_rounds != 0 || e.misses != 0)
+        std::fprintf(
+          stderr,
+          "[HTP] token driver: pool misses=%llu misses/token=%.2f "
+          "miss_wait_us/token=%.1f rounds=%llu arm_ms/round=%.3f\n",
+          (unsigned long long)e.misses, static_cast<double>(e.misses) / n,
+          static_cast<double>(e.miss_us) / n, (unsigned long long)e.pool_rounds,
+          e.pool_rounds
+            ? static_cast<double>(e.pool_read_us) / 1000.0 / e.pool_rounds
+            : 0.0);
       std::fprintf(stderr,
                    "[HTP] token driver: close tokens=%llu hops/token=%.2f "
                    "s1_served=%u s2_served=%u timeouts=%u/%u stale=%u/%u "
@@ -3985,9 +4276,13 @@ private:
                static_cast<unsigned>(ban_.size()), "LM_BAN");
       ban_sent_ = ban_;
     }
+    if (!pool_descs_.empty())
+      poolSync(); // [plan 201 S1]
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     std::memcpy(q2.act->data(), act, act_bytes);
     const uint32_t tok = e.tok++;
+    if (!pool_descs_.empty())
+      poolArm(tok);
     const htp_dspq_token_req r1 = {HTP_DSPQ_OP_TOKEN, tok, 0u, pos};
     const htp_dspq_token_req r2 = {HTP_DSPQ_OP_TOKEN, tok,
                                    logits ? HTP_DSPQ_TOKEN_LOGITS : 0u, pos};
@@ -4025,6 +4320,8 @@ private:
     }
     const uint64_t us = HtpProfile::nowUs() - t0;
     const uint32_t c2 = sysCounterUs(); // after both reads: S1 answered first
+    if (!pool_descs_.empty())
+      poolDisarm(); // S1 answered (or the token failed): no round in flight
     const int cb = q1.cb_err.load() != 0 ? q1.cb_err.load() : q2.cb_err.load();
     if (err != AEE_SUCCESS || cb != 0 || len2 != sizeof(s2r) ||
         len1 != sizeof(s1r) || s2r.seq != tok || s1r.seq != tok ||
@@ -4068,6 +4365,10 @@ private:
       have_id_ = true;
     }
     ++e.tokens;
+    e.misses += s1r.misses;
+    e.miss_us += s1r.miss_us;
+    if (!pool_descs_.empty())
+      poolRefresh(s1r);
     e.hops += s2r.hops;
     e.wait1_us += s1r.wait_us;
     e.wait2_us += s2r.wait_us;
@@ -5965,6 +6266,14 @@ private:
   /** [plan 201 S1] per MoE op (moe_ops_ order) its EXPERTS table as the
    *  f32 words graph_set_param carries: h_gu[0..E) then h_dn[0..E) */
   std::vector<std::vector<float>> moe_tables_;
+  /** [plan 201 S1] The expert pool behind the per-token entry
+   *  (set_decode_moe_experts): per MoE layer its experts, where each
+   *  gate_up key sits (layer, expert), the layer's policy, and whether a
+   *  prefill touched the pool since the last token (poolSync). */
+  std::vector<std::vector<ExpertFileDesc>> pool_descs_;
+  std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
+  ExpertPoolFn pool_fn_;
+  bool pool_dirty_ = true;
   bool graph_inited_ = false;
   bool graph_short_warned_ = false;
   // [#130] The stretch tables of section 3.2: per op the maximal resident
@@ -6041,10 +6350,27 @@ private:
     int64_t disp1_us = 0, disp2_us = 0, ret2_us = 0, inout2_us = 0;
     uint64_t kind1[HTP_OP_KIND_N] = {0}, kind2[HTP_OP_KIND_N] = {0};
     uint32_t rounds = 0, spin_us = 0;
+    /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
+     *  rounds served and the ARM's time on them */
+    uint64_t misses = 0, miss_us = 0, pool_rounds = 0, pool_read_us = 0;
   };
   /** @brief The mailbox page: HEXKL_MBOX_BYTES (16 896) rounded to the
    *  #178 probe's 64 KiB. */
   static constexpr size_t kMboxBytes = size_t(64) << 10;
+  /** [plan 201 S1] poolServe's thread and its handshake with tokenForward:
+   *  active while a token is in flight, idle once the thread stopped
+   *  polling; the loads of the last answer until S1 fills their pairs. */
+  struct PoolServer {
+    std::thread th;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> active{false};
+    bool stop = false, idle = false;
+    uint32_t tok = 0;
+    std::vector<StagedExpert> pending;
+    std::exception_ptr err;
+  };
+  std::unique_ptr<PoolServer> pool_srv_;
   bool e2e_ = false; /**< NNTR_HTP_E2E=1 and a description set */
   std::shared_ptr<E2eState> e2e_st_;
   bool q4m1_bound_ = false; /**< the Q4M1 weights registered at load (E3) */
