@@ -693,32 +693,16 @@ TEST(nntrainer_cpu_backend_standalone, wh_pack_unpacks_like_the_load_path) {
   }
 
   // And the packing is reversible: every value lands where whSlot says, so
-  // reading it back gives the weight again.
+  // reading it back gives the weight again. whUnpack is that read, and the
+  // reference path NNTR_MOE_DIFF dequantizes a whole expert through it, so
+  // the round trip is what says those reference values mean anything.
   std::vector<uint8_t> wh(nntrainer::whBytes(K, N));
   nntrainer::whPack(rm.data(), K, N, wh.data());
   EXPECT_EQ(wh.size(), nibble_bytes);
 
-  const unsigned int n_tiles = N / nntrainer::WH_TILE;
-  size_t bad = 0;
-  for (unsigned int kt = 0; kt < K / nntrainer::WH_TILE; ++kt) {
-    for (unsigned int nt = 0; nt < n_tiles; ++nt) {
-      const uint8_t *tile =
-        wh.data() +
-        (static_cast<size_t>(kt) * n_tiles + nt) * nntrainer::WH_TILE_BYTES;
-      for (unsigned int r = 0; r < nntrainer::WH_TILE; ++r) {
-        for (unsigned int c = 0; c < nntrainer::WH_TILE; ++c) {
-          const unsigned int sl = nntrainer::whSlot(r, c);
-          const uint8_t nib = (tile[sl / 2] >> (4 * (sl % 2))) & 0x0Fu;
-          const int8_t got =
-            static_cast<int8_t>(nib > 7 ? (int)nib - 16 : (int)nib);
-          if (got != rm[static_cast<size_t>(kt * nntrainer::WH_TILE + r) * N +
-                        nt * nntrainer::WH_TILE + c])
-            ++bad;
-        }
-      }
-    }
-  }
-  EXPECT_EQ(bad, 0u) << "whPack and whSlot disagree about where values go";
+  std::vector<int8_t> back(static_cast<size_t>(K) * N);
+  nntrainer::whUnpack(wh.data(), K, N, back.data());
+  EXPECT_EQ(back, rm) << "whPack and whUnpack disagree about where values go";
 }
 
 /**
