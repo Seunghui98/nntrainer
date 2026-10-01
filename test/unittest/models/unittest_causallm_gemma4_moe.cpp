@@ -114,6 +114,7 @@ causallm::json makeTinyGemma4MoeConfig() {
        {"sliding_window", 4},
        {"tie_word_embeddings", true},
        {"top_k_experts", 2},
+       {"use_bidirectional_attention", "vision"},
        {"vocab_size", 32},
        {"vocab_size_per_layer_input", 32},
      }},
