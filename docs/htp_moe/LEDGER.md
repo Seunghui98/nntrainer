@@ -667,6 +667,33 @@ p0), #137 (`needs-plan`, p2), #110 (`needs-plan`, `needs-user`, parked),
 #76 (tracker, still titled "htp_moe tracker"). Queue: **#201 (plan) →
 the rest waits for the re-plan.**
 
+**Cycle 27 (seen 2026-10-01): PR head unchanged at `f923bf29`** (`gh pr
+view 4327 --json headRefOid,updatedAt`: `f923bf29…`, `updatedAt`
+2026-09-30 05:24 UTC, as in cycle 26). Nothing to decide upstream.
+
+On our side (cycle 27, 2026-10-01; base `htp_decode` @ `53f38aabf`, PRs
+#202 / #203 open onto it, #205 merged `bb8c6d06`, #206 open = #204's S26
+port): **#201's three device sittings and #207's farm sitting folded**
+(§2 #201 row; rule 59; ㉜ ㉝; BENCHMARK Results ×4 + Method cycle 27).
+Verdict: **one PD with the expert pool inside the per-token E2E entry
+(Q28) beats two PDs with the same pool and all-resident E0 on both S25
+units, at A's bits** — `R3CY10WM83Y` 43 / 36 / 31 tok/s (G ≤ 512; G = 1024
+not run, the unit was withdrawn for the S26) and the device-farm unit
+`R3CY205ZMND` 40–47 / 33–39 / 29–32 (G 64 / 512 / 1024; another session,
+whole sitting re-run from a set rebuilt at `a2ebef9c9`, logs on that
+machine); C = 28 is the one-PD pool (C = 29 same speed, C = 30 does not
+load). Still 7–13 tok/s under A (50–57): no row of record moves, the S25
+"now" is frozen (unit withdrawn), #208 opens the S26 column. Policy rows
+(user, 2026-09-30 / 10-01): agents run adb on `htp_decode` (`dc1898239`);
+the S25 is withdrawn, the S26 (v81) replaces it (plan 201 §4.1
+`0d7efb00a`); #204's port is PR #206 (`state:needs-measurement`); #207
+(S25 farm, `state:measured` → folded here) and #208 (S26 farm,
+`state:needs-measurement`) are the device-farm sittings. Issue state after
+the fold: #201 `state:review` (PRs #202 / #203 open), #207 done by this
+fold (to close `completed`), #204 / #208 wait for the farm S26. Open:
+sitting 2's prefill column is not in the comment (gate not read on that
+unit), the pool-28 miss cost (㉜), the farm unit's LEAK rate (㉝).
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
@@ -1510,6 +1537,44 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     the silicon reading decides, and any lever whose ISS gain is a
     memory-side effect is read on silicon before it is planned around.
 
+59. **One PD beats two PDs for the resident FC set, and a pool-28 miss
+    costs ≈ 3.5 ms where a pool-16 / -24 miss costs 0.5–0.7** (#201 S2
+    one-PD sittings 1 and 2, `R3CY10WM83Y` 2026-10-01 09:43 and
+    `R3CY205ZMND` 11:00, plus the two-PD sitting 2026-09-30 22:18). (a)
+    With the FC set + lm_head on S1's arena beside a 28-expert pool
+    (`NNTR_HTP_E2E_PDS=1`), FC + DENSE_FFN + LM_HEAD read 9.2 ms a token
+    `feed=vtcm` against 11.6–13.1 on the VTCM-less S2, the 44 hops
+    (≈ 0.33 ms each side) and the second wall go, `rt` 22.4 against 26.6
+    (P28) / 30.6 (E0) ms: +6–9 tok/s over two PDs, +12–14 over E0, on
+    both units, every text == A. #178's projection for a second session
+    (45–46 tok/s) was the two-PD shape; the one-PD shape is what plan 201
+    §3.4 asked for and it is the better of the two. The pool is capped by
+    the PD's address space: C = 29 is the largest that loads beside the
+    448 MiB FC set on the S25, C = 30 fails `fastrpc_mmap(32 MiB)`; C = 29
+    gives fewer misses (0.12–0.23 a token at G ≥ 512 vs 0.17–0.34) but the
+    same speed, so **C = 28 is the one-PD pool**. The FC set's ≈ 1.1 ms
+    over #178's isolated 8.06 and the MoE round's 10.5 ms (0.48 a layer)
+    are what is left between Q28 (≈ 22–23 ms a token) and A (≈ 18–21).
+    (b) Against reasoning: a miss on the 28-pool reads **3.45 ms** (one
+    PD, farm unit, profiled: 121 misses / 417 ms) and **3.79** (two PDs,
+    `R3CY10WM83Y`) against 0.72 (C = 24) / 0.53 (C = 16), with the model
+    file 95–100 % page-cache resident and the profiled prefetch reading
+    88 / 88 experts ahead with 0.0 ms exposed wait — page-cache residency
+    and the prefetch do not explain it; the bigger ION arena (3.3 GB) and
+    the reader threads' placement are the next reads (㉜). At G ≥ 512 the
+    28-pool misses 0.12–0.34 a token, so the cost is 0.1–1.1 ms a token,
+    not the lever's ceiling. (c) Per unit, per boot, no cause: the farm
+    unit stopped twice on the S1 ceiling 3584 (after a two-PD G = 512 r1
+    on a 7.8-day-uptime boot and after the profiled run, both runs having
+    closed clean, `chunks unmapped 13/13`), `R3CY10WM83Y` once across the
+    three #201 sittings (two-PD, after `E0_G512_r1`, also a first boot) —
+    read it before any S26 sitting plans its reboots (㉝). (d) The two
+    units are not one column: ≈ 7 % apart in DSP clock by the farm
+    session's reading (rule 34's band), yet Q28 at G = 512 read higher on
+    the slower unit (44.7–46.7 vs 42.4–43.4) — the one-PD cell's spread
+    across boots and prefill ramps is larger than the unit gap; read each
+    sitting against its own A only.
+
 ## 2. Verdicts (measured, closed)
 
 | item | verdict | source |
@@ -1570,6 +1635,7 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | **#132 Part B: the two-session NPU end-to-end decode on silicon — E5 / E5b / E5c / E5e / E5d (`htp/132-partb-e3` `10bb91b7` → `7cf87794`, shadow branch `dev/e2e-shadow-132`; `R3CY10WM83Y`, 2026-09-30 06:13–09:2x, five reboot-bracketed sets; decision D = (1) + (2), plan PR #186)** | **Mechanism: pass** — once S1's arena is mapped before S2 opens (rule 54; E5 died at `mapped=3584`), the path loads (S2 open 24 ms, attach 383.6 MiB, load 685 ms, startup +343 ms) and runs every token at **`calls/token=1.00`, 44 hops**, no timeouts, no leak. **Accuracy: E5b failed** (E ≠ A from decode step 5–26 on 8/8 prompts with every G=8 check and every shadowed op equal — not folded as a result), **E5c located it** (S and Ev leave A at the same conv-layer row, L13 / L17, with every shadow equal), **E5e passes**: CONV1D_GATE in the CPU's fused tap order (`fma(w2, s0, fma(w1, s1, w0·g))`, scalar `sffma` taps) → S and Ev bit-identical over 64 steps on prompt512 and korean, every shadow equal incl. conv 1152/1152 (rule 55). **Speed: E5b 16.7 / 16.0 / 15.2 tok/s** (the 1000 µs hop-wait spin starving the other PD, rule 56) → **E5d spin 0: 20.8 / 19.5 at G 64 / 512**, text ≡ A; per kind (G=64) S1 MoE 9.67 ms (at the isolated 0.44 ms/round) + router 0.79, S2 FC 8.75 + DENSE_FFN 5.60 + LM_HEAD 5.97 + ATTN_M1 8.33 (pre-#170 kernel) + small ≈ 1.2, ARM token 44.7 ms. **Verdict: a lever row far under A (53.5–55 / 54.4–54.8 / 52.4–52.9), not a default; the issue continues** — rebase onto `htp_moe` (ATTN_M1 round 3 ≈ −7 ms), the HVX quantizer / SwiGLU / argmax in the graph kernels and per-shape lanes (FC / FFN / lm_head 20.3 → ≈ 11 ms), then set_e5f; projected ≈ 25 ms/token ≈ 40 tok/s before the FC-loop work, against the plan's 47–51 (the FC loop toward 57 GB/s is the missing term). Track 2 (VTCM share) stopped: the MoE prefill layout needs ≥ 6720 KiB (caps 6656 / 5888 → `AEE_ENOMEMORY`), S2 gets ≤ 0.95 MiB → a ≤ 3-lane VTCM feed slower than L2 (≈ 15 vs 8.06 ms/token) | issue #132 comments (E5b, E5c, E5e / E5d, track 2); `132-part-b-e2e.md` (branch); `132/set_e5*/logs/` |
 | **Record sitting 2026-09-30: cool-start A control for the row of record (`record-2026-09-30-cool-a.md`; `R3CY10WM83Y`, 02:48–02:53 KST, `htp_moe` @ `90d88e2b`, device dir `s170r2q`, nothing set, A twice per G, each G block at zone0 ≤ 35 °C)** | **The "now" moves to 53.97 / 52.16 / 51.41** (r1 / r2 53.51 / 54.42, 54.75 / 49.56, 51.54 / 51.29; prefill 574.0 / 482.1, 542.4 / 526.2, 579.8 / 426.0; zone0 after 59.0 / 55.2, 62.1 / 62.9, 64.5 / 65.6 °C; text r1 = r2; banners `applied=0x703e1 … dma_bypass=1 source=default`, `dspq` close `bad=0`). Decode ≥ 50 at all three G on a cool start; #158 B's 51.82 / 50.61 / 47.36 is kept as the warm-start reading (+4.1 / +3.1 / +8.6 % cool over warm), so the goal holds under the stated condition and rule 52 is the row's condition, not an open question. Not a lever. | `record-2026-09-30-cool-a.md`, BENCHMARK Goals + Method (record-sitting paragraph), contract §1 |
 | **Record sitting 2026-09-30, CPU `q40` control on the same unit (02:58–03:03 KST, `R3CY10WM83Y`, same app set, model bin `d28f55c5…` = #78's, config 512 / [124900] / no-sample for the sitting, `htp=0`, cool start per G 31.6 / 32.8 / 33.6 °C, two runs)** | **CPU 52.18 / 51.31 / 50.12** (52.03 / 52.33, 51.74 / 50.87, 50.49 / 49.75; prefill 348 / 332, 338 / 318, 337 / 280; text r1 = r2) — the first CPU cell on this unit, −0.5 / +4.2 / +3.7 % vs `R3CY205ZMND`'s #94 s2. **Read against the NPU cool row (53.97 / 52.16 / 51.41): NPU above the CPU by +3.4 / +1.7 / +2.6 % under the same protocol on the same unit — the contract's "above the CPU" clause is met on `R3CY10WM83Y`, narrowly** (the G=512 margin, 0.85 tok/s, is inside one run's spread; the CPU itself clears 50 at every G cool). | `record-2026-09-30-cool-a.md`, BENCHMARK Goals (both decode rows), contract §1 |
+| **#201 S2, one PD (Q28 / Q29 = P28 + `NNTR_HTP_E2E_PDS=1`) against two PDs (P28), E0 and A — sitting 1 `R3CY10WM83Y` (2026-10-01 09:43–09:58, G 64 / 512, set `f5e8b1648`, 22 runs, no stop) and sitting 2 `R3CY205ZMND` (device farm, #207, 10:57–11:22, G 64 / 512 / 1024, set rebuilt at `a2ebef9c9`, 32 runs, two LEAK stops, three boots; tables from the issue comment, logs on that machine); with S0 (hybrid pool, 21:42) and the two-PD sitting (22:18) of 2026-09-30 on `R3CY10WM83Y`** | **One PD wins, bit-identical, on both units; still under A.** Q28 **42.98 / 43.13, 43.40 / 42.44** (G 64 / 512) vs P28 36.72 / 35.81, 36.67 / 34.13 vs E0 30.51 / 30.46, 30.79 / 30.66 vs A 56.74 / 54.51, 48.45 / 54.23 on `R3CY10WM83Y`; **40.48 / 40.97, 44.68 / 46.74, 45.11 / 45.20** vs P28 33.16 / 32.94, 35.37 / 39.07, 36.75 / 35.89 vs E0 29.30 / 30.09, 31.23 / 32.31, 31.02 / 30.92 vs A 54.61 / 54.65, 51.81 / 56.11, 51.82 / 50.30 on the farm unit (G 64 / 512 / 1024); Q29 = Q28 within spread with fewer misses; every text == A r1 of its G (20 / 20, 30 / 30; S0 30 / 30, two-PD 28 / 28). Mechanism: FC set on S1's VTCM 9.2 ms vs 11.6–13.1 on S2, no hops, `rt` 22.4 vs 26.6 / 30.6 (rule 59 a). Two-PD sitting: the pool beats all-resident E0 by the server spin's wake-up effect (L0 by accident, ≈ −4.5 ms a token), P32 35.6 vs E0 30.3–30.8. S0: the pool on the hybrid path F28 ≈ A (54.9 / 53.5 / 54.4 vs 57.3 / 55.4 / 54.9), F16w −20 %, cold 12–13. Pool-28 miss 3.45 / 3.79 ms on the two units, unexplained (rule 59 b, ㉜); LEAK 2 in 32 (farm) vs 1 across three sittings (㉝). Prefill: sitting 1 and two-PD inside −5 % on the means; sitting 2's column not in the comment. **No row of record** (lever on open PR #203, under A, second unit); the next structural read is the MoE round (10.5 ms) and the FC set's 1.1 ms over isolated, on the S26 (#204 / #208) | `201-one-pd.md` §Sitting 1 / §Sitting 2, `201-fsu-e2e.md`, `201-pool-baseline.md` (all on `htp/201-pool-miss-path`); issue #207 comment 2026-10-01; `201/s0/`, `201/s2/logs/`, `201/s3/logs/` (sitting 1) |
 ## 3. Open items (candidates for issues; the supervisor promotes them)
 
 | # | item | expected | depends on |
@@ -1605,6 +1671,8 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | ㉙ | **CLOSED (cycle 23): #162 closed by the user after step 0 and the prefetch A/B (§2 #162 row, rule 51) — neither lever pays; G=1024 ≥ 50 belongs to the end-to-end track (PR #169) and, on the hybrid default, to rule 52 (cool A cells read 50.9–52.4 at G=1024, the row of record 47.36 waits for a mirrored cool sitting).** **Filed as #162 (p1, `state:needs-plan`, cycle 22).** G=1024 is the one length below the goal after #158: **47.36 tok/s = 21.11 ms/token, −1.1 ms needed**, bit-preserving. Candidates: (a) CPU attention (`mha_core`) 1.97 ms/token at G=1024 (1.47 at G=512), heads independent, the fp16 NEON reduction order kept as `152-resident-accuracy.md` documents it; (b) the #90 prefetch overlap (S = 4 MiB, +0.7–1.4 ms/token on the L2 path) — re-read on the bypass default first (rule 44 (2)). Gate: G=1024 ≥ 50 against the sitting's A (bypass default), dumps `bit_identical=1`, nll equal, text ≡ A 8/8, prefill ≥ −5 % | decode goal at G=1024 | rules 44, 46 |
 | ㉚ | **Decided (user, 2026-09-30): option (1) + (2)** — Part B as the two-session design (S1 = router + MoE, S2 = the rest, one call per session per token, shared-page hops), bit-preserving; (2) the VTCM-share probe, stopped on the host finding (MoE prefill layout ≥ 6720 KiB; S2 ≤ 0.95 MiB; ≤ 3-lane VTCM feed slower than L2) — S2's FC stays L2-fed. Status in ㉓ and the §2 #132 Part B row; #178 = PR #183 re-target; #192 (single-session window) not viable. The hybrid stays the default until the E2E path is faster and bit-identical (20.8 vs ≈ 54 today). **Decision for the user (cycle 23), after #132 Part A and #178:** the FC set + lm_head (383 MiB, 402 MB/token) is the term that decides the decode NPU end-to-end path. Measured: exact FC on the DSP VTCM-fed 7.88 ms/token (S1, but S1 has 113 MiB free), L2-fed in a second session 8.06 (S2 has 0 VTCM), the CPU 7.4; the two-session path projects ≈ 45–46 tok/s against the hybrid's 50.6–54. Options: (a) build the two-session E2E plan anyway (needs an HVX quantizer, an HVX CPU-exact router, and either VTCM for S2 or an L2 feed at the K=2048 rate for K=7168 ≈ −1 ms); (c) of #132 (keep the FCs on the CPU, one call per token only for the DSP-resident kinds — the hybrid stays the product path); or the §3.5 fallback. Until decided, #132 and #178 stay `needs-user`; the implementer's queue is #170 round 3 | decides whether the end-to-end track continues past ATTN_M1 | user |
 | ㉛ | **Filed as #197 (p2, `state:needs-plan`, cycle 25), after PR #191.** The S26 M=1 decode MoE call after #185 is 427.1 µs `dsp`/call (DQ) against ≈ 346 µs of transfer at 62 GB/s over 4 queues: C(2) and C(3) move no bytes (≈ 38 µs/call DMA-idle) and GU(0)'s remainder after QUANT is exposed (`DMA_FIRST` 50 µs). Next rung named by #185's `ponytail:`: a third down slot in the arena's spare ≈ 0.9 MiB (half a down) or a row-split of one down over two jobs, each with its own host proof (dataflow / submit-lane scoreboards + a negative). Gate on #197: `dsp` ≤ A − 20 µs/call, decode ≥ A and ≥ S25 #158 B at every G, bit-identical, prefill ≥ −5 %. Only the S26 (v81) benefits — on the S25 one queue is the bypass ceiling (rule 43) | ≈ −20..−38 µs/call ≈ +4..8 % S26 decode | #185, #177, rule 43 |
+| ㉜ | **Pool-28 miss cost ≈ 3.5–3.8 ms a miss on two S25 units (rule 59 b)** against 0.5–0.7 at C = 16 / 24, page cache 95–100 % resident, prefetch 88 / 88 ahead. Candidates: the 3.3 GB ION arena's page placement (the 28-pool's swap target is a different chunk set), the reader threads' core placement under the server spin, the per-miss rebind. Read with the pool server's per-stage timers on one profiled Q28 G = 64 run (read / swap / rebind split) before any pool-size decision on the S26; at G ≥ 512 it is 0.1–1.1 ms a token, so p2 unless the S26's pool is smaller | the miss's split names the stage; if read-bound, a per-chunk read order or a larger read unit | S26 bring-up (#204 / #208) |
+| ㉝ | **S1 ceiling 3584 (LEAK) stops: 2 in 32 runs on the farm S25 `R3CY205ZMND` vs 1 across three sittings (≈ 94 runs) on `R3CY10WM83Y`** (rule 59 c); all four known cases on a boot's first G = 512 r1 or a profiled run, the stopped runs themselves closed clean. Per unit, per boot, no cause. Not a lever; a runner fact: the S26 sittings keep the reboot-and-resume rule and log uptime at every stop. Read `ceiling.txt` + the `.logcat` of the farm's two stops (on that machine) for the mapping that stays | which PD / process holds the 256 MiB after a clean close | farm session's logs |
 
 ## 3a. Guide and tooling notes
 
