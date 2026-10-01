@@ -179,7 +179,7 @@ sets everything below; agents put that line first in every shell.
 | Host build | `build/` (`meson setup build -Denable-transformer=true -Denable-tflite-backbone=false -Denable-tflite-interpreter=false`; no `flatc` here) | host gtests, `nntr_quantize_stream`, `run_host_checks.sh` |
 | Models | `/local/mnt/workspace/models/lfm2.5-8b-a1b/{hf,fp32,q40,q40-qs4cx-wh}` (§11) | `NNTR_MODEL_DIR` |
 | clang-format-14 | `~/.local/bin/clang-format-14` | AGENTS.md rule, changed lines only |
-| adb | `/usr/bin/adb` | **agents never run it** |
+| adb | `/usr/bin/adb` | **agents run the device sittings themselves** (user, 2026-09-30, from #201 on): always `adb -s <serial>` with the serial the issue or the user names (no default), a handoff doc is still written as the record, text approval stays the user's (§12) |
 
 **No Hexagon simulator in this project** (user decision 2026-09-21). Kernel
 correctness is decided by host scalar specs and bit-identity checks (gate 1)
@@ -193,10 +193,12 @@ Galaxy S25 Ultra — **any unit** (user decision 2026-09-22; two units,
 records the serial that ran (`adb devices`), BENCHMARK.md tags every row
 with it, and results are compared only inside one sitting (A/B); when two
 sittings happen to share a unit the same-unit drift is noted (LEDGER
-rule 13). Agents never touch the phone. A task that needs
-silicon numbers ends in a **measurement handoff**
-(`docs/measurements/<issue#>-<slug>.md`, template in
-`.claude/skills/hexagon-handoff`) that the user runs in one sitting.
+rule 13). A task that needs silicon numbers ends in a **measurement
+handoff** (`docs/measurements/<issue#>-<slug>.md`, template in
+`.claude/skills/hexagon-handoff`) run in one sitting — by the agent on
+`htp_decode` (§4.1 adb row, 2026-09-30), by the user before that. Since
+2026-10-01 the unit is a Galaxy S26 Ultra (v81 skel, #204); its serial is
+given by the user when attached.
 
 Handoff rules (user decisions Q3, Q13, Q18, Q19):
 
@@ -357,6 +359,7 @@ recorded in BENCHMARK.md's artifact section once built.
 
 | date | decision |
 |---|---|
+| 2026-10-01 | **The S26 Ultra replaces the S25 for `htp_decode`; agents run adb (user, 2026-09-30 / 10-01).** The S26 stack (#168 ELF-arch guard, #177 `NNTR_MOE_DMA_QUEUES`, #185 DQ schedule; 7 code commits, not C3 / DQR) is ported onto `htp_decode` by #204, so `htp_decode` builds the v81 skel (`HEX_ARCH=v81`, `ARCH OK (V81)`); the queue default stays 1. From #201 on, agents run the device sittings with `adb -s <serial>` (the §4.1 row; this replaces the 2026-09-29 `htp_moe_v81`-only exception), keep the handoff as the record (reboot, cool start, md5s, stop rules), and leave text approval to the user. The S25 rows (`R3CY10WM83Y`) stay that device's column |
 | 2026-09-30 | **New base branch `htp_decode` (user, re-plan of the project).** Cut from `htp_first_version` @ `d4a898430` and pushed to `origin`: `htp_moe` + #132 Part B (the two-session E2E) + upstream nntrainer/nntrainer#4383 @ `5a84c05d` (MoE expert streaming from flash, "FSU") + upstream #4343 @ `50ed1916` (fp16 KV attention) + upstream main @ `aad932ce` + plan 194 and the E1 commits of #194. Purpose: review the whole decode-side NPU end-to-end structure (the `NNTR_HTP_E2E` path) with FSU in the tree and optimize it; references named by the user: upstream PR #4296 (Gemma 4 on the CPU), QNN, T-MAN. Wherever §5, §6 and §10 say `htp_moe` as the docs / PR target, read `htp_decode`. The tracks are runtime switches (`NNTR_HTP_E2E`, `NNTR_HTP_PPL_LEVERS`), not branches: `htp_moe_ppl` and `htp_moe_v81` are retired (the L0–L4 levers stay on `htp/194-s3`, the S26 stack on `htp/168` / `177` / `185` / `187-*`, kept as local `archive/*` tags), and lever / S26 work does not continue until re-planned. First item: #201 (`state:needs-plan`, p0), whose first deliverable is a plan (structure review → measured per-stage breakdown → ranked levers). Speed target, accuracy rule, FSU control, prefill gate and device scope for this base are **not decided** — #201 lists them as open questions |
 | 2026-09-29 | **Decode NPU end-to-end is the main track (user).** Every decode op moves to the HTP, the per-token entry ends at one call per token (no CPU round trips), and kernels are optimized to reach ≥ 50 tok/s at gen 64 / 512 / 1024, with the bit-preserving rule unchanged (text ≡ the switch-off run; every resident kind bit-identical to the Android CPU path, verified per op with a CPU-vs-HTP shadow on the same input; a passing PPL with a new repetition loop is a failure, LEDGER rule 45). The 2026-09-28 row's "not extended" is lifted for the resident path under this rule. Order: (1) RMSNORM / QK_NORM bit-identical (#164, verified on silicon 2026-09-29: 392/392 rows, 1920/1920 heads, logits == A), (2) the M=1 FCs, router, final norm + lm_head bit-identical (#132 PR 2), (3) one call per token (#132), (4) the bit-identical ATTN_M1 made fast (≈ 1.4 ms/layer on silicon vs ≈ 0.15 needed), (5) the small kernels (norm ≈ 0.4 ms/token on the DSP vs 0.1 on the CPU). The CPU-hybrid default stays the product path until the end-to-end path is faster and bit-identical; hybrid-only levers (#162 prefetch) are secondary. Same day: the user asked for a review (not a build) of splitting the four decode experts two on the CPU / two on the NPU (#157, PR #161 `NNTR_MOE_HTP_SPLIT=k`) |
 | 2026-09-29 | **Targets after rule 42 (bytes per token ≈ 886 MB): (a) + (b).** (a) bit-preserving levers as decided on 2026-09-28 (#150 next); (b) CPU + DSP reading weights concurrently to raise the aggregate bandwidth — first measure whether the two readers add up on this phone (#90, raised to p1; HeteroLLM, SOSP 2025, reports one processor 40–45 GB/s and GPU+NPU ≈ 60 GB/s on Snapdragon 8 Gen 3), and under the bit-preserving rule only as overlapped reads (the CPU prefetching the next layer's weights while the DSP runs the MoE), not as split arithmetic. (c) (fewer bytes / non-bit-identical paths) is not opened yet: the user is willing to accept changed text if the outputs stay sensible (no meta sentences, no repetition loops) but wants the accuracy of such paths improved first. Same day: PR #148 (#146, ATTN_M1 O1 + O3) merged; the resident path stays off by default |

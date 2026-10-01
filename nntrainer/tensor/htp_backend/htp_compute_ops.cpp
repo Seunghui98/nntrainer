@@ -195,7 +195,8 @@ enum {
   HTP_MOE_T_DMA_FIRST_READY_US,
   HTP_MOE_T_DMA_LAST_ISSUE_US,
   HTP_MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
-  HTP_MOE_T_M1_FEED, /**< NOT us: 1 = the GEMV read VTCM fed by DMA (#117) */
+  HTP_MOE_T_M1_FEED, /**< NOT us: the DMA queues the VTCM feed used (#117:
+                          1; #177: 1..4), 0 = the GEMV read the arena */
   HTP_MOE_N_STAGES
 };
 
@@ -435,6 +436,7 @@ public:
       b.dma_last_issue_us += stage_us[HTP_MOE_T_DMA_LAST_ISSUE_US];
       b.m1_calls += (stage_us[HTP_MOE_T_PATH] != 0u) ? 1u : 0u;
       b.m1_feed_calls += (stage_us[HTP_MOE_T_M1_FEED] != 0u) ? 1u : 0u;
+      b.m1_feed_q_sum += stage_us[HTP_MOE_T_M1_FEED];
     }
   }
 
@@ -537,6 +539,9 @@ private:
     uint64_t misses = 0;
     uint64_t miss_read_us = 0;
     uint64_t miss_rpc_us = 0;
+    /** Their DMA queue counts, summed (#177): dmaq= is this over
+        m1_feed_calls, the queues the feed really used. */
+    uint64_t m1_feed_q_sum = 0;
     uint64_t host_us = 0;
     uint64_t dsp_us = 0;
     uint64_t quant_us = 0;
@@ -740,7 +745,7 @@ private:
           "dequant %.1f acc %.1f drain %.1f+%.1f push %.1f "
           "scatter %.1f alloc %.1f "
           "stage %.1f mm %.1f | rest<=%.1f (%.1f%% of host) "
-          "blocks=%llu m1_gemv=%llu/%llu feed=%llu/%llu]",
+          "blocks=%llu m1_gemv=%llu/%llu feed=%llu/%llu dmaq=%.2f]",
           dsp_per, host_per > 0.0 ? 100.0 * dsp_per / host_per : 0.0,
           host_per - dsp_per, quant_per, gather_per, requant_per,
           hidden ? "(hidden)" : "", swiglu_per, dequant_per, acc_per, drain_per,
@@ -748,7 +753,10 @@ private:
           mm_meas_per, mm_per, host_per > 0.0 ? 100.0 * mm_per / host_per : 0.0,
           (unsigned long long)b.blocks, (unsigned long long)b.m1_calls,
           (unsigned long long)b.calls, (unsigned long long)b.m1_feed_calls,
-          (unsigned long long)b.calls);
+          (unsigned long long)b.calls,
+          b.m1_feed_calls != 0
+            ? static_cast<double>(b.m1_feed_q_sum) / b.m1_feed_calls
+            : 0.0);
       }
       if (level_ >= 2 && b.calls != 0 && b.dma_first_us != 0) {
         // The first weight wait happens with an empty ring, so it times a
@@ -2258,9 +2266,20 @@ public:
       const char *lead_env = std::getenv("NNTR_MOE_HTP_GEMV_LEAD_KB");
       const char *rows1_env = std::getenv("NNTR_MOE_HTP_GEMV_ROWS1");
       const char *feed_env = std::getenv("NNTR_MOE_HTP_GEMV_FEED");
+      // #177: the M=1 feed's DMA queue count. A value other than 1..4 is
+      // a mistyped variant, and running it as the default would measure
+      // the reference under the variant's name, so it throws.
+      const char *queues_env = std::getenv("NNTR_MOE_DMA_QUEUES");
+      uint32_t queue_bits = 0;
+      if (htp_moe_opts_dma_queues(queues_env, &queue_bits) != 0) {
+        throw std::runtime_error(std::string("NNTR_MOE_DMA_QUEUES=") +
+                                 queues_env +
+                                 " is not one of 1, 2, 3, 4 (unset = 1)");
+      }
       const uint32_t flags =
         htp_moe_opts_flags(env, lead_env, rows1_env, feed_env) |
-        htp_moe_opts_dma_bypass(std::getenv("NNTR_MOE_DMA_BYPASS"));
+        htp_moe_opts_dma_bypass(std::getenv("NNTR_MOE_DMA_BYPASS")) |
+        queue_bits;
       const char *source = env != nullptr ? "env" : "default";
       uint32_t applied = 0;
       const int err = nntr_hvx_moe_set_opts(session, flags, &applied);
@@ -2300,13 +2319,14 @@ public:
       std::fprintf(
         stderr,
         "[HTP] moe m1 gemv: %s (applied=0x%x) lead=%uKB rows1=%u "
-        "feed=%s dma_bypass=%u source=%s\n",
+        "feed=%s dma_bypass=%u dma_q=%u source=%s\n",
         (flags & HTP_MOE_FLAG_M1_GEMV) != 0u ? "on" : "off", applied,
         ((flags >> HTP_MOE_GEMV_LEAD_SHIFT) & HTP_MOE_GEMV_LEAD_BITS) *
           HTP_MOE_GEMV_LEAD_KB_UNIT,
         (flags & HTP_MOE_FLAG_GEMV_ROWS1) != 0u ? 1u : 0u,
         htp_moe_opts_feed_name(flags),
-        (applied & HTP_MOE_FLAG_DMA_BYPASS) != 0u ? 1u : 0u, source);
+        (applied & HTP_MOE_FLAG_DMA_BYPASS) != 0u ? 1u : 0u,
+        htp_moe_opts_dma_q(applied), source);
     });
   }
 

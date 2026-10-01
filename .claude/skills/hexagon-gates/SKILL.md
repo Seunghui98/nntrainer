@@ -83,12 +83,16 @@ a device gtest second.
 
 ```
 ./test/htp/build.sh                       # v79; HEXKL_ROOT / HEXKL_SDK_VER from env.sh
+HEX_ARCH=v81 ./test/htp/build.sh          # v81 (S26 Ultra); or export before sourcing env.sh
 md5sum test/htp/build/libnntr_hvx_skel.so
 ```
 Pass: `test/htp/build/libnntr_hvx_skel.so` exists, `-Wall -Werror` clean,
 and `build.sh` printed `UNDEFINED SYMBOLS OK (<n> runtime imports)` (a
 project symbol left out of `SRCS` links fine and fails on the device with
-`0x80000406`, #97; the guard prints the offending names and exits 1).
+`0x80000406`, #97; the guard prints the offending names and exits 1) and
+`ARCH OK (V79)` / `ARCH OK (V81)` (the ELF flags match `HEX_ARCH`; both
+arches write the same file name, #168). On `htp_decode` a change to the
+DSP sources passes this rung for both arches.
 `build.sh` regenerates the FastRPC stub/skel from `test/htp/nntr_hvx.idl`;
 when the IDL changed, the host side must be rebuilt too (rung 1 and 3),
 or the device fails with `AEE_EBADPARM (0x8000040E)`. Variants:
@@ -151,9 +155,12 @@ Fresh checkout or new `git worktree` (the #105 sitting's rebuild lost
   point at another package.
 A handoff's rebuild recipe lists these four lines.
 
-## 4. Device (user only)
+## 4. Device
 
-Never run here. Write a handoff (`hexagon-handoff` skill), set
+On `htp_decode` the agent runs the sitting itself (contract §4.1 adb row,
+user 2026-09-30): `adb -s <serial>` with the serial the issue or the user
+names, never a default; the handoff (`hexagon-handoff` skill) is still
+written first and filled as the record. Elsewhere: write the handoff, set
 `state:needs-measurement`, stop. Performance conclusions are drawn only
 from filled handoff tables read as an A/B inside one sitting.
 
