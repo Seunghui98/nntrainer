@@ -292,18 +292,20 @@ public:
   // so the implementation registers them as they are instead of converting
   // and baking. It is a flag rather than a colsum pointer because the sums
   // sit immediately after the scales and the callee already knows N.
+  //
+  // gelu says the gated activation between gate_up and down is
+  // gelu_tanh(g)*u (Gemma-4) rather than silu(g)*u (LFM2).
   virtual bool supports_gemm_qs4cx_moe_layer_fp32() const { return false; }
-  virtual void
-  gemm_qs4cx_moe_layer_fp32(const std::vector<void *> &gate_up_data,
-                            const std::vector<float *> &gate_up_scale,
-                            const std::vector<void *> &down_data,
-                            const std::vector<float *> &down_scale,
-                            const std::vector<unsigned int> &row_index,
-                            const std::vector<unsigned int> &row_count,
-                            const std::vector<float> &row_weight,
-                            const float *act, float *out, unsigned int M,
-                            unsigned int K, unsigned int inter,
-                            unsigned int N_out, bool weights_wh);
+  virtual void gemm_qs4cx_moe_layer_fp32(
+    const std::vector<void *> &gate_up_data,
+    const std::vector<float *> &gate_up_scale,
+    const std::vector<void *> &down_data,
+    const std::vector<float *> &down_scale,
+    const std::vector<unsigned int> &row_index,
+    const std::vector<unsigned int> &row_count,
+    const std::vector<float> &row_weight, const float *act, float *out,
+    unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
+    bool weights_wh, bool gelu = false);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate
