@@ -348,6 +348,14 @@ S25 is withdrawn and the S26 (v81) replaces it (plan 201 §4.1
 (the farm S26 re-baseline, `state:needs-measurement`) are the device-farm
 sittings. Upstream #4327 unchanged at `f923bf29`.
 
+**#211 (2026-10-01, code, no sitting yet): the E0 / P<C> variants are
+retired.** The two-PD E2E path was removed (user, contract §12); from here
+an NPU E2E row is one PD, variant letter **Q<C>** (`NNTR_HTP_E2E=1
+NNTR_MOE_CACHE_EXPERTS=<C>`). All-resident E0 no longer loads on the 8B
+(3696 MiB of experts + 448 of FC set > the PD's 3840; the load error names
+`NNTR_MOE_CACHE_EXPERTS`); the E0 / P cells above stay as history, and
+`NNTR_HTP_E2E_PDS` other than 1 is refused at load (LEDGER §3a).
+
 ## Goals
 
 | goal | now | target | ceiling | status |
