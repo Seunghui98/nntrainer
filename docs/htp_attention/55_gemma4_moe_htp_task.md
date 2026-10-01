@@ -235,3 +235,9 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 교훈 하나: 처음 참조를 교과서 tanh 형으로 쓰자 u8 재양자화 뒤 2개 원소가 9e-5 어긋났다 — 44의 L2와 같은 메커니즘. 참조는 커널과 같은 식으로, 항등식은 양자화 전에 따로 본다.
 - ponytail: ARM NEON GeGLU 없음(CPU expert는 x86 참조 전용). dense FFN(Phase 4)의 HTP 경로는 아직 silu 고정(`invokeMoeLayer` kind=1에 glu=0).
 
+### 10.4 첫 기기 실행 (2026-10-01): 돌아가지만 출력이 깨짐 — CPU 그래프는 HF와 일치
+
+- 기기(S25 Ultra, V79): C=5, `gemma4-26b-a4b-qs4cx-wh`(12,336 MiB). 로드·아레나·prefill·decode 모두 **돌아간다**(skel·stub 재빌드 뒤; 처음엔 옛 skel로 `AEE_EBADPARM`, 그다음 `use_bidirectional_attention: "vision"` 문자열 파싱 예외 → 3fde104로 수정). 토크나이저가 LFM2 것이어서 한 번 깨졌고(`<|startoftext|>`), Gemma 토크나이저·`<bos><|turn>` 템플릿으로 바꾼 뒤에도 **출력은 무의미한 토큰**("SAH TEL X.A RE…"). 긴 프롬프트(약 1000토큰 + 256 생성)에서는 "Creating shared tensor of size bigger than tensor memory"로 죽음(1024 경계 의심, 별도).
+- 호스트에서 가른 것: tiny Gemma4-MoE(26B 형상: 128→4 expert, top-2, K==V, global kv 2, per-layer input 0)를 transformers 5.18.0으로 돌린 HF 참조와 nntrainer 그래프가 **FP32에서 일치**(`Gemma4MoeDifferentialTest`, 06862c3). 즉 router·expert·norm 접기·K==V·가중치 파일 순서·변환기·양자화기 순서는 맞다. 깨진 출력의 원인은 **기기 쪽**이다: (a) HTP MoE 커널의 GeGLU 에필로그 또는 Gemma 형상(K 2816, inter 704)에서의 커널 동작, (b) ARM 커널(attention head 512·GQA 8, Q4_0 ARM 레이아웃)의 이 형상 처리, (c) QS4CX_WH 파일 자체. 다음 판정 수단: 기기 gtest `HvxSwigluDet.GegluMatchesScalarBitExact`(GeGLU HVX 비트 일치), PC x86 Q4_0 CPU 실행(ARM/HTP 무관 참조).
+- 부수 발견: x86 AVX2 rotary 커널의 fp16 꼬리 저장이 head_dim 8(half 4)에서 8 lane을 써 16폭 KV cache의 마지막 행을 넘친다(tiny fixture는 `max_seq_len` 16으로 회피; 실제 head_dim은 16의 배수라 꼬리를 안 탄다). `NetworkGraph::getTensor`의 `unordered_map::at` 예외는 잡혀서 무해.
+
