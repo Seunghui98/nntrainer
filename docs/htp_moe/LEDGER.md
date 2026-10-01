@@ -720,6 +720,30 @@ being written as the next issue). Issue state: #208 → verdict row in §2
 ("E2E runs on v81; optimization deferred"), to close `completed`; #204
 closes with it (its port, PR #206, is merged).
 
+**Cycle 29 (2026-10-01 evening, base `htp_decode` @ `87cc9c4a4`): the
+#201 S3 probe and its discriminator folded** (`201-s3-probe.md`,
+`201-s3probe-run.sh`, `201-s3disc-run.sh`; `R3CY10WM83Y`, 17:27 and
+17:34 KST, sitting 1's build `a2ebef9c9`, md5 OK both, 20 profiled
+Q28 / Q24 G = 64 runs, every text == sitting 1's `A_G64_r1` 20 / 20,
+ceiling 3840 after every run). **The orchestrator's first reading —
+"reader-core placement decides the miss cost" (Q28_BIG 0.48 ms against
+Q28 4.76) — was wrong**: the implementer's interleaved D / B / P0 × 4
+sitting after a reboot read the big-core pin as slow as the default on
+the first runs and all three settings equal from run 5 on; the readers do
+not run in decode at all (code read). What is left: the slow miss (3.7–5.0
+ms) is a **boot-proximity** effect (uptime ≲ 130 s in both sittings), the
+cause unmeasured; rule 61 (wait ≥ 5 min or a warm-up after a reboot;
+first-run cells flagged, #208's 4.7 ms a candidate), ㉜ rewritten, no
+tok/s row (profiled runs). The S3 "reader cores" lever of plan 201 is not
+applied (no code, no PR). Issues: #201 carried `state:in-progress` and
+`state:review` at once → `state:in-progress` only (S4 slices PRs #213 /
+#214 open, more remain); **the miss-cost cause filed as #216** (p1,
+`state:needs-plan`); #137 stays `needs-plan`
+p2 (device-gtest hygiene, reproduced on v81 in #208, not on the decode
+goal path; PR #212 drops the one test that bricks the developer S26,
+rule 60). Open PRs into `htp_decode`, none reviewed: #212, #213, #214,
+#215 (#211). Upstream PR #4327 is not watched (contract §12).
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
@@ -1611,6 +1635,27 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     cause is not known and was not re-tried. The S25 units and
     `R5KL20NFRCK` ran it.
 
+61. **A boot's first ≈ 2 minutes are not measurement time: the pool
+    miss read (8 `pread` slices into the ION arena, one per pinned core)
+    costs 3.7–5.0 ms a miss at uptime ≲ 130 s and 0.5–1.6 ms afterwards,
+    whatever the knob** (`201-s3-probe.md`, `R3CY10WM83Y` 2026-10-01
+    17:27 / 17:34, two reboots, 20 profiled Q28 / Q24 G = 64 runs, every
+    text == A). Against reasoning: the handoffs' "reboot, then start" put
+    the first runs inside that window, and rule 59 b's 3.5–3.8 vs 0.5–0.7
+    compared a C = 28 cell near a boot with C = 16 / 24 cells that were
+    not. Protocol from here: **after a reboot wait ≥ 5 min, or run one
+    discarded warm-up run, before the first measured run**, and record
+    the uptime on every run line. The first-run cells already in the
+    tables are flagged, not corrected: `201-one-pd.md` sitting 2's
+    `Q28 G = 512 r1` (noted cold) and `prof_Q28` (3.45 ms), the two-PD
+    sitting's 3.79 (`201-fsu-e2e.md`), and #208's `prof_Q28_q4` / `_q1`
+    (4.69 / 3.99 ms on the developer S26) — that unit's "≈ 4.7 ms a miss"
+    is unexplained and boot proximity is a candidate for it. The
+    reader-thread knobs (`NNTR_MOE_PREFETCH_CPUS`, `_READERS`,
+    `NNTR_MOE_PREFETCH=0`) do not move the decode miss (the readers run
+    only in prefill; the miss is the pool server's `parallel_for`); the
+    cause of the slow regime is not measured (㉜, #216).
+
 ## 2. Verdicts (measured, closed)
 
 | item | verdict | source |
@@ -1708,7 +1753,7 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | ㉙ | **CLOSED (cycle 23): #162 closed by the user after step 0 and the prefetch A/B (§2 #162 row, rule 51) — neither lever pays; G=1024 ≥ 50 belongs to the end-to-end track (PR #169) and, on the hybrid default, to rule 52 (cool A cells read 50.9–52.4 at G=1024, the row of record 47.36 waits for a mirrored cool sitting).** **Filed as #162 (p1, `state:needs-plan`, cycle 22).** G=1024 is the one length below the goal after #158: **47.36 tok/s = 21.11 ms/token, −1.1 ms needed**, bit-preserving. Candidates: (a) CPU attention (`mha_core`) 1.97 ms/token at G=1024 (1.47 at G=512), heads independent, the fp16 NEON reduction order kept as `152-resident-accuracy.md` documents it; (b) the #90 prefetch overlap (S = 4 MiB, +0.7–1.4 ms/token on the L2 path) — re-read on the bypass default first (rule 44 (2)). Gate: G=1024 ≥ 50 against the sitting's A (bypass default), dumps `bit_identical=1`, nll equal, text ≡ A 8/8, prefill ≥ −5 % | decode goal at G=1024 | rules 44, 46 |
 | ㉚ | **Decided (user, 2026-09-30): option (1) + (2)** — Part B as the two-session design (S1 = router + MoE, S2 = the rest, one call per session per token, shared-page hops), bit-preserving; (2) the VTCM-share probe, stopped on the host finding (MoE prefill layout ≥ 6720 KiB; S2 ≤ 0.95 MiB; ≤ 3-lane VTCM feed slower than L2) — S2's FC stays L2-fed. Status in ㉓ and the §2 #132 Part B row; #178 = PR #183 re-target; #192 (single-session window) not viable. The hybrid stays the default until the E2E path is faster and bit-identical (20.8 vs ≈ 54 today). **Decision for the user (cycle 23), after #132 Part A and #178:** the FC set + lm_head (383 MiB, 402 MB/token) is the term that decides the decode NPU end-to-end path. Measured: exact FC on the DSP VTCM-fed 7.88 ms/token (S1, but S1 has 113 MiB free), L2-fed in a second session 8.06 (S2 has 0 VTCM), the CPU 7.4; the two-session path projects ≈ 45–46 tok/s against the hybrid's 50.6–54. Options: (a) build the two-session E2E plan anyway (needs an HVX quantizer, an HVX CPU-exact router, and either VTCM for S2 or an L2 feed at the K=2048 rate for K=7168 ≈ −1 ms); (c) of #132 (keep the FCs on the CPU, one call per token only for the DSP-resident kinds — the hybrid stays the product path); or the §3.5 fallback. Until decided, #132 and #178 stay `needs-user`; the implementer's queue is #170 round 3 | decides whether the end-to-end track continues past ATTN_M1 | user |
 | ㉛ | **Filed as #197 (p2, `state:needs-plan`, cycle 25), after PR #191.** The S26 M=1 decode MoE call after #185 is 427.1 µs `dsp`/call (DQ) against ≈ 346 µs of transfer at 62 GB/s over 4 queues: C(2) and C(3) move no bytes (≈ 38 µs/call DMA-idle) and GU(0)'s remainder after QUANT is exposed (`DMA_FIRST` 50 µs). Next rung named by #185's `ponytail:`: a third down slot in the arena's spare ≈ 0.9 MiB (half a down) or a row-split of one down over two jobs, each with its own host proof (dataflow / submit-lane scoreboards + a negative). Gate on #197: `dsp` ≤ A − 20 µs/call, decode ≥ A and ≥ S25 #158 B at every G, bit-identical, prefill ≥ −5 %. Only the S26 (v81) benefits — on the S25 one queue is the bypass ceiling (rule 43) | ≈ −20..−38 µs/call ≈ +4..8 % S26 decode | #185, #177, rule 43 |
-| ㉜ | **Pool-28 miss cost ≈ 3.5–3.8 ms a miss on two S25 units (rule 59 b)** against 0.5–0.7 at C = 16 / 24, page cache 95–100 % resident, prefetch 88 / 88 ahead. Candidates: the 3.3 GB ION arena's page placement (the 28-pool's swap target is a different chunk set), the reader threads' core placement under the server spin, the per-miss rebind. Read with the pool server's per-stage timers on one profiled Q28 G = 64 run (read / swap / rebind split) before any pool-size decision on the S26; at G ≥ 512 it is 0.1–1.1 ms a token, so p2 unless the S26's pool is smaller | the miss's split names the stage; if read-bound, a per-chunk read order or a larger read unit | S26 bring-up (#204 / #208) |
+| ㉜ | **Pool-28 miss cost: a boot-proximity effect with an unmeasured cause (rule 61; `201-s3-probe.md`).** The 3.5–3.8 ms a miss of rule 59 b reads 0.5–1.1 ms on the same build, unit and C = 28 once the boot is ≳ 2 min old, and 3.7–5.0 ms inside the first ≈ 130 s whatever the setting. Ruled out: page cache (`201-fsu-e2e.md`; resident 3948–4116 MiB on fast and slow runs alike), arena / pool size (C = 28 = C = 24 when the boot is old), reader-thread placement (`NNTR_MOE_PREFETCH_CPUS=6,7`, `_READERS=1`, `NNTR_MOE_PREFETCH=0`: the readers run only in prefill). Correlated: uptime at the run (probe runs 1, 2, 4 and disc runs 1–4 slow, every later run fast; one fast run inside the window). Structure under suspicion: a decode miss is the pool server (pinned to core 6, main's pin) running `readWeight`'s `parallel_for` as **8 page-aligned `pread` slices, one per compute worker, hard-pinned one per core (7, 0–5)** — a barrier over all 8 cores, so any one busy core (post-boot services, zram / kswapd after the 4 GB `cat`) stalls the whole miss. Nothing else in the app slows (ARM memcpy 22–26 GB/s, MoE `dsp` 15–16 ms a call, prefill 431–562 in both regimes). Next read (#216, p1, `state:needs-plan`): per-core `/proc/stat` load sampled through a boot's first 5 min beside a Q28 G = 64 run, then the miss read with 2 slices on the big cores and with the slices unpinned, A/B inside one old boot and inside a fresh one. #208's 4.7 ms a miss on the developer S26 is unexplained with this as a candidate. At G ≥ 512 the 28-pool misses 0.12–0.34 a token, so even the slow regime is 0.5–1.7 ms a token there; p1 because every G = 64 pool cell and every first-after-boot cell carries it | per-core load names the core or clears the hypothesis; a 2-slice / unpinned miss read that holds 0.5–1.1 ms inside a boot's first 2 min, or a protocol-only fix (rule 61) | #216 |
 | ㉝ | **S1 ceiling 3584 (LEAK) stops: 2 in 32 runs on the farm S25 `R3CY205ZMND` vs 1 across three sittings (≈ 94 runs) on `R3CY10WM83Y`** (rule 59 c); all four known cases on a boot's first G = 512 r1 or a profiled run, the stopped runs themselves closed clean. Per unit, per boot, no cause. Not a lever; a runner fact: the S26 sittings keep the reboot-and-resume rule and log uptime at every stop. Read `ceiling.txt` + the `.logcat` of the farm's two stops (on that machine) for the mapping that stays | which PD / process holds the 256 MiB after a clean close | farm session's logs |
 
 ## 3a. Guide and tooling notes
