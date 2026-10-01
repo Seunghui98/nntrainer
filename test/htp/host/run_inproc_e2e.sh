@@ -87,45 +87,42 @@
 #                              bit_identical lines above hold with it)
 #   E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED   (head_dim 8:
 #                              no one-call token on the hd8 fixture)
-# and, since #132 Part B E3, the same token on two sessions in this process
-# (NNTR_HTP_E2E=1: S1 the router and the experts, S2 the rest on a lite
-# open with no VTCM, its FC set in an attached arena, the MoE rounds over
-# the mailbox page; one dspqueue packet per session per token). Not the
-# device's two PDs -- one address space, no cache maintenance, no transport
+# and, since #132 Part B E3 (one PD since #211), the one-PD token in this
+# process (NNTR_HTP_E2E=1: every kind, the FC set on S1's arena chunks, the
+# pool's miss rounds on the page; one dspqueue packet a token). Not the
+# device's PD -- one address space, no cache maintenance, no transport
 # time -- but every ARM-side step of the device path:
 #   E2E eval e3==e1-hd64 / -lfm25 ... bit_identical=1  (logits, the Android-
 #                              order E1 run of the same model)
-#   E2E fwd hd64 / lfm25 e3 calls/token=1.00 hops/token=4.00 / 8.00
-#                              timeouts=0/0 id_mismatch=0 ok
+#   E2E fwd hd64 / lfm25 e3 calls/token=1.00 hops/token=0.00
+#                              timeouts=0 id_mismatch=0 unmap_fail=0 ok
 #   E2E tokens e3-run==e1-run-lfm25 8/8 id_only=1      (run(): only the id
 #                              comes back, the CPU takes it)
 #   E2E tokens e3-run==e1-run-lfm25-ban 8/8 id_only=1  (bad_word_ids = the
-#                              token the unbanned run picks: S2's argmax
+#                              token the unbanned run picks: the DSP's argmax
 #                              skips it, LM_BAN, as the CPU's -inf does)
 #   E2E ppl-decode e3==e1-hd64 steps=7 identical=1     (NNTR_PPL_DECODE
 #                              forced on E1's path: the logits come back)
 #   E2E teardown 25off / 25e3 arena chunks unmapped n/n mapped_kib=0
 #                              freed_while_mapped=0  (E5i: the S1 arena
 #                              released on the DSP, then unmapped, before
-#                              the close; one session and two)
-#   E2E arena retry cap=100 refused=2 bit_identical=1  (E5g: a boot whose
+#                              the close; hybrid and E2E)
+#   E2E arena retry cap=200 refused=1 bit_identical=1  (E5g: a boot whose
 #                              last 256 MiB window is taken; the stand-in
-#                              refuses maps past 100 MiB and keeps a refused
-#                              fd, as the driver did; S1's chunk halves to
-#                              64 MiB and the run equals the uncapped one)
+#                              refuses maps past 200 MiB and keeps a refused
+#                              fd, as the driver did; the MoE chunk halves
+#                              to 128 MiB, the FC set's 64 fits beside it
+#                              (#211: one PD holds both), and the run
+#                              equals the uncapped one)
 #   E2E e3 pool C=2 hd64 / C=1 lfm25 / C=2 lfm25 == e3 bit_identical=1
-#                              misses=<n> calls/token=1.00 timeouts=0/0
+#                              misses=<n> calls/token=1.00 timeouts=0
 #                              (plan 201 S1: NNTR_MOE_CACHE_EXPERTS with
-#                              NNTR_HTP_E2E=1, S1's miss rounds served by the
+#                              NNTR_HTP_E2E=1, the miss rounds served by the
 #                              ARM's pool server; logits against the
 #                              all-resident E run of the same fixture)
-#   E2E e3 pds=1 pool C=2 lfm25 == e3 bit_identical=1 ... (one PD, a pool)
-#   E2E e3 pds=1 hd64 / lfm25 == pds=2 bit_identical=1 calls/token=1.00
-#                              hops/token=0.00 timeouts=0/0 unmap_fail=0
-#                              (plan 201 S1:
-#                              NNTR_HTP_E2E_PDS=1, every kind and the FC set
-#                              on S1, one packet a token)
-# and, since #194 S1 (htp_moe_ppl), the same two-session token with lever
+#   E2E e2e pds=2 refused ok   (#211: NNTR_HTP_E2E_PDS is a guard, the
+#                              two-PD path is gone)
+# and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
 #   E2E ppl-decode hd64 levers=0x2 e0=<ppl> l1=<ppl> delta=<%> ok   (|delta|
@@ -135,7 +132,7 @@
 #   E2E eval l1-lfm25 ... min_snr_db=<x>               (x >= 30 gated, vs E0;
 #                              bit_identical=0, else the lever is not wired)
 #   E2E levers banner e0=0x0 l1=0x2 ok
-#   E2E L0 wake split closes: disp s1=.. s2=.. s2_pkt=.. ret s2=.. clk_resid=..
+#   E2E L0 wake split closes: disp=.. pkt=.. ret=.. clk_resid=..
 #   E2E ppl-decode alts steps=7 ok                     (NNTR_PPL_DECODE_ALTS:
 #                              the step lines gain the ids' logits)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
@@ -306,9 +303,9 @@ done
 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS NNTR_HTP_FC_FEED=l2 \
   NNTR_INPROC_X86_Q8=1 \
   run_e2e hd64-e1l2 "$OUT/htp64q" htp "$OUT/dump_64e1l2" "$OUT/64e1l2.log" --max-seq 32
-# [#132 Part B E3] the two-session token (NNTR_HTP_E2E=1; its packets ride
-# dspqueue, so these runs set NNTR_HTP_DSPQ=1)
-echo "== [#132 Part B E3] hd64 / lfm25, NNTR_HTP_E2E=1 (two sessions)"
+# [#132 Part B E3, #211] the one-PD token (NNTR_HTP_E2E=1; its packets
+# ride dspqueue, so these runs set NNTR_HTP_DSPQ=1)
+echo "== [#132 Part B E3] hd64 / lfm25, NNTR_HTP_E2E=1 (one PD)"
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3 "$OUT/htp64q" htp "$OUT/dump_64e3" "$OUT/64e3.log" --max-seq 32
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
@@ -330,7 +327,7 @@ NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KIND
   run_e2e q64-e1ppl "$OUT/htp64q" htp "$OUT/dump_64e1ppl" "$OUT/64e1ppl.log" --max-seq 32 --run
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
-PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=200 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
 # [plan 201 S1] the expert pool (NNTR_MOE_CACHE_EXPERTS) inside the
 # per-token entry: S1's miss rounds served by the ARM's pool server, a pool
@@ -342,16 +339,13 @@ for c in 1 2; do
   PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=$c \
     run_e2e q25-e3pool$c "$OUT/htp25q" htp "$OUT/dump_25e3pool$c" "$OUT/25e3pool$c.log" --max-seq 2048
 done
-# [plan 201 S1] one PD (NNTR_HTP_E2E_PDS=1): every kind, the FC set and the
-# pool in S1, one packet and no hops; against the two-PD E runs, all
-# experts resident and with a pool of half of them
-NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 \
-  run_e2e q64-pd1 "$OUT/htp64q" htp "$OUT/dump_64pd1" "$OUT/64pd1.log" --max-seq 32
-PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 \
-  run_e2e q25-pd1 "$OUT/htp25q" htp "$OUT/dump_25pd1" "$OUT/25pd1.log" --max-seq 2048
-PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 NNTR_MOE_CACHE_EXPERTS=2 \
-  run_e2e q25-pd1pool2 "$OUT/htp25q" htp "$OUT/dump_25pd1pool2" "$OUT/25pd1pool2.log" --max-seq 2048
-# [#194 S1] lever L1 on the same two-session token
+# [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
+rc_pds=0
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
+  --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
+  --moe-engine htp --max-seq 32 > "$OUT/64pds2.log" 2>&1 || rc_pds=$?
+tail -1 "$OUT/64pds2.log"
+# [#194 S1] lever L1 on the same token
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
   run_e2e q64-l1ppl "$OUT/htp64q" htp "$OUT/dump_64l1ppl" "$OUT/64l1ppl.log" --max-seq 32 --run
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
@@ -434,34 +428,25 @@ if [ $rc = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ESCHEMENOTSUPPOR
 else
   echo "E2E FAIL all kinds at head_dim 8 not refused (rc=$rc)"; fail=1
 fi
-for d in "64e3 64e3pool2 hd64 2" "25e3 25e3pool1 lfm25 1" "25e3 25e3pool2 lfm25 2" \
-  "25e3 25pd1pool2 lfm25 2 pds=1"; do
+for d in "64e3 64e3pool2 hd64 2" "25e3 25e3pool1 lfm25 1" "25e3 25e3pool2 lfm25 2"; do
   set -- $d
   ev="$($EVAL --label "e3pool-$3-C$4" "$OUT/dump_$1" "$OUT/dump_$2" | tail -1 || true)"
   calls="$(calls_per_token "$OUT/$2.log")"
   close="$(grep -o 'token driver: close .*' "$OUT/$2.log")"
   misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/$2.log")"
   if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
-     grep -q 'timeouts=0/0 stale=0/0' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
-    echo "E2E e3 ${5:+$5 }pool C=$4 $3 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0/0"
+     grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+    echo "E2E e3 pool C=$4 $3 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
   else
-    echo "E2E FAIL e3 ${5:+$5 }pool C=$4 $3: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+    echo "E2E FAIL e3 pool C=$4 $3: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
   fi
 done
-for d in "64e3 64pd1 hd64" "25e3 25pd1 lfm25"; do
-  set -- $d
-  ev="$($EVAL --label "pd1-$3" "$OUT/dump_$1" "$OUT/dump_$2" | tail -1 || true)"
-  calls="$(calls_per_token "$OUT/$2.log")"
-  close="$(grep -o 'token driver: close .*' "$OUT/$2.log")"
-  if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
-     grep -q 'hops/token=0.00 .* timeouts=0/0 stale=0/0' <<< "$close" &&
-     grep -q 'token driver: on .* pds=1' "$OUT/$2.log" &&
-     grep -q 's2: close .* unmap_fail=0 detach_fail=0 ' "$OUT/$2.log"; then
-    echo "E2E e3 pds=1 $3 == pds=2 bit_identical=1 calls/token=1.00 hops/token=0.00 timeouts=0/0 unmap_fail=0"
-  else
-    echo "E2E FAIL e3 pds=1 $3: [$ev] calls/token=${calls:-none} close=[$close]"; fail=1
-  fi
-done
+if [ $rc_pds = 1 ] &&
+  grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
+  echo "E2E e2e pds=2 refused ok"
+else
+  echo "E2E FAIL NNTR_HTP_E2E_PDS=2 not refused (rc=$rc_pds)"; fail=1
+fi
 # (f) the hd64 fixture: its own golden with the switch off; with it on, 12
 # calls per token, the SNR floor, the token policy, and the init lines
 $EVAL --label golden-hd64 "$GOLDEN64" "$OUT/dump_64off" | tail -1 || fail=1
@@ -558,21 +543,22 @@ done
 grep -q '^\[HTP\] graph: q4m1 weights=12 handles=12 feed=l2$' "$OUT/64e1l2.log" ||
   { echo "E2E FAIL hd64 e1 l2: no feed=l2 line"; fail=1; }
 $EVAL --label e1-feed-l2 "$OUT/dump_64e1" "$OUT/dump_64e1l2" | tail -1 || fail=1
-# (h3) [#132 Part B E3] two sessions: every logit equal to the one-session
-# E1 run (Android order) of the same model, one packet per token, 2 hops
-# per MoE layer, no timeout, S2's argmax equal to the logits' first
-# maximum; run() with only the id back equals E1's run(); the PPL decode
-# step lines (17 digits) equal E1's
-for d in "hd64 64e3 64e1a 4.00" "lfm25 25e3 25e1a 8.00"; do
-  read -r fx tag ref hops <<< "$d"
+# (h3) [#132 Part B E3, #211] one PD: every logit equal to the one-session
+# E1 run (Android order) of the same model, one packet per token, no hop,
+# no timeout, the DSP's argmax equal to the logits' first maximum, nothing
+# left mapped; run() with only the id back equals E1's run(); the PPL
+# decode step lines (17 digits) equal E1's
+for d in "hd64 64e3 64e1a" "lfm25 25e3 25e1a"; do
+  read -r fx tag ref <<< "$d"
   $EVAL --label "e3==e1-$fx" "$OUT/dump_$ref" "$OUT/dump_$tag" | tail -1 || fail=1
   close="$(grep '^\[HTP\] token driver: close ' "$OUT/$tag.log" || true)"
   calls="$(calls_per_token "$OUT/$tag.log")"
-  if [ "$calls" = 1.00 ] && grep -q " hops/token=$hops " <<< "$close" &&
-    grep -q ' timeouts=0/0 stale=0/0 ' <<< "$close" &&
+  if [ "$calls" = 1.00 ] && grep -q " hops/token=0.00 " <<< "$close" &&
+    grep -q ' timeouts=0 stale=0 ' <<< "$close" &&
     grep -q ' id_mismatch=0 ' <<< "$close" &&
-    grep -q '^\[HTP\] s2: fc arena weights=' "$OUT/$tag.log"; then
-    echo "E2E fwd $fx e3 calls/token=$calls hops/token=$hops timeouts=0/0 id_mismatch=0 ok"
+    grep -q '^\[HTP\] e2e: fc arena weights=' "$OUT/$tag.log" &&
+    grep -q '^\[HTP\] e2e: close .* unmap_fail=0 detach_fail=0 ' "$OUT/$tag.log"; then
+    echo "E2E fwd $fx e3 calls/token=$calls hops/token=0.00 timeouts=0 id_mismatch=0 unmap_fail=0 ok"
   else
     echo "E2E FAIL $fx e3: calls/token=${calls:-none} close=[$close]"; fail=1
   fi
@@ -580,7 +566,7 @@ done
 cap_eval="$($EVAL --label e3cap "$OUT/dump_25e3" "$OUT/dump_25e3cap" | tail -1 || true)"
 refused=$(grep -c 'arena: [0-9]* MiB refused' "$OUT/25e3cap.log" || true)
 if grep -q 'bit_identical=1' <<< "$cap_eval" && [ "$refused" -ge 1 ]; then
-  echo "E2E arena retry cap=100 refused=$refused bit_identical=1"
+  echo "E2E arena retry cap=200 refused=$refused bit_identical=1"
 else
   echo "E2E FAIL arena retry under a cap: refused=$refused [$cap_eval]"; fail=1
 fi
@@ -591,8 +577,8 @@ fi
 for t in 25off 25e3; do
   un="$(sed -n 's/.*arena: chunks unmapped \([0-9]*\)\/\([0-9]*\) .*/\1 \2/p' "$OUT/$t.log")"
   ex="$(grep -o 'INPROC rpc exit: .*' "$OUT/$t.log" | head -1)"
-  # the arena goes after the other hooks (E: after S2's close line)
-  late="$(grep -n 'arena: chunks unmapped\|s2: close' "$OUT/$t.log" | tail -1)"
+  # the arena goes after the other hooks (E: after the e2e close line)
+  late="$(grep -n 'arena: chunks unmapped\|e2e: close' "$OUT/$t.log" | tail -1)"
   if read -r a b <<< "$un" && [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" -gt 0 ] &&
     [ "$ex" = "INPROC rpc exit: mapped_kib=0 freed_while_mapped=0" ] &&
     grep -q 'arena: chunks unmapped' <<< "$late"; then
@@ -784,12 +770,13 @@ l1_line="$($EVAL --label l1-lfm25 --allow-diff --snr-floor 30 "$OUT/dump_25e3" "
 echo "$l1_line"
 grep -q 'bit_identical=0' <<< "$l1_line" ||
   { echo "E2E FAIL l1-lfm25 bit-identical to E0: the lever is not wired"; fail=1; }
-# [#194 L0] the wake split closes on one clock: disp + S2's packet time +
-# ret = the ARM's round trip, to within 50 us a token, nothing negative
+# [#194 L0] the wake split closes on one clock: disp + the DSP's packet
+# time + its wall + ret = the ARM's round trip, to within 50 us a token,
+# nothing negative
 wk="$(grep -h 'L0 wake us/token' "$OUT/25e3.log" || true)"
 if awk -v l="$wk" 'BEGIN{n = split(l, f, "[ =]"); ok = n > 0; for (i = 1; i < n; ++i) {
     if (f[i] == "clk_resid") { r = f[i + 1]; if (r < 0) r = -r; ok = ok && r < 50; seen = 1 }
-    if (f[i] == "s1" || f[i] == "s2" || f[i] == "s2_pkt") ok = ok && f[i + 1] + 0 >= 0 }
+    if (f[i] == "disp" || f[i] == "pkt" || f[i] == "ret") ok = ok && f[i + 1] + 0 >= 0 }
     exit !(ok && seen)}'; then
   echo "E2E L0 wake split closes: ${wk#*us/token }"
 else
