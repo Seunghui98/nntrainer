@@ -4,7 +4,9 @@ Branch `htp/201-pool-miss-path` (PR #203); artifacts built from `f5e8b1648`,
 staged at `/local/mnt/workspace/htp_moe/201/s3/`, run by the implementer on
 `R3CY10WM83Y` (user, 2026-09-30: device sittings run directly, S25 only).
 Companion of `201-fsu-e2e.md` (the two-PD half). **Estimated device time:
-≈ 50 min, reboot first.**
+≈ 50 min, reboot first.** Two sittings below: sitting 1 on `R3CY10WM83Y`
+(G 64 / 512; the S25 was withdrawn before G = 1024) and sitting 2 on a
+device-farm unit, `R3CY205ZMND` (issue #207; whole sitting incl. G = 1024).
 
 ## Why
 
@@ -57,7 +59,7 @@ run. Gates: text = A r1 of its G; `calls/token=1.00`; close line
   Re-smoked on silicon 2026-10-01: Q29 `s2: close … unmap_fail=0
   detach_fail=0`, `arena: chunks unmapped 14/14`, ceiling 3840.
 
-## Sitting as read (2026-10-01 09:43–09:58 KST, R3CY10WM83Y)
+## Sitting 1 as read (2026-10-01 09:43–09:58 KST, R3CY10WM83Y)
 
 Rebooted (uptime 75 s), MD5 OK on both ends, no stop, no `BAD` line (77
 `OK` checks), ceiling 3840 MiB after all 22 runs. Each half block started
@@ -77,7 +79,13 @@ G = 64 and 512). Every E / P / Q run: `levers=0x0`, `calls/token=1.00`,
 |---|---|---|---|---|---|
 | 64 | 56.74 / 54.51 | 30.51 / 30.46 | 36.72 / 35.81 | **42.98 / 43.13** | **43.45 / 43.66** |
 | 512 | 48.45 / 54.23 (53.78 / 52.20) | 30.79 / 30.66 | 36.67 / 34.13 | **43.40 / 42.44** (45.36 / 44.48) | **42.40 / 43.51** (43.16 / 44.91) |
-| 1024 | not measured (S25 withdrawn) | not measured | not measured | not measured | not measured |
+| 1024 | — | — | — | — | — |
+
+(G = 1024 was not run on this unit: the S25 was withdrawn. The G = 1024
+row exists only in **sitting 2** below, on `R3CY205ZMND`; the two units
+differ by ≈ 7 % in DSP clock, so that row is a different column from the
+G 64 / 512 rows above and the two tables are kept apart, numbers never
+merged across units.)
 
 Prefill (G = 512, r1 / r2): A 538 / 514, E0 528 / 496, P28 537 / 446, Q28
 501 / 525, Q29 413 / 577; means within −5 % of A's except Q29 r1 (413), a
@@ -110,6 +118,98 @@ P28) and +12–13 over E0, at the same bits.
   set's 1.1 ms over isolated, the misses (≈ 1.1 ms a token at G = 512, less
   at longer G as the pool settles), the small ops (≈ 2.4 ms: attention 0.71,
   router 0.69, conv 0.46, norms 0.33, ADD 0.09).
+
+## Sitting 2 (R3CY205ZMND, device farm, 2026-10-01 10:57–11:22 KST)
+
+Run by another session (issue #207's comment) on a **different S25 unit**:
+`R3CY205ZMND`, SM-S938N / SM8750, build `S938NKSSCCZH2`, over the ADF SSH
+bridge through an `adb` shim. The workstation stage above was not on that
+machine, so the set was **rebuilt from `a2ebef9c9`** (the PR head before
+its rebase; the same sources as this branch) with `201-s3-stage.sh`, and
+the **whole sitting re-run** (G = 64 / 512 / 1024, both halves) rather than
+only the missing G = 1024 block. md5 of the rebuilt ARM set and skel differ
+from the table above (other machine; the skel is not byte-reproducible);
+`libsdkl.so`, `libc++_shared.so`, `page_cache_evict` and `run_s3.sh` match
+it; MD5 OK on both ends on every invocation; skel `v79, hexkl 6.4.0.1`,
+`UNDEFINED SYMBOLS OK (62 runtime imports)`; model pushed fresh, sha256
+equal on phone and workstation (`8396d0ef…`). **The logs are on the farm
+session's machine** (`/local/mnt/workspace/htp_moe/201/s3/logs/` there:
+`sitting.out`, `speed.txt`, `pool.txt`, `extras.txt`, `ceiling.txt`,
+per-run `.log` / `.logcat`; extras runner `run_s3_extras.sh`), not on the
+workstation that holds sitting 1 — the tables below are copied from the
+comment, not re-read from logs. The two units differ by ≈ 7 % in DSP
+clock: **do not compare sitting 2's tok/s against sitting 1's cell by
+cell**; each sitting is read against its own A.
+
+**Gates: every text == A r1 of its G, 30 of 30** (`text=same`); 116 `OK`,
+0 `BAD`, expectation mismatches 0; every E / P / Q run `levers=0x0`,
+`calls/token=1.00`, `timeouts=0/0 stale=0/0 … id_mismatch=0`,
+`hops/token=44.00` (E0, P28) or `0.00` with `pds=1` (Q28, Q29), S2's close
+`unmap_fail=0 detach_fail=0`.
+
+### Decode tok/s (prompt 512; r1 / r2; last 64 in brackets)
+
+| G | A | E0 | P28 | **Q28** | **Q29** |
+|---|---|---|---|---|---|
+| 64 | 54.61 / 54.65 | 29.30 / 30.09 | 33.16 / 32.94 | **40.48 / 40.97** | **40.03 / 41.61** |
+| 512 | 51.81 / 56.11 (50.00 / 51.04) | 31.23 / 32.31 | 35.37 / 39.07 | **44.68 / 46.74** (48.52 / 47.94) | **46.68 / 47.17** (48.34 / 48.34) |
+| **1024** | 51.82 / 50.30 (49.42 / 48.27) | 31.02 / 30.92 | 36.75 / 35.89 | **45.11 / 45.20** (44.02 / 44.63) | **45.31 / 45.32** (44.14 / 44.35) |
+
+* One PD keeps its lead at G = 1024: Q28 +8.4–9.3 tok/s over P28, +14.2
+  over E0, same bits. Over the three G on this unit: one PD + pool
+  40–47, two PDs + pool 33–39, E0 29–32, A 50–56.
+* Q29 = Q28 at G = 1024 (45.3 / 45.2) with fewer misses (0.12 against
+  0.17 a token) — the sitting-1 reading (C = 28 is the one-PD pool) holds.
+* L0 at G = 1024 (r1): Q28 `rt` 21.67 ms (wake 0.19, `arm_us` 0.34), P28
+  26.70.
+
+### Pool lines (misses a token / miss wait µs a token / server ms a round; r1, r2)
+
+| | G 64 | G 512 | G 1024 |
+|---|---|---|---|
+| P28 | 1.89 / 653, 574 / 0.93, 0.85 | 0.34 / 311, 819 / 1.57, 3.38 | 0.17 / 100, 81 / 1.14, 1.01 |
+| Q28 | 1.89 / 516, 537 / 0.79, 0.80 | 0.34 / 1804, 651 / 6.98, 2.76 | 0.17 / 45, 84 / 0.73, 1.01 |
+| Q29 | 1.34 / 614, 382 / 1.07, 0.82 | 0.23 / 715, 602 / 4.42, 3.78 | 0.12 / 31, 32 / 0.75, 0.77 |
+
+(Q28 G = 512 r1 was the first run after a reboot — prefill 347 against
+520–590 — so its 1804 µs / 6.98 ms is a cold cell.)
+
+### Q28 extras at G = 64
+
+The runner at `a2ebef9c9` has no profile / cold cell for Q28; these were
+run as `201-s2-run.sh` ran P16c and the profiles, through `run()` and its
+gates. Both `text=same`, 5 / 5 `OK` each.
+
+| cell | tok/s | misses a token | miss wait a token | server ms a round | read ms a miss |
+|---|---|---|---|---|---|
+| Q28 `NNTR_HTP_PROFILE=2` | 34.32 | 1.89 | 6.03 ms | 4.79 | **3.45** (121 misses, 417 ms) |
+| Q28c cold (`page_cache_evict` every 20 ms) | 35.52 | 1.89 | 6.14 ms | 4.86 | — |
+
+Profiled prefetch: 88 of 88 read before their layer asked, exposed wait
+0.0 ms, 3.24 ms an expert on a reader. The pool-28 miss still reads
+≈ 3.5 ms a miss (3.45 here, one PD; 3.79 in the two-PD sitting on
+`R3CY10WM83Y`, `201-fsu-e2e.md`) against 0.5–0.7 for C = 16 / 24 — now on
+two units, still unexplained (page-cache residency ruled out in the
+two-PD sitting). The profile run's tok/s (34.3) is not a speed cell
+(contract §1.1).
+
+### Read before folding
+
+* **Two LEAK stops.** Ceiling 3584 MiB (`stop=fastrpc_mmap_or_attach:
+  0x00000001`) after `P28_G512_r1` (first boot, uptime 7.8 days, not
+  rebooted before the sitting) and after `prof_Q28` (a fresh boot). Both
+  runs closed clean on their own (`unmap_fail=0 detach_fail=0`, `arena:
+  chunks unmapped 13/13`). Rebooted and resumed each time; every other run
+  left 3840 MiB. Sitting 1 on `R3CY10WM83Y` had none in 22 runs; the
+  two-PD sitting on that unit had one (after `E0_G512_r1`, also on the
+  sitting's first boot); S0 none in 36. No cause; a per-unit, per-boot
+  observation.
+* **Boots are mixed.** Boot 1: G = 64 all, G = 512 A / E0 / P28 r1. Boot
+  2: the rest + `prof_Q28`. Boot 3: Q28c. P28 G = 512 is 35.37 (boot 1)
+  against 39.07 (boot 2): do not read that cell as run-to-run spread.
+* Sitting 2 is one unit throughout, so its A / E0 / P28 / Q28 / Q29
+  columns are read against each other; against sitting 1 only the
+  ordering (Q > P > E0, Q29 ≈ Q28) and the bit identity carry over.
 
 ## Phone-side state, for re-staging on the S26
 
