@@ -107,3 +107,163 @@ peak memory: 3222772 KB
 - **기기 측정은 사용자가 한다.** 한국어 복붙 가이드: 단계별 코드 블록 + 기대 결과 + 실패하면. 실제 경로 사용(`$HOME/workspace/Hexagon_SDK/6.4.0.2`, `$HOME/workspace/hxkl-beta2/hexkl_addon`, `~/workspace/android-ndk-r26d`, 기기 `R3CY10WM83Y`). IDL/DSP 바꾸면 stub·skel·앱 셋 다 재빌드 + skel push.
 - 커밋: `git commit -s`, `[component] 제목`, 한 커밋 한 주제, 바꾼 줄만 clang-format-14(`git clang-format --force HEAD -- <files>`), 커밋 전 `bash test/htp/host/run_host_checks.sh`와 호스트 `unittest_causallm_models`. 모델 이름을 커밋·주석에 쓰지 않는다. push는 `claude/epic-hopper-occf31`에만.
 - 돌려 보지 못한 것은 "기기 미측정"이라고 쓴다. 결과는 55 §10.x에 날짜·조건·표·판정·다음 순서로.
+
+## 9. 복붙 가이드 (2026-10-01) — 재배치한 가중치로 다시 재고, 안 된 부분만 DIFF로 가른다
+
+**먼저 읽을 것: 55 §10.5.** §1~§8이 "기기에서만 도는 코드"를 용의자로 지목했지만, 호스트에서 확정된 원인은 **PC 변환 경로**다. FP32 중간 파일의 MoE 블록 순서가 양자화기가 위치로 읽는 순서와 달라서, 층마다 router norm gamma가 router 행렬의 앞 22행이 되고 expert마다 gate|up이 섞여 들어갔다. 층당 float 수가 양쪽 같아서 아무 검사도 걸리지 않았다. 아래 1~4가 그 수정을, 5~7이 그래도 남는 것을 가른다.
+
+**IDL은 바뀌지 않았다** → stub·skel 재빌드 불필요, skel push 불필요. 앱(`libcausallm_core.so`, `nntrainer_causallm`)만 다시 만든다. (IDL을 건드리는 변경이 생기면 §3의 주의대로 stub·skel·앱 셋 다.)
+
+기기가 두 대 붙어 있으니 맨 앞에 한 번:
+```bash
+export ANDROID_SERIAL=R3CY10WM83Y
+adb devices
+```
+기대 결과: `R3CY10WM83Y device` 한 줄이 보인다.
+
+### 1단계 — 브랜치와 호스트 검사
+
+```bash
+cd ~/workspace/nntrainer
+git fetch origin claude/gemma4-accuracy-diff
+git checkout claude/gemma4-accuracy-diff
+ninja -C build
+bash test/htp/host/run_host_checks.sh
+./build/Applications/CausalLM/unittest_causallm_models 2>&1 | tail -3
+./build/test/unittest/unittest_nntrainer_cpu_backend --gtest_filter='*wh_pack*'
+```
+기대 결과: 호스트 검사 5개 모두 `... OK`, `unittest_causallm_models`는 `[  PASSED  ] 87 tests.`(+ fixture 없는 14개 SKIPPED, FAILED 0), `wh_pack_unpacks_like_the_load_path` 통과.
+실패하면: `git submodule update --init --depth 1` 뒤 `ninja -C build`를 다시. 87이 아니고 FAILED가 있으면 그 테스트 이름을 알려 줄 것 — 재양자화는 하지 말 것.
+
+### 2단계 — 재배치한 FP32를 다시 양자화 (PC, 약 40분)
+
+재배치 파일은 이미 PC에 있다(`res/gemma4_26ba4b/nntr_gemma4_fp32_fixed.safetensors`, 100.93 GB). 양자화기는 이제 입력 헤더를 보고 자기가 읽는 순서와 다르면 **dry run에서** 멈춘다.
+
+```bash
+cd ~/workspace/nntrainer
+R=Applications/CausalLM/res/gemma4_26ba4b
+cp $R/nntr_config.json $R/nntr_config_fixed.json
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("Applications/CausalLM/res/gemma4_26ba4b/nntr_config_fixed.json")
+c = json.loads(p.read_text())
+c["model_file_name"] = "nntr_gemma4_fp32_fixed.safetensors"
+p.write_text(json.dumps(c, indent=2))
+PY
+./build/Applications/CausalLM/nntr_quantize_stream $R \
+  --config $R/nntr_config_fixed.json \
+  -o $R/q40_fixed \
+  --fc_dtype Q4_0 --moe_dtype QS4CX_WH --embd_dtype Q4_0 --isa ARM
+ls -l $R/q40_fixed/
+```
+기대 결과: `Quantized layer 1/30` … `30/30` 뒤 `Output size: 12336 MiB` 근처, `Streaming quantization complete`. 출력 `.bin`이 12,9xx,xxx,xxx B(= 12,336 MiB)이고 §10.3의 옛 파일과 **크기가 같다**(바뀐 것은 값이 아니라 순서다).
+실패하면:
+- `Input layout mismatch at tensor <n>: ...` → 재배치가 덜 됐거나 잘못된 파일을 가리켰다. 그 줄을 그대로 알려 줄 것. 옛 파일(`nntr_gemma4_fp32.safetensors`)로 돌리면 `tensor 15`에서 같은 메시지가 나오는 게 정상이다.
+- 디스크가 모자라면(`df -h /`에서 20 GB 미만) 옛 `q40/nntr_gemma4_q40_arm.bin`을 먼저 지운다. 기기에 있는 것과 같은 깨진 파일이다.
+
+### 3단계 — 앱 재빌드 (PC, 약 15분)
+
+```bash
+cd ~/workspace/nntrainer/Applications/CausalLM
+export HEXAGON_SDK_ROOT=$HOME/workspace/Hexagon_SDK/6.4.0.2
+export HEXKL_ROOT=$HOME/workspace/hxkl-beta2/hexkl_addon
+export ANDROID_NDK=~/workspace/android-ndk-r26d
+./build_android.sh --htp
+```
+기대 결과: `[SUCCESS] Build completed successfully!`와 `libcausallm_core.so`, `nntrainer_causallm` 두 줄의 `[OK]`.
+실패하면: `HexKL addon not found` → `HEXKL_ROOT` 확인. `generate_stub.sh` 에러 → `HEXAGON_SDK_ROOT` 확인. 스크립트가 "this does NOT rebuild libnntr_hvx_skel.so"라고 알리는 것은 정상이다(이번엔 skel이 그대로여도 된다).
+
+### 4단계 — 기기에 올리고 ppl을 다시 잰다
+
+기기 `/data/user/0` 여유가 16 GB뿐이라 모델은 **같은 경로에 덮어쓴다**(지금 올라가 있는 파일이 깨진 그 파일이다).
+
+```bash
+cd ~/workspace/nntrainer/Applications/CausalLM
+./install_android.sh
+M=/data/local/tmp/nntrainer/causallm/models/gemma4-26b-a4b-qs4cx-wh
+adb push res/gemma4_26ba4b/q40_fixed/nntr_gemma4_q40_arm.bin $M/nntr_gemma4_q40_arm.bin
+adb shell "ls -l $M/nntr_gemma4_q40_arm.bin"
+```
+기대 결과: push가 12.9 GB를 올리고(약 10~20분), 기기의 크기가 PC 파일과 같다.
+실패하면: `No space left` → `adb shell rm $M/nntr_gemma4_q40_arm.bin` 뒤 다시 push.
+
+```bash
+adb shell "cd /data/local/tmp/nntrainer/causallm && \
+  LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. NNTR_NUM_THREADS=8 \
+  NNTR_MOE_CACHE_EXPERTS=5 NNTR_PPL=1 \
+  ./nntrainer_causallm ./models/gemma4-26b-a4b-qs4cx-wh" 2>&1 | tail -40
+```
+기대 결과(**이번 과제의 판정 기준**): `[PPL] prompt tokens=446 nll/token=<한 자리>`이고 생성이 영어 문장이다. §4의 13.2649(균등분포 12.48보다 나쁨)에서 내려와야 한다.
+- 한 자리로 내려오고 문장이 읽히면: 원인은 §10.5의 변환 순서 하나였다. 5~6단계는 돌릴 필요 없고, 7단계만 돌려 커널 게이트를 닫는다.
+- 여전히 12~13이면: 남은 원인이 있다. 5단계로.
+- 중간이면(예: 9~11, 문장 조각): 두 원인이 겹쳐 있다. 5단계로.
+
+실패하면: `AEE_EBADPARM`이 첫 콜에서 나면 skel과 앱의 IDL이 어긋난 것이다(이번 변경은 IDL을 안 건드렸으니, 그렇다면 3단계 앱이 아니라 기기의 옛 skel이 원인 — §3 경로로 skel을 다시 올린다). `Creating shared tensor of size bigger than tensor memory`는 프롬프트가 1024에 걸린 별개 문제(§7)이니 446 토큰 설정을 그대로 쓴다.
+
+### 5단계 — 그래도 잡음이면: 한 실행으로 층별 판정 (`NNTR_MOE_DIFF`)
+
+4단계가 잡음일 때만 돌린다. MoE 층마다 **앞 8토큰**을 CPU에서 f32로 다시 계산해 HTP 결과와의 SNR을 찍고, 그 층 **입력의 mean/std/max**를 같이 찍는다. 생성은 짧게.
+
+```bash
+adb shell "cd /data/local/tmp/nntrainer/causallm && \
+  LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. NNTR_NUM_THREADS=8 \
+  NNTR_MOE_CACHE_EXPERTS=5 NNTR_PPL=1 NNTR_MOE_DIFF=8 \
+  ./nntrainer_causallm ./models/gemma4-26b-a4b-qs4cx-wh" 2>&1 | grep -aE "MOE-DIFF|\[PPL\]|FATAL" | head -40
+```
+기대 결과: 층 0~29마다 한 줄,
+`[MOE-DIFF] layer=0 M=447 rows=8 experts=NN snr=XX.XdB max_abs_ref=.. max_abs_got=.. in_mean=.. in_std=.. in_max=..`
+
+읽는 법 — 이 두 숫자가 "MoE 커널"과 "그 앞 attention"을 가른다:
+
+| 입력 통계 | SNR | 판정 |
+|---|---|---|
+| std가 정상 범위(대략 0.1~10), 층마다 서서히 증가 | 30~45 dB | MoE 커널 정상. 범인은 MoE 밖(attention·임베딩·lm_head) |
+| 정상 | 0 dB 근처·음수 | **MoE 커널**. 층 번호와 SNR을 알려 줄 것 |
+| **첫 몇 층부터 std가 수백~수천, 또는 inf/nan** | 아무 값 | **attention 쪽이 먼저 깨진다.** 가장 낮은 layer 번호가 출발점 |
+| 층이 올라가며 std가 발산 | 점점 낮아짐 | 누적. 처음 꺾이는 층을 본다 |
+
+실패하면: `[MOE-DIFF] layer=.. expert=..: read failed` → 모델 파일 fd를 못 읽었다(push가 덜 됐는지 확인). `has no file fd` → `NNTR_MOE_CACHE_EXPERTS`가 빠져 expert가 상주 모드다(5를 꼭 넣는다). 한 층에 수 초 걸리는 게 정상이다(ARM에서 f32로 다시 계산한다).
+
+### 6단계 — 값이 범인인지 부작용인지 (`NNTR_MOE_SHADOW`)
+
+5단계에서 SNR이 낮게 나왔을 때만. **모든** 행의 참조를 계산해 모델에 그 값을 대신 넘긴다. prefill 한 층에 수 분이니 생성은 짧게 둔다.
+
+```bash
+adb shell "cd /data/local/tmp/nntrainer/causallm && \
+  LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. NNTR_NUM_THREADS=8 \
+  NNTR_MOE_CACHE_EXPERTS=5 NNTR_PPL=1 NNTR_MOE_SHADOW=1 \
+  ./nntrainer_causallm ./models/gemma4-26b-a4b-qs4cx-wh" 2>&1 | grep -aE "MOE-DIFF|\[PPL\]|FATAL" | tail -10
+```
+기대 결과: ppl이 나오기까지 아주 오래 걸린다(수십 분). 판정은 두 갈래뿐이다.
+- **텍스트가 살아나고 nll이 내려간다** → HTP MoE가 내는 **값**이 범인. 5단계의 층·SNR이 쫓을 대상.
+- **그대로 잡음** → MoE 값은 범인이 아니다. 범인은 MoE 밖(ARM attention head 512·GQA 8, Q4_0 임베딩/lm_head) 또는 MoE 콜의 부작용(버퍼 aliasing 등)이다.
+
+실패하면: 너무 오래 걸려 못 기다리겠으면 중단해도 된다 — 5단계의 표만으로도 다음 수가 정해진다.
+
+### 7단계 — 아직 안 돌린 기기 gtest 두 개
+
+4단계 결과와 무관하게 한 번은 돌려 둔다. 둘 다 커널 쪽 용의자(§6 A)를 닫는 게이트고, 지금까지 **미실행**이다.
+
+```bash
+cd ~/workspace/nntrainer
+export HEXAGON_SDK_ROOT=$HOME/workspace/Hexagon_SDK/6.4.0.2
+export HEXKL_ROOT=$HOME/workspace/hxkl-beta2/hexkl_addon
+export HEXKL_SDK_VER=6.4.0.2
+export ANDROID_NDK=~/workspace/android-ndk-r26d
+export DEFAULT_HEXAGON_TOOLS_ROOT=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.04
+bash test/htp/run_u8i4_layer_on_device.sh 2>&1 | tail -30
+grep -aE "GEGLU_DET_FIELD|U8I4_FIELD path=moe_layer" /tmp/hvx_softmax_device_run.log /tmp/hvx_mm_u8i4_device_run.log
+```
+기대 결과:
+- `HvxSwigluDet.GegluMatchesScalarBitExact` 통과, `GEGLU_DET_FIELD bad_exp=0 bad_recip=0 bad_out=0 of <N>` — HVX GeGLU가 호스트 스칼라와 비트 일치.
+- `MoeLayerMatchesTwoCallReference`가 `lfm2`와 `gemma4`(K 2816, inter 704) 두 형상 모두 통과, `U8I4_FIELD path=moe_layer field=bad_elems value=0`.
+- 둘 다 0이면 HTP MoE 커널은 이 입력 분포에서 혐의를 벗는다.
+
+실패하면:
+- `DEFAULT_HEXAGON_TOOLS_ROOT ... does not exist` → `ls $HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/`로 버전 디렉터리 이름을 확인해 바꿔 넣는다(§3의 그 함정).
+- `bad_out`이나 `bad_elems`가 0이 아니면 **그게 커널 버그다.** 숫자와 형상(`gemma4`인지 `lfm2`인지)을 알려 줄 것.
+- 이 스크립트는 skel을 새로 빌드해 `/data/local/tmp/htp_u8i4_layer_test`에만 올린다. 앱이 쓰는 `/data/local/tmp/nntrainer/causallm/libnntr_hvx_skel.so`는 건드리지 않으니 4단계와 섞이지 않는다.
+
+### 보내 줄 것
+
+1~4단계는 각 블록의 마지막 출력 그대로, 5·7단계는 `MOE-DIFF` 줄 전체와 `*_FIELD` 줄. 4단계에서 한 자리 nll과 영어 문장이 나오면 거기서 멈추고 알려 주면 된다 — 나머지는 55 §10.6에 기록하고 닫는다.
