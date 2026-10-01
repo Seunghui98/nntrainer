@@ -5333,9 +5333,10 @@ private:
    *  one background thread: on the S25 a WILLNEED reads before it returns
    *  (3-8 ms an expert) and a DONTNEED took about 2 ms on a miss's path;
    *  a thread per call inherited its caller's core pin (the pool server's)
-   *  and stretched S1's miss wait. The worker runs unpinned and holds only
-   *  the fds and offsets it was given, so it is left running (and its
-   *  queue leaked) at exit. */
+   *  and stretched S1's miss wait. The worker runs unpinned and is left
+   *  running (its queue leaked) at exit; each queued advice holds its own
+   *  dup of the fd, so a model closed before the queue drains cannot send
+   *  the advice to a file that reuses the number. */
   using Advice = std::pair<ExpertFileDesc, bool>;
   static void adviseLater(std::vector<Advice> v) {
     if (v.empty()) // before the worker exists: unset spawns no thread
@@ -5363,13 +5364,16 @@ private:
           n->q.pop_front();
           lock.unlock();
           fadviseExpert(a.first, a.second);
+          ::close(a.first.fd);
         }
       }).detach();
       return n;
     }();
     {
       std::lock_guard<std::mutex> lock(q->mu);
-      q->q.insert(q->q.end(), v.begin(), v.end());
+      for (Advice &a : v)
+        if ((a.first.fd = ::dup(a.first.fd)) >= 0)
+          q->q.push_back(a);
     }
     q->cv.notify_one();
   }
