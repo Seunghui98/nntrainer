@@ -1,271 +1,327 @@
-# Plan 216: the decode pool miss read — name the post-boot stall, then take the read off the 8-core barrier
+# Plan 216 (revision 2): the slow decode pool miss is a UFS read — keep the page cache equal to the arena's complement
 
-Issue #216 (p1, part of #76 / #201). Base `htp_decode` @ `36dbc21f4`; every
-`path:line` below is that tree (PR #215, open, shifts the cited
-`htp_compute_ops.cpp` lines but changes none of them — see §2). Source
-measurements: `docs/measurements/201-s3-probe.md`, LEDGER rule 61 / ㉜.
+Issue #216 (p1, part of #76 / #201). Base `htp_decode` @ `f5f459587`; every
+`path:line` below is that tree (PR #215, open, shifts `htp_compute_ops.cpp`
+by ≈ 14 lines around `poolAnswer` and ≈ 148 around `readWeight`, bodies
+unchanged). Source measurements: `docs/measurements/216-miss-read.md`
+(PR #217), logs `/local/mnt/workspace/htp_moe/216/logs_core/{b1,b2,b3}/`,
+`201-s3-probe.md`, LEDGER rules 59 b / 61, ㉜.
+
+**Revision 1 refuted.** Revision 1 (commit `2c740606c`) read the slow miss
+as an 8-core `parallel_for` barrier stalled by a busy post-boot core and
+planned slice shapes (`NNTR_MOE_MISS_SLICES` / `_CPUS`). Step 1's sampler
+found no busy core in any slow window (busiest non-app core 3–16 %), and
+put the cost on storage instead: in b3 the decode window read **610 / 310 /
+61 / 0 MiB** from block devices (`pgpgin`) for **5.03 / 2.72 / 1.55 /
+0.55 ms/miss**, with PSI io 92–296 ms in every slow window (0–31 in the
+fast ones) and kswapd ≥ 65 k scans/s. Not boot proximity (b2 slow at
+uptime 301 s, b3 slow after a 6-min idle and fastest 8 s later). The
+slice patch (`/local/mnt/workspace/htp_moe/216/lever-not-built.patch`) is
+not used here: it addressed the wrong cause.
 
 ## 1. Goal and gate
 
-From the issue, made measurable:
+Named cause: the model file's page cache is evicted by kswapd during the
+run, so a pool miss `pread`s from UFS (≈ 4–5 ms for 5.3 MiB) instead of
+from the cache (≈ 0.5 ms). The lever must remove the memory pressure that
+makes the kernel evict the pages the pool will need. Gate, Q28 one PD
+(`NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 NNTR_MOE_CACHE_EXPERTS=28`), prompt
+512, `NNTR_HTP_PROFILE=2`, unit `R3CY10WM83Y`:
 
-1. **A table uptime × per-core busy % × ms/miss** over a boot's first 5 min,
-   one unit, two reboots plus one idle-first control boot, that either
-   names the busy core(s) during slow misses or shows none. Posted on
-   #216, folded into `201-s3-probe.md` "Not verified here" and ㉜.
-2. **The winning miss-read shape, if any:** `[HTP-PROFILE] expert misses …
-   (x ms/miss)` (`htp_compute_ops.cpp:859–869`) **≤ 1.1 ms inside a fresh
-   boot's first 2 min** on Q28 G = 64 `NNTR_HTP_PROFILE=2`, and
-   `arm_ms/round` / `miss_wait_us/token` (`:4173–4182`) not above the
-   current shape's on an old boot, same sitting, interleaved. On every run:
-   `calls/token=1.00`, `pds=1`, close clean, ceiling 3840 MiB, uptime on
-   the run line (rule 61).
-3. **Text == A** on every run (`strip` + `cmp` against the sitting's
-   `A_G64_r1`, as `201-s3disc-run.sh` does). Bit identity is untouched by
-   construction: the bytes land in the same arena slot in the same order;
-   the PR states it and the host `run_inproc_e2e.sh` pool line
-   (`test/htp/host/run_inproc_e2e.sh:352`, `NNTR_HTP_E2E_PDS=1
-   NNTR_MOE_CACHE_EXPERTS=2`) prints `bit_identical=1` under every shape.
-4. **Prefill ≥ −5 % of the same sitting's A** on prefill tok/s and the
-   M > 1 MoE `dsp` ms/call (the pinned worker pool is prefill's).
-5. Host: `run_host_checks.sh` `ALL CHECKS PASS` + `WORKER POOL LANES OK`,
+1. **≤ 1.1 ms/miss in every run** of a 4-run A/B sequence (B's four runs)
+   on a fresh boot (first run at uptime ≈ 60 s) **and** on an old boot
+   (≥ 10 min idle) — `[HTP-PROFILE] expert misses … (x ms/miss)`
+   (`htp_compute_ops.cpp:859–869`), plus `arm_ms/round` not above A's
+   fast runs (0.77–0.94) so the new calls are shown off the critical path.
+2. **Decode-window `pgpgin` ≈ 0** (≤ 11 MiB = two experts) in the sampler's
+   fold **and** in the app's own new `pgpgin_mib=` field on the pool line
+   (§2); `workingset_refault_file` ≈ 0; PSI io ≤ 31 ms.
+3. **Text == A** on every run (`strip` + `cmp` against sitting 1's
+   `A_G64_r1`, as `216-core-load-run.sh` does); `calls/token=1.00`, close
+   clean, ceiling 3840 after every run. Bit identity is untouched by
+   construction — `posix_fadvise` changes no byte, the slot, order and
+   `pread` are the same — and the host `run_inproc_e2e.sh` pool lines
+   (`test/htp/host/run_inproc_e2e.sh:339–352`) print `bit_identical=1`
+   with the same `misses=` under the knob.
+4. **Prefill ≥ −5 % of the same block's A** (tok/s and the M > 1 MoE
+   `dsp`): the lever issues read-aheads during prefill (§3).
+5. **Hybrid A unchanged** (nothing set, the product path): one run per boot
+   with the knob set; its experts never pass through `readExpert`, so the
+   lever is a no-op there by construction (§3).
+6. Host: `run_host_checks.sh` `ALL CHECKS PASS` + `WORKER POOL LANES OK`,
    `tools/htp_syntax_check.sh` exit 0, `run_inproc_e2e.sh` `INPROC E2E
    PASS`, `clang-format-14` on changed lines.
 
-Verdict-only close (step 1 names nothing and step 2 moves nothing) is an
-allowed end: rule 61 stays the fix.
+## 2. Where it lives (verified on `f5f459587`)
 
-## 2. Where it lives (verified on `origin/htp_decode` @ `36dbc21f4`)
+**The memory picture** (S25 SM-S938N, `201/phone_state/device.txt`, the
+216 sampler's `M` lines, the run logs):
 
-**The miss read.**
+| item | MiB | source |
+|---|---|---|
+| MemTotal | 11 114 (11 381 316 kB = 10.85 GiB) | `device.txt` |
+| Android before our process (MemTotal − MemAvailable at uptime 16 s) | ≈ 3 740 | b3 `core.samples` first `M` line: MemAvailable 7 374, Cached 4 035 |
+| expert arena, Q28: 13 × 256 MiB chunks (616 slots × 5.29 MiB = 3 259 + the 64 MiB grain) | 3 328 | `takeExpertSlot` `:5332–5376`, `expertStride` `:5380–5382`; log `arena chunk 12 … mapped total 3328` |
+| FC set + lm_head arena (one PD) | 448 (383.6 attached) | log `s2: fc arena … mapped_mib=448` |
+| app RSS (ION mappings excluded: `RSS 599 -> 599` while chunks map) | 766 | log `RSS 766 MB` |
+| model file in the page cache after `cat` + preload | 4 116 | runner's `resident … of 4116 MiB` |
+| **sum** | **≈ 12 400 > 11 114** | |
 
-* `nntrainer/tensor/htp_backend/htp_compute_ops.cpp:5584–5640`
-  `readWeight(fd, off, K, N, arena_dst, e, use_pool)`: with `use_pool`,
-  `n_slices = min(ThreadManager::getComputeThreadCount(), kExpertReadSlicesMax)`
-  (`:5603–5604`; `kExpertReadSlicesMax = 8` at `:6214`) = **8** under
-  `NNTR_NUM_THREADS=8`; slice = ceil(nib / 8) rounded up to 4 KiB
-  (`:5605–5606`); `tm.parallel_for(0, n_slices, …)` (`:5607–5611`), each
-  slice a `preadAll` (`:5278–5295`) into the uncached ION arena; then the
-  caller alone `pread`s the scales / column sums tail (`:5617–5620`).
-  `readExpert` (`:5387–5399`) calls it twice (gate_up, then down) — **two
-  barriers per missed expert pair** (≈ 5.4 MiB).
-* Callers of `use_pool=true`: the pool server's `poolAnswer`
-  (`:2299–2375`, `readExpert` at `:2347`, under `handle_mutex_`), the
-  prefill-side `register_qs4cx_wh_expert_file[s]` (`:2717`, `:2746`, main
-  thread). `use_pool=false`: the prefetch readers (`prefetchReaderLoop`
-  `:5549–5572`, `readExpert` at `:5563`) — one expert per thread, prefill
-  only (`Applications/CausalLM/models/lfm2_moe/lfm2_moe_layer.cpp:912–915`
-  gates the depth on `total_tokens > 1`).
+≈ 1.3 GiB must leave: per boot the sampler counts 5.3–9.5 M kswapd scans
+and 280–394 k pages (1.1–1.5 GB) swapped out to zram (`pswpout`; SwapFree
+4 194 300 kB = 4.0 GiB at boot — the task's "12 GB swap" is not what the
+sampler shows; `SwapTotal` is read in step 0). The file pages are the
+cheapest reclaim, and which survive is the kernel LRU's choice: the `cat`
+walks the file head → tail, the preload reads layers 0–18 again, so after
+prefill the non-resident experts (layers 0–2, §3) are the *coldest* pages
+in the LRU at the moment the arena's 3.3 GB allocation pushes. **Every
+resident expert's bytes are held twice** — in its arena slot and in the
+page cache — and only the complement (704 − 616 = 88 experts ≈ 465 MiB at
+C = 28; 176 ≈ 931 MiB at C = 24) is ever read again. The pool-size
+correlation of rule 59 b (C = 16 / 24 cheap, C = 28 dear) is this
+arithmetic: the 3.3 GB arena pushes the cache over the edge, C = 24's
+2 816 MiB arena does so 512 MiB less often.
 
-**Who runs the slices.** `nntrainer/utils/thread_manager.h:170–181`
-`parallel_for` → `parallelize` (`:262–315`): takes `execution_mutex_`,
-splits `[0, 8)` over `threads_count = workers + 1 = 8` — one index each;
-**tid 0 is the calling thread** (`thread_parallelize(0)` at `:311`), tids
-1–7 the workers; the join is `wait_worker_threads()` (`:313`,
-`thread_manager.cpp:176–`: `SPIN_COUNT = 1e6` yields, then futex) and it
-**waits for all 7 workers' check-in whatever their range** — a 2-slice
-`parallel_for` would still be an 8-thread barrier. Workers wait for work in
-`wait_for_new_command` (`thread_manager.cpp:145–174`, 1e6 yields then
-`futex_wait`). Pinning: `ThreadManager::initialize`
-(`thread_manager.cpp:71–124`) — `core_map = getCoresByPerformance()`
-(`thread_manager_util.cpp:97–175`, cores sorted by `cpuinfo_max_freq`
-descending), **main pinned to `core_map[0]`** (`:100–101`), worker *i* to
-`core_map[i]` (`:115–121`, `pinSelfToCore` `thread_manager_util.cpp:191`).
-On the S25 that is main → 6, workers → 7, 0, 1, 2, 3, 4, 5
-(`201/s3/logs_disc/D_1.threads`: tids 13451–13457 `Cpus_allowed_list`
-7, 0–5; main 13353 `6`). No env knob turns the affinity off
-(`ThreadManagerConfig::enable_affinity = true`, `thread_manager.h:88`, no
-`setConfig` caller in the tree).
+**The read path (unchanged by this plan).** `readExpert` (`:5387–5399`) →
+`readWeight` (`:5584–5631`): 8 page-aligned `pread` slices through
+`ThreadManager::parallel_for` into the uncached ION slot, then the tail;
+`preadAll` `:5278–5295`. Callers: the pool server's `poolAnswer`
+(`:2299–2383`, `readExpert` at `:2347`), the preload
+`register_qs4cx_wh_expert_file` (`:2708–2731`, `at_load=true`), the
+prefill miss batch `register_qs4cx_wh_expert_files` (`:2734–2763`), the
+prefetch readers (`prefetchReaderLoop` `:5548–5572`). Evictions:
+`release_qs4cx_wh_expert` (`:2868–2882`, key only — the slot goes to
+`free_expert_slots_`, `experts_` loses the key) from the layer's `release`
+lambda (`lfm2_moe_layer.cpp:788–793`, prefill and the hybrid-pool path)
+and from `poolAnswer`'s evict callback (`:2322–2330`, decode). The
+descriptor with the file range is `ExpertFileDesc{key_gu, key_dn, fd,
+off_gu, off_dn, K, inter, N_out}` (`compute_ops.h:435–442`); the fd is the
+loader's long-lived `model_file_fd` (`neuralnet.cpp:1070`, `O_RDONLY`),
+captured by virtual tensors in `Tensor::read` (`tensor.cpp:1414–1424`). A
+weight's bytes in the file are `[off, off + whBytes(K, N) + 8 N)` (nibbles,
+N f32 scales, N f32 column sums — what `readWeight` reads at `:5617–5620`).
+Virtual experts are never mmapped in the pool path (the layer passes the
+tensor's address as a key, `lfm2_moe_layer.cpp:840–844`), so
+`POSIX_FADV_DONTNEED` can drop their pages.
 
-**The pool server.** `poolArm` (`:2425–2434`) creates
-`std::thread(poolServe)` from main **after** `initialize()` pinned main to
-core 6, so the server inherits `Cpus_allowed_list=6` (`D_1.threads` tid
-14204). `poolServe` (`:2385–2420`) yield-spins on core 6 for the token;
-`poolAnswer`'s `readExpert` therefore runs slice 0 on core 6 and slices 1–7
-on the pinned workers: **every miss is a barrier over all 8 cores**, twice
-per expert pair. Meanwhile main is blocked in the dspqueue read
-(`:4337–4347`, `q2.api->read … kDspqTimeoutUs`), one packet a token
-(`calls/token=1.00`), so no other `parallel_for` runs in decode — the
-workers do nothing else during a token. In prefill the same 7 workers are
-every CPU op's `parallel_for` and the prefill misses' slices (`:2746`,
-from main); hence the prefill gate.
+**What changes** (all in `nntrainer/tensor/htp_backend/htp_compute_ops.cpp`):
 
-**Accounting.** `arm_ms/round` = `pool_read_us / pool_rounds`
-(`:2368–2370` `read_us` = whole `poolAnswer`: harvest + policy + reads;
-printed `:4173–4182`); the `[HTP-PROFILE] expert misses … ms/miss` line is
-the same `read_us` through `addExpertLoad` (`:2371–2372`, print
-`:859–869`), so "ms/miss" = answer time / loads. `miss_wait_us/token` is
-the **DSP's** wait from posting the request to seeing the answer word
-(`hmx/hexkl_token.c:227–254` `tk_miss_wait`, `st.miss_us`; returned per
-token `test/htp/nntr_hvx_token.c:161`, summed `:4416–4417`); the gap
-`miss_wait − rounds × arm_ms` is the server's poll latency.
+* `readExpert` `:5387–5399`: after both weights are in the slot, with the
+  knob on, `posix_fadvise(fd, off, len, POSIX_FADV_DONTNEED)` on both
+  ranges.
+* `ExpertResident` `:5270–5274` gains the `ExpertFileDesc` (filled in
+  `fileRegistered` `:5439–5445`), so `release_qs4cx_wh_expert` `:2868–2882`
+  knows the victim's ranges and issues `POSIX_FADV_WILLNEED` on them —
+  inline from the layer, **deferred** in `poolAnswer`: the evict callback
+  pushes the ranges on a `PoolServer` vector that is flushed after the
+  answer word is written (`:2378–2382`), off the DSP's path.
+* Knob `NNTR_MOE_FADVISE` parsed like `prefetchKnobs()` (`:6246–6268`):
+  unset / `0` = today, byte for byte; `1` = DONTNEED on load + WILLNEED on
+  evict (the lever); `2` = DONTNEED only (the diagnostic that shows the
+  re-miss cost, §3). Printed on `[HTP] token driver: on …` (`:4046–4050`).
+* The pool line `[HTP] token driver: pool misses=… arm_ms/round=…`
+  (`:4173–4182`) gains `pgpgin_mib=<Δ /proc/vmstat pgpgin from driver-on
+  to close>` (`E2eState` `:6410` gets the baseline; Linux only). From then
+  on every pool cell carries its own storage-read count — rule 61's
+  requirement, without a sampler.
 
-**PR #215 (`htp/211-one-pd-only`)** touches none of these bodies: its
-`htp_compute_ops.cpp` hunks nearest to them are the `poolServe` /
-`poolArm` comments (`-2384,7` / `-2422,8`), the close print (`-4180,65`)
-and `E2eState` (`-6375,42`). After it, `poolAnswer` sits ≈ 14 lines
-earlier and `readWeight` / `kExpertReadSlicesMax` ≈ 148 lines earlier.
-Rebase cost: zero conflicts expected; re-run the host gates once on top.
-
-**Consumers that do not move.** No IDL / stub / skel change (the DSP side
-is untouched; `libnntr_hvx_skel.so` md5 stays `31c0a033…` of the staged
-set), no quantizer tag, no loader check, no new `NNTR_HTP_PROFILE` stage
-(the existing `arm_ms/round` and `ms/miss` lines are the readout),
-`tools/htp_fc_report.py` unaffected.
+**Consumers that do not move.** No IDL / stub (`test/htp/nntr_hvx.idl`,
+`generate_stub.sh`) or skel change — the DSP is untouched, the staged
+`libnntr_hvx_skel.so` md5 `31c0a033…` stays; no quantizer tag
+(`nntr_quantize_stream`), no loader check, no `NNTR_HTP_PROFILE` stage
+table; `tools/htp_fc_report.py` does not parse the pool line; the 216 fold
+(`216-core-load-report.py:63–66`) and runners `grep -o` up to
+`arm_ms/round=[0-9.]*`, so the appended field is harmless.
+`docs/measurements/216-sampler.sh` / `216-core-load-run.sh` /
+`216-core-load-report.py` change as §4 step 3 says.
 
 ## 3. Design
 
-**Measure first (the issue's order).** Step 1 is a sampler beside the runs,
-no app change: per-core `/proc/stat` deltas at 0.5 s, `/proc/loadavg`,
-`scaling_cur_freq` per core, `pgscan_kswapd` / `pswpout` from
-`/proc/vmstat`, and every 5 s the second frame of
-`top -b -H -d 1 -n 2 -m 12` (names the thread on a busy core). The
-existing `.threads` sampler covered only the app; the system sample is what
-is missing. A third boot that idles 5 min before its first run is the
-control that separates "uptime" from "the first N runs of a process".
+**Chosen: (a+) page cache = arena complement.** Drop an expert's file
+pages the moment its bytes are in the arena (they are dead there: the DSP
+reads the slot), and re-read the victim's pages in the background the
+moment it leaves the arena. The cache then holds ≈ the complement
+(465 MiB at C = 28) instead of 4 116, the sum in §2 falls to ≈ 8 750 MiB
+(≈ 2.3 GiB headroom), kswapd has nothing to reclaim, and a miss is a
+cache hit by construction unless its victim was evicted less than one UFS
+read (≈ 5 ms) ago.
 
-**The lever, one mechanism, three shapes.** Take the pool server's reads
-off `ThreadManager`: `readExpert(st, ReadBy)` replaces the `bool use_pool`
-with an enum `{kSingle, kWorkers, kServer}`; `kServer` runs the slices on
-the server thread plus `k` **helper threads owned by `PoolServer`**
-(created in `poolArm` next to the server; affinity set explicitly with
-`pinToCpus`, `:6279–6290`, because a thread created there would otherwise
-inherit core 6; they yield-spin while `p.active`, condvar-wait otherwise,
-like the server — a `ponytail:` comment names the spin as the ceiling).
-Two env knobs, parsed like `prefetchKnobs()` (`:6246–6268`):
+**Why DONTNEED alone (pure (a)) is not enough — the re-miss arithmetic.**
+Replaying the #201 S0 routing trace (`201/s0/logs/moe_trace.txt`, A,
+G = 1024, prompt 512) from the device's start state — `preloadExperts`
+fills the pool in layer order (`lfm2_moe_layer.cpp:520–533`: layers 0–18
+whole, 8 of layer 19), the prefill read-ahead evicts LRU experts outside
+the call and outside later layers' resident sets (`:942–960`) — gives at
+C = 28 **102 misses at G = 64** (device: 121), **0 first-time loads, 83
+re-misses of experts evicted during prefill** (layers 0–2 are the 88
+prefill victims; token 0 alone misses 10) **and 19 re-misses of decode
+victims**; at G = 512 / 1024: 129 / 132 misses, 84 / 84 prefill victims,
+45 / 48 decode victims. At C = 24: 190 / 639 / 1133 misses, 146 / 161 /
+162 prefill victims. So after prefill **every decode miss is a re-miss of
+an expert the arena once held**: with DONTNEED on load and nothing else,
+every miss becomes a UFS read (the slow regime made permanent — the
+`NNTR_MOE_FADVISE=2` cell is kept to show exactly that). With WILLNEED at
+eviction: the 88 prefill victims are read ahead during the ≈ 1 s prefill
+(465 MiB, UFS ≥ 1 GB/s, done before token 0); the decode victims' gap
+between eviction and re-miss is p10 1.1 tokens (≈ 25 ms), p50 11 tokens;
+**1 of 19 at G = 64 (2 of 48 at G = 1024) falls inside one token** and
+pays a partial UFS read once. Script: `scratchpad/remiss2.py` of this
+session (to be committed beside the measurement as
+`docs/measurements/216-remiss-sim.py` in step 3).
 
-* `NNTR_MOE_MISS_SLICES=n` — unset → today's `kWorkers` path, byte for
-  byte; `1` → the server reads alone (lever c, no barrier at all); `n ≥ 2`
-  → server + `n − 1` helpers.
-* `NNTR_MOE_MISS_CPUS=list` — the helpers' affinity; unset = all cores
-  (lever b, unpinned); `7` → lever a (server on 6 + one helper on 7).
+**Ranked levers.**
 
-The barrier shrinks from 8 pinned threads to `n` threads that the scheduler
-may move; the bytes, the slot and the order are unchanged. Prefill's
-misses (`:2746`) keep `kWorkers` (main calls them between CPU ops), so
-prefill is untouched by construction. If the A/B names a winner, the PR
-flips only the unset value (as #115 / #151 did: bit-identical, prefill
-gate, text == A), keeps the knobs, and `201-s3probe-run.sh`'s successor
-records the shape on every run line.
-
-**Ranked levers** (gain inside the boot window / risk / code):
-
-| rank | lever | expected gain | risk | code |
+| rank | lever | arithmetic | risk | code |
 |---|---|---|---|---|
-| 1 | (b) `SLICES=8`, helpers unpinned | one busy core no longer stalls the read: the kernel places the helper elsewhere; fast-regime rate kept (8 preads, 0.5–1.1 ms) | condvar / spin wake of 7 helpers per barrier (~0.05–0.15 ms if they slept); EAS may stack two helpers on one core | the `PoolServer` helper set, ≈ 50 lines |
-| 2 | (a) `SLICES=2 CPUS=7` | barrier over the two prime cores only, where post-boot services are least likely (the busy ones land on 0–5 if EAS behaves) | 2 preads ≈ 1.2 ms/miss by doc 52 §10.9's curve (1 thread 1.37 → 8 threads 1.12 on 3.5 MiB) — may miss the 1.1 gate; core 7 may be the busy one | same mechanism, no extra code |
-| 3 | (c) `SLICES=1` | no barrier, no other core; the cleanest **diagnostic**: fast inside the window ⇒ the barrier is the cause | +0.3–0.6 ms/miss on an old boot (≈ −2–4 % decode at G = 64, ≈ 0 at G ≥ 512) — fails "not slower" at G = 64 | 3 lines |
-| 4 | (d) read-ahead from the previous token's routing (plan 201 P-D) | hides the miss (ceiling 64 %, doc 53 §7) | needs a predictor (the ARM learns a token's routes only in `poolRefresh`, `:2456`, after the token); wasted reads cost DDR and slots; it hides the slow regime rather than curing it, and 8 pinned cores would still burn | a new design; not this issue |
+| 1 | **(a+)** DONTNEED on load + WILLNEED on evict | cache 4 116 → ≈ 465 MiB; sum 12 400 → 8 750 MiB; misses stay cache hits (0.5 ms); UFS traffic = one expert per eviction (≈ 10 MiB/token at G = 64's 1.89 misses, 1–2 at G ≥ 512) in the background | WILLNEED race when the victim returns within ≈ 5 ms (1 of 19 re-misses at G = 64); prefill pays 88 WILLNEED submissions (≈ 0.1–0.3 ms each ≈ −2 % worst case; fallback below); fadvise cost on the miss path ≈ 0.1 ms (DONTNEED of 1 300 pages) — read in `arm_ms/round` | ≈ 60 lines, one file |
+| 2 | (b) pin the complement: `mlock` / `MAP_POPULATE` on the non-resident ranges, re-pinned at every eviction | same memory as (a+) but pinned; no race | needs `RLIMIT_MEMLOCK` ≥ 0.5 GB for the shell user (read `ulimit -l` in step 0; Android's default is small), one VMA per expert, and pinning under pressure moves the kill to lmkd; `MADV_WILLNEED` re-touch per token costs ≈ 88 calls a token | the pinned fallback of (a+) if the race shows in the A/B |
+| 3 | (c) C = 24 | arena −512 MiB of a 1.3 GiB shortfall; 2.56–3.58 misses/token at G = 64 (1.2 at G ≥ 512, ten times C = 28's) at 0.5–0.7 ms = 1.3–2.5 ms/token vs C = 28's 1.0 fast / 9.5 slow; `Q24` read 41.5–43.1 against Q28's fast 44.0–44.4 | trades a cure for a milder disease; still under pressure (12 400 − 512 > 11 114), so the slow regime can return | none (knob) |
+| 4 | (d) `O_DIRECT` miss read | every miss = UFS ≈ 4–5 ms, deterministic = the slow regime | rejected unless (a+) fails; ION slot alignment is fine | small |
 
-**Ship first: (b)**, the unpinned helper set — it is the only shape that
-promises both halves of the gate (≤ 1.1 inside the window, parity on an
-old boot), and (a) / (c) are the same code with other knob values, so the
-A/B costs one binary. (c) runs in the same sitting as the diagnostic; (d)
-stays on #201.
+**Rejected alternative: a user-space second-level cache** (keep the
+complement in anon memory, copy the victim out of its arena slot before
+the overwrite). It is the only design with *no* UFS traffic, but the copy
+out reads uncached ION on the ARM (rate unmeasured, likely ≪ 5 GB/s) on
+the miss's critical path, the anon pool is zram-swappable, and it is a
+new cache with its own policy — ten times the code of (a+) for a race
+that the trace says bites once per 64 tokens.
 
-**Rejected alternative: fewer slices through `ThreadManager`.** A 2-slice
-`parallel_for` still wakes and joins all 7 workers (`thread_manager.h:272–313`),
-so the 8-core barrier remains; and reusing the prefetch readers' job
-queue (`:5549–5572`) was rejected because they exist only after the first
-prefill `_begin`, vanish under `NNTR_MOE_PREFETCH=0`, are pinned to
-all-but-caller, and their one-expert-per-thread job would need a closure
-queue — more change than four private helpers.
+**Hybrid interaction.** The hybrid A (`moe_engine: htp`, nothing set) is
+not virtual: the loader reads every expert into the weight pool
+(`manager.cpp:474–480`), `get_or_register_wh` (`:5687–`) copies it to the
+arena and `releaseArmSource` (`:5653–5673`) `MADV_DONTNEED`s the anon copy.
+Nothing in it calls `readExpert` or `release_qs4cx_wh_expert`, so the knob
+is a no-op there (gate 5 confirms with a run). The hybrid double-holds too
+(3 840 MiB arena + the 4 116 MiB file that nothing reads after load,
+`fsu: false` in `nntr_config.json`): a whole-file DONTNEED after the load
+would hand Android 4 GB. That is a memory-headroom gain with no decode
+read behind it, needs the fd at app level (non-virtual tensors keep no fd,
+`tensor.cpp:1421–1424`), and is filed as a follow-up line in LEDGER, not
+built here.
+
+**Design rules kept.** No DSP change (doc 45 §3: activation handles, DMA,
+`_det` untouched); contract §2's walls and the arena budget unchanged
+(C = 28, 3 328 MiB, ceiling 3840); no CPU fallback for `QS4CX_WH`
+introduced; the knob's unset value is today's behaviour, and the default
+flips only after the A/B, as #115 / #151 did.
 
 ## 4. Steps
 
 Each step ends in a rung of `.claude/skills/hexagon-gates`.
 
-1. **Sampler and fold (no app change).** `docs/measurements/216-core-load-run.sh`
-   (from `201-s3disc-run.sh`: md5 check, `cat` + `page_cache_evict`,
-   Q28 G = 64 `NNTR_HTP_PROFILE=2`, `strip` + `cmp` text, ceiling after
-   every run, **uptime stamped before and after each run** and the
-   `generation: … ms` line locating the decode window) plus the system
-   sampler above writing `core.samples`; `docs/measurements/216-core-load-report.py`
-   folds `core.samples` + the run logs into the table (per run: uptime,
-   ms/miss, `arm_ms/round`, `miss_wait`, busy % per core over the decode
-   window with the app's own threads' ticks subtracted from the `.threads`
-   deltas, top thread names). Gate: the script runs on the host against
-   the existing `201/s3/logs_disc/*` files (a synthetic `core.samples`
-   from the workstation's `/proc/stat`) and prints the table.
-   *No gate rung needed — docs/measurements only.*
-2. **Device, measurement (unavoidable).** Unit `R3CY10WM83Y`, sitting 1's
-   build (`a2ebef9c9`, md5s as in `201-s3-probe.md`); nothing new to push.
-   Boot 1 and 2: sampler from uptime 60 s to 330 s, runs at uptime ≈ 60,
-   120, 180, 300 s. Boot 3 (control): sampler on, phone idle until uptime
-   360 s, then the same four runs back to back. Readout: slow misses
-   coincide with a busy core (name it) / with a cpufreq dip / with
-   neither; the control says whether an idle 5 min alone ends the regime.
-   Post the table on #216. **If no core is ever busy and `SLICES=1` in
-   step 5 is not faster in the window either, stop at a verdict-only close.**
-3. **Code: `ReadBy` and the helper set** (`htp_compute_ops.cpp` only:
-   `readExpert` / `readWeight` signature, `poolAnswer` → `kServer`,
-   `PoolServer` helpers + two knobs, the `[HTP] token driver: pool …`
-   line gains `read=<shape>`). Gate rung 0 + 1: `clang-format-14`;
-   `ninja -C build`; `run_host_checks.sh` (`ALL CHECKS PASS`, `WORKER
-   POOL LANES OK`); `tools/htp_syntax_check.sh`; `run_inproc_e2e.sh`
-   `INPROC E2E PASS` — and its pool line (`:352`) re-run by hand under
-   `NNTR_MOE_MISS_SLICES=1`, `=2 NNTR_MOE_MISS_CPUS=7`, `=8`, each
-   `bit_identical=1` with the same `misses=`. That is the one runnable
-   check the new code leaves behind (the host build has an 8-thread pool,
-   so all three shapes exercise their branch).
-4. **App build once** (rung 3, `--cache`). The skel is not rebuilt: its
-   device md5 must stay `31c0a033…`; the app set's md5s go on the handoff
-   table. Rebase onto `htp_decode` once #215 merges, re-run rung 1.
-5. **Device, A/B (unavoidable).** Variants (≤ 4, one binary):
-   **A** = knobs unset (today's 8 pinned slices), **B1** = `SLICES=8`
-   unpinned, **B2** = `SLICES=2 CPUS=7`, **B3** = `SLICES=1`. Fresh boot:
-   from uptime 60 s, interleave A B1 B2 B3 twice (8 runs ≈ 80 s, all
-   inside the window; the sampler from step 1 on). Old boot (≥ 5 min or
-   the same boot after 300 s): A B1 B2 B3 × 3 interleaved. Prompt 512,
-   G = 64 Q28 throughout (the pool's miss rate is highest there, 1.89 a
-   token); one A and one winner G = 512 run on the old boot for the
-   G ≥ 512 column. Prefill gate from the old-boot block: prefill tok/s and
-   M > 1 `dsp` of the winner against A. Text == A on all runs; uptime on
-   every line.
-6. **PR into `htp_decode`** (`htp/216-miss-read-slices`): the winner as
-   the unset value, knobs kept, the diagnostic cells and the step-1 table
-   in `docs/measurements/216-miss-read.md`, LEDGER / BENCHMARK rows below.
-   Or the verdict-only close with the table folded into `201-s3-probe.md`.
+0. **Device facts, one adb minute, no build** (goes into the runner's
+   header and `216-miss-read.md`): `grep -E 'MemTotal|SwapTotal|SwapFree'
+   /proc/meminfo`, `ulimit -l` (decides whether (b) is even possible),
+   `cat /proc/sys/vm/swappiness`, `ls /sys/block | grep zram`. *No rung —
+   a reading.*
+1. **Code** (`htp_compute_ops.cpp` only, §2): the knob; DONTNEED in
+   `readExpert`; `ExpertResident` + `fileRegistered` carry the descriptor;
+   `release_qs4cx_wh_expert` → WILLNEED, deferred through `PoolServer` in
+   `poolAnswer`; `fadvise=` on the driver-on line and `pgpgin_mib=` on the
+   pool line. Gate rung 0 + 1: `clang-format-14`; `ninja -C build`;
+   `run_host_checks.sh` (`ALL CHECKS PASS`, `WORKER POOL LANES OK`);
+   `tools/htp_syntax_check.sh`; `run_inproc_e2e.sh` `INPROC E2E PASS`; then
+   its two pool lines (`:339–352`) re-run by hand under
+   `NNTR_MOE_FADVISE=1` and `=2`: `bit_identical=1`, the same `misses=`,
+   and the new `pgpgin_mib=` field printed. The runnable check the code
+   leaves behind: a host registration-only run of the real file
+   (`q40-qs4cx-wh`, prompt 16, `NNTR_MOE_CACHE_EXPERTS=28`, G = 1) with
+   `tools/htp/page_cache_evict <file> -1` after it — `resident` ≈ 4 116
+   MiB with the knob unset, ≈ the complement with `=1` (the host has no
+   pressure, so this proves the mechanics, not the gate).
+2. **App build once** (rung 3, `--cache`); the skel is not rebuilt (device
+   md5 must stay `31c0a033…`); md5s of the app set on the handoff table.
+   Rebase onto `htp_decode` once #215 merges and re-run rung 1.
+3. **Runners** (`docs/measurements/`, from the 216 set): `216-sampler.sh`
+   adds, every 4th sample, `page_cache_evict <model> -1` → a `R <MiB>`
+   line (the file's resident MiB *during* the decode window; mincore of
+   1 M pages ≈ 0.1–0.3 s on the phone, hence not every sample);
+   `216-core-load-report.py` gains `resident min/max in window` and keeps
+   `pgpgin MiB` / refaults / PSI io as standard columns next to ms/miss;
+   `216-fadvise-run.sh` (from `216-core-load-run.sh`) keeps the `cat` +
+   `page_cache_evict -1` pre-read for every variant (A's "warm" definition
+   is unchanged; after the lever the pre-read serves only the load) and
+   stamps uptime and `fadvise=` on every run line. `216-remiss-sim.py` =
+   the replay of §3. *No rung — docs/measurements only; the fold is run
+   on b3's logs to show it still parses.*
+4. **Device A/B (unavoidable).** One binary, four variants: **A** = knob
+   unset (today), **B** = `NNTR_MOE_FADVISE=1`, **D** = `=2` (diagnostic,
+   predicted slow), **H** = hybrid A with `=1` (predicted unchanged).
+   Two boots, sampler on from `sys.boot_completed`:
+   * **Boot 1 (fresh):** from uptime 60 s, `A B A B A B A B` at G = 64,
+     then `D` once, then `A B` at G = 512, then `H` once.
+   * **Boot 2 (old):** idle to uptime ≥ 600 s, then the same sequence.
+   Read per run: ms/miss, `arm_ms/round`, `miss_wait_us/token`, prefill
+   tok/s and M > 1 `dsp`, the app's `pgpgin_mib=`, the fold's `pgpgin` /
+   refaults / PSI io / kswapd / `resident min/max` for the window, text,
+   ceiling, uptime. Gate = §1 on B's eight G = 64 runs and two G = 512
+   runs; D is expected at ≈ 4–5 ms/miss with `pgpgin` ≈ 121 × 5.3 MiB
+   (if D is *fast*, the model of §3 is wrong and the plan stops for a
+   re-read); H within A's spread.
+   *If B passes everywhere but prefill fails the −5 %:* move the
+   prefill-side WILLNEEDs to one bulk pass at `poolSync` (`:2229–2240`,
+   the "a prefill touched the pool" hook: WILLNEED every expert in
+   `pool_descs_` not in `experts_`), re-run boot 2's block. *If B shows
+   the race (a run with `pgpgin` > 11 MiB and ms/miss > 1.1 while
+   `resident` stayed ≥ the complement):* (b) with the `ulimit -l` reading
+   from step 0 decides whether pinning is available; otherwise the verdict
+   is (a+) with the residual named.
+5. **PR into `htp_decode`** (`htp/216-page-cache-complement`): code, the
+   runners, `216-miss-read.md` §"A/B" (or `216-fadvise.md`), LEDGER /
+   BENCHMARK rows of §6, `bit identity untouched by construction` stated.
+   Default flip (unset → `1`) is the user's call at review (precedent
+   #115 / #151): the PR ships with unset = today's behaviour unless told
+   otherwise.
 
 ## 5. Risks
 
-* **Sampler perturbation.** The adb-side sampler is itself CPU load on an
-  unpinned shell; 0.5 s `/proc/stat` is negligible, the 5 s `top` frame is
-  not — its own PID is reported in the table so a "busy core" that is the
-  sampler is visible, and boot 2 can run with the `top` frames off.
-* **Time alignment.** The app prints no timestamps; the decode window is
-  reconstructed as `[run end − generation ms, run end]` from the runner's
-  stamps. Misalignment by a second smears but does not invent a busy
-  core; the table carries both the window and the whole-run busy %.
-* **Thermal / DVFS between sittings.** The probe started at zone0 35.9 °C
-  sixty seconds after boot (the boot itself heats the unit); fresh-boot
-  and old-boot blocks differ in temperature as well as uptime. The
-  per-core `scaling_cur_freq` column and the interleaving inside each
-  block keep this visible; the gate reads shapes against A within one
-  block, never across blocks.
-* **Unpinned helpers on a big.LITTLE scheduler.** EAS may place two
-  helpers on one core or on a cold core; the `read=<shape>` run line plus
-  the `.threads` sampler (helpers' `cpu` field) show where they ran.
+* **Host-vs-device gap is total for the gate.** The workstation has no
+  memory pressure; only the phone shows eviction. The host proves bit
+  identity, the miss count and the mechanics (`resident` falling to the
+  complement); the handoff table's `pgpgin` / `resident` / PSI columns
+  per run are what make the device-side effect visible.
+* **Readahead race / UFS rate.** WILLNEED is asynchronous; a victim that
+  returns within ≈ 5 ms pays the remaining I/O (1 of 19 re-misses at
+  G = 64 in the trace). The `pgpgin_mib=` field on every run line bounds
+  it (one expert = 5.3 MiB).
+* **Prefill-side cost.** 88 WILLNEED submissions and 465 MiB of
+  background UFS during a ≈ 1 s prefill; read against the −5 % gate
+  inside each block; the `poolSync` bulk pass is the fallback.
+* **Other apps / zram.** The lever removes our 3.3 GB of needless cache,
+  it does not pin: a foreground app or lmkd can still move the kernel's
+  LRU. The sampler's kswapd / `pswpout` / PSI columns say whether a slow
+  run is ours; an old boot with other apps resident is the harder case and
+  is the second boot of the design.
+* **DVFS / thermal.** Slow runs read cpu6/7 at 3.3–3.8 GHz against 4.47 —
+  a consequence of I/O waits, and a confound for tok/s; the gate is read
+  on ms/miss and `pgpgin`, tok/s is read only within a block (A/B
+  interleaved), never across boots.
 * **Stale skel / wrong set.** No skel change, so a stale skel cannot
-  appear as a win; the md5 table on every run guards the app set.
-* **Address-space budget.** Unchanged: no new ION, no new slot, C = 28 /
-  3.3 GB arena as before (ceiling 3840 after every run, as now).
-* **The hypothesis is wrong.** If no core is busy and `SLICES=1` is as
-  slow in the window as 8 slices, the stall is in the copy itself
-  (page cache → uncached ION) and none of (a)–(c) helps — the plan ends in
-  the verdict and the next read is the kernel side (`pread` vs `mmap` +
-  `memcpy`, DMA-BUF cached mapping), filed as its own issue.
+  appear as a win; md5s on every run line.
+* **Address-space budget.** Unchanged (no new ION, C = 28, ceiling 3840).
+* **The replay is an approximation.** 102 vs the device's 121 misses at
+  G = 64 (the read-ahead's exact victims differ); the classification
+  (every miss a re-miss, 80 % prefill victims) does not depend on the
+  difference. D's cell is the on-device check of that model.
 
 ## 6. Docs to update
 
-* `docs/measurements/201-s3-probe.md`: "Not verified here" → the step-1
-  table and the control boot's reading; the step-5 cells if run.
-* `docs/htp_moe/LEDGER.md`: ㉜ closed or rewritten with the named cause
-  and the shape; rule 61 amended (either "the window no longer costs
-  with `read=<shape>`" or "protocol stays"); #208's "≈ 4.7 ms a miss"
-  note points at the result; a §2 verdict row for the miss-read shape.
-* `docs/htp_moe/BENCHMARK.md`: a Method cycle note (profiled runs, no
-  Results row — contract §1.1); if the default flips, the next sitting's A
-  carries it as #115 / #151 did.
-* `docs/plans/201-htp-decode-e2e-review-gemma-moe.md` P-D row: unchanged,
-  referenced from the ranked table.
+* `docs/htp_moe/LEDGER.md`: ㉜ → cause named (page-cache eviction under
+  the double holding, `pgpgin` ↔ ms/miss) and the lever's verdict; rule 61
+  rewritten — the slow regime is memory pressure, not a boot window, the
+  5-min wait is dropped, and a pool cell is readable only with its
+  `pgpgin_mib=` (or window `pgpgin`) beside it; rule 59 b's "C = 28 dear"
+  gets the arithmetic; #208's "≈ 4.7 ms a miss" is the same candidate
+  cause; a §2 verdict row for #216; a follow-up line for the hybrid's
+  whole-file drop (memory headroom only). If the default flips: rule row
+  as #115 / #151.
+* `docs/htp_moe/BENCHMARK.md`: Method cycle note (profiled runs, no
+  Results row — contract §1.1); the "warm" protocol note gains "`pgpgin`
+  per window is a standard column"; if the default flips, the next
+  sitting's A carries it.
+* `docs/measurements/201-s3-probe.md` "Not verified here" and
+  `216-miss-read.md` "What this changes": pointer to the A/B result.
+* `docs/plans/201-htp-decode-e2e-review-gemma-moe.md`: the preload-order
+  observation from §3 (layers 0–2 cold after every prefill, ≈ 1.5 of the
+  1.89 misses/token at G = 64) as a one-line candidate for the policy
+  track, not for this issue.
