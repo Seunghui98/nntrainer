@@ -539,21 +539,32 @@ struct PaletteOptions {
   }
 };
 
+/** @brief One tensor of a .safetensors header: its name and its payload size,
+ *  in the order the payload stores them. See TensorWriter::source_tensors_. */
+struct SourceTensor {
+  std::string name;
+  size_t bytes;
+};
+
 class TensorWriter {
 public:
   /**
    * @param source_bytes size of the source .bin, only read in dry-run mode
    * @param dry_run count the source bytes the layout walk needs, touching
    *        neither stream -- see expectedInputBytes()
+   * @param source_tensors the input's tensors in payload order when it is a
+   *        .safetensors, else null -- see expectSourceTensor()
    */
   TensorWriter(std::ifstream &input, std::ofstream &output,
                ml::train::ISA target_isa, size_t source_bytes = 0,
-               bool dry_run = false) :
+               bool dry_run = false,
+               const std::vector<SourceTensor> *source_tensors = nullptr) :
     input_(input),
     output_(output),
     target_isa_(target_isa),
     source_bytes_(source_bytes),
-    dry_run_(dry_run) {}
+    dry_run_(dry_run),
+    source_tensors_(source_tensors) {}
 
   bool isDryRun() const { return dry_run_; }
 
@@ -566,6 +577,7 @@ public:
 
   void copyFp32(size_t elements, const std::string &name) {
     const size_t bytes = checkedMultiply(elements, sizeof(float), name);
+    expectSourceTensor(bytes, name);
     if (dry_run_) {
       expected_input_bytes_ += bytes;
       return;
@@ -575,6 +587,7 @@ public:
 
   void discardFp32(size_t elements, const std::string &name) {
     const size_t bytes = checkedMultiply(elements, sizeof(float), name);
+    expectSourceTensor(bytes, name);
     if (dry_run_) {
       expected_input_bytes_ += bytes;
       return;
@@ -597,6 +610,7 @@ public:
   void writeEmbedding(size_t rows, size_t columns, DType dtype,
                       const std::string &name) {
     const size_t source_bytes = tensorBytes(rows, columns, name);
+    expectSourceTensor(source_bytes, name);
     if (dtype == DType::FP32) {
       if (dry_run_) {
         expected_input_bytes_ += source_bytes;
@@ -646,6 +660,7 @@ public:
   void writeFc(size_t input_size, size_t output_size, DType dtype,
                const std::string &name) {
     const size_t source_bytes = tensorBytes(input_size, output_size, name);
+    expectSourceTensor(source_bytes, name);
     if (dtype == DType::FP32) {
       if (dry_run_) {
         expected_input_bytes_ += source_bytes;
@@ -706,6 +721,8 @@ public:
                      const std::string &name) {
     const size_t a_bytes = tensorBytes(input_size, out_a, name);
     const size_t b_bytes = tensorBytes(input_size, out_b, name);
+    expectSourceTensor(a_bytes, name + " (gate half)");
+    expectSourceTensor(b_bytes, name + " (up half)");
     const size_t output_size = out_a + out_b;
     if (dtype == DType::FP32)
       throw std::invalid_argument(name + ": a fused FC is written quantized");
@@ -734,6 +751,14 @@ public:
   }
 
   void requireEndOfFile() {
+    if (source_tensors_ != nullptr &&
+        source_cursor_ != source_tensors_->size()) {
+      throw std::runtime_error(
+        "The layout walk stopped after " + std::to_string(source_cursor_) +
+        " of " + std::to_string(source_tensors_->size()) +
+        " tensors in the input's header; the next one the converter wrote is " +
+        (*source_tensors_)[source_cursor_].name + ".");
+    }
     // The dry run's own total is compared against the file size instead.
     if (dry_run_)
       return;
@@ -747,6 +772,55 @@ public:
   }
 
 private:
+  /**
+   * @brief One tensor read here is one tensor the converter wrote.
+   *
+   * The .safetensors path reads the payload positionally and used to trust
+   * the order outright. It is not a safe thing to trust: a 26B MoE model
+   * whose FP32 intermediate came from a converter that wrote the router
+   * scale AFTER the router matrix and each expert's gate and up as two
+   * tensors instead of the fused one quantized and ran end to end, because
+   * the per-layer BYTE TOTALS of the two layouts are identical -- the
+   * dry-run total below cannot see the difference. What came out was a
+   * router norm made of the router matrix's first rows and a gate|up weight
+   * whose halves were consecutive gate rows, which is noise, and the search
+   * for it went to the device.
+   *
+   * The invariant that does catch it costs one comparison: every tensor this
+   * tool reads is exactly one tensor in the input's header, so a read that
+   * splits one or spans two is a layout disagreement and is named here
+   * rather than at the end of a 40-minute run. Only element counts are
+   * compared, not names: the converter's keys ("layer0_sparse_moe:gate") and
+   * this tool's ("layer0_router") are different spellings of the same
+   * tensor, and mapping them would be a second place to keep in step.
+   *
+   * A .bin input has no header, so there is nothing to check and nothing
+   * changes for it.
+   */
+  void expectSourceTensor(size_t bytes, const std::string &name) {
+    if (source_tensors_ == nullptr)
+      return;
+    if (source_cursor_ >= source_tensors_->size()) {
+      throw std::runtime_error("The layout walk wants " + name + " (" +
+                               std::to_string(bytes) +
+                               " bytes) past the last tensor in the input's "
+                               "header.");
+    }
+    const SourceTensor &have = (*source_tensors_)[source_cursor_];
+    if (have.bytes != bytes) {
+      throw std::runtime_error(
+        "Input layout mismatch at tensor " + std::to_string(source_cursor_) +
+        ": this tool reads " + name + " as " + std::to_string(bytes) +
+        " bytes, but the next tensor the converter wrote is " + have.name +
+        " at " + std::to_string(have.bytes) +
+        " bytes. The converter is the authority -- regenerate the FP32 file "
+        "with the res/<model>/weight_converter.py of this revision, or fix "
+        "the order this tool walks. Byte totals can still agree while the "
+        "order does not, so do not read a passing size check as agreement.");
+    }
+    ++source_cursor_;
+  }
+
   void writeBytes(const void *source, size_t bytes, const std::string &name) {
     if (bytes >
         static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
@@ -1086,6 +1160,10 @@ private:
   size_t source_bytes_ = 0;
   bool dry_run_ = false;
   size_t expected_input_bytes_ = 0;
+  /** The input's tensors in payload order, or null for a .bin. */
+  const std::vector<SourceTensor> *source_tensors_ = nullptr;
+  /** How many of them the layout walk has consumed. */
+  size_t source_cursor_ = 0;
   /** QS4CX_WH per-output-channel column sums awaiting flushQs4cxScales() */
   std::vector<float> pending_colsums_;
   /** QS4CX per-channel scales awaiting flushQs4cxScales() */
@@ -1693,10 +1771,11 @@ int run(int argc, char **argv) {
   // the .bin, so past the header the bytes are in the .bin's order (the
   // tied lm head's trailing copy is the one thing the .bin has that this
   // does not, and hasRemainingBytes already allows for that). Skip
-  // [8-byte little-endian header length][header JSON] and read on.
-  // ponytail: the order is trusted, not checked against the header's
-  // names; the byte-count check below still catches a shape mismatch.
+  // [8-byte little-endian header length][header JSON] and read on -- with
+  // the header kept, so TensorWriter::expectSourceTensor can hold the walk
+  // to one tensor per tensor the converter wrote.
   uintmax_t data_start = 0;
+  std::vector<SourceTensor> source_tensors;
   if (input_ext == ".safetensors") {
     unsigned char len_bytes[8];
     input.read(reinterpret_cast<char *>(len_bytes), sizeof(len_bytes));
@@ -1710,6 +1789,29 @@ int run(int argc, char **argv) {
     if (data_start >= std::filesystem::file_size(input_path))
       throw std::runtime_error("safetensors header length is past the end of " +
                                input_path.string());
+    std::string header_json(static_cast<size_t>(header_len), '\0');
+    input.read(header_json.data(), static_cast<std::streamsize>(header_len));
+    if (!input)
+      throw std::runtime_error("Failed to read the safetensors header of " +
+                               input_path.string());
+    // Named, not a temporary: items() hands back a proxy that refers to the
+    // object, and a temporary one dies before the loop reads it.
+    const json header = json::parse(header_json);
+    std::vector<std::pair<uint64_t, SourceTensor>> at;
+    for (const auto &entry : header.items()) {
+      if (entry.key() == "__metadata__")
+        continue;
+      const auto &offsets = entry.value().at("data_offsets");
+      const uint64_t begin = offsets.at(0).get<uint64_t>();
+      const uint64_t end = offsets.at(1).get<uint64_t>();
+      at.emplace_back(
+        begin, SourceTensor{entry.key(), static_cast<size_t>(end - begin)});
+    }
+    std::sort(at.begin(), at.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    source_tensors.reserve(at.size());
+    for (auto &pair : at)
+      source_tensors.push_back(std::move(pair.second));
     input.seekg(static_cast<std::streamoff>(data_start));
   }
   std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
@@ -1754,7 +1856,8 @@ int run(int argc, char **argv) {
   const uintmax_t source_bytes =
     std::filesystem::file_size(input_path) - data_start;
   TensorWriter probe(input, output, quant.target_isa,
-                     static_cast<size_t>(source_bytes), /*dry_run=*/true);
+                     static_cast<size_t>(source_bytes), /*dry_run=*/true,
+                     source_tensors.empty() ? nullptr : &source_tensors);
   walk(probe);
   if (probe.expectedInputBytes() != source_bytes) {
     const bool file_is_short = probe.expectedInputBytes() > source_bytes;
@@ -1783,7 +1886,8 @@ int run(int argc, char **argv) {
       "config.json.");
   }
 
-  TensorWriter writer(input, output, quant.target_isa);
+  TensorWriter writer(input, output, quant.target_isa, 0, /*dry_run=*/false,
+                      source_tensors.empty() ? nullptr : &source_tensors);
   writer.setPalette(palette);
   walk(writer);
   output.close();
