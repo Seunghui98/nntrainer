@@ -365,7 +365,7 @@ typedef struct {
   const int32_t *act_zp;
   float *res; /**< this tail's m x N_out, read by its expert's scatter */
   uint32_t m, k_tiles, inter, inter_ktiles, inter_ntiles, gu_ntiles, dn_ntiles,
-    N_out;
+    N_out, act;
 } moe_tail_ctx;
 
 /** @brief Worker time spent inside tail units, summed across workers,
@@ -400,7 +400,8 @@ static void moe_tail_pair_unit(uint32_t n_units, uint32_t j, void *v) {
   hvx_dequant_swiglu_acc_tiles_to_f32(
     (const uint8_t *)tiles, MOE_TAIL_TILE_BYTES, 1u, j,
     HEXKL_HMX_INT8_BLOCK_N_COL, t->m, t->act_scale, t->act_zp, t->g->colsum_w,
-    t->g->w_scale, t->g->bias, t->inter, t->sh->gate_f32, t->inter, NULL);
+    t->g->w_scale, t->g->bias, t->inter, t->act, t->sh->gate_f32, t->inter,
+    NULL);
   moe_tail_probe_add(t0);
 }
 
@@ -633,12 +634,15 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,
   uint32_t n_experts, const uint32_t *h_gate_up, const uint32_t *h_down,
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
-  const float *act_f32, float *out_f32, hvx_worker_pool *pool,
+  const float *act_f32, float *out_f32, uint32_t act, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch) {
 
   if (!tbl || !vtcm_base || !h_gate_up || !h_down || !row_index || !row_count ||
       !row_weight || !act_f32 || !out_f32 || !scratch || M == 0u ||
       n_experts == 0u) {
+    return AEE_EBADPARM;
+  }
+  if (act != HVX_GLU_SILU && act != HVX_GLU_GELU_TANH) {
     return AEE_EBADPARM;
   }
 
@@ -957,6 +961,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     tc->gu_ntiles = gu_ntiles;
     tc->dn_ntiles = dn_ntiles;
     tc->N_out = N_out;
+    tc->act = act;
     hvx_bg_job *jb = &jobs[1u + 3u * t];
     uint8_t *dn = tail_done + (size_t)t * (inter_ntiles + 1u + dn_ntiles);
     jb[0].func = moe_tail_pair_unit;
@@ -1137,6 +1142,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           jb->inter = inter;
           jb->dst = gate;
           jb->dst_stride = inter;
+          jb->act = act;
           hvx_worker_pool_submit(pool, hvx_dq_swiglu_worker, jb, np);
         }
         ++sb;

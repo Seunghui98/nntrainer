@@ -315,8 +315,12 @@ interface nntr_hvx : remote_handle64 {
    // hands over. The kernel underneath takes plain pointers, so the Phase D
    // entry point that leaves the residual stream on the DSP is a second
    // wrapper over the same code, not a rewrite (doc 45 section 3.1).
+   //
+   // act is the gated activation between gate_up and down: 0 silu(g)*u
+   // (LFM2), 1 gelu_tanh(g)*u (Gemma-4; doc 55). HVX_GLU_* in
+   // hvx_dequant_i32.h.
    AEEResult mm_u8i4_moe_layer(in uint32 M, in uint32 K, in uint32 inter,
-                               in uint32 N_out,
+                               in uint32 N_out, in uint32 act,
                                in sequence<uint32> h_gate_up,
                                in sequence<uint32> h_down,
                                in sequence<uint32> row_index,
@@ -329,7 +333,7 @@ interface nntr_hvx : remote_handle64 {
    // [total, quant, swiglu, dequant, acc_read, drain, scatter, acc_stride].
    // DEBUG ONLY.
    AEEResult mm_u8i4_moe_layer_timed(in uint32 M, in uint32 K, in uint32 inter,
-                                     in uint32 N_out,
+                                     in uint32 N_out, in uint32 act,
                                      in sequence<uint32> h_gate_up,
                                      in sequence<uint32> h_down,
                                      in sequence<uint32> row_index,

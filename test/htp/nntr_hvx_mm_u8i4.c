@@ -1157,7 +1157,7 @@ static int check_moe_row_totals(const uint32 *row_count, int n_experts,
 }
 
 int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
-                               uint32 inter, uint32 N_out,
+                               uint32 inter, uint32 N_out, uint32 act,
                                const uint32 *h_gate_up, int h_gate_upLen,
                                const uint32 *h_down, int h_downLen,
                                const uint32 *row_index, int row_indexLen,
@@ -1179,12 +1179,12 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
   return hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch);
+    row_weight, act_f32, out_f32, act, s->quant_pool, &s->moe_scratch);
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_timed(
   remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
-  const uint32 *h_gate_up, int h_gate_upLen, const uint32 *h_down,
+  uint32 act, const uint32 *h_gate_up, int h_gate_upLen, const uint32 *h_down,
   int h_downLen, const uint32 *row_index, int row_indexLen,
   const uint32 *row_count, int row_countLen, const float *row_weight,
   int row_weightLen, const float *act_f32, int act_f32Len, float *out_f32,
@@ -1212,7 +1212,7 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   rc = hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch);
+    row_weight, act_f32, out_f32, act, s->quant_pool, &s->moe_scratch);
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
 

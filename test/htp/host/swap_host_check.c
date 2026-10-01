@@ -38,7 +38,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,
   uint32_t n_experts, const uint32_t *h_gate_up, const uint32_t *h_down,
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
-  const float *act_f32, float *out_f32, hvx_worker_pool *pool,
+  const float *act_f32, float *out_f32, uint32_t act, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch) {
   fprintf(stderr, "swap_host_check: hexkl_mm_u8i4_moe_layer_run called\n");
   abort();

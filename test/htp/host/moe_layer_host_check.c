@@ -22,6 +22,63 @@
 
 #include "hvx_scalar_stubs.h"
 
+/* gelu_tanh in the form the kernel computes it: x * sigmoid(t),
+   t = x (C0 + C1 x^2). The reference below uses it too, because the
+   kernel's output is REQUANTIZED to u8 before the down matmul: the textbook
+   0.5 x (1 + tanh y) differs from this by a few f32 ulps, which flips one
+   u8 level on a couple of elements and reads as 9e-5 after down (the doc 44
+   L2 lesson). The identity itself is checked separately in main, before
+   any quantization, where ulps are what they are. */
+static float gelu_sig(float g) {
+  const float t = g * (1.5957691216f + 0.0713548163f * g * g);
+  return g / (1.f + expf(-t));
+}
+
+/* The straightforward reference: per routed row, quantize, gate_up,
+   act(gate)*up, requantize, down, weighted accumulate. */
+static void ref_layer(int gelu, uint32_t M, uint32_t K, uint32_t inter,
+                      uint32_t N_out, uint32_t NE, const W *wg, const W *wd,
+                      const uint32_t *rc_, const uint32_t *ridx,
+                      const float *rw, const float *act, float *want) {
+  uint8_t *aq = (uint8_t *)malloc(K);
+  uint8_t *mq = (uint8_t *)malloc(inter);
+  float *gu = (float *)malloc(sizeof(float) * 2 * inter);
+  float *dn = (float *)malloc(sizeof(float) * N_out);
+  float *mid = (float *)malloc(sizeof(float) * inter);
+  memset(want, 0, sizeof(float) * M * N_out);
+  uint32_t base = 0;
+  for (uint32_t e = 0; e < NE; ++e) {
+    for (uint32_t i = 0; i < rc_[e]; ++i) {
+      uint32_t row = ridx[base + i];
+      float as;
+      int32_t az;
+      quant_row(act + (size_t)row * K, K, aq, &as, &az);
+      ref_mm(&wg[e], aq, as, az, gu);
+      for (uint32_t j = 0; j < inter; ++j) {
+        const float g = gu[j];
+        const float a = gelu ? gelu_sig(g) : g / (1.f + expf(-g));
+        mid[j] = a * gu[inter + j];
+      }
+      float ms;
+      int32_t mz;
+      quant_row(mid, inter, mq, &ms, &mz);
+      ref_mm(&wd[e], mq, ms, mz, dn);
+      for (uint32_t c = 0; c < N_out; ++c) {
+        /* Two operations through a volatile, matching what the kernel and
+           the ARM path both do -- see hvx_scale_add_rows_f32's stub. */
+        volatile float p = dn[c] * rw[base + i];
+        want[(size_t)row * N_out + c] = want[(size_t)row * N_out + c] + p;
+      }
+    }
+    base += rc_[e];
+  }
+  free(aq);
+  free(mq);
+  free(gu);
+  free(dn);
+  free(mid);
+}
+
 int main(void) {
   const uint32_t M = 37, K = 64, inter = 32, N_out = 64, NE = 5;
   static uint8_t vtcm[8u << 20];
@@ -73,41 +130,14 @@ int main(void) {
   hexkl_moe_scratch scratch = {NULL, NULL, 0};
   rc = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
                                    inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
-                                   got, NULL, &scratch);
+                                   got, HVX_GLU_SILU, NULL, &scratch);
   printf("run rc=%d  n_rows=%u\n", rc, n_rows);
   if (rc)
     return 1;
 
   /* reference */
   float *want = (float *)calloc(M * N_out, sizeof(float));
-  uint8_t *aq = (uint8_t *)malloc(K);
-  uint8_t *mq = (uint8_t *)malloc(inter);
-  float *gu = (float *)malloc(sizeof(float) * 2 * inter);
-  float *dn = (float *)malloc(sizeof(float) * N_out);
-  float *mid = (float *)malloc(sizeof(float) * inter);
-  uint32_t base = 0;
-  for (uint32_t e = 0; e < NE; ++e) {
-    for (uint32_t i = 0; i < rc_[e]; ++i) {
-      uint32_t row = ridx[base + i];
-      float as;
-      int32_t az;
-      quant_row(act + (size_t)row * K, K, aq, &as, &az);
-      ref_mm(&wg[e], aq, as, az, gu);
-      for (uint32_t j = 0; j < inter; ++j)
-        mid[j] = gu[j] / (1.f + expf(-gu[j])) * gu[inter + j];
-      float ms;
-      int32_t mz;
-      quant_row(mid, inter, mq, &ms, &mz);
-      ref_mm(&wd[e], mq, ms, mz, dn);
-      for (uint32_t c = 0; c < N_out; ++c) {
-        /* Two operations through a volatile, matching what the kernel and
-           the ARM path both do -- see hvx_scale_add_rows_f32's stub. */
-        volatile float p = dn[c] * rw[base + i];
-        want[(size_t)row * N_out + c] = want[(size_t)row * N_out + c] + p;
-      }
-    }
-    base += rc_[e];
-  }
+  ref_layer(0, M, K, inter, N_out, NE, wg, wd, rc_, ridx, rw, act, want);
 
   double worst = 0.0;
   uint32_t bad = 0;
@@ -154,6 +184,57 @@ int main(void) {
       fail = 1;
   }
 
+  /* (After the probe counts above: the two calls below would add to them.) */
+  /* The identity the GeGLU epilogue rests on, x sigmoid(2y) == 0.5 x (1 +
+     tanh y), on a sweep of gate values in f32 and before any quantization:
+     a wrong constant shows up here as 1e-3, not as a u8 flip. */
+  {
+    double worst_id = 0.0;
+    for (int i = -2000; i <= 2000; ++i) {
+      const float g = (float)i * 0.005f; /* [-10, 10] */
+      /* In double: f32's 1 + tanh(y) cancels to a few ulps for y < -5. */
+      const double gd = g;
+      const double ref =
+        0.5 * gd *
+        (1.0 + tanh(0.7978845608028654 * (gd + 0.044715 * gd * gd * gd)));
+      const double d = fabs((double)gelu_sig(g) - ref) / (fabs(ref) + 1e-6);
+      if (d > worst_id)
+        worst_id = d;
+    }
+    printf("gelu identity     : worst_rel=%g (want < 1e-5)\n", worst_id);
+    fail |= (worst_id > 1e-5);
+  }
+
+  /* The same layer with the GeGLU epilogue (doc 55: Gemma-4's experts). */
+  {
+    float *got_g = (float *)malloc(sizeof(float) * M * N_out);
+    float *want_g = (float *)calloc(M * N_out, sizeof(float));
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, got_g, HVX_GLU_GELU_TANH, NULL, &scratch);
+    ref_layer(1, M, K, inter, N_out, NE, wg, wd, rc_, ridx, rw, act, want_g);
+    uint32_t bad_g = 0;
+    double worst_g = 0.0;
+    for (uint32_t i = 0; i < M * N_out; ++i) {
+      double d = fabs((double)got_g[i] - (double)want_g[i]);
+      double sc = fabs((double)want_g[i]) + 1e-6;
+      if (d / sc > 1e-5)
+        ++bad_g;
+      if (d / sc > worst_g)
+        worst_g = d / sc;
+    }
+    printf("gelu epilogue     : rc=%d mismatches=%u worst_rel=%g\n", r, bad_g,
+           worst_g);
+    fail |= (r != 0 || bad_g != 0);
+    r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                    K, inter, N_out, NE, hg, hd, ridx, rc_, rw,
+                                    act, got_g, 7u, NULL, &scratch);
+    printf("act=7             : rc=%d (want %d)\n", r, AEE_EBADPARM);
+    fail |= (r != AEE_EBADPARM);
+    free(got_g);
+    free(want_g);
+  }
+
   /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
      the host, against the whole call. Only the fp32 addition order may
      differ, so the error is taken against the output's largest magnitude:
@@ -162,12 +243,13 @@ int main(void) {
     float *a = (float *)malloc(sizeof(float) * M * N_out);
     float *b = (float *)malloc(sizeof(float) * M * N_out);
     uint32_t n0 = rc_[0] + rc_[1] + rc_[2];
-    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
-                                        M, K, inter, N_out, 3, hg, hd, ridx,
-                                        rc_, rw, act, a, NULL, &scratch);
-    r |= hexkl_mm_u8i4_moe_layer_run(
-      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, 2, hg + 3,
-      hd + 3, ridx + n0, rc_ + 3, rw + n0, act, b, NULL, &scratch);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, 3, hg, hd,
+      ridx, rc_, rw, act, a, HVX_GLU_SILU, NULL, &scratch);
+    r |= hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                     K, inter, N_out, 2, hg + 3, hd + 3,
+                                     ridx + n0, rc_ + 3, rw + n0, act, b,
+                                     HVX_GLU_SILU, NULL, &scratch);
     double w = 0.0, big = 0.0;
     for (uint32_t i = 0; i < M * N_out; ++i) {
       double d = fabs((double)(a[i] + b[i]) - (double)got[i]);
@@ -187,9 +269,9 @@ int main(void) {
   {
     uint32_t z[8] = {0, 0, 0, 0, 0};
     memset(got, 0xA5, sizeof(float) * M * N_out);
-    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
-                                        M, K, inter, N_out, NE, hg, hd, ridx, z,
-                                        rw, act, got, NULL, &scratch);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, z, rw, act, got, HVX_GLU_SILU, NULL, &scratch);
     int ok = (r == 0);
     for (uint32_t i = 0; i < M * N_out; ++i) {
       if (got[i] != 0.f) {
@@ -202,18 +284,18 @@ int main(void) {
   }
   {
     uint32_t c64[8] = {64, 0, 0, 0, 0};
-    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
-                                        M, K, inter, N_out, NE, hg, hd, ridx,
-                                        c64, rw, act, got, NULL, &scratch);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, c64, rw, act, got, HVX_GLU_SILU, NULL, &scratch);
     printf("exactly 64 rows   : rc=%d\n", r);
     fail |= (r != 0);
   }
   {
     uint32_t c1[8] = {1, 0, 0, 0, 0};
     uint32_t bad_row[1] = {M};
-    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
-                                        M, K, inter, N_out, NE, hg, hd, bad_row,
-                                        c1, rw, act, got, NULL, &scratch);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      bad_row, c1, rw, act, got, HVX_GLU_SILU, NULL, &scratch);
     printf("row_index >= M    : rc=%d (want %d)\n", r, AEE_EBADPARM);
     fail |= (r != AEE_EBADPARM);
   }

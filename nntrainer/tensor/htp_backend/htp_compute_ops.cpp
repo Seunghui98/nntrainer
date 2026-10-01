@@ -1020,7 +1020,8 @@ public:
                                  const std::vector<float> &row_weight,
                                  const float *act, float *out, unsigned int M,
                                  unsigned int K, unsigned int inter,
-                                 unsigned int N_out, bool weights_wh) override {
+                                 unsigned int N_out, bool weights_wh,
+                                 bool gelu) override {
     const size_t n_experts = gate_up_data.size();
     if (n_experts == 0 || gate_up_scale.size() != n_experts ||
         down_data.size() != n_experts || down_scale.size() != n_experts ||
@@ -1047,7 +1048,7 @@ public:
       }
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
-                   out, M, K, inter, N_out);
+                   out, M, K, inter, N_out, 0, gelu ? 1u : 0u);
   }
 
   /** Same registration the layer call above does on first use, keyed by
@@ -1858,7 +1859,8 @@ private:
                       const std::vector<unsigned int> &row_count,
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
-                      unsigned int inter, unsigned int N_out, int kind = 0) {
+                      unsigned int inter, unsigned int N_out, int kind = 0,
+                      uint32_t glu = 0) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
@@ -1894,7 +1896,7 @@ private:
       uint32_t rep_stage[HTP_MOE_N_STAGES] = {0};
       const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
       err = timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
-                      session, M, K, inter, N_out, h_gu.data(),
+                      session, M, K, inter, N_out, glu, h_gu.data(),
                       static_cast<int>(h_gu.size()), h_dn.data(),
                       static_cast<int>(h_dn.size()), row_index.data(),
                       static_cast<int>(row_index.size()), row_count.data(),
@@ -1902,7 +1904,7 @@ private:
                       static_cast<int>(row_weight.size()), act_f32, act_len,
                       out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
                   : nntr_hvx_mm_u8i4_moe_layer(
-                      session, M, K, inter, N_out, h_gu.data(),
+                      session, M, K, inter, N_out, glu, h_gu.data(),
                       static_cast<int>(h_gu.size()), h_dn.data(),
                       static_cast<int>(h_dn.size()), row_index.data(),
                       static_cast<int>(row_index.size()), row_count.data(),

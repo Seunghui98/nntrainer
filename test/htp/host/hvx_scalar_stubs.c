@@ -282,8 +282,14 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
     for (uint32_t r = 0; r < c->m_count; ++r)
       for (uint32_t k = 0; k < 32u; ++k) {
         const float g = gt[r * 32u + k];
+        /* gelu_tanh(g) = g * sigmoid(g (C0 + C1 g^2)), the identity the
+           HVX side rests on; moe_layer_host_check's reference uses the
+           textbook tanh form, so the identity itself is what gets checked. */
+        const float t = c->act == HVX_GLU_GELU_TANH
+                          ? g * (1.5957691216f + 0.0713548163f * g * g)
+                          : g;
         c->dst[(size_t)r * c->dst_stride + cg + k] =
-          g / (1.f + expf(-g)) * ut[r * 32u + k];
+          g / (1.f + expf(-t)) * ut[r * 32u + k];
       }
   }
 }
@@ -293,8 +299,8 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
   uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
-  hvx_worker_pool *pool) {
+  const float *bias, uint32_t inter, uint32_t act, float *dst,
+  uint32_t dst_stride, hvx_worker_pool *pool) {
   (void)pool;
   hvx_dq_swiglu_job jb;
   jb.tiles_base = tiles_base;
@@ -311,6 +317,7 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   jb.inter = inter;
   jb.dst = dst;
   jb.dst_stride = dst_stride;
+  jb.act = act;
   hvx_dq_swiglu_worker(1u, 0u, &jb);
 }
 /* Scalar stand-in for the pooled batch dequant job. Deliberately a loop

@@ -208,6 +208,8 @@ void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx);
  * @param[in] row_weight  [n_rows] routing weight for each entry
  * @param[in] act_f32     [M x K]
  * @param[out] out_f32    [M x N_out]
+ * @param[in] act         HVX_GLU_SILU or HVX_GLU_GELU_TANH: the gated
+ *                        activation between gate_up and down
  * @param[in,out] scratch session-lifetime heap scratch; grown here as needed
  * @return AEE_SUCCESS, or the first failing stage's code
  */
@@ -216,7 +218,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,
   uint32_t n_experts, const uint32_t *h_gate_up, const uint32_t *h_down,
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
-  const float *act_f32, float *out_f32, hvx_worker_pool *pool,
+  const float *act_f32, float *out_f32, uint32_t act, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch);
 
 #endif /* __NNTRAINER_HEXKL_MM_U8I4_MOE_H__ */
