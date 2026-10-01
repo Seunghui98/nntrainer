@@ -694,6 +694,32 @@ fold (to close `completed`), #204 / #208 wait for the farm S26. Open:
 sitting 2's prefill column is not in the comment (gate not read on that
 unit), the pool-28 miss cost (㉜), the farm unit's LEAK rate (㉝).
 
+**Cycle 28 (2026-10-01, base `htp_decode` @ `84142c0b9`): the #208 S26
+sitting happened, on a developer unit — recorded, not derived from.**
+The orchestrator ran plan 204 §4 step 7 (G4 / G5 / G6) on
+**`R3CY70LV96T`** (SM-S948U, SM8850, userdebug `S948USQU1AZAB`, kernel
+6.12 — not the earlier S26 `R5KL20NFRCK`), 14:12–15:29 KST, three
+invocations: attempt 1 ended when the `HmxMmU8I4Layer.RegistryCapacity`
+gtest dropped the phone into download mode (rule 60), attempt 2 ran the
+gtests with it excluded (mm_u8i4 34/0, fc 1/0, two_sessions 6/0,
+softmax 28/4 and attn 10/2 = #137's known set, reproduced on v81) and
+stopped on a config file the crash had zeroed, attempt 3 ran all 24 runs
++ 2 profiles + the CPU control without a stop. **What it showed: the
+one-PD E2E (Q28) runs on an S26 (v81); every NPU text == A q4 r1 of its
+G (20 / 20); the S1 ceiling stayed 3840 MiB throughout.** The raw tables
+(A 53.6–57.9 and E0 29.3–33.9 at G 64, Q28 37.4 at G 512; four DMA
+queues no better than one on any variant; a pool-28 miss ≈ 4–4.7 ms with
+the page-cache `read()` at ≈ 2 GB/s on this phone) are in
+`204-s26-rebaseline.md` as an appendix **marked "developer unit, not
+representative"** (user, 2026-10-01: a userdebug engineering phone may
+not represent the product S26) — no rule, no BENCHMARK column, no "now"
+is derived from them, and ㉜ is not updated from them. **S26
+optimization is deferred by the user until a product unit is
+available.** Same day: the user decided to delete the two-PD path (plan
+being written as the next issue). Issue state: #208 → verdict row in §2
+("E2E runs on v81; optimization deferred"), to close `completed`; #204
+closes with it (its port, PR #206, is merged).
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
@@ -1575,6 +1601,16 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     across boots and prefill ramps is larger than the unit gap; read each
     sitting against its own A only.
 
+60. **`HmxMmU8I4Layer.RegistryCapacity` takes the S26 developer unit
+    `R3CY70LV96T` (userdebug `S948USQU1AZAB`) into Samsung download mode**
+    (2026-10-01 14:12, after 16 `[ OK ]`; USB `04e8:685d`, adb gone, no
+    tombstone / pstore; the four config files written seconds before came
+    back zeroed — `sync` after every push on this unit). Exclude it there
+    (`--gtest_filter=-HmxMmU8I4Layer.RegistryCapacity`, as
+    `204/s26/run_s26.sh` now does); whether the test or the build is the
+    cause is not known and was not re-tried. The S25 units and
+    `R5KL20NFRCK` ran it.
+
 ## 2. Verdicts (measured, closed)
 
 | item | verdict | source |
@@ -1636,6 +1672,7 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | **Record sitting 2026-09-30: cool-start A control for the row of record (`record-2026-09-30-cool-a.md`; `R3CY10WM83Y`, 02:48–02:53 KST, `htp_moe` @ `90d88e2b`, device dir `s170r2q`, nothing set, A twice per G, each G block at zone0 ≤ 35 °C)** | **The "now" moves to 53.97 / 52.16 / 51.41** (r1 / r2 53.51 / 54.42, 54.75 / 49.56, 51.54 / 51.29; prefill 574.0 / 482.1, 542.4 / 526.2, 579.8 / 426.0; zone0 after 59.0 / 55.2, 62.1 / 62.9, 64.5 / 65.6 °C; text r1 = r2; banners `applied=0x703e1 … dma_bypass=1 source=default`, `dspq` close `bad=0`). Decode ≥ 50 at all three G on a cool start; #158 B's 51.82 / 50.61 / 47.36 is kept as the warm-start reading (+4.1 / +3.1 / +8.6 % cool over warm), so the goal holds under the stated condition and rule 52 is the row's condition, not an open question. Not a lever. | `record-2026-09-30-cool-a.md`, BENCHMARK Goals + Method (record-sitting paragraph), contract §1 |
 | **Record sitting 2026-09-30, CPU `q40` control on the same unit (02:58–03:03 KST, `R3CY10WM83Y`, same app set, model bin `d28f55c5…` = #78's, config 512 / [124900] / no-sample for the sitting, `htp=0`, cool start per G 31.6 / 32.8 / 33.6 °C, two runs)** | **CPU 52.18 / 51.31 / 50.12** (52.03 / 52.33, 51.74 / 50.87, 50.49 / 49.75; prefill 348 / 332, 338 / 318, 337 / 280; text r1 = r2) — the first CPU cell on this unit, −0.5 / +4.2 / +3.7 % vs `R3CY205ZMND`'s #94 s2. **Read against the NPU cool row (53.97 / 52.16 / 51.41): NPU above the CPU by +3.4 / +1.7 / +2.6 % under the same protocol on the same unit — the contract's "above the CPU" clause is met on `R3CY10WM83Y`, narrowly** (the G=512 margin, 0.85 tok/s, is inside one run's spread; the CPU itself clears 50 at every G cool). | `record-2026-09-30-cool-a.md`, BENCHMARK Goals (both decode rows), contract §1 |
 | **#201 S2, one PD (Q28 / Q29 = P28 + `NNTR_HTP_E2E_PDS=1`) against two PDs (P28), E0 and A — sitting 1 `R3CY10WM83Y` (2026-10-01 09:43–09:58, G 64 / 512, set `f5e8b1648`, 22 runs, no stop) and sitting 2 `R3CY205ZMND` (device farm, #207, 10:57–11:22, G 64 / 512 / 1024, set rebuilt at `a2ebef9c9`, 32 runs, two LEAK stops, three boots; tables from the issue comment, logs on that machine); with S0 (hybrid pool, 21:42) and the two-PD sitting (22:18) of 2026-09-30 on `R3CY10WM83Y`** | **One PD wins, bit-identical, on both units; still under A.** Q28 **42.98 / 43.13, 43.40 / 42.44** (G 64 / 512) vs P28 36.72 / 35.81, 36.67 / 34.13 vs E0 30.51 / 30.46, 30.79 / 30.66 vs A 56.74 / 54.51, 48.45 / 54.23 on `R3CY10WM83Y`; **40.48 / 40.97, 44.68 / 46.74, 45.11 / 45.20** vs P28 33.16 / 32.94, 35.37 / 39.07, 36.75 / 35.89 vs E0 29.30 / 30.09, 31.23 / 32.31, 31.02 / 30.92 vs A 54.61 / 54.65, 51.81 / 56.11, 51.82 / 50.30 on the farm unit (G 64 / 512 / 1024); Q29 = Q28 within spread with fewer misses; every text == A r1 of its G (20 / 20, 30 / 30; S0 30 / 30, two-PD 28 / 28). Mechanism: FC set on S1's VTCM 9.2 ms vs 11.6–13.1 on S2, no hops, `rt` 22.4 vs 26.6 / 30.6 (rule 59 a). Two-PD sitting: the pool beats all-resident E0 by the server spin's wake-up effect (L0 by accident, ≈ −4.5 ms a token), P32 35.6 vs E0 30.3–30.8. S0: the pool on the hybrid path F28 ≈ A (54.9 / 53.5 / 54.4 vs 57.3 / 55.4 / 54.9), F16w −20 %, cold 12–13. Pool-28 miss 3.45 / 3.79 ms on the two units, unexplained (rule 59 b, ㉜); LEAK 2 in 32 (farm) vs 1 across three sittings (㉝). Prefill: sitting 1 and two-PD inside −5 % on the means; sitting 2's column not in the comment. **No row of record** (lever on open PR #203, under A, second unit); the next structural read is the MoE round (10.5 ms) and the FC set's 1.1 ms over isolated, on the S26 (#204 / #208) | `201-one-pd.md` §Sitting 1 / §Sitting 2, `201-fsu-e2e.md`, `201-pool-baseline.md` (all on `htp/201-pool-miss-path`); issue #207 comment 2026-10-01; `201/s0/`, `201/s2/logs/`, `201/s3/logs/` (sitting 1) |
+| **#208: the S26 re-baseline on `htp_decode` (plan 204 §4 step 7; set from `4c0c20dca`, v81 skel `26fdf25a…`; `R3CY70LV96T`, SM-S948U userdebug, 2026-10-01 14:12–15:29 KST, three invocations, 24 runs + 2 profiles + CPU control; run by the orchestrator)** | **E2E runs on v81; optimization deferred.** The one-PD E2E (Q28) and the two-PD variants ran on an S26 with every NPU text == A q4 r1 of its G (20 / 20) and the S1 ceiling at 3840 MiB on all 24 cells; gtests on the v81 skel pass except #137's known set (softmax 28/4, attn 10/2) and `RegistryCapacity`, which drops this unit (rule 60). The tables (A 53.9 / 53.6, 57.9 / 55.9 at G 64 q4 / q1; E0 29.3 / 29.3, 30.1 / 33.9; P28 27.2 / 28.6, 29.0 / 30.2; Q28 30.7 / 33.9, 31.7 / 35.1; G 512 q4 A 54.4, E0 30.7, P28 31.6, Q28 37.4; CPU 50.9) are an appendix of record only: **developer unit, not representative** (user) — no rule, no BENCHMARK column. Observations kept there: four DMA queues read no better than one on any variant (the banner shows the setting applied); a pool-28 miss reads 3.99–4.69 ms with the phone's page-cache `read()` at ≈ 1.6–2.0 GB/s. S26 optimization deferred until a product unit | `204-s26-rebaseline.md` §Results (this fold); `/local/mnt/workspace/htp_moe/204/s26/logs/` |
 ## 3. Open items (candidates for issues; the supervisor promotes them)
 
 | # | item | expected | depends on |
