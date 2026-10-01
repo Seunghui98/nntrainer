@@ -1377,7 +1377,8 @@ public:
                                  const std::vector<float> &row_weight,
                                  const float *act, float *out, unsigned int M,
                                  unsigned int K, unsigned int inter,
-                                 unsigned int N_out, bool weights_wh) override {
+                                 unsigned int N_out, bool weights_wh,
+                                 bool gelu) override {
     const size_t n_experts = gate_up_data.size();
     if (n_experts == 0 || gate_up_scale.size() != n_experts ||
         down_data.size() != n_experts || down_scale.size() != n_experts ||
@@ -1442,7 +1443,7 @@ public:
       }
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
-                   out, M, K, inter, N_out);
+                   out, M, K, inter, N_out, 0, gelu ? 1u : 0u);
   }
 
   /** [#85] NNTR_HTP_FORWARD=1 routes decode's MoE calls through the
@@ -3535,7 +3536,7 @@ private:
                const std::vector<unsigned int> &row_index,
                const std::vector<unsigned int> &row_count,
                const std::vector<float> &row_weight, size_t act_bytes,
-               size_t out_bytes, uint32_t *stage_us) {
+               size_t out_bytes, uint32_t glu, uint32_t *stage_us) {
     static_assert(HTP_MOE_N_STAGES == HTP_DSPQ_STAGES,
                   "htp_dspq_wire.h's stage count is the timed call's");
     DspqMoe &st = *dspq_;
@@ -3544,7 +3545,8 @@ private:
     const uint32_t seq = ++st.seq;
     const htp_dspq_req_hdr hdr = {HTP_DSPQ_OP_MOE,
                                   seq,
-                                  stage_us ? HTP_DSPQ_FLAG_TIMED : 0u,
+                                  (stage_us ? HTP_DSPQ_FLAG_TIMED : 0u) |
+                                    (glu ? HTP_DSPQ_FLAG_GELU : 0u),
                                   M,
                                   K,
                                   inter,
@@ -4143,7 +4145,8 @@ private:
                       const std::vector<unsigned int> &row_count,
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
-                      unsigned int inter, unsigned int N_out, int kind = 0) {
+                      unsigned int inter, unsigned int N_out, int kind = 0,
+                      uint32_t glu = 0) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
@@ -4196,17 +4199,17 @@ private:
       const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
-                                timed ? rep_stage : nullptr)
+                                glu, timed ? rep_stage : nullptr)
             : timed  ? nntr_hvx_mm_u8i4_moe_layer_timed(
-                         session, M, K, inter, N_out, h_gu.data(),
-                         static_cast<int>(h_gu.size()), h_dn.data(),
-                         static_cast<int>(h_dn.size()), row_index.data(),
-                         static_cast<int>(row_index.size()), row_count.data(),
-                         static_cast<int>(row_count.size()), row_weight.data(),
-                         static_cast<int>(row_weight.size()), act_f32, act_len,
-                         out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
+                        session, M, K, inter, N_out, glu, h_gu.data(),
+                        static_cast<int>(h_gu.size()), h_dn.data(),
+                        static_cast<int>(h_dn.size()), row_index.data(),
+                        static_cast<int>(row_index.size()), row_count.data(),
+                        static_cast<int>(row_count.size()), row_weight.data(),
+                        static_cast<int>(row_weight.size()), act_f32, act_len,
+                        out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
                     : nntr_hvx_mm_u8i4_moe_layer(
-                        session, M, K, inter, N_out, h_gu.data(),
+                        session, M, K, inter, N_out, glu, h_gu.data(),
                         static_cast<int>(h_gu.size()), h_dn.data(),
                         static_cast<int>(h_dn.size()), row_index.data(),
                         static_cast<int>(row_index.size()), row_count.data(),
