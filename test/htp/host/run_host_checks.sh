@@ -240,14 +240,13 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   echo "GRAPH Q4M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
 
-# [#132 Part B E2] The two-session token driver (hmx/hexkl_token.c): S1 and
-# S2 on two pthreads over the hd64 list split by mask, every MoE row across
-# a malloc'd mailbox page, bit-identical to the one-session run for 10 000
-# tokens (TOKEN DRIVER BIT-IDENTICAL), then the lost-post, stale-read and
-# failed-side paths (TOKEN DRIVER FAILURE PATHS OK; ~3 s of timeouts).
-# Same kernels and flags as the graph check. Then two mutants of
-# hexkl_token.c, each of which must fail it: S2 reading its own row back
-# as the MoE output, and the trailer check gone.
+# [#132 Part B E2, #211] The one-PD token driver (hmx/hexkl_token.c): one
+# session over the hd64 list with every kind resident, bit-identical to the
+# one-session forward for 10 000 tokens (TOKEN DRIVER BIT-IDENTICAL), the
+# pool's miss rounds against an owner pthread (TOKEN POOL BIT-IDENTICAL),
+# then the miss round's failure paths: no owner, a stale answer, the
+# owner's code (TOKEN DRIVER FAILURE PATHS OK; ~1 s of timeout). Same
+# kernels and flags as the graph check.
 token_check() { # token_check <hexkl_token.c> <exe> [hexkl_graph.c]
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
     -Wno-format-truncation -pthread -include malloc.h \
@@ -261,12 +260,12 @@ token_check() { # token_check <hexkl_token.c> <exe> [hexkl_graph.c]
 }
 token_check "$BACKEND/hmx/hexkl_token.c" "$OUT/token_host_check"
 "$OUT/token_host_check"
-# [plan 201 S1] the pool's third mutant: the answer's evictions not
-# cleared, so an evicted expert's table entry names the bytes its pair now
-# holds (TOKEN POOL BIT-IDENTICAL must fail)
-for mut in 's/    in = tk_row(theirs);/    in = tk_row(mine);/' \
-  's/  if (\*(const uint32_t \*)(slot + HEXKL_MBOX_LINE + row) != seq) {/  if (0) {/' \
-  's/  for (i = 0; rc == AEE_SUCCESS \&\& i < a->n_evict; ++i) {/  for (i = 0; 0 \&\& i < a->n_evict; ++i) {/'; do
+# Two mutants of hexkl_token.c, each of which must fail it: [plan 201 S1]
+# the answer's evictions not cleared, so an evicted expert's table entry
+# names the bytes its pair now holds (TOKEN POOL BIT-IDENTICAL must fail);
+# [#211] the answer's seq2 check gone (the stale answer must be refused)
+for mut in 's/  for (i = 0; rc == AEE_SUCCESS \&\& i < a->n_evict; ++i) {/  for (i = 0; 0 \&\& i < a->n_evict; ++i) {/' \
+  's/  if (a->seq2 != seq || /  if (0 || /'; do
   sed "$mut" "$BACKEND/hmx/hexkl_token.c" > "$OUT/hexkl_token_mutant.c"
   if cmp -s "$OUT/hexkl_token_mutant.c" "$BACKEND/hmx/hexkl_token.c"; then
     echo "TOKEN MUTATION DID NOT APPLY: $mut"; exit 1
