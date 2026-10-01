@@ -18,6 +18,8 @@ measured by the upstream author on another unit / tree (docs 52 / 53);
 **[R]** a reference read at its source; **[G]** arithmetic on measured or
 read inputs, or a stated guess.
 
+**Status 2026-10-01: S0, S1 and S2 done and merged (#202, #203; S26 port #206); S4 next; S3 waits for the S26 numbers (#208).**
+
 ## 0. Decisions, and what is left for the user
 
 | # | decision (user, 2026-09-30) |
