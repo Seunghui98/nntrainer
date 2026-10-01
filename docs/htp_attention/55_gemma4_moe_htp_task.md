@@ -241,3 +241,25 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 호스트에서 가른 것: tiny Gemma4-MoE(26B 형상: 128→4 expert, top-2, K==V, global kv 2, per-layer input 0)를 transformers 5.18.0으로 돌린 HF 참조와 nntrainer 그래프가 **FP32에서 일치**(`Gemma4MoeDifferentialTest`, 06862c3). 즉 router·expert·norm 접기·K==V·가중치 파일 순서·변환기·양자화기 순서는 맞다. 깨진 출력의 원인은 **기기 쪽**이다: (a) HTP MoE 커널의 GeGLU 에필로그 또는 Gemma 형상(K 2816, inter 704)에서의 커널 동작, (b) ARM 커널(attention head 512·GQA 8, Q4_0 ARM 레이아웃)의 이 형상 처리, (c) QS4CX_WH 파일 자체. 다음 판정 수단: 기기 gtest `HvxSwigluDet.GegluMatchesScalarBitExact`(GeGLU HVX 비트 일치), PC x86 Q4_0 CPU 실행(ARM/HTP 무관 참조).
 - 부수 발견: x86 AVX2 rotary 커널의 fp16 꼬리 저장이 head_dim 8(half 4)에서 8 lane을 써 16폭 KV cache의 마지막 행을 넘친다(tiny fixture는 `max_seq_len` 16으로 회피; 실제 head_dim은 16의 배수라 꼬리를 안 탄다). `NetworkGraph::getTensor`의 `unordered_map::at` 예외는 잡혀서 무해.
 
+### 10.5 잡음의 원인: FP32 중간 파일의 MoE 순서가 양자화기와 다르다 (2026-10-01, 호스트에서 확정, 기기 미측정)
+
+- 조건: PC 호스트만. 기기도 DSP도 쓰지 않았다. 대상은 §10.3이 만든 `res/gemma4_26ba4b/nntr_gemma4_fp32.safetensors`(100,933,907,208 B)와 그것을 양자화한 `q40/nntr_gemma4_q40_arm.bin`(12,935,608,440 B, 기기에 올라가 있는 바로 그 파일).
+- 방법: 파일 헤더의 텐서 이름·형상·오프셋을 payload 순서로 뽑아 `quantize_stream.cpp`의 `writeGemma4Moe`가 **위치로** 읽는 순서와 한 항목씩 맞춰 걸었다(8277 항목). 어긋나는 첫 지점과, 어긋난 뒤 각 읽기가 실제로 집어 가는 바이트를 numpy로 확인했다.
+
+| | 파일에 있는 순서 | 양자화기가 읽는 순서 | 결과 |
+|---|---|---|---|
+| 14번까지 | attention_norm … pre_ffn_norm_2 | 같음 | 일치 (attention·dense MLP·norm 전부 정상) |
+| 15 | `sparse_moe:router` [2816,128] | `_router_norm` 2816 | **router 행렬의 앞 22행이 router norm gamma가 된다** (mean 0.0000 std 0.0185). 진짜 gamma = `router.scale · H^-0.5` (mean 0.6041)는 어디에도 안 들어간다 |
+| 16 | `sparse_moe:router_scale` [2816] | `_router` 2816×128 | **router 행렬이 22행 밀리고 꼬리 2816 float이 생 `router.scale`**(mean 32.05)로 채워진다 → 라우팅이 전부 다른 값 |
+| 17 | `router_per_expert_scale` [128] | `_per_expert_scale` 128 | 우연히 일치(앞의 밀림이 정확히 2816 float이라 여기서 맞아떨어진다) |
+| expert e | `expert_gate_e`[2816,704] + `expert_up_e`[2816,704] | `_gate_up` [2816,1408] 한 개 | **융합 행 k의 up 절반 = gate 행 2k+1**(numpy로 비트 일치 확인, up 행 0과는 불일치) → 128 expert × 30층의 gate·up이 모두 섞인다 |
+| expert e | `expert_down_e` [704,2816] | `_down` [704,2816] | 일치 |
+
+- 왜 아무것도 안 터졌나: **층당 float 수가 양쪽 모두 814,094,977로 같다.** §10.3이 "dry-run 바이트 대조 통과 = 텐서 순서가 맞는다"고 적은 근거가 바로 이 숫자이고, 이 숫자는 순서를 볼 수 없다. 누적 밀림도 없어서 층 경계마다 다시 맞는다.
+- 판정: **잡음의 원인은 기기가 아니라 PC 변환 경로다.** 파일을 쓴 변환기는 레포의 `res/gemma4/weight_converter.py`(228a026)가 아니다 — 그쪽은 expert를 융합 `expert_gate_up_{e}`로, router norm을 `scale·H^-0.5` 접어 router **앞에** 쓴다. 레포 이력·다른 체크아웃에 그 이름(`sparse_moe:router_scale`, `expert_gate_N`)을 쓰는 변환기는 없다(55 §6.1이 "초안은 gate/up 분리, router_scale 따로"라고 적어 둔 그 초안과 일치). HTP MoE 커널(GeGLU·Gemma 형상), ARM attention, QS4CX_WH 파일 포맷은 이 증상에 대해 **용의자가 아니다**. tiny 모델 호스트 테스트가 통과한 이유도 같다: `generate_gemma4_moe_reference.py`가 fixture를 직접 융합 순서로 써서 변환기를 거치지 않는다.
+- 고친 것:
+  1. `[CausalLM] quantize_stream: one tensor read is one tensor the converter wrote` — `.safetensors` 입력의 헤더를 읽어 두고, 읽는 텐서 하나가 변환기가 쓴 텐서 하나와 바이트 수까지 같은지 dry run에서 본다. 이 파일에 대해 실제로 `tensor 15: layer0_router_norm 11264 B vs layer0_sparse_moe:router 1441792 B`로 거부한다(확인). 바이트 총합이 같아도 순서는 틀릴 수 있다는 것이 이 가드가 막는 유일한 실패다.
+  2. FP32 파일 재배치(일회용 스크립트, 레포에 넣지 않음): router scale을 `·H^-0.5` 접어 router 앞으로, expert마다 gate|up을 **열 방향**으로 융합. 8277 텐서·25,233,141,790 float이 `writeGemma4Moe`의 읽기 순서와 한 항목씩 일치하는 것을 쓰기 전에 확인했다.
+- 남은 가정 하나: 파일의 `expert_gate_N`이 HF `gate_up_proj`의 **앞** 청크(gate)라는 것. HF 관례와 이름이 그렇지만 체크포인트가 PC에 더 없어 대조할 수 없다. 재양자화 뒤에도 잡음이면 재배치에서 gate/up을 바꿔 다시 양자화하는 것이 한 줄 실험이다.
+- 다음 순서: 재양자화 → 기기 push → `NNTR_PPL=1`. 판정 기준은 nll/token이 한 자리, 생성이 영어 문장. 그래도 틀리면 §6.1의 `NNTR_MOE_DIFF=8`(층 입력 통계 + MoE SNR을 한 실행에서) → `NNTR_MOE_SHADOW=1`. 가이드는 `56_gemma4_accuracy_handoff.md` §9.
+
