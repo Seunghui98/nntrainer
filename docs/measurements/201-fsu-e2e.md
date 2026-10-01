@@ -132,3 +132,7 @@ last item) is the next structural read.
 **Prefill** (tok/s r1 / r2, G = 512): A 552 / 448, E0 577 / 442, P28 500 /
 545, P24 540 / 417; the spread is run to run, no variant below −5 % of A on
 the mean of the two.
+
+**Next read:** the one-PD half, `201-one-pd.md` (2026-10-01): one PD with
+the pool at C = 28 reads 43.0–43.4 tok/s against this sitting's P28 ≈ 37–40
+and E0 ≈ 31, text = A.
