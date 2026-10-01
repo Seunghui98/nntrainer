@@ -56,6 +56,7 @@
 #include <stdint.h>
 
 #include "hexkl_graph.h"
+#include "htp_dspq_wire.h"
 
 /** @brief The page's byte layout. */
 #define HEXKL_MBOX_PING 0u
@@ -66,8 +67,13 @@
 #define HEXKL_MBOX_SLOT (2u * HEXKL_MBOX_LINE + HEXKL_MBOX_ROW_MAX)
 #define HEXKL_MBOX_S2_SLOT 256u
 #define HEXKL_MBOX_S1_SLOT (HEXKL_MBOX_S2_SLOT + HEXKL_MBOX_SLOT)
-/** @brief The page size the driver needs (16 896 B). */
-#define HEXKL_MBOX_BYTES (HEXKL_MBOX_S1_SLOT + HEXKL_MBOX_SLOT)
+/** @brief [plan 201 S1] The expert pool's miss round (protocol P-A): S1's
+ *  request (htp_miss_req) and the pool owner's answer (htp_miss_ans),
+ *  each in its own lines after the two slots. */
+#define HEXKL_MBOX_MISS_REQ HTP_MBOX_MISS_REQ
+#define HEXKL_MBOX_MISS_ANS HTP_MBOX_MISS_ANS
+/** @brief The page size the driver needs (18 432 B). */
+#define HEXKL_MBOX_BYTES (HTP_MBOX_MISS_ANS + HTP_MBOX_MISS_ANS_BYTES)
 /** @brief A wait gives up this long after its spin window. */
 #define HEXKL_TOKEN_TIMEOUT_US 1000000u
 /** @brief Poll period after the spin window: a sleep, so the waiting
@@ -89,6 +95,13 @@ typedef struct {
                          bits of the QTimer's us, global to both PDs) */
 } hexkl_mbox_hdr;
 
+/* [plan 201 S1] the miss lines' structs (htp_miss_req / _ans) are the
+   ARM's too: htp_dspq_wire.h */
+typedef char
+  hexkl_miss_at[HTP_MBOX_MISS_REQ == HEXKL_MBOX_S1_SLOT + HEXKL_MBOX_SLOT ? 1
+                                                                          : -1];
+typedef char hexkl_miss_max[HTP_MBOX_MISS_MAX == HEXKL_GRAPH_MISS_MAX ? 1 : -1];
+
 /** @brief One side's counters, accumulated over its calls. */
 typedef struct {
   uint32_t tokens;   /**< calls that returned 0 */
@@ -100,6 +113,8 @@ typedef struct {
   uint32_t stale;    /**< reads refused as stale */
   uint64_t pcycles;  /**< the op_pcycles of every stretch this side ran */
   uint64_t kind_pcycles[HTP_OP_KIND_N]; /**< the same, per op kind */
+  uint32_t misses;  /**< [plan 201 S1] experts loaded by miss rounds */
+  uint32_t miss_us; /**< the waits for their answers */
 } hexkl_token_stats;
 
 /** @brief The sequence value of round @a round of token @a tok. */
@@ -130,7 +145,12 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
 
 /**
  * @brief S1's side of token @a tok: hexkl_token_rounds(g) rounds of wait,
- *        forward over the stretch S2 names, post.
+ *        forward over the stretch S2 names, post. [plan 201 S1] A MOE op
+ *        whose routed experts are not all in its EXPERTS table runs a miss
+ *        round on the page's miss lines: the request, the present experts,
+ *        the answer (each eviction cleared from its table, each load
+ *        rebound through @a env's rebind and entered), the rest. g's
+ *        route_log holds the token's routed sets after the call.
  * @return 0; AEE_EEXPIRED; HEXKL_TOKEN_E_STALE; S2's code from its header;
  *         hexkl_graph_forward's code (posted to S2 too); AEE_EBADSTATE (no
  *         resident op, or S2 named an op S1 does not run);

@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
@@ -483,6 +484,25 @@ public:
   }
   virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() {
     return {};
+  }
+
+  // [plan 201 S1] The pool's policy for the per-token entry's miss path:
+  // makes every key of need resident, calling evict for each key that
+  // leaves (before any load) and load for each that must come in -- the
+  // layer's ExpertLru::acquire.
+  using ExpertPoolFn =
+    std::function<void(const std::vector<const void *> &need,
+                       const std::function<void(const void *)> &load,
+                       const std::function<void(const void *)> &evict)>;
+
+  // [plan 201 S1] One MoE layer's experts (all of them, expert order), in
+  // layer order across calls, and the pool's policy: with NNTR_HTP_E2E=1
+  // the backend serves S1's misses from these while a decode token runs.
+  // A backend without the per-token entry ignores it.
+  virtual void set_decode_moe_experts(const std::vector<ExpertFileDesc> &all,
+                                      const ExpertPoolFn &pool) {
+    (void)all;
+    (void)pool;
   }
 
   // Undoes the above for one expert: both handles released, the slot back

@@ -113,10 +113,18 @@
 #                              refuses maps past 100 MiB and keeps a refused
 #                              fd, as the driver did; S1's chunk halves to
 #                              64 MiB and the run equals the uncapped one)
-#   E2E e3 pool C=2 refused: the expert pool is not in the per-token entry
-#                              (plan 201 S1)  (NNTR_MOE_CACHE_EXPERTS with
-#                              NNTR_HTP_E2E=1 throws at the first MoE call
-#                              instead of binding handles the LRU retires)
+#   E2E e3 pool C=2 hd64 / C=1 lfm25 / C=2 lfm25 == e3 bit_identical=1
+#                              misses=<n> calls/token=1.00 timeouts=0/0
+#                              (plan 201 S1: NNTR_MOE_CACHE_EXPERTS with
+#                              NNTR_HTP_E2E=1, S1's miss rounds served by the
+#                              ARM's pool server; logits against the
+#                              all-resident E run of the same fixture)
+#   E2E e3 pds=1 pool C=2 lfm25 == e3 bit_identical=1 ... (one PD, a pool)
+#   E2E e3 pds=1 hd64 / lfm25 == pds=2 bit_identical=1 calls/token=1.00
+#                              hops/token=0.00 timeouts=0/0 unmap_fail=0
+#                              (plan 201 S1:
+#                              NNTR_HTP_E2E_PDS=1, every kind and the FC set
+#                              on S1, one packet a token)
 # and, since #194 S1 (htp_moe_ppl), the same two-session token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -324,13 +332,25 @@ NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
 PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
-# [plan 201 S1] the expert pool (NNTR_MOE_CACHE_EXPERTS) is not inside the
-# per-token entry yet: the E path refuses it instead of reading a handle the
-# ARM's LRU has retired
-rc_pool=0
-NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 "$E2E" --model "$OUT/htp64q" \
-  --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
-  --moe-engine htp --max-seq 32 > "$OUT/64e3pool.log" 2>&1 || rc_pool=$?
+# [plan 201 S1] the expert pool (NNTR_MOE_CACHE_EXPERTS) inside the
+# per-token entry: S1's miss rounds served by the ARM's pool server, a pool
+# of half the experts (hd64 C=2: 4 of 8; lfm25 C=2: 8 of 16) and a quarter
+# (lfm25 C=1), against the all-resident E runs above
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q64-e3pool2 "$OUT/htp64q" htp "$OUT/dump_64e3pool2" "$OUT/64e3pool2.log" --max-seq 32
+for c in 1 2; do
+  PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=$c \
+    run_e2e q25-e3pool$c "$OUT/htp25q" htp "$OUT/dump_25e3pool$c" "$OUT/25e3pool$c.log" --max-seq 2048
+done
+# [plan 201 S1] one PD (NNTR_HTP_E2E_PDS=1): every kind, the FC set and the
+# pool in S1, one packet and no hops; against the two-PD E runs, all
+# experts resident and with a pool of half of them
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 \
+  run_e2e q64-pd1 "$OUT/htp64q" htp "$OUT/dump_64pd1" "$OUT/64pd1.log" --max-seq 32
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 \
+  run_e2e q25-pd1 "$OUT/htp25q" htp "$OUT/dump_25pd1" "$OUT/25pd1.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q25-pd1pool2 "$OUT/htp25q" htp "$OUT/dump_25pd1pool2" "$OUT/25pd1pool2.log" --max-seq 2048
 # [#194 S1] lever L1 on the same two-session token
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
   run_e2e q64-l1ppl "$OUT/htp64q" htp "$OUT/dump_64l1ppl" "$OUT/64l1ppl.log" --max-seq 32 --run
@@ -414,11 +434,34 @@ if [ $rc = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ESCHEMENOTSUPPOR
 else
   echo "E2E FAIL all kinds at head_dim 8 not refused (rc=$rc)"; fail=1
 fi
-if [ $rc_pool = 1 ] && grep -q '^E2E FAIL NNTR_HTP_FORWARD / NNTR_HTP_E2E with NNTR_MOE_CACHE_EXPERTS' "$OUT/64e3pool.log"; then
-  echo "E2E e3 pool C=2 refused: the expert pool is not in the per-token entry (plan 201 S1)"
-else
-  echo "E2E FAIL e3 with NNTR_MOE_CACHE_EXPERTS=2 not refused (rc=$rc_pool)"; fail=1
-fi
+for d in "64e3 64e3pool2 hd64 2" "25e3 25e3pool1 lfm25 1" "25e3 25e3pool2 lfm25 2" \
+  "25e3 25pd1pool2 lfm25 2 pds=1"; do
+  set -- $d
+  ev="$($EVAL --label "e3pool-$3-C$4" "$OUT/dump_$1" "$OUT/dump_$2" | tail -1 || true)"
+  calls="$(calls_per_token "$OUT/$2.log")"
+  close="$(grep -o 'token driver: close .*' "$OUT/$2.log")"
+  misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/$2.log")"
+  if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+     grep -q 'timeouts=0/0 stale=0/0' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+    echo "E2E e3 ${5:+$5 }pool C=$4 $3 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0/0"
+  else
+    echo "E2E FAIL e3 ${5:+$5 }pool C=$4 $3: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+  fi
+done
+for d in "64e3 64pd1 hd64" "25e3 25pd1 lfm25"; do
+  set -- $d
+  ev="$($EVAL --label "pd1-$3" "$OUT/dump_$1" "$OUT/dump_$2" | tail -1 || true)"
+  calls="$(calls_per_token "$OUT/$2.log")"
+  close="$(grep -o 'token driver: close .*' "$OUT/$2.log")"
+  if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+     grep -q 'hops/token=0.00 .* timeouts=0/0 stale=0/0' <<< "$close" &&
+     grep -q 'token driver: on .* pds=1' "$OUT/$2.log" &&
+     grep -q 's2: close .* unmap_fail=0 detach_fail=0 ' "$OUT/$2.log"; then
+    echo "E2E e3 pds=1 $3 == pds=2 bit_identical=1 calls/token=1.00 hops/token=0.00 timeouts=0/0 unmap_fail=0"
+  else
+    echo "E2E FAIL e3 pds=1 $3: [$ev] calls/token=${calls:-none} close=[$close]"; fail=1
+  fi
+done
 # (f) the hd64 fixture: its own golden with the switch off; with it on, 12
 # calls per token, the SNR floor, the token policy, and the init lines
 $EVAL --label golden-hd64 "$GOLDEN64" "$OUT/dump_64off" | tail -1 || fail=1

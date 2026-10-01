@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 ##
-# @file    201-s0-run.sh
-# @brief   Plan 201 S0 device sitting: the expert pool on the hybrid path,
-#          against A and E0 (handoff docs/measurements/201-pool-baseline.md)
+# @file    201-s2-run.sh
+# @brief   Plan 201 S2 (two-PD half) device sitting: the expert pool inside
+#          the per-token E2E entry (P2) against A and E0 (handoff
+#          docs/measurements/201-fsu-e2e.md)
 #
-# Staged by 201-s0-stage.sh as run_s0.sh; run from the stage directory's copy:
-#   bash /local/mnt/workspace/htp_moe/201/s0/run_s0.sh [serial]
+# Staged by 201-s2-stage.sh as run_s2.sh; run from the stage directory's copy:
+#   bash /local/mnt/workspace/htp_moe/201/s2/run_s2.sh [serial, default the S25]
 # Variants (one binary set, env only):
-#   A    hybrid, nothing set (the unchanged reference)
-#   E0   NNTR_HTP_E2E=1 (two sessions, all experts resident)
-#   F28  A + NNTR_MOE_CACHE_EXPERTS=28, model file pre-read (warm)
-#   F16w A + NNTR_MOE_CACHE_EXPERTS=16, model file pre-read (warm)
-#   F16c A + NNTR_MOE_CACHE_EXPERTS=16, page_cache_evict on the model file
-#        every 20 ms for the whole run (cold: every miss read from flash)
-# Per G in 64 512 1024: zone0 <= 35 C, then A E0 F28 F16w F16c F16c F16w F28
-# E0 A. Then G = 64 profile runs (NNTR_HTP_PROFILE=2) of F28 / F16w / F16c,
-# and one A run at G = 1024 with NNTR_MOE_TRACE (pulled, replayed with
-# tools/moe_expert_cache_sim.py on the workstation). S1's mapping ceiling
-# after every run. RESUMABLE per run: a finished run leaves logs/done/<run>;
-# after any STOP (LEAK, 0x8000040e, a failed token, FATAL) reboot the phone
-# and run the same command again.
+#   A     hybrid, nothing set (the unchanged reference)
+#   E0    NNTR_HTP_E2E=1 (two sessions, all experts resident)
+#   P<C>  NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=<C>, the model file pre-read
+#         (warm; its resident MiB printed before the run)
+#   P16c  P16 with page_cache_evict on the model file every 20 ms (cold)
+# G = 64: cool, A E0 P28 P24 P16, cool, P16 P24 P28 E0 A. G = 512 / 1024:
+# cool, A E0 Pbest P28, cool, P28 Pbest E0 A (Pbest: the fastest of P16 /
+# P24 / P28 at G = 64, r1 + r2; P24 when that is P28). Then at G = 64: P16c,
+# one NNTR_HTP_PROFILE=2 run each of P28 / P24 / P16 (read ms a miss), and
+# P32 (every expert in the pool: the no-miss control). S1's ceiling after
+# every run. RESUMABLE per run (logs/done/<run>); after any STOP reboot the
+# phone and run the same command again.
 set -u -o pipefail
 S=${1:-R3CY10WM83Y} # the S25; never the first `adb devices` entry (a Note20 is attached too)
 W=$(cd "$(dirname "$0")" && pwd); L=$W/logs; mkdir -p $L/done
-C=/data/local/tmp/nntrainer/causallm; D=$C/s201s0; M=../models/q40-qs4cx-wh
+C=/data/local/tmp/nntrainer/causallm; D=$C/s201s2; M=../models/q40-qs4cx-wh
 MF=$M/nntr_lfm2_8b_a1b_q40_arm.bin
 AD="adb -s $S"
 exec > >(tee -a $L/sitting.out) 2>&1
@@ -41,16 +41,18 @@ ceil() {
   echo "ceiling after $1: ${c:-?} MiB" | tee -a $L/ceiling.txt
   [ "${c:-0}" -ge 3840 ] || stop "LEAK: S1 ceiling ${c:-?} MiB after $1"; }
 strip() { sed -n '/^=====/q;p' "$1" | perl -0pe 's/\[HTP[^\]\n]*\] [^\n]*\n//g; s/\[PPL\] [^\n]*\n//g' |
-  grep -v 'moe m1 gemv\|libnntr_hvx_skel\|nntrainer_causallm\|num_to_generate'; }
-run() { # run <A|E0|F28|F16w|F16c> <G> <log> [env ...]
+  grep -v 'moe m1 gemv\|libnntr_hvx_skel\|nntrainer_causallm\|num_to_generate\|^resident [0-9]* MiB'; }
+run() { # run <A|E0|P<C>|P16c> <G> <log> [env ...]
   local v=$1 g=$2 log=$3 e="" pre="" post=""; shift 3
   [ -f $L/done/$log ] && { echo "$log: done earlier, skipped"; return 0; }
   case $v in
+    A) ;;
     E0) e="NNTR_HTP_E2E=1" ;;
-    F28) e="NNTR_MOE_CACHE_EXPERTS=28"; pre="cat $MF > /dev/null &&" ;;
-    F16w) e="NNTR_MOE_CACHE_EXPERTS=16"; pre="cat $MF > /dev/null &&" ;;
-    F16c) e="NNTR_MOE_CACHE_EXPERTS=16"; pre="(./page_cache_evict $MF 20 & echo \$! > evict.pid) &&"
+    P16c) e="NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=16"
+          pre="(./page_cache_evict $MF 20 & echo \$! > evict.pid) &&"
           post="; kill \$(cat evict.pid); rm -f evict.pid" ;;
+    P*) e="NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=${v#P}"
+        pre="cat $MF > /dev/null && ./page_cache_evict $MF -1 &&" ;;
   esac
   $AD logcat -c
   $AD shell "cd $D && sed -i 's/\"num_to_generate\": [0-9]*/\"num_to_generate\": $g/' $M/nntr_config.json && \
@@ -59,24 +61,25 @@ run() { # run <A|E0|F28|F16w|F16c> <G> <log> [env ...]
   $AD logcat -d | grep -iE 'adsprpc|fastrpc|nntr_hvx|token' > $L/$log.logcat || true
   grep -qi '0x8000040e' $L/$log.log && stop "$log: 0x8000040e (stale skel or stub)"
   grep -q FATAL $L/$log.log && stop "$log: $(grep -m1 FATAL $L/$log.log | cut -c1-200)"
-  grep -q 'token driver: token .* failed' $L/$log.log && stop "$log: a token failed (AEE_EEXPIRED = a hop timed out)"
+  grep -q 'token driver: token .* failed\|token driver: .* transport failed' $L/$log.log && stop "$log: a token failed ($(grep -m1 'token driver: token' $L/$log.log | cut -c1-160))"
   grep -q '^generation:' $L/$log.log || stop "$log cannot generate (a LEAK? reboot; logcat in $log.logcat)"
-  echo "$log: $(grep -h -E '^(prefill|generation|generation\(last 64\)):' $L/$log.log | grep -o '[0-9.]* TPS' | tr '\n' ' ')$(grep -h -o 'peak memory: [0-9]* KB' $L/$log.log) $(grep -h -o 'calls/token=[0-9.]*' $L/$log.log)"
+  echo "$log: $(grep -h -E '^(prefill|generation|generation\(last 64\)):' $L/$log.log | grep -o '[0-9.]* TPS' | tr '\n' ' ')$(grep -h -o 'calls/token=[0-9.]*' $L/$log.log) $(grep -h -o 'resident [0-9]* MiB' $L/$log.log)"
   case $v in
-    E0)
+    A)
+      want "$log hybrid banners (dspq on, no s2)" "$(grep -c '\[HTP\] dspq: on' $L/$log.log)/$(grep -c 's2: open' $L/$log.log)" 1/0 ;;
+    *)
       want "$log levers banner" "$(grep -c '^\[HTP\] ppl levers=0x0 L1=exact$' $L/$log.log)" 1
       want "$log s2 close: no unmap / detach refused" "$(grep -c 's2: close .* unmap_fail=0 detach_fail=0 ' $L/$log.log)" 1
-      want "$log s2 arena after S1 (3840)" "$(grep -c 's2: fc arena weights=67 handles=74 .* s1_arena_mib=3840' $L/$log.log)" 1
       want "$log close clean" "$(grep -c 'token driver: close tokens=[0-9]* hops/token=44.00 .* timeouts=0/0 stale=0/0 .* id_mismatch=0 ' $L/$log.log)" 1
-      want "$log calls/token=1.00" "$(grep -cF 'calls/token=1.00' $L/$log.log)" 1 ;;
-    *)
-      want "$log hybrid banners (dspq on, no s2)" "$(grep -c '\[HTP\] dspq: on' $L/$log.log)/$(grep -c 's2: open' $L/$log.log)" 1/0 ;;
+      want "$log calls/token=1.00" "$(grep -cF 'calls/token=1.00' $L/$log.log)" 1
+      [ $v = E0 ] || grep -h 'token driver: pool\|token driver: L0 us/token' $L/$log.log | sed 's/^/    /' ;;
   esac
   touch $L/done/$log
   ceil $log; }
+mean() { grep -h '^generation:' "$@" | grep -o '[0-9.]* TPS' | awk '{s += $1; n++} END {printf "%.2f", n ? s / n : 0}'; }
 
-echo "=== 201 S0 $(date '+%F %T %Z') unit=$S (done: $(ls $L/done | wc -l) runs)"
-$AD get-state > /dev/null 2>&1 || stop "no device attached"
+echo "=== 201 S2 $(date '+%F %T %Z') unit=$S (done: $(ls $L/done | wc -l) runs)"
+$AD get-state > /dev/null 2>&1 || stop "unit $S not attached"
 echo "uptime (reboot first): $($AD shell cat /proc/uptime | tr -d '\r')"
 $AD shell input keyevent 223 || true
 therm t0
@@ -93,8 +96,6 @@ $AD shell "cd $D/$M && sed -i 's/\"do_sample\": true/\"do_sample\": false/' gene
 
 if [ ! -f $L/done/evict_check ]; then
   cool; run A 64 warmup
-  # the model file's own pages (mincore), not /proc/meminfo's Cached: the
-  # file is a symlink and the phone never holds all of it (S0: 2613 of 4116)
   r=$($AD shell "cd $D && ./page_cache_evict $MF" | tr -d '\r')
   echo "evict check: $r" | tee $L/evict_check.txt
   set -- $r # resident <a> -> <b> MiB of <c> MiB
@@ -103,36 +104,38 @@ if [ ! -f $L/done/evict_check ]; then
   touch $L/done/evict_check
 fi
 
-for g in 64 512 1024; do
-  n=0; for r in r1 r2; do for v in A E0 F28 F16w F16c; do [ -f $L/done/${v}_G${g}_$r ] && n=$((n + 1)); done; done
-  [ $n = 10 ] && { echo "--- G=$g done earlier"; continue; }
+echo "--- G=64 $(date +%H:%M:%S)"; cool
+for v in A E0 P28 P24 P16; do run $v 64 ${v}_G64_r1; done
+cool
+for v in P16 P24 P28 E0 A; do run $v 64 ${v}_G64_r2; done
+therm t_G64
+best=P16; bt=0
+for v in P16 P24 P28; do t=$(mean $L/${v}_G64_r1.log $L/${v}_G64_r2.log)
+  echo "G=64 mean decode $v: $t"; awk -v a=$t -v b=$bt 'BEGIN {exit !(a > b)}' && { best=$v; bt=$t; }; done
+[ $best = P28 ] && best=P24
+echo "Pbest=$best (with P28 at G 512 / 1024)" | tee $L/best.txt
+for g in 512 1024; do
   echo "--- G=$g $(date +%H:%M:%S)"; cool
-  for v in A E0 F28 F16w F16c; do run $v $g ${v}_G${g}_r1; done
-  for v in F16c F16w F28 E0 A; do run $v $g ${v}_G${g}_r2; done
+  for v in A E0 $best P28; do run $v $g ${v}_G${g}_r1; done
+  cool
+  for v in P28 $best E0 A; do run $v $g ${v}_G${g}_r2; done
   therm t_G$g
 done
-
-echo "--- profiles (G = 64, NNTR_HTP_PROFILE=2; not for tok/s)"; cool
-for v in F28 F16w F16c; do run $v 64 prof_$v NNTR_HTP_PROFILE=2; done
-
-echo "--- routing trace (A, G = 1024)"
-if [ ! -f $L/done/trace_A_G1024 ]; then
-  $AD shell "rm -f $D/moe_trace.txt"
-  run A 1024 trace_A_G1024 NNTR_MOE_TRACE=moe_trace.txt
-  $AD pull $D/moe_trace.txt $L/moe_trace.txt > /dev/null || stop "no moe_trace.txt on the device"
-fi
+echo "--- G=64 extras: cold, profiles, the no-miss control"; cool
+run P16c 64 P16c_G64
+for v in P28 P24 P16; do run $v 64 prof_$v NNTR_HTP_PROFILE=2; done
+run P32 64 P32_G64
 therm t_end
 
-echo "--- speed (prefill / decode / last 64 TPS; peak RSS; text vs A r1 of the same G)"
-for g in 64 512 1024; do for r in r1 r2; do for v in A E0 F28 F16w F16c; do f=$L/${v}_G${g}_$r.log
+echo "--- speed (prefill / decode / last 64 TPS; text vs A r1 of the same G)"
+for f in $L/[AEP]*_G*_r[12].log $L/P16c_G64.log $L/P32_G64.log; do b=$(basename $f .log); g=${b#*_G}; g=${g%%_*}
   t=$(cmp -s <(strip $L/A_G${g}_r1.log) <(strip $f) && echo same || echo DIFF)
-  echo "G=$g $v $r: $(grep -h -E '^(prefill|generation|generation\(last 64\)):' $f | grep -o '[0-9.]* TPS' | tr '\n' ' ')$(grep -h -o 'peak memory: [0-9]* KB' $f) text=$t"
-done; done; done | tee $L/speed.txt
-want "every text == A r1 of its G (the pool and E0 are A's bits)" "$(grep -c 'text=DIFF' $L/speed.txt)" 0
-echo "--- E0 per session and L0 (G = 512 r1)"; grep -h -E 'per-kind pcyc|moe pcyc/round|token driver: close|L0 us/token|L0 wake' $L/E0_G512_r1.log | sed 's/^/  /'
-echo "--- pool profiles"; for v in F28 F16w F16c; do echo "$v:"; grep -h -E 'expert cache misses|expert misses|arena chunk .*mapped total|peak memory|^generation:' $L/prof_$v.log | tail -6 | sed 's/^/  /'; done
-echo "--- hit rate per C (simulator on the trace; 22 layers)"
-python3 $W/tools/moe_expert_cache_sim.py $L/moe_trace.txt --cache 8 12 16 20 24 28 32 --policies ours belady 2>&1 | tee $L/sim.txt
+  echo "$b: $(grep -h -E '^(prefill|generation|generation\(last 64\)):' $f | grep -o '[0-9.]* TPS' | tr '\n' ' ')text=$t"
+done | tee $L/speed.txt
+want "every text == A r1 of its G (E0 and the pool are A's bits)" "$(grep -c 'text=DIFF' $L/speed.txt)" 0
+echo "--- pool lines (misses, miss wait, the server's time a round; L0)"
+for f in $L/P*_G*.log $L/prof_*.log; do echo "$(basename $f .log):"; grep -h 'token driver: pool\|L0 us/token\|expert cache misses\|resident [0-9]* MiB' $f | sed 's/^/  /'; done | tee $L/pool.txt
+echo "--- E0 / P per session (G = 512 r1)"; for v in E0 P28 $best; do echo "$v"; grep -h -E 'per-kind pcyc|moe pcyc/round|L0 us/token|L0 wake' $L/${v}_G512_r1.log | sed 's/^/  /'; done
 echo "--- evict check"; cat $L/evict_check.txt
 echo "--- ceiling"; sort -t: -k2 -n $L/ceiling.txt | head -2
 echo "--- therm"; cat $L/therm.log

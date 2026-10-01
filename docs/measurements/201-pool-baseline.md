@@ -6,6 +6,54 @@ its runner and the evictor tool, no code the app or skel is built from).
 Staged at `/local/mnt/workspace/htp_moe/201/s0/`. **Estimated device time:
 ≈ 55 min, reboot first** (+ ≈ 1 min a LEAK stop and its reboot).
 
+**Run 2026-09-30 21:42–22:08 KST on `R3CY10WM83Y` (S25 Ultra), no stop,
+read from `/local/mnt/workspace/htp_moe/201/s0/logs/` (`sitting.out`,
+`speed.txt`, `sim.txt`, the per-run logs). Section "Sitting as read" below.**
+
+## Sitting as read
+
+Uptime 65 s at the start (rebooted), battery 100 %. MD5 OK on both ends.
+Ceiling 3840 MiB after every one of the 36 runs; no `LEAK`, no
+`0x8000040e`, no failed token. `expectation mismatches: 1`, the evict check
+(below), which was a wrong check, not a wrong run.
+
+* **Every text equals A r1 of its G** (`text=DIFF` count 0 over 30 cells):
+  E0 and the pool at C = 28 / 16, warm and cold, are A's bits on silicon.
+* **The misses explain most of the pool's cost.** Decode ms a token from
+  the G = 64 profile runs: A ≈ 17.5, F28 20.7, F16w 23.4, F16c 74.4. Misses
+  × (read + swap) account for 3.1 of F28's +3.2 ms (104 misses = 1.6 a
+  token × 1.94 ms), 4.6 of F16w's +5.9 (648 = 10.1 a token × 0.46) and 48.8
+  of F16c's +56.9 (× 4.83); the rest is not split. The simulator on A's G =
+  1024 trace gives 0.48 misses a decode call at C = 16 (10.6 a token),
+  matching F16's 10.1.
+* **A warm miss is 0.40 ms (F16w) but 1.85 ms at F28.** Not explained.
+  `page_cache_evict` (report mode, run after the sitting) found **2613 of
+  the file's 4116 MiB** resident after the last run: the phone never holds
+  the whole expert section, so "warm" is only partly warm, and a bigger
+  arena (F28 3.3 GB against F16 1.9 GB) may leave less of it. That is a
+  hypothesis for S2's warm cells to read (the S2 runner prints the file's
+  resident MiB before each pool run), not a finding.
+* **F16c is cold**: 4.76 ms a miss against F16w's 0.40 on the same 648
+  misses. That, not the evict check, is the evidence. The check itself was
+  wrong twice: `stat` read the symlink (`the file is 0 MB`) and the 2000 MB
+  threshold on `/proc/meminfo` Cached assumed the whole file was cached
+  (the drop was 558 MB). The runner now asks the tool for the file's own
+  resident pages (mincore) before and after (`resident a -> b MiB of c`,
+  pass when b < 1 % of c; on this phone after the sitting: `resident 2613
+  -> 0 MiB of 4116 MiB`).
+* **E0 is 12 ms a token behind A** (G = 512: 32.1 / 32.5 against 55.4 /
+  55.4). Where it goes (E0 G = 512 r1): rt 29.2 ms = S2's wall 25.2 + the
+  wake 4.1 (almost all `ret s2` 4.0: S2's answer to the ARM's blocking
+  read); S2's FC + DENSE_FFN + LM_HEAD 11.07 ms against 8.06 isolated
+  (#178: S2 has no VTCM); S1's MoE 10.2 ms (0.464 ms a round) + router 0.82.
+* **Thermal**: each G block started at zone0 ≤ 35 °C, but within a block
+  zone0 climbed to 52 / 62 / 65 °C (G 64 / 512 / 1024). The G = 1024 r2
+  cells ran hot and read low for every variant (A 49.4 against r1 54.9);
+  read G = 1024 from r1. S2's runner also cools between r1 and r2.
+* **Prefill** (G = 512, r1 / r2): A 512 / 504, E0 548 / 392, F28 529 / 393,
+  F16w 446 / 449. The r2 spread is thermal. F16c's prefill (344 / 354) is
+  cold by construction.
+
 ## Why
 
 Plan `docs/plans/201-htp-decode-e2e-review-gemma-moe.md` §4 S0. Before the
@@ -116,60 +164,68 @@ cache misses: <n>, file read <ms> (<ms>/miss), swap rpc …` and `[HTP] arena
 chunk … mapped total <MiB>`; the summary `every text == A r1 of its G … = 0`
 and `expectation mismatches (this invocation): 0`.
 
-## Results (fill in)
+## Results
 
-### Speed (prompt 512; prefill / decode all / decode last 64 TPS; peak RSS; text vs A r1)
+### Speed (prompt 512; decode tok/s all, r1 / r2; last 64 in brackets where it differs)
 
-| G | run | A | E0 | F28 | F16w | F16c |
-|---|---|---|---|---|---|---|
-| 64 | r1 | | | | | |
-| 64 | r2 | | | | | |
-| 512 | r1 | | | | | |
-| 512 | r2 | | | | | |
-| 1024 | r1 | | | | | |
-| 1024 | r2 | | | | | |
+| G | A | E0 | F28 | F16w | F16c |
+|---|---|---|---|---|---|
+| 64 | 57.30 / 55.90 | 30.70 / 31.83 | 54.94 / 52.89 | 44.82 / 45.42 | 12.81 / 13.42 |
+| 512 | 55.36 / 55.42 (54.42 / 53.78) | 32.11 / 32.54 | 53.47 / 54.35 (55.41 / 54.51) | 44.38 / 45.90 | 12.72 / 12.77 |
+| 1024 | 54.90 / 49.45 (52.33 / 45.04) | 31.36 / 31.62 | 54.44 / 47.81 (51.91 / 45.85) | 43.09 / 41.82 (40.74 / 35.22) | 11.72 / 11.38 |
 
-Reference (not this tree): #194 sitting 1b A 56.21 / 54.89 (G = 512), E0
-32.19 / 30.94; doc 52 C = 16 warm on another unit 57 / 73 / 85 % hits at
-C = 8 / 12 / 16. Goal ≥ 50 decode; prefill never below −5 % of this
-sitting's A (F16c excepted, its prefill is cold by construction).
+Text = A r1 of the same G in all 30 cells. Peak RSS: A / E0 4.7–5.3 GB
+(the resident experts), F28 / F16 0.83–0.91 GB.
 
-### Pool (G = 64 profile runs)
+### Pool (G = 64 profile runs, `NNTR_HTP_PROFILE=2`)
 
-| variant | misses (all / per decode call) | file read ms a miss | swap rpc ms a miss | mapped arena MiB | peak RSS | decode tok/s |
-|---|---|---|---|---|---|---|
-| F28 | | | | | | |
-| F16w | | | | | | |
-| F16c | | | | | | |
+| variant | misses (decode calls 1408) | a token | file read ms a miss | swap rpc ms a miss | mapped arena MiB | peak RSS MB | decode tok/s (profiled) |
+|---|---|---|---|---|---|---|---|
+| F28 | 104 (0.07 / call) | 1.6 | 1.85 | 0.09 | 3328 | 843 | 48.37 |
+| F16w | 648 (0.46 / call) | 10.1 | 0.40 | 0.06 | 1920 | 843 | 42.72 |
+| F16c | 648 (0.46 / call) | 10.1 | 4.76 | 0.07 | 1920 | 814 | 13.44 |
 
-### Hit rate per C (simulator on the A G = 1024 trace, policy `ours` / `belady`)
+### Hit rate per C (simulator on the A G = 1024 trace, 22 528 decode calls)
 
 | C | 8 | 12 | 16 | 20 | 24 | 28 | 32 |
 |---|---|---|---|---|---|---|---|
-| miss / decode call | | | | | | | |
-| hit % | | | | | | | |
+| miss / decode call, ours | 1.59 | 0.90 | 0.48 | 0.21 | 0.05 | 0.00 | 0.00 |
+| hit %, ours | 60.2 | 77.6 | 88.0 | 94.7 | 98.8 | 99.9 | 100.0 |
+| hit %, belady | 81.7 | 90.5 | 95.7 | 98.4 | 99.7 | 100.0 | 100.0 |
+
+Read-ahead ceiling (previous token's top-(4+m) of the same layer): top-4
+44.8 %, top-8 63.6 % covered.
 
 ### E0 per session and L0 (G = 512 r1)
 
-<paste the `graph[S1|S2] per-kind`, `moe pcyc/round`, `L0` and `close` lines>
+```
+graph[S1] per-kind pcyc/token: ROUTER_TOPK=1724753(0.822ms) MOE=21408265(10.206ms) | wall_ms/token=22.059 mhz=2098
+graph[S2] per-kind pcyc/token: RMSNORM=813267(0.387ms) FC=12536569(5.972ms) CONV1D_GATE=1073936(0.512ms) QK_NORM=213166(0.102ms) ROPE=51525(0.025ms) ATTN_M1=1617489(0.770ms) ADD=275599(0.131ms) DENSE_FFN=4229761(2.015ms) LM_HEAD=6467801(3.081ms) | wall_ms/token=25.151 mhz=2099
+graph[S1] moe pcyc/round=973103 (0.464 ms) router pcyc/round=78398; s2 fc+dense_ffn+lm_head ms/token=11.068 (isolated #178: 8.06); arm token_ms=29.233
+L0 wake us/token disp s1=57.4 s2=63.3 s2_pkt=3.0 ret s2=4015.5 clk_resid=-0.2
+L0 us/token rt=29232.7 s2_wall=25151.2 s1_wall=22059.5 wake=4081.5 hop_us s1=305.0 s2=327.5 arm_fwd=29242.7 arm_us=1624.7 arm_n=511
+close tokens=512 hops/token=44.00 s1_served=512 s2_served=512 timeouts=0/0 stale=0/0 id_checked=0 id_mismatch=0
+```
 
 ### Evict check, ceiling, thermal
 
-<paste>
+`evict check: Cached 2007 -> 1449 MB (dropped 558 MB; the file is 0 MB)`
+(the check was wrong, see "Sitting as read"). Ceiling 3840 MiB after all
+36 runs. Therm: t0 21:42 zone0 34.3 °C; after G 64 / 512 / 1024 55.2 /
+62.5 / 65.6 °C; end 61.4 °C; battery 100 % throughout.
 
 ## Text approval
 
-Not a PPL sitting (see Why): every text must be A's. The user reads A's
-G = 64 r1 text once for sanity; any `text=DIFF` row is void.
-
-| variant | text = A r1 (G 64 / 512 / 1024) | generated text (G = 64, r1) |
-|---|---|---|
-| A | (reference) | <paste> |
-| E0 | | |
-| F28 | | |
-| F16w | | |
-| F16c | | |
+Not a PPL sitting: every text equals A's (`every text == A r1 of its G = 0`
+differing), so nothing needs approval. A's G = 64 r1 text, for the record:
+"town has a single main street that climbs from the harbour to a stone
+church at the top of the hill, and along it stand a bakery, a hardware
+shop, two pubs, a post office that also sells fishing line, a small museum
+that opens only on summer weekends, and a lifeboat station".
 
 ## Notes from the run
 
-<unit serial, battery, thermal, LEAK stops and reboots, anything stale>
+Run by the orchestrator on `R3CY10WM83Y`; a Note20 (`R3CN80CW3FY`) was also
+attached. The runner then took the first `adb devices` entry when given no
+serial; it now defaults to the S25's serial. Cooling waits of 30 s–3.5 min
+before each G block.
