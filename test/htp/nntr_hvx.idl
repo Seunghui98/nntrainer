@@ -223,9 +223,11 @@ interface nntr_hvx : remote_handle64 {
    // separate "the two arithmetics differ" from "they agree and something
    // downstream does not" -- the whole point is bit identity against a
    // scalar reference, so a failure has to say WHERE.
-   // Every length must match and be a multiple of 32.
-   AEEResult swiglu_det_f32(in sequence<float> gate, in sequence<float> up,
-                            rout sequence<float> res,
+   // Every length must match and be a multiple of 32. act 0 is SwiGLU,
+   // 1 the GeGLU twin (hvx_geglu_det_sf; exp_out and recip_out are then
+   // of t = g (C0 + C1 g^2), doc 55).
+   AEEResult swiglu_det_f32(in uint32 act, in sequence<float> gate,
+                            in sequence<float> up, rout sequence<float> res,
                             rout sequence<float> exp_out,
                             rout sequence<float> recip_out);
 
