@@ -450,6 +450,21 @@ Each ends in a rung of `.claude/skills/hexagon-gates`.
   speed on silicon first (S4 gates their arithmetic, not their time), then
   one issue per lever that reads above 1 ms a token.
 
+### 4.1 Device change: the S26 (v81) replaces the S25 (2026-10-01)
+
+The user withdraws the S25 after the one-PD sitting. `htp_decode` carries
+none of the S26 stack (it descends from `htp_moe` 40e797ed; the stack is on
+local tags `archive/htp/168-s26-v81-bringup`, `177-m1-dma-queues`,
+`185-dqr`), so on the S26 the M=1 feed would run on one DMA queue — 34 %
+below the S25's single queue, which #177's 4-queue split recovered (+22–25 %
+decode). The user asked that this be considered. Before any S2/S3 sitting
+on the S26: port the three sets onto `htp_decode` (conflicts expected where
+the FSU merge touched the DMA ring and the u8i4 feed), v81 skel + stub,
+device gtests, then one re-baseline sitting (A, E0, P28, the one-PD variant
+if landed; 4 queues and 1 queue each). Filed as its own issue. The S25
+columns of `201-pool-baseline.md` / `201-fsu-e2e.md` stay that device's
+record; the S26 gets its own.
+
 ## 5. Risks
 
 * **Hit rate above C = 16 and for Gemma is unknown**; the whole one-PD
