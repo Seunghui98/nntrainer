@@ -171,7 +171,9 @@ export ANDROID_NDK=~/workspace/android-ndk-r26d
 ./build_android.sh --htp
 ```
 기대 결과: `[SUCCESS] Build completed successfully!`와 `libcausallm_core.so`, `nntrainer_causallm` 두 줄의 `[OK]`.
-실패하면: `HexKL addon not found` → `HEXKL_ROOT` 확인. `generate_stub.sh` 에러 → `HEXAGON_SDK_ROOT` 확인. 스크립트가 "this does NOT rebuild libnntr_hvx_skel.so"라고 알리는 것은 정상이다(이번엔 skel이 그대로여도 된다).
+실패하면:
+- `no member named 'whUnpack' in namespace 'nntrainer'` → **`--cache`를 붙여 돌린 것이다.** 앱은 `nntrainer/tensor/`의 헤더가 아니라 `builddir/android_build_result/include/nntrainer/`의 **설치된 사본**을 본다. `--cache`는 nntrainer 빌드를 건너뛰어 그 사본을 갱신하지 않는다. 위 명령처럼 `--cache` 없이 돌릴 것(nntrainer 재빌드까지 약 15분).
+- `HexKL addon not found` → `HEXKL_ROOT` 확인. `generate_stub.sh` 에러 → `HEXAGON_SDK_ROOT` 확인. 스크립트가 "this does NOT rebuild libnntr_hvx_skel.so"라고 알리는 것은 정상이다(이번엔 skel이 그대로여도 된다).
 
 ### 4단계 — 기기에 올리고 ppl을 다시 잰다
 
