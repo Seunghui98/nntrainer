@@ -137,28 +137,26 @@ bash test/htp/host/run_host_checks.sh
 
 ### 2단계 — 재배치한 FP32를 다시 양자화 (PC, 약 40분)
 
-재배치 파일은 이미 PC에 있다(`res/gemma4_26ba4b/nntr_gemma4_fp32_fixed.safetensors`, 100.93 GB). 양자화기는 이제 입력 헤더를 보고 자기가 읽는 순서와 다르면 **dry run에서** 멈춘다.
+**이 단계는 이미 PC에서 돌려 뒀다.** 결과(`res/gemma4_26ba4b/q40_fixed/nntr_gemma4_q40_arm.bin`)가 있으면 3단계로 가고, 다시 만들어야 할 때만 아래를 돌린다.
+
+재배치한 FP32는 `res/gemma4_26ba4b/nntr_gemma4_fp32_fixed.safetensors`(페이로드 100,932,567,160 B — 옛 파일과 같은 바이트 수, 순서만 다르다)이고, 그것을 `model_file_name`으로 가리키는 심볼릭 링크 디렉터리 `res/gemma4_26ba4b_fixed/`가 입력이다. **입력 파일명은 항상 모델 디렉터리의 `nntr_config.json`에서 온다** — `--config`는 출력 설정만 바꾼다(그래서 `--config`로 FP32 설정을 주면 `lmhead_dtype FP32`가 임베딩 Q4_0과 어긋나 tied 검사에서 멈춘다).
 
 ```bash
 cd ~/workspace/nntrainer
-R=Applications/CausalLM/res/gemma4_26ba4b
-cp $R/nntr_config.json $R/nntr_config_fixed.json
-python3 - <<'PY'
-import json, pathlib
-p = pathlib.Path("Applications/CausalLM/res/gemma4_26ba4b/nntr_config_fixed.json")
-c = json.loads(p.read_text())
-c["model_file_name"] = "nntr_gemma4_fp32_fixed.safetensors"
-p.write_text(json.dumps(c, indent=2))
-PY
-./build/Applications/CausalLM/nntr_quantize_stream $R \
-  --config $R/nntr_config_fixed.json \
-  -o $R/q40_fixed \
+./build/Applications/CausalLM/nntr_quantize_stream \
+  Applications/CausalLM/res/gemma4_26ba4b_fixed \
+  -o Applications/CausalLM/res/gemma4_26ba4b/q40_fixed \
+  --output_bin nntr_gemma4_q40_arm.bin \
   --fc_dtype Q4_0 --moe_dtype QS4CX_WH --embd_dtype Q4_0 --isa ARM
-ls -l $R/q40_fixed/
+ls -l Applications/CausalLM/res/gemma4_26ba4b/q40_fixed/
 ```
-기대 결과: `Quantized layer 1/30` … `30/30` 뒤 `Output size: 12336 MiB` 근처, `Streaming quantization complete`. 출력 `.bin`이 12,9xx,xxx,xxx B(= 12,336 MiB)이고 §10.3의 옛 파일과 **크기가 같다**(바뀐 것은 값이 아니라 순서다).
+`build`의 바이너리를 쓸 것. `build_x86`의 것은 이번 가드가 없어서 순서 불일치를 또 조용히 통과시킨다.
+
+기대 결과: `Quantized layer 1/30` … `30/30` 뒤 `Streaming quantization complete`. 출력 `.bin`이 12,935,608,440 B(= 12,336 MiB)로 §10.3의 옛 파일과 **크기가 같다**(바뀐 것은 값이 아니라 순서다).
 실패하면:
-- `Input layout mismatch at tensor <n>: ...` → 재배치가 덜 됐거나 잘못된 파일을 가리켰다. 그 줄을 그대로 알려 줄 것. 옛 파일(`nntr_gemma4_fp32.safetensors`)로 돌리면 `tensor 15`에서 같은 메시지가 나오는 게 정상이다.
+- `Input layout mismatch at tensor <n>: ...` → 입력이 재배치 전 파일이다. 옛 파일(`res/gemma4_26ba4b`를 그대로 입력으로)이면 `tensor 15`에서 이 메시지가 나오는 게 **정상**이고, 그것이 §10.5의 원인이다.
+- `A tied model requires matching embedding and LM head dtypes` → `--config`를 줬거나 `--lmhead_dtype`이 임베딩과 다르다. 위 명령처럼 `--config` 없이.
+- `--output_bin must use the .bin extension` → `--config`를 준 탓에 출력 이름이 입력의 `.safetensors`에서 유도됐다. 위 명령처럼.
 - 디스크가 모자라면(`df -h /`에서 20 GB 미만) 옛 `q40/nntr_gemma4_q40_arm.bin`을 먼저 지운다. 기기에 있는 것과 같은 깨진 파일이다.
 
 ### 3단계 — 앱 재빌드 (PC, 약 15분)
