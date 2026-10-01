@@ -263,3 +263,21 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 남은 가정 하나: 파일의 `expert_gate_N`이 HF `gate_up_proj`의 **앞** 청크(gate)라는 것. HF 관례와 이름이 그렇지만 체크포인트가 PC에 더 없어 대조할 수 없다. 재양자화 뒤에도 잡음이면 재배치에서 gate/up을 바꿔 다시 양자화하는 것이 한 줄 실험이다.
 - 다음 순서: 재양자화 → 기기 push → `NNTR_PPL=1`. 판정 기준은 nll/token이 한 자리, 생성이 영어 문장. 그래도 틀리면 §6.1의 `NNTR_MOE_DIFF=8`(층 입력 통계 + MoE SNR을 한 실행에서) → `NNTR_MOE_SHADOW=1`. 가이드는 `56_gemma4_accuracy_handoff.md` §9.
 
+
+### 10.6 재배치 가중치로 재측정 (2026-10-01, 기기 R3CY10WM83Y·V79): 잡음 해결 확인, 남은 것은 base 체크포인트
+
+- 조건: §10.5의 재배치 FP32를 `--fc_dtype Q4_0 --moe_dtype QS4CX_WH --embd_dtype Q4_0 --lmhead_dtype Q4_0 --isa ARM`로 재양자화(가드 통과, 크기 12,935,608,440 B로 옛 파일과 동일), 기기에 덮어쓰기 push, `NNTR_NUM_THREADS=8 NNTR_MOE_CACHE_EXPERTS=5 NNTR_PPL=1`.
+- 새 `.bin`은 옛 것과 크기가 같고 3840개 구간(30층 × 128 expert)에서만 다르다. 전부 expert `gate_up`과 층별 router 영역이고, 모든 `down`·attention·dense MLP·임베딩·norm은 바이트 단위로 동일(일회용 `compare_bins.py`). 재배치가 의도한 곳만 건드렸다.
+
+| 프롬프트 | 토큰 | nll/token | ppl | 생성 |
+|---|---|---|---|---|
+| 채팅+요약 지시 (`…<\|turn>model\n`) | 446 | 4.56 | 95.2 | 유창한 영어, 그러나 원문을 요약 없이 복사하고 턴을 끝내지 않음 |
+| 위 + `<\|channel>thought\n<channel\|>` 접미 | 450 | 4.72 | 112.7 | 타밀 문자 반복(퇴화) |
+| 순수 이어쓰기(초록 151토큰) | 151 | 6.06 | 426 | 그림 캡션 이어쓰기, 반복 |
+| **few-shot 영→불 번역** | 52 | **3.70** | 40.4 | **정답**("Le livre est sur la table.") |
+
+- 판정: **§1의 잡음(nll 13.26, 균등분포보다 나쁨)은 해결됐다.** 원인은 §10.5의 FP32 파일 MoE 순서였고 기기 코드가 아니다. few-shot 번역이 정답을 낸 것이 결정적이다 — 그 한 실행이 ARM attention(head 512·GQA 8)·Q4_0 임베딩·tied lm_head·HTP MoE 전 경로를 거치는데 올바른 출력이 나왔으므로 §6 용의자 B(ARM)도 닫힌다.
+- 남은 행동(요약 지시를 무시하고 원문 복사)은 수치 결함이 아니라 **체크포인트가 instruct가 아니라 base**이기 때문이다. 근거: 우리 `tokenizer_config.json`이 `google/gemma-4-26B-A4B`의 것과 MD5 동일(`81cb135b…`), 그 리포에는 `chat_template.jinja`가 없다(HTTP 404); `-it` 리포에만 있다(18,683 B). base가 본 적 없는 `-it` 전용 토큰(`<\|channel>thought`)을 주면 위 2행처럼 더 망가진다.
+- 커널 혐의 해소(기기 gtest, 같은 날): `HvxSwigluDet.GegluMatchesScalarBitExact` `bad_out=0 of 8192`; `MoeLayerMatchesTwoCallReference`가 LFM2(N 2048)와 Gemma(K 2816·inter 704·N 2816) 두 형상 모두 `bad_elems=0`, `max_ulp=0`. §6 용의자 A 닫힘.
+- 호스트 CPU 전-Q4_0 기준점(`--moe_dtype Q4_0 --isa X86`, `q40_x86_fixed/`)은 만들어 뒀으나 실행은 스레드 설정(`NNTR_NUM_THREADS=16` > 가용 12)으로 실패했다. few-shot이 이미 ARM 경로를 덮으므로 필수는 아니다; 필요하면 `NNTR_NUM_THREADS=8`로 다시 돌린다.
+- 다음: 지시 수행(요약)을 보려면 `google/gemma-4-26B-A4B-it`를 변환·양자화해야 한다(가중치 파이프라인은 그대로, §10.5 가드가 순서를 지킨다).
