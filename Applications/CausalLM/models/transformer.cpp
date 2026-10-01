@@ -153,7 +153,12 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     IS_CAUSAL = cfg["is_causal"].get<bool>();
   } else if (cfg.contains("use_bidirectional_attention") &&
              !cfg["use_bidirectional_attention"].is_null()) {
-    IS_CAUSAL = !cfg["use_bidirectional_attention"].get<bool>();
+    // Gemma-4 writes a string here: "all" is bidirectional, "vision" means
+    // only the vision tokens are (Gemma4TextAttention: is_causal = value !=
+    // "all"), so text stays causal. Older configs write a bool.
+    const auto &bidir = cfg["use_bidirectional_attention"];
+    IS_CAUSAL = bidir.is_string() ? bidir.get<std::string>() != "all"
+                                  : !bidir.get<bool>();
   } else if (nntr_cfg.contains("model_type") &&
              strToModelType(nntr_cfg["model_type"].get<std::string>()) ==
                ModelType::EMBEDDING &&
