@@ -161,7 +161,12 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  2 x head_dim (q gamma | k gamma) for QK_NORM; CONV_W is 3 x N
  *  (w0 | w1 | w2) and CONV_STATE 2 x N (x_{t-2} | x_{t-1}) for
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
- *  position) with op == HTP_GRAPH_NO_OP; ROUTER_W is K x n_experts
+ *  position) with op == HTP_GRAPH_NO_OP, the head_dim 64 table every ROPE
+ *  op without its own reads; [plan 201 S4] on a ROPE op it is that op's own
+ *  table, max_seq x head_dim (cos[hd / 2] | sin[hd / 2] per position, from
+ *  the CPU's precompute_freqs: the layer's theta and rotary variant, e.g.
+ *  Gemma 4's proportional RoPE with partial factor 0.25 as zero angles),
+ *  shared between ROPE ops that bind equal tables; ROUTER_W is K x n_experts
  *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
  *  ROUTER_TOPK (#132); [plan 201 S4] for the softmax router (eps_bits set)
  *  ROUTER_BIAS is K + n_experts: the input scale g[K]
@@ -368,8 +373,10 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
  *         Gemma's 2816), its feed 0 or HTP_GRAPH_NORM_N1; QK_NORM:
  *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
- *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE and
- *         ATTN_M1 (#152: the fp16 CPU order): head_dim 64), NOTALLOWED for
+ *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE:
+ *         head_dim a multiple of 64 up to 512 (plan 201 S4; any other than
+ *         64 reads its own ROPE_TABLE); ATTN_M1 (#152: the fp16 CPU order):
+ *         head_dim 64), NOTALLOWED for
  *         a resident
  *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
  *         apply RoPE, since mha_core does on the CPU). #132's rules: an ADD
@@ -463,13 +470,15 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (op->K != 3u * op->N || op->N != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
-    case HTP_OP_ATTN_M1:
     case HTP_OP_ADD:
-      if (op->N != hidden || (k == HTP_OP_ADD && op->K != hidden))
+      if (op->N != hidden || op->K != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
-      if (k == HTP_OP_ADD && (op->out_slot != 0u || op->in_slot == 0u))
+      if (op->out_slot != 0u || op->in_slot == 0u)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
+    /* ATTN_M1's N is gqa n_kv head_dim (the record rule below), the o
+       projection's K: LFM2's 32 x 64 happens to be its hidden, Gemma 4's
+       16 x 256 and 16 x 512 are not (plan 201 S4) */
     case HTP_OP_ROUTER_TOPK:
       if (op->K != hidden || op->N != op->n_experts || op->n_experts == 0u ||
           op->n_experts > HTP_GRAPH_MAX_EXPERTS || op->top_k == 0u ||
@@ -528,10 +537,13 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (k == HTP_OP_ROPE)
         rope_resident = op->resident;
       if (op->resident != 0u) {
-        if (op->head_dim % 32u != 0u || op->head_dim > 128u ||
-            (op->head_dim & (op->head_dim - 1u)) != 0u || op->gqa > 8u ||
-            max_seq % 32u != 0u ||
-            ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) && op->head_dim != 64u))
+        if (op->gqa > 8u || max_seq % 32u != 0u ||
+            (k == HTP_OP_QK_NORM &&
+             (op->head_dim % 32u != 0u || op->head_dim > 128u ||
+              (op->head_dim & (op->head_dim - 1u)) != 0u)) ||
+            (k == HTP_OP_ROPE &&
+             (op->head_dim % 64u != 0u || op->head_dim > 512u)) ||
+            (k == HTP_OP_ATTN_M1 && op->head_dim != 64u))
           return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
         if (k == HTP_OP_ATTN_M1 && rope_resident == 0u)
           return HTP_GRAPH_E_NOTALLOWED;

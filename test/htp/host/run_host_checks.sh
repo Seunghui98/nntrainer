@@ -310,6 +310,24 @@ if "$OUT/m1_ops_mutant" > "$OUT/m1_ops_mutant.log"; then
 fi
 echo "ROUTER SOFTMAX MUTANT CAUGHT: renormalise skipped ($(grep -c '^FAIL: router softmax' "$OUT/m1_ops_mutant.log") failed checks)"
 
+# [plan 201 S4] RoPE at Gemma 4's head_dim 256 / 512: the kernel pairing
+# (i, i + 32) inside each 64-lane chunk -- LFM2's head_dim 64 RoPE reused
+# per chunk, the same bytes at 64 -- must fail the hd256 / hd512 lines.
+mut='s/\*vb = (HVX_UVector \*)(x + h);/*vb = (HVX_UVector *)(x + LANES);/'
+sed "$mut" "$BACKEND/hvx/hvx_m1_ops_f32.c" > "$OUT/hvx_m1_ops_rope_mut.c"
+if cmp -s "$OUT/hvx_m1_ops_rope_mut.c" "$BACKEND/hvx/hvx_m1_ops_f32.c"; then
+  echo "ROPE MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_rope_mutant" \
+  "$HERE/m1_ops_host_check.c" "$OUT/hvx_m1_ops_rope_mut.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+if "$OUT/m1_ops_rope_mutant" > "$OUT/m1_ops_rope_mutant.log"; then
+  echo "ROPE MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "ROPE MUTANT CAUGHT: hd64 pairing per chunk ($(grep -c '^FAIL: rope' "$OUT/m1_ops_rope_mutant.log") failed checks, rope64 lines $(grep -c 'rope64 pos=.* bad=0' "$OUT/m1_ops_rope_mutant.log")/5 still bad=0)"
+
 # [plan 201 S4] The MoE epilogue's GeGLU-tanh: geglu_det_one (swiglu_det.h)
 # against f64 incl. the tanh saturation ends and subnormals, then the REAL
 # hvx_dequant_i32.c epilogue on hvx_emu/ (geglu and swiglu) bit for bit

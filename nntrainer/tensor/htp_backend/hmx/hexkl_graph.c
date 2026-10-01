@@ -32,7 +32,9 @@
  * session's (nntr_hvx_fc_q4.c's note), not the graph's.
  * [plan 201 S4] Gemma's softmax router: 30 x [2816][128] f32 weights plus
  * 11 KiB of scales, 1.4 MiB a layer, 43 MiB (the ponytail note in
- * hvx_router_softmax_topk_f32).
+ * hvx_router_softmax_topk_f32). Its RoPE: one max_seq x head_dim f32 table
+ * per distinct (theta, variant) -- equal tables are shared -- so 4 MiB
+ * (sliding, 256) + 8 MiB (full, 512) at max_seq 4096.
  */
 
 #include "hexkl_graph.h"
@@ -264,17 +266,24 @@ static int graph_op_qk_norm(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
+/* [plan 201 S4] The op's own table (ROPE_TABLE bound on this op: max_seq
+   x head_dim, Gemma's per-layer theta and partial factor) when it has one,
+   else the session's shared head_dim 64 table (LFM2). */
 static int graph_op_rope(hexkl_graph *g, const htp_graph_op *op,
                          graph_call *call, const float *in, float *out) {
-  const uint32_t n_q = op->gqa * op->n_kv;
-  if (g->rope_cs == NULL) {
+  const uint32_t n_q = op->gqa * op->n_kv, hd = op->head_dim;
+  const float *cs = g->param[op - g->ops];
+  if (cs == NULL) {
+    cs = hd == 64u ? g->rope_cs : NULL;
+  }
+  if (cs == NULL) {
     return AEE_EBADSTATE;
   }
   if (in != out) {
     memcpy(out, in, (size_t)op->K * sizeof(float));
   }
-  hvx_rope64_f32(out, n_q, out + (size_t)n_q * 64u, op->n_kv,
-                 g->rope_cs + (size_t)call->pos * 64u);
+  hvx_rope_f32(out, n_q, out + (size_t)n_q * hd, op->n_kv,
+               cs + (size_t)call->pos * hd, hd);
   return AEE_SUCCESS;
 }
 
@@ -623,13 +632,27 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
   return AEE_SUCCESS;
 }
 
+/** @brief ROPE ops after @a i whose table is @a t (NULL: none). */
+static uint32_t graph_rope_users_after(const hexkl_graph *g, const float *t,
+                                       uint32_t i) {
+  uint32_t j, n = 0;
+  for (j = i + 1u; t != NULL && j < g->n_ops; ++j) {
+    n += g->ops[j].kind == HTP_OP_ROPE && g->param[j] == t;
+  }
+  return n;
+}
+
 void hexkl_graph_free(hexkl_graph *g) {
   uint32_t i;
   if (g == NULL) {
     return;
   }
   for (i = 0; i < g->n_ops; ++i) {
-    free(g->param[i]);
+    /* a shared ROPE table is freed by its last holder */
+    if (g->ops[i].kind != HTP_OP_ROPE ||
+        graph_rope_users_after(g, g->param[i], i) == 0u) {
+      free(g->param[i]);
+    }
     free(g->state[i]);
     free(g->experts[i]);
   }
@@ -645,7 +668,8 @@ void hexkl_graph_free(hexkl_graph *g) {
 
 /** @brief The parameter's length for (kind, which), 0 when the kind does
  *  not take it. */
-static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
+static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which,
+                                uint32_t max_seq) {
   switch (which) {
   case HTP_GRAPH_PARAM_GAMMA:
     return op->kind == HTP_OP_RMSNORM   ? op->K
@@ -657,6 +681,8 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
     return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
   case HTP_GRAPH_PARAM_ROUTER_W:
     return op->kind == HTP_OP_ROUTER_TOPK ? op->K * op->n_experts : 0u;
+  case HTP_GRAPH_PARAM_ROPE_TABLE: /* [plan 201 S4] the op's own */
+    return op->kind == HTP_OP_ROPE ? op->head_dim * max_seq : 0u;
   case HTP_GRAPH_PARAM_ROUTER_BIAS: /* softmax: g[K] | per-expert scale */
     return op->kind != HTP_OP_ROUTER_TOPK ? 0u
            : op->eps_bits != 0u           ? op->K + op->n_experts
@@ -664,6 +690,55 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
   default:
     return 0u;
   }
+}
+
+/** @brief ROPE ops other than @a except whose table is @a t. */
+static uint32_t graph_rope_users(const hexkl_graph *g, const float *t,
+                                 uint32_t except) {
+  uint32_t j, n = 0;
+  for (j = 0; j < g->n_ops; ++j) {
+    n += j != except && g->ops[j].kind == HTP_OP_ROPE && g->param[j] == t;
+  }
+  return n;
+}
+
+/* [plan 201 S4] A ROPE op's own table, max_seq x head_dim. A table equal to
+   one another ROPE op of the same head_dim holds is shared, not copied
+   (Gemma's 25 sliding layers bind one: 4 MiB at max_seq 4096 and head_dim
+   256, not 100), and a shared table is never written in place. */
+static int graph_set_rope(hexkl_graph *g, uint32_t op, const float *data,
+                          uint32_t n) {
+  float *mine, *t = NULL;
+  uint32_t j;
+  if (op >= g->n_ops) {
+    return AEE_EBADITEM;
+  }
+  if (n == 0u || n != graph_param_len(&g->ops[op], HTP_GRAPH_PARAM_ROPE_TABLE,
+                                      g->max_seq)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  for (j = 0; j < g->n_ops && t == NULL; ++j) {
+    if (j != op && g->ops[j].kind == HTP_OP_ROPE && g->param[j] != NULL &&
+        g->ops[j].head_dim == g->ops[op].head_dim &&
+        memcmp(g->param[j], data, (size_t)n * sizeof(float)) == 0) {
+      t = g->param[j];
+    }
+  }
+  mine = g->param[op];
+  if (t == NULL) {
+    t = (mine != NULL && graph_rope_users(g, mine, op) == 0u)
+          ? mine
+          : (float *)malloc((size_t)n * sizeof(float));
+    if (t == NULL) {
+      return AEE_ENOMEMORY;
+    }
+    memcpy(t, data, (size_t)n * sizeof(float));
+  }
+  if (mine != NULL && mine != t && graph_rope_users(g, mine, op) == 0u) {
+    free(mine);
+  }
+  g->param[op] = t;
+  return AEE_SUCCESS;
 }
 
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
@@ -728,17 +803,17 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     memcpy(h, data, (size_t)n * sizeof(uint32_t));
     return AEE_SUCCESS;
   }
+  if (which == HTP_GRAPH_PARAM_ROPE_TABLE && op != HTP_GRAPH_NO_OP) {
+    return graph_set_rope(g, op, data, n);
+  }
   if (which == HTP_GRAPH_PARAM_ROPE_TABLE) {
-    if (op != HTP_GRAPH_NO_OP) {
-      return AEE_EBADITEM;
-    }
     want = alloc = g->max_seq * 64u;
     dst = &g->rope_cs;
   } else {
     if (op >= g->n_ops) {
       return AEE_EBADITEM;
     }
-    want = graph_param_len(&g->ops[op], which);
+    want = graph_param_len(&g->ops[op], which, g->max_seq);
     if (want == 0u) {
       return AEE_EINVALIDFORMAT;
     }
