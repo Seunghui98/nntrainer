@@ -3694,19 +3694,26 @@ private:
     return true;
   }
 
-  /** @brief Creation, once, at the first M==1 MoE call (section 3.4); any
-   *  failure prints one "dspq: off" line and is never retried. */
+  /** @brief Creation, once, at the first M==1 MoE call (section 3.4) or
+   *  at the E2E graph init; any failure prints one "dspq: off" line and is
+   *  never retried. [#211] With NNTR_HTP_E2E=1 the token packets ride this
+   *  queue whichever call creates it (a one-row prefill chunk comes first):
+   *  its out buffer holds the logits and it spins the E2E way. */
   void dspqCreate(remote_handle64 session) {
     const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
+    const size_t logits_bytes =
+      e2e_ ? static_cast<size_t>(graph_words_[5]) * 4u : 0u;
     dspq_ = dspqMake(
-      session, CDSP_DOMAIN_ID, "dspq", HTP_DSPQ_BUF_BYTES,
-      spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-               : 1000u);
+      session, CDSP_DOMAIN_ID, "dspq",
+      std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
+      e2e_       ? e2eSpinUs()
+      : spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
+                 : 1000u);
   }
 
-  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 0): how long a
-   *  waiting session spins (with a pause) before it sleeps -- at each hop
-   *  and on its dspqueue after a token. E5b's 1000 us kept one of the six
+  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 0): how long the DSP
+   *  spins (with a pause) before it sleeps -- at each miss wait and on the
+   *  dspqueue after a token. On two PDs (E5b) 1000 us kept one of the six
    *  hardware threads busy through the other session's compute; E5d read
    *  20.8 / 20.2 / 16.5 tok/s at 0 / 20 / 1000. */
   static uint32_t e2eSpinUs() {
@@ -3939,10 +3946,8 @@ private:
     E2eState &e = *e2e_st_;
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
     const size_t logits_bytes = static_cast<size_t>(graph_words_[5]) * 4u;
-    if (!dspq_) // S1's queue: token packets only at decode, so the E2E spin
-      dspq_ = dspqMake(e.h1, CDSP_DOMAIN_ID, "dspq",
-                       std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
-                       e2eSpinUs());
+    if (!dspq_)
+      dspqCreate(e.h1);
     if (dspq_->state != DspqMoe::ON || dspq_->session != e.h1) {
       throw std::runtime_error("NNTR_HTP_E2E=1: S1's dspqueue is off (see "
                                "the dspq line; NNTR_HTP_DSPQ=0?): the token "
