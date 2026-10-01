@@ -227,3 +227,11 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 미확인: 실제 체크포인트 변환(HF 접근 불가), 양자화기 dry-run 바이트 수, ppl. 기대 FP32 `.bin` 크기 = 25,233,141,790 파라미터 × 4 + tied lm head 재기록 = **103,885,357,176 B (103.9 GB)**; 양자화기는 뒤의 embedding 중복을 버린다.
 - 다음: 사용자 PC에서 변환 → Q4_0 양자화 → x86 ppl (가이드는 세션 대화 기록).
 
+### 10.3 Phase 2 파일, Phase 3a GeGLU 에필로그 (2026-10-01): PC·호스트 확인, 기기 미측정
+
+- **Phase 2 (사용자 PC):** `weight_converter.py --safetensors`로 변환(소스 96,256 MiB = 25,233,141,790 × 4 B, 산술과 일치) → `nntr_quantize_stream --fc_dtype Q4_0 --moe_dtype QS4CX_WH --embd_dtype Q4_0 --isa ARM` → `nntr_gemma4_q40_arm.bin` **12,336 MiB**(산술 12,339). 양자화기가 `.safetensors`를 직접 읽게 했다(9dd2c76; 헤더 뒤는 .bin 순서). dry-run 바이트 대조 통과 = 변환기·양자화기·그래프의 텐서 순서가 맞는다.
+- **Phase 3a 코드:** `act` 플래그(0 silu, 1 gelu_tanh)를 층 `MoEActivation` → `ComputeOps::gemm_qs4cx_moe_layer_fp32(…, gelu)` → IDL `mm_u8i4_moe_layer(…, act, …)` → skel → `hexkl_mm_u8i4_moe_layer_run(…, act, …)` → `hvx_dq_swiglu_job.act`로 끼웠다. HVX `hvx_geglu_det_sf` = x·σ(x(C0 + C1x²))로 기존 det exp·recip 재사용(벡터 곱 3 + 합 1 추가), 호스트 쌍 `geglu_det_one`(스칼라). CPU 경로도 이제 `moe_activation`을 따른다(전에는 속성과 무관하게 SwiGLU였다). **IDL이 바뀌어 stub(`generate_stub.sh`)과 skel(`test/htp/build.sh`)을 다시 만들어야 한다**; 옛 skel이면 첫 콜이 AEE_EBADPARM.
+- 호스트 검사: `moe_layer_host_check`에 GeGLU 케이스(참조와 0 불일치), 항등식 x·σ(2y) = 0.5x(1+tanh y) 스윕(상대 1.3e-6, 참조는 double — f32 tanh는 y < −5에서 1+tanh가 상쇄돼 7%까지 틀린다), act=7 거부. 3/3 통과. `htp_compute_ops.cpp`는 IDL에서 생성한 헤더로 문법 검사만(호스트에 SDK 없음).
+- 교훈 하나: 처음 참조를 교과서 tanh 형으로 쓰자 u8 재양자화 뒤 2개 원소가 9e-5 어긋났다 — 44의 L2와 같은 메커니즘. 참조는 커널과 같은 식으로, 항등식은 양자화 전에 따로 본다.
+- ponytail: ARM NEON GeGLU 없음(CPU expert는 x86 참조 전용). dense FFN(Phase 4)의 HTP 경로는 아직 silu 고정(`invokeMoeLayer` kind=1에 glu=0).
+
