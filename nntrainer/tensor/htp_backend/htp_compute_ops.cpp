@@ -81,6 +81,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -2225,10 +2226,18 @@ public:
         "has " +
         std::to_string(moe_ops_.size()));
     std::vector<std::vector<float>> tabs(pool_descs_.size());
+    // [#216] The decode misses' file pages are dropped here, once per
+    // prefill, not as each is read: a drop beside the miss reads (advice
+    // worker) cost 0.4-0.7 ms a miss round (S25). Every resident expert is
+    // named; those dropped already (load, prefill) are a no-op.
+    std::vector<Advice> drop;
     {
       std::lock_guard<std::mutex> lock(handle_mutex_);
       for (size_t m = 0; m < pool_descs_.size(); ++m) {
         const std::vector<ExpertFileDesc> &d = pool_descs_[m];
+        for (size_t x = 0; fadviseKnob() != 0 && x < d.size(); ++x)
+          if (experts_.count(d[x].key_gu) != 0)
+            drop.emplace_back(d[x], false);
         if (d.size() != graphOp(moe_ops_[m])->n_experts)
           throw std::runtime_error(
             "token driver: MoE layer " + std::to_string(m) + " gave " +
@@ -2251,6 +2260,10 @@ public:
                static_cast<unsigned>(tabs[m].size()),
                static_cast<unsigned>(tabs[m].size()), "EXPERTS");
     pool_dirty_ = false;
+    // ponytail: a generation's decode loads stay cached until the next
+    // prefill (<= misses x 5.3 MiB: 0.7 GiB at G = 1024); a drop per N
+    // tokens off the miss path is the upgrade for long generations
+    adviseLater(std::move(drop));
   }
 
   /** [plan 201 S1] Files the last answer's loads under the pairs S1 wrote
@@ -2306,9 +2319,12 @@ public:
         need, [&](const void *k) { loads.push_back(k); },
         [&](const void *k) {
           const std::pair<uint32_t, uint32_t> w = pool_where_.at(k);
-          if (a.n_evict == HTP_MBOX_MISS_MAX || !release_qs4cx_wh_expert(k))
+          ExpertFileDesc v;
+          if (a.n_evict == HTP_MBOX_MISS_MAX || !releaseExpert(k, v))
             throw std::runtime_error("token driver: the pool evicted an "
                                      "expert it does not hold");
+          if (fadviseKnob() == 1) // [#216] asked back after the answer
+            p.advice.emplace_back(v, true);
           a.evict[a.n_evict][0] = moe_ops_[w.first];
           a.evict[a.n_evict++][1] = w.second;
         });
@@ -2330,7 +2346,8 @@ public:
       for (uint32_t i = 0; i < r.n_miss; ++i) {
         const ExpertFileDesc &x = d[r.miss[i]];
         StagedExpert st = stageExpert(session, x);
-        st.rc = readExpert(st, /*use_pool=*/true);
+        // [#216] dropped at the next poolSync, not beside the miss reads
+        st.rc = readExpert(st, /*use_pool=*/true, /*advise=*/false);
         if (st.rc != 0) {
           free_expert_slots_.push_back(st.slot);
           throwPread(st.rc, "expert weight (miss)");
@@ -2364,6 +2381,8 @@ public:
     std::atomic_thread_fence(std::memory_order_release);
     *reinterpret_cast<volatile uint32_t *>(dst) = r.seq;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    adviseLater(std::move(p.advice));
+    p.advice.clear();
   }
 
   /** [plan 201 S1] The pool server: a thread that, while a token is in
@@ -2824,10 +2843,22 @@ public:
    * zero: every eviction is followed by the load that wanted its slot.
    */
   bool release_qs4cx_wh_expert(const void *key_gu) override {
+    ExpertFileDesc d;
+    if (!releaseExpert(key_gu, d))
+      return false;
+    if (fadviseKnob() == 1)
+      adviseLater({{d, true}});
+    return true;
+  }
+
+  /** @brief release_qs4cx_wh_expert without the advice; @a d gets the
+   *  victim's file ranges. */
+  bool releaseExpert(const void *key_gu, ExpertFileDesc &d) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = experts_.find(key_gu);
     if (it == experts_.end())
       return false;
+    d = it->second.d;
     ExpertSlot slot = it->second.slot;
     slot.h_gu = it->second.h_gu;
     slot.h_dn = it->second.h_dn;
@@ -3981,10 +4012,12 @@ private:
     }
     e.moe_ops = static_cast<uint32_t>(moe_ops_.size());
     e.spin_us = spin_us;
+    e.pgpgin0 = vmstatPgpginKib();
     std::fprintf(stderr,
                  "[HTP] token driver: on mbox=%zu spin_us=%u moe_ops=%u "
-                 "logits_buf=%zu\n",
-                 e.mbox->size(), spin_us, e.moe_ops, logits_bytes);
+                 "logits_buf=%zu fadvise=%d\n",
+                 e.mbox->size(), spin_us, e.moe_ops, logits_bytes,
+                 fadviseKnob());
   }
 
   /** @brief [#132 Part B E3, #211] The close hook, before the session
@@ -4082,12 +4115,14 @@ private:
         std::fprintf(
           stderr,
           "[HTP] token driver: pool misses=%llu misses/token=%.2f "
-          "miss_wait_us/token=%.1f rounds=%llu arm_ms/round=%.3f\n",
+          "miss_wait_us/token=%.1f rounds=%llu arm_ms/round=%.3f "
+          "pgpgin_mib=%.1f\n",
           (unsigned long long)e.misses, static_cast<double>(e.misses) / n,
           static_cast<double>(e.miss_us) / n, (unsigned long long)e.pool_rounds,
           e.pool_rounds
             ? static_cast<double>(e.pool_read_us) / 1000.0 / e.pool_rounds
-            : 0.0);
+            : 0.0,
+          static_cast<double>(vmstatPgpginKib() - e.pgpgin0) / 1024.0);
       std::fprintf(
         stderr,
         "[HTP] token driver: close tokens=%llu hops/token=%.2f "
@@ -5123,6 +5158,7 @@ private:
     ExpertSlot slot;
     const void *key_dn;
     uint32_t h_gu, h_dn;
+    ExpertFileDesc d; /**< [#216] its file ranges, for the WILLNEED on evict */
   };
 
   /** @brief pread that finishes: 0, or the errno, or -1 at end of file.
@@ -5236,18 +5272,127 @@ private:
   /** @brief Reads both weights of @a st into its slot. No lock and no
    *  throw -- the slot is this expert's alone until registerStaged -- so a
    *  background thread can run it. @return 0, errno, or -1 at EOF. */
-  int readExpert(StagedExpert &st, bool use_pool) {
+  int readExpert(StagedExpert &st, bool use_pool, bool advise = true) {
     const ExpertFileDesc &d = st.d;
     uint8_t *base = st.base;
     const uint32_t gu_stride = expertStride(d.K, 2 * d.inter);
     st.gu.chunk = st.dn.chunk = st.slot.chunk;
     st.gu.off = st.slot.off;
     st.dn.off = st.slot.off + gu_stride;
-    const int rc =
+    int rc =
       readWeight(d.fd, d.off_gu, d.K, 2 * d.inter, base, st.gu, use_pool);
-    return rc != 0 ? rc
-                   : readWeight(d.fd, d.off_dn, d.inter, d.N_out,
-                                base + gu_stride, st.dn, use_pool);
+    if (rc == 0)
+      rc = readWeight(d.fd, d.off_dn, d.inter, d.N_out, base + gu_stride, st.dn,
+                      use_pool);
+    if (rc == 0 && advise && fadviseKnob() != 0) // [#216] the slot holds it
+      adviseLater({{d, false}});
+    return rc;
+  }
+
+  /** @brief [#216] NNTR_MOE_FADVISE: unset / 0 = no advice (the bytes and
+   *  the reads are the same either way); 1 = an expert's file pages are
+   *  dropped from the page cache once its bytes are in the arena and asked
+   *  back when it leaves the arena, so the cache holds about the arena's
+   *  complement instead of the whole file; 2 = the drop only (diagnostic:
+   *  every miss then reads storage). */
+  static int fadviseKnob() {
+    static const int k = [] {
+      const char *v = std::getenv("NNTR_MOE_FADVISE");
+      return v != nullptr ? std::atoi(v) : 0;
+    }();
+    return k;
+  }
+
+  /** @brief [#216] posix_fadvise DONTNEED (or WILLNEED) on both weight
+   *  ranges of @a d as readWeight reads them: nibbles, N scales, N sums.
+   *  Advice only -- a failure changes nothing a matmul reads, so it is not
+   *  checked. */
+  static void fadviseExpert(const ExpertFileDesc &d, bool willneed) {
+#if defined(__linux__)
+    // One WILLNEED reads at most the device's read-ahead window (measured:
+    // 1 MiB on the S25's 6.6 kernel, 128 KiB on the workstation) of its
+    // range, so it goes in 128 KiB pieces; DONTNEED takes the whole range.
+    const uint64_t piece = willneed ? (uint64_t(128) << 10) : ~uint64_t(0);
+    const auto advise = [&](uint64_t off, uint64_t len) {
+      for (uint64_t at = 0; at < len; at += std::min(piece, len - at))
+        (void)posix_fadvise(d.fd, static_cast<off_t>(off + at),
+                            static_cast<off_t>(std::min(piece, len - at)),
+                            willneed ? POSIX_FADV_WILLNEED
+                                     : POSIX_FADV_DONTNEED);
+    };
+    const uint32_t n_gu = 2 * d.inter;
+    advise(d.off_gu, whBytes(d.K, n_gu) + 8ull * n_gu);
+    advise(d.off_dn, whBytes(d.inter, d.N_out) + 8ull * d.N_out);
+#else
+    (void)d;
+    (void)willneed;
+#endif
+  }
+
+  /** @brief [#216] fadviseExpert on each (expert, willneed) of @a v, on
+   *  one background thread: on the S25 a WILLNEED reads before it returns
+   *  (3-8 ms an expert) and a DONTNEED took about 2 ms on a miss's path;
+   *  a thread per call inherited its caller's core pin (the pool server's)
+   *  and stretched S1's miss wait. The worker runs unpinned and is left
+   *  running (its queue leaked) at exit; each queued advice holds its own
+   *  dup of the fd, so a model closed before the queue drains cannot send
+   *  the advice to a file that reuses the number. */
+  using Advice = std::pair<ExpertFileDesc, bool>;
+  static void adviseLater(std::vector<Advice> v) {
+    if (v.empty()) // before the worker exists: unset spawns no thread
+      return;
+    struct Queue {
+      std::mutex mu;
+      std::condition_variable cv;
+      std::deque<Advice> q;
+    };
+    static Queue *const q = [] {
+      Queue *n = new Queue;
+      std::thread([n] {
+#if defined(__linux__)
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        for (long c = 0; c < sysconf(_SC_NPROCESSORS_CONF) && c < CPU_SETSIZE;
+             ++c)
+          CPU_SET(c, &all);
+        sched_setaffinity(0, sizeof(all), &all);
+#endif
+        for (;;) {
+          std::unique_lock<std::mutex> lock(n->mu);
+          n->cv.wait(lock, [n] { return !n->q.empty(); });
+          const Advice a = n->q.front();
+          n->q.pop_front();
+          lock.unlock();
+          fadviseExpert(a.first, a.second);
+          ::close(a.first.fd);
+        }
+      }).detach();
+      return n;
+    }();
+    {
+      std::lock_guard<std::mutex> lock(q->mu);
+      for (Advice &a : v)
+        if ((a.first.fd = ::dup(a.first.fd)) >= 0)
+          q->q.push_back(a);
+    }
+    q->cv.notify_one();
+  }
+
+  /** @brief [#216] /proc/vmstat pgpgin (KiB read from block devices,
+   *  system-wide), 0 where there is no such file. */
+  static uint64_t vmstatPgpginKib() {
+    uint64_t v = 0;
+    if (FILE *f = std::fopen("/proc/vmstat", "r")) {
+      char k[64];
+      unsigned long long n = 0;
+      while (std::fscanf(f, "%63s %llu", k, &n) == 2)
+        if (std::strcmp(k, "pgpgin") == 0) {
+          v = n;
+          break;
+        }
+      std::fclose(f);
+    }
+    return v;
   }
 
   /** @brief Registers a read expert and files it. On any failure the slot
@@ -5293,7 +5438,8 @@ private:
     st.slot.h_gu = st.slot.h_dn = kNoHandle; // released by the swap
     handle_cache_[d.key_gu] = h_gu;
     handle_cache_[d.key_dn] = h_dn;
-    experts_.emplace(d.key_gu, ExpertResident{st.slot, d.key_dn, h_gu, h_dn});
+    experts_.emplace(d.key_gu,
+                     ExpertResident{st.slot, d.key_dn, h_gu, h_dn, d});
   }
 
   /**
@@ -6257,6 +6403,7 @@ private:
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */
     uint64_t misses = 0, miss_us = 0, pool_rounds = 0, pool_read_us = 0;
+    uint64_t pgpgin0 = 0; /**< [#216] vmstatPgpginKib() at driver on */
   };
   /** @brief The mailbox page: HEXKL_MBOX_BYTES (18 432) rounded to the
    *  #178 probe's 64 KiB. */
@@ -6272,6 +6419,8 @@ private:
     bool stop = false, idle = false;
     uint32_t tok = 0;
     std::vector<StagedExpert> pending;
+    /** [#216] this answer's victims, asked back after it */
+    std::vector<std::pair<ExpertFileDesc, bool>> advice;
     std::exception_ptr err;
   };
   std::unique_ptr<PoolServer> pool_srv_;
