@@ -359,3 +359,30 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
   1. **K 방향 그룹 scale** — Q4_0이 4.458을 내는 바로 그 해상도. 그룹 32 = HMX k-타일 하나라 타일 경계와 맞는다. QS4CX_WH 파일 형식(채널×k-타일 scale) + 커널이 k-타일별 부분합에 scale을 곱하도록 에필로그 변경 + IDL·stub·skel 재빌드. 비용: HMX 누산기를 k-타일마다 꺼내야 하는지에 따라 성능이 갈린다 — 설계 전에 HMX 누산 구조를 확인해야 한다.
   2. **활성화 인지 스케일링(AWQ식)** — 형식·커널 불변. gate_up 입력 채널 scale은 층의 128 expert가 공유하는 `pre_ffn_norm_2` gamma에 접고(층 공유 scale), down 입력 채널 scale은 expert마다 up 출력 열에 접는다(GeGLU는 gate에만 비선형이라 up 열 scale은 정확히 상쇄된다). 보정 활성화가 필요하고 효과는 미측정.
 - 기각: 채널별 MSE scale(§10.9, nll 악화).
+
+### 10.11 prefill 속도 분해: LFM2.5 6xx TPS 대 Gemma 41 TPS (2026-10-02, 기기 R3CY10WM83Y)
+
+- 조건: 446토큰 요약 프롬프트(447 prefill), §10.6 모델. `NNTR_M0_PROFILE=1 NNTR_HTP_PROFILE=2`, 그리고 `build_android.sh --htp --profile` 빌드의 층별 시간표(prefill 콜 = 각 층의 max 열).
+- **C(층당 캐시 expert) 하나로 2.2배**: 지금까지 실행 명령의 `NNTR_MOE_CACHE_EXPERTS=5`가 config 기본값 16을 덮어썼다.
+
+| | C=5 | C=16 |
+|---|---|---|
+| prefill | 10.94 s, 40.9 TPS | **5.01 s, 89.3 TPS** |
+| prefill 중 동기 expert 읽기 | 2893개, 7.10 s 노출 | 0 (선읽기 3360개, 노출 10 ms) |
+| peak RSS | 3.21 GB | 3.22 GB |
+
+  C=5면 풀 150칸이 한 층의 128 expert로 거의 차서 다음 층 선읽기(52 §10.10) 자리가 없다.
+- **C=16 prefill 5.39 s(프로파일 빌드)의 연산별 분해**:
+
+| 연산 | 시간 | 비중 | 실행 위치 |
+|---|---|---|---|
+| attention 본체 (mha_core) | 1507 ms | 28.0% | ARM |
+| attention projection (q 448, k 317, v 219, o 556) | 1540 ms | 28.6% | ARM |
+| MoE (HTP 콜 + router 118) | 1123 ms | 20.8% | HTP |
+| dense MLP (gate 294, up 283, down 225) | 802 ms | 14.9% | ARM |
+| norm·scalar_multiply·add 등 | 약 410 ms | 7.6% | ARM |
+
+- attention 본체 1507 ms 중 **약 800 ms는 첫 sliding 층(0층 266 ms)과 첫 full 층(5층 591 ms)** 에 몰린다(보통 층 20 / 35 ms). `MHACoreLayer::precompute_freqs`가 RoPE cos/sin 표를 `max_position_embeddings`(**262144**) 위치만큼, 위치마다 `std::vector`로 만든다. 쓰이는 인덱스는 `max_timestep`(2048) 미만뿐이다. 표 크기는 FP32 기준 sliding(head 256) 512 MiB + full(head 512) 1 GiB — peak RSS에 들어가는지는 미확인(수정 후 측정).
+- MoE 커널(층당 27.7 ms): LFM2와 HMX 실효 속도는 같으나(약 3.3 TMAC/s) expert당 행이 약 28(447×8/128)이라 64행 블록이 44%만 찬다 → mm 14.66 ms(LFM2 8.86), acc 6.34 ms(LFM2 2.96).
+- 이미 적용된 것(MoE 경로): 층당 1콜(transport 0.72 ms/콜), ION 슬롯(480/480), poll QoS(qos_mode 2), WH 오프라인 bake(등록 1.15 s는 로드 시), weight DMA 선행, dequant+GeGLU 융합. 적용 안 된 것: projection·dense FFN·attention의 HTP 경로(LFM2의 `attn_proj_engine`/`conv_block_engine`/`dense_ffn_engine`이 Gemma4에 미연결), C=5에서의 선읽기.
+- 상한(산술): prefill은 층마다 128 expert를 모두 건드려 3840 expert ≈ 11.4 GB, C=16 풀 480칸을 빼면 약 10 GB를 flash에서 읽는다. 3.0 GB/s(53 §10.32)로 약 3.3 s → 447토큰에서 약 135 TPS. 지금은 CPU 작업 5 s 뒤에 숨어 있지만 CPU 몫을 줄이면 이것이 바닥이 된다. LFM2는 expert 전체가 3.7 GB라 같은 바닥이 0.9 s였다. 프롬프트 길이와 무관한 고정비라 긴 프롬프트일수록 TPS 상한이 오른다.
