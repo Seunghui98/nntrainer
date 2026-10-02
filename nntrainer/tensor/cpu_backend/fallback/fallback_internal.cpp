@@ -708,68 +708,6 @@ inline size_t num_bytes_per_block_qs8c32(size_t bl) {
   return bl + sizeof(int16_t);
 }
 
-/**
- * @brief The QS4CX scale of one channel (levels per unit): the one, among a
- *        short ladder of clip points, that quantizes @a src with the least
- *        squared error.
- *
- * One scale covers all k inputs of a channel, so taking it from the
- * channel's range lets a single outlier set the step for every other value.
- * On the expert weights of a 26B MoE model this search moved the
- * quantization SNR against FP32 from 17.2 to 18.9 dB on average (block-32
- * Q4_0 reaches 21.1), with nothing about the format or any kernel changing:
- * the stored value is still 1/scale and the codes are still
- * clamp(round(x * scale), -8, 7).
- *
- * The range-derived scale this function used to return is the first
- * candidate, so no channel ever quantizes worse than it did before.
- *
- * ponytail: a fixed 19-point ladder of symmetric clip ratios, not an
- * optimizer; 20 passes over the channel, at quantization time only. A finer
- * search or K-group scales are the upgrades if this is still the gap.
- */
-float qs4cx_channel_scale(const float *src, size_t k) {
-  float mx = -FLT_MAX, mn = FLT_MAX, amax = 0.0f;
-  for (size_t i = 0; i < k; ++i) {
-    mx = std::max(mx, src[i]);
-    mn = std::min(mn, src[i]);
-    amax = std::max(amax, std::fabs(src[i]));
-  }
-  const float rmin = std::min(0.0f, mn);
-  const float rmax = std::max(0.0f, mx);
-  if (rmin == rmax)
-    return 1.0f;
-
-  auto sq_err = [&](float scale) {
-    const float inv = 1.0f / scale;
-    double err = 0.0;
-    for (size_t i = 0; i < k; ++i) {
-      int32_t q = (int32_t)std::round(src[i] * scale);
-      q = std::min(std::max(q, INT4_MIN), INT4_MAX);
-      const double d = (double)src[i] - (double)q * inv;
-      err += d * d;
-    }
-    return err;
-  };
-
-  float best = (float)(INT4_MAX - INT4_MIN) / (rmax - rmin);
-  double best_err = sq_err(best);
-  // 7, not 7.5: at ratio 1 the largest |x| lands on code 7 exactly. A 7.5
-  // ladder put it on the rounding tie between 7 and 8, where float noise
-  // picks the code -- unittest_nntrainer_fallback's per-element bound
-  // caught it -- for no gain (both ladders measured 18.9 dB).
-  for (int s = 0; s < 19; ++s) {
-    const float ratio = 0.55f + 0.025f * (float)s; // 0.55 .. 1.00
-    const float scale = 7.0f / (ratio * amax);
-    const double err = sq_err(scale);
-    if (err < best_err) {
-      best_err = err;
-      best = scale;
-    }
-  }
-  return best;
-}
-
 } // namespace
 
 void __fallback_quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
@@ -782,7 +720,25 @@ void __fallback_quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
   for (size_t n_idx = 0; n_idx < n; ++n_idx) {
     const float *src_ptr = rhs_f32 + n_idx * k;
 
-    const float scale0 = qs4cx_channel_scale(src_ptr, k);
+    float max0 = -FLT_MAX;
+    float min0 = FLT_MAX;
+
+    // Find min/max for each channel
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const float src0_0 = src_ptr[k_idx];
+
+      max0 = std::max(src0_0, max0);
+      min0 = std::min(src0_0, min0);
+    }
+
+    // Maximum/minimum int8 values
+    const float qmin = (float)INT4_MIN;
+    const float qmax = (float)INT4_MAX;
+
+    const float rmin0 = std::min(0.0f, min0);
+    const float rmax0 = std::max(0.0f, max0);
+
+    const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
 
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
@@ -825,7 +781,25 @@ void __fallback_quant_kxn_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
   for (size_t n_idx = 0; n_idx < n; ++n_idx) {
     const float *src_ptr = rhs_f32 + n_idx * k;
 
-    const float scale0 = qs4cx_channel_scale(src_ptr, k);
+    float max0 = -FLT_MAX;
+    float min0 = FLT_MAX;
+
+    // Find min/max for each channel
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const float src0_0 = src_ptr[k_idx];
+
+      max0 = std::max(src0_0, max0);
+      min0 = std::min(src0_0, min0);
+    }
+
+    // Maximum/minimum int8 values
+    const float qmin = (float)INT4_MIN;
+    const float qmax = (float)INT4_MAX;
+
+    const float rmin0 = std::min(0.0f, min0);
+    const float rmax0 = std::max(0.0f, max0);
+
+    const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
 
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
