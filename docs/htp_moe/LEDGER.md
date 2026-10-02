@@ -813,6 +813,31 @@ derived. Issue state: #216 `state:review` (unchanged), #201
 stopped at 2026-09-30 on `htp_moe`: #132 Part B, the v81 issues and #157
 / #178 are closed since).
 
+**Cycle 32 (2026-10-02, base `htp_decode` @ `238a280b7`): no measurement,
+no row of record moves; one merge, three user decisions.** Merged by the
+user: PR #218 (#216's `NNTR_MOE_FADVISE` lever, `238a280b7`) **env-only,
+default not flipped** (user decision on the PR and on #216: the steady
+0.86–1.13 ms miss and +10 / +15 % decode at G = 64 do not buy prefill
+−7 to −18 %, rule 62); #216 closed `completed`, its `pgpgin_mib=` field
+stays on every future pool-miss cell. Decisions recorded in the contract
+(§12, two 2026-10-02 rows; §4.1 adb row; §4.2 device scope): (1) **the
+LFM2.5 table is closed out on the #222 config of record** (all engine keys
+`htp`, `init_seq_len 1024`, PPL cost of `attn_proj` / `dense_ffn`
+accepted) and then the project moves to Gemma — the closing sitting
+`222-config-refresh.md` (PR #223, open) is being run by the user on the
+S25 via the farm; #222 stays `state:needs-measurement` and nothing of it
+is folded before the handoff is filled and PR #223 merges; (2) **Gemma
+(#201 S5 / S6) sittings run on a Galaxy S26 Ultra attached to the
+workstation via adb**, a new BENCHMARK column; who drives that adb (agent
+or user) is a `needs-user` question — until answered, agents do not run
+adb. #201: PR #221 (S4 graph builder, 542-op 26B-A4B list, four mutants
+caught) open; the rest of S4 waits on the user's three answers of the
+2026-10-02 comment (#4296 pin merge, Gemma HTP MoE layer + QS4CX_WH
+writer S5 → S4, head_dim ≥ 64 fixture). #219 `state:in-progress`
+(implementer on host steps 1–3). Queue healthy (#137 `state:planned`,
+#219), nothing derived; upstream not watched. Open PRs into
+`htp_decode`: #223, #221, #220 (guide). Tracker #76 body refreshed.
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
