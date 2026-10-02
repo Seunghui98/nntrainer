@@ -380,6 +380,7 @@ void Transformer::repack_weight() {
   struct PendingFc {
     nntrainer::ComputeOps *ops;
     void *data;
+    const float *scale; ///< QS4CX per-channel scales; null for Q4_0
     unsigned int K, N;
   };
   std::vector<PendingFc> fc_pending;
@@ -505,8 +506,15 @@ void Transformer::repack_weight() {
         if (dtype == ml::train::TensorDim::DataType::QS4CX && !t.isVirtual()) {
           t.pack();
         }
-        if (fc_ops && dtype == ml::train::TensorDim::DataType::Q4_0) {
+        // A QS4CX FC weight (quantized offline, no Q4_0 detour) is
+        // registered here too, through the key gemm_qs4cx_accel_fp32 looks
+        // up: the weight's own data pointer and scales.
+        if (fc_ops && (dtype == ml::train::TensorDim::DataType::Q4_0 ||
+                       (dtype == ml::train::TensorDim::DataType::QS4CX &&
+                        !t.isVirtual()))) {
+          const bool qs4cx = dtype == ml::train::TensorDim::DataType::QS4CX;
           fc_pending.push_back({fc_ops, t.getData<char>(),
+                                qs4cx ? t.getScale<float>() : nullptr,
                                 static_cast<unsigned int>(t.height()),
                                 static_cast<unsigned int>(t.width())});
         }
@@ -609,17 +617,30 @@ void Transformer::repack_weight() {
     // touches every page of them inside the first prefill. In graph order
     // that first weight is a conv in_proj (the widest N) whenever those are
     // routed, so one call at M=512 covers every later shape's buffers.
+    // A QS4CX weight has no register-only entry that slices it the way
+    // the FC call does (register_qs4cx_weight is the one-handle expert
+    // form), so its call registers it: 64 rows, one row block, for every
+    // weight but the warm-up one.
     bool fc_warmed = false;
     for (const auto &p : fc_pending) {
-      if (!p.ops->register_q4_0_weight(p.data, p.K, p.N))
+      const bool qs4cx = p.scale != nullptr;
+      if (qs4cx ? !p.ops->supports_gemm_qs4cx_accel_fp32()
+                : !p.ops->register_q4_0_weight(p.data, p.K, p.N))
         continue;
-      if (fc_warmed || !p.ops->supports_gemm_q4_0_accel_fp32())
+      if (fc_warmed && !qs4cx)
         continue;
+      if (!qs4cx && !p.ops->supports_gemm_q4_0_accel_fp32())
+        continue;
+      const unsigned int M = fc_warmed ? 64 : 512;
       fc_warmed = true;
-      const unsigned int M = 512;
       std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
       std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
-      p.ops->gemm_q4_0_accel_fp32(p.data, act.data(), out.data(), M, p.N, p.K);
+      if (qs4cx)
+        p.ops->gemm_qs4cx_accel_fp32(p.data, const_cast<float *>(p.scale),
+                                     act.data(), out.data(), M, p.N, p.K);
+      else
+        p.ops->gemm_q4_0_accel_fp32(p.data, act.data(), out.data(), M, p.N,
+                                    p.K);
       ml_logd("FC HTP kernel warmed up at load (M=%u, K=%u, N=%u)", M, p.K,
               p.N);
     }
