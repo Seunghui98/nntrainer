@@ -1211,14 +1211,7 @@ public:
     // K = 7168, 3.1 MiB of u8 rows at M = 444 and 7 at M = 1024. Each
     // chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms;
     // one call covers every K = 2048 weight up to 1,920 rows.
-    const unsigned int step = fcMaxRows(K);
-    for (unsigned int m0 = 0; m0 < M; m0 += step) {
-      const unsigned int m = std::min(step, M - m0);
-      invokeLayer(session, fh.handles.data(),
-                  static_cast<int>(fh.handles.size()),
-                  matBdata + static_cast<size_t>(m0) * K,
-                  matCdata + static_cast<size_t>(m0) * N, m, N, K, &fh.cols);
-    }
+    invokeFc(session, fh, matBdata, matCdata, M, N, K);
   }
 
   /** @brief Rows one layer call may carry at this K.
@@ -1311,12 +1304,13 @@ public:
                              unsigned int K) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const uint32_t handle =
-      get_or_register_qs4cx(matAdata, matAscale, session, K, N);
-
-    // ponytail: see gemm_q4_0_accel_fp32's identical comment -- reverted
-    // from invokeLayerU8In for the same reason.
-    invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
+    // Column slices and row chunks as gemm_q4_0_accel_fp32 takes them: one
+    // handle over the whole weight overflows VTCM once it is wider than
+    // fcSliceCols (2816 x 4096 at M = 512 answered AEE_ENOMEMORY). A weight
+    // that fits one slice keeps its handle_cache_ entry, so an expert that
+    // register_qs4cx_weight registered is not registered twice.
+    invokeFc(session, get_or_register_fc(matAdata, session, K, N, matAscale),
+             matBdata, matCdata, M, N, K);
   }
 
   // Same grouping as gemm_q4_0_batch_fp32, for QS4CX weights -- see the
@@ -4531,6 +4525,20 @@ private:
     std::vector<unsigned int> cols; /**< N of each handle */
   };
 
+  /** @brief One FC weight's layer calls, in fcMaxRows row chunks. */
+  void invokeFc(remote_handle64 session, const FcHandles &fh, float *matBdata,
+                float *matCdata, unsigned int M, unsigned int N,
+                unsigned int K) {
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      invokeLayer(session, fh.handles.data(),
+                  static_cast<int>(fh.handles.size()),
+                  matBdata + static_cast<size_t>(m0) * K,
+                  matCdata + static_cast<size_t>(m0) * N, m, N, K, &fh.cols);
+    }
+  }
+
   /** @brief Columns of a K-deep weight per registered handle.
    *
    * hexkl_mm_u8i4_layer_run lays VTCM out as the whole activation
@@ -4554,9 +4562,13 @@ private:
    *  it fits fcSliceCols, else one per column slice, converted once and
    *  registered slice by slice under keys inside the weight (its data
    *  pointer plus the slice's first column -- distinct, and valid as long
-   *  as the weight is). Cached by the weight pointer like every handle. */
+   *  as the weight is). Cached by the weight pointer like every handle.
+   *  @param qs4cx_scale non-null: @a matAdata is a QS4CX weight with these
+   *         per-channel scales (quantized offline, no Q4_0 detour); null:
+   *         Q4_0x4 bytes. */
   const FcHandles &get_or_register_fc(void *matAdata, remote_handle64 session,
-                                      uint32_t K, uint32_t N) {
+                                      uint32_t K, uint32_t N,
+                                      const float *qs4cx_scale = nullptr) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = fc_cache_.find(matAdata);
     if (it != fc_cache_.end())
@@ -4565,7 +4577,10 @@ private:
     FcHandles fh;
     const unsigned int cap = fcSliceCols(K);
     if (N <= cap) {
-      fh.handles.push_back(get_or_register_unlocked(matAdata, session, K, N));
+      fh.handles.push_back(
+        qs4cx_scale
+          ? get_or_register_qs4cx_unlocked(matAdata, qs4cx_scale, session, K, N)
+          : get_or_register_unlocked(matAdata, session, K, N));
       fh.cols.push_back(N);
     } else {
       std::vector<int8_t> full(static_cast<size_t>(K) * N);
@@ -4574,8 +4589,12 @@ private:
       // The first slice's profile entry carries the conversion, so its
       // clock starts before it; the later slices' start with their copy.
       uint64_t t_begin = HtpProfile::nowUs();
-      htp_qs4cx_from_q4_0x4(matAdata, K, N, full.data(), w_scale.data(),
-                            colsum_w.data());
+      if (qs4cx_scale)
+        htp_qs4cx_from_packed(matAdata, qs4cx_scale, K, N, full.data(),
+                              w_scale.data(), colsum_w.data());
+      else
+        htp_qs4cx_from_q4_0x4(matAdata, K, N, full.data(), w_scale.data(),
+                              colsum_w.data());
       uint64_t convert_us = HtpProfile::nowUs() - t_begin;
       for (uint32_t c0 = 0; c0 < N; c0 += cap) {
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
@@ -5367,6 +5386,14 @@ private:
                                  remote_handle64 session, uint32_t K,
                                  uint32_t N) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
+    return get_or_register_qs4cx_unlocked(matAdata, matAscale, session, K, N);
+  }
+
+  /** @note Call with handle_mutex_ already held. */
+  uint32_t get_or_register_qs4cx_unlocked(void *matAdata,
+                                          const float *matAscale,
+                                          remote_handle64 session, uint32_t K,
+                                          uint32_t N) {
     auto it = handle_cache_.find(matAdata);
     if (it != handle_cache_.end())
       return it->second;
