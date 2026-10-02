@@ -1526,9 +1526,12 @@ int run(int argc, char **argv) {
     throw std::invalid_argument(
       "A tied model requires matching embedding and LM head dtypes");
   }
+  // The experts take --moe_dtype; the FCs are plain fully_connected layers,
+  // whose QS4CX weight the HTP registers without a Q4_0 detour.
   if (is_gemma4_moe && quant.fc_dtype != DType::FP32 &&
-      quant.fc_dtype != DType::Q4_0) {
-    throw std::invalid_argument("Gemma4 MoE FC dtype must be FP32 or Q4_0");
+      quant.fc_dtype != DType::Q4_0 && quant.fc_dtype != DType::QS4CX) {
+    throw std::invalid_argument(
+      "Gemma4 MoE FC dtype must be FP32, Q4_0 or QS4CX");
   }
   const std::string input_bin =
     nntr_cfg.at("model_file_name").get<std::string>();
