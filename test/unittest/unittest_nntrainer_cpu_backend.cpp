@@ -697,6 +697,53 @@ TEST(nntrainer_cpu_backend_standalone, wh_pack_unpacks_like_the_load_path) {
 }
 
 /**
+ * @brief A QS4CX weight packs and multiplies on whatever CPU this is.
+ *
+ * Transformer::repack_weight packs every QS4CX weight. Only the ARM kernels
+ * read the packed layout; on x86 dotQs4cx reads the nibbles as they are, and
+ * the fallback has no packer, so pack() used to throw and no QS4CX model
+ * could load on a PC. The product is checked against the dequantized weight;
+ * the CPU kernel quantizes the activations to int8 per row, hence an SNR
+ * bound rather than equality.
+ */
+TEST(nntrainer_cpu_backend_standalone, qs4cx_tensor_packs_and_dots) {
+  nntrainer::init_backend();
+
+  const unsigned int M = 4, K = 64, N = 96;
+  std::vector<float> w_nk = generate_random_vector<float>(N * K); // [N][K]
+  nntrainer::TensorDim wdim(1, 1, K, N,
+                            {ml::train::TensorDim::Format::NCHW,
+                             ml::train::TensorDim::DataType::QS4CX});
+  nntrainer::Tensor w(wdim, true);
+  nntrainer::quant_qs4cx_f32(N, K, w_nk.data(), w.getData<uint8_t>(),
+                             w.getScale<float>(), true);
+  ASSERT_NO_THROW(w.pack());
+
+  std::vector<float> deq(static_cast<size_t>(N) * K);
+  nntrainer::dequant_qs4cx_f32(N, K, w.getData<uint8_t>(), w.getScale<float>(),
+                               deq.data(), true);
+
+  nntrainer::Tensor x(1, 1, M, K);
+  std::vector<float> xv = generate_random_vector<float>(M * K);
+  std::copy(xv.begin(), xv.end(), x.getData<float>());
+  nntrainer::Tensor y(1, 1, M, N);
+  x.dot(w, y);
+
+  double signal = 0.0, noise = 0.0;
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      double ref = 0.0;
+      for (unsigned int k = 0; k < K; ++k)
+        ref += (double)xv[m * K + k] * deq[static_cast<size_t>(n) * K + k];
+      const double d = (double)y.getData<float>()[m * N + n] - ref;
+      signal += ref * ref;
+      noise += d * d;
+    }
+  }
+  EXPECT_GT(10.0 * std::log10(signal / noise), 30.0);
+}
+
+/**
  * @brief whSourcePageRange never hands back a byte it was not given
  *
  * The HTP arena drops a weight's pages once the bytes are copied in, and
