@@ -791,6 +791,28 @@ closed; #216 `state:review` (PRs #217 / #218 open, verdict on the
 issue); #201 `state:in-progress` (PR #214 conflicting, being rebased;
 PR #212 open); #137 `state:planned`; #219 `state:needs-plan`.
 
+**Cycle 31 (2026-10-02, base `htp_decode` @ `b26c161eb`): no measurement,
+no row of record moves; three merges folded.** Merged by the user: PR
+#214 (#201 S4: QK_NORM 256 / 512 + v norm, dense GeGLU, two-branch FFN +
+`layer_scalar`, soft-capped 262 144-row head, `2b8832a23`), PR #212 (drop
+`HmxMmU8I4Layer.RegistryCapacity`, the gtest that puts the S26 into
+download mode, rule 60, `0e880088d`) and PR #217 (#216 step 1 docs,
+`216-miss-read.md`, `b26c161eb`). With #214 every S4 kernel is in
+(#209 GeGLU epilogue, #210 router / any-width norm, #213 attention, #214
+head / norms / FFN); what remains of S4 is the Gemma graph builder and the
+load hand-over (plan 201 §2.4 last row), host-gated on the #4296 tiny
+fixture; S5 / S6 wait for the Gemma model files (and the user's pin of
+upstream #4296, plan 201 §0). Open PRs into `htp_decode`: #218 (#216's
+fadvise lever, env-only — the user's call stands from cycle 30: merge
+env-only or close; the default flip is not recommended) and #220 (guide
+refresh, docs, cycles 22–30). No `state:measured` issue, no device
+attached (contract §12), upstream not watched. Queue healthy: #219
+`state:planned` (plan `a540b876e`) and #137 `state:planned` — nothing
+derived. Issue state: #216 `state:review` (unchanged), #201
+`state:in-progress`, tracker #76's body rewritten for `htp_decode` (it had
+stopped at 2026-09-30 on `htp_moe`: #132 Part B, the v81 issues and #157
+/ #178 are closed since).
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
