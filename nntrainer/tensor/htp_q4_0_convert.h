@@ -64,12 +64,13 @@ void htp_qs4cx_from_q4_0x4(const void *q4_0x4_repacked, uint32_t K, uint32_t N,
  *
  * Unlike htp_qs4cx_from_q4_0x4, this is *not* a requantization -- it is a
  * bit rearrangement plus one integer sum, and the int4 values it produces
- * are exactly the ones quant_qs4cx_f32 already chose. The two quantizers
- * agree bit for bit on the arithmetic: both take rmin/rmax over the
- * channel with 0 folded in, both use scale = 15/(rmax-rmin), both round
- * and clamp to [-8, 7], and both store 1/scale (compare
- * __fallback_quant_nxk_qs4cx_f32 in fallback_internal.cpp with
- * htp_qs4cx_from_q4_0x4's body). Only the representation differs:
+ * are exactly the ones quant_qs4cx_f32 already chose. Both quantizers round
+ * and clamp to [-8, 7] and store 1/scale, but they no longer pick the scale
+ * the same way: quant_qs4cx_f32 searches clip points for the least squared
+ * error (qs4cx_channel_scale in fallback_internal.cpp), while
+ * htp_qs4cx_from_q4_0x4 still takes scale = 15/(rmax-rmin) from the
+ * channel's range. Only the representation differs between the on-disk
+ * QS4CX and what this function emits:
  *
  *   QS4CX on disk  nibbles q+8, two per byte, one channel per row:
  *                  packed[n * ((K+1)/2) + k/2], low nibble for even k

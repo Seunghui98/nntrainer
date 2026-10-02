@@ -697,6 +697,60 @@ TEST(nntrainer_cpu_backend_standalone, wh_pack_unpacks_like_the_load_path) {
 }
 
 /**
+ * @brief QS4CX's scale search never quantizes a channel worse than the
+ *        range-derived scale it replaced, and does better where one outlier
+ *        sets the channel's range.
+ *
+ * The old scale is recomputed here independently -- 15/(rmax-rmin) with 0
+ * folded into the range, codes clamp(round(x*scale), -8, 7) -- so the test
+ * pins the property the search promises rather than its own arithmetic.
+ */
+TEST(nntrainer_cpu_backend_standalone, qs4cx_scale_never_worse_than_minmax) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 256, N = 64;
+  std::vector<float> weight =
+    generate_random_vector<float>(N * K, -0.05f, 0.05f);
+  // One outlier per channel, alternating sign, so the range comes from it.
+  for (unsigned int n = 0; n < N; ++n)
+    weight[n * K + (n * 7) % K] = (n % 2) ? 0.4f : -0.4f;
+
+  const size_t nibble_bytes = static_cast<size_t>(N) * ((K + 1) / 2);
+  std::vector<uint8_t> packed(nibble_bytes);
+  std::vector<float> scales(N);
+  nntrainer::quant_qs4cx_f32(N, K, weight.data(), packed.data(), scales.data(),
+                             true);
+  std::vector<float> got(static_cast<size_t>(N) * K);
+  nntrainer::dequant_qs4cx_f32(N, K, packed.data(), scales.data(), got.data(),
+                               true);
+
+  double total_new = 0.0, total_old = 0.0;
+  for (unsigned int n = 0; n < N; ++n) {
+    const float *w = weight.data() + static_cast<size_t>(n) * K;
+    float mx = 0.0f, mn = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      mx = std::max(mx, w[k]);
+      mn = std::min(mn, w[k]);
+    }
+    const float old_scale = 15.0f / (mx - mn);
+    double sse_new = 0.0, sse_old = 0.0;
+    for (unsigned int k = 0; k < K; ++k) {
+      const int q =
+        std::min(7, std::max(-8, (int)std::round(w[k] * old_scale)));
+      const double d_old = (double)w[k] - (double)q / old_scale;
+      const double d_new = (double)w[k] - (double)got[(size_t)n * K + k];
+      sse_old += d_old * d_old;
+      sse_new += d_new * d_new;
+    }
+    EXPECT_LE(sse_new, sse_old * (1.0 + 1e-5)) << "channel " << n;
+    total_new += sse_new;
+    total_old += sse_old;
+  }
+  EXPECT_LT(total_new, 0.9 * total_old)
+    << "the search should beat the range-derived scale with outliers";
+}
+
+/**
  * @brief whSourcePageRange never hands back a byte it was not given
  *
  * The HTP arena drops a weight's pages once the bytes are copied in, and
