@@ -120,7 +120,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_attn_decode_f16.c $BACKEND/hvx/hvx_attn_decode_q.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_kv_quant.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
-    -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
+    -m"$HEX_ARCH" -mhvx -mhvx-length=128B -mhmx -G0 -O3 -fPIC -shared \
     -Wall -Werror \
     ${HEX_EXTRA_CFLAGS:-} \
     -I generated \
