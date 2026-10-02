@@ -71,6 +71,15 @@ void QS4CX_Tensor::pack() {
     return;
   }
 
+  // Only the KleidiAI kernels read the packed layout, and FloatTensor::
+  // dotQs4cx reaches them on ARM only (the same condition, below). On x86 it
+  // calls gemm_qai8dxp_qsi4cxp_rhs_unpacked on the nibbles and scales as
+  // they are, and the fallback has no packer --
+  // get_rhs_packed_size_qsi4cxp_qs4cxs1s0 is NYI there -- so packing on x86
+  // could only throw, which made every QS4CX model unloadable on a PC.
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64)
   size_t opt_kernel_idx = 8;
   /**
    * @note QS4CX tensor assumes that it is per-channel quantized along width()
@@ -90,6 +99,7 @@ void QS4CX_Tensor::pack() {
   if (!packed_data) {
     throw std::runtime_error{"something wrong"};
   }
+#endif
 }
 
 void *QS4CX_Tensor::getPackedData() const {
