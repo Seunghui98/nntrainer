@@ -150,6 +150,11 @@
 #   E2E 2bit gemma64 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
 #   E2E tokens 2bit==twin-gemma64 8/8 expected_mismatch=0
 #   E2E 2bit pool C=2 gemma64 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+#   E2E keys lfm25 prefill-moved=1 htp_fc_rows=<n> e3==e1 bit_identical=1 pool C=2
+#     bit_identical=1 misses=<n> calls/token=1.00 q4m1_handles=23
+#     cpu-fc-skipped=<n> per_token=10 ok
+#                              (#222: the config of record's engine keys and
+#                              init_seq_len 1024 on the lfm25 fixture)
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -418,6 +423,27 @@ done
 run_gemma g64e3p g64htpp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
 run_gemma g64e3q2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
 run_gemma g64e3q2pool2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# [#222] the config of record's keys on the same model: conv_block,
+# dense_ffn and attn_proj on the HTP (their prefill on the HTP FC kernels,
+# load-time registration and warm-ups), init_seq_len 1024; hybrid (off),
+# the one-session E1 run and the one-PD run, the last with a pool of C=2
+# (8 of the fixture's 16 experts)
+cp -a "$OUT/htp25q" "$OUT/htp25k"
+python3 - "$OUT/htp25k/nntr_config.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.update(conv_block_engine="htp", dense_ffn_engine="htp",
+         attn_proj_engine="htp", init_seq_len=1024)
+json.dump(c, open(sys.argv[1], "w"), indent=4)
+PY
+echo "== [#222] lfm25 with the engine keys: off, KINDS=all, NNTR_HTP_E2E=1, pool C=2"
+PROMPT=512 NNTR_HTP_PROFILE=1 run_e2e q25k-off "$OUT/htp25k" htp "$OUT/dump_25koff" "$OUT/25koff.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25k-e1a "$OUT/htp25k" htp "$OUT/dump_25ke1a" "$OUT/25ke1a.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25k-e3 "$OUT/htp25k" htp "$OUT/dump_25ke3" "$OUT/25ke3.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q25k-e3pool2 "$OUT/htp25k" htp "$OUT/dump_25ke3pool2" "$OUT/25ke3pool2.log" --max-seq 2048
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -586,6 +612,36 @@ two_bit() { # two_bit <label> <ref run> <2-bit run> <pool runs...>
 }
 two_bit lfm25 25e3p 25e3q2 25e3q2pool1 25e3q2pool2
 two_bit gemma64 g64e3p g64e3q2 g64e3q2pool2
+# [#222] with the keys: the prefill moved (step 0's logits differ from the
+# keyless run's), and the decode paths hold as without them -- the one-PD
+# token equal to E1's of the same model, one call per token, the pool
+# equal to the all-resident run, 23 handles (the keys' one-layer forms
+# hand the same weights), the CPU's FC work skipped at every resident row
+# (conv_block 4, qkv 2, attention_out 2, dense_ffn 2), and E1 against the
+# keys' own hybrid run by the tokens policy
+mkdir -p "$OUT/k0a" "$OUT/k0b"
+cp "$OUT/dump_25qoff/logits_0.f32" "$OUT/k0a/"; cp "$OUT/dump_25koff/logits_0.f32" "$OUT/k0b/"
+k0="$($EVAL --label keys-prefill --allow-diff --snr-floor 0 "$OUT/k0a" "$OUT/k0b" | tail -1 || true)"
+k3="$($EVAL --label e3==e1-lfm25-keys "$OUT/dump_25ke1a" "$OUT/dump_25ke3" | tail -1 || true)"
+kp="$($EVAL --label e3pool-lfm25-keys-C2 "$OUT/dump_25ke3" "$OUT/dump_25ke3pool2" | tail -1 || true)"
+kt="$($EVAL --label 'e1==off-lfm25-keys' --tokens-policy "$OUT/dump_25koff" "$OUT/dump_25ke1a" | tail -1 || true)"
+echo "$k0"; echo "$k3"; echo "$kp"; echo "$kt"
+calls="$(calls_per_token "$OUT/25ke3.log")"
+calls_p="$(calls_per_token "$OUT/25ke3pool2.log")"
+handles="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) .*/\1/p' "$OUT/25ke1a.log")"
+skipped="$(sed -n 's/^\[HTP\] graph: cpu fc skipped=\([0-9]*\)$/\1/p' "$OUT/25ke1a.log")"
+toks="$(sed -n 's/.*forward calls=[0-9]* tokens=\([0-9]*\) .*/\1/p' "$OUT/25ke1a.log")"
+misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/25ke3pool2.log")"
+rows="$(grep -cE 'HTP-PROFILE\]   K=[0-9 ]+N=[0-9 ]+M>1 (conv|dense|FC) +calls=[1-9]' "$OUT/25koff.log" || true)"
+if grep -q 'bit_identical=0' <<< "$k0" && grep -q 'bit_identical=1' <<< "$k3" &&
+  [ "${rows:-0}" -ge 3 ] &&
+  grep -q 'bit_identical=1' <<< "$kp" && grep -q '^E2E tokens' <<< "$kt" && ! grep -q 'unexpected=' <<< "$kt" &&
+  [ "$calls" = 1.00 ] && [ "$calls_p" = 1.00 ] && [ "${misses:-0}" -gt 0 ] &&
+  [ "$handles" = 23 ] && [ -n "$toks" ] && [ "${skipped:-0}" = $((10 * toks)) ]; then
+  echo "E2E keys lfm25 prefill-moved=1 htp_fc_rows=$rows e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=$misses calls/token=1.00 q4m1_handles=23 cpu-fc-skipped=$skipped per_token=10 ok"
+else
+  echo "E2E FAIL keys lfm25: htp_fc_rows=${rows:-none} calls/token=${calls:-none}/${calls_p:-none} handles=${handles:-none} skipped=${skipped:-none} tokens=${toks:-none} misses=${misses:-none}"; fail=1
+fi
 if [ $rc_pds = 1 ] &&
   grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
   echo "E2E e2e pds=2 refused ok"
