@@ -233,7 +233,15 @@ python3 tools/prefill_timeline.py prof.log --config prof_cfg.json --layer 5
 ### 7.5 측정 규칙 (이 세션이 비용을 치르고 배운 것)
 
 - **한 번에 하나만 돌린다.** 다른 `nntrainer_causallm`(사용자의 CPU 벤치마크 포함)과 겹치면 miss당 flash 읽기가 1.5 ms에서 7 ms로 느려져 숫자가 무효가 된다. 시작 전에 `adb shell 'ps -A | grep nntrainer_causall[m]'`로 확인한다.
-- **식힌 뒤 잰다.** 512토큰을 생성하면 SoC가 약 58 °C까지 오른다. 실행 사이에 최소 180 s를 쉬고, CPU·NSP 센서 최고값이 38 °C 이하, 배터리(`dumpsys battery`)가 30.0 °C 이하가 될 때까지 기다린다. scratchpad의 `prof_run.sh`의 `cool()`과 같은 방식이다.
+- **식힌 뒤 잰다.** 512토큰을 생성하면 SoC가 약 58 °C까지 오른다. 실행 사이에 최소 180 s를 쉬고, CPU·NSP 센서 최고값이 38 °C 이하, 배터리(`dumpsys battery`)가 30.0 °C 이하가 될 때까지 기다린다. 쓰던 함수는 아래와 같다(20분이 지나도 안 식으면 그대로 진행하고 온도를 기록한다).
+
+```bash
+export ANDROID_SERIAL=R3CY10WM83Y
+temps() { adb shell 'm=0; for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type)" in cpu*|nsp*) t=$(cat $z/temp); [ "$t" -gt "$m" ] && m=$t;; esac; done; b=$(dumpsys battery | grep "  temperature" | tr -dc 0-9); echo "$m $b"'; }
+cool() { while adb shell 'ps -A' | grep -q 'nntrainer_causall[m]'; do sleep 10; done; sleep 180
+         for i in $(seq 120); do read soc bat <<<"$(temps)"; [ "$soc" -le 38000 ] && [ "$bat" -le 300 ] && break; sleep 10; done
+         echo "start soc=$soc bat=$bat"; }
+```
 - `pgrep -f`로 기다리는 루프는 자기 자신의 명령줄과 일치해서 끝나지 않는다. `grep 'nntrainer_causall[m]'`처럼 쓴다.
 - PC에서 PR 4296 같은 다른 worktree의 바이너리를 돌릴 때는 `env -u LD_LIBRARY_PATH`를 쓴다. 셸의 `LD_LIBRARY_PATH`가 메인 저장소의 라이브러리를 잡는다.
 - config 함정:
