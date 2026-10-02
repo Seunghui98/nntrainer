@@ -179,7 +179,7 @@ sets everything below; agents put that line first in every shell.
 | Host build | `build/` (`meson setup build -Denable-transformer=true -Denable-tflite-backbone=false -Denable-tflite-interpreter=false`; no `flatc` here) | host gtests, `nntr_quantize_stream`, `run_host_checks.sh` |
 | Models | `/local/mnt/workspace/models/lfm2.5-8b-a1b/{hf,fp32,q40,q40-qs4cx-wh}` (§11) | `NNTR_MODEL_DIR` |
 | clang-format-14 | `~/.local/bin/clang-format-14` | AGENTS.md rule, changed lines only |
-| adb | `/usr/bin/adb` | **agents run the device sittings themselves** (user, 2026-09-30, from #201 on): always `adb -s <serial>` with the serial the issue or the user names (no default), a handoff doc is still written as the record, text approval stays the user's (§12) |
+| adb | `/usr/bin/adb` | **Since 2026-10-02 no device is attached and agents do not run adb** (§12, 2026-10-02 row): a task that needs silicon numbers files its handoff as an issue / issue comment (`needs-user` + `state:needs-measurement`, full path and commands) and the user runs it from a device-farm session. Between 2026-09-30 and 2026-10-01 agents ran the sittings themselves (`adb -s <serial>`, serial named by the issue or the user, handoff doc as the record, text approval the user's); that row applies again only when the user attaches a unit and says so |
 
 **No Hexagon simulator in this project** (user decision 2026-09-21). Kernel
 correctness is decided by host scalar specs and bit-identity checks (gate 1)
@@ -195,10 +195,13 @@ with it, and results are compared only inside one sitting (A/B); when two
 sittings happen to share a unit the same-unit drift is noted (LEDGER
 rule 13). A task that needs silicon numbers ends in a **measurement
 handoff** (`docs/measurements/<issue#>-<slug>.md`, template in
-`.claude/skills/hexagon-handoff`) run in one sitting — by the agent on
-`htp_decode` (§4.1 adb row, 2026-09-30), by the user before that. Since
-2026-10-01 the unit is a Galaxy S26 Ultra (v81 skel, #204); its serial is
-given by the user when attached.
+`.claude/skills/hexagon-handoff`) run in one sitting — by the user from a
+device-farm session since 2026-10-02 (the handoff is also filed as an issue
+or issue comment with `needs-user` + `state:needs-measurement`, §12), by the
+agent on `htp_decode` between 2026-09-30 and 2026-10-01 (§4.1 adb row), by
+the user before that. Since 2026-10-01 the unit is a Galaxy S26 Ultra (v81
+skel, #204) when a product unit exists; the S25 rows stay that device's
+column. Its serial is given by the user when attached.
 
 Handoff rules (user decisions Q3, Q13, Q18, Q19):
 
@@ -359,6 +362,7 @@ recorded in BENCHMARK.md's artifact section once built.
 
 | date | decision |
 |---|---|
+| 2026-10-02 | **No device on the workstation: agents do not run adb; every device measurement is a filed handoff the user runs from a session on the device farm (user).** The S25 Ultra `R3CY10WM83Y` is disconnected from the workstation. From this date a task that needs silicon numbers ends in a handoff (`docs/measurements/<n>-*.md` on the branch: variants, staged set + md5s, the run script, expected log lines, empty tables) **and** a GitHub issue or an issue comment on the task issue that carries the full handoff path and the commands, labelled `needs-user` + `state:needs-measurement`; the user runs it from another session connected to the device farm, fills the tables, and the supervisor folds them (§4.2 rule set unchanged: control first, A/B inside one sitting, md5 gate, text approval by the user). This replaces the 2026-10-01 "agents run adb" row and the §4.1 adb row for as long as no unit is attached; when a unit is attached again the user says so and the 2026-10-01 row applies. The #216 lever's two sittings (23:06–23:36 KST on 2026-10-01) ran before the disconnect and are folded in cycle 30 |
 | 2026-10-01 | **S26 optimization is deferred until a product unit; the two-PD path is deleted (user).** The #208 sitting ran on `R3CY70LV96T`, a developer / engineering S26 (userdebug `S948USQU1AZAB`): the one-PD E2E runs on v81, texts == A 20 / 20, ceiling 3840 — recorded in `204-s26-rebaseline.md`, with its tables as an appendix marked "developer unit, not representative"; no rule, no BENCHMARK column and no "now" come from it (LEDGER cycle 28). The two-PD E2E path (`NNTR_HTP_E2E_PDS` = 2, S2 with the FC set) is to be removed — one PD is the design (rule 59); the removal plan is the next issue |
 | 2026-10-01 | **Upstream PR #4327 is no longer watched (user).** The supervisor stops reporting its commits; §Upstream in LEDGER is frozen at `f923bf29`. Same day: PRs #206 (S26 stack port, #204), #202 and #203 (#201 S1: the expert pool inside the per-token E2E entry, one PD) merged into `htp_decode`; #207 (farm S25 sitting) closed as folded; #208 (S26 re-baseline) waits for a farm S26 |
 | 2026-10-01 | **The S26 Ultra replaces the S25 for `htp_decode`; agents run adb (user, 2026-09-30 / 10-01).** The S26 stack (#168 ELF-arch guard, #177 `NNTR_MOE_DMA_QUEUES`, #185 DQ schedule; 7 code commits, not C3 / DQR) is ported onto `htp_decode` by #204, so `htp_decode` builds the v81 skel (`HEX_ARCH=v81`, `ARCH OK (V81)`); the queue default stays 1. From #201 on, agents run the device sittings with `adb -s <serial>` (the §4.1 row; this replaces the 2026-09-29 `htp_moe_v81`-only exception), keep the handoff as the record (reboot, cool start, md5s, stop rules), and leave text approval to the user. The S25 rows (`R3CY10WM83Y`) stay that device's column |

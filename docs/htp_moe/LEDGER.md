@@ -744,6 +744,53 @@ goal path; PR #212 drops the one test that bricks the developer S26,
 rule 60). Open PRs into `htp_decode`, none reviewed: #212, #213, #214,
 #215 (#211). Upstream PR #4327 is not watched (contract §12).
 
+**Cycle 30 (2026-10-02, base `htp_decode` @ `03a44701c`): #216's two
+measurements folded — the pool-28 miss cost has a measured cause, and the
+first lever against it fails the prefill gate.** Merged by the user:
+PR #215 (#211, one PD only, `aa78104e9`) and PR #213 (#201 S4 attention,
+`03a44701c`); #211 closed `completed`. **(1) Step 1** (`216-miss-read.md`
+on `htp/216-miss-read`, PR #217 open; `R3CY10WM83Y` 21:43–22:01 KST,
+sitting 1's build, MD5 OK ×3 boots, 12 profiled Q28 G = 64 runs, text
+12 / 12 == A, ceiling 3840): **no busy core** (busiest non-app core
+3–16 % in 11 of 12 decode windows); the slow misses are **UFS reads** —
+in b3, 610 / 310 / 61 / 0 MiB `pgpgin` and 151 k / 79 k / 16 k / 1 file
+refaults in the decode window line up with 5.03 / 2.72 / 1.55 / 0.55
+ms/miss, PSI io 92–296 ms in every slow window (0–31 fast), kswapd
+≥ 65 k scans/s; **not boot proximity** (b1 slow at uptime 300 s, b2 slow
+at 60–301 s throughout, b3 slow after a 6-minute idle and fastest 8 s
+later). Cause: the 3.3 GB ION arena + the 4.1 GB model file in the page
+cache + Android (≈ 3.7 GB) exceed the 11.1 GB, so kswapd evicts the
+file's pages during the run and a re-missed expert comes from storage.
+Rule 61 amended (its protocol does not remove the slow regime), ㉜
+rewritten. Plan 216's slice lever not built (stop rule). **(2) The
+fadvise lever** (`216-fadvise.md` @ `45be8de65` on `htp/216-fadvise`,
+PR #218 open, env-only `NNTR_MOE_FADVISE`; two sittings 23:06–23:36 KST
+on a fresh and a ≥ 10-min-old boot, set `61a26580…` / skel `9d61aef4…`,
+device md5 == staged on both boots, verified against
+`216/fadvise/logs/{fresh,old}/md5_device.log` here; text 26 / 26 == A,
+`calls/token=1.00`, ceiling 3840 after 25 / 26): B holds the miss at
+0.86–1.13 ms where A ranges 0.68–4.38 on the same boot, decode +14.6 /
++10.5 % on the G = 64 block means (36.27 → 41.56, 38.67 → 42.71), −0.5 /
++4.3 % at G = 512; **prefill −10.4 / −7.4 % at G = 64 and −17.8 / −11.9 %
+at G = 512 — the prefill gate fails**, as do the plan's `arm_ms/round`
+(1.20–1.58 vs A-fast 0.945) and window-`pgpgin` gates; the `=2`
+(drop-only) cell is as slow as A's slow regime (3.87 / 3.97 ms/miss,
+every miss from storage), which confirms the plan's model (every decode
+miss is a re-miss of an expert the arena once held). Silicon rule 62:
+on this kernel `posix_fadvise` is not a hint — WILLNEED reads only the
+1 MiB read-ahead window and costs 3–8 ms per expert, DONTNEED 2–10 ms.
+§2 row; the default is **not flipped** (user's call at review: merge
+#218 env-only, or close it). The next lever is filed (#219, p1): the
+complement held in a cached ARM buffer and refilled off the token path,
+with the page cache kept out of the sum. Also this cycle: **no device on
+the workstation** (user, 2026-10-02): agents do not run adb, handoffs are
+filed as issues / comments with `needs-user` + `state:needs-measurement`
+(contract §12 row, §4.1 adb row, §4.2 — the 2026-10-01 "agents run adb"
+policy of cycle 27 is suspended, not withdrawn). Issue state: #211
+closed; #216 `state:review` (PRs #217 / #218 open, verdict on the
+issue); #201 `state:in-progress` (PR #214 conflicting, being rebased;
+PR #212 open); #137 `state:planned`; #219 `state:needs-plan`.
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
@@ -1656,6 +1703,41 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     `NNTR_MOE_PREFETCH=0`) do not move the decode miss (the readers run
     only in prefill; the miss is the pool server's `parallel_for`); the
     cause of the slow regime is not measured (㉜, #216).
+    **Amended, cycle 30 (#216 step 1, `216-miss-read.md`): the cause is
+    not boot proximity and the protocol does not remove it.** The slow
+    miss is a storage read: the model file's page cache is evicted by
+    kswapd *during the run* (3.3 GB ION arena + 4.1 GB file + Android on
+    11.1 GB), and a re-missed expert then comes from UFS — `pgpgin` 610 /
+    310 / 61 / 0 MiB in the decode window against 5.03 / 2.72 / 1.55 /
+    0.55 ms/miss on one boot, PSI io 92–296 ms in every slow window.
+    Slow runs happen at uptime 300 s and after a 6-minute idle; the
+    uptime correlation of the two S3 sittings was that sitting's memory
+    state. What stays of the protocol: the uptime on every run line, and
+    **a pool-miss cell is readable only with the decode window's
+    `pgpgin` (the `pgpgin_mib=` field on the pool line since PR #218) or
+    PSI io next to it** — without it a ms/miss number is one draw from a
+    bimodal distribution (0.68–4.38 on one boot, `216-fadvise.md`). The
+    first-run cells flagged above stay flagged for this reason, not for
+    their uptime.
+
+62. **`posix_fadvise` is not a hint on this phone (S25, kernel
+    6.6.77-android15): WILLNEED reads at most the device's 1 MiB
+    read-ahead window of a range and costs 3–8 ms of caller time per
+    5.4 MiB expert; DONTNEED costs 2–10 ms per expert** (`216-fadvise.md`
+    probes, `R3CY10WM83Y` 2026-10-01; the workstation clamps the window
+    at 128 KiB). Against reasoning: plan 216 rev. 2 assumed one
+    asynchronous call per range at ≈ 0.1 ms. Consequences measured in the
+    same sitting: issued in 128 KiB pieces on one unpinned worker, the
+    advice keeps every decode miss a cache hit (0.86–1.13 ms/miss on both
+    boots) but puts +0.3–0.6 ms on each miss round beside A's fast reads
+    and **−7 to −18 % on the prefill**, where the drops and WILLNEEDs run
+    beside the 8-thread prefill; no placement tried (inline, per-call
+    threads, one worker at any priority, deferred to the decode start)
+    removed the cost. `mlock` is not available either (`ulimit -l`
+    64 KiB without root). A page-cache lever on this kernel must avoid
+    the syscalls on the token and prefill paths: hold the bytes in a
+    user buffer, or read with `O_DIRECT`, and drop the file's pages once
+    at load.
 
 ## 2. Verdicts (measured, closed)
 
@@ -1719,6 +1801,8 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | **Record sitting 2026-09-30, CPU `q40` control on the same unit (02:58–03:03 KST, `R3CY10WM83Y`, same app set, model bin `d28f55c5…` = #78's, config 512 / [124900] / no-sample for the sitting, `htp=0`, cool start per G 31.6 / 32.8 / 33.6 °C, two runs)** | **CPU 52.18 / 51.31 / 50.12** (52.03 / 52.33, 51.74 / 50.87, 50.49 / 49.75; prefill 348 / 332, 338 / 318, 337 / 280; text r1 = r2) — the first CPU cell on this unit, −0.5 / +4.2 / +3.7 % vs `R3CY205ZMND`'s #94 s2. **Read against the NPU cool row (53.97 / 52.16 / 51.41): NPU above the CPU by +3.4 / +1.7 / +2.6 % under the same protocol on the same unit — the contract's "above the CPU" clause is met on `R3CY10WM83Y`, narrowly** (the G=512 margin, 0.85 tok/s, is inside one run's spread; the CPU itself clears 50 at every G cool). | `record-2026-09-30-cool-a.md`, BENCHMARK Goals (both decode rows), contract §1 |
 | **#201 S2, one PD (Q28 / Q29 = P28 + `NNTR_HTP_E2E_PDS=1`) against two PDs (P28), E0 and A — sitting 1 `R3CY10WM83Y` (2026-10-01 09:43–09:58, G 64 / 512, set `f5e8b1648`, 22 runs, no stop) and sitting 2 `R3CY205ZMND` (device farm, #207, 10:57–11:22, G 64 / 512 / 1024, set rebuilt at `a2ebef9c9`, 32 runs, two LEAK stops, three boots; tables from the issue comment, logs on that machine); with S0 (hybrid pool, 21:42) and the two-PD sitting (22:18) of 2026-09-30 on `R3CY10WM83Y`** | **One PD wins, bit-identical, on both units; still under A.** Q28 **42.98 / 43.13, 43.40 / 42.44** (G 64 / 512) vs P28 36.72 / 35.81, 36.67 / 34.13 vs E0 30.51 / 30.46, 30.79 / 30.66 vs A 56.74 / 54.51, 48.45 / 54.23 on `R3CY10WM83Y`; **40.48 / 40.97, 44.68 / 46.74, 45.11 / 45.20** vs P28 33.16 / 32.94, 35.37 / 39.07, 36.75 / 35.89 vs E0 29.30 / 30.09, 31.23 / 32.31, 31.02 / 30.92 vs A 54.61 / 54.65, 51.81 / 56.11, 51.82 / 50.30 on the farm unit (G 64 / 512 / 1024); Q29 = Q28 within spread with fewer misses; every text == A r1 of its G (20 / 20, 30 / 30; S0 30 / 30, two-PD 28 / 28). Mechanism: FC set on S1's VTCM 9.2 ms vs 11.6–13.1 on S2, no hops, `rt` 22.4 vs 26.6 / 30.6 (rule 59 a). Two-PD sitting: the pool beats all-resident E0 by the server spin's wake-up effect (L0 by accident, ≈ −4.5 ms a token), P32 35.6 vs E0 30.3–30.8. S0: the pool on the hybrid path F28 ≈ A (54.9 / 53.5 / 54.4 vs 57.3 / 55.4 / 54.9), F16w −20 %, cold 12–13. Pool-28 miss 3.45 / 3.79 ms on the two units, unexplained (rule 59 b, ㉜); LEAK 2 in 32 (farm) vs 1 across three sittings (㉝). Prefill: sitting 1 and two-PD inside −5 % on the means; sitting 2's column not in the comment. **No row of record** (lever on open PR #203, under A, second unit); the next structural read is the MoE round (10.5 ms) and the FC set's 1.1 ms over isolated, on the S26 (#204 / #208) | `201-one-pd.md` §Sitting 1 / §Sitting 2, `201-fsu-e2e.md`, `201-pool-baseline.md` (all on `htp/201-pool-miss-path`); issue #207 comment 2026-10-01; `201/s0/`, `201/s2/logs/`, `201/s3/logs/` (sitting 1) |
 | **#208: the S26 re-baseline on `htp_decode` (plan 204 §4 step 7; set from `4c0c20dca`, v81 skel `26fdf25a…`; `R3CY70LV96T`, SM-S948U userdebug, 2026-10-01 14:12–15:29 KST, three invocations, 24 runs + 2 profiles + CPU control; run by the orchestrator)** | **E2E runs on v81; optimization deferred.** The one-PD E2E (Q28) and the two-PD variants ran on an S26 with every NPU text == A q4 r1 of its G (20 / 20) and the S1 ceiling at 3840 MiB on all 24 cells; gtests on the v81 skel pass except #137's known set (softmax 28/4, attn 10/2) and `RegistryCapacity`, which drops this unit (rule 60). The tables (A 53.9 / 53.6, 57.9 / 55.9 at G 64 q4 / q1; E0 29.3 / 29.3, 30.1 / 33.9; P28 27.2 / 28.6, 29.0 / 30.2; Q28 30.7 / 33.9, 31.7 / 35.1; G 512 q4 A 54.4, E0 30.7, P28 31.6, Q28 37.4; CPU 50.9) are an appendix of record only: **developer unit, not representative** (user) — no rule, no BENCHMARK column. Observations kept there: four DMA queues read no better than one on any variant (the banner shows the setting applied); a pool-28 miss reads 3.99–4.69 ms with the phone's page-cache `read()` at ≈ 1.6–2.0 GB/s. S26 optimization deferred until a product unit | `204-s26-rebaseline.md` §Results (this fold); `/local/mnt/workspace/htp_moe/204/s26/logs/` |
+| **#216: the pool-28 miss cost — step 1 (`216-miss-read.md`, PR #217; `R3CY10WM83Y` 2026-10-01 21:43–22:01 KST, sitting 1's build `a2ebef9c9`, MD5 OK on three boots, 12 profiled Q28 G = 64 runs, per-core `/proc/stat` + `top -H` + vmstat sampler at 0.5 s) and the fadvise lever (`216-fadvise.md` @ `45be8de65`, PR #218, `htp/216-fadvise` @ `222a3196c`; two sittings 23:06–23:36 KST on a fresh and a ≥ 10-min-old boot, set `61a26580…` / skel `9d61aef4…` rebuilt from `03811d8ef`, device md5 == staged on both boots, 26 runs)** | **Cause measured, first lever fails the prefill gate, default not flipped.** (1) The slow miss is a storage read, not a busy core and not boot proximity (rule 61 amended, ㉜): `pgpgin` 610 / 310 / 61 / 0 MiB and refaults 151 k / 79 k / 16 k / 1 in the decode window against 5.03 / 2.72 / 1.55 / 0.55 ms/miss, PSI io 92–296 ms in every slow window (0–31 fast), busiest non-app core 3–16 % in 11 / 12 windows; slow at uptime 300 s and after a 6-min idle. Memory arithmetic: arena 3 328 + FC 448 + RSS 766 unreclaimable + the model file 4 116 cached + Android ≈ 3 740 > 11 114 MiB — every resident expert held twice. Plan 216's slice lever not built (stop rule; patch kept). (2) `NNTR_MOE_FADVISE=1` (DONTNEED after a slot is filled, WILLNEED on the victim, 128 KiB pieces on one worker, decode drops at `poolSync`): ms/miss **B 0.86–1.13 vs A 0.68–4.38** on both boots; decode G = 64 block means **36.27 → 41.56 (+14.6 %) fresh, 38.67 → 42.71 (+10.5 %) old**, G = 512 −0.5 / +4.3 %; against A's one fast run (0.68, 43.66) B is 1–4 % slower. **Prefill 494.8 → 443.6 (−10.4 %) / 540.5 → 500.2 (−7.4 %) at G = 64, −17.8 / −11.9 % at G = 512 — gate fail**; `arm_ms/round` 1.20–1.58 vs A-fast 0.945 (fail); window `pgpgin` 639–643 MiB at G = 64 by the plan's own arithmetic (fail by construction); `=2` drop-only 3.87 / 3.97 ms/miss = A's slow regime (model confirmed: every decode miss is a re-miss). Text 26 / 26 == A, `calls/token=1.00` 22 / 22, ceiling 3840 after 25 / 26 (one 3584 after a hybrid run, unexplained); hybrid H vs H0 inside spread (the path never reaches `readExpert`). Host: `ALL CHECKS PASS`, `INPROC E2E PASS` under unset / `=1` / `=2` with the same `misses=`, `bit_identical=1`. Rule 62 (fadvise is 2–10 ms a call here, WILLNEED reads 1 MiB). What is left → **#219**: the complement in a cached ARM buffer, refilled off the token path, the page cache dropped once at load; not verified: G = 1024, the victim re-miss race, `MADV_PAGEOUT` / plain `pread` into scratch as a cheaper drop | `216-miss-read.md` + `216-core-load-{run.sh,report.py}`, `216-sampler.sh` (PR #217); `216-fadvise.md` + `216-fadvise-{run.sh,sampler.sh,report.py}` (PR #218); issue #216 comments 2026-10-01 13:03 / 14:54; `/local/mnt/workspace/htp_moe/216/{logs_core,fadvise}/` |
+
 ## 3. Open items (candidates for issues; the supervisor promotes them)
 
 | # | item | expected | depends on |
@@ -1754,7 +1838,7 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | ㉙ | **CLOSED (cycle 23): #162 closed by the user after step 0 and the prefetch A/B (§2 #162 row, rule 51) — neither lever pays; G=1024 ≥ 50 belongs to the end-to-end track (PR #169) and, on the hybrid default, to rule 52 (cool A cells read 50.9–52.4 at G=1024, the row of record 47.36 waits for a mirrored cool sitting).** **Filed as #162 (p1, `state:needs-plan`, cycle 22).** G=1024 is the one length below the goal after #158: **47.36 tok/s = 21.11 ms/token, −1.1 ms needed**, bit-preserving. Candidates: (a) CPU attention (`mha_core`) 1.97 ms/token at G=1024 (1.47 at G=512), heads independent, the fp16 NEON reduction order kept as `152-resident-accuracy.md` documents it; (b) the #90 prefetch overlap (S = 4 MiB, +0.7–1.4 ms/token on the L2 path) — re-read on the bypass default first (rule 44 (2)). Gate: G=1024 ≥ 50 against the sitting's A (bypass default), dumps `bit_identical=1`, nll equal, text ≡ A 8/8, prefill ≥ −5 % | decode goal at G=1024 | rules 44, 46 |
 | ㉚ | **Decided (user, 2026-09-30): option (1) + (2)** — Part B as the two-session design (S1 = router + MoE, S2 = the rest, one call per session per token, shared-page hops), bit-preserving; (2) the VTCM-share probe, stopped on the host finding (MoE prefill layout ≥ 6720 KiB; S2 ≤ 0.95 MiB; ≤ 3-lane VTCM feed slower than L2) — S2's FC stays L2-fed. Status in ㉓ and the §2 #132 Part B row; #178 = PR #183 re-target; #192 (single-session window) not viable. The hybrid stays the default until the E2E path is faster and bit-identical (20.8 vs ≈ 54 today). **Decision for the user (cycle 23), after #132 Part A and #178:** the FC set + lm_head (383 MiB, 402 MB/token) is the term that decides the decode NPU end-to-end path. Measured: exact FC on the DSP VTCM-fed 7.88 ms/token (S1, but S1 has 113 MiB free), L2-fed in a second session 8.06 (S2 has 0 VTCM), the CPU 7.4; the two-session path projects ≈ 45–46 tok/s against the hybrid's 50.6–54. Options: (a) build the two-session E2E plan anyway (needs an HVX quantizer, an HVX CPU-exact router, and either VTCM for S2 or an L2 feed at the K=2048 rate for K=7168 ≈ −1 ms); (c) of #132 (keep the FCs on the CPU, one call per token only for the DSP-resident kinds — the hybrid stays the product path); or the §3.5 fallback. Until decided, #132 and #178 stay `needs-user`; the implementer's queue is #170 round 3 | decides whether the end-to-end track continues past ATTN_M1 | user |
 | ㉛ | **Filed as #197 (p2, `state:needs-plan`, cycle 25), after PR #191.** The S26 M=1 decode MoE call after #185 is 427.1 µs `dsp`/call (DQ) against ≈ 346 µs of transfer at 62 GB/s over 4 queues: C(2) and C(3) move no bytes (≈ 38 µs/call DMA-idle) and GU(0)'s remainder after QUANT is exposed (`DMA_FIRST` 50 µs). Next rung named by #185's `ponytail:`: a third down slot in the arena's spare ≈ 0.9 MiB (half a down) or a row-split of one down over two jobs, each with its own host proof (dataflow / submit-lane scoreboards + a negative). Gate on #197: `dsp` ≤ A − 20 µs/call, decode ≥ A and ≥ S25 #158 B at every G, bit-identical, prefill ≥ −5 %. Only the S26 (v81) benefits — on the S25 one queue is the bypass ceiling (rule 43) | ≈ −20..−38 µs/call ≈ +4..8 % S26 decode | #185, #177, rule 43 |
-| ㉜ | **Pool-28 miss cost: a boot-proximity effect with an unmeasured cause (rule 61; `201-s3-probe.md`).** The 3.5–3.8 ms a miss of rule 59 b reads 0.5–1.1 ms on the same build, unit and C = 28 once the boot is ≳ 2 min old, and 3.7–5.0 ms inside the first ≈ 130 s whatever the setting. Ruled out: page cache (`201-fsu-e2e.md`; resident 3948–4116 MiB on fast and slow runs alike), arena / pool size (C = 28 = C = 24 when the boot is old), reader-thread placement (`NNTR_MOE_PREFETCH_CPUS=6,7`, `_READERS=1`, `NNTR_MOE_PREFETCH=0`: the readers run only in prefill). Correlated: uptime at the run (probe runs 1, 2, 4 and disc runs 1–4 slow, every later run fast; one fast run inside the window). Structure under suspicion: a decode miss is the pool server (pinned to core 6, main's pin) running `readWeight`'s `parallel_for` as **8 page-aligned `pread` slices, one per compute worker, hard-pinned one per core (7, 0–5)** — a barrier over all 8 cores, so any one busy core (post-boot services, zram / kswapd after the 4 GB `cat`) stalls the whole miss. Nothing else in the app slows (ARM memcpy 22–26 GB/s, MoE `dsp` 15–16 ms a call, prefill 431–562 in both regimes). Next read (#216, p1, `state:needs-plan`): per-core `/proc/stat` load sampled through a boot's first 5 min beside a Q28 G = 64 run, then the miss read with 2 slices on the big cores and with the slices unpinned, A/B inside one old boot and inside a fresh one. #208's 4.7 ms a miss on the developer S26 is unexplained with this as a candidate. At G ≥ 512 the 28-pool misses 0.12–0.34 a token, so even the slow regime is 0.5–1.7 ms a token there; p1 because every G = 64 pool cell and every first-after-boot cell carries it | per-core load names the core or clears the hypothesis; a 2-slice / unpinned miss read that holds 0.5–1.1 ms inside a boot's first 2 min, or a protocol-only fix (rule 61) | #216 |
+| ㉜ | **Pool-28 miss cost: cause measured (cycle 30, #216 step 1 + lever; rule 61 amended, rule 62). The slow miss (3.7–5.0 ms) is a UFS read of a re-missed expert whose file pages kswapd evicted during the run; the fast one (0.5–1.1) is the same `pread` from the page cache. Memory: arena 3 328 + FC 448 + RSS 766 MiB unreclaimable, the model file 4 116 cached (every resident expert held twice), Android ≈ 3 740, on 11 114 MiB.** Ruled out, in order: page-cache residency *before* the run (`201-fsu-e2e.md`; it is evicted during), arena / pool size as a cure (C = 24 is 512 MiB less pressure), reader-thread placement (readers run only in prefill), a busy core on the 8-pinned-slice barrier (busiest non-app core 3–16 %), boot proximity (slow at uptime 300 s and after a 6-min idle). Measured lever (PR #218, `NNTR_MOE_FADVISE=1`, env-only, not flipped): misses 0.86–1.13 ms on every run of both boots, decode +10 / +15 % at G = 64, but the advice costs 2–10 ms a call on this kernel and **prefill −7 to −18 %** — gate fail; the `=2` cell shows pure dropping makes every miss a storage read (102 / 102 re-misses in the S0-trace replay, 121 on the device). At G ≥ 512 the pool misses 0.12–0.34 a token, so even the slow regime is ≤ 1.7 ms a token there; at G = 64 (1.89 misses a token) it is 3–8 ms a token, the largest single term between Q28 (43) and A (54) on that cell. Next (#219, p1, `state:needs-plan`): keep the 88-expert complement (≈ 465 MiB) in a cached ARM buffer at load, serve a miss as a 5.3 MiB memcpy into the ION slot (ARM staging memcpy 22–26 GB/s → ≈ 0.25 ms), refill the vacated tier slot with the victim's bytes by a plain / `O_DIRECT` `pread` on a helper off the token path (re-miss gap p10 1.1 tokens), and drop the file's pages once at load so the page cache leaves the sum; a hybrid-path run must be unchanged | ≤ 0.5 ms a miss on every run of a fresh and an old boot, window `pgpgin` ≈ 0 without `fadvise` on the token or prefill path, prefill ≥ −5 %, text == A; or a measured reason the tier cannot hold | #219; rule 62 |
 | ㉝ | **S1 ceiling 3584 (LEAK) stops: 2 in 32 runs on the farm S25 `R3CY205ZMND` vs 1 across three sittings (≈ 94 runs) on `R3CY10WM83Y`** (rule 59 c); all four known cases on a boot's first G = 512 r1 or a profiled run, the stopped runs themselves closed clean. Per unit, per boot, no cause. Not a lever; a runner fact: the S26 sittings keep the reboot-and-resume rule and log uptime at every stop. Read `ceiling.txt` + the `.logcat` of the farm's two stops (on that machine) for the mapping that stays | which PD / process holds the 256 MiB after a clean close | farm session's logs |
 
 ## 3a. Guide and tooling notes
