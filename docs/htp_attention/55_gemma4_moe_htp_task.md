@@ -416,3 +416,44 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 | peak RSS (512 / 1024) | 3.20 / 3.44 GB | 4.69 / 5.10 GB | — |
 
 - NPU의 prefill 시간이 길이에 거의 비례한다(512 → 1024에 1.91배). 토큰당 비용(CPU의 attention·projection, §10.11)이 지배하고 flash 고정비는 아직 숨어 있다는 뜻이다. decode는 두 경로 모두 expert 캐시 미스의 flash 읽기에 묶여 3~3.6 TPS로 비슷하다.
+
+### 10.14 층당 캐시 expert 수 C: decode는 C=8이 가장 빠르다 (2026-10-02, 기기 R3CY10WM83Y)
+
+- 조건: §10.6 모델, 모든 FC와 MoE를 HTP에 둔 512토큰 설정(`attn_proj_engine`·`dense_ffn_engine`·`moe_engine` = htp), 생성 512토큰, `NNTR_MOE_CACHE_EXPERTS`로 C만 바꿨다. 각 실행 전에 최소 180 s 쉬고, CPU·NSP 센서 최고값 38 °C 이하, 배터리 30.0 °C 이하가 될 때까지 기다렸다. 512토큰 생성 한 번에 SoC가 약 58 °C까지 오른다.
+
+| C | 풀 칸 | arena | prefill | decode | decode miss | 읽기/miss |
+|---|---|---|---|---|---|---|
+| 8 | 240 | 약 0.7 GiB | 105.6 TPS | **4.51 TPS** | 81348 | 0.76 ms |
+| 16 | 480 | 1408 MiB | 119.8 TPS | 3.39 TPS | 62198 | 1.58 ms |
+| 24 | 720 | 2112 MiB | **123.3 TPS** | 3.47 TPS | 41955 | 2.27 ms |
+| 32 | 960 | 2816 MiB 매핑 후 | 로드 실패 | — | — | — |
+| 40 | 1200 | 3072 MiB 매핑 후 | 로드 실패 | — | — | — |
+
+- C=32는 projection을 DSP heap에 등록하는 `nntr_hvx_weight_register_u8i4`에서, C=40은 expert 등록(`swap_u8i4_arena`)에서 0x80000402(AEE_ENOMEMORY)로 실패했다. arena와 DSP heap이 PD의 4 GB 주소 공간 하나를 나눠 쓴다(§10.11 주변의 doc 46 §41). 모든 FC를 HTP에 두면 C의 상한은 24와 32 사이다.
+- C가 커질수록 miss 수는 줄지만 miss당 읽기 시간이 늘어 decode가 느려진다. 페이지 캐시 때문이라고 보지만 측정하지 않았다: arena는 고정된 ION 메모리라 C가 클수록 OS 페이지 캐시에 남는 RAM이 줄어든다. C=8의 0.76 ms/miss는 2.87 MiB 기준 약 3.9 GB/s로, flash보다 RAM 속도에 가깝다.
+- prefill은 512토큰에서 층마다 128 expert를 모두 쓰기 때문에, C를 키워도 미리 읽을 여유만 조금 늘 뿐이다(16 → 24에서 +3%).
+- 판정: 이 설정에서는 C=8이다. decode가 +33%, prefill이 −12%이고, 512토큰을 생성하는 전체 시간이 가장 짧다. C=4는 측정하지 않았다(120칸은 한 층의 128 expert보다 작아 prefill 호출이 나뉜다).
+
+### 10.15 FC를 오프라인 QS4CX로: prefill 정확도는 좋아지고 decode가 경계에 선다 (2026-10-02, 기기 R3CY10WM83Y)
+
+- 코드: 66c41a5(QS4CX FC가 Q4_0 경로와 같이 열 slice·행 chunk로 나뉨 — 없으면 2816×4096 M=512에서 ENOMEMORY), 69db273(QS4CX FC를 로드 시 등록), 7becfdc(MoE 모델에서도 `--fc_dtype QS4CX` 허용).
+- 모델: `--fc_dtype QS4CX --moe_dtype QS4CX_WH --embd_dtype Q4_0 --lmhead_dtype Q4_0 --isa ARM`, 12,240 MiB. config `fc_layer_dtype: QS4CX`. HTP는 FP32에서 한 번 양자화한 값을 그대로 받고, decode(M=1)는 CPU KleidiAI QS4CX GEMV로 돈다.
+
+| 446토큰, `NNTR_PPL=1` | nll/token |
+|---|---|
+| MoE만 HTP, FC CPU Q4_0 (§10.12) | 4.556 |
+| 전부 HTP, FC를 로드 시 Q4_0 → QS4CX 재양자화 (§10.12) | 5.095 |
+| **전부 HTP, FC 오프라인 QS4CX** | **4.510** |
+| FC CPU QS4CX (prefill도 CPU) | 4.374 |
+
+| 512토큰, C=16, 전부 HTP | FC Q4_0 (§10.14) | FC QS4CX |
+|---|---|---|
+| 로드 시 등록 | 11.1 s (변환 5.4 s) | 7.1 s (변환 1.6 s) |
+| prefill | 119.8 TPS | 122.2 TPS |
+| decode | 3.39 TPS | 2.79 TPS |
+| peak RSS | 3.21 GB | 4.03 GB |
+| 텍스트 | 요약 | 첫 구절 "The small harbour town of Ard-" 반복 |
+
+- 446토큰 프롬프트로 48토큰을 생성하면 FC를 HTP에 둔 경우와 CPU에 둔 경우 모두 정상 영어 문장이다. decode 커널이 고장 난 것은 아니다. GEMV(idx 2)와 GEMM(idx 8)은 같은 `qsi4cxp8x8` RHS pack을 읽는다. 512토큰에서 반복된 것은 decode FC가 Q4_0(블록-32 scale)에서 채널당 scale로 바뀐 정밀도 차이(§10.10의 weight SNR 21.2 → 17.2 dB)로 본다. prefill은 정답 토큰을 넣어 주며 채점하므로 decode에서 생기는 누적은 nll에 나타나지 않는다.
+- RSS +0.8 GB: ARM 쪽 QS4CX가 원본과 KleidiAI pack을 둘 다 들고 있다.
+- 판정: 모델은 FC Q4_0으로 되돌렸다. prefill HTP용 QS4CX와 decode CPU용 Q4_0을 FC마다 둘 다 저장하는 방안은 제안만 했고 만들지 않았다.
