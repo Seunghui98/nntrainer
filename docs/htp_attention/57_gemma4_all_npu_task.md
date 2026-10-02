@@ -269,3 +269,13 @@ cool() { while adb shell 'ps -A' | grep -q 'nntrainer_causall[m]'; do sleep 10; 
 ## 9. 결과 기록
 
 (여기에 단계별 결과를 추가한다: 날짜, 커밋, 조건, prefill/decode, nll, 텍스트, `prefill_timeline` 상위 표.)
+
+### 9.0 0단계·1단계 (2026-10-02): 브랜치 세움, host 검증 통과, 기기 미측정
+
+- 브랜치: `claude/zealous-bell-a2pot9` = pr4385(`htp_first_version` @ d4a8984) + 46커밋(코드 24, 테스트 보강 1, `[Docs]` 21). d652e57·2212121은 §1대로 뺐다. 공통 조상 7a8e260.
+- 충돌 2건을 PR 4385 구조로 풀었다.
+  - e23f947e (757e819의 GeGLU `act`): 커널 `hexkl_mm_u8i4_moe_layer_run`의 시그니처는 PR 4385의 `flags` 그대로 두고 `HEXKL_MOE_FLAG_GELU_TANH`(bit 19)를 더했다. skel이 IDL의 `act`(0 silu, 1 gelu_tanh)를 그 비트로 바꿔 `moe_set_opts` 워드에 OR 한다. dspqueue 패킷(`htp_dspq_wire.h`)에는 `HTP_DSPQ_FLAG_GELU`. M=1 GEMV 경로(`moe_m1_pair_worker`)도 같은 `hvx_dequant_swiglu_acc_tiles_to_f32`를 쓰므로 GeGLU를 받는다. host 체크: GeGLU 층 0 mismatch(swiglu_det.h의 `geglu_det_one` 대조), identity 1.2e-6.
+  - 1b79a200 (a7c527a의 `NNTR_MOE_DIFF`): include 줄만 충돌.
+- 6f7fa8d3: PR 4385가 7a8e260 뒤에 추가한 기기 gtest 호출 4곳(`unittest_hvx_mm_u8i4.cpp` 2, `unittest_hvx_dma_probe.cpp` 2)에 `act` 인자를 넣었다. Android 빌드는 이 환경에 없어 IDL 순서로만 맞췄다.
+- host (x86, 시스템 OpenBLAS, meson 1.5.2): `run_host_checks.sh` 끝까지 통과, `htp_syntax_check.sh` 통과, `unittest_causallm_models` **98 passed / 0 failed / 3 skipped**(101개; `Lfm2MoeDifferentialTest` 3개는 lfm2_moe_tiny fixture 가중치를 torch 없이 만들 수 없어 skip. e8d2604 기준에서 실패하던 Q40 두 테스트가 여기서는 skip이라 그 원인은 아직 모른다). Gemma4·Gemma4Moe differential 테스트는 통과.
+- **기기 미측정.** IDL이 바뀌었으므로 기기에서는 stub·skel·앱을 모두 다시 빌드하고 `libnntr_hvx_skel.so`를 push해야 한다(§7.2). §2 기준선은 이 브랜치에서 다시 재야 한다.
