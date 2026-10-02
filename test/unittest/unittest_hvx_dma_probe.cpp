@@ -424,9 +424,9 @@ struct MoeSets {
                    *d = dn.data() + (set % n_sets) * kE;
     std::fill(stage.begin(), stage.end(), 0u);
     return nntr_hvx_mm_u8i4_moe_layer_timed(
-      h, 1, kK, kI, kN, g, (int)kE, d, (int)kE, row_index.data(), (int)kE,
-      row_count.data(), (int)kE, row_weight.data(), (int)kE, act.data(),
-      (int)kK, out.data(), (int)kN, stage.data(), kMoeStages);
+      h, 1, kK, kI, kN, 0u /* silu */, g, (int)kE, d, (int)kE, row_index.data(),
+      (int)kE, row_count.data(), (int)kE, row_weight.data(), (int)kE,
+      act.data(), (int)kK, out.data(), (int)kN, stage.data(), kMoeStages);
   }
 
   ~MoeSets() {
@@ -1170,10 +1170,10 @@ TEST_F(HvxDmaProbe, MoeChunkReplay) {
     int err = AEE_SUCCESS;
     for (int rep = 0; rep < 2 && err == AEE_SUCCESS; ++rep) {
       err = nntr_hvx_mm_u8i4_moe_layer_timed(
-        handle_, 1, K, I, N, h_gu.data(), (int)E, h_dn.data(), (int)E,
-        row_index.data(), (int)E, row_count.data(), (int)E, row_weight.data(),
-        (int)E, act.data(), (int)K, out.data(), (int)N, stage.data(),
-        kMoeStages);
+        handle_, 1, K, I, N, 0u /* silu */, h_gu.data(), (int)E, h_dn.data(),
+        (int)E, row_index.data(), (int)E, row_count.data(), (int)E,
+        row_weight.data(), (int)E, act.data(), (int)K, out.data(), (int)N,
+        stage.data(), kMoeStages);
     }
     if (err != AEE_SUCCESS) {
       std::cout << "DMA_REPLAY_NOTE moe_layer_timed err=" << hex(err)
