@@ -281,3 +281,26 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 커널 혐의 해소(기기 gtest, 같은 날): `HvxSwigluDet.GegluMatchesScalarBitExact` `bad_out=0 of 8192`; `MoeLayerMatchesTwoCallReference`가 LFM2(N 2048)와 Gemma(K 2816·inter 704·N 2816) 두 형상 모두 `bad_elems=0`, `max_ulp=0`. §6 용의자 A 닫힘.
 - 호스트 CPU 전-Q4_0 기준점(`--moe_dtype Q4_0 --isa X86`, `q40_x86_fixed/`)은 만들어 뒀으나 실행은 스레드 설정(`NNTR_NUM_THREADS=16` > 가용 12)으로 실패했다. few-shot이 이미 ARM 경로를 덮으므로 필수는 아니다; 필요하면 `NNTR_NUM_THREADS=8`로 다시 돌린다.
 - 다음: 지시 수행(요약)을 보려면 `google/gemma-4-26B-A4B-it`를 변환·양자화해야 한다(가중치 파이프라인은 그대로, §10.5 가드가 순서를 지킨다).
+
+### 10.7 HTP 대 CPU Q4_0 텍스트 비교와 가중치 레시피 오차 (2026-10-02, 기기 R3CY10WM83Y + PC)
+
+- 조건: 같은 요약 프롬프트(md5 `21573099`), 512 토큰. (a) 이 브랜치, expert QS4CX_WH를 HTP로(§10.6). (b) PR 4296의 런타임, expert Q4_0을 CPU로, `moe_cache_size 16`(층당 LRU, flash에서 mmap 스트리밍). (b)의 모델은 **원래 FP32**(= PR 4296 변환기의 gate/up/down 분리 레이아웃 — §10.5의 "출처 불명 변환기"가 바로 이것이다)를 PR 양자화기로 Q4_0 ARM 양자화했다.
+
+| | 생성 | prefill | decode | peak RSS |
+|---|---|---|---|---|
+| (a) QS4CX_WH + HTP | 원문 복사 후 `</Text>` 반복(512) | 447 tok 12.6 s | 5.14 TPS | 3.2 GB |
+| (b) Q4_0 + CPU flash offload | 원문 복사 후 `</Text><eos>`로 종료(269) | 447 tok 12.8 s | 4.25 TPS | 4.7 GB |
+
+- 두 생성은 본문 **1484자(약 260 토큰)가 문자 단위로 동일**하다(오타 `these-operations`까지). 갈라지는 곳은 `…research.\n</Text>` 다음 한 토큰뿐: (b) `<eos>`, (a) `\n`. HTP 경로가 계산을 틀리는 것이 아니라, 동률에 가까운 토큰 하나가 뒤집힌 것이다.
+- 원인 측정(PC, FP32 대비 expert 가중치 SNR, 층 0·5·10·15·20·25·29 × expert 0·63·127, 양자화기 레시피를 numpy로 옮겨서):
+
+| | QS4CX (출력 채널당 scale 1, K 2816) | Q4_0 (32개마다 scale 1) | 차이 |
+|---|---|---|---|
+| gate·up | 16.5–17.2 dB | 21.0–21.3 dB | 4.1–4.5 dB |
+| down | 17.6–18.2 dB | 21.0–21.3 dB | 3.1–3.4 dB |
+| 전체 평균 | 17.23 dB | 21.16 dB | **3.93 dB** |
+
+- 판정: 차이는 **모든 층에서 균일**하다 → 특정 층·연산의 결함이 아니라 레시피 성질이다. 3.93 dB = 양자화 잡음 전력 약 2.5배. QS4CX의 zero-point 없는 `[-8,7]` 클립은 0.025%(gate·up)·0.1%(down)로 원인이 아니다; 원인은 scale 해상도(88배 차이)다.
+- 측정 안 한 나머지 오차원: HTP 커널의 행 단위 u8 활성화 재양자화(expert 입력, GeGLU 중간값). `NNTR_MOE_DIFF=8`로 층별로 잴 수 있다(기기 미측정).
+- 업그레이드 경로(설계만): K 방향 그룹 scale. 그룹 32는 HMX k-타일 하나와 정확히 맞으므로, QS4CX_WH 파일에 (k-타일, 출력 채널)별 scale을 두고 커널이 k-타일별 부분합에 scale을 곱하게 하면 Q4_0 수준 가중치 정밀도에 다가간다. 파일 포맷 + 커널 에필로그 변경이라 활성화 몫을 먼저 잰 뒤 결정한다.
+- 덧붙여: (a)(b) 모두 요약 지시를 따르지 않고 원문을 복사한다 → §10.6의 base 체크포인트 판정과 일치.
