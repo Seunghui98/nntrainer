@@ -335,3 +335,27 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - 판정 2: **가중치 MSE는 이 격차의 대리 지표가 아니다.** MSE 최적 클립은 가중치 SNR을 17.2 → 18.9 dB로 올렸지만 nll은 0.032 나빠졌다. 절댓값 큰 가중치를 잘라 평균 오차를 줄이는데, 학습된 모델에서는 그 가중치가 불균형하게 중요하다(활성화 인지 기법들이 존재하는 이유). 변경(d652e57)은 모든 QS4CX 경로가 공유하는 양자화기를 바꾸므로 되돌렸다(2212121). 기기 모델도 원래 파일로 복원.
 - 함정 하나: 원래 FP32 config에서 물려받은 `skip_prefill: true`면 마지막 토큰을 빼고 prefill해 `NNTR_PPL`이 한 위치도 집계하지 않는다(`no positions scored`). PPL을 잴 config은 `skip_prefill: false`여야 한다.
 - 다음: 같은 가중치를 x86 CPU **QS4CX**(채널 int4 + 행 단위 8비트 활성화 `qa8dx` — HTP 커널과 같은 방식)로 돌린다. ≈4.55면 격차 전체가 레시피(형식) 몫 → 형식·양자화를 고친다; ≈4.45면 HTP 커널 고유 → 커널을 본다.
+
+### 10.10 격차 분해: 형식 0.1 nat, FP16·커널은 0.01 이하 (2026-10-02, 기기 R3CY10WM83Y + PC x86)
+
+- 같은 446토큰 요약 프롬프트, `NNTR_PPL=1`. attention·dense MLP·임베딩·lm_head는 모든 행에서 Q4_0. Android 빌드는 `enable-fp16=true`라 attention이 FP16(`#if ENABLE_FP16 && defined(__ANDROID__)`), PC는 FP32다 — 그래서 §10.9의 x86 대 기기 비교만으로는 expert 탓이라고 단정할 수 없었고, 아래 네 점으로 분해했다.
+
+| 경로 | attention | expert | nll/token | ppl |
+|---|---|---|---|---|
+| PC x86 CPU, 이 브랜치 앱 | FP32 | Q4_0 | 4.4475 | 85.4 |
+| 기기 ARM CPU, PR 4296 앱(flash offload, `moe_cache_size 16`) | FP16 | Q4_0 | **4.4581** | 86.3 |
+| PC x86 CPU, 이 브랜치 앱 | FP32 | QS4CX | 4.5631 | 95.9 |
+| 기기 HTP, 이 브랜치 앱 | FP16 | QS4CX_WH | **4.5562** | 95.2 |
+
+| 요인 | 비교 | 영향 |
+|---|---|---|
+| expert 형식(채널당 scale 1 대 32개마다 scale 1) | 기기 Q4_0 대 기기 HTP | **0.098 nat** (x86끼리 0.116) |
+| FP16 대 FP32 attention | 같은 형식의 기기 대 x86 | +0.011 / −0.007 |
+| HTP 커널 대 CPU QS4CX 커널 | 기기 HTP 대 x86 QS4CX | 0.007 |
+
+- 판정: 남은 정확도 격차는 **QS4CX 형식 자체**다. HTP 커널은 같은 형식의 CPU 커널과 0.007 nat 안에서 같고, FP16 attention의 몫도 0.01 nat 수준이다. 계산 결함은 없다.
+- 측정에 필요해 고친 것: x86에서 QS4CX 모델이 `pack()`의 NYI로 로드조차 안 되던 것(89b426f). PR 4296 앱의 `NNTR_PPL`은 측정용 로컬 포트로 워크트리에만 있고 어디에도 올리지 않았다.
+- 해법 후보(미구현, 미측정):
+  1. **K 방향 그룹 scale** — Q4_0이 4.458을 내는 바로 그 해상도. 그룹 32 = HMX k-타일 하나라 타일 경계와 맞는다. QS4CX_WH 파일 형식(채널×k-타일 scale) + 커널이 k-타일별 부분합에 scale을 곱하도록 에필로그 변경 + IDL·stub·skel 재빌드. 비용: HMX 누산기를 k-타일마다 꺼내야 하는지에 따라 성능이 갈린다 — 설계 전에 HMX 누산 구조를 확인해야 한다.
+  2. **활성화 인지 스케일링(AWQ식)** — 형식·커널 불변. gate_up 입력 채널 scale은 층의 128 expert가 공유하는 `pre_ffn_norm_2` gamma에 접고(층 공유 scale), down 입력 채널 scale은 expert마다 up 출력 열에 접는다(GeGLU는 gate에만 비선형이라 up 열 scale은 정확히 상쇄된다). 보정 활성화가 필요하고 효과는 미측정.
+- 기각: 채널별 MSE scale(§10.9, nll 악화).
