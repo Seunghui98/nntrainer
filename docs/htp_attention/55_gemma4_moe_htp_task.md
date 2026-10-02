@@ -386,3 +386,19 @@ Phase 1 판정(사용자 PC): 변환 → `--fc_dtype Q4_0 --moe_dtype Q4_0 --emb
 - MoE 커널(층당 27.7 ms): LFM2와 HMX 실효 속도는 같으나(약 3.3 TMAC/s) expert당 행이 약 28(447×8/128)이라 64행 블록이 44%만 찬다 → mm 14.66 ms(LFM2 8.86), acc 6.34 ms(LFM2 2.96).
 - 이미 적용된 것(MoE 경로): 층당 1콜(transport 0.72 ms/콜), ION 슬롯(480/480), poll QoS(qos_mode 2), WH 오프라인 bake(등록 1.15 s는 로드 시), weight DMA 선행, dequant+GeGLU 융합. 적용 안 된 것: projection·dense FFN·attention의 HTP 경로(LFM2의 `attn_proj_engine`/`conv_block_engine`/`dense_ffn_engine`이 Gemma4에 미연결), C=5에서의 선읽기.
 - 상한(산술): prefill은 층마다 128 expert를 모두 건드려 3840 expert ≈ 11.4 GB, C=16 풀 480칸을 빼면 약 10 GB를 flash에서 읽는다. 3.0 GB/s(53 §10.32)로 약 3.3 s → 447토큰에서 약 135 TPS. 지금은 CPU 작업 5 s 뒤에 숨어 있지만 CPU 몫을 줄이면 이것이 바닥이 된다. LFM2는 expert 전체가 3.7 GB라 같은 바닥이 0.9 s였다. 프롬프트 길이와 무관한 고정비라 긴 프롬프트일수록 TPS 상한이 오른다.
+
+### 10.12 projection·dense MLP도 HTP로: 계산은 빠르지만 정확도를 잃는다 (2026-10-02, 기기 R3CY10WM83Y)
+
+- 코드: 42d1ac6 — Gemma4가 LFM2와 같은 키 `attn_proj_engine`·`dense_ffn_engine`(+`*_htp_layers`)를 읽어 q/k/v/o와 dense MLP gate/up/down FC 7개에 engine을 준다. prefill(M>1)만 HTP, decode는 CPU Q4_0(Q4_0 등록 경로는 ARM 페이지를 버리지 않는다). 기본 `cpu`.
+- 조건: §10.6 모델, C=16(config), 446토큰, `NNTR_PPL=1`(lm_head가 446행을 채점해 prefill이 비-PPL 측정 5.01 s보다 길다 — 아래 행끼리만 비교).
+
+| HTP로 보낸 것 | nll/token | Δ | prefill | 로드 시 등록 |
+|---|---|---|---|---|
+| MoE만 | 4.5562 | — | 7.59 s | 480개, 1.07 s |
+| + dense MLP | 4.6894 | +0.13 | 7.56 s | — |
+| + attention projection | 5.0207 | **+0.46** | 7.32 s | — |
+| + 둘 다 | 5.0950 | +0.54 | 6.98 s | 975개, **11.2 s** |
+
+- HTP 위 FC 계산 자체는 빠르다: 7개 FC 206콜 합계 0.50 s(CPU에서는 2.34 s). 끝단 이득이 0.61 s뿐인 이유 중 측정된 것: expert 선읽기가 따라가지 못하기 시작했다 — 층이 요청할 때 읽혀 있던 비율 94% → 77%, 노출 대기 183 → 675 ms. §10.11의 flash 바닥이 드러나는 첫 신호. 나머지(staging 0.17 s 등)는 미분해.
+- 판정: 지금 형식으로는 **켜지 않는다**. 정확도 손실은 대부분 attention projection(+0.46)에서 온다. 원인 후보는 둘이고 아직 가르지 않았다 — (a) 로드 시 Q4_0 → 채널당 scale QS4CX로 다시 양자화(블록-32 정밀도를 잃는 이중 양자화), (b) FC 입력의 행 단위 u8 활성화 양자화(층 입력에 큰 outlier가 있는 층이 있다, §10.8). §10.10과 같은 형식 한계가 FC에도 적용되는 것이다.
+- 다음: 정확도는 그룹 scale(K-타일 단위) 형식이 들어와야 FC 오프로드가 성립한다. 속도는 정확도 손실 없는 RoPE 표 수정(약 −0.8 s, §10.11)이 먼저다.
