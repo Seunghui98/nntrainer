@@ -1623,7 +1623,8 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     session's reading (rule 34's band), yet Q28 at G = 512 read higher on
     the slower unit (44.7–46.7 vs 42.4–43.4) — the one-PD cell's spread
     across boots and prefill ramps is larger than the unit gap; read each
-    sitting against its own A only.
+    sitting against its own A only. (e) The two-PD path was removed by
+    #211 on 2026-10-01; its numbers stay as the reason.
 
 60. **`HmxMmU8I4Layer.RegistryCapacity` takes the S26 developer unit
     `R3CY70LV96T` (userdebug `S948USQU1AZAB`) into Samsung download mode**
@@ -1850,6 +1851,24 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
   needs an x86-packed twin (`nntr_quantize_stream … --moe_dtype QS4CX_WH`
   without `--isa ARM`) and is minutes per token on the scalar HMX
   stand-in: registration and dumps only, never a number.
+
+* **#211 (2026-10-01): `NNTR_HTP_E2E_PDS` is a guard, not a switch.**
+  Unset or `1` proceeds (one PD, the only E2E path); any other value
+  throws at load naming #211, so a runner that still passes `_PDS=2`
+  cannot label a one-PD row with a removed variant. Drop the guard with
+  the next genuine IDL change, together with `role` in
+  `token_driver_start` (the DSP accepts only 0) and the `hops` /
+  `wait_us` / `hop_us` fields of `htp_dspq_token_resp` (they read 0):
+  removing them now would have made a pure deletion the PR whose device
+  failure mode is the stale-stub `transport failed: err=0xe`.
+
+* **#211: `unittest_hvx_two_sessions` is the #178 platform probe, not the
+  E2E path, and stays whole** (with `mailbox_run` and
+  `nntr_hvx_mailbox.c`): it reserves its own S2 and never used
+  `HtpBackend::openSecond` (deleted), its `S1Ceiling` is the runners'
+  ceiling cell (`CEILING s1_mmap_mib=` before and after every run), and
+  its Q1–Q5 lines are what rule 59 and ㉝ cite. Its `TwoSessions` name is
+  a probe's.
 
 ## 4. Reusable code on `hvx_impl` (survey 2026-09-21; read with `git show hvx_impl:<path>`)
 

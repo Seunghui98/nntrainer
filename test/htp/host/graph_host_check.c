@@ -447,54 +447,6 @@ static void check_validator(void) {
         "error code values drifted from AEEStdErr.h");
   CHECK(hexkl_graph_resident_kinds() == HTP_GRAPH_KINDS_ALL,
         "kernel table: resident kinds 0x%x", hexkl_graph_resident_kinds());
-
-  /* #132 Part B: the same list for two sessions, complementary masks */
-  {
-    static uint32_t s1[sizeof(w) / sizeof(w[0])], s2[sizeof(w) / sizeof(w[0])];
-    uint32_t n_s1 = 0, n_s2 = 0, hops = 0, bad = 0;
-    n = build(w, cap, &kLfm25, kLfm25Layers, HTP_GRAPH_KINDS_ALL);
-    rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
-    CHECK(rc == 0u, "LFM2.5 all kinds: %s", htp_graph_err_name(rc));
-    memcpy(s1, w, n * sizeof(uint32_t));
-    memcpy(s2, w, n * sizeof(uint32_t));
-    htp_graph_set_resident(s1, HTP_GRAPH_KINDS_S1);
-    htp_graph_set_resident(s2, HTP_GRAPH_KINDS_S2);
-    CHECK((HTP_GRAPH_KINDS_S1 & HTP_GRAPH_KINDS_S2) == 0u &&
-            (HTP_GRAPH_KINDS_S1 | HTP_GRAPH_KINDS_S2) == HTP_GRAPH_KINDS_ALL,
-          "masks do not partition the kinds");
-    rc = htp_graph_validate(s1, n, HTP_GRAPH_KINDS_ALL, NULL);
-    CHECK(rc == 0u, "S1 mask: %s", htp_graph_err_name(rc));
-    rc = htp_graph_validate(s2, n, HTP_GRAPH_KINDS_ALL, NULL);
-    CHECK(rc == 0u, "S2 mask: %s", htp_graph_err_name(rc));
-    /* every op resident in exactly one session; S1's stretches are
-       exactly [ROUTER_TOPK MOE] and each is a hop between two of S2's */
-    for (i = 0; i < n_ops; ++i) {
-      const htp_graph_op *a = htp_graph_op_cat(s1, i),
-                         *b = htp_graph_op_cat(s2, i);
-      const int starts_s1 =
-        a->resident && (i == 0u || !htp_graph_op_cat(s1, i - 1u)->resident);
-      const int starts_s2 =
-        b->resident && (i == 0u || !htp_graph_op_cat(s2, i - 1u)->resident);
-      bad += a->resident == b->resident;
-      if (starts_s1) {
-        ++n_s1;
-        bad += a->kind != HTP_OP_ROUTER_TOPK || i + 2u >= n_ops ||
-               htp_graph_op_cat(s1, i + 1u)->kind != HTP_OP_MOE ||
-               htp_graph_op_cat(s1, i + 2u)->resident;
-      }
-      n_s2 += starts_s2;
-      hops += (starts_s1 || starts_s2) && i != 0u;
-    }
-    CHECK(bad == 0u && n_s1 == 22u && n_s2 == 23u && hops == 44u &&
-            htp_graph_op_cat(s2, 0)->resident &&
-            htp_graph_op_cat(s2, n_ops - 1u)->resident,
-          "session split: bad=%u S1 stretches=%u S2 stretches=%u hops=%u", bad,
-          n_s1, n_s2, hops);
-    printf("GRAPH SESSION MASKS OK: S1=%s S2 = the other %u kinds; LFM2.5 "
-           "S2 stretches=%u S1 stretches=%u hops/token=%u\n",
-           htp_graph_kinds_str(HTP_GRAPH_KINDS_S1, names, sizeof(names)),
-           HTP_OP_KIND_N - 2u, n_s2, n_s1, hops);
-  }
 }
 
 /* ---- forward half ------------------------------------------------------ */

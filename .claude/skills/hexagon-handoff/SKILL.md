@@ -33,6 +33,13 @@ Hard rules (user decisions 2026-09-21):
   pass; the supervisor folds only approved rows. The text comparison is
   mandatory in every such handoff; the PPL column adds to it and never
   replaces it (user, 2026-09-28).
+* **NPU E2E variants are A and Q<C> only** (#211, user 2026-10-01):
+  Q<C> = `NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=<C>`, one PD. There is no
+  E0 (all-resident does not fit one PD on the 8B) and no P<C> (the two-PD
+  path is gone); do not pass `NNTR_HTP_E2E_PDS` (any value but 1 is
+  refused at load). The historical runners (`201-s*-run.sh`,
+  `204-s26-run.sh` and their `-stage.sh`) name E0 / P / Q as they ran and
+  are not templates for this; their `one PD` grep line drops.
 * Every artifact row has an md5 and the commit it was built from; the
   user copies the md5 the run prints or `md5sum` on the device shows.
 
