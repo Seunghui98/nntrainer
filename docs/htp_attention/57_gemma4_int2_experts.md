@@ -199,6 +199,21 @@ adb shell 'cd /data/local/tmp/nntrainer/causallm && sh g4_int2_bench.sh' 2>&1 | 
 
 ### 5.2 e2e
 
+**read-ahead 끔 / reader 수 (2026-10-06, packed int2, C=16, PROFILE=2)**
+
+| 실행 | prefill | read-ahead | miss (전체) | reader ms/expert | 합산 읽기 속도 |
+|---|---|---|---|---|---|
+| 기본 (reader 4) | 3920 ms | 3360 읽음, 노출 21 ms | 328 | 3.61 | 1.68 GB/s |
+| `NNTR_MOE_PREFETCH=0` | 4789 ms (+869) | 없음 | 935, 1.59 ms/miss, file read 1490 ms | — | 동기 0.96 GB/s |
+| reader 2 | 4821 ms | 노출 390 ms | | 2.44 | 1.25 GB/s |
+| reader 6 | 4817 ms | 노출 0 ms | | 3.53 | 2.58 GB/s |
+
+판정:
+- **읽기가 드러나면 비용은 실재한다**: read-ahead를 끄자 prefill +0.87 s, miss당 1.59 ms(1.52 MB). int4였다면 miss당 바이트가 2배다(미측정).
+- **합산 읽기 속도는 reader 수에 비례해 오른다**(1.25 → 1.68 → 2.58 GB/s). flash 한계(3.0 GB/s)가 아니라 **reader 한 스레드의 한계**(0.4~0.6 GB/s, uncached arena로의 pread)다. reader 6이면 5.1 GB를 2.0 s에 읽어 여유가 생긴다.
+- **실행 간 편차가 0.9 s다.** reader 2(노출 390 ms)와 reader 6(노출 0)이 둘 다 4.8 s로 같고, 기본 4개가 3.9 s였다. 읽기 노출로 설명되지 않는다 → 발열 또는 page cache 상태. 연속 실행의 뒤쪽일수록 느린 패턴과 맞다. **int4/int2 비교는 같은 조건을 번갈아 2~3회 반복해야 한다.** 미확인.
+- 더미 라우팅은 prefill에서 층당 약 20 expert만 더 건드린다(미스 ~600). read-ahead는 다음 층 expert 전부(3360)를 읽으므로 더미에서는 5배 과잉 읽기다. 실제 모델은 prefill에서 거의 128개를 다 건드리므로 과잉이 아니다.
+
 **packed int2, NNTR_HTP_PROFILE=2 (2026-10-06)** — C=16, read-ahead 기본, 512 tok prompt / 512 생성. 파일 7,226,112,120 B, arena 704 MiB, 출력 텍스트 정상(더미지만 프롬프트를 되풀이).
 
 | | prefill (M>1, 31 calls) | decode (M==1, 15360 calls) |
