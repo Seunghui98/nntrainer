@@ -127,6 +127,8 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
+    ../models/gemma4/gemma4_moe_causallm.cpp \
+    ../models/gemma4/gemma4_moe_layer.cpp \
     ../models/lfm2/lfm2_causallm.cpp \
     ../models/lfm2_moe/lfm2_moe_causallm.cpp \
     ../models/lfm2_moe/lfm2_slim_moe_causallm.cpp \
@@ -253,6 +255,8 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
+    ../models/gemma4/gemma4_moe_causallm.cpp \
+    ../models/gemma4/gemma4_moe_layer.cpp \
     ../models/lfm2/lfm2_causallm.cpp \
     ../models/lfm2_moe/lfm2_moe_causallm.cpp \
     ../models/lfm2_moe/lfm2_slim_moe_causallm.cpp \
