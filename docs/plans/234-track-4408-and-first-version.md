@@ -171,6 +171,28 @@ noted; no step needs a device. Order is by dependency, not by size.
   Gate: rung 1 — `unittest_causallm_models` incl. the two new cases; E2E
   lines unchanged (the E2E quantizes `.bin` fixtures, so this is a no-op
   there by construction — say so in the PR).
+  *As built (PR for P2, stacked on P1):* both commits ported, authors
+  kept. Conflict only in `quantize_stream.cpp`: `PaletteOptions` (#238)
+  and `writer.setPalette` kept beside `SourceTensor` and the new ctor
+  argument; `writeFcConcat` (#231, the Gemma `QS4CX_WH` / `QS2CX_WH`
+  gate | up writer) checks its two source tensors one by one. The "FP32
+  or Q4_0" Gemma dtype check (now `:1737`) is untouched and kept: it
+  reads `--fc_dtype` only, the experts' `QS4CX_WH` / `QS2CX_WH` come in
+  through `--moe_dtype`. The §1 gate as built differs in
+  one point: the guard compares **sizes**, so a swap of two same-sized
+  tensors is not detectable by it (the converter's keys and the
+  quantizer's names are different spellings; upstream chose not to map
+  them). The test therefore reproduces §10.5 as it happened — router
+  scale before the router matrix, offsets consistent, byte total equal —
+  which is refused at the dry run with both names and sizes and an empty
+  output; the same bytes as a `.bin` quantize (control). A header whose
+  keys are in another order is **reordered** by `data_offsets`, not
+  refused, and quantizes byte-identical to the `.bin` (Q4_0 and
+  `QS4CX_WH`). The fixture's `.safetensors` is the converter's output,
+  written by `generate_gemma4_moe_reference.py` beside the `.bin`. One
+  addition beyond #4408, from the port's review: the reader refuses a
+  header it cannot follow positionally (a non-F32 tensor, offsets that do
+  not tile the payload, no tensors, a wrapping header length).
 * **P3. The diagnostic pair** — `7dbd876ed` (clean), then `a7c527ac2`
   rebased: the diff runs on the layer's CPU-side call (the hybrid /
   `NNTR_HTP_FORWARD` path), reads expert bytes through the pool's
