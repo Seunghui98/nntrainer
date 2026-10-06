@@ -26,6 +26,7 @@
 #include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
+#include <memory>
 
 namespace causallm {
 
@@ -75,6 +76,21 @@ public:
   QScale(float val = 1.0f) : nntrainer::Property<float>(val) {}
   using prop_tag = nntrainer::float_prop_tag;
   static constexpr const char *key = "q_scale";
+};
+
+/**
+ * @brief rope: RoPE on q and k after their norms, with rope_theta,
+ *        rope_scaling_type (default or proportional),
+ * rope_partial_rotary_factor and max_timestep (the table's rows) as the
+ * attention core takes them -- whose use_rope is then off. The head dim is
+ * feature_size. On the accelerator it rides the projection call; on the CPU it
+ * is the attention core's own kernel over the same table.
+ */
+class Rope : public nntrainer::Property<bool> {
+public:
+  Rope(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "rope";
 };
 
 } // namespace props
@@ -193,7 +209,9 @@ private:
   /** feature_size: the head dim q and k are normed over; unset = no norm */
   std::tuple<props::QUnit, props::KUnit, props::VUnit, props::FeatureSize,
              nntrainer::props::Epsilon, props::VNorm, props::VFromK,
-             props::QScale, props::InNorm>
+             props::QScale, props::InNorm, props::Rope, props::RopeTheta,
+             props::RopeScalingType, props::RopePartialRotaryFactor,
+             nntrainer::props::MaxTimestep>
     qkv_props;
   std::array<unsigned int, 6>
     weight_idx; /**< [in_gamma,] q, [q_gamma,] k, [k_gamma,] v */
@@ -204,6 +222,11 @@ private:
   bool v_norm = false;
   bool v_from_k = false;
   float q_scale = 1.0f;
+  bool rope = false;
+  unsigned int rope_rows = 0; /**< positions the table holds */
+  /** [pos][cos row (feature_size, halves duplicated) | sin row], shared by
+   *  every layer of the same shape */
+  std::shared_ptr<const std::vector<float>> rope_table;
 };
 
 } // namespace causallm

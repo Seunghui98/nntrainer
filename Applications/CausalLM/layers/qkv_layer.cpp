@@ -23,7 +23,10 @@
 
 #include <qkv_layer.h>
 
+#include <cmath>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <vector>
 
 #include "htp_decode_hook.h"
@@ -51,9 +54,64 @@ QKVLayer::QKVLayer() :
   LayerImpl(),
   qkv_props(props::QUnit(), props::KUnit(), props::VUnit(),
             props::FeatureSize(), nntrainer::props::Epsilon(), props::VNorm(),
-            props::VFromK(), props::QScale(), props::InNorm()) {
+            props::VFromK(), props::QScale(), props::InNorm(), props::Rope(),
+            props::RopeTheta(), props::RopeScalingType(),
+            props::RopePartialRotaryFactor(), nntrainer::props::MaxTimestep()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
+}
+
+/** @brief The RoPE table in the attention core's own numbers (its
+ *  precompute_freqs: the thetas of the default and proportional types, then
+ *  calc_trigonometric_vals_dup per position), as [pos][cos | sin] rows of
+ *  2 * hd floats, once per shape for every layer that asks. */
+static std::shared_ptr<const std::vector<float>>
+ropeTable(unsigned int hd, unsigned int rows, float theta,
+          const std::string &type, float partial) {
+  static std::mutex mtx;
+  static std::map<std::string, std::shared_ptr<const std::vector<float>>> cache;
+  const std::string key = std::to_string(hd) + ":" + std::to_string(rows) +
+                          ":" + std::to_string(theta) + ":" + type + ":" +
+                          std::to_string(partial);
+  const std::lock_guard<std::mutex> lock(mtx);
+  auto it = cache.find(key);
+  if (it != cache.end())
+    return it->second;
+  NNTR_THROW_IF(type != "default" && type != "proportional",
+                std::invalid_argument)
+    << "qkv_layer: rope_scaling_type " << type
+    << " is not folded here; keep use_rope on the attention core";
+  const unsigned int half = hd / 2;
+  std::vector<float> thetas(half, 0.0f);
+  if (type == "default") {
+    for (unsigned int i = 0; i < half; ++i)
+      thetas[i] = 1.0 / (std::pow(theta, (2 * i) / static_cast<float>(hd)));
+  } else {
+    const int angles = static_cast<int>((partial * hd) / 2.0f);
+    for (int i = 0; i < angles; ++i)
+      thetas[i] = 1.0f / (std::pow(theta, (2 * i) / static_cast<float>(hd)));
+  }
+  auto table =
+    std::make_shared<std::vector<float>>(static_cast<size_t>(rows) * 2 * hd);
+  for (unsigned int pos = 0; pos < rows; ++pos) {
+    float *row = table->data() + static_cast<size_t>(pos) * 2 * hd;
+    nntrainer::calc_trigonometric_vals_dup(half, thetas.data(), row, row + hd,
+                                           pos, 1.0f);
+  }
+  cache[key] = table;
+  return table;
+}
+
+/** @brief The attention core's RoPE kernel over rows [0, rows) of x at
+ *  positions from + r, heads of hd across the row's width. */
+static void ropeRows(float *x, unsigned int rows, unsigned int width,
+                     unsigned int hd, const float *table, unsigned int from) {
+  for (unsigned int r = 0; r < rows; ++r) {
+    const float *cs = table + static_cast<size_t>(from + r) * 2 * hd;
+    nntrainer::compute_rotary_emb_value(width, hd, hd / 2,
+                                        x + static_cast<size_t>(r) * width,
+                                        nullptr, cs, cs + hd, false);
+  }
 }
 
 void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -74,6 +132,7 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
   v_from_k = std::get<props::VFromK>(qkv_props).get();
   q_scale = std::get<props::QScale>(qkv_props).get();
   in_norm = std::get<props::InNorm>(qkv_props).get();
+  rope = std::get<props::Rope>(qkv_props).get();
   // v from the raw k projection: v's width is k's, and the raw k lands in
   // the norm scratch below, so the norm (feature_size) must be on.
   const unsigned int v_unit =
@@ -121,6 +180,20 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
                    v_unit % feature_size != 0),
                 std::invalid_argument)
     << "qkv_layer: feature_size must divide q_unit, k_unit and v_unit";
+  if (rope) {
+    NNTR_THROW_IF(feature_size == 0 || feature_size % 2 != 0,
+                  std::invalid_argument)
+      << "qkv_layer: rope takes feature_size as the head dim, an even one";
+    NNTR_THROW_IF(std::get<nntrainer::props::MaxTimestep>(qkv_props).empty(),
+                  std::invalid_argument)
+      << "qkv_layer: rope needs max_timestep for its table";
+    rope_rows = std::get<nntrainer::props::MaxTimestep>(qkv_props).get();
+    rope_table =
+      ropeTable(feature_size, rope_rows,
+                static_cast<float>(std::get<props::RopeTheta>(qkv_props).get()),
+                std::get<props::RopeScalingType>(qkv_props).get(),
+                std::get<props::RopePartialRotaryFactor>(qkv_props).get());
+  }
   NNTR_THROW_IF((v_from_k || v_norm) && feature_size == 0,
                 std::invalid_argument)
     << "qkv_layer: v_from_k and v_norm need feature_size";
@@ -311,9 +384,11 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const auto wtype = Qweight.getDataType();
   auto *ops = input_step.getOps();
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
-  // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1).
+  // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1). The
+  // accelerator's RoPE takes a head dim whose half is a multiple of 32.
   if ((in_norm || feature_size) && ops != nullptr &&
       ops->supports_gemm_q4_0_batch_norm_fp32() &&
+      (!rope || (feature_size / 2) % 32 == 0) &&
       (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&
       input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
       (wtype == q4 || wtype == qs4cx) && Kweight.getDataType() == wtype &&
@@ -352,12 +427,18 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     } else {
       chunks.push_back(0u);
     }
+    NNTR_THROW_IF(rope && from + rows > rope_rows, std::runtime_error)
+      << "qkv_layer: rows " << from << ".." << from + rows
+      << " past the RoPE table's " << rope_rows;
     ops->gemm_q4_0_batch_norm_fp32(
       wdata, wscale, input_step.getData<float>(), dsts, rows, widths,
       input_step_dim.width(),
       in_norm ? context.getWeight(weight_idx[IN_GAMMA]).getData<float>()
               : nullptr,
-      chunks, gammas.data(), epsilon);
+      chunks, gammas.data(), epsilon,
+      rope ? rope_table->data() + static_cast<size_t>(from) * 2 * feature_size
+           : nullptr,
+      rope ? feature_size : 0u, 2u);
     return;
   }
 
@@ -394,7 +475,7 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // [#130] one decode row: with QK_NORM resident the HTP norms q | k and
     // keeps the row for the attention hook, so the outputs stay unwritten
     if (to - from == 1 && input_dim.batch() == 1 && !v_from_k && !v_norm &&
-        q_scale == 1.0f &&
+        q_scale == 1.0f && !rope &&
         Qhidden_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       const unsigned int wq = Qhidden_step_dim.width(),
                          wk = Khidden_step_dim.width(),
@@ -424,6 +505,17 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     headNorm(Khidden_, context.getOutput(QKVParams::K),
              &context.getWeight(weight_idx[WK_GAMMA]), to - from, feature_size,
              epsilon);
+    if (rope) {
+      NNTR_THROW_IF(from + rows > rope_rows, std::runtime_error)
+        << "qkv_layer: rows " << from << ".." << from + rows
+        << " past the RoPE table's " << rope_rows;
+      ropeRows(context.getOutput(QKVParams::Q).getData<float>(), rows,
+               Qhidden_step_dim.width(), feature_size, rope_table->data(),
+               from);
+      ropeRows(context.getOutput(QKVParams::K).getData<float>(), rows,
+               Khidden_step_dim.width(), feature_size, rope_table->data(),
+               from);
+    }
     if (v_norm) {
       // v_from_k: the raw k projection is what v_raw would have held
       headNorm(v_from_k ? Khidden_ : Vhidden_, context.getOutput(QKVParams::V),
