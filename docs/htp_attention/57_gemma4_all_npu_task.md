@@ -293,13 +293,22 @@ cool() { while adb shell 'ps -A' | grep -q 'nntrainer_causall[m]'; do sleep 10; 
 | §5-4 | `[HTP] hvx_rmsnorm_rows_f32 ...`, `[HTP] Layer calls that carry the block's RMSNorms`, `[CausalLM] in_norm / out_norm on the fused layers ...`, `[CausalLM/Gemma4] Fold seven of the block's nine norms ...` | IDL `mm_u8i4_layer_norm`·`mm_u8i4_moe_layer_norm`: pre/post RMSNorm을 호출 안으로. attention_norm→qkv, pre_ffn_norm·post_ffn_norm_1→dense_ffn, pre_ffn_norm_2·router_norm·post_ffn_norm_2→MoE 층. q/k/v per-head norm도 호출 안 | 층당 CPU norm 9개 중 7개 제거(약 230 ms) |
 | §5-8 | `[HTP] QS4CX weights on the fused calls ...`, `[CausalLM] The fused layers take QS4CX weights, at decode too` | `--fc_dtype QS4CX` 파일을 재양자화 없이 등록. decode M=1 FC도 HTP(`accelerates_qs4cx_at_m1`). 융합 호출을 512열 정렬 슬라이스로(2816×4096이 VTCM 안에) | §10.15의 nll 4.510, CPU QS4CX decode 경로(반복 루프) 제거 |
 
-CPU에 남는 것(prefill): embedding, post_attention_norm, post_ffn_norm, 잔차 add 2개, ffn_sum, layer_scalar, RoPE(`apply_rotary_emb_tensor_v2`, attention 호출 전), router(2816→128 + softmax top-8), lm_head·softcap. 다음은 §5-5(router)와 post_attention_norm을 attention_out 층으로 접는 것.
+CPU에 남는 것(prefill): embedding, post_attention_norm, post_ffn_norm, 잔차 add 2개, ffn_sum, layer_scalar, RoPE(`apply_rotary_emb_tensor_v2`, attention 호출 전), router(2816→128 + softmax top-8), lm_head·softcap. 다음은 §5-5(router)와 post_attention_norm을 attention_out 층으로 접는 것. → 블록 epilogue는 §9.3에서 처리.
 
 주의:
 - IDL이 바뀌었다. stub·skel·앱을 모두 다시 빌드하고 `libnntr_hvx_skel.so`를 push한다.
 - `fcSliceCols`가 512열 배수로 내림한다(head 경계). hd가 512를 나누지 않는 모델은 별도 정렬이 필요하다.
-- `attention_out`의 post_attention_norm은 아직 CPU다(`fully_connected`에 norm 옵션이 없음).
+- `attention_out`의 post_attention_norm은 §9.3에서 `residual_add`로 옮겼다.
 - 기기 실행 가이드는 §9.2.
+
+### 9.3 §5-4 나머지: 블록 epilogue(post norm·잔차 add·ffn_sum·layer_scalar) 한 호출 (2026-10-06), 기기 미측정
+
+attention_out 뒤의 `post_attention_norm`+add, FFN 뒤의 `ffn_sum`+`post_ffn_norm`+add+`layer_scalar`(층당 CPU 연산 6개)를 `residual_add` 층 둘로 바꿨다. `residual_add`가 `in_norm`(gamma 가중치), `use_weight`(scalar 가중치), 세 번째 입력(MoE 출력)을 받아 `out = scale·(resid + rmsnorm(x[+x2])·gamma)`를 prefill에서 HTP 한 호출(`rmsnorm_add_f32`, `hvx_rmsnorm_add_f32` 커널: 행마다 2회 스트리밍, scratch 없음)로 보낸다. decode(M=1)는 CPU(호출 1회가 2816 float 연산보다 비싸다).
+
+- 왜 attention_out FC 호출 안에 접지 않았나: FC는 512열 슬라이스로 쪼개져 각 슬라이스가 별도 DSP 호출이라, 전체 행(2816) RMSNorm을 슬라이스 안에서 끝낼 수 없다. 별도 호출(층당 2회, 호출당 약 0.1–0.2 ms 전송 예상)이 가장 짧은 경로. 입력 staging memcpy는 여전히 ARM(`[HTP-PROFILE] arm staging`).
+- 가중치 순서 불변: 층 이름 `_post_attention_norm`(gamma), `_post_ffn_norm`(gamma, scalar)을 그대로 쓴다. `hidden_size_per_layer_input > 0`이면 scalar는 per-layer 경로 뒤에 남는다(26B-A4B는 0).
+- 검증: `rmsnorm_rows_host_check`(RMSNORM ROWS OK, epilogue 3 shape + 거부 1), `unittest_causallm_models`, `htp_syntax_check.sh`. 기기: profile에서 K=N=2816(또는 K=5632) FC 행으로 보인다.
+- CPU에 남는 것(prefill): embedding, RoPE, router, lm_head·softcap.
 
 ### 9.2 기기 실행 가이드 (이 브랜치)
 
