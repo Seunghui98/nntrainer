@@ -578,6 +578,18 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<float> y,
                              rout sequence<float> row_scale);
 
+   // [57 section 5 step 4] The decoder block's epilogue at prefill shapes:
+   // out = scale * (out + rmsnorm(x [+ x2]) * gamma) over M rows of n
+   // floats (n a multiple of 32), the whole-row norm of the summed addend.
+   // out carries the residual in; x is M*n floats, or 2*M*n with the
+   // second addend (the MoE output beside the dense one) behind the first.
+   // gamma is n floats or empty for 1. Lives on the hvx_rmsnorm_rows_f32
+   // kernel, so the rows split across the session's worker pool.
+   AEEResult rmsnorm_add_f32(in uint32 M, in uint32 n, in float eps,
+                             in float scale, in sequence<float> gamma,
+                             in sequence<float> x,
+                             inrout sequence<float> out);
+
    // RoPE at head_dim 64: qk is n_q q heads then (qkLen / 64 - n_q) k
    // heads of 64 contiguous floats, cs the 64-float cos[32] | sin[32] row
    // of one position; y receives the rotated copy.

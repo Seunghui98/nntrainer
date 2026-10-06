@@ -225,6 +225,11 @@ void ComputeOps::gemm_q4_0_batch_norm_fp32(
   const std::vector<unsigned int> &, const float *, float) {
   NI(gemm_q4_0_batch_norm_fp32);
 }
+void ComputeOps::rmsnorm_add_fp32(unsigned int, unsigned int, const float *,
+                                  const float *, const float *, const float *,
+                                  float, float, float *) {
+  NI(rmsnorm_add_fp32);
+}
 void ComputeOps::gemm_q4_K_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,
                                 unsigned int, float *, unsigned int) {

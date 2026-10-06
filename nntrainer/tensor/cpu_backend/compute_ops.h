@@ -229,6 +229,17 @@ public:
     const std::vector<unsigned int> &post_chunk, const float *post_gamma,
     float eps);
 
+  // The decoder block's epilogue as one accelerator call (doc 57 section
+  // 5 step 4): out = scale * (resid + rmsnorm(x [+ x2]) * gamma) over M
+  // rows of N floats, the whole-row norm of the summed addend. x2 nullptr
+  // for one addend, gamma nullptr for 1. A backend without it says so and
+  // the layer runs the three ops itself.
+  virtual bool supports_rmsnorm_add_fp32() const { return false; }
+  virtual void rmsnorm_add_fp32(unsigned int M, unsigned int N,
+                                const float *resid, const float *x,
+                                const float *x2, const float *gamma, float eps,
+                                float scale, float *out);
+
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,

@@ -1366,6 +1366,43 @@ public:
     }
   }
 
+  // The block epilogue (see the base declaration): the residual rides the
+  // out staging buffer in and the result out, the addends the act buffer
+  // (x then x2), gamma as a plain host pointer like the fused norms'.
+  bool supports_rmsnorm_add_fp32() const override { return true; }
+
+  void rmsnorm_add_fp32(unsigned int M, unsigned int N, const float *resid,
+                        const float *x, const float *x2, const float *gamma,
+                        float eps, float scale, float *out) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t rows = static_cast<size_t>(M) * N;
+    const size_t x_len = x2 ? 2 * rows : rows;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, x_len * sizeof(float)).data());
+    float *res =
+      reinterpret_cast<float *>(stage(out_pool_, rows * sizeof(float)).data());
+    stagedMemcpy(act, x, rows * sizeof(float));
+    if (x2)
+      stagedMemcpy(act + rows, x2, rows * sizeof(float));
+    stagedMemcpy(res, resid, rows * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_rmsnorm_add_f32(
+      session, M, N, eps, scale, gamma, gamma ? static_cast<int>(N) : 0, act,
+      static_cast<int>(x_len), res, static_cast<int>(rows));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_rmsnorm_add_f32 failed: err=" + std::to_string(err) +
+        " (M=" + std::to_string(M) + " N=" + std::to_string(N) + ")");
+    }
+    stagedMemcpy(out, res, rows * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(M, x2 ? 2 * N : N, N, elapsed, nullptr);
+  }
+
   // A QS4CX weight was quantized once, straight from FP32, and already
   // holds the int4 values this registry wants -- so the seam is
   // htp_qs4cx_from_packed's bit rearrangement plus a colsum, not a second
