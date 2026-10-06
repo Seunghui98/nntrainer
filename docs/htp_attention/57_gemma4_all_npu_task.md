@@ -308,7 +308,16 @@ attention_out 뒤의 `post_attention_norm`+add, FFN 뒤의 `ffn_sum`+`post_ffn_n
 - 왜 attention_out FC 호출 안에 접지 않았나: FC는 512열 슬라이스로 쪼개져 각 슬라이스가 별도 DSP 호출이라, 전체 행(2816) RMSNorm을 슬라이스 안에서 끝낼 수 없다. 별도 호출(층당 2회, 호출당 약 0.1–0.2 ms 전송 예상)이 가장 짧은 경로. 입력 staging memcpy는 여전히 ARM(`[HTP-PROFILE] arm staging`).
 - 가중치 순서 불변: 층 이름 `_post_attention_norm`(gamma), `_post_ffn_norm`(gamma, scalar)을 그대로 쓴다. `hidden_size_per_layer_input > 0`이면 scalar는 per-layer 경로 뒤에 남는다(26B-A4B는 0).
 - 검증: `rmsnorm_rows_host_check`(RMSNORM ROWS OK, epilogue 3 shape + 거부 1), `unittest_causallm_models`, `htp_syntax_check.sh`. 기기: profile에서 K=N=2816(또는 K=5632) FC 행으로 보인다.
-- CPU에 남는 것(prefill): embedding, RoPE, router, lm_head·softcap.
+- CPU에 남는 것(prefill): embedding, RoPE, router, lm_head·softcap. → router는 §9.4.
+
+### 9.4 §5-5 router 로짓을 DSP로 (2026-10-06), 기기 미측정
+
+MoE 층의 router(`router_norm` + 2816×128 f32 dot, CPU 191 ms/30층)를 prefill에서 DSP 호출 `router_logits_f32`로 옮겼다. 커널 `hvx_router_rows_f32`: 가중치 256행 chunk(128 KiB, L2 상주)를 x의 모든 행에 재사용, 행 4개씩 qf32 누적, chunk 사이는 f32. router_norm은 호출 안(`norm_rows_in`). softmax·top-8·가중치 정규화는 CPU에 그대로 둔다(선택 규칙이 CPU와 완전히 같고, 512×128이라 작다). expert 선읽기(flash)가 top-k 결과를 먼저 알아야 하므로 MoE 본 호출과 한 호출로 합치지 않았다(합치면 선읽기가 호출 뒤로 밀린다).
+
+- 게이트: M>1, E%32==0, E≤128, FP32. decode(M=1)는 CPU dot(호출 1회 비용 > 2816×128 MAC).
+- 검증: `router_rows_host_check`(ROUTER ROWS OK, worst_rel 2.6e-7, 4 shape + 거부 3), `swap_host_check`가 skel 파일을 새 entry와 함께 링크, `htp_syntax_check.sh`, `unittest_causallm_models`(CPU 경로).
+- ponytail: 가중치 1.4 MB가 호출마다 FastRPC로 넘어간다(층당 prefill 1회). profile에서 K=2816 N=128 행으로 보인다.
+- CPU에 남는 것(prefill): embedding, RoPE(attention 호출 전 q/k 회전), softmax top-8(작음), lm_head·softcap.
 
 ### 9.2 기기 실행 가이드 (이 브랜치)
 
