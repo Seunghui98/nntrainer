@@ -26,7 +26,15 @@
 #include <gemma4_causallm.h>
 #include <gemma4_moe_causallm.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <utility>
 
 namespace {
 
@@ -173,5 +181,254 @@ TEST(Gemma4MoEVirtualCacheDifferentialTest, Q40CloseToFP32Reference) {
   causallm_test::runQ40DifferentialChecks(gemma4MoECachedModel());
 }
 #endif
+
+/**
+ * @brief [issue #234 P2] nntr_quantize_stream on a converter-written
+ *        .safetensors, against the .bin the same converter wrote
+ *
+ * The fixture's .safetensors comes from gemma4_moe_weight_converter.py
+ * (generate_gemma4_moe_reference.py writes both). Skips when it or
+ * NNTR_QUANTIZE_STREAM_BIN is absent.
+ */
+class Gemma4MoEQuantizeStreamSafetensors : public ::testing::Test {
+protected:
+  void SetUp() override {
+    fixture_ = causallm_test::findFixtureDir("gemma4_moe_tiny");
+    const char *bin = std::getenv("NNTR_QUANTIZE_STREAM_BIN");
+    if (bin == nullptr || std::string(bin).empty())
+      GTEST_SKIP() << "NNTR_QUANTIZE_STREAM_BIN not set";
+    quantize_ = bin;
+    if (!std::filesystem::exists(fixture_ / (kStem + ".bin")) ||
+        !std::filesystem::exists(fixture_ / (kStem + ".safetensors")))
+      GTEST_SKIP() << "run generate_gemma4_moe_reference.py (writes the "
+                      ".bin and the .safetensors)";
+    work_ = std::filesystem::temp_directory_path() /
+            "nntrainer_gemma4_moe_quantize_safetensors";
+    std::filesystem::remove_all(work_);
+    std::filesystem::create_directories(work_);
+  }
+
+  void TearDown() override {
+    if (!work_.empty() && !HasFailure())
+      std::filesystem::remove_all(work_);
+  }
+
+  static std::string readAll(const std::filesystem::path &path) {
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in),
+            std::istreambuf_iterator<char>()};
+  }
+
+  static void writeAll(const std::filesystem::path &path,
+                       const std::string &bytes) {
+    std::ofstream(path, std::ios::binary) << bytes;
+  }
+
+  /** @brief A model dir named @a name whose weight file is @a weight */
+  std::filesystem::path modelDir(const std::string &name,
+                                 const std::string &weight_name,
+                                 const std::string &weight) {
+    const auto dir = work_ / name;
+    std::filesystem::create_directories(dir);
+    for (const char *f :
+         {"config.json", "generation_config.json", "tokenizer.json"})
+      std::filesystem::copy_file(fixture_ / f, dir / f);
+    causallm::json cfg =
+      causallm::json::parse(readAll(fixture_ / "nntr_config.json"));
+    cfg["model_file_name"] = weight_name;
+    writeAll(dir / "nntr_config.json", cfg.dump(2));
+    writeAll(dir / weight_name, weight);
+    return dir;
+  }
+
+  /** @brief Quantize @a dir into dir/out; returns the exit status, the
+   *  log in @a log and the output .bin's bytes (empty if none) in @a out */
+  int quantize(const std::filesystem::path &dir, const std::string &args,
+               std::string &log, std::string &out) {
+    const auto out_dir = dir / "out";
+    const auto log_path = dir / "quantize.log";
+    const std::string cmd = "\"" + quantize_ + "\" \"" + dir.string() +
+                            "\" -o \"" + out_dir.string() + "\" " + args +
+                            " > \"" + log_path.string() + "\" 2>&1";
+    const int status = std::system(cmd.c_str());
+    log = readAll(log_path);
+    out.clear();
+    if (std::filesystem::exists(out_dir))
+      for (const auto &e : std::filesystem::directory_iterator(out_dir))
+        if (e.path().extension() == ".bin")
+          out = readAll(e.path());
+    return status;
+  }
+
+  /**
+   * @brief The converter's .safetensors header over the .bin's bytes
+   *
+   * The generator writes both files from one state dict, but a checkout may
+   * keep a .bin from an older run (another torch, other float bits) next to
+   * a newer .safetensors. The header is shapes and offsets only, so pairing
+   * it with the .bin keeps every comparison here about the reader.
+   */
+  void converterFile(causallm::json &header, std::string &header_block,
+                     std::string &payload) {
+    const std::string st = readAll(fixture_ / (kStem + ".safetensors"));
+    ASSERT_GE(st.size(), 8u);
+    uint64_t len = 0;
+    for (int i = 7; i >= 0; --i)
+      len = (len << 8) | static_cast<unsigned char>(st[i]);
+    ASSERT_LE(8 + len, st.size());
+    header_block = st.substr(0, 8 + len);
+    header = causallm::json::parse(st.substr(8, len));
+    const std::string bin = readAll(fixture_ / (kStem + ".bin"));
+    ASSERT_GE(bin.size(), st.size() - header_block.size());
+    payload = bin.substr(0, st.size() - header_block.size());
+  }
+
+  /** @brief Join a header and a payload into a .safetensors */
+  static std::string join(const std::string &header_json,
+                          const std::string &payload) {
+    std::string h = header_json;
+    h.append((8 - h.size() % 8) % 8, ' ');
+    std::string file(8, '\0');
+    for (int i = 0; i < 8; ++i)
+      file[i] = static_cast<char>((uint64_t{h.size()} >> (8 * i)) & 0xff);
+    return file + h + payload;
+  }
+
+  const std::string kStem = "nntr_gemma4_moe_tiny_fp32";
+  std::filesystem::path fixture_;
+  std::filesystem::path work_;
+  std::string quantize_;
+};
+
+/**
+ * @brief The converter's .safetensors quantizes byte-identical to its .bin,
+ *        for the CPU MoE (Q4_0) and the HTP one (QS4CX_WH: the gate | up
+ *        writer reads two source tensors), and so does the same file with
+ *        its header re-serialized in another key order: the reader
+ *        REORDERS by data_offsets, a header's key order is not the layout
+ */
+TEST_F(Gemma4MoEQuantizeStreamSafetensors, SameBytesAsBinAnyHeaderKeyOrder) {
+  const std::string bin = readAll(fixture_ / (kStem + ".bin"));
+  causallm::json header;
+  std::string header_block, payload;
+  ASSERT_NO_FATAL_FAILURE(converterFile(header, header_block, payload));
+  const std::string st = header_block + payload;
+  // nlohmann::json keeps object keys sorted, so dump() is a permutation of
+  // the converter's walk order (layer0_ffn_down before layer0_ffn_gate, ...)
+  const std::string sorted_header = header.dump();
+  ASSERT_LT(st.find("layer0_ffn_gate"), st.find("layer0_ffn_down"));
+  ASSERT_GT(sorted_header.find("layer0_ffn_gate"),
+            sorted_header.find("layer0_ffn_down"))
+    << "the re-serialized header is not a permutation";
+
+  const std::pair<std::string, std::string> runs[] = {
+    {"q40", "--fc_dtype Q4_0"}, {"wh", "--fc_dtype Q4_0 --moe_dtype QS4CX_WH"}};
+  for (const auto &[tag, args] : runs) {
+    SCOPED_TRACE(args);
+    std::string log, from_bin, from_st, from_permuted;
+    ASSERT_EQ(quantize(modelDir("bin_" + tag, kStem + ".bin", bin), args, log,
+                       from_bin),
+              0)
+      << log;
+    ASSERT_EQ(quantize(modelDir("st_" + tag, kStem + ".safetensors", st), args,
+                       log, from_st),
+              0)
+      << log;
+    ASSERT_EQ(quantize(modelDir("permuted_" + tag, kStem + ".safetensors",
+                                join(sorted_header, payload)),
+                       args, log, from_permuted),
+              0)
+      << log;
+    ASSERT_FALSE(from_bin.empty());
+    EXPECT_TRUE(from_st == from_bin)
+      << "the .safetensors quantized differently";
+    EXPECT_TRUE(from_permuted == from_bin)
+      << "a permuted header key order changed the output";
+  }
+}
+
+/**
+ * @brief The layout of doc 55 section 10.5: the router scale stored before
+ *        the router matrix, offsets consistent, byte total unchanged. It is
+ *        REFUSED at the dry run naming both tensors and both sizes, and no
+ *        output byte is written. Not caught: two same-sized tensors swapped
+ *        (the guard compares sizes, not names -- the converter's keys and
+ *        the quantizer's are different spellings).
+ */
+TEST_F(Gemma4MoEQuantizeStreamSafetensors, RouterScaleBeforeRouterRefused) {
+  causallm::json header;
+  std::string header_block, payload;
+  ASSERT_NO_FATAL_FAILURE(converterFile(header, header_block, payload));
+  auto &router = header.at("layer0_sparse_moe:router");
+  auto &scale = header.at("layer0_sparse_moe:router_scale");
+  const uint64_t rb = router["data_offsets"][0], re = router["data_offsets"][1];
+  const uint64_t sb = scale["data_offsets"][0], se = scale["data_offsets"][1];
+  ASSERT_EQ(re, sb) << "the converter wrote the scale right after the router";
+  ASSERT_NE(re - rb, se - sb);
+  const std::string swapped = payload.substr(0, rb) +
+                              payload.substr(sb, se - sb) +
+                              payload.substr(rb, re - rb) + payload.substr(se);
+  scale["data_offsets"] = {rb, rb + (se - sb)};
+  router["data_offsets"] = {rb + (se - sb), se};
+  ASSERT_EQ(swapped.size(), payload.size());
+
+  std::string log, out;
+  EXPECT_NE(quantize(modelDir("swapped", kStem + ".safetensors",
+                              join(header.dump(), swapped)),
+                     "--fc_dtype Q4_0", log, out),
+            0)
+    << log;
+  EXPECT_NE(log.find("Input layout mismatch"), std::string::npos) << log;
+  EXPECT_NE(log.find("layer0_sparse_moe router as " + std::to_string(re - rb) +
+                     " bytes"),
+            std::string::npos)
+    << log;
+  EXPECT_NE(log.find("layer0_sparse_moe:router_scale at " +
+                     std::to_string(se - sb) + " bytes"),
+            std::string::npos)
+    << log;
+  EXPECT_TRUE(out.empty()) << "a byte was written before the refusal";
+
+  // Control: the same bytes as a .bin (no header) pass every size check and
+  // quantize -- the refusal above is the per-tensor guard's alone.
+  const std::string bin = readAll(fixture_ / (kStem + ".bin"));
+  EXPECT_EQ(quantize(modelDir("swapped_bin", kStem + ".bin",
+                              swapped + bin.substr(swapped.size())),
+                     "--fc_dtype Q4_0", log, out),
+            0)
+    << log;
+  EXPECT_FALSE(out.empty());
+}
+
+/**
+ * @brief A header the positional reader cannot follow is named as such:
+ *        a non-F32 tensor (an HF BF16 checkpoint) and a gap in the offsets
+ */
+TEST_F(Gemma4MoEQuantizeStreamSafetensors, MalformedHeaderRefused) {
+  causallm::json header;
+  std::string header_block, payload;
+  ASSERT_NO_FATAL_FAILURE(converterFile(header, header_block, payload));
+  std::string log, out;
+
+  causallm::json bf16 = header;
+  bf16["embedding0:Embedding"]["dtype"] = "BF16";
+  EXPECT_NE(quantize(modelDir("bf16", kStem + ".safetensors",
+                              join(bf16.dump(), payload)),
+                     "--fc_dtype Q4_0", log, out),
+            0);
+  EXPECT_NE(log.find("reads an F32 .safetensors only"), std::string::npos)
+    << log;
+
+  causallm::json gap = header;
+  auto &router_end = gap["layer0_sparse_moe:router"]["data_offsets"][1];
+  router_end = router_end.get<uint64_t>() - 4;
+  EXPECT_NE(
+    quantize(modelDir("gap", kStem + ".safetensors", join(gap.dump(), payload)),
+             "--fc_dtype Q4_0", log, out),
+    0);
+  EXPECT_NE(log.find("layer0_sparse_moe:router_scale starts at payload byte"),
+            std::string::npos)
+    << log;
+}
 
 } // namespace
