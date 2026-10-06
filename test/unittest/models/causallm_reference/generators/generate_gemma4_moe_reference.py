@@ -108,13 +108,22 @@ def build_model(seed, cfg=None, random_layer_scalar=False, random_norms=False,
 
 
 def convert_weights(model, output_path):
-    """Write weights using the same ordered walker as production conversion."""
+    """Write weights using the same ordered walker as production conversion.
+
+    The .safetensors beside the .bin is the converter's --safetensors output
+    of the same weights: the quantizer reads either (issue #234 P2), and
+    QuantizeStreamSafetensors* compares the two and permutes the header.
+    """
     converter = load_production_converter()
     wrapper_config = types.SimpleNamespace(text_config=model.config)
     with open(output_path, "wb") as output_file:
         converter.save_gemma4_moe_bin(
             model.state_dict(), wrapper_config, "float32", output_file, True
         )
+    converter.save_gemma4_moe_safetensors(
+        model.state_dict(), wrapper_config, "float32",
+        str(pathlib.Path(output_path).with_suffix(".safetensors")), True
+    )
 
 
 def softcap(logits, cap):
