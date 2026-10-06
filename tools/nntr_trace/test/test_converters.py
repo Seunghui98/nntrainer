@@ -53,8 +53,8 @@ class HtpTraceSelftest(unittest.TestCase):
     m, model = metrics_of(os.path.join(DATA, "htp_trace_selftest.json"))
     self.assertEqual([t["name"] for t in m["tokens"]],
                      ["prefill (444 tokens)", "decode token 1", "decode token 2", "decode token 3"])
-    self.assertEqual([t["calls"] for t in m["tokens"]], [2, 8, 8, 8])
-    self.assertEqual(m["transport"]["n"], 26)
+    self.assertEqual([t["calls"] for t in m["tokens"]], [3, 8, 8, 8])
+    self.assertEqual(m["transport"]["n"], 27)
     self.assertEqual(m["warnings"]["items"], [])
     moe = next(k for k in m["kernels"] if k["name"] == "moe_ffn: micro-mm (measured)")
     self.assertEqual(moe["calls"], 13)
@@ -62,6 +62,22 @@ class HtpTraceSelftest(unittest.TestCase):
     self.assertAlmostEqual(fc["total_us"], 3202 - 357 - 794 - 501 - 58, places=3)
     untimed = [e for e in model["all"] if e["cat"] == "host.wait" and "note" in e["args"]]
     self.assertEqual(len(untimed), 12)  # gate_up calls passed stage_us=nullptr
+
+  def test_hidden_swiglu_sits_inside_its_hmx_span(self):
+    # The MoE layer kernel's SWIGLU slot is worker time that ran under the
+    # HMX: drawn on its own lane over the mm span, clamped to it, raw in args.
+    m, model = metrics_of(os.path.join(DATA, "htp_trace_selftest.json"))
+    hidden = [e for e in model["all"] if e["tid"] == 513 and e["pid"] == 2]
+    self.assertEqual(len(hidden), 14)  # 1 prefill MoE + 1 conv + 12 decode MoE
+    mms = [e for e in model["all"] if e["cat"] == "dsp.hmx" and "micro-mm (measured)" in e["name"]]
+    for h in hidden:
+      under = [x for x in mms if abs(x["ts"] - h["ts"]) < 1e-6 and x["args"]["op"] == h["args"]["op"]]
+      self.assertEqual(len(under), 1, h)
+      self.assertLessEqual(h["dur"], under[0]["dur"] + 1e-6)
+      self.assertEqual(h["dur"], min(h["args"]["worker_us"], under[0]["dur"]))
+    conv = next(h for h in hidden if h["args"]["op"] == "conv_block")
+    self.assertEqual((conv["args"]["worker_us"], conv["dur"]), (3300, 2500))  # clamped
+    self.assertGreater(m["buckets"]["overlap"], 0)
 
 
 if __name__ == "__main__":
