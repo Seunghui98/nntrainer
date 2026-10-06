@@ -346,3 +346,107 @@ blocker; S1–S3 are host work and can start on LFM now.
 * **Plan 201 §3.2 / §3.4**: the Gemma columns re-pointed at this plan's
   2-bit rows; S6's lever list gains "FC set at 2 bits after #225".
 * **Contract `0001` §12**: the user's S0 answer as a dated row.
+
+## 7. S7 — the 2 GB budget (a later stage; nothing in S1–S5 or in plan 234's port order depends on it)
+
+**User, 2026-10-06:** peak memory (process RSS including the ION arenas)
+under 2 GB, the rest streamed from flash — to be considered **last**, after
+the ternary 26B decodes end to end on the device. Issue #234 asked for the
+arithmetic to be on record now; this section is that record and nothing
+more. §3.4's pool numbers (C ≈ 57–66) assumed a 3.8 GB arena and are
+superseded here for the 2 GB case only. Tags as §0; **[M-4408]** = doc 55
+§10.14 on `refs/pr/4408` (S25, 4-bit experts, hybrid path, one prompt).
+
+### 7.1 Resident bytes per kind, 26B-A4B (MiB)
+
+| kind | where | 4-bit | 2-bit | source |
+|---|---|---:|---:|---|
+| expert slot (page-rounded) | ION arena | 2.871 | **1.453** (gate \| up 1 003 520 B + down 520 192 B) | [G] doc 55 §3.2 formula, `expertStride` |
+| FC set on WH (attention 1.110 B + dense 0.535 B weights) | ION arena (P5 sidecar) | ≈ 790 | ≈ 395 | [G] 0.5 / 0.25 B/w + 8 B per column |
+| lm_head on WH (738 M, tied) | ION arena | 352 | 176 (only if the tied head is ternary) | [G] |
+| router 30 × [2816][128] f32 | DSP heap | 41 | 41 | [G]; `hexkl_graph.c:589-605` pattern |
+| KV cache, FP16, sliding 25 layers (K + V, 8 heads × 256) | DSP heap (attention on the NPU) | 200 at **window 1024** / 800 at max_seq 4096 | same | [G]; today the sliding cache is sized by `max_seq_len` (plan 201 status note: ≈ 800 MiB) — sizing it by the window is the lever |
+| KV cache, global 5 layers, K = V (2 heads × 512) | DSP heap | 40 at 4096 | same | [G] |
+| DSP heap base (graph, scratch, token mailbox) | DSP heap | ≈ 100 (LFM one PD `heap_used` 92 MiB, rule 63 [M-LFM]; S1 ≈ 70 + S2 ≈ 30 two-PD, plan 201 §2.2) + growth for 30 layers ≈ 150 [E] | same | |
+| ARM RSS, model-independent (libs, runtime, graph, tokenizer, activations) | ARM anon | ≈ 240 [E] = LFM's 766 [M-LFM, 216-fadvise step 0] − 141 embedding Q4_0 − 384 FC Q4_0 originals | same | the 766 was never decomposed on the device; this split is arithmetic |
+| ARM RSS, model-dependent: embedding table Q4_0 (262 144 × 2816) | ARM | 396 | 176 if ternary | [G]; **mmap-able**: one row a token → page cache, not RSS |
+| ARM RSS, model-dependent: FC Q4_0 originals (CPU copies of NPU-resident kinds) | ARM | 888 | — | [G]; LFM keeps them (384 of the 766); with every kind resident they are dead weight |
+| page cache (the expert file region) | OS, **not RSS** | 10.8 GiB | 5.5 GiB | [G]; `NNTR_MOE_FADVISE` (#216, merged, env-only) and #219's tier change *where* the complement lives — the tier (anon RSS) **counts**, the page cache does not |
+
+### 7.2 The largest pool under 2 048 MiB
+
+Fixed part, with the two ARM copies gone (embedding mmap'd, no FC
+originals — both are required: with them the FC arena alone overflows):
+ARM 240 + heap 150 + router 41 + KV 240 (window 1024 + global 4096) =
+**671 MiB**.
+
+| configuration | fixed + FC set + lm_head | pool room | slots (1.453) | **C of 128** | prefill read-ahead (30 C ≥ 128 + slack) |
+|---|---:|---:|---:|---:|---|
+| experts 2-bit, FCs 4-bit, lm_head 4-bit | 671 + 790 + 352 = 1 813 | 235 | 161 | **5** | at the R2 floor; no slack (doc 55 §10.11: C = 5 lost the read-ahead, prefill 40.9 vs 89.3 TPS) |
+| experts + FCs 2-bit, lm_head 4-bit | 671 + 395 + 352 = 1 418 | 630 | 433 | **14** | yes |
+| everything 2-bit | 671 + 395 + 176 = 1 242 | 806 | 554 | **18** | yes |
+| (KV at max_seq 4096 instead of the window) | + 600 | − 413 slots | | C − 13 | the KV window sizing is worth 13 experts a layer |
+
+### 7.3 Misses a token and the decode floor
+
+Hit rate: the only Gemma points are [M-4408] — misses over 512 generated
+tokens 81 348 / 62 198 / 41 955 at C = 8 / 16 / 24 → **159 / 121 / 82
+misses a token** of 240 routed uses (hit 34 / 49 / 66 %), hybrid LRU, 4-bit
+weights, one prompt; LFM's curve (57 / 73 / 85 % at C = 8 / 12 / 16 of 32,
+doc 53 §5) has the same shape at the same C / E. Interpolated [E]: C = 5
+≈ 170, C = 14 ≈ 130, C = 18 ≈ 110 misses a token.
+
+Cost of one miss at 1.453 MiB [E, scaled from measured rates]: cold UFS
+3.0 GB/s (doc 53 §5.5 [M-up]) → **0.5 ms**; the uncached-ION store cap
+4.9 GB/s (`readWeight`'s comment, plan 219 §0.1) → 0.3 ms — this is the
+warm floor on this path; doc 55 §10.14's warm 0.76 ms per 2.87 MiB (3.9
+GB/s) → 0.38 ms; LFM's best warm 0.31–0.37 ms per 5.25 MiB (plan 201
+§3.3) → 0.1 ms is a cached-staging rate the ION slot does not reach.
+
+| configuration | DDR term a token (§3.2, 44 GB/s + 4 ms [E]; at 70 GB/s in brackets) | miss bytes a token | miss term cold / warm (0.5 / 0.3 ms) | **floor cold / warm** |
+|---|---:|---:|---:|---:|
+| C = 5, FCs 4-bit | 39.2 (22.1) ms | 170 × 1.453 = 247 MiB | 85 / 51 ms | 124 ms → **8 tok/s** / 90 → 11 |
+| C = 14, FCs 2-bit | 29.9 (16.3) | 189 MiB | 65 / 39 | 95 → **11** / 69 → 14 |
+| C = 18, all 2-bit | 25.7 (13.6) | 160 MiB | 55 / 33 | 81 → **12** / 59 → 17 |
+| for scale: §3.4's C = 66 (3.8 GB arena), hit ≈ 85–90 % [E] | 25.7 | 35–52 MiB | 12–18 / 7–11 | 38–44 → 23–26 / 33–37 → 27–30 |
+
+Under 2 GB the floor is **miss-bound, ≈ 8–17 tok/s**: the flash term is
+1.3–2× the DDR term, and the serial miss read is the wall. The page cache
+— not RSS, but the whole difference between the cold and the warm column —
+needs ≈ 5.5 GiB for the 2-bit expert region; on a 12 GB phone with ≈ 3.7 GB
+of Android and 2 GB of ours that is at the edge, so "warm" is a measurement,
+not a plan (rule 61's `pgpgin` / refault columns on every cell).
+
+### 7.4 What flash streaming buys, and which levers matter when the pool is small
+
+It buys the run itself: 2-bit experts alone are 5.5 GiB resident, so under
+2 GB there is no all-resident option. The cost is the factor 2–3 above
+between the 2 GB floor and the 3.8 GB one. Levers, largest first [E]:
+
+1. **No ARM copy of any NPU-resident weight; the embedding mmap'd** —
+   1 284 MiB = 884 slots = C + 29; without it nothing fits (§7.2).
+2. **FCs (and the head) at 2 bits** — C 5 → 14 → 18 (§7.2); the same
+   code path as §3.2's floor 45 → 61.
+3. **KV sized by the sliding window** — C + 13 at max_seq 4096.
+4. **Keep the misses warm** — 0.5 → 0.3 ms a miss, −20 to −34 ms a
+   token; it is page-cache policy, outside RSS: `NNTR_MOE_FADVISE`'s
+   WILLNEED-on-evict (rule 62: 2–10 ms a call on the S25, prefill
+   −7..−18 % — re-read on Gemma, not adopted).
+5. **Read-ahead from the previous token's routing (P-D)** and **misses
+   under the hits' compute (P-A)**: they hide, they do not shrink —
+   P-A hides ≤ the hit experts' DMA of the layer (≈ 8 ms of 55–85), P-D
+   the previous token's whole compute but at a 64 % routing-prediction
+   ceiling on LFM (doc 53 §7 [M-up]); with 110–170 misses a token both
+   are worth ≈ 10–20 ms, less than lever 4 and only after it.
+6. **Four slabs** (§3.3): a DDR-term lever (≈ −1 to −2 ms); irrelevant to
+   the misses.
+7. **#219's ARM tier does not fit**: the complement is 3 840 − 554 =
+   3 286 experts = 4.7 GiB, and any capped tier slot costs the same 1.453
+   MiB as a pool slot while serving a hit at 0.3 ms instead of 0 — under
+   an RSS cap a tier slot is strictly worse than a pool slot. Off under
+   2 GB.
+
+Open, for S7 proper: the real `RSS 766` decomposition on the device (one
+`smaps` read of an LFM run settles the 240), the sliding-cache sizing in
+the attention op, whether the loader can skip the CPU originals when every
+kind is resident, and S5's own routing trace for the hit curve.
