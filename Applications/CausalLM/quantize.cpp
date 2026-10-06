@@ -576,7 +576,9 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
 
       // Gemma4 MoE custom layer keeps its router weights in FP32 and
       // quantizes only the expert projections in its save override.
-      dtype_map[prefix + "_sparse_moe"] = fc_dtype;
+      // [plan 201 S4] In --moe_dtype (the fc dtype unless set), the
+      // moe_layer_dtype this tool writes and Gemma4MoECausalLM reads.
+      dtype_map[prefix + "_sparse_moe"] = moe_dtype;
 
       dtype_map[prefix + "_ffn_output"] = fc_dtype;
 

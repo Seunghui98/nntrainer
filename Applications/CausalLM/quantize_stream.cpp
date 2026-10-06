@@ -629,6 +629,44 @@ public:
     writeBlockedTransposed(input_size, output_size, dtype, name);
   }
 
+  /**
+   * [plan 201 S4] Two FC weights stored one after the other in the FP32
+   * file ([input, out_a] then [input, out_b], Gemma 4's expert gate and
+   * up) written as one [out_a + out_b, input] weight: the fused gate | up
+   * expert of the HTP MoE layer (Lfm2MoELayer's expert_gate_up). Only for
+   * a quantized dtype, and only in one pass, like QS4CX_WH's writeFc.
+   */
+  void writeFcConcat(size_t input_size, size_t out_a, size_t out_b, DType dtype,
+                     const std::string &name) {
+    const size_t a_bytes = tensorBytes(input_size, out_a, name);
+    const size_t b_bytes = tensorBytes(input_size, out_b, name);
+    const size_t output_size = out_a + out_b;
+    if (dtype == DType::FP32)
+      throw std::invalid_argument(name + ": a fused FC is written quantized");
+    quantizedSize(dtype, output_size, input_size, true, name);
+    if (dry_run_) {
+      expected_input_bytes_ += a_bytes + b_bytes;
+      return;
+    }
+    if (a_bytes + b_bytes > MAX_TENSOR_BUFFER_BYTES)
+      throw std::invalid_argument(name + " is over the " +
+                                  std::to_string(MAX_TENSOR_BUFFER_BYTES) +
+                                  " bytes a fused FC writes in one pass");
+    std::vector<float> a(tensorElements(input_size, out_a, name));
+    std::vector<float> b(tensorElements(input_size, out_b, name));
+    readFloats(a, name);
+    readFloats(b, name);
+    std::vector<float> transposed(output_size * input_size);
+    for (size_t input = 0; input < input_size; ++input) {
+      for (size_t o = 0; o < out_a; ++o)
+        transposed[o * input_size + input] = a[input * out_a + o];
+      for (size_t o = 0; o < out_b; ++o)
+        transposed[(out_a + o) * input_size + input] = b[input * out_b + o];
+    }
+    writeQuantized(transposed, output_size, input_size, dtype, true, name);
+    flushQs4cxScales(dtype, name);
+  }
+
   void requireEndOfFile() {
     // The dry run's own total is compared against the file size instead.
     if (dry_run_)
@@ -1048,15 +1086,24 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
     writer.copyFp32(model.num_experts,
                     prefix + "_sparse_moe router_per_expert_scale");
 
+    // The experts in --moe_dtype (the fc dtype unless set). [plan 201 S4]
+    // QS4CX_WH is the HTP MoE layer's (lfm2_moe, moe_engine=htp): gate and
+    // up fused into one [2 * inter, hidden] weight, as LFM2's experts.
     for (size_t expert = 0; expert < model.num_experts; ++expert) {
       const std::string expert_prefix =
         prefix + "_expert" + std::to_string(expert);
-      writer.writeFc(model.hidden_size, model.moe_intermediate_size,
-                     quant.fc_dtype, expert_prefix + "_gate");
-      writer.writeFc(model.hidden_size, model.moe_intermediate_size,
-                     quant.fc_dtype, expert_prefix + "_up");
+      if (quant.moe_dtype == DType::QS4CX_WH) {
+        writer.writeFcConcat(model.hidden_size, model.moe_intermediate_size,
+                             model.moe_intermediate_size, quant.moe_dtype,
+                             expert_prefix + "_gate_up");
+      } else {
+        writer.writeFc(model.hidden_size, model.moe_intermediate_size,
+                       quant.moe_dtype, expert_prefix + "_gate");
+        writer.writeFc(model.hidden_size, model.moe_intermediate_size,
+                       quant.moe_dtype, expert_prefix + "_up");
+      }
       writer.writeFc(model.moe_intermediate_size, model.hidden_size,
-                     quant.fc_dtype, expert_prefix + "_down");
+                     quant.moe_dtype, expert_prefix + "_down");
     }
 
     writer.copyFp32(model.hidden_size, prefix + "_post_ffn_norm_2");

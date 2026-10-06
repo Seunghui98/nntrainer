@@ -11,6 +11,7 @@
 #include <gemma4_moe_causallm.h>
 #include <gemma4_moe_layer.h>
 #include <layer_context.h>
+#include <lfm2_moe_layer.h>
 #include <llm_util.hpp>
 #include <model.h>
 
@@ -54,9 +55,20 @@ void Gemma4MoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   NNTR_THROW_IF(NUM_KV_SHARED_LAYERS > 0, std::invalid_argument)
     << "[Gemma4MoE] shared KV layers are not supported";
 
-  // [plan 201 S4] moe_engine=htp: the experts and the dense FFN are GeGLU
-  // on the HTP (the session's MoE flag, sent with the first MoE call)
+  // [plan 201 S4] moe_engine=htp: the lfm2_moe layer with the softmax
+  // router, QS4CX_WH experts and the expert pool; its experts and the
+  // dense FFN are GeGLU on the HTP (the session's MoE flag, sent with the
+  // first MoE call)
   moe_engine = nntr_cfg.value("moe_engine", std::string("cpu"));
+  moe_layer_dtype = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
+  // The two expert layouts: nntr_quantize_stream fuses gate | up for
+  // QS4CX_WH (the HTP layer's), every other dtype keeps them apart
+  // (gemma4_moe's)
+  NNTR_THROW_IF((moe_engine == "htp") != (moe_layer_dtype == "QS4CX_WH"),
+                std::invalid_argument)
+    << "[Gemma4MoE] moe_engine=htp takes QS4CX_WH experts and only it does "
+       "(moe_engine="
+    << moe_engine << ", moe_layer_dtype=" << moe_layer_dtype << ")";
 #ifdef ENABLE_HEXKL
   if (moe_engine == "htp")
     nntrainer::get_htp_ops()->set_moe_geglu(true);
@@ -288,16 +300,34 @@ Tensor Gemma4MoECausalLM::createFeedForwardBlock(const int layer_id,
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false")}));
   Tensor sparse_input = pre_sparse_norm(post_attention);
-  LayerHandle sparse_moe(createLayer(
-    "gemma4_moe",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_sparse_moe"),
-     withKey("unit", std::to_string(moe_intermediate_size)),
-     withKey("num_experts", std::to_string(num_experts)),
-     withKey("num_experts_per_token", std::to_string(top_k_experts)),
-     withKey("moe_cache_size", std::to_string(moe_cache_size)),
-     withKey("moe_activation", "tanh_gelu"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("weight_dtype", FC_LAYER_DTYPE)}));
+  // [plan 201 S4] moe_engine=htp: lfm2_moe with the softmax router (the
+  // experts' file layout is the fused gate | up of nntr_quantize_stream's
+  // QS4CX_WH writer); else #4296's gemma4_moe
+  const std::string moe_name =
+    "layer" + std::to_string(layer_id) + "_sparse_moe";
+  LayerHandle sparse_moe(
+    moe_engine == "htp"
+      ? createLayer(
+          "lfm2_moe",
+          {withKey("name", moe_name),
+           withKey("unit", std::to_string(moe_intermediate_size)),
+           withKey("num_experts", std::to_string(num_experts)),
+           withKey("num_experts_per_token", std::to_string(top_k_experts)),
+           withKey("moe_activation", "tanh_gelu"),
+           withKey("moe_router", "softmax"),
+           withKey("epsilon", std::to_string(NORM_EPS)),
+           withKey("weight_dtype", moe_layer_dtype),
+           withKey("engine", moe_engine)})
+      : createLayer(
+          "gemma4_moe",
+          {withKey("name", moe_name),
+           withKey("unit", std::to_string(moe_intermediate_size)),
+           withKey("num_experts", std::to_string(num_experts)),
+           withKey("num_experts_per_token", std::to_string(top_k_experts)),
+           withKey("moe_cache_size", std::to_string(moe_cache_size)),
+           withKey("moe_activation", "tanh_gelu"),
+           withKey("epsilon", std::to_string(NORM_EPS)),
+           withKey("weight_dtype", moe_layer_dtype)}));
   Tensor sparse_output = sparse_moe({sparse_input, post_attention});
 
   LayerHandle post_sparse_norm(createLayer(
@@ -329,6 +359,12 @@ void Gemma4MoECausalLM::registerCustomLayers() {
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
+  }
+  // [plan 201 S4] the HTP MoE layer (moe_engine=htp)
+  try {
+    app_context->registerFactory(nntrainer::createLayer<Lfm2MoELayer>);
+  } catch (std::invalid_argument &e) {
+    (void)e; // already registered by another model of this process
   }
 }
 

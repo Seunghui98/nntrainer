@@ -49,6 +49,19 @@ public:
   static constexpr const char *key = "moe_activation";
 };
 /**
+ * @brief [plan 201 S4] The MoE router: "sigmoid" (LFM2: sigmoid scores plus
+ *        an expert bias for the selection) or "softmax" (Gemma 4: an
+ *        un-normed router input RMS-normed and scaled, softmax, top-k,
+ *        renormalised, times a per-expert scale)
+ */
+class MoERouter : public nntrainer::Property<std::string> {
+public:
+  MoERouter(std::string value = "sigmoid") { set(value); };
+  static constexpr const char *key = "moe_router";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
  * @brief NumExperts,  Number of experts property
  */
 class NumExperts : public nntrainer::PositiveIntegerProperty {
