@@ -126,7 +126,11 @@ int run(const Options &o) {
   nntr["num_to_generate"] = o.run ? o.steps - 1 : o.steps;
   // the prefill buffer; the fixture says 4. run() records the prefill's
   // token only when the prompt is shorter than it, as in the app's config.
-  nntr["init_seq_len"] = o.run ? o.prompt + 1 : o.prompt;
+  // A config that asks for more keeps it (#222: init_seq_len 1024).
+  nntr["init_seq_len"] =
+    std::max(nntr.value("init_seq_len", 0u), o.run ? o.prompt + 1 : o.prompt);
+  if (nntr["init_seq_len"].get<unsigned>() > o.max_seq)
+    throw std::invalid_argument("the config's init_seq_len is above --max-seq");
   const bool gemma = cfg.contains("architectures") &&
                      cfg["architectures"].is_array() &&
                      !cfg["architectures"].empty() &&

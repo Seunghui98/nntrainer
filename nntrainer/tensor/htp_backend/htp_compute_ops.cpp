@@ -99,6 +99,28 @@ namespace nntrainer {
 namespace {
 
 /**
+ * @brief htp_qs4cx_from_q4_0x4 on a model weight in the CPU's own repack.
+ *
+ * On the device that repack is q4_0x4, the converter's format, and the
+ * bytes pass through. The in-process host build (#84) holds the host
+ * ISA's repack (x8 on x86), which the converter would read as garbage
+ * scales (NaN logits): it is re-laid as q4_0x4 first, so the prefill FC
+ * kinds the engine keys route (#222) run on the host as on the device.
+ */
+void qs4cxFromModelQ4_0(const void *w, uint32_t K, uint32_t N, int8_t *q,
+                        float *scale, int32_t *colsum) {
+#if defined(__aarch64__)
+  htp_qs4cx_from_q4_0x4(w, K, N, q, scale, colsum);
+#else
+  const size_t bytes = static_cast<size_t>(N) * (K / 32u) * Q4_CPU_BLOCK_BYTES;
+  std::vector<char> canon(bytes), x4(bytes);
+  unpack_q4_0(w, canon.data(), bytes, N, K);
+  repack_q4_0(x4.data(), canon.data(), bytes, N, K, ml::train::ISA::ARM);
+  htp_qs4cx_from_q4_0x4(x4.data(), K, N, q, scale, colsum);
+#endif
+}
+
+/**
  * @brief Slots mm_u8i4_layer_timed fills.
  *
  * Restated here because the ARM side cannot include the DSP source that
@@ -4951,9 +4973,9 @@ private:
     std::vector<float> w_scale(N);
     std::vector<int32_t> colsum_w(N);
     const uint64_t t_convert = HtpProfile::nowUs();
-    htp_qs4cx_from_q4_0x4(matAdata, K, N,
-                          reinterpret_cast<int8_t *>(q_w4_i8.data()),
-                          w_scale.data(), colsum_w.data());
+    qs4cxFromModelQ4_0(matAdata, K, N,
+                       reinterpret_cast<int8_t *>(q_w4_i8.data()),
+                       w_scale.data(), colsum_w.data());
     const uint64_t convert_us = HtpProfile::nowUs() - t_convert;
 
     return register_locked(matAdata, session, K, N, q_w4_i8, w_scale, colsum_w,
@@ -5009,8 +5031,8 @@ private:
       // The first slice's profile entry carries the conversion, so its
       // clock starts before it; the later slices' start with their copy.
       uint64_t t_begin = HtpProfile::nowUs();
-      htp_qs4cx_from_q4_0x4(matAdata, K, N, full.data(), w_scale.data(),
-                            colsum_w.data());
+      qs4cxFromModelQ4_0(matAdata, K, N, full.data(), w_scale.data(),
+                         colsum_w.data());
       uint64_t convert_us = HtpProfile::nowUs() - t_begin;
       for (uint32_t c0 = 0; c0 < N; c0 += cap) {
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
@@ -5124,11 +5146,11 @@ private:
       gate_rm(static_cast<size_t>(K) * I), down_rm(static_cast<size_t>(I) * N);
     std::vector<float> up_s(I), gate_s(I), down_s(N);
     std::vector<int32_t> up_c(I), gate_c(I), down_c(N);
-    htp_qs4cx_from_q4_0x4(up, K, I, up_rm.data(), up_s.data(), up_c.data());
-    htp_qs4cx_from_q4_0x4(gate, K, I, gate_rm.data(), gate_s.data(),
-                          gate_c.data());
-    htp_qs4cx_from_q4_0x4(down, I, N, down_rm.data(), down_s.data(),
-                          down_c.data());
+    qs4cxFromModelQ4_0(up, K, I, up_rm.data(), up_s.data(), up_c.data());
+    qs4cxFromModelQ4_0(gate, K, I, gate_rm.data(), gate_s.data(),
+                       gate_c.data());
+    qs4cxFromModelQ4_0(down, I, N, down_rm.data(), down_s.data(),
+                       down_c.data());
     uint64_t convert_us = HtpProfile::nowUs() - t_begin;
 
     DenseHandles dh;
