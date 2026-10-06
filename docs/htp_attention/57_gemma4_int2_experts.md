@@ -197,6 +197,27 @@ adb shell 'cd /data/local/tmp/nntrainer/causallm && sh g4_int2_bench.sh' 2>&1 | 
 
 ### 5.2 e2e
 
+**첫 int2 실행 (2026-10-06, 사용자 기기)** — `NNTR_MOE_EXPERT_BITS=2`, C=16, read-ahead 기본, `NNTR_HTP_PROFILE=1`, 8 threads, 447토큰 prompt, 512토큰 생성, 원본 int4 파일과의 같은 조건 비교는 아직 없음.
+
+| 항목 | 값 |
+|---|---|
+| arena | 704 MiB (3청크) — §2.2 산술과 같음, int2 stride가 적용됨 |
+| prefill | 447 tok, 3840 ms (116 TPS) |
+| decode | 512 tok, 43739 ms (11.7 TPS), 85.4 ms/token |
+| peak RSS | 3,306,556 KB |
+| 등록 (첫 forward에 포함) | 480 weights, 790 ms (convert 1.57 ms/weight) |
+| MoE prefill 콜 | 31 calls, 18.9 ms/call, 585 ms |
+| MoE decode 콜 | 15360 calls, 1461.8 us/call, 22.45 s = decode의 51% (토큰당 30 × 1.46 = 43.9 ms) |
+| expert miss | 331 (decode 콜당 0.02), 1.36 ms/miss 읽기 |
+| read-ahead | 3360 experts, 노출 대기 21 ms, 99% 제때 도착, reader 3.61 ms/expert |
+
+해석:
+- 동작은 의도대로다. arena 704 MiB, set_expert_bits 성공, 오류 없음. 출력은 더미 가중치라 두 토큰 반복(의미 없음).
+- **miss가 비정상적으로 적다.** 출력이 두 토큰 반복으로 무너져 라우팅이 거의 고정되었고, decode가 사실상 전부 캐시 적중이다. 실제 모델의 decode miss 조건을 대표하지 못한다. int4와의 비교는 같은 값의 int4 파일(i4same)로 해야 공정하다.
+- decode 85 ms/token 중 MoE HTP 콜 43.9 ms, 나머지 약 41 ms는 MoE 밖(CPU attention, Q4_0 dense MLP, 262144 vocab lm_head, norm)이다.
+- 확장이 숨었는지는 level 1로는 알 수 없다. `NNTR_HTP_PROFILE=2`의 drain과 `int2 expand (worker)`가 필요하다.
+- miss당 1.36 ms(1.52 MB, 약 1.1 GB/s)는 산술 기대(int4 대비 절반)를 확인할 기준이 아직 없다. 같은 조건 int4 실행과 비교해야 한다.
+
 | 이름 | pass | prefill ms | decode TPS | peak RSS KB | arena MiB | misses (ms/miss) | prefetch 수 (노출 ms) | text md5 |
 |---|---|---|---|---|---|---|---|---|
 | (기기 미측정) | | | | | | | | |
