@@ -1403,6 +1403,44 @@ public:
       profile.addInvoke(M, x2 ? 2 * N : N, N, elapsed, nullptr);
   }
 
+  // The router logits (see the base declaration): the rows through the
+  // act pool, the logits through the out pool, gamma and the gate weight
+  // as plain host pointers. ponytail: the K x E f32 weight (1.4 MB at
+  // 2816 x 128) crosses with every call -- one prefill call a layer; a
+  // registered copy is the upgrade if the transport shows in a profile.
+  bool supports_router_logits_fp32() const override { return true; }
+
+  void router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
+                          const float *x, const float *gamma, float eps,
+                          const float *w, float *logits) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t x_len = static_cast<size_t>(M) * K;
+    const size_t out_len = static_cast<size_t>(M) * E;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, x_len * sizeof(float)).data());
+    float *out = reinterpret_cast<float *>(
+      stage(out_pool_, out_len * sizeof(float)).data());
+    stagedMemcpy(act, x, x_len * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_router_logits_f32(
+      session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w,
+      static_cast<int>(static_cast<size_t>(K) * E), act,
+      static_cast<int>(x_len), out, static_cast<int>(out_len));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_router_logits_f32 failed: err=" + std::to_string(err) +
+        " (M=" + std::to_string(M) + " K=" + std::to_string(K) +
+        " E=" + std::to_string(E) + ")");
+    }
+    stagedMemcpy(logits, out, out_len * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(M, K, E, elapsed, nullptr);
+  }
+
   // A QS4CX weight was quantized once, straight from FP32, and already
   // holds the int4 values this registry wants -- so the seam is
   // htp_qs4cx_from_packed's bit rearrangement plus a colsum, not a second

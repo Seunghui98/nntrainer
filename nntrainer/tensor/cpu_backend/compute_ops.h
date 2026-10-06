@@ -240,6 +240,17 @@ public:
                                 const float *x2, const float *gamma, float eps,
                                 float scale, float *out);
 
+  // The MoE router's logits at prefill shapes (doc 57 section 5 step 5):
+  // logits[M][E] = rmsnorm(x)[M][K] . w[K][E] in f32, gamma (K floats)
+  // for the router's own norm or nullptr for none. E a multiple of 32 up
+  // to 128. The softmax and the top-k stay with the layer, so the
+  // selection rule is one and the same on every backend.
+  virtual bool supports_router_logits_fp32() const { return false; }
+  virtual void router_logits_fp32(unsigned int M, unsigned int K,
+                                  unsigned int E, const float *x,
+                                  const float *gamma, float eps, const float *w,
+                                  float *logits);
+
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,

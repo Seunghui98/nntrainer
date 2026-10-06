@@ -362,6 +362,17 @@ interface nntr_hvx : remote_handle64 {
                                      rout sequence<float> out_f32,
                                      rout sequence<uint32> stage_us);
 
+   // [57 section 5 step 5] The MoE router's logits at prefill shapes:
+   // logits[M][E] = rmsnorm(x)[M][K] . w[K][E] in f32 (hvx_router_rows_f32),
+   // gamma K floats for the router's own norm or empty for none. E a
+   // multiple of 32 up to 128. The softmax and the top-k stay with the
+   // caller, so the selection rule is the CPU's; the call removes the
+   // M x K x E CPU matmul and the norm before it.
+   AEEResult router_logits_f32(in uint32 M, in uint32 K, in uint32 E,
+                               in float eps, in sequence<float> gamma,
+                               in sequence<float> w, in sequence<float> x,
+                               rout sequence<float> logits);
+
    // mm_u8i4_moe_layer with the block's norms folded in, as
    // mm_u8i4_layer_norm does for the FC call: pre_gamma (K floats, or
    // empty) norms every activation row before the call, post_gamma (N_out
