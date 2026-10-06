@@ -291,3 +291,56 @@ adb shell 'cd /data/local/tmp/nntrainer/causallm && sh g4_int2_bench.sh' 2>&1 | 
 ### 6.4 int4 비교
 같은 sweep을 i4same 파일(`NNTR_MOE_EXPERT_BITS=4`)로 한 번 더 돌리면 모든 열이 int4/int2 쌍으로 나온다. 특히 reader ms/expert(바이트 2배)와 노출 ms.
 
+## 7. 왜 TPS가 안 올랐나: expert 경로의 숨은 몫과 드러난 몫
+
+int2 실측(§5.2)과 int4 산술로 expert 경로를 세 단계로 나눠 적는다. int4 열은 **같은 조건 미측정**이며 `test/htp/g4_io_dma_probe.sh`가 그 열을 채운다(int4 실제 모델 vs int2 더미, read-ahead 켬/끔 각 2회, 첫 회는 워밍업).
+
+### 7.1 flash → arena (호스트 reader)
+
+| | int2 실측 | int4 산술 |
+|---|---|---|
+| prefill에 읽는 양 | 3360 × 1.52 MB = 5.1 GB | 10.2 GB |
+| reader 4개 합산 속도 | 1.68 GB/s (expert당 3.61 ms) | 같다고 보면 |
+| reader가 읽는 데 쓴 시간 | **3.0 s** | **6.1 s** |
+| prefill 전체 | 4.0 s | — |
+| 드러난 대기 (read-ahead) | 21 ms | 6.1 > 4.0이면 **약 2 s 드러남** (page cache에 있지 않다면) |
+| read-ahead 끔: 동기 miss | 1.59 ms/miss, prefill +0.87 s | miss당 2배 바이트 |
+
+- int2에서 읽기는 **거의 전부 숨었다**(3.0 s 중 0.02 s 노출). 그래서 int2 prefill은 CPU 계산 시간(3.2 s) + MoE 호출(0.66 s)로 결정되고, 읽기 바이트를 절반으로 줄여도 시간이 안 변한다.
+- int4가 "133 TPS"였다면 10 GB를 4 s 안에 읽었다는 뜻이므로 page cache(두 번째 실행 이후)에서 읽었을 가능성이 크다. cold면 int4는 읽기가 드러난다. **probe의 i4_pf 노출 ms가 이걸 가른다.**
+- 한계는 flash가 아니라 reader 스레드 한 개(0.4~0.6 GB/s). reader 6개면 2.6 GB/s(§5.2).
+
+### 7.2 arena → VTCM (DMA)
+
+| | int2 실측 | int4 산술 |
+|---|---|---|
+| prefill 호출당 | 61,968 KB | 123,936 KB |
+| HMX 동작 중 DMA 속도 (doc 51 §2.26) | ~12 GB/s | ~12 GB/s |
+| prefill 호출당 DMA 시간 | 5.2 ms / 20.6 ms 호출 | 10.3 ms / ~20.6 ms |
+| decode 호출당 | 11,616 KB → **1.0 ms** / 1.44 ms 호출 | 23,232 KB → **1.9 ms** / ~1.4 ms 호출 |
+| drain (가중치 기다린 시간) | prefill 2.5 ms, decode 0.12 ms | **probe가 채움** |
+
+- prefill: int4도 DMA가 호출 시간 안에 들어가므로(10.3 < 20.6) 절반이 되어도 시간 이득은 없다.
+- decode: int4는 DMA 1.9 ms가 호출 1.4 ms보다 길어 **DMA bound 가능성**이 있다. int2는 1.0 ms로 들어가고 실측 drain 0.12 ms다. int4의 decode drain이 ~0.5 ms로 나오면 int2가 decode 호출당 0.4 ms(30층 → 토큰당 12 ms, 90 → 78 ms, 11.1 → 12.8 TPS)를 번 것이다. **이것이 int2가 지금 조건에서 시간으로 벌 수 있는 유일한 몫이고, probe의 i4 decode drain이 판정한다.**
+
+### 7.3 VTCM 안 확장 (int2만)
+
+| | prefill 호출 | decode 호출 |
+|---|---|---|
+| 워커 시간 (일의 양) | 7,888 us | 1,472 us |
+| 드러난 상한 (drain 전체) | 2,548 us (12%) | 118 us (8%) |
+| int4 drain과의 차이 | probe | probe |
+
+- 확장이 추가한 노출은 많아야 drain 전체이고, 그중 int4에도 있던 몫(호출당 첫 expert 대기)을 빼야 순수 확장 노출이다.
+
+### 7.4 결론 (현재 더미, C=16, 기기 warm)
+- prefill TPS가 같은 이유: 읽기도 DMA도 int4부터 이미 숨어 있었고(또는 page cache), int2는 숨은 것을 더 숨겼을 뿐이다. prefill 시간은 CPU 3.2 s가 정한다.
+- decode TPS가 같은 이유: miss가 없어(더미 라우팅) 읽기 이득이 0이고, DMA 이득은 int4 drain을 봐야 안다(최대 +1.7 TPS 산술).
+- int2가 시간으로 보이는 조건: (a) cold 또는 page cache 밖 (b) 실제 라우팅의 decode miss (c) CPU 계산을 HTP로 옮겨 prefill이 읽기 바닥에 닿을 때.
+
+### 7.5 probe 실행
+```
+cd /data/local/tmp/nntrainer/causallm && sh g4_io_dma_probe.sh models/gemma4-26b-a4b-qs4cx-wh models/gemma4-26b-a4b-int2-wh
+```
+요약 줄의 열: prefill_ms, decode_tps, read(prefetch_n, exposed_ms, reader_ms, miss, ms/miss), prefill call(dsp, drain, mm, dma_kb, expand), decode call(같음). rep=2끼리 비교한다.
+
