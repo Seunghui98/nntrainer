@@ -6159,7 +6159,7 @@ public:
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
-        head_dim > 256 || cache_to < cache_from + n_q || cache_to > 0xFFFFu) {
+        head_dim > 512 || cache_to < cache_from + n_q || cache_to > 0xFFFFu) {
       return false;
     }
     // The IDL takes dense [n_q][n_head_q*head_dim] and
