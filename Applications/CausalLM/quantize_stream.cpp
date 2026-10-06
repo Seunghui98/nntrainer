@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -561,6 +562,7 @@ public:
                const std::vector<SourceTensor> *source_tensors = nullptr) :
     input_(input),
     output_(output),
+    out_(&output),
     target_isa_(target_isa),
     source_bytes_(source_bytes),
     dry_run_(dry_run),
@@ -571,6 +573,24 @@ public:
   /** @brief Byte count is unchanged by the palette, so the dry run does not
    *         need this -- only the real pass does. */
   void setPalette(const PaletteOptions &p) { palette_ = p; }
+  /**
+   * @brief [#225] From now on every writeFc(..., fc_wh = true) also writes
+   *        its weight as a QS4CX_WH image into @a sidecar, quantized from
+   *        the same transposed f32 the main file's copy came from.
+   * @param sidecar nullptr in the dry run, which only counts the images
+   * @param count   the dry run's count: the index is written last, into the
+   *                room reserved for it here
+   */
+  void enableFcWh(std::ofstream *sidecar, uint32_t count) {
+    fcwh_on_ = true;
+    sidecar_ = sidecar;
+    if (sidecar_ != nullptr)
+      sidecar_->seekp(
+        static_cast<std::streamoff>(nntrainer::fcWhHeaderBytes(count)));
+  }
+
+  uint32_t fcWhCount() const { return fcwh_count_; }
+  std::vector<nntrainer::FcWhEntry> &fcWhEntries() { return fcwh_; }
 
   /** @brief FP32 source bytes the layout walk consumed (dry run only) */
   size_t expectedInputBytes() const { return expected_input_bytes_; }
@@ -658,9 +678,10 @@ public:
    * blocked transpose to cap memory use.
    */
   void writeFc(size_t input_size, size_t output_size, DType dtype,
-               const std::string &name) {
+               const std::string &name, bool fc_wh = false) {
     const size_t source_bytes = tensorBytes(input_size, output_size, name);
     expectSourceTensor(source_bytes, name);
+    const bool wh = fc_wh && fcwh_on_;
     if (dtype == DType::FP32) {
       if (dry_run_) {
         expected_input_bytes_ += source_bytes;
@@ -672,25 +693,28 @@ public:
 
     // Validate the complete shape before writing any part of this tensor.
     quantizedSize(dtype, output_size, input_size, true, name);
-    if (dry_run_) {
-      expected_input_bytes_ += source_bytes;
-      return;
-    }
-
+    if (wh)
+      quantizedSize(DType::QS4CX_WH, output_size, input_size, true, name);
     // A WH tile spans 32 inputs and 32 outputs and the tiles come out
     // k-major, so a weight written in row blocks would need its output
     // reordered afterwards. Every weight this dtype is for fits the buffer
     // (the largest is 29 MB against 64), so the blocked path is refused
-    // rather than built.
+    // rather than built -- in the dry run, before any byte is written.
     // ponytail: the fix if a model ever needs it is to hold the whole WH
     // image -- K*N/2 bytes, 3.5 MB for the largest -- and fill it block by
     // block, not to change the tile order.
-    if ((dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH) &&
+    if ((dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH || wh) &&
         source_bytes > MAX_TENSOR_BUFFER_BYTES) {
       throw std::invalid_argument(
         name + " is " + std::to_string(source_bytes) + " bytes, over the " +
-        std::to_string(MAX_TENSOR_BUFFER_BYTES) + " " + dtypeName(dtype) +
-        " can write in one pass. Quantize this tensor as QS4CX.");
+        std::to_string(MAX_TENSOR_BUFFER_BYTES) + " " +
+        (wh ? "QS4CX_WH" : dtypeName(dtype)) + " can write in one pass. " +
+        (wh ? "Drop --fc_wh_sidecar." : "Quantize this tensor as QS4CX."));
+    }
+    if (dry_run_) {
+      expected_input_bytes_ += source_bytes;
+      fcwh_count_ += wh ? 1u : 0u;
+      return;
     }
     if (source_bytes <= MAX_TENSOR_BUFFER_BYTES) {
       std::vector<float> source(tensorElements(input_size, output_size, name));
@@ -702,8 +726,11 @@ public:
             source[input * output_size + output];
         }
       }
+      const std::streamoff main_off = output_.tellp();
       writeQuantized(transposed, output_size, input_size, dtype, true, name);
       flushQs4cxScales(dtype, name);
+      if (wh)
+        writeFcWh(transposed, input_size, output_size, name, main_off);
       return;
     }
 
@@ -821,14 +848,35 @@ private:
     ++source_cursor_;
   }
 
+  /** @brief The sidecar image of one FC weight: writeQuantized's QS4CX_WH
+   *  branch on the stream swapped to the sidecar, so the bytes are the ones
+   *  a --fc_dtype QS4CX_WH run would put in the main file. */
+  void writeFcWh(const std::vector<float> &transposed, size_t K, size_t N,
+                 const std::string &name, std::streamoff main_off) {
+    if (name.size() >= sizeof(nntrainer::FcWhEntry::name))
+      throw std::invalid_argument(name + ": name too long for the FC WH index");
+    nntrainer::FcWhEntry e{};
+    std::memcpy(e.name, name.data(), name.size());
+    e.K = static_cast<uint32_t>(K);
+    e.N = static_cast<uint32_t>(N);
+    e.q4_off = static_cast<uint64_t>(main_off);
+    e.off = static_cast<uint64_t>(sidecar_->tellp());
+    out_ = sidecar_;
+    writeQuantized(transposed, N, K, DType::QS4CX_WH, true, name);
+    flushQs4cxScales(DType::QS4CX_WH, name);
+    out_ = &output_;
+    e.bytes = static_cast<uint64_t>(sidecar_->tellp()) - e.off;
+    fcwh_.push_back(e);
+  }
+
   void writeBytes(const void *source, size_t bytes, const std::string &name) {
     if (bytes >
         static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
       throw std::overflow_error("Write size is too large for " + name);
     }
-    output_.write(static_cast<const char *>(source),
-                  static_cast<std::streamsize>(bytes));
-    if (!output_)
+    out_->write(static_cast<const char *>(source),
+                static_cast<std::streamsize>(bytes));
+    if (!*out_)
       throw std::runtime_error("Failed to write " + name);
   }
 
@@ -1156,6 +1204,7 @@ private:
 
   std::ifstream &input_;
   std::ofstream &output_;
+  std::ostream *out_; /**< where writeBytes goes: output_, or the sidecar */
   ml::train::ISA target_isa_;
   size_t source_bytes_ = 0;
   bool dry_run_ = false;
@@ -1170,6 +1219,11 @@ private:
   std::vector<float> pending_scales_;
   /** Off by default: an unasked-for run is byte-identical to before */
   PaletteOptions palette_;
+  /** [#225] the FC WH sidecar: on, its stream, its index, the dry count */
+  bool fcwh_on_ = false;
+  std::ofstream *sidecar_ = nullptr;
+  std::vector<nntrainer::FcWhEntry> fcwh_;
+  uint32_t fcwh_count_ = 0;
 };
 
 void validateSourceConfig(const json &nntr_cfg) {
@@ -1262,26 +1316,30 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
       checkedMultiply(kv_heads, head_dim, prefix + " KV width");
 
     writer.copyFp32(model.hidden_size, prefix + "_attention_norm");
+    // [#225] The seven FCs the one-PD graph runs (FC q | k | v, o and
+    // DENSE_FFN up, gate, down) also go to the FC WH sidecar when it is on;
+    // the per-layer-input FCs below are no graph op and stay out.
     writer.writeFc(model.hidden_size, query_width, quant.fc_dtype,
-                   prefix + "_wq");
+                   prefix + "_wq", true);
     writer.copyFp32(head_dim, prefix + "_q_norm");
-    writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype, prefix + "_wk");
+    writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype, prefix + "_wk",
+                   true);
     writer.copyFp32(head_dim, prefix + "_k_norm");
     if (!model.attention_k_eq_v || is_sliding) {
       writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
-                     prefix + "_wv");
+                     prefix + "_wv", true);
     }
     writer.writeFc(query_width, model.hidden_size, quant.fc_dtype,
-                   prefix + "_attention_out");
+                   prefix + "_attention_out", true);
 
     writer.copyFp32(model.hidden_size, prefix + "_post_attention_norm");
     writer.copyFp32(model.hidden_size, prefix + "_pre_ffn_norm");
     writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                   prefix + "_ffn_gate");
+                   prefix + "_ffn_gate", true);
     writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                   prefix + "_ffn_up");
+                   prefix + "_ffn_up", true);
     writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
-                   prefix + "_ffn_down");
+                   prefix + "_ffn_down", true);
 
     writer.copyFp32(model.hidden_size, prefix + "_post_ffn_norm_1");
     writer.copyFp32(model.hidden_size, prefix + "_pre_ffn_norm_2");
@@ -1394,23 +1452,23 @@ void writeLfm2Moe(TensorWriter &writer, const Lfm2MoePlan &model,
       // (weight_dtype=FP32 in the graph), out_proj comes back to hidden_size.
       writer.writeFc(model.hidden_size,
                      checkedMultiply(3, model.conv_dim, prefix + "_conv_in"),
-                     quant.fc_dtype, prefix + "_conv_in_proj");
+                     quant.fc_dtype, prefix + "_conv_in_proj", true);
       writer.copyFp32(
         tensorElements(model.conv_l_cache, model.conv_dim, prefix + "_conv"),
         prefix + "_conv_conv");
       writer.writeFc(model.conv_dim, model.hidden_size, quant.fc_dtype,
-                     prefix + "_conv_out_proj");
+                     prefix + "_conv_out_proj", true);
     } else {
       writer.writeFc(model.hidden_size, query_width, quant.fc_dtype,
-                     prefix + "_wq");
+                     prefix + "_wq", true);
       writer.copyFp32(model.head_dim, prefix + "_q_norm");
       writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
-                     prefix + "_wk");
+                     prefix + "_wk", true);
       writer.copyFp32(model.head_dim, prefix + "_k_norm");
       writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
-                     prefix + "_wv");
+                     prefix + "_wv", true);
       writer.writeFc(query_width, model.hidden_size, quant.fc_dtype,
-                     prefix + "_attention_out");
+                     prefix + "_attention_out", true);
     }
 
     writer.copyFp32(model.hidden_size, prefix + "_ffn_norm");
@@ -1418,11 +1476,11 @@ void writeLfm2Moe(TensorWriter &writer, const Lfm2MoePlan &model,
     if (layer < model.num_dense_layers) {
       // Dense SwiGLU FFN, in NNTrainer's historical up, gate, down order.
       writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                     prefix + "_ffn_up");
+                     prefix + "_ffn_up", true);
       writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                     prefix + "_ffn_gate");
+                     prefix + "_ffn_gate", true);
       writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
-                     prefix + "_ffn_down");
+                     prefix + "_ffn_down", true);
     } else {
       // Router gate and expert bias are never quantized: Lfm2MoELayer::save
       // forces both to DataType::NONE regardless of the requested dtype, and
@@ -1513,8 +1571,17 @@ void copyAuxiliaryFiles(const std::filesystem::path &model_dir,
 void writeOutputConfig(const std::filesystem::path &model_dir,
                        const std::filesystem::path &output_dir,
                        const std::string &output_bin,
-                       const QuantizationPlan &quant, json nntr_cfg) {
+                       const QuantizationPlan &quant, json nntr_cfg,
+                       const std::string &fc_wh_bin) {
   nntr_cfg["model_file_name"] = output_bin;
+  // [#225] Only a run that wrote the sidecar names it; a stale pair copied
+  // from the source config would point the loader at another file.
+  nntr_cfg.erase("fc_wh_file_name");
+  nntr_cfg.erase("fc_wh_format");
+  if (!fc_wh_bin.empty()) {
+    nntr_cfg["fc_wh_file_name"] = fc_wh_bin;
+    nntr_cfg["fc_wh_format"] = nntrainer::FCWH_FORMAT;
+  }
   nntr_cfg["model_tensor_type"] =
     std::string(dtypeName(quant.fc_dtype)) + "-FP32";
   nntr_cfg["fc_layer_dtype"] = dtypeName(quant.fc_dtype);
@@ -1538,6 +1605,48 @@ void writeOutputConfig(const std::filesystem::path &model_dir,
     throw std::runtime_error("Failed to open " + output_config.string());
   }
   file << nntr_cfg.dump(4) << '\n';
+}
+
+/**
+ * @brief [#225] Closes the sidecar: each entry's key from its Q4_0 bytes in
+ *        the finished main file, then the header into the room enableFcWh
+ *        reserved, then the size check.
+ */
+void finishFcWh(std::vector<nntrainer::FcWhEntry> &entries, uint32_t count,
+                const std::filesystem::path &main_path, std::ofstream &sidecar,
+                const std::filesystem::path &sidecar_path) {
+  if (entries.size() != count) {
+    throw std::runtime_error(
+      "FC WH sidecar: the walk wrote " + std::to_string(entries.size()) +
+      " images, the dry run counted " + std::to_string(count));
+  }
+  std::ifstream main(main_path, std::ios::binary);
+  for (auto &e : entries) {
+    std::vector<char> q4(quantizedSize(DType::Q4_0, e.N, e.K, true, e.name));
+    main.seekg(static_cast<std::streamoff>(e.q4_off));
+    main.read(q4.data(), static_cast<std::streamsize>(q4.size()));
+    if (!main)
+      throw std::runtime_error(std::string("FC WH sidecar: cannot re-read ") +
+                               e.name + " from " + main_path.string());
+    e.key = nntrainer::fcWhKey(q4.data(), q4.size());
+  }
+  const uint64_t end = entries.empty()
+                         ? nntrainer::fcWhHeaderBytes(count)
+                         : entries.back().off + entries.back().bytes;
+  sidecar.seekp(0);
+  const uint32_t version = nntrainer::FCWH_VERSION;
+  sidecar.write(nntrainer::FCWH_MAGIC, sizeof(nntrainer::FCWH_MAGIC));
+  sidecar.write(reinterpret_cast<const char *>(&version), sizeof(version));
+  sidecar.write(reinterpret_cast<const char *>(&count), sizeof(count));
+  sidecar.write(reinterpret_cast<const char *>(entries.data()),
+                static_cast<std::streamsize>(entries.size() *
+                                             sizeof(nntrainer::FcWhEntry)));
+  sidecar.close();
+  if (!sidecar || std::filesystem::file_size(sidecar_path) != end) {
+    throw std::runtime_error("Failed to finalize " + sidecar_path.string());
+  }
+  std::cout << "  FC WH sidecar: " << sidecar_path << " (" << count
+            << " weights, " << (end >> 20) << " MiB)\n";
 }
 
 void printUsage(const char *program) {
@@ -1570,6 +1679,12 @@ void printUsage(const char *program) {
     << "  --moe_palette_refit <b>  on (default) or off -- least-squares "
        "w_scale for\n"
     << "                        the restricted codes\n"
+    << "  --fc_wh_sidecar       LFM2-MoE / Gemma4-MoE, --fc_dtype Q4_0: "
+       "also write\n"
+    << "                        the FC weights as QS4CX_WH images into <bin "
+       "stem>_fcwh.bin\n"
+    << "                        (the HTP reads them; fc_wh_file_name in "
+       "nntr_config)\n"
     << "  -h, --help            Show this help\n\n"
     << "Architectures: Qwen3MoeForCausalLM, Lfm2MoeForCausalLM, "
        "Gemma4ForCausalLM,\n"
@@ -1608,6 +1723,7 @@ int run(int argc, char **argv) {
   std::string output_bin;
   std::filesystem::path target_config;
   PaletteOptions palette;
+  bool fc_wh_sidecar = false;
   // Which dtypes the command line actually asked for, so --config fills in
   // the rest instead of overruling them. Without this,
   // "--config old.json --moe_dtype QS4CX_WH" quietly quantizes to whatever
@@ -1658,6 +1774,8 @@ int run(int argc, char **argv) {
       if (v != "on" && v != "off")
         throw std::invalid_argument("--moe_palette_refit: on or off");
       palette.refit_scale = (v == "on");
+    } else if (argument == "--fc_wh_sidecar") {
+      fc_wh_sidecar = true;
     } else if (argument == "--help" || argument == "-h") {
       printUsage(argv[0]);
       return EXIT_SUCCESS;
@@ -1738,6 +1856,14 @@ int run(int argc, char **argv) {
       quant.fc_dtype != DType::Q4_0) {
     throw std::invalid_argument(
       "Gemma4 MoE FC/expert dtype must be FP32 or Q4_0");
+  }
+  // [#225] The sidecar is the HTP prefill's copy of the CPU's Q4_0 FCs: it
+  // is keyed by those Q4_0 bytes, and only the LFM2 and Gemma4 MoE walks
+  // mark their FCs.
+  if (fc_wh_sidecar &&
+      ((!is_lfm2_moe && !is_gemma4_moe) || quant.fc_dtype != DType::Q4_0)) {
+    throw std::invalid_argument("--fc_wh_sidecar needs Lfm2MoeForCausalLM or "
+                                "a Gemma4 MoE, and --fc_dtype Q4_0");
   }
   const std::string input_bin =
     nntr_cfg.at("model_file_name").get<std::string>();
@@ -1881,6 +2007,8 @@ int run(int argc, char **argv) {
   TensorWriter probe(input, output, quant.target_isa,
                      static_cast<size_t>(source_bytes), /*dry_run=*/true,
                      source_header);
+  if (fc_wh_sidecar)
+    probe.enableFcWh(nullptr, 0);
   walk(probe);
   if (probe.expectedInputBytes() != source_bytes) {
     const bool file_is_short = probe.expectedInputBytes() > source_bytes;
@@ -1912,14 +2040,29 @@ int run(int argc, char **argv) {
   TensorWriter writer(input, output, quant.target_isa, 0, /*dry_run=*/false,
                       source_header);
   writer.setPalette(palette);
+  std::string fc_wh_bin;
+  std::ofstream sidecar;
+  if (fc_wh_sidecar) {
+    // Named after the main file: its keys are that file's Q4_0 bytes (that
+    // ISA's repack), so two runs into one directory must not share it.
+    fc_wh_bin = std::filesystem::path(output_bin).stem().string() + "_fcwh.bin";
+    sidecar.open(output_dir / fc_wh_bin, std::ios::binary | std::ios::trunc);
+    if (!sidecar.is_open())
+      throw std::runtime_error("Failed to open " + fc_wh_bin);
+    writer.enableFcWh(&sidecar, probe.fcWhCount());
+  }
   walk(writer);
   output.close();
   if (!output)
     throw std::runtime_error("Failed to finalize " + output_path.string());
+  if (fc_wh_sidecar)
+    finishFcWh(writer.fcWhEntries(), probe.fcWhCount(), output_path, sidecar,
+               output_dir / fc_wh_bin);
 
   if (!std::filesystem::equivalent(model_dir, output_dir))
     copyAuxiliaryFiles(model_dir, output_dir);
-  writeOutputConfig(model_dir, output_dir, output_bin, quant, nntr_cfg);
+  writeOutputConfig(model_dir, output_dir, output_bin, quant, nntr_cfg,
+                    fc_wh_bin);
 
   const uintmax_t input_size = source_bytes;
   const uintmax_t output_size = std::filesystem::file_size(output_path);
