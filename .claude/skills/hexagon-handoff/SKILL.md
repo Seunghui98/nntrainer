@@ -70,7 +70,7 @@ Branch `htp/<issue#>-<slug>` @ `<sha>` — estimated device time: <N> min
    strings <libcausallm_core.so> | grep -c NNTR_HTP_FORWARD_KINDS    # >= 1 (rule 36)
    ```
    A variant whose log lacks its expected banner (`[HTP] graph: init …` for `NNTR_HTP_FORWARD=1`) is **void** — recorded as void, never read as "at A's speed" (rule 36).
-2. `adb devices` lists exactly one device; record its serial under Notes (any S25 Ultra is allowed, contract §4.2 — the handoff never names one). Note battery % and whether the phone is warm.
+2. `tools/htp/sitting_lock.sh take <serial> "<issue#> <variant>" <N>` succeeds (the phone is shared; exit 1 = another sitting holds `/data/local/tmp/nntrainer/.sitting.lock`: stop and report the holder). `release` it at the end of the sitting, failures included. `adb devices` lists exactly one device; record its serial under Notes (any S25 Ultra is allowed, contract §4.2 — the handoff never names one). Note battery % and whether the phone is warm.
 3. Install once: `(cd Applications/CausalLM && ./install_android.sh --model=<model dir>)` for each model dir, then
    `adb push test/htp/build/libnntr_hvx_skel.A.so /data/local/tmp/nntrainer/causallm/libnntr_hvx_skel.so`.
    Never push `builddir/jni/arm64-v8a/libcdsprpc.so`.

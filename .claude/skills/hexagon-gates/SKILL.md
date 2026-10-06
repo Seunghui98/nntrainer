@@ -164,6 +164,21 @@ written first and filled as the record. Elsewhere: write the handoff, set
 `state:needs-measurement`, stop. Performance conclusions are drawn only
 from filled handoff tables read as an A/B inside one sitting.
 
+**The phone is shared: take the sitting lock first (user, 2026-10-06).**
+Before any `adb push` / `adb shell` that runs a test or a model, and
+before a device gtest in rung 3:
+
+```
+tools/htp/sitting_lock.sh take <serial> "<issue#> <what>" <expect_min>   # exit 1 = someone else holds it: do not touch the phone, report the holder
+...                                                                      # the sitting
+tools/htp/sitting_lock.sh release <serial>                               # on every exit path, failure included
+```
+
+The lock is `/data/local/tmp/nntrainer/.sitting.lock` on the device and
+holds `owner= purpose= start= expect_min=`. `status <serial>` prints it.
+Never delete another owner's lock; if it looks stale (start older than
+expect_min by hours), say so to the user instead.
+
 ## Kernel review list (apply to any `test/htp/*.c`, `htp_backend/**` change)
 
 * Everything before a quantizer is `_det` (one spec, scalar/NEON/HVX,
