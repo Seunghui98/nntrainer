@@ -197,15 +197,14 @@ TEST_P(Gemma4MoeTinyModelTest, WeightBearingLayerOrderMatchesConverter) {
   std::vector<std::string> expected = {"embedding0"};
   for (int i = 0; i < tiny_num_layers; ++i) {
     const std::string p = "layer" + std::to_string(i);
-    // _qkv holds q, q_norm, k, k_norm (and v on a sliding layer; layer 1
-    // is full_attention: K == V) and _ffn holds gate, up, down, each in the
-    // file's order, so the tensor order is unchanged by the fusion.
-    std::vector<std::string> block = {p + "_attention_norm", p + "_qkv"};
-    for (const char *n :
-         {"_attention_out", "_post_attention_norm", "_pre_ffn_norm", "_ffn",
-          "_post_ffn_norm_1",
-          "_pre_ffn_norm_2", "_router_norm", "_sparse_moe", "_post_ffn_norm_2",
-          "_post_ffn_norm", "_layer_scalar"})
+    // _qkv holds attention_norm, q, q_norm, k, k_norm (and v on a sliding
+    // layer; layer 1 is full_attention: K == V); _ffn holds pre_ffn_norm,
+    // gate, up, down, post_ffn_norm_1; _sparse_moe holds pre_ffn_norm_2,
+    // router_norm, the router and the experts, post_ffn_norm_2 -- each in
+    // the file's order, so the tensor order is unchanged by the fusion.
+    std::vector<std::string> block = {p + "_qkv"};
+    for (const char *n : {"_attention_out", "_post_attention_norm", "_ffn",
+                          "_sparse_moe", "_post_ffn_norm", "_layer_scalar"})
       block.push_back(p + n);
     expected.insert(expected.end(), block.begin(), block.end());
   }
