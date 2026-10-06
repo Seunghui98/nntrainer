@@ -49,6 +49,34 @@ public:
   using prop_tag = nntrainer::uint_prop_tag;
 };
 
+/** v_norm: a gamma-less per-head RMS norm on v (feature_size wide, the
+ *  same kernel as q and k without the multiply) */
+class VNorm : public nntrainer::Property<bool> {
+public:
+  VNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "v_norm";
+};
+
+/** v_from_k: no v weight; v is the raw k projection, before k_norm (a
+ *  model whose attention has K == V). Needs feature_size. */
+class VFromK : public nntrainer::Property<bool> {
+public:
+  VFromK(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "v_from_k";
+};
+
+/** q_scale: multiplied into q after its norm (folded into the gamma
+ *  multiply), e.g. sqrt(head_dim) for a model whose attention scaling is
+ *  1.0 against a core that divides by sqrt(head_dim) */
+class QScale : public nntrainer::Property<float> {
+public:
+  QScale(float val = 1.0f) : nntrainer::Property<float>(val) {}
+  using prop_tag = nntrainer::float_prop_tag;
+  static constexpr const char *key = "q_scale";
+};
+
 } // namespace props
 
 /**
@@ -65,6 +93,10 @@ public:
  * order, q, q_norm's gamma, k, k_norm's gamma, v, and applies the same
  * rms_norm_wrt_width + gamma multiply ReshapedRMSNormLayer would; the
  * outputs are q_normed, k_normed, v. Without it: q, k, v as they are.
+ * v_norm adds the gamma-less norm on v, q_scale a factor on q after its
+ * norm, and v_from_k drops the v weight and takes v from the raw k
+ * projection -- the three things one model's attention does around the
+ * projections, folded in so one call still covers the block.
  */
 WIN_EXPORT class QKVLayer : public nntrainer::LayerImpl {
 public:
@@ -157,11 +189,15 @@ public:
 private:
   /** feature_size: the head dim q and k are normed over; unset = no norm */
   std::tuple<props::QUnit, props::KUnit, props::VUnit, props::FeatureSize,
-             nntrainer::props::Epsilon>
+             nntrainer::props::Epsilon, props::VNorm, props::VFromK,
+             props::QScale>
     qkv_props;
   std::array<unsigned int, 5> weight_idx; /**< q, [q_gamma,] k, [k_gamma,] v */
-  std::array<unsigned int, 2> tensor_idx; /**< q and k before the norm */
+  std::array<unsigned int, 3> tensor_idx; /**< q, k (and v) before the norm */
   unsigned int feature_size = 0;
+  bool v_norm = false;
+  bool v_from_k = false;
+  float q_scale = 1.0f;
 };
 
 } // namespace causallm
