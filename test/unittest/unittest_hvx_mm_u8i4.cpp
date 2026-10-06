@@ -2704,6 +2704,193 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
   rfree(buf);
 }
 
+/**
+ * [doc 57] hvx_expand_wh2 against the format's definition: code c becomes
+ * the nibble of c - 2, source byte j becomes destination bytes 2j, 2j+1.
+ * The one thing only the device can say is the vshuff byte order; if this
+ * fails with every even/odd destination byte swapped, the two operands of
+ * Q6_W_vshuff_VVR in hvx_expand_wh2.c are the wrong way round.
+ */
+TEST_F(HmxMmU8I4Layer, ExpandWh2MatchesScalar) {
+  const int n = 4096;
+  std::vector<uint8_t> src(n), dst(2 * n, 0xEE);
+  uint32_t st = 0x2B17u;
+  for (auto &b : src) {
+    st = st * 1664525u + 1013904223u;
+    b = static_cast<uint8_t>(st >> 24);
+  }
+  ASSERT_EQ(nntr_hvx_expand_wh2(handle_, src.data(), n, dst.data(), 2 * n),
+            AEE_SUCCESS);
+  size_t bad = 0, first = 0;
+  for (int j = 0; j < n; ++j) {
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t c0 = (src[j] >> (4 * h)) & 3u;
+      const uint32_t c1 = (src[j] >> (4 * h + 2)) & 3u;
+      const uint8_t want =
+        static_cast<uint8_t>(((c0 + 14u) & 15u) | (((c1 + 14u) & 15u) << 4));
+      if (dst[2 * j + h] != want && bad++ == 0)
+        first = 2 * j + h;
+    }
+  }
+  std::cout << "U8I4_FIELD path=expand_wh2 field=bad_bytes value=" << bad
+            << " of " << 2 * n << " first=" << first << std::endl;
+  EXPECT_EQ(bad, 0u);
+}
+
+/**
+ * [doc 57] The MoE layer with WH2 experts against the same experts as WH,
+ * both registered the way the host's expert pool does it (arena slot, tail
+ * after the bytes, one swap), at gemma-4-26B-A4B's expert shape and the
+ * GeGLU epilogue. The weights hold int2 values, so after the expansion the
+ * two calls feed the HMX the same nibbles and must agree bit for bit: any
+ * difference is the WH2 path -- the staging, the expansion, or a wait in
+ * the pipeline that let a matmul read a weight before it was expanded.
+ * Expert 0 spans two blocks, so the second block reuses an expanded
+ * weight; three experts make the staging buffers alternate.
+ */
+TEST_F(HmxMmU8I4Layer, MoeLayerInt2MatchesInt4) {
+  const uint32_t K = 2816, I = 704, N = 2816, M = 128, NE = 3;
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  struct Pair {
+    uint32_t k, n;
+    std::vector<uint8_t> wh, wh2;
+    std::vector<float> scale;
+    std::vector<int32_t> colsum;
+  };
+  uint32_t st = 0x1D2E3F4u;
+  auto make = [&](uint32_t k, uint32_t n) {
+    Pair p{k, n, {}, {}, {}, {}};
+    std::vector<int8_t> q(static_cast<size_t>(k) * n);
+    p.colsum.assign(n, 0);
+    for (size_t i = 0; i < q.size(); ++i) {
+      st = st * 1664525u + 1013904223u;
+      q[i] = static_cast<int8_t>(static_cast<int>((st >> 24) & 3u) - 2);
+      p.colsum[i % n] += q[i];
+    }
+    p.scale.resize(n);
+    for (uint32_t c = 0; c < n; ++c) {
+      st = st * 1664525u + 1013904223u;
+      p.scale[c] = 0.002f + 0.002f * ((st >> 8) % 1000u) / 1000.0f;
+    }
+    p.wh.resize(nntrainer::whBytes(k, n));
+    nntrainer::whPack(q.data(), k, n, p.wh.data());
+    p.wh2.resize(nntrainer::wh2Bytes(k, n));
+    nntrainer::wh2FromWh(p.wh.data(), p.wh.size(), p.wh2.data());
+    return p;
+  };
+  std::vector<Pair> gu, dn;
+  for (uint32_t e = 0; e < NE; ++e) {
+    gu.push_back(make(K, 2 * I));
+    dn.push_back(make(I, N));
+  }
+
+  auto stride = [](size_t bytes, uint32_t n) {
+    return static_cast<uint32_t>((bytes + 8u * n + 4095u) & ~size_t(4095u));
+  };
+  const uint32_t s4 =
+    stride(gu[0].wh.size(), 2 * I) + stride(dn[0].wh.size(), N);
+  const uint32_t s2 =
+    stride(gu[0].wh2.size(), 2 * I) + stride(dn[0].wh2.size(), N);
+  const uint32_t arena_bytes = NE * (s4 + s2);
+  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
+  const int fd = to_fd(buf);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+                  static_cast<int>(FASTRPC_MAP_FD)),
+            0);
+  uint32_t arena = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
+            AEE_SUCCESS);
+
+  auto *base = static_cast<uint8_t *>(buf);
+  auto put = [&](uint32_t off, const std::vector<uint8_t> &b, const Pair &p) {
+    std::memcpy(base + off, b.data(), b.size());
+    std::memcpy(base + off + b.size(), p.scale.data(), 4u * p.n);
+    std::memcpy(base + off + b.size() + 4u * p.n, p.colsum.data(), 4u * p.n);
+    return stride(b.size(), p.n);
+  };
+  std::vector<uint32_t> h4g(NE), h4d(NE), h2g(NE), h2d(NE);
+  auto swap = [&](uint32_t off_gu, uint32_t off_dn, uint32_t *hg,
+                  uint32_t *hd) {
+    return nntr_hvx_weight_swap_u8i4_arena(
+      handle_, 0xFFFFFFFFu, 0xFFFFFFFFu, K, I, N, arena, off_gu, off_dn,
+      nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, hg, hd);
+  };
+  EXPECT_EQ(nntr_hvx_set_expert_bits(handle_, 3u), AEE_EBADPARM + kDspOffset);
+  uint32_t off = 0;
+  for (uint32_t e = 0; e < NE; ++e) {
+    const uint32_t og = off;
+    off += put(og, gu[e].wh, gu[e]);
+    const uint32_t od = off;
+    off += put(od, dn[e].wh, dn[e]);
+    ASSERT_EQ(swap(og, od, &h4g[e], &h4d[e]), AEE_SUCCESS);
+  }
+  ASSERT_EQ(nntr_hvx_set_expert_bits(handle_, 2u), AEE_SUCCESS);
+  for (uint32_t e = 0; e < NE; ++e) {
+    const uint32_t og = off;
+    off += put(og, gu[e].wh2, gu[e]);
+    const uint32_t od = off;
+    off += put(od, dn[e].wh2, dn[e]);
+    ASSERT_EQ(swap(og, od, &h2g[e], &h2d[e]), AEE_SUCCESS);
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0057u);
+  const std::vector<uint32_t> row_count = {100u, 64u, 7u};
+  std::vector<uint32_t> row_index;
+  std::vector<float> row_weight;
+  for (uint32_t e = 0; e < NE; ++e) {
+    for (uint32_t i = 0; i < row_count[e]; ++i) {
+      row_index.push_back((i * 37u + e * 11u) % M); // distinct within e
+      st = st * 1664525u + 1013904223u;
+      row_weight.push_back(0.1f + 0.9f * ((st >> 8) % 1000u) / 1000.0f);
+    }
+  }
+  auto run = [&](const std::vector<uint32_t> &hg,
+                 const std::vector<uint32_t> &hd, std::vector<float> &out) {
+    out.assign(static_cast<size_t>(M) * N, 1.0f);
+    return nntr_hvx_mm_u8i4_moe_layer(
+      handle_, M, K, I, N, 1u /* gelu_tanh */, hg.data(), (int)hg.size(),
+      hd.data(), (int)hd.size(), row_index.data(), (int)row_index.size(),
+      row_count.data(), (int)row_count.size(), row_weight.data(),
+      (int)row_weight.size(), x.data(), (int)x.size(), out.data(),
+      (int)out.size());
+  };
+  std::vector<float> o4, o2;
+  ASSERT_EQ(run(h4g, h4d, o4), AEE_SUCCESS);
+  ASSERT_EQ(run(h2g, h2d, o2), AEE_SUCCESS);
+  size_t bad = 0, nonzero = 0;
+  for (size_t i = 0; i < o4.size(); ++i) {
+    bad += std::memcmp(&o4[i], &o2[i], sizeof(float)) != 0;
+    nonzero += o4[i] != 0.0f;
+  }
+  std::cout << "U8I4_FIELD path=moe_int2 field=bad_elems value=" << bad
+            << " of " << o4.size() << " nonzero=" << nonzero << std::endl;
+  EXPECT_GT(nonzero, 0u);
+  EXPECT_EQ(bad, 0u);
+
+  // A WH2 gate_up beside a WH down is refused before any work.
+  std::vector<float> om;
+  EXPECT_EQ(run(h2g, h4d, om), AEE_EBADPARM + kDspOffset);
+
+  for (uint32_t e = 0; e < NE; ++e) {
+    for (uint32_t h : {h4g[e], h4d[e], h2g[e], h2d[e]})
+      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h), AEE_SUCCESS);
+  }
+  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
+  rfree(buf);
+}
+
 TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
   const double need_gb = 4.10;
 
