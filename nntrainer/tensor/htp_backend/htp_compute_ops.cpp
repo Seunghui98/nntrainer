@@ -4756,8 +4756,8 @@ private:
 
   void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
                                 const float *act, float *out, unsigned int M,
-                                unsigned int K, unsigned int I,
-                                unsigned int N) override {
+                                unsigned int K, unsigned int I, unsigned int N,
+                                bool gelu) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const DenseHandles &dh =
@@ -4773,7 +4773,7 @@ private:
         row_index[c * M + r] = r;
     }
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
-                   act, out, M, K, dh.w, N, /*kind=*/1);
+                   act, out, M, K, dh.w, N, /*kind=*/1, gelu ? 1u : 0u);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
