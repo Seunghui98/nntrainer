@@ -1,11 +1,16 @@
 # nntr_trace
 
 Timeline profiling for nntrainer runs that mix CPU, Hexagon HTP (HMX / HVX /
-DMA) and QNN layers. The design and the phased plan are in
+DMA) and QNN layers.
+
+**Start with [`GUIDE.md`](GUIDE.md)** (Korean): branches, a five-minute demo
+without a device, capturing on a phone, reading the numbers, sharing a
+report, troubleshooting. The design and the phased plan are in
 [`docs/backend_guide/HTP_TRACE_PROFILER.md`](../../docs/backend_guide/HTP_TRACE_PROFILER.md);
-the viewer's own roadmap is [`VIEWER_PLAN.md`](VIEWER_PLAN.md). Nothing in the
-runtime emits a trace yet: this directory holds the file format by example,
-the viewer, and converters for the logs the HTP device tests already print.
+the viewer's own roadmap is [`VIEWER_PLAN.md`](VIEWER_PLAN.md). The runtime
+recorder that writes a per-call trace lives on the HTP branch (see below);
+this directory holds the viewer, the converters for the logs HTP builds
+already print, samples, and tests.
 
 | file | what it does |
 |---|---|
@@ -42,7 +47,10 @@ python3 tools/nntr_trace/bundle.py -o report.html --trace "run=profile.json"
 ```
 
 **B. Per-call timeline.** Needs a build with the `HtpTrace` recorder
-(`nntrainer/tensor/htp_backend/htp_trace.{h,cpp}`, on the HTP branch).
+(`nntrainer/tensor/htp_backend/htp_trace.{h,cpp}`, on branch
+`claude/gallant-bell-7mnznj-htp-trace`, based on
+`claude/lfm2-moe-ffn-hexkl-2ivn5v`); build it with
+`Applications/CausalLM/build_android.sh --htp` (not `--cache`).
 `NNTR_TRACE` names the output and implies profile level 2 so the timed
 FastRPC entries run:
 
@@ -55,10 +63,10 @@ python3 tools/nntr_trace/bundle.py -o run.html --trace "run=trace.json"
 
 Every FastRPC call gets a host wait span, its seam halves and a DSP entry
 holding that call's stage totals on their lanes, with prefill and each
-decode token marked as phases. Lane overlap (HMX ∥ HVX) reads 0 at this
-level: the stage totals are laid out sequentially inside a call, which the
-metadata states. Measuring real overlap needs the DSP-side ring of P3 in
-the plan document.
+decode token marked as phases. Stage totals are laid out sequentially
+inside a call, which the metadata states; the one measured overlap is the
+MoE layer kernel's SwiGLU worker time, drawn under its HMX span. General
+lane overlap needs the DSP-side ring of P3 in the plan document.
 
 ## Viewer
 

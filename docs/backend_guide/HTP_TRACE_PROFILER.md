@@ -4,10 +4,11 @@
 
 Status: plan + prototype, with a first slice of P2 landed on the HTP
 branch. The viewer, the converters and the samples live in
-`tools/nntr_trace/` (see its README for the device recipe);
+`tools/nntr_trace/` (`tools/nntr_trace/GUIDE.md` is the how-to);
 `nntrainer/tensor/htp_backend/htp_trace.{h,cpp}` on the HTP branch writes a
-per-call `trace.json` when `NNTR_TRACE` is set. The DSP-side ring buffer
-(P3), and therefore real lane overlap, is not built yet.
+per-call `trace.json` when `NNTR_TRACE` is set (branch
+`claude/gallant-bell-7mnznj-htp-trace`). The DSP-side ring buffer (P3), and
+therefore general lane overlap, is not built yet.
 
 ## 0. Why
 
