@@ -108,10 +108,16 @@ interface nntr_hvx : remote_handle64 {
    // in call order, concatenated): handle i's output rows are normed per
    // post_chunk[i]-wide piece (N_i for a whole-row norm, the head dim for
    // a per-head one), times its gamma, in place. eps for both.
+   // After the norms, RoPE (hvx_rope_rows_f32) on the first rope_handles
+   // handles' output rows, per head of rope_hd (0 = none): rope_cs is M
+   // rows of 2*rope_hd floats, the CPU table's cos row then sin row for
+   // each row's position. The q and k projections thus leave rotated.
    AEEResult mm_u8i4_layer_norm(in uint32 M, in uint32 K, in float eps,
                                 in sequence<float> pre_gamma,
                                 in sequence<uint32> post_chunk,
                                 in sequence<float> post_gamma,
+                                in uint32 rope_hd, in uint32 rope_handles,
+                                in sequence<float> rope_cs,
                                 in sequence<uint32> w_handles,
                                 in sequence<float> act_f32,
                                 rout sequence<float> out_cat);

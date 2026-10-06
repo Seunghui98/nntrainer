@@ -1303,15 +1303,18 @@ public:
                                  unsigned int M, std::vector<unsigned int> N,
                                  unsigned int K, const float *pre_gamma,
                                  const std::vector<unsigned int> &post_chunk,
-                                 const float *post_gamma,
-                                 float eps) override {
+                                 const float *post_gamma, float eps,
+                                 const float *rope_cs, unsigned int rope_hd,
+                                 unsigned int rope_weights) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const size_t n = matAdata.size();
     if ((!post_chunk.empty() && post_chunk.size() != n) ||
-        (!matAscale.empty() && matAscale.size() != n)) {
+        (!matAscale.empty() && matAscale.size() != n) ||
+        (rope_hd != 0 && (rope_weights > n || rope_cs == nullptr))) {
       throw std::invalid_argument(
-        "gemm_q4_0_batch_norm_fp32: one post_chunk / scale per weight");
+        "gemm_q4_0_batch_norm_fp32: one post_chunk / scale per weight, "
+        "rope on a prefix of them");
     }
     // Every weight as the column slices gemm_q4_0_accel_fp32 would make
     // of it (a 2816 x 4096 weight does not fit the VTCM double buffer
@@ -1322,6 +1325,7 @@ public:
     std::vector<float> gammas;
     std::vector<OutSlice> slices;
     unsigned int n_total = 0;
+    unsigned int rope_slices = 0;
     const float *g = post_gamma;
     for (size_t i = 0; i < n; ++i) {
       const FcHandles &fh = get_or_register_fc(
@@ -1331,11 +1335,15 @@ public:
       unsigned int c0 = 0;
       for (size_t j = 0; j < fh.handles.size(); ++j) {
         const unsigned int cols = fh.cols[j];
-        if (chunk != 0u && cols % chunk != 0u) {
+        if ((chunk != 0u && cols % chunk != 0u) ||
+            (rope_hd != 0u && i < rope_weights && cols % rope_hd != 0u)) {
           throw std::invalid_argument(
             "gemm_q4_0_batch_norm_fp32: a slice of " + std::to_string(cols) +
-            " columns does not hold whole chunks of " + std::to_string(chunk));
+            " columns does not hold whole chunks of " + std::to_string(chunk) +
+            " / heads of " + std::to_string(rope_hd));
         }
+        if (rope_hd != 0u && i < rope_weights)
+          ++rope_slices;
         handles.push_back(fh.handles[j]);
         chunks.push_back(chunk);
         if (chunk != 0u)
@@ -1352,14 +1360,19 @@ public:
     norms.post_chunk = post_chunk.empty() ? nullptr : &chunks;
     norms.post_gamma = gammas.data();
     norms.eps = eps;
-    // Both norms are per row, so the row chunks gemm_q4_0_batch_fp32 makes
-    // for VTCM carry them unchanged.
+    norms.rope_hd = rope_hd;
+    norms.rope_handles = rope_slices;
+    // Both norms and the RoPE are per row, so the row chunks
+    // gemm_q4_0_batch_fp32 makes for VTCM carry them unchanged (the table
+    // rows advance with the activation rows).
     const unsigned int step = fcMaxRows(K);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       std::vector<OutSlice> rows = slices;
       for (OutSlice &o : rows)
         o.dst += static_cast<size_t>(m0) * o.stride;
+      norms.rope_cs =
+        rope_hd ? rope_cs + static_cast<size_t>(m0) * 2 * rope_hd : nullptr;
       invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
                   matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
                   K, nullptr, nullptr, &norms, &rows);
@@ -3081,7 +3094,10 @@ private:
     const std::vector<unsigned int> *post_chunk = nullptr; /**< per handle */
     const float *post_gamma = nullptr;           /**< the chunks, concatenated */
     float eps = 0.0f;
-    bool any() const { return pre_gamma || post_chunk; }
+    const float *rope_cs = nullptr; /**< M rows of 2*rope_hd, or nullptr */
+    unsigned int rope_hd = 0;       /**< 0: no RoPE */
+    unsigned int rope_handles = 0;  /**< the handles rotated, a prefix */
+    bool any() const { return pre_gamma || post_chunk || rope_hd; }
   };
 
   void invokeLayer(remote_handle64 session, const uint32_t *handles,
@@ -3122,8 +3138,10 @@ private:
         norms->pre_gamma ? static_cast<int>(K) : 0,
         norms->post_chunk ? norms->post_chunk->data() : nullptr,
         norms->post_chunk ? static_cast<int>(norms->post_chunk->size()) : 0,
-        norms->post_gamma, post_gamma_len, handles, num_handles, act_f32,
-        act_len, out_cat, out_len);
+        norms->post_gamma, post_gamma_len, norms->rope_hd, norms->rope_handles,
+        norms->rope_cs,
+        norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0, handles,
+        num_handles, act_f32, act_len, out_cat, out_len);
       const uint64_t elapsed = HtpProfile::nowUs() - t0;
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_norm failed: err=" +

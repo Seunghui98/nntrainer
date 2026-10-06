@@ -220,14 +220,19 @@ public:
   // for both. A backend without it says so and the layer norms itself.
   // matAscale: empty for Q4_0 weights, else one QS4CX per-channel scale
   // region per weight (gemm_qs4cx_accel_fp32's form: quantized offline,
-  // no Q4_0 detour).
+  // no Q4_0 detour). rope_cs / rope_hd / rope_weights: after the norms,
+  // RoPE per head of rope_hd on the outputs of the first rope_weights
+  // weights (q and k), rope_cs being M rows of 2*rope_hd floats -- the
+  // CPU table's cos row then sin row for each row's position; rope_hd 0
+  // for none.
   virtual bool supports_gemm_q4_0_batch_norm_fp32() const { return false; }
   virtual void gemm_q4_0_batch_norm_fp32(
     std::vector<void *> matAdata, std::vector<float *> matAscale,
     float *matBdata, std::vector<float *> matCdata, unsigned int M,
     std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
     const std::vector<unsigned int> &post_chunk, const float *post_gamma,
-    float eps);
+    float eps, const float *rope_cs = nullptr, unsigned int rope_hd = 0,
+    unsigned int rope_weights = 0);
 
   // The decoder block's epilogue as one accelerator call (doc 57 section
   // 5 step 4): out = scale * (resid + rmsnorm(x [+ x2]) * gamma) over M
