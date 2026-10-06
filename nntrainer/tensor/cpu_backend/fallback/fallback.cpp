@@ -249,6 +249,15 @@ void gemv_q4_0_rowwise_range(const unsigned int row_begin,
   __ggml_gemv_q4_0_rowwise_range(row_begin, row_end, K, quantized_A, B, C);
 }
 
+void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
+               const unsigned int K, const float *A, const unsigned int lda,
+               std::vector<void *> Bs, std::vector<unsigned int> ldbs,
+               std::vector<float *> Cs, std::vector<unsigned int> ldcs) {
+  for (size_t i = 0; i < Ns.size(); ++i)
+    __fallback_gemm_q4_0<float>(M, Ns[i], K, A, lda, Bs[i], ldbs[i], Cs[i],
+                                ldcs[i]);
+}
+
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
