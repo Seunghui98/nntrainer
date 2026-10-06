@@ -137,6 +137,40 @@ public:
   using prop_tag = nntrainer::enum_class_prop_tag;
   static constexpr const char *key = "gamma_initializer";
 };
+/**
+ * @brief in_norm: the layer owns the RMSNorm gamma of its input (hidden
+ *        wide, FP32, the first weight in the file) and applies that norm
+ *        itself -- on an accelerator inside the same call as its matmuls.
+ */
+class InNorm : public nntrainer::Property<bool> {
+public:
+  InNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "in_norm";
+};
+
+/**
+ * @brief out_norm: likewise the RMSNorm of the layer's output (its gamma
+ *        is the last weight in the file).
+ */
+class OutNorm : public nntrainer::Property<bool> {
+public:
+  OutNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "out_norm";
+};
+
+/**
+ * @brief router_norm: an MoE layer's router reads its own RMSNorm of the
+ *        layer's input (gamma after in_norm's in the file).
+ */
+class RouterNorm : public nntrainer::Property<bool> {
+public:
+  RouterNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "router_norm";
+};
+
 }; // namespace props
 
 WIN_EXPORT enum RMSParams { gamma };

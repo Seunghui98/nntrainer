@@ -96,7 +96,10 @@ public:
  * v_norm adds the gamma-less norm on v, q_scale a factor on q after its
  * norm, and v_from_k drops the v weight and takes v from the raw k
  * projection -- the three things one model's attention does around the
- * projections, folded in so one call still covers the block.
+ * projections, folded in so one call still covers the block. in_norm
+ * folds the block's input RMSNorm in too (its gamma leads the weights).
+ * On an accelerator with gemm_q4_0_batch_norm_fp32 every norm here rides
+ * the projection call; on the CPU they are the same kernels in sequence.
  */
 WIN_EXPORT class QKVLayer : public nntrainer::LayerImpl {
 public:
@@ -190,10 +193,13 @@ private:
   /** feature_size: the head dim q and k are normed over; unset = no norm */
   std::tuple<props::QUnit, props::KUnit, props::VUnit, props::FeatureSize,
              nntrainer::props::Epsilon, props::VNorm, props::VFromK,
-             props::QScale>
+             props::QScale, props::InNorm>
     qkv_props;
-  std::array<unsigned int, 5> weight_idx; /**< q, [q_gamma,] k, [k_gamma,] v */
-  std::array<unsigned int, 3> tensor_idx; /**< q, k (and v) before the norm */
+  std::array<unsigned int, 6>
+    weight_idx; /**< [in_gamma,] q, [q_gamma,] k, [k_gamma,] v */
+  std::array<unsigned int, 4>
+    tensor_idx; /**< q, k (and v) before the norm; the normed input */
+  bool in_norm = false;
   unsigned int feature_size = 0;
   bool v_norm = false;
   bool v_from_k = false;

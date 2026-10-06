@@ -43,13 +43,15 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum QKVParams { Q, K, V };
 /** weight_idx slots; the file's order is q, q_gamma, k, k_gamma, v */
-enum QKVWeights { WQ, WQ_GAMMA, WK, WK_GAMMA, WV };
+enum QKVWeights { WQ, WQ_GAMMA, WK, WK_GAMMA, WV, IN_GAMMA };
+/** tensor_idx slots: the three raw projections, then the normed input */
+enum QKVTensors { T_Q, T_K, T_V, T_IN };
 
 QKVLayer::QKVLayer() :
   LayerImpl(),
   qkv_props(props::QUnit(), props::KUnit(), props::VUnit(),
             props::FeatureSize(), nntrainer::props::Epsilon(), props::VNorm(),
-            props::VFromK(), props::QScale()) {
+            props::VFromK(), props::QScale(), props::InNorm()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -71,6 +73,7 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
   v_norm = std::get<props::VNorm>(qkv_props).get();
   v_from_k = std::get<props::VFromK>(qkv_props).get();
   q_scale = std::get<props::QScale>(qkv_props).get();
+  in_norm = std::get<props::InNorm>(qkv_props).get();
   // v from the raw k projection: v's width is k's, and the raw k lands in
   // the norm scratch below, so the norm (feature_size) must be on.
   const unsigned int v_unit =
@@ -134,6 +137,17 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, name, true);
   };
 
+  // The input norm's gamma leads the weights, where the file has it.
+  if (in_norm) {
+    const nntrainer::TensorDim in_gamma_dim(
+      1, 1, 1, in_dim.width(),
+      nntrainer::TensorDim::TensorType(context.getFormat(),
+                                       nntrainer::TensorDim::DataType::FP32));
+    weight_idx[IN_GAMMA] = context.requestWeight(
+      in_gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "in_norm_gamma", true);
+  }
+
   /** Q */
   nntrainer::TensorDim weight_dim(
     1, is_nchw ? 1 : q_unit, is_nchw ? in_dim.width() : 1,
@@ -177,6 +191,14 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
         output_dims[QKVParams::V], "v_raw", nntrainer::Initializer::NONE,
         false, nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
     }
+  }
+  if (in_norm) {
+    nntrainer::TensorDim normed_dim = in_dim;
+    normed_dim.setTensorType(
+      {context.getFormat(), context.getActivationDataType()});
+    tensor_idx[T_IN] = context.requestTensor(
+      normed_dim, "in_normed", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
   }
 }
 
@@ -254,6 +276,8 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   nntrainer::Tensor input_step =
     input_.getSharedDataTensor(input_step_dim, 0, true);
+  const float epsilon = std::get<nntrainer::props::Epsilon>(qkv_props).get();
+  const unsigned int rows = to - from;
 
   nntrainer::TensorDim Qhidden_dim = Qhidden_.getDim();
   nntrainer::TensorDim Qhidden_step_dim = Qhidden_.getDim();
@@ -276,6 +300,73 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor Vhidden_step =
     Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
 
+  // Every norm of the block in the projection call (doc 57 section 5 step
+  // 4): the input norm before the quantizer, the per-head norms (q's gamma
+  // carrying q_scale, v's gamma all ones) on the output rows. v from the
+  // raw k projection is the k weight sent twice, its second copy normed
+  // without a gamma -- one more projection on the accelerator instead of
+  // a copy and a norm on the CPU.
+  const auto q4 = ml::train::TensorDim::DataType::Q4_0;
+  auto *ops = input_step.getOps();
+  if (rows > 1 && (in_norm || feature_size) && ops != nullptr &&
+      ops->supports_gemm_q4_0_batch_norm_fp32() &&
+      input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      Qweight.getDataType() == q4 && Kweight.getDataType() == q4 &&
+      (v_from_k || context.getWeight(weight_idx[WV]).getDataType() == q4)) {
+    std::vector<void *> wdata = {Qweight.getData<char>(), Kweight.getData<char>()};
+    std::vector<unsigned int> widths = {
+      static_cast<unsigned int>(Qhidden_step_dim.width()),
+      static_cast<unsigned int>(Khidden_step_dim.width())};
+    std::vector<float *> dsts = {context.getOutput(QKVParams::Q).getData<float>(),
+                                 context.getOutput(QKVParams::K).getData<float>()};
+    std::vector<unsigned int> chunks;
+    std::vector<float> gammas;
+    if (feature_size) {
+      const float *gq = context.getWeight(weight_idx[WQ_GAMMA]).getData<float>();
+      const float *gk = context.getWeight(weight_idx[WK_GAMMA]).getData<float>();
+      chunks = {feature_size, feature_size};
+      for (unsigned int j = 0; j < feature_size; ++j)
+        gammas.push_back(gq[j] * q_scale);
+      gammas.insert(gammas.end(), gk, gk + feature_size);
+    } else {
+      chunks = {0u, 0u};
+    }
+    nntrainer::Tensor &Vweight =
+      context.getWeight(weight_idx[v_from_k ? WK : WV]);
+    wdata.push_back(Vweight.getData<char>());
+    widths.push_back(static_cast<unsigned int>(Vhidden_step_dim.width()));
+    dsts.push_back(context.getOutput(QKVParams::V).getData<float>());
+    if (v_norm) {
+      chunks.push_back(feature_size);
+      gammas.insert(gammas.end(), feature_size, 1.0f);
+    } else {
+      chunks.push_back(0u);
+    }
+    ops->gemm_q4_0_batch_norm_fp32(
+      wdata, input_step.getData<float>(), dsts, rows, widths,
+      input_step_dim.width(),
+      in_norm ? context.getWeight(weight_idx[IN_GAMMA]).getData<float>()
+              : nullptr,
+      chunks, gammas.data(), epsilon);
+    return;
+  }
+
+  // The CPU: the input norm first, into its scratch (the kernel is not in
+  // place), then the projections read the normed rows.
+  if (in_norm) {
+    NNTR_THROW_IF(input_step.getDataType() !=
+                    ml::train::TensorDim::DataType::FP32,
+                  std::invalid_argument)
+      << "qkv_layer: in_norm is FP32 only";
+    nntrainer::Tensor normed = context.getTensor(tensor_idx[T_IN])
+                                 .getSharedDataTensor(input_step_dim, 0, true);
+    nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+      input_step.getData<float>(), normed.getData<float>(), rows,
+      input_step_dim.width(), epsilon);
+    normed.multiply_i(context.getWeight(weight_idx[IN_GAMMA]));
+    input_step = normed;
+  }
+
   std::vector<nntrainer::Tensor *> Weights({&Qweight, &Kweight});
   std::vector<nntrainer::Tensor *> Outputs({&Qhidden_step, &Khidden_step});
   if (!v_from_k) {
@@ -290,7 +381,6 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     input_step.dot(Weights, Outputs);
 
   if (feature_size) {
-    const float epsilon = std::get<nntrainer::props::Epsilon>(qkv_props).get();
     // [#130] one decode row: with QK_NORM resident the HTP norms q | k and
     // keeps the row for the attention hook, so the outputs stay unwritten
     if (to - from == 1 && input_dim.batch() == 1 && !v_from_k && !v_norm &&
@@ -363,5 +453,7 @@ void QKVLayer::updateTensorsByInputDimensions(
     if (v_norm && !v_from_k)
       context.updateTensor(tensor_idx[QKVParams::V], Voutput_dim);
   }
+  if (in_norm)
+    context.updateTensor(tensor_idx[T_IN], input_dim);
 }
 } // namespace causallm
