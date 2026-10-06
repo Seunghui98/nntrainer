@@ -1,6 +1,6 @@
 # 57. gemma-4-26B-A4B: int2 expert 가중치 (flash → arena int2 → VTCM에서 int4로 확장)
 
-상태: **구현·호스트 검사 완료, 기기 미측정.** 브랜치 `claude/epic-hopper-occf31`, 커밋 a77ccbe·016f9d4·4aaa7c5·b816b18 + 이 문서.
+상태: **구현·호스트 검사 완료, 기기 gtest 통과(§5.1), e2e 성능 미측정.** 브랜치 `claude/epic-hopper-occf31`, 커밋 a77ccbe·016f9d4·4aaa7c5·b816b18 + 이 문서.
 
 ## 1. 과제와 범위
 
@@ -188,6 +188,14 @@ adb shell 'cd /data/local/tmp/nntrainer/causallm && sh g4_int2_bench.sh' 2>&1 | 
 - 기대치(산술, 미측정): C=16 cold prefill 바닥 3.37 → 1.71 s. TPS와 확장 시간은 **추정하지 않는다**.
 
 ## 5. 측정 기록
+
+### 5.1 기기 gtest (2026-10-06, 사용자 기기, `run_u8i4_layer_on_device.sh`)
+
+- `ExpandWh2MatchesScalar`: `bad_bytes 0 of 8192`. `Q6_W_vshuff_VVR(odd, even, -1)` 바이트 순서가 맞다.
+- `MoeLayerInt2MatchesInt4`: `bad_elems 0 of 360448`, nonzero 332222. WH2 경로(staging, 확장, 대기)가 gemma 형상·GeGLU에서 WH 경로와 비트 단위로 같다.
+- 전체 PASSED (35 / 21 / 6 / 1). 성능은 아직 미측정이다.
+
+### 5.2 e2e
 
 | 이름 | pass | prefill ms | decode TPS | peak RSS KB | arena MiB | misses (ms/miss) | prefetch 수 (노출 ms) | text md5 |
 |---|---|---|---|---|---|---|---|---|
