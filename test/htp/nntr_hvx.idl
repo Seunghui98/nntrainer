@@ -1045,4 +1045,37 @@ interface nntr_hvx : remote_handle64 {
    // its index.
    AEEResult expand_i2i4(in sequence<uint8> codes, in sequence<int8> pal,
                          rout sequence<uint8> hvx, rout sequence<uint8> ref);
+
+   // [doc 54] weight_register_u8i4_arena for QS2CX_WH: the arena holds
+   // (K/32)*(N/32)*256 bytes of 2-bit codes instead of 512 of nibbles, and
+   // pal carries the four int4 values they index. The M=1 GEMV reads the
+   // codes through a register LUT; the HMX path expands a chunk in place
+   // after its DMA lands, so the VTCM budget is the 4-bit one and nothing
+   // after the matmul changes. wh_off must be 512-aligned, as for 4 bits.
+   AEEResult weight_register_u2i4_arena(in uint32 K, in uint32 N,
+                                        in uint32 arena, in uint32 wh_off,
+                                        in sequence<int8> pal,
+                                        in sequence<float> w_scale,
+                                        in sequence<int32> colsum_w,
+                                        in sequence<float> bias,
+                                        rout uint32 w_handle);
+
+   // [plan 229] weight_swap_batch_u8i4_arena for QS2CX_WH experts: each
+   // weight's arena span is its (K/32)*(N/32)*256 bytes of codes, then N
+   // f32 scales and N i32 column sums (always in the arena: no arrays),
+   // and pal_gu / pal_dn carry four int4 codes per expert. The swap and
+   // the partial-batch rules are the 4-bit call's; a rebind retags the
+   // slot's width with the bytes.
+   AEEResult weight_swap_batch_u2i4_arena(in uint32 K, in uint32 inter,
+                                          in uint32 N_out,
+                                          in sequence<uint32> old_gu,
+                                          in sequence<uint32> old_dn,
+                                          in sequence<uint32> arena,
+                                          in sequence<uint32> off_gu,
+                                          in sequence<uint32> off_dn,
+                                          in sequence<int8> pal_gu,
+                                          in sequence<int8> pal_dn,
+                                          rout sequence<uint32> h_gu,
+                                          rout sequence<uint32> h_dn,
+                                          rout uint32 n_done, rout int32 err);
 };
