@@ -199,6 +199,25 @@ adb shell 'cd /data/local/tmp/nntrainer/causallm && sh g4_int2_bench.sh' 2>&1 | 
 
 ### 5.2 e2e
 
+**packed int2, NNTR_HTP_PROFILE=2 (2026-10-06)** — C=16, read-ahead 기본, 512 tok prompt / 512 생성. 파일 7,226,112,120 B, arena 704 MiB, 출력 텍스트 정상(더미지만 프롬프트를 되풀이).
+
+| | prefill (M>1, 31 calls) | decode (M==1, 15360 calls) |
+|---|---|---|
+| e2e | 3920 ms (130.6 TPS) | 46292 ms (11.06 TPS, 90.4 ms/tok) |
+| MoE 호출 host / dsp | 21259 / 20585 us/call, 합 659 ms | 1529 / 1439 us/call, 합 23.5 s = decode의 51% |
+| mm / acc / requant / quant | 9753 / 4493 / 1569 / 504 | 829 / 392 / 2 / 71 |
+| drain (gu + dn) = 노출 대기 | 1601 + 947 = 2548 (12%) | 107 + 11 = 118 (8%) |
+| int2 expand (worker, 일의 양) | 7888 | 1472 |
+| weight DMA | 61968 KB/call | 11616 KB/call (8 × 1.42 MiB) |
+| miss | 328회 전체, 1.44 ms/miss, file read 합 472 ms | |
+| read-ahead | 3360 experts, 노출 21 ms | |
+
+판정:
+- **int2가 줄이는 것은 flash 읽기(miss)인데 이 실행에는 miss가 사실상 없다.** 328회, 전부 0.47 s. 더미 라우팅이 고정되어 거의 전부 캐시 적중이고, prefill 읽기는 read-ahead가 99% 숨긴다. 그래서 e2e가 int4와 같은 것이 맞다. 실제 라우팅(top-8/128, C=16)이면 decode에서 토큰당 수백 miss가 생기고 그때 1.44 ms/miss의 절반 효과가 나타난다. 미측정.
+- **확장 노출 상한**: drain이 MoE 호출의 8%(decode)/12%(prefill), e2e로는 각각 ≤4%/≤2%. int4의 drain과 비교해야 "숨었다"를 말할 수 있다(i4same 미실행).
+- **e2e 병목은 MoE 밖**: decode 90 ms 중 MoE HTP 46, 나머지 44 ms는 CPU(Q4_0 dense MLP·projection·lm_head 262144×2816). prefill 3.9 s 중 MoE 0.66 s + 등록 0.79 s, 나머지 2.5 s가 CPU. 54의 "projection/FFN을 HTP로"가 Gemma에는 아직 없다. int2가 비운 arena 704 MiB가 그 자리다.
+- MoE 호출 안: decode acc_read 27%, mm 58%. M=1에서 HMX 64행 타일의 1행만 쓴다 — 구조적 비용.
+
 **첫 int2 실행 (2026-10-06, 사용자 기기)** — `NNTR_MOE_EXPERT_BITS=2`, C=16, read-ahead 기본, `NNTR_HTP_PROFILE=1`, 8 threads, 447토큰 prompt, 512토큰 생성, 원본 int4 파일과의 같은 조건 비교는 아직 없음.
 
 | 항목 | 값 |
