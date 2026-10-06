@@ -279,3 +279,57 @@ cool() { while adb shell 'ps -A' | grep -q 'nntrainer_causall[m]'; do sleep 10; 
 - 6f7fa8d3: PR 4385가 7a8e260 뒤에 추가한 기기 gtest 호출 4곳(`unittest_hvx_mm_u8i4.cpp` 2, `unittest_hvx_dma_probe.cpp` 2)에 `act` 인자를 넣었다. Android 빌드는 이 환경에 없어 IDL 순서로만 맞췄다.
 - host (x86, 시스템 OpenBLAS, meson 1.5.2): `run_host_checks.sh` 끝까지 통과, `htp_syntax_check.sh` 통과, `unittest_causallm_models` **98 passed / 0 failed / 3 skipped**(101개; `Lfm2MoeDifferentialTest` 3개는 lfm2_moe_tiny fixture 가중치를 torch 없이 만들 수 없어 skip. e8d2604 기준에서 실패하던 Q40 두 테스트가 여기서는 skip이라 그 원인은 아직 모른다). Gemma4·Gemma4Moe differential 테스트는 통과.
 - **기기 미측정.** IDL이 바뀌었으므로 기기에서는 stub·skel·앱을 모두 다시 빌드하고 `libnntr_hvx_skel.so`를 push해야 한다(§7.2). §2 기준선은 이 브랜치에서 다시 재야 한다.
+
+### 9.1 §5-1, §5-3, §5-2, §5-4, §5-8 (2026-10-06): prefill의 CPU 몫을 HTP 호출 안으로, 기기 미측정
+
+브랜치 `claude/zealous-bell-a2pot9`, pr4385 위 59커밋. 전부 host에서만 검증했다(`unittest_causallm_models` 98 passed / 3 skipped, `run_host_checks.sh`, `htp_syntax_check.sh`). **기기 미측정.**
+
+| 단계 | 커밋 | 내용 | 기대 효과(산술, 57 §3 기준) |
+|---|---|---|---|
+| §5-1 | `[CausalLM] mha_core: build the RoPE table to max_timestep` | RoPE 표를 262144 → `max_timestep`(2048) 위치만 | L0·L5의 약 1.0 s |
+| §5-3a | (코드 변경 없음) | Gemma4 builder가 이미 `createAttentionCore`를 거침. config에 `"attention_engine": "htp"`를 주면 sliding 25층(hd 256)이 `attn_f16_prefill`로 | attention 본체 2.1 s 중 sliding 층 몫 |
+| §5-3b | `[HTP] attn_f16: take head_dim up to 512` | plan·ComputeOps의 hd 상한 256 → 512. full 5층(hd 512)도 HMX. 기기 gtest `PrefillWideHeadsTwoKvHeads` 추가 | 커널에 host stand-in이 없어 **기기 gtest가 게이트** |
+| §5-2 | `[CausalLM] dense_ffn: a GeGLU gate ...`, `[CausalLM] qkv_layer: a gamma-less v norm ...`, `[CausalLM/Gemma4] q/k/v and the dense MLP as one layer each` | q/k/v(+q_norm·k_norm·v_norm·√hd) → `qkv_layer` 1호출, gate/up/GeGLU/down → `dense_ffn` 1호출(GeGLU는 DSP epilogue). 가중치 순서는 파일과 동일 | 층당 FC 호출 7 → 2, CPU GeLU·multiply·q_scaled 제거 |
+| §5-4 | `[HTP] hvx_rmsnorm_rows_f32 ...`, `[HTP] Layer calls that carry the block's RMSNorms`, `[CausalLM] in_norm / out_norm on the fused layers ...`, `[CausalLM/Gemma4] Fold seven of the block's nine norms ...` | IDL `mm_u8i4_layer_norm`·`mm_u8i4_moe_layer_norm`: pre/post RMSNorm을 호출 안으로. attention_norm→qkv, pre_ffn_norm·post_ffn_norm_1→dense_ffn, pre_ffn_norm_2·router_norm·post_ffn_norm_2→MoE 층. q/k/v per-head norm도 호출 안 | 층당 CPU norm 9개 중 7개 제거(약 230 ms) |
+| §5-8 | `[HTP] QS4CX weights on the fused calls ...`, `[CausalLM] The fused layers take QS4CX weights, at decode too` | `--fc_dtype QS4CX` 파일을 재양자화 없이 등록. decode M=1 FC도 HTP(`accelerates_qs4cx_at_m1`). 융합 호출을 512열 정렬 슬라이스로(2816×4096이 VTCM 안에) | §10.15의 nll 4.510, CPU QS4CX decode 경로(반복 루프) 제거 |
+
+CPU에 남는 것(prefill): embedding, post_attention_norm, post_ffn_norm, 잔차 add 2개, ffn_sum, layer_scalar, RoPE(`apply_rotary_emb_tensor_v2`, attention 호출 전), router(2816→128 + softmax top-8), lm_head·softcap. 다음은 §5-5(router)와 post_attention_norm을 attention_out 층으로 접는 것.
+
+주의:
+- IDL이 바뀌었다. stub·skel·앱을 모두 다시 빌드하고 `libnntr_hvx_skel.so`를 push한다.
+- `fcSliceCols`가 512열 배수로 내림한다(head 경계). hd가 512를 나누지 않는 모델은 별도 정렬이 필요하다.
+- `attention_out`의 post_attention_norm은 아직 CPU다(`fully_connected`에 norm 옵션이 없음).
+- 기기 실행 가이드는 §9.2.
+
+### 9.2 기기 실행 가이드 (이 브랜치)
+
+```bash
+cd ~/workspace/nntrainer && git fetch origin claude/zealous-bell-a2pot9 && git checkout claude/zealous-bell-a2pot9
+export HEXAGON_SDK_ROOT=$HOME/workspace/Hexagon_SDK/6.4.0.2 HEXKL_ROOT=$HOME/workspace/hxkl-beta2/hexkl_addon ANDROID_NDK=$HOME/workspace/android-ndk-r26d
+./test/htp/build.sh                                   # skel (IDL 변경): UNDEFINED SYMBOLS OK
+(cd Applications/CausalLM && ./build_android.sh --htp) # stub 재생성 + 앱. --cache 금지
+export ANDROID_SERIAL=R3CY10WM83Y; D=/data/local/tmp/nntrainer/causallm
+adb push test/htp/build/libnntr_hvx_skel.so $D/
+adb push Applications/CausalLM/jni/libs/arm64-v8a/{nntrainer_causallm,libcausallm_core.so} $D/
+adb push builddir/android_build_result/lib/arm64-v8a/{libnntrainer.so,libccapi-nntrainer.so} $D/
+```
+
+모델: FC를 QS4CX로 다시 양자화한다(§7.3 명령에서 `--fc_dtype QS4CX`, 약 15분, 12.2 GB). 기존 Q4_0 bin도 로드되지만 FC가 로드 시 재양자화 경로를 탄다.
+
+config(`g4-npu-512/nntr_config.json`)에 더할 키:
+
+```json
+"attention_engine": "htp",
+"attn_proj_engine": "htp",
+"dense_ffn_engine": "htp",
+"moe_engine": "htp",
+"fc_layer_dtype": "QS4CX",
+"model_tensor_type": "QS4CX-FP32"
+```
+
+측정 순서(§7.5의 `cool` 뒤, 한 번에 하나):
+1. 기기 gtest `unittest_hvx_attn_f16 --gtest_filter='*PrefillWideHeads*'` (hd 512 커널 게이트).
+2. `g4-npu-512` 일반 빌드: prefill/decode TPS, 512토큰 텍스트.
+3. 446토큰 `NNTR_PPL=1`: nll (기준 4.556; QS4CX FC면 4.510 근처 기대).
+4. `--profile` 빌드로 `g4-prof-npu` → `prefill_timeline.py --by-op --by-layer`.
+5. 각 단계를 가르려면 config 키를 하나씩 켠다: `attention_engine`만(§5-3), 거기에 engine 키 셋(§5-2·5-4), 마지막에 QS4CX 파일(§5-8).
