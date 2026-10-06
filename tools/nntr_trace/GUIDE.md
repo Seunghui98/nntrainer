@@ -15,22 +15,20 @@ Trace Event Format(`trace.json`)이라 이 디렉터리의 `viewer.html`,
 
 ## 1. 브랜치와 구성 요소
 
-작업은 두 브랜치에 나뉘어 있습니다. 보는 쪽(도구)은 어떤 빌드와도 상관없고,
-측정하는 쪽(런타임 레코더)은 HTP 커널이 있는 브랜치 위에 올라가 있기 때문입니다.
+모든 작업은 브랜치 하나에 있습니다.
 
-| 브랜치 (Seunghui98/nntrainer) | 기반 | 들어 있는 것 | 언제 필요한가 |
-|---|---|---|---|
-| `claude/gallant-bell-7mnznj` | `nntrainer/nntrainer:main` | 뷰어, 변환기, `summarize.py`, 샘플·테스트, 설계 문서, 이 가이드 | 결과를 볼 때 (항상) |
-| `claude/gallant-bell-7mnznj-htp-trace` | `claude/lfm2-moe-ffn-hexkl-2ivn5v` | 런타임 레코더 `HtpTrace` (`NNTR_TRACE`) | 폰에서 호출별 타임라인을 뽑을 때 |
-
-두 브랜치를 한 체크아웃에서 같이 쓰는 방법:
+| 브랜치 (Seunghui98/nntrainer) | 기반 | 들어 있는 것 |
+|---|---|---|
+| `claude/gallant-bell-7mnznj` | `claude/lfm2-moe-ffn-hexkl-2ivn5v` | 런타임 레코더 `HtpTrace` (`NNTR_TRACE`), 뷰어, 변환기, `summarize.py`, 샘플·테스트, 설계 문서, 이 가이드 |
 
 ```bash
-git fetch origin claude/gallant-bell-7mnznj claude/gallant-bell-7mnznj-htp-trace
-git checkout claude/gallant-bell-7mnznj-htp-trace                      # 빌드할 쪽
-git worktree add ../nntr-trace-tools origin/claude/gallant-bell-7mnznj # 보는 쪽
-# 이후 도구 경로: ../nntr-trace-tools/tools/nntr_trace/
+git fetch origin claude/gallant-bell-7mnznj
+git checkout -b nntr-trace origin/claude/gallant-bell-7mnznj
 ```
+
+레코더는 HTP 커널이 들어 있는 `claude/lfm2-moe-ffn-hexkl-2ivn5v` 위에서만 빌드됩니다.
+결과를 **보기만** 할 때는 빌드가 필요 없습니다. 같은 체크아웃의
+`tools/nntr_trace/`를 그대로 쓰면 됩니다.
 
 ### 파일 지도
 
@@ -44,7 +42,7 @@ git worktree add ../nntr-trace-tools origin/claude/gallant-bell-7mnznj # 보는 
 | `qnn_optrace_to_nntr.py` | QNN HTP optrace(`*_chromeTrace_opTrace.json`) → trace (pid 3) |
 | `make_sample_trace.py` | 합성 샘플 trace (문서에 기록된 실측값을 스케일) |
 | `test/run.sh` | 샘플 생성, 번들, headless Chromium 검사, python 테스트 |
-| (HTP 브랜치) `nntrainer/tensor/htp_backend/htp_trace.{h,cpp}` | 런타임 레코더 |
+| `nntrainer/tensor/htp_backend/htp_trace.{h,cpp}` | 런타임 레코더 |
 
 ---
 
@@ -97,7 +95,7 @@ python3 tools/nntr_trace/bundle.py -o report.html --trace "run=profile.json"
 
 ### 3.2 경로 B: 호출별 타임라인 (`NNTR_TRACE`)
 
-**빌드.** `claude/gallant-bell-7mnznj-htp-trace`를 체크아웃하고:
+**빌드.** `claude/gallant-bell-7mnznj`를 체크아웃하고:
 
 ```bash
 cd Applications/CausalLM
@@ -111,7 +109,7 @@ cd Applications/CausalLM
   `readelf -d builddir/android_build_result/lib/arm64-v8a/libnntrainer.so | grep -E "libsdkl|libcdsprpc"`
   둘 다 보여야 HTP가 켜진 빌드입니다.
 - **DSP skel은 다시 빌드할 필요 없습니다.** 이 브랜치는 ARM 쪽만 바꾸고 IDL은
-  그대로입니다. 폰에 있는 `libnntr_hvx_skel.so`가 기반 브랜치와 맞으면 됩니다.
+  그대로입니다. 폰에 있는 `libnntr_hvx_skel.so`가 기반 브랜치(`claude/lfm2-moe-ffn-hexkl-2ivn5v`)와 맞으면 됩니다.
 - `builddir/jni/arm64-v8a/libcdsprpc.so`는 링크용 스텁입니다. 폰에 push하면
   안 됩니다 (run guide §5).
 

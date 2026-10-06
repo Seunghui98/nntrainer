@@ -7,10 +7,10 @@ DMA) and QNN layers.
 without a device, capturing on a phone, reading the numbers, sharing a
 report, troubleshooting. The design and the phased plan are in
 [`docs/backend_guide/HTP_TRACE_PROFILER.md`](../../docs/backend_guide/HTP_TRACE_PROFILER.md);
-the viewer's own roadmap is [`VIEWER_PLAN.md`](VIEWER_PLAN.md). The runtime
-recorder that writes a per-call trace lives on the HTP branch (see below);
-this directory holds the viewer, the converters for the logs HTP builds
-already print, samples, and tests.
+the viewer's own roadmap is [`VIEWER_PLAN.md`](VIEWER_PLAN.md). This directory
+holds the viewer, the converters for the logs HTP builds already print,
+samples, and tests; the runtime recorder that writes a per-call trace is
+`nntrainer/tensor/htp_backend/htp_trace.{h,cpp}` (see below).
 
 | file | what it does |
 |---|---|
@@ -47,9 +47,7 @@ python3 tools/nntr_trace/bundle.py -o report.html --trace "run=profile.json"
 ```
 
 **B. Per-call timeline.** Needs a build with the `HtpTrace` recorder
-(`nntrainer/tensor/htp_backend/htp_trace.{h,cpp}`, on branch
-`claude/gallant-bell-7mnznj-htp-trace`, based on
-`claude/lfm2-moe-ffn-hexkl-2ivn5v`); build it with
+(`nntrainer/tensor/htp_backend/htp_trace.{h,cpp}`); build it with
 `Applications/CausalLM/build_android.sh --htp` (not `--cache`).
 `NNTR_TRACE` names the output and implies profile level 2 so the timed
 FastRPC entries run:
