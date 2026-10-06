@@ -27,6 +27,17 @@ project now takes is nntrainer/nntrainer#4296 (Gemma 4 on the CPU),
 (user decision 2026-10-06, contract §12); it is a pin, not a watch — later
 #4296 commits are not tracked here.
 
+**Gemma watch (since cycle 35, user 2026-10-06, #234):** upstream
+nntrainer/nntrainer#4408 ("[WIP][DRAFT][HTP] Run gemma-4-26B-A4B on the HTP
+with flash offload", Seunghui98, `refs/pr/4408`) — watch sha
+**`28771a928`** (PR updated 2026-10-02 09:32 UTC; unchanged in cycle 35) —
+and `htp_first_version` (cycle 35: `69c05f517`, the #219 handoff files;
+PR #224 merged there; PR #233 open) are read each cycle; a port issue is
+filed when the Gemma model needs something (#234 is the first). Reference,
+not watched: #4410 (`refs/pr/4410` @ `0d603f29a`, the 2-bit / ternary
+expert stack #229 S1 ports). #4327 stays frozen at `f923bf29` (head
+unchanged on 2026-10-06).
+
 `hvx_conv_gate_f32.{c,h}` (upstream `7f81560b`) reached `htp_moe` through
 PR #121's merge, so #82 is plan 82's case (a): it reuses the file unchanged
 and takes no `hvx_scalar_stubs` (PR #125).
@@ -971,6 +982,37 @@ cycle-33 rewrite is not. The `hexagon-gates` skill already carries PR
 not watched. Open PRs: #233 (`htp_first_version`), #224 (to be retargeted).
 "Now" unchanged (record sitting 53.97 / 52.16 / 51.41; S25 column frozen).
 Tracker #76 body refreshed.
+
+**Cycle 35 (2026-10-06, base `htp_decode` @ `a19d4dd4e`): the goal is
+restated; no measurement, no row, no `state:measured` handoff folded.**
+Merged by the user: PR #235 (guide, cycles 31–34, `a19d4dd4e`) into
+`htp_decode`; PR #224 (#219's ARM tier, host-gated) into
+`htp_first_version` — #219 stays `state:needs-measurement`, its step-4
+sitting waits on #225 (one PD does not load on the config of record
+without the FC WH sidecar). **User decisions (contract §1 / §12):** (1)
+the project goal is now **Gemma-4 26B-A4B with ternary-quantized weight
+files on the NPU, decode end to end on the one-PD path; no tok/s target**
+(50 tok/s is a reference). Ternary is confirmed, the storage format is
+still to come (#229 S0 `needs-user`); #229 S1 (port #4410's `QS2CX_WH` +
+u8i2 GEMV onto the pool path, host-gated on the hd64 fixture) starts
+without it. (2) A **peak-memory bound < 2 GB** (process RSS incl. ION
+arenas, flash streaming for the rest) was stated and the same day
+**deferred to a later stage — after the ternary 26B decodes end to end on
+the device, not a gate on S5 / S6**; ㉟ holds it. (3) **`htp_decode` stays
+the Gemma base**; §Upstream gains the #4408 watch (`28771a928`) and the
+`htp_first_version` watch; #234 (p1, `state:needs-plan`, planner this
+cycle) ports #4408's converter / safetensors reader / 26B config and
+#225's FC WH path; the `06ed17b7b` "single base" docs rewrite is not
+carried (closes cycle 34's docs-base question: the supervisor's docs live
+on `htp_decode`). **#225** (`state:measured` + `needs-user`,
+`htp_first_version`, another session): `origin/htp_first_version` carries
+no `docs/measurements/225-*` since `06ed17b7b` (only the #219 handoff
+files, unfilled) — nothing to fold; the `state:measured` label is that
+session's and is left alone. Queue: #234 `needs-plan`, #229 + #137
+`planned`, #110 `needs-plan` — healthy, nothing derived. Open PRs: #233
+(`htp_first_version`). S26 column still empty (no files). "Now" unchanged
+(LFM record sitting 53.97 / 52.16 / 51.41; S25 column frozen). Tracker
+#76 retitled to the Gemma goal, body refreshed.
 
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
@@ -2050,6 +2092,7 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | ㉜ | **Pool-28 miss cost: cause measured (cycle 30, #216 step 1 + lever; rule 61 amended, rule 62). The slow miss (3.7–5.0 ms) is a UFS read of a re-missed expert whose file pages kswapd evicted during the run; the fast one (0.5–1.1) is the same `pread` from the page cache. Memory: arena 3 328 + FC 448 + RSS 766 MiB unreclaimable, the model file 4 116 cached (every resident expert held twice), Android ≈ 3 740, on 11 114 MiB.** Ruled out, in order: page-cache residency *before* the run (`201-fsu-e2e.md`; it is evicted during), arena / pool size as a cure (C = 24 is 512 MiB less pressure), reader-thread placement (readers run only in prefill), a busy core on the 8-pinned-slice barrier (busiest non-app core 3–16 %), boot proximity (slow at uptime 300 s and after a 6-min idle). Measured lever (PR #218, `NNTR_MOE_FADVISE=1`, env-only, not flipped): misses 0.86–1.13 ms on every run of both boots, decode +10 / +15 % at G = 64, but the advice costs 2–10 ms a call on this kernel and **prefill −7 to −18 %** — gate fail; the `=2` cell shows pure dropping makes every miss a storage read (102 / 102 re-misses in the S0-trace replay, 121 on the device). At G ≥ 512 the pool misses 0.12–0.34 a token, so even the slow regime is ≤ 1.7 ms a token there; at G = 64 (1.89 misses a token) it is 3–8 ms a token, the largest single term between Q28 (43) and A (54) on that cell. Next (#219, p1, `state:needs-plan`): keep the 88-expert complement (≈ 465 MiB) in a cached ARM buffer at load, serve a miss as a 5.3 MiB memcpy into the ION slot (ARM staging memcpy 22–26 GB/s → ≈ 0.25 ms), refill the vacated tier slot with the victim's bytes by a plain / `O_DIRECT` `pread` on a helper off the token path (re-miss gap p10 1.1 tokens), and drop the file's pages once at load so the page cache leaves the sum; a hybrid-path run must be unchanged | ≤ 0.5 ms a miss on every run of a fresh and an old boot, window `pgpgin` ≈ 0 without `fadvise` on the token or prefill path, prefill ≥ −5 %, text == A; or a measured reason the tier cannot hold | #219; rule 62 |
 | ㉝ | **S1 ceiling 3584 (LEAK) stops: 2 in 32 runs on the farm S25 `R3CY205ZMND` vs 1 across three sittings (≈ 94 runs) on `R3CY10WM83Y`** (rule 59 c); all four known cases on a boot's first G = 512 r1 or a profiled run, the stopped runs themselves closed clean. Per unit, per boot, no cause. Not a lever; a runner fact: the S26 sittings keep the reboot-and-resume rule and log uptime at every stop. Read `ceiling.txt` + the `.logcat` of the farm's two stops (on that machine) for the mapping that stays | which PD / process holds the 256 MiB after a clean close | farm session's logs |
 | ㉞ | **#201 S5 host-side prep (cycle 34, from the implementer's S4 close-out): three items that need no 26B files.** (a) The sliding layers' DSP attention cache (`HTP_ATTN_KV_CACHE_B`, hd 64) is sized at `max_seq` 4096 on the 26B-A4B shape ≈ 800 MiB — it has to be window-sized (Gemma's sliding window) or capped by a smaller `max_seq`, inside the one-PD budget of rule 63 (pool + FC set + heap + scratch ≤ 3840 MiB, S26 ceiling 3840 per #208); (b) #4296's CPU layers without a hook still compute at decode on stale rows and the result is discarded — correct, wasted CPU time per token; the E2E path should skip them the way `dense_ffn` does since PR #223 (`htpDecodeRowResident`); (c) the final soft-cap stays on the CPU (one op; the DSP has the soft-capped head since PR #214). Gate: the hd64 fixture's E2E lines unchanged (`calls/token=1.00`, tokens 8/8, SNR ≥ 20 dB), the cache bytes printed at load, the CPU skip count printed per token. Also from #229: the ternary → 4-bit converter and the prefill dequantization path are their own issue once the checkpoint's storage format is pinned (`needs-user`) | S5's 26B load fits the S26's one PD; decode's CPU remainder is the hooks' only | #201 (files), #229 |
+| ㉟ | **Peak memory < 2 GB — deferred constraint (user 2026-10-06, cycle 35; contract §1).** Stated: Gemma decode E2E should keep process peak RSS incl. the ION arenas under 2 GB (pool + FC set + KV caches + DSP heap + scratch), flash streaming (the expert pool / FSU) covering what does not fit. Same day: **considered last, after the ternary 26B decodes end to end on the S26** — not a gate on S5 / S6, so plan 229's one-PD sizing (C ≈ 57–66 on a 3.8 GB arena) stands for S5 and ㉞ (a)'s cache sizing works to rule 63's budget. For S5 and its levers: every Gemma row records peak RSS and the arena bytes (`mapped=` line, pool C, FC set, cache bytes) so the later stage starts from measured numbers. When promoted (after S5 / S6): one issue per budget term, gate = peak RSS < 2 GB on the S26 with text / SNR unchanged vs the unconstrained A and the pool's miss cost (㉜) re-read at the smaller C | sizing from S5's first sitting; which terms (pool C, KV `max_seq`, FC set bits) carry the cut | S5's first sitting (#201), #229 (2-bit halves the slots), #234 |
 
 ## 3a. Guide and tooling notes
 
