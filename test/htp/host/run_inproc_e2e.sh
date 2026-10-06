@@ -138,6 +138,18 @@
 #                              dropped layer_scalar reads 0-10)
 #   E2E tokens gemma64 e3==off 8/8 expected_mismatch=0
 #   E2E e3 pool C=2 gemma64 == e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+# and, since plan 229 S1 (#4410's QS2CX_WH: 2-bit expert codes and a
+# per-tensor palette of four int4 values), the one-PD token on 2-bit
+# experts against the 4-bit model restricted to the same four levels
+# (QS4CX_WH --moe_palette_g max, the "palette twin"): prefill on the HMX
+# path's VTCM expansion, decode on the u8i2 LUT GEMV, the same int32 sums,
+# so every MoE call and every logit equal the twin's; and through the pool:
+#   E2E 2bit lfm25 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
+#   E2E tokens 2bit==twin-lfm25 8/8 expected_mismatch=0
+#   E2E 2bit pool C=1 / C=2 lfm25 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+#   E2E 2bit gemma64 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
+#   E2E tokens 2bit==twin-gemma64 8/8 expected_mismatch=0
+#   E2E 2bit pool C=2 gemma64 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -386,6 +398,26 @@ run_gemma g64cpu g64cpu cpu
 run_gemma g64off g64htp htp
 run_gemma g64e3 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
 run_gemma g64e3pool2 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# [plan 229] QS2CX_WH experts and their 4-bit palette twin (header above)
+"$Q" "$FIX25" -o "$OUT/htp25q2" --fc_dtype Q4_0 --moe_dtype QS2CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_htp25q2.log"
+"$Q" "$FIX25" -o "$OUT/htp25qp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --moe_palette_g max --embd_dtype Q4_0 > "$OUT/q_htp25qp.log"
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3p "$OUT/htp25qp" htp "$OUT/dump_25e3p" "$OUT/25e3p.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3q2 "$OUT/htp25q2" htp "$OUT/dump_25e3q2" "$OUT/25e3q2.log" --max-seq 2048
+for c in 1 2; do
+  PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=$c \
+    run_e2e q25-e3q2pool$c "$OUT/htp25q2" htp "$OUT/dump_25e3q2pool$c" "$OUT/25e3q2pool$c.log" --max-seq 2048
+done
+"$Q" "$FIXG" -o "$OUT/g64htp2" --fc_dtype Q4_0 --moe_dtype QS2CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64htp2.log"
+"$Q" "$FIXG" -o "$OUT/g64htpp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --moe_palette_g max --embd_dtype Q4_0 > "$OUT/q_g64htpp.log"
+run_gemma g64e3p g64htpp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3q2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3q2pool2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -518,6 +550,42 @@ if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
 else
   echo "E2E FAIL e3 pool C=2 gemma64: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
 fi
+# [plan 229] the 2-bit lines: every dumped file (the prefill MoE calls'
+# inputs and outputs, the logits) of the 2-bit token equals its palette
+# twin's, one call a token, no timeout; the pool's logits equal the
+# all-resident 2-bit token's with misses served (logits: a pool smaller
+# than a prefill layer's experts splits its calls, as the 4-bit gemma64
+# line above).
+two_bit() { # two_bit <label> <ref run> <2-bit run> <pool runs...>
+  local label=$1 ref=$2 got=$3 p ev calls close misses
+  shift 3
+  ev="$($EVAL --label "2bit-$label" "$OUT/dump_$ref" "$OUT/dump_$got" | tail -1 || true)"
+  calls="$(calls_per_token "$OUT/$got.log")"
+  close="$(grep -o 'token driver: close .*' "$OUT/$got.log")"
+  if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+     grep -q ' timeouts=0 stale=0 ' <<< "$close"; then
+    echo "E2E 2bit $label e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0"
+  else
+    echo "E2E FAIL 2bit $label: [$ev] calls/token=${calls:-none} close=[$close]"; fail=1
+  fi
+  $EVAL --label "2bit==twin-$label" --tokens-policy "$OUT/dump_$ref" "$OUT/dump_$got" | tail -1 || fail=1
+  logits_only "$OUT/dump_$got" "$OUT/ref_$got"
+  for p in "$@"; do
+    logits_only "$OUT/dump_$p" "$OUT/ref_$p"
+    ev="$($EVAL --label "2bit-$label-$p" "$OUT/ref_$got" "$OUT/ref_$p" | tail -1 || true)"
+    calls="$(calls_per_token "$OUT/$p.log")"
+    close="$(grep -o 'token driver: close .*' "$OUT/$p.log")"
+    misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/$p.log")"
+    if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+       grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+      echo "E2E 2bit pool C=${p##*pool} $label == 2bit e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
+    else
+      echo "E2E FAIL 2bit pool $p: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+    fi
+  done
+}
+two_bit lfm25 25e3p 25e3q2 25e3q2pool1 25e3q2pool2
+two_bit gemma64 g64e3p g64e3q2 g64e3q2pool2
 if [ $rc_pds = 1 ] &&
   grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
   echo "E2E e2e pds=2 refused ok"
