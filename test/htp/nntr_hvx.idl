@@ -371,13 +371,21 @@ interface nntr_hvx : remote_handle64 {
    // [57 section 5 step 5] The MoE router's logits at prefill shapes:
    // logits[M][E] = rmsnorm(x)[M][K] . w[K][E] in f32 (hvx_router_rows_f32),
    // gamma K floats for the router's own norm or empty for none. E a
-   // multiple of 32 up to 128. The softmax and the top-k stay with the
-   // caller, so the selection rule is the CPU's; the call removes the
-   // M x K x E CPU matmul and the norm before it.
+   // multiple of 32 up to 128. The call removes the M x K x E CPU matmul
+   // and the norm before it. top_k 0: logits only, sel and weight empty.
+   // top_k > 0 (the softmax router): logits returns the softmax
+   // probabilities, sel the n_sel largest per row (descending, an exact
+   // tie to the lower index -- the CPU layer's comparator) and weight the
+   // first top_k's p * (1 / their sum) * scale[e] (hvx_router_topk_rows_f32);
+   // scale is E floats. n_sel past top_k is the caller's prefetch hint.
    AEEResult router_logits_f32(in uint32 M, in uint32 K, in uint32 E,
                                in float eps, in sequence<float> gamma,
                                in sequence<float> w, in sequence<float> x,
-                               rout sequence<float> logits);
+                               in uint32 top_k, in uint32 n_sel,
+                               in sequence<float> scale,
+                               rout sequence<float> logits,
+                               rout sequence<uint32> sel,
+                               rout sequence<float> weight);
 
    // mm_u8i4_moe_layer with the block's norms folded in, as
    // mm_u8i4_layer_norm does for the FC call: pre_gamma (K floats, or

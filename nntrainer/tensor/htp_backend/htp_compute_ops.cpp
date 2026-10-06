@@ -1425,7 +1425,9 @@ public:
 
   void router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
                           const float *x, const float *gamma, float eps,
-                          const float *w, float *logits) override {
+                          const float *w, float *logits, unsigned int top_k,
+                          unsigned int n_sel, const float *scale,
+                          unsigned int *sel, float *weight) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const size_t x_len = static_cast<size_t>(M) * K;
@@ -1437,10 +1439,17 @@ public:
       stage(out_pool_, out_len * sizeof(float)).data());
     stagedMemcpy(act, x, x_len * sizeof(float));
     const uint64_t t0 = HtpProfile::nowUs();
+    // the selection is small (M x 13 + M x 8 at the softmax router's
+    // width) and goes straight to the caller's arrays
+    static_assert(sizeof(unsigned int) == sizeof(uint32_t), "sel is u32");
     const int err = nntr_hvx_router_logits_f32(
       session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w,
       static_cast<int>(static_cast<size_t>(K) * E), act,
-      static_cast<int>(x_len), out, static_cast<int>(out_len));
+      static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+      top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
+      reinterpret_cast<uint32_t *>(sel),
+      top_k ? static_cast<int>(M * n_sel) : 0, weight,
+      top_k ? static_cast<int>(M * top_k) : 0);
     const uint64_t elapsed = HtpProfile::nowUs() - t0;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error(
