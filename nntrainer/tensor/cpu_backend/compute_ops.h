@@ -341,6 +341,27 @@ public:
     return false;
   }
 
+  // [plan 201 S4] One f32 parameter of the decode list's op @a op (which:
+  // HTP_GRAPH_PARAM_*, n floats), handed by the model at load by the
+  // weight's name instead of by its layer's hook order (Gemma 4 runs its
+  // two FFN branches in the other order than its list). The backend checks
+  // the length now, keeps the pointer and binds it at graph init, so the
+  // data must stay where it is until the first decode token (a resident
+  // weight, or a buffer the model owns); the op's hook then binds
+  // nothing. False when the backend takes none.
+  virtual bool set_decode_graph_param(unsigned op, unsigned which,
+                                      const float *data, unsigned n) {
+    (void)op;
+    (void)which;
+    (void)data;
+    (void)n;
+    return false;
+  }
+  // [plan 201 S4] The model's gated activation for the accelerator's MoE
+  // experts and dense FFN: true = GeGLU (gelu_tanh(gate) * up, Gemma 4),
+  // false = SwiGLU (the default). Set before the first MoE call.
+  virtual void set_moe_geglu(bool on) { (void)on; }
+
   // [#130] The per-token hook a CPU layer calls at one decode row before
   // running its own kernel: kind is the op kind of htp_graph_desc.h, pos
   // the absolute token position, in / out the row (in may be null when
@@ -350,7 +371,9 @@ public:
   // 0 when the op is not resident (the layer runs its CPU path), 1 when
   // out was written by the accelerator, 2 when the attention cache must
   // be seeded first: the layer then hands rows [0, pos) of its KV cache to
-  // decode_kv_seed_fp32 and calls again. Plain scalars and pointers: core
+  // decode_kv_seed_fp32 and calls again; [plan 201 S4] 3 when an attention
+  // hook brought no RoPE table and its ROPE op has none bound: the layer
+  // builds its table and calls again. Plain scalars and pointers: core
   // gains no accelerator type.
   virtual int decode_op_fp32(unsigned kind, unsigned pos, const float *in,
                              unsigned in_len, float *out, unsigned out_len,

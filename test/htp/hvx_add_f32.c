@@ -297,6 +297,8 @@ int nntr_hvx_close(remote_handle64 handle) {
   /* [#81] The attention cache borrows the pool, so it goes first. */
   hvx_attn_m1_free(s->attn_m1);
   s->attn_m1 = NULL;
+  hvx_attn_m1_free(s->attn_m1_b);
+  s->attn_m1_b = NULL;
   for (uint32_t i = 0; i < HEXKL_KV_TILES_MAX; ++i) {
     if (s->kv_tiles.slots[i].in_use) {
       hexkl_kv_tiles_f16_release(&s->kv_tiles, i);
