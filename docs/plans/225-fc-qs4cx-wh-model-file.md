@@ -219,6 +219,36 @@ C = 28 (3328) + Q4M1 set 448 + WH 216 = 3992 > 3840 (that is #222's
 is a different cell. Hence the device handoff is after PR 2 (§4), and PR 1's
 E2E is a host gate only.
 
+### 3.4a Hybrid decode consumer (PR 3, user request 2026-10-06): the M = 1 FCs on the WH GEMV, switched
+
+The user wants the hybrid's decode row to read the same sidecar through
+the DSP WH GEMV instead of the CPU Q4_0 GEMV, so one copy serves prefill
+and decode on both paths. PR 3 (`htp/225-fcwh-hybrid-m1`), after PR 2,
+behind `NNTR_HTP_FC_M1=1` (default off):
+
+* The CPU gate opens under the switch (`accelerates_q4_0_at_m1()`,
+  `htp_compute_ops.cpp:1185`; `conv_block_layer.cpp:189` `rows > 1`;
+  `float_tensor.cpp:1037`), and M = 1 FC / conv in-out / dense FFN go to a
+  per-op IDL entry `fc_wh_m1` that wraps PR 2's `nntr_hvx_fc_wh_graph`
+  body (one u8 row quant, `hvx_gemm_u8i4_wh_col` per part, dequant) on the
+  prefill handles of §3.3 — no new weight copy, no new kernel.
+* What the ledger already measured, which the handoff reads rather than
+  assumes: the hybrid has no per-token entry, so each FC is its own
+  FastRPC call — ≈ 6 a layer, ≈ +130 calls a token at ≈ 14 µs (rule 40)
+  ≈ +2 ms; the per-op path has no VTCM feed between calls (the MoE's
+  arena / VTCM layout is the MoE's), so the 216 MiB read at 21–27 GB/s
+  (rule 26) ≈ 8–10 ms against the CPU's ≈ 7.4 ms for the same FCs (rule
+  42, ㉘). Expected reading: hybrid decode slower with the switch on; the
+  byte cut (4.0 vs 4.5 bits) does not cover the calls. A batched entry
+  (one call for a layer's q/k/v/o + conv, residual kept on the DSP) is the
+  only way it breaks even, and that is the E2E graph again (㉓).
+* Gate: host `run_inproc_e2e.sh` line `E2E keys lfm25 fc-m1=1 … tokens
+  m1==cpu 8/8 min_snr_db ≥ 30`; device: one extra hybrid variant **Bm1**
+  (B + the switch) at P512 × G64 / G512 / G1024 (3 runs, ≈ 5 min) with
+  `calls/token` and the FC `dsp_us`. It is a reading beside B; it becomes
+  the hybrid row of record only if it is ≥ B on decode and passes the
+  accuracy threshold of §3.6 (same bytes as PR 2).
+
 ### 3.5 lm_head
 
 Stays Q4_0 in the main file (tied embedding; the packer refuses WH for the
@@ -254,9 +284,10 @@ double buffers are untouched.
 
 ## 4. Steps
 
-Each step ends in a `.claude/skills/hexagon-gates` rung. Two PRs on
+Each step ends in a `.claude/skills/hexagon-gates` rung. Three PRs on
 `htp_first_version`: PR 1 = steps 1–4 (`htp/225-fcwh-prefill`), PR 2 =
-steps 5–6 (`htp/225-fcwh-e2e`); the handoff is step 7.
+steps 5–6 (`htp/225-fcwh-e2e`), PR 3 = step 6a (`htp/225-fcwh-hybrid-m1`,
+§3.4a, switched, default off); the handoff is step 7.
 
 1. **Packer: the sidecar.** `--fc_wh_sidecar`, header + images, config
    keys, `cmp` of the main bin against `7b7867fa…` on the 8B
@@ -296,6 +327,11 @@ steps 5–6 (`htp/225-fcwh-e2e`); the handoff is step 7.
 6. **PR 2 app build.** Rung 3 as step 4; stage the set with `225-stage.sh`
    (app, both skels, the evictor, prompts, the config of record with the
    new key, md5.txt including the sidecar). Open PR 2.
+6a. **PR 3: the hybrid's M = 1 FCs on the WH GEMV (§3.4a).** The switch,
+   the per-op IDL entry wrapping PR 2's body, the CPU gates. Gate: rung 1
+   (`run_inproc_e2e.sh` `E2E keys lfm25 fc-m1=1 … tokens m1==cpu 8/8`,
+   switch-off lines unchanged), rung 2 (v79 + v81), rung 3; stage with the
+   PR 2 set (one binary, the switch is env). Open PR 3.
 7. **Device handoff (user, S25 farm, `needs-user` + `state:needs-measurement`)**
    — `docs/measurements/225-fcwh-table.md` + `225-run.sh`. One binary set;
    variants ≤ 4: **A** = CPU `q40` (its config with `init_seq_len 1024` for
@@ -313,7 +349,8 @@ steps 5–6 (`htp/225-fcwh-e2e`); the handoff is step 7.
    VOID with its arena / heap lines and goes on; the hybrid VOID triggers
    the C=31 deviation run (§3.3 c). Per run it checks `calls/token=1.00`,
    `cpu fc skipped = 32 × tokens`, `fc wh: … heap=0` (Q) / `heap=<MiB>` (B),
-   the device md5 of the sidecar. **Estimate: ≈ 90 min device time** (27 +
+   the device md5 of the sidecar. **Bm1** (hybrid + `NNTR_HTP_FC_M1=1`) at P512 × G64 / G512 / G1024 as a
+   reading beside B (3 runs). **Estimate: ≈ 95 min device time** (27 +
    2 + 4 + 2 + 24 PPL runs ≈ 59 runs at ≈ 1–1.5 min each incl. load, 9 cool
    waits, reboot + 5 min idle) plus ≈ 15 min of workstation steps.
 
