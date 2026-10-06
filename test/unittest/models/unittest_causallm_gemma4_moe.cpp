@@ -197,14 +197,13 @@ TEST_P(Gemma4MoeTinyModelTest, WeightBearingLayerOrderMatchesConverter) {
   std::vector<std::string> expected = {"embedding0"};
   for (int i = 0; i < tiny_num_layers; ++i) {
     const std::string p = "layer" + std::to_string(i);
-    const bool full = i == 1; // layer_types[1] == full_attention: K == V
-    std::vector<std::string> block = {p + "_attention_norm", p + "_wq",
-                                      p + "_q_norm", p + "_wk", p + "_k_norm"};
-    if (!full)
-      block.push_back(p + "_wv");
+    // _qkv holds q, q_norm, k, k_norm (and v on a sliding layer; layer 1
+    // is full_attention: K == V) and _ffn holds gate, up, down, each in the
+    // file's order, so the tensor order is unchanged by the fusion.
+    std::vector<std::string> block = {p + "_attention_norm", p + "_qkv"};
     for (const char *n :
-         {"_attention_out", "_post_attention_norm", "_pre_ffn_norm",
-          "_ffn_gate", "_ffn_up", "_ffn_down", "_post_ffn_norm_1",
+         {"_attention_out", "_post_attention_norm", "_pre_ffn_norm", "_ffn",
+          "_post_ffn_norm_1",
           "_pre_ffn_norm_2", "_router_norm", "_sparse_moe", "_post_ffn_norm_2",
           "_post_ffn_norm", "_layer_scalar"})
       block.push_back(p + n);

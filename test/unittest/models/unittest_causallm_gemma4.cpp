@@ -130,13 +130,10 @@ makeGemma4LayerDtypeMap(const causallm_test::TinyCausalLMDataType &data_type) {
       causallm_test::toTensorDataType(data_type.fc_layer_dtype);
     for (int i = 0; i < tiny_gemma4_num_layers; ++i) {
       const std::string prefix = "layer" + std::to_string(i);
-      dtype_map[prefix + "_wq"] = dtype;
-      dtype_map[prefix + "_wk"] = dtype;
-      dtype_map[prefix + "_wv"] = dtype;
+      // the fused q/k/v (its norm gammas stay FP32) and dense FFN layers
+      dtype_map[prefix + "_qkv"] = dtype;
       dtype_map[prefix + "_attention_out"] = dtype;
-      dtype_map[prefix + "_ffn_gate"] = dtype;
-      dtype_map[prefix + "_ffn_up"] = dtype;
-      dtype_map[prefix + "_ffn_down"] = dtype;
+      dtype_map[prefix + "_ffn"] = dtype;
       // Gemma4-specific per-layer FC weights
       // hidden_size_per_layer_input=32 ensures width is divisible by 32
       dtype_map[prefix + "_per_layer_input_gate"] = dtype;
