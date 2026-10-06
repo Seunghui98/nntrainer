@@ -462,6 +462,15 @@ public:
     return false;
   }
 
+  // [#225] The FC WH sidecar (htp_wh_layout.h) the model names in
+  // nntr_config.json's fc_wh_file_name: the three register_q4_0_* hooks
+  // then take each Q4_0 weight's image from it instead of re-quantizing.
+  // Called once, before them. false: this backend does not read one.
+  virtual bool set_fc_wh_file(const char *path) {
+    (void)path;
+    return false;
+  }
+
   // A QS4CX_WH expert pair the loader never read (a virtual weight, doc
   // 52), and where its bytes are: gate_up [K, 2 * inter] at off_gu and down
   // [inter, N_out] at off_dn in the model file behind fd, each laid out as

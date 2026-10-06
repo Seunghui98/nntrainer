@@ -20,7 +20,7 @@
  *
  *   htp_e2e_test --model <quantized dir> --tokenizer <tokenizer.json>
  *                [--prompt 16] [--steps 8] [--moe-engine htp|cpu]
- *                [--dump <dir>] [--max-seq N] [--run]
+ *                [--dump <dir>] [--max-seq N] [--run] [--repack]
  *
  * The prompt is deterministic, ids[i] = 1 + (7 i mod 30): inside the
  * 32-token vocabulary, never bos (0) or eos (31). Output:
@@ -35,6 +35,9 @@
  * path NNTR_PPL_DECODE lives on.
  * The model class follows config.json's architectures: Gemma4ForCausalLM
  * is the Gemma 4 MoE fixture ([plan 201 S4]), anything else LFM2-MoE.
+ * --repack calls repack_weight after the load, as the app's main does
+ * (#225): the load-time FC registrations, the FC WH sidecar and the
+ * warm-up calls (which the MoE dumps then hold too).
  * Exit 0, or 1 with `E2E FAIL <reason>` on any exception.
  */
 
@@ -57,7 +60,7 @@ namespace {
 struct Options {
   std::string model, tokenizer, engine = "htp", dump;
   unsigned prompt = 16, steps = 8, max_seq = 0;
-  bool run = false;
+  bool run = false, repack = false;
 };
 
 Options parse(int argc, char **argv) {
@@ -85,6 +88,8 @@ Options parse(int argc, char **argv) {
       o.max_seq = static_cast<unsigned>(std::stoul(value()));
     else if (a == "--run")
       o.run = true;
+    else if (a == "--repack")
+      o.repack = true;
     else
       throw std::invalid_argument("unknown option " + a);
   }
@@ -166,6 +171,8 @@ int runModel(const Options &o, nlohmann::json &cfg, nlohmann::json &gen,
   causallm_test::CausalLMTestAdapter<Model> model(cfg, gen, nntr);
   model.initializeModel();
   model.loadWeight(weights);
+  if (o.repack)
+    model.repack_weight();
 
   std::vector<unsigned int> ids(o.prompt);
   for (unsigned i = 0; i < o.prompt; ++i)

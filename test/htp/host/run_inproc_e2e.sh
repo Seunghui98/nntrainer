@@ -155,6 +155,13 @@
 #     cpu-fc-skipped=<n> per_token=10 ok
 #                              (#222: the config of record's engine keys and
 #                              init_seq_len 1024 on the lfm25 fixture)
+#   E2E keys fcwh-lfm25 handles=<n> arena_kib=<n> heap=0 requant=0 main=same
+#     heap-path heap_kib=<n> e3 calls/token=1.00 ok
+#   E2E eval fcwh==wh-lfm25 ... bit_identical=1
+#   E2E eval fcwh-nokeys==off-lfm25 ... bit_identical=1 ... sidecar=unopened ok
+#                              (#225: the keys reading the FC WH sidecar,
+#                              its images in the arena and through the heap
+#                              path)
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -444,6 +451,32 @@ PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25k-e3 "$OUT/htp25k" htp "$OUT/dump_25ke3" "$OUT/25ke3.log" --max-seq 2048
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
   run_e2e q25k-e3pool2 "$OUT/htp25k" htp "$OUT/dump_25ke3pool2" "$OUT/25ke3pool2.log" --max-seq 2048
+# [#225] the same keys on the model packed with the FC WH sidecar (its main
+# file must be htp25q's): hybrid with the images in the arena, the same
+# with every image through the heap path (NNTR_HTP_FC_WH_HEAP=1), the
+# one-PD run (decode still on Q4M1 in PR 1).
+# --repack: the app's load (main.cpp), where the sidecar is opened and the
+# FCs registered before the first prefill
+"$Q" "$FIX25" -o "$OUT/htp25w" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 --fc_wh_sidecar > "$OUT/q_htp25w.log"
+w_main_same=0
+cmp -s "$OUT/htp25q/$(sed -n 's/.*"model_file_name": "\(.*\)".*/\1/p' "$OUT/htp25q/nntr_config.json")" \
+  "$OUT/htp25w/$(sed -n 's/.*"model_file_name": "\(.*\)".*/\1/p' "$OUT/htp25w/nntr_config.json")" && w_main_same=1
+cp -a "$OUT/htp25w" "$OUT/htp25wn" # no keys: the sidecar named, never opened
+python3 - "$OUT/htp25w/nntr_config.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.update(conv_block_engine="htp", dense_ffn_engine="htp",
+         attn_proj_engine="htp", init_seq_len=1024)
+json.dump(c, open(sys.argv[1], "w"), indent=4)
+PY
+echo "== [#225] lfm25 keys + FC WH sidecar: arena, heap, NNTR_HTP_E2E=1"
+PROMPT=512 run_e2e q25w-off "$OUT/htp25w" htp "$OUT/dump_25woff" "$OUT/25woff.log" --max-seq 2048 --repack
+PROMPT=512 run_e2e q25w-nokeys "$OUT/htp25wn" htp "$OUT/dump_25wn" "$OUT/25wn.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_FC_WH_HEAP=1 \
+  run_e2e q25w-heap "$OUT/htp25w" htp "$OUT/dump_25wheap" "$OUT/25wheap.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25w-e3 "$OUT/htp25w" htp "$OUT/dump_25we3" "$OUT/25we3.log" --max-seq 2048 --repack
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -642,6 +675,42 @@ if grep -q 'bit_identical=0' <<< "$k0" && grep -q 'bit_identical=1' <<< "$k3" &&
 else
   echo "E2E FAIL keys lfm25: htp_fc_rows=${rows:-none} calls/token=${calls:-none}/${calls_p:-none} handles=${handles:-none} skipped=${skipped:-none} tokens=${toks:-none} misses=${misses:-none}"; fail=1
 fi
+# [#225] (1) the sidecar's banner: every FC prefill weight from the file,
+# none re-quantized, nothing on the heap -- and with NNTR_HTP_FC_WH_HEAP=1
+# everything on it; (2) fcwh==wh: the images as they lie in the file (the
+# arena, the way get_or_register_wh places a WH tensor) against the same
+# images through whUnpack and the DSP's bake (the hybrid's overflow), every
+# MoE call and the logits; (3) the one-PD run on the sidecar model;
+# (3b) no engine key: the sidecar named in the config, never opened, the
+# logits those of the keyless model without one (the CPU-only and Aoff
+# configs of the handoff); (4) printed, not
+# gated: the keys' logits against the keyless hybrid (CPU Q4_0 FCs), the
+# sidecar's and the load-time re-quantization's, side by side
+wb="$(sed -n 's/^\[HTP\] fc wh: file=.* handles=\([0-9]*\) arena_kib=\([0-9]*\) heap_kib=\([0-9]*\) requant=\([0-9]*\)$/\1 \2 \3 \4/p' "$OUT/25woff.log")"
+wh_heap="$(sed -n 's/^\[HTP\] fc wh: file=.* arena_kib=\([0-9]*\) heap_kib=\([0-9]*\) requant=0$/\1 \2/p' "$OUT/25wheap.log")"
+read -r w_handles w_arena w_heap w_requant <<< "${wb:-x x x x}"
+read -r h_arena h_heap <<< "${wh_heap:-x x}"
+calls_w="$(calls_per_token "$OUT/25we3.log")"
+if [ "$w_main_same" = 1 ] && [ "$w_heap" = 0 ] && [ "$w_requant" = 0 ] &&
+  [ "${w_handles:-0}" -gt 0 ] 2> /dev/null && [ "$h_arena" = 0 ] &&
+  [ "$h_heap" = "$w_arena" ] && [ "$calls_w" = 1.00 ]; then
+  echo "E2E keys fcwh-lfm25 handles=$w_handles arena_kib=$w_arena heap=0 requant=0 main=same heap-path heap_kib=$h_heap e3 calls/token=1.00 ok"
+else
+  echo "E2E FAIL keys fcwh-lfm25: banner=[${wb:-none}] heap-run=[${wh_heap:-none}] main_same=$w_main_same calls/token=${calls_w:-none}"; fail=1
+fi
+$EVAL --label 'fcwh==wh-lfm25' "$OUT/dump_25woff" "$OUT/dump_25wheap" | tail -1 || fail=1
+mkdir -p "$OUT/lq" "$OUT/lk" "$OUT/lw" "$OUT/lwn"
+cp "$OUT"/dump_25wn/logits_*.f32 "$OUT/lwn/"
+nk="$($EVAL --label fcwh-nokeys==off-lfm25 "$OUT/lwn" "$OUT/dump_25qoff" | tail -1 || true)"
+if grep -q 'bit_identical=1' <<< "$nk" && ! grep -q '^\[HTP\] fc wh:' "$OUT/25wn.log"; then
+  echo "$nk sidecar=unopened ok"
+else
+  echo "E2E FAIL fcwh-nokeys-lfm25: [$nk]"; fail=1
+fi
+cp "$OUT"/dump_25qoff/logits_*.f32 "$OUT/lq/"; cp "$OUT"/dump_25koff/logits_*.f32 "$OUT/lk/"
+cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lw/"
+$EVAL --label fcwh-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lw" | tail -1 || true
+$EVAL --label requant-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lk" | tail -1 || true
 if [ $rc_pds = 1 ] &&
   grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
   echo "E2E e2e pds=2 refused ok"
