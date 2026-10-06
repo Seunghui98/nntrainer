@@ -2598,7 +2598,7 @@ private:
     if (expert_slot_bytes_ == 0) {
       // [doc 57] The first expert fixes the format for the process: the DSP
       // reads every later swap's weights as it says.
-      if (expertBits() == 2) {
+      if (moeExpertBits() == 2) {
         const int err = nntr_hvx_set_expert_bits(session, 2);
         if (err != AEE_SUCCESS) {
           throw std::runtime_error(
@@ -2647,36 +2647,10 @@ private:
            ~4095u;
   }
 
-  /**
-   * @brief [doc 57] NNTR_MOE_EXPERT_BITS=2: expert weights go to the arena
-   *        as WH2 (2-bit codes, htp_wh_layout.h), half the bytes, and the
-   *        DSP expands them to int4 in VTCM. Unset or 4: WH, as before.
-   *
-   * Experts only. The file keeps the int4 layout either way -- a WH2
-   * expert is its first wh2Bytes, the rest of the nibble span unread, the
-   * scales and column sums where they always were -- so a WH2 model file
-   * (tools/make_wh2_from_wh4.py) has every offset of the WH one and nothing
-   * in the loader changes. The cost is a file as big as the int4 one.
-   * ponytail: a packed WH2 file would halve that; the converter would have
-   * to write it and the expert offsets would stop being shared.
-   */
-  static uint32_t expertBits() {
-    static const uint32_t bits = [] {
-      const char *v = std::getenv("NNTR_MOE_EXPERT_BITS");
-      if (v == nullptr || std::strcmp(v, "4") == 0)
-        return 4u;
-      if (std::strcmp(v, "2") == 0)
-        return 2u;
-      throw std::invalid_argument(std::string("NNTR_MOE_EXPERT_BITS=") + v +
-                                  ": only 2 or 4");
-    }();
-    return bits;
-  }
-
-  /** @brief An expert weight's bytes in the arena: WH, or WH2 at half. */
-  static size_t expertWhBytes(uint32_t K, uint32_t N) {
-    return expertBits() == 2 ? wh2Bytes(K, N) : whBytes(K, N);
-  }
+  /* [doc 57] NNTR_MOE_EXPERT_BITS=2: expert weights are WH2 in the file
+     and the arena (htp_wh_layout.h's moeExpertBits / expertWhBytes), and
+     the DSP expands them to int4 in VTCM. Experts only; nothing else reads
+     the switch. */
 
   /** @brief Reads both weights of @a st into its slot. No lock and no
    *  throw -- the slot is this expert's alone until registerStaged -- so a
@@ -2880,11 +2854,11 @@ private:
    *  32 here. @return 0, errno, or -1 at end of file. */
   int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
                  uint8_t *arena_dst, ArenaEntry &e, bool use_pool) {
-    // [doc 57] WH2 reads the first half of the nibble span; the tail is
-    // still at off + whBytes in the file, and right after the read bytes
-    // in the arena.
+    // [doc 57] WH or WH2 bytes (a packed int2 file holds the expert at
+    // half the nibble bytes), then the tail right after them, in the file
+    // as in the arena.
     const size_t nib = expertWhBytes(K, N);
-    const uint64_t file_tail = off + whBytes(K, N);
+    const uint64_t file_tail = off + nib;
     // [doc 52 sections 10.7, 10.9] The nibble read is 82% of a miss and
     // capped near 4.9 GB/s by the uncached mapping whatever the thread
     // count: 8 slices bought 18%. Kept for the synchronous miss; the

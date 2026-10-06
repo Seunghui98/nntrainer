@@ -47,6 +47,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
 namespace nntrainer {
 
@@ -110,6 +114,36 @@ inline void whPack(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
  * the HMX reads it (hvx_expand_wh2), so the matmul never sees WH2.
  */
 inline size_t wh2Bytes(uint32_t K, uint32_t N) { return whBytes(K, N) / 2u; }
+
+/**
+ * @brief NNTR_MOE_EXPERT_BITS: 4 (unset) or 2. With 2, every QS4CX_WH
+ *  expert weight the loader never reads (the virtual experts of a MoE
+ *  layer) is WH2 in the model file -- its wh2Bytes, then its N f32 scales
+ *  and N f32 column sums -- so the file is written packed by
+ *  tools/make_wh2_from_wh4.py, the loader's offset walk counts such a
+ *  weight at that size, the expert pool reads it at that size, and the
+ *  DSP expands it to int4 in VTCM (doc 57). Read once; a value other than
+ *  2 or 4 throws, since a wrong guess here is a wrong offset for every
+ *  tensor after the first expert.
+ */
+inline uint32_t moeExpertBits() {
+  static const uint32_t bits = [] {
+    const char *v = std::getenv("NNTR_MOE_EXPERT_BITS");
+    if (v == nullptr || std::strcmp(v, "4") == 0)
+      return 4u;
+    if (std::strcmp(v, "2") == 0)
+      return 2u;
+    throw std::invalid_argument(std::string("NNTR_MOE_EXPERT_BITS=") + v +
+                                ": only 2 or 4");
+  }();
+  return bits;
+}
+
+/** @brief An expert weight's nibble bytes in the file and the arena: WH,
+ *  or WH2 at half under NNTR_MOE_EXPERT_BITS=2. */
+inline size_t expertWhBytes(uint32_t K, uint32_t N) {
+  return moeExpertBits() == 2u ? wh2Bytes(K, N) : whBytes(K, N);
+}
 
 /** @brief WH bytes -> WH2, for values already in [-2, 1]. A nibble out of
  *  that range is a caller bug; it is masked, not checked. */

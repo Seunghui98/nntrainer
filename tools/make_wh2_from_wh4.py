@@ -7,15 +7,19 @@ Reads a quantized model file written by nntr_quantize_stream with
 --moe_dtype QS4CX_WH (every expert weight: WH nibbles, then N f32 scales,
 then N f32 column sums) and writes, from the same int4 values:
 
-  --out-wh2  the file NNTR_MOE_EXPERT_BITS=2 reads: each expert weight's
-             nibble span starts with its WH2 bytes (2-bit codes, half the
-             span; the second half is left as it was and never read), and
-             the scales and column sums sit where they always were.
-  --out-wh4  optional: the SAME int2 values in the ordinary WH layout, for
-             NNTR_MOE_EXPERT_BITS=4. The two files are then the same model,
-             bit for bit after the DSP's expansion, so an int4 run on this
-             one and an int2 run on --out-wh2 route identically, hit the
-             expert cache identically, and must print the same tokens.
+  --out-wh2  the PACKED file NNTR_MOE_EXPERT_BITS=2 reads: every expert
+             weight is its WH2 bytes (2-bit codes, half the nibble bytes)
+             followed by the N scales and N column sums, and every other
+             tensor follows at its new, earlier offset. The loader counts a
+             virtual QS4CX_WH weight at that size under the same switch
+             (neuralnet.cpp), so the offsets agree. 7.2 GB for the 12.9 GB
+             gemma-4-26B-A4B file.
+  --out-wh4  optional: the SAME int2 values in the ordinary WH layout and
+             file size, for NNTR_MOE_EXPERT_BITS=4. The two files are then
+             the same model, bit for bit after the DSP's expansion, so an
+             int4 run on this one and an int2 run on --out-wh2 route
+             identically, hit the expert cache identically, and must print
+             the same tokens.
 
 Every other tensor is copied unchanged. The int2 values are a coarse
 requantization, q2 = clamp(floor((q4 + 2) / 4), -2, 1) with the scale x4, so
@@ -129,33 +133,52 @@ def run(args):
     if total != size:
         sys.exit(f"layout replay gives {total} bytes, the file has {size}: "
                  f"wrong --fc-dtype/--embd-dtype or config. Nothing written.")
+    packed = size - sum(k * n // 4 for _, k, n in experts)
     print(f"layout matches the file: {size} bytes, {len(experts)} expert "
-          f"weights")
-    outs = [(args.out_wh2, 0)]
+          f"weights; packed int2 file will be {packed} bytes")
+    out2 = open(args.out_wh2, "wb")
+    out4 = None
     if args.out_wh4:
-        outs.append((args.out_wh4, 1))
-    for path, _ in outs:
-        print("copying ->", path)
-        shutil.copyfile(args.inp, path)
-    fds = [(open(p, "r+b"), which) for p, which in outs]
+        print("copying ->", args.out_wh4)
+        shutil.copyfile(args.inp, args.out_wh4)
+        out4 = open(args.out_wh4, "r+b")
     with open(args.inp, "rb") as src:
+        pos = 0  # next unread byte of the source
+
+        def copy_through(end):
+            nonlocal pos
+            while pos < end:
+                chunk = src.read(min(64 << 20, end - pos))
+                out2.write(chunk)
+                pos += len(chunk)
+
         for i, (off, k, n) in enumerate(experts):
+            copy_through(off)
             whb = k * n // 2
-            src.seek(off)
             nib = src.read(whb)
             scales = np.frombuffer(src.read(4 * n), np.float32)
+            src.seek(4 * n, 1)  # the column sums are recomputed
+            pos = off + whb + 8 * n
             wh2, wh4, s4, cs = convert(nib, scales, k, n)
-            for f, which in fds:
-                f.seek(off)
-                f.write(wh2 if which == 0 else wh4)
-                f.seek(off + whb)
-                f.write(s4.tobytes())
-                f.write(cs.tobytes())
+            out2.write(wh2)
+            out2.write(s4.tobytes())
+            out2.write(cs.tobytes())
+            if out4 is not None:
+                out4.seek(off)
+                out4.write(wh4)
+                out4.seek(off + whb)
+                out4.write(s4.tobytes())
+                out4.write(cs.tobytes())
             if i % 256 == 0:
                 print(f"  expert weight {i}/{len(experts)}", flush=True)
-    for f, _ in fds:
-        f.close()
-    print("done")
+        copy_through(size)
+    out2.close()
+    if out4 is not None:
+        out4.close()
+    got = os.path.getsize(args.out_wh2)
+    if got != packed:
+        sys.exit(f"packed file is {got} bytes, expected {packed}")
+    print(f"done: {args.out_wh2} = {got} bytes")
 
 
 def self_test():
@@ -194,8 +217,10 @@ def self_test():
            "num_experts": 128, "tie_word_embeddings": True,
            "layer_types": (["sliding_attention"] * 5 + ["full_attention"]) * 5}
     total, ex = layout(cfg, "Q4_0", "Q4_0")
+    packed = total - sum(k * n // 4 for _, k, n in ex)
     print(f"self-test: repack OK; gemma-4-26B-A4B Q4_0 file = {total} bytes "
-          f"({total / 2**20:.0f} MiB), {len(ex)} expert weights")
+          f"({total / 2**20:.0f} MiB), {len(ex)} expert weights; packed int2 "
+          f"= {packed} bytes ({packed / 2**20:.0f} MiB)")
 
 
 def main():

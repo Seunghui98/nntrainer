@@ -42,6 +42,7 @@
 #include <common_properties.h>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <htp_wh_layout.h>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
@@ -961,6 +962,17 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
+      // [doc 57] A virtual QS4CX_WH weight -- a MoE expert the backend
+      // streams from the file -- is WH2 in a packed int2 file: half the
+      // nibble bytes, the scales and column sums right after. The tensor's
+      // own size is the WH one, so the walk corrects it here; nothing else
+      // in the file moves relative to its neighbours.
+      if (tensor_data_type == TensorDim::DataType::QS4CX_WH &&
+          weight->getVariableRef().isVirtual() && moeExpertBits() == 2u) {
+        const auto &d = weight->getDim();
+        size -=
+          whBytes(d.height(), d.width()) - wh2Bytes(d.height(), d.width());
+      }
       weight->getVariableRef().setFileOffset(start_from);
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for

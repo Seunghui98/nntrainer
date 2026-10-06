@@ -21,9 +21,10 @@
 
 ### 2.2 파일과 arena
 
-- 파일은 **int4 레이아웃을 그대로 유지**한다. WH2 가중치는 니블 구간의 앞 절반이고, 뒤 절반은 읽지 않는다. scale과 colsum은 원래 자리(off + whBytes)에 있다. 그래서 로더 오프셋이 하나도 바뀌지 않는다.
-  - ponytail: 파일 크기는 int4와 같다. 압축 파일을 원하면 양자화기가 따로 써야 하고 expert 오프셋 공유가 깨진다.
-- `NNTR_MOE_EXPERT_BITS=2`면 호스트는 니블 구간의 앞 절반만 pread하고, arena 칸 stride도 절반으로 잡는다.
+- **파일은 packed다.** `NNTR_MOE_EXPERT_BITS=2`에서 expert 가중치는 파일에 WH2 바이트(니블의 절반) + N f32 scale + N f32 colsum으로만 들어 있고, 뒤의 모든 텐서는 그만큼 앞당겨진다. Gemma 파일은 12,935,608,440 → **7,226,112,120 B (6.73 GiB)**.
+- 로더(`neuralnet.cpp`의 .bin 오프셋 순회)는 같은 스위치 아래에서 **virtual QS4CX_WH** 텐서(= 스트리밍 expert)만 그 크기로 센다. 다른 텐서는 그대로다. 호스트 expert pool은 같은 바이트 수를 pread하고 scale·colsum을 바로 뒤에서 읽는다(`expertWhBytes`, htp_wh_layout.h).
+- 스위치는 파일에 기록되지 않는다. int4 파일을 BITS=2로 열거나 그 반대면 첫 expert 뒤의 모든 오프셋이 틀어진다. ponytail: 파일 헤더가 없어 로더가 확인할 수 없다. 더미 도구가 쓴 크기(위 숫자)와 파일 크기가 같은지 눈으로 확인한다.
+- 처음 구현(a77ccbe~570005d)은 int4 레이아웃을 유지하고 앞 절반만 읽는 형식이었다. 그 파일(13 GB)은 **이제 읽히지 않는다**. 저장 공간·push 시간·readahead 낭비 때문에 packed로 바꿨다(§5.2 첫 실행은 그 옛 형식으로 쟀다).
 - 첫 expert를 놓기 전에 DSP에 `set_expert_bits(2)`를 한 번 보낸다. 이후 swap은 arena에서 WH2로 읽고, scale·colsum은 WH2 바로 뒤에서 읽는다.
 
 | | int4 (WH) | int2 (WH2) |
@@ -34,6 +35,7 @@
 | C=16 arena | 1408 MiB | 704 MiB |
 | C=32 arena | — | 1408 MiB (int4 C=16과 같음) |
 | C=16 cold prefill 바닥 (55 §4 방식, 3.0 GB/s) | 10.12 GB → 3.37 s | 5.12 GB → 1.71 s |
+| 모델 파일 | 12,935,608,440 B | 7,226,112,120 B |
 
 표는 전부 산술이다. **기기 미측정.** int4 C=16 arena 1408 MiB는 55 §4 값과 같아 칸·청크 산식은 맞다.
 
@@ -128,8 +130,8 @@ mkdir -p ~/workspace/g4dummy && cd ~/workspace/nntrainer && python3 tools/make_w
 ```
 - 기대 결과:
   - self-test가 `12935608440 bytes`를 출력한다.
-  - 본 실행이 `layout matches the file: 12935608440 bytes, 7680 expert weights`, 진행 줄, `done`을 출력한다.
-  - 두 파일 모두 12935608440 B다.
+  - 본 실행이 `layout matches the file: 12935608440 bytes, 7680 expert weights; packed int2 file will be 7226112120 bytes`, 진행 줄, `done: … = 7226112120 bytes`를 출력한다.
+  - int2 파일은 7,226,112,120 B, int4(i4same) 파일은 12,935,608,440 B다.
 - 실패하면:
   - `layout replay gives … the file has …`이면 아무것도 쓰지 않은 것이다. 양자화 때 `--fc_dtype`/`--embd_dtype`이 Q4_0이 아니었다면 `--fc-dtype`/`--embd-dtype`로 그 값을 주세요. 그래도 안 맞으면 두 숫자를 보내 주세요.
   - 디스크가 모자라면 `--out-wh4`를 빼고 int2 파일만 만듭니다. 그러면 int4 기준은 기존 실제 파일이 되고, 라우팅이 달라져 출력 비교는 못 합니다.
