@@ -400,4 +400,35 @@ TEST_F(Gemma4MoEQuantizeStreamSafetensors, RouterScaleBeforeRouterRefused) {
   EXPECT_FALSE(out.empty());
 }
 
+/**
+ * @brief A header the positional reader cannot follow is named as such:
+ *        a non-F32 tensor (an HF BF16 checkpoint) and a gap in the offsets
+ */
+TEST_F(Gemma4MoEQuantizeStreamSafetensors, MalformedHeaderRefused) {
+  causallm::json header;
+  std::string header_block, payload;
+  ASSERT_NO_FATAL_FAILURE(converterFile(header, header_block, payload));
+  std::string log, out;
+
+  causallm::json bf16 = header;
+  bf16["embedding0:Embedding"]["dtype"] = "BF16";
+  EXPECT_NE(quantize(modelDir("bf16", kStem + ".safetensors",
+                              join(bf16.dump(), payload)),
+                     "--fc_dtype Q4_0", log, out),
+            0);
+  EXPECT_NE(log.find("reads an F32 .safetensors only"), std::string::npos)
+    << log;
+
+  causallm::json gap = header;
+  auto &router_end = gap["layer0_sparse_moe:router"]["data_offsets"][1];
+  router_end = router_end.get<uint64_t>() - 4;
+  EXPECT_NE(
+    quantize(modelDir("gap", kStem + ".safetensors", join(gap.dump(), payload)),
+             "--fc_dtype Q4_0", log, out),
+    0);
+  EXPECT_NE(log.find("layer0_sparse_moe:router_scale starts at payload byte"),
+            std::string::npos)
+    << log;
+}
+
 } // namespace

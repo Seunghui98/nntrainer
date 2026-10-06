@@ -1785,10 +1785,10 @@ int run(int argc, char **argv) {
     uint64_t header_len = 0;
     for (int i = 7; i >= 0; --i)
       header_len = (header_len << 8) | len_bytes[i];
-    data_start = 8 + header_len;
-    if (data_start >= std::filesystem::file_size(input_path))
+    if (header_len >= std::filesystem::file_size(input_path) - 8)
       throw std::runtime_error("safetensors header length is past the end of " +
                                input_path.string());
+    data_start = 8 + header_len;
     std::string header_json(static_cast<size_t>(header_len), '\0');
     input.read(header_json.data(), static_cast<std::streamsize>(header_len));
     if (!input)
@@ -1797,21 +1797,42 @@ int run(int argc, char **argv) {
     // Named, not a temporary: items() hands back a proxy that refers to the
     // object, and a temporary one dies before the loop reads it.
     const json header = json::parse(header_json);
+    // The walk reads FP32 positionally, so the header must describe exactly
+    // that: F32 tensors tiling the payload from byte 0 with no gap or
+    // overlap. An HF checkpoint (BF16) or a hand-edited header is named
+    // here rather than as a size mismatch blamed on the layout.
     std::vector<std::pair<uint64_t, SourceTensor>> at;
     for (const auto &entry : header.items()) {
       if (entry.key() == "__metadata__")
         continue;
+      if (entry.value().at("dtype").get<std::string>() != "F32")
+        throw std::runtime_error(entry.key() + " in " + input_path.string() +
+                                 " is " + entry.value().at("dtype").dump() +
+                                 "; this tool reads an F32 .safetensors only");
       const auto &offsets = entry.value().at("data_offsets");
       const uint64_t begin = offsets.at(0).get<uint64_t>();
       const uint64_t end = offsets.at(1).get<uint64_t>();
+      if (end < begin)
+        throw std::runtime_error(entry.key() + " ends before it begins in " +
+                                 input_path.string());
       at.emplace_back(
         begin, SourceTensor{entry.key(), static_cast<size_t>(end - begin)});
     }
+    if (at.empty())
+      throw std::runtime_error(input_path.string() + " lists no tensors");
     std::sort(at.begin(), at.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
     source_tensors.reserve(at.size());
-    for (auto &pair : at)
+    uint64_t next = 0;
+    for (auto &pair : at) {
+      if (pair.first != next)
+        throw std::runtime_error(
+          pair.second.name + " starts at payload byte " +
+          std::to_string(pair.first) + ", the tensor before it ends at " +
+          std::to_string(next) + ": the header does not tile the payload");
+      next = pair.first + pair.second.bytes;
       source_tensors.push_back(std::move(pair.second));
+    }
     input.seekg(static_cast<std::streamoff>(data_start));
   }
   std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
@@ -1855,9 +1876,11 @@ int run(int argc, char **argv) {
   // same code, consuming nothing, and compare the total against the file.
   const uintmax_t source_bytes =
     std::filesystem::file_size(input_path) - data_start;
+  const std::vector<SourceTensor> *source_header =
+    source_tensors.empty() ? nullptr : &source_tensors;
   TensorWriter probe(input, output, quant.target_isa,
                      static_cast<size_t>(source_bytes), /*dry_run=*/true,
-                     source_tensors.empty() ? nullptr : &source_tensors);
+                     source_header);
   walk(probe);
   if (probe.expectedInputBytes() != source_bytes) {
     const bool file_is_short = probe.expectedInputBytes() > source_bytes;
@@ -1887,7 +1910,7 @@ int run(int argc, char **argv) {
   }
 
   TensorWriter writer(input, output, quant.target_isa, 0, /*dry_run=*/false,
-                      source_tensors.empty() ? nullptr : &source_tensors);
+                      source_header);
   writer.setPalette(palette);
   walk(writer);
   output.close();
