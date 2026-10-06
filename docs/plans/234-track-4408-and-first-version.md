@@ -153,6 +153,13 @@ noted; no step needs a device. Order is by dependency, not by size.
   `moe_cache_size` = the pool C the sitting sets, `sample_input` with the
   Gemma chat template). Gate: rung 1 — `INPROC E2E PASS` with the new
   engine-key line and every existing line unchanged; `*Lfm2Moe*` 6 / 6.
+  *As built (PR for P1):* the 26B file leaves out the #222 keys and
+  `moe_cache_size`. The keys are read only by `lfm2_causallm.cpp:363-377`,
+  `moe_cache_size` only by the CPU `gemma4_moe` layer, and the HTP pool is
+  `NNTR_MOE_CACHE_EXPERTS`. `d541bda3a`'s skip is LFM-only: Gemma builds no
+  `DenseFfnLayer`, so whether the Gemma one-PD decode still runs its dense
+  MLP on the CPU is open. The keys line exposed a hang from `ed2660ddc`
+  (`exp_live` read out of bounds on 4-bit M>1 calls); P1 carries the fix.
 * **P2. The quantizer reads the PC's file and refuses a wrong order** —
   `9dd2c76de` (clean), then `f9c09eaa2` rebased (the ctor / dtype-check
   hunks around `:489` / `:1491`); drop the "Gemma4 MoE FC/expert dtype must
