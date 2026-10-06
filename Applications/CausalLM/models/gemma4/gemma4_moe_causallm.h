@@ -58,8 +58,13 @@ private:
   unsigned int top_k_experts = 0;
   unsigned int moe_intermediate_size = 0;
   unsigned int moe_cache_size = 0;
-  /** [plan 201 S4] the MoE engine (nntr_config moe_engine) */
+  /** [plan 201 S4] the MoE layer's engine (nntr_config moe_engine): "htp"
+   *  builds the lfm2_moe layer with the softmax router (QS4CX_WH experts,
+   *  the expert pool), anything else #4296's gemma4_moe */
   std::string moe_engine = "cpu";
+  /** [plan 201 S4] the expert dtype (nntr_config moe_layer_dtype), default
+   *  FC_LAYER_DTYPE */
+  std::string moe_layer_dtype;
   /** [plan 201 S4] NNTR_HTP_E2E=1 with moe_engine=htp: the whole decode
    *  token on the HTP */
   bool htp_e2e = false;
