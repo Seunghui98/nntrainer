@@ -317,7 +317,16 @@ MoE 층의 router(`router_norm` + 2816×128 f32 dot, CPU 191 ms/30층)를 prefil
 - 게이트: M>1, E%32==0, E≤128, FP32. decode(M=1)는 CPU dot(호출 1회 비용 > 2816×128 MAC).
 - 검증: `router_rows_host_check`(ROUTER ROWS OK, worst_rel 2.6e-7, 4 shape + 거부 3), `swap_host_check`가 skel 파일을 새 entry와 함께 링크, `htp_syntax_check.sh`, `unittest_causallm_models`(CPU 경로).
 - ponytail: 가중치 1.4 MB가 호출마다 FastRPC로 넘어간다(층당 prefill 1회). profile에서 K=2816 N=128 행으로 보인다.
-- CPU에 남는 것(prefill): embedding, RoPE(attention 호출 전 q/k 회전), softmax top-8(작음), lm_head·softcap.
+- CPU에 남는 것(prefill): embedding, RoPE(attention 호출 전 q/k 회전), softmax top-8(작음), lm_head·softcap. → RoPE는 §9.5.
+
+### 9.5 RoPE를 qkv 호출의 post 단계로 (2026-10-06), 기기 미측정
+
+`mha_core`가 attention 호출 전에 CPU로 돌리던 q/k RoPE(`apply_rotary_emb_tensor_v2`, 층당 q 512×4096 + k 512×2048 f32)를 `qkv_layer`로 옮겼다. `qkv_layer`에 `rope`, `rope_theta`, `rope_scaling_type`(default·proportional), `rope_partial_rotary_factor`, `max_timestep` 속성; 표는 mha_core의 `precompute_freqs`와 같은 수식(`calc_trigonometric_vals_dup`, 같은 float/double 연산 순서)으로 [pos][cos|sin] 행을 만들고 같은 shape의 층끼리 공유한다(sliding hd 256: 4 MB, full hd 512: 8 MB). HTP: `mm_u8i4_layer_norm`에 `rope_hd/rope_handles/rope_cs`가 붙어 per-head norm 뒤에 q·k 슬라이스를 `hvx_rope_rows_f32`로 회전(행마다 표 2·hd float, 512행 full 층이면 2 MB 전송). CPU: 같은 표로 `compute_rotary_emb_value`. Gemma4 builder는 attention core에 `use_rope=false`를 주므로 core는 k를 fp16 캐시로 변환만 한다.
+
+- 검증: `rope_rows_host_check`(CPU 커널 연산 순서와 비트 일치, hd 256·512(partial 0.25)·64, 거부 3), `swap_host_check`(확장된 entry 링크), `htp_syntax_check.sh`, `unittest_causallm_models`(Gemma4 golden logits가 CPU 경로의 RoPE 이동을 검증).
+- KV 공유 층(`createSharedAttention`)은 q만 FC+norm+scalar로 만들고 core의 RoPE를 그대로 쓴다(prefill을 건너뛰는 층).
+- ponytail: `rope_scaling_factor`는 1.0 가정(yarn은 거부 → core의 use_rope를 켠다).
+- CPU에 남는 것(prefill): embedding, softmax top-8(작음), lm_head·softcap, ARM staging memcpy.
 
 ### 9.2 기기 실행 가이드 (이 브랜치)
 
