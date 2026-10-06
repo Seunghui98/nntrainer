@@ -218,11 +218,14 @@ public:
   // (the chunks of every normed weight in call order, concatenated) norm
   // weight i's output rows per post_chunk[i]-wide piece, in place. eps
   // for both. A backend without it says so and the layer norms itself.
+  // matAscale: empty for Q4_0 weights, else one QS4CX per-channel scale
+  // region per weight (gemm_qs4cx_accel_fp32's form: quantized offline,
+  // no Q4_0 detour).
   virtual bool supports_gemm_q4_0_batch_norm_fp32() const { return false; }
   virtual void gemm_q4_0_batch_norm_fp32(
-    std::vector<void *> matAdata, float *matBdata,
-    std::vector<float *> matCdata, unsigned int M, std::vector<unsigned int> N,
-    unsigned int K, const float *pre_gamma,
+    std::vector<void *> matAdata, std::vector<float *> matAscale,
+    float *matBdata, std::vector<float *> matCdata, unsigned int M,
+    std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
     const std::vector<unsigned int> &post_chunk, const float *post_gamma,
     float eps);
 
@@ -241,6 +244,10 @@ public:
   // touching CPU/GPU's existing M > 1 behavior, which is intentional and
   // must not change.
   virtual bool accelerates_q4_0_at_m1() const { return false; }
+  // The same question for QS4CX weights, answered separately: a backend
+  // that holds them in its own format may prefer every row, decode's one
+  // included, over a CPU path in another format (doc 57 section 5).
+  virtual bool accelerates_qs4cx_at_m1() const { return false; }
 
   // QS4CX weights reach an accelerator without the Q4_0 detour: a model
   // quantized straight from FP32 into QS4CX carries the same int4 values
@@ -522,19 +529,23 @@ public:
   virtual bool supports_gemm_q4_0_dense_ffn_fp32() const { return false; }
   // pre_gamma (K floats) / post_gamma (N floats), nullptr for none, and
   // eps: the RMSNorms before and after the block, folded into the call as
-  // gemm_q4_0_batch_norm_fp32 folds them.
-  virtual void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
-                                        const float *act, float *out,
-                                        unsigned int M, unsigned int K,
-                                        unsigned int I, unsigned int N,
-                                        bool gelu = false,
-                                        const float *pre_gamma = nullptr,
-                                        const float *post_gamma = nullptr,
-                                        float eps = 0.0f) {
+  // gemm_q4_0_batch_norm_fp32 folds them. up_scale / gate_scale /
+  // down_scale: non-null when the three weights are QS4CX (their
+  // per-channel scales), null for Q4_0.
+  virtual void gemm_q4_0_dense_ffn_fp32(
+    void *up, void *gate, void *down, const float *act, float *out,
+    unsigned int M, unsigned int K, unsigned int I, unsigned int N,
+    bool gelu = false, const float *pre_gamma = nullptr,
+    const float *post_gamma = nullptr, float eps = 0.0f,
+    const float *up_scale = nullptr, const float *gate_scale = nullptr,
+    const float *down_scale = nullptr) {
     (void)gelu;
     (void)pre_gamma;
     (void)post_gamma;
     (void)eps;
+    (void)up_scale;
+    (void)gate_scale;
+    (void)down_scale;
     (void)up;
     (void)gate;
     (void)down;
@@ -549,7 +560,13 @@ public:
   }
   virtual bool register_q4_0_dense_ffn(void *up, void *gate, void *down,
                                        unsigned int K, unsigned int I,
-                                       unsigned int N) {
+                                       unsigned int N,
+                                       const float *up_scale = nullptr,
+                                       const float *gate_scale = nullptr,
+                                       const float *down_scale = nullptr) {
+    (void)up_scale;
+    (void)gate_scale;
+    (void)down_scale;
     (void)up;
     (void)gate;
     (void)down;

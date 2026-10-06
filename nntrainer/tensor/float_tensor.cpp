@@ -829,7 +829,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     // weights fell through to the "standard inputs" loop at the top of
     // this function, i.e. one dot() -- one FastRPC call -- per expert.
     if (o->supports_gemm_qs4cx_batch_fp32() &&
-        (M > 1 || o->accelerates_q4_0_at_m1())) {
+        (M > 1 || o->accelerates_qs4cx_at_m1())) {
       std::vector<float *> ascales;
       for (unsigned int i = 0; i < input.size(); ++i) {
         ascales.push_back(input[i]->getScale<float>());
@@ -1103,12 +1103,12 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
 
   // An accelerator that takes QS4CX directly skips the Q4_0 detour: the
   // weight was quantized once, from FP32, and the int4 values on disk are
-  // already the ones the accelerator's registry wants. Reuses
-  // accelerates_q4_0_at_m1() for the M == 1 gate because it answers the
-  // same question -- whether decode is worth dispatching for this backend.
+  // already the ones the accelerator's registry wants. The M == 1 gate is
+  // the backend's own answer for this format: it may want decode's row
+  // too, rather than a CPU kernel on the same bytes.
   auto *o = getOps();
   if (o->supports_gemm_qs4cx_accel_fp32() &&
-      (M > 1 || o->accelerates_q4_0_at_m1())) {
+      (M > 1 || o->accelerates_qs4cx_at_m1())) {
     o->gemm_qs4cx_accel_fp32(input.getData<char>(), input.getScale<float>(),
                              (float *)getData(), output.getData<float>(), M, N,
                              K);

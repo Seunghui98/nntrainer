@@ -1167,6 +1167,12 @@ public:
   // dot(), not a MoE stack) and saves the one MoE FFN caller from a
   // documented loss.
   bool accelerates_q4_0_at_m1() const override { return false; }
+  // QS4CX weights live on the DSP in their own format and nowhere else
+  // once the FCs are quantized to it offline (doc 57 section 5): decode's
+  // row goes to the same kernel as prefill, 64-row pad tax and all (one
+  // call per FC, a few ms a token), rather than to a CPU kernel on another
+  // packing of the same bytes.
+  bool accelerates_qs4cx_at_m1() const override { return true; }
 
   /** @brief The handles one conv block is registered as: in_proj's column
    *  thirds a, b, c (get_or_register_fc's slices at this model's K) and
@@ -1291,42 +1297,72 @@ public:
 
   bool supports_gemm_q4_0_batch_norm_fp32() const override { return true; }
 
-  void gemm_q4_0_batch_norm_fp32(std::vector<void *> matAdata, float *matBdata,
-                                 std::vector<float *> matCdata, unsigned int M,
-                                 std::vector<unsigned int> N, unsigned int K,
-                                 const float *pre_gamma,
+  void gemm_q4_0_batch_norm_fp32(std::vector<void *> matAdata,
+                                 std::vector<float *> matAscale,
+                                 float *matBdata, std::vector<float *> matCdata,
+                                 unsigned int M, std::vector<unsigned int> N,
+                                 unsigned int K, const float *pre_gamma,
                                  const std::vector<unsigned int> &post_chunk,
                                  const float *post_gamma,
                                  float eps) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const size_t n = matAdata.size();
-    if (!post_chunk.empty() && post_chunk.size() != n) {
+    if ((!post_chunk.empty() && post_chunk.size() != n) ||
+        (!matAscale.empty() && matAscale.size() != n)) {
       throw std::invalid_argument(
-        "gemm_q4_0_batch_norm_fp32: one post_chunk per weight");
+        "gemm_q4_0_batch_norm_fp32: one post_chunk / scale per weight");
     }
-    std::vector<uint32_t> handles(n);
+    // Every weight as the column slices gemm_q4_0_accel_fp32 would make
+    // of it (a 2816 x 4096 weight does not fit the VTCM double buffer
+    // whole), all of them one call: handle by handle, the slice's chunk
+    // and its weight's gamma again, and where the slice's rows land.
+    std::vector<uint32_t> handles;
+    std::vector<unsigned int> chunks;
+    std::vector<float> gammas;
+    std::vector<OutSlice> slices;
     unsigned int n_total = 0;
+    const float *g = post_gamma;
     for (size_t i = 0; i < n; ++i) {
-      handles[i] = get_or_register(matAdata[i], session, K, N[i]);
-      n_total += N[i];
+      const FcHandles &fh = get_or_register_fc(
+        matAdata[i], session, K, N[i],
+        matAscale.empty() ? nullptr : matAscale[i]);
+      const unsigned int chunk = post_chunk.empty() ? 0u : post_chunk[i];
+      unsigned int c0 = 0;
+      for (size_t j = 0; j < fh.handles.size(); ++j) {
+        const unsigned int cols = fh.cols[j];
+        if (chunk != 0u && cols % chunk != 0u) {
+          throw std::invalid_argument(
+            "gemm_q4_0_batch_norm_fp32: a slice of " + std::to_string(cols) +
+            " columns does not hold whole chunks of " + std::to_string(chunk));
+        }
+        handles.push_back(fh.handles[j]);
+        chunks.push_back(chunk);
+        if (chunk != 0u)
+          gammas.insert(gammas.end(), g, g + chunk);
+        slices.push_back({matCdata[i], N[i], c0, cols});
+        c0 += cols;
+        n_total += cols;
+      }
+      if (chunk != 0u)
+        g += chunk;
     }
-    // Both norms are per row, so the row chunks gemm_q4_0_batch_fp32 makes
-    // for VTCM carry them unchanged.
     FusedNorms norms;
     norms.pre_gamma = pre_gamma;
-    norms.post_chunk = post_chunk.empty() ? nullptr : &post_chunk;
-    norms.post_gamma = post_gamma;
+    norms.post_chunk = post_chunk.empty() ? nullptr : &chunks;
+    norms.post_gamma = gammas.data();
     norms.eps = eps;
+    // Both norms are per row, so the row chunks gemm_q4_0_batch_fp32 makes
+    // for VTCM carry them unchanged.
     const unsigned int step = fcMaxRows(K);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
-      std::vector<float *> dsts(n);
-      for (size_t i = 0; i < n; ++i)
-        dsts[i] = matCdata[i] + static_cast<size_t>(m0) * N[i];
-      invokeLayer(session, handles.data(), static_cast<int>(n),
+      std::vector<OutSlice> rows = slices;
+      for (OutSlice &o : rows)
+        o.dst += static_cast<size_t>(m0) * o.stride;
+      invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
                   matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
-                  K, &N, &dsts, &norms);
+                  K, nullptr, nullptr, &norms, &rows);
     }
   }
 
@@ -2956,6 +2992,13 @@ private:
    *  slices of one weight and matCdata is its whole [M x N], or separate
    *  weights whose [M x N_i] blocks go to @a dsts[i]; NULL when each
    *  handle's output stays a block of its own (or there is only one). */
+  /** @brief Where one handle's [M x cols] output block lands: columns
+   *  [c0, c0 + cols) of a [M x stride] destination. */
+  struct OutSlice {
+    float *dst;
+    unsigned int stride, c0, cols;
+  };
+
   /** @brief The RMSNorms folded into one layer call (mm_u8i4_layer_norm):
    *  nothing set = the plain call. */
   struct FusedNorms {
@@ -2971,7 +3014,8 @@ private:
                    unsigned int M, unsigned int N, unsigned int K,
                    const std::vector<unsigned int> *blocks = nullptr,
                    const std::vector<float *> *dsts = nullptr,
-                   const FusedNorms *norms = nullptr) {
+                   const FusedNorms *norms = nullptr,
+                   const std::vector<OutSlice> *slices = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
     const auto shape = [&]() {
@@ -3010,7 +3054,19 @@ private:
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_norm failed: err=" +
                                  std::to_string(err) + shape());
       }
-      copyOut(matCdata, out_cat, M, N, blocks, dsts);
+      if (slices) {
+        size_t off = 0;
+        for (const OutSlice &o : *slices) {
+          for (unsigned int r = 0; r < M; ++r) {
+            stagedMemcpy(o.dst + static_cast<size_t>(r) * o.stride + o.c0,
+                         out_cat + off + static_cast<size_t>(r) * o.cols,
+                         static_cast<size_t>(o.cols) * sizeof(float));
+          }
+          off += static_cast<size_t>(M) * o.cols;
+        }
+      } else {
+        copyOut(matCdata, out_cat, M, N, blocks, dsts);
+      }
       if (profile.level())
         profile.addInvoke(M, K, N, elapsed, nullptr);
       return;
@@ -4650,7 +4706,13 @@ private:
     const unsigned int k_tiles = K / 32u;
     const unsigned int n_tiles =
       k_tiles == 0 ? 0 : (kSliceBytes / 512u) / k_tiles;
-    return n_tiles < 1u ? 32u : n_tiles * 32u;
+    const unsigned int cols = n_tiles < 1u ? 32u : n_tiles * 32u;
+    // A slice holds whole heads, so a per-head norm folded into the call
+    // (mm_u8i4_layer_norm's post chunks) never straddles two handles: 512
+    // columns is the widest head dim here and divides every smaller one.
+    // ponytail: a head dim that does not divide 512 needs its own
+    // alignment passed down, not this constant.
+    return cols >= 512u ? (cols / 512u) * 512u : cols;
   }
 
   /** @brief get_or_register for an FC weight of any width: one handle when
@@ -4784,9 +4846,10 @@ private:
    *  takes a row slice, so its column sums are recomputed over those rows
    *  -- the kernel's zero-point correction is per chunk. Cached by the up
    *  weight's pointer. */
-  const DenseHandles &get_or_register_dense(void *up, void *gate, void *down,
-                                            remote_handle64 session, uint32_t K,
-                                            uint32_t I, uint32_t N) {
+  const DenseHandles &get_or_register_dense(
+    void *up, void *gate, void *down, remote_handle64 session, uint32_t K,
+    uint32_t I, uint32_t N, const float *up_s = nullptr,
+    const float *gate_s = nullptr, const float *down_s = nullptr) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = dense_cache_.find(up);
     if (it != dense_cache_.end())
@@ -4801,13 +4864,24 @@ private:
     uint64_t t_begin = HtpProfile::nowUs();
     std::vector<int8_t> up_rm(static_cast<size_t>(K) * I),
       gate_rm(static_cast<size_t>(K) * I), down_rm(static_cast<size_t>(I) * N);
-    std::vector<float> up_s(I), gate_s(I), down_s(N);
+    std::vector<float> up_s_v(I), gate_s_v(I), down_s_v(N);
     std::vector<int32_t> up_c(I), gate_c(I), down_c(N);
-    htp_qs4cx_from_q4_0x4(up, K, I, up_rm.data(), up_s.data(), up_c.data());
-    htp_qs4cx_from_q4_0x4(gate, K, I, gate_rm.data(), gate_s.data(),
-                          gate_c.data());
-    htp_qs4cx_from_q4_0x4(down, I, N, down_rm.data(), down_s.data(),
-                          down_c.data());
+    // QS4CX weights (scales given) are a bit rearrangement, as the FC
+    // path's; Q4_0 ones a requantization.
+    if (up_s) {
+      htp_qs4cx_from_packed(up, up_s, K, I, up_rm.data(), up_s_v.data(),
+                            up_c.data());
+      htp_qs4cx_from_packed(gate, gate_s, K, I, gate_rm.data(), gate_s_v.data(),
+                            gate_c.data());
+      htp_qs4cx_from_packed(down, down_s, I, N, down_rm.data(), down_s_v.data(),
+                            down_c.data());
+    } else {
+      htp_qs4cx_from_q4_0x4(up, K, I, up_rm.data(), up_s_v.data(), up_c.data());
+      htp_qs4cx_from_q4_0x4(gate, K, I, gate_rm.data(), gate_s_v.data(),
+                            gate_c.data());
+      htp_qs4cx_from_q4_0x4(down, I, N, down_rm.data(), down_s_v.data(),
+                            down_c.data());
+    }
     uint64_t convert_us = HtpProfile::nowUs() - t_begin;
 
     DenseHandles dh;
@@ -4822,8 +4896,8 @@ private:
         std::memcpy(gu.data() + static_cast<size_t>(k) * 2 * w + w,
                     up_rm.data() + static_cast<size_t>(k) * I + c0, w);
       }
-      std::vector<float> gus(gate_s.begin() + c0, gate_s.begin() + c0 + w);
-      gus.insert(gus.end(), up_s.begin() + c0, up_s.begin() + c0 + w);
+      std::vector<float> gus(gate_s_v.begin() + c0, gate_s_v.begin() + c0 + w);
+      gus.insert(gus.end(), up_s_v.begin() + c0, up_s_v.begin() + c0 + w);
       std::vector<int32_t> guc(gate_c.begin() + c0, gate_c.begin() + c0 + w);
       guc.insert(guc.end(), up_c.begin() + c0, up_c.begin() + c0 + w);
       if (c0 != 0)
@@ -4840,7 +4914,7 @@ private:
         for (uint32_t n = 0; n < N; ++n)
           dnc[n] += dn[static_cast<size_t>(r) * N + n];
       }
-      std::vector<float> dns(down_s);
+      std::vector<float> dns(down_s_v);
       dh.h_dn.push_back(registerRm(static_cast<char *>(down) + c0, session, dn,
                                    w, N, dns, dnc, HtpProfile::nowUs(), 0));
     }
@@ -4853,11 +4927,13 @@ private:
                                 const float *act, float *out, unsigned int M,
                                 unsigned int K, unsigned int I, unsigned int N,
                                 bool gelu, const float *pre_gamma,
-                                const float *post_gamma, float eps) override {
+                                const float *post_gamma, float eps,
+                                const float *up_scale, const float *gate_scale,
+                                const float *down_scale) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const DenseHandles &dh =
-      get_or_register_dense(up, gate, down, session, K, I, N);
+    const DenseHandles &dh = get_or_register_dense(
+      up, gate, down, session, K, I, N, up_scale, gate_scale, down_scale);
     // Every chunk is an "expert" that takes every row with weight 1: the
     // kernel zero-fills out and scatter-adds each chunk's down result into
     // it, which is exactly the sum over the intermediate dimension.
@@ -4874,10 +4950,13 @@ private:
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
-                               unsigned int I, unsigned int N) override {
+                               unsigned int I, unsigned int N,
+                               const float *up_scale, const float *gate_scale,
+                               const float *down_scale) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    get_or_register_dense(up, gate, down, session, K, I, N);
+    get_or_register_dense(up, gate, down, session, K, I, N, up_scale,
+                          gate_scale, down_scale);
     return true;
   }
 

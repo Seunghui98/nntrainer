@@ -220,8 +220,8 @@ void ComputeOps::gemm_qs4cx_moe_layer_fp32(
   NI(gemm_qs4cx_moe_layer_fp32);
 }
 void ComputeOps::gemm_q4_0_batch_norm_fp32(
-  std::vector<void *>, float *, std::vector<float *>, unsigned int,
-  std::vector<unsigned int>, unsigned int, const float *,
+  std::vector<void *>, std::vector<float *>, float *, std::vector<float *>,
+  unsigned int, std::vector<unsigned int>, unsigned int, const float *,
   const std::vector<unsigned int> &, const float *, float) {
   NI(gemm_q4_0_batch_norm_fp32);
 }
