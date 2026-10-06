@@ -402,7 +402,7 @@ void Transformer::repack_weight() {
     std::vector<void *> gu_data, dn_data;
     std::vector<float *> gu_scale, dn_scale;
     unsigned int K = 0, inter = 0, N_out = 0;
-    bool weights_wh = false;
+    unsigned int w_bits = 0u; /**< 0 QS4CX, 4 QS4CX_WH, 2 QS2CX_WH */
   } moe_warm;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
@@ -493,7 +493,7 @@ void Transformer::repack_weight() {
       std::vector<void *> gu_data, dn_data;
       std::vector<float *> gu_scale, dn_scale;
       unsigned int gu_h = 0, gu_w = 0, dn_h = 0, dn_w = 0;
-      bool weights_wh = false;
+      unsigned int w_bits = 0u;
       for (auto &w : weights) {
         auto &t = w->getVariableRef();
         const auto dtype = t.getDataType();
@@ -506,10 +506,13 @@ void Transformer::repack_weight() {
                                 static_cast<unsigned int>(t.width())});
         }
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
-                    dtype == ml::train::TensorDim::DataType::QS4CX_WH)) {
+                    dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
+                    dtype == ml::train::TensorDim::DataType::QS2CX_WH)) {
           const auto h = static_cast<unsigned int>(t.height());
           const auto wd = static_cast<unsigned int>(t.width());
-          weights_wh = dtype == ml::train::TensorDim::DataType::QS4CX_WH;
+          w_bits = dtype == ml::train::TensorDim::DataType::QS4CX_WH   ? 4u
+                   : dtype == ml::train::TensorDim::DataType::QS2CX_WH ? 2u
+                                                                       : 0u;
           // [doc 52] A virtual expert has no bytes here: preloadExperts
           // below reads it from the model file into the accelerator's slot
           // pool, keyed by the tensor itself, and the warm-up passes that
@@ -518,7 +521,7 @@ void Transformer::repack_weight() {
             t.isVirtual() ? static_cast<void *>(&t) : t.getData<char>();
           float *scale = t.isVirtual() ? nullptr : t.getScale<float>();
           if (!t.isVirtual())
-            ops->register_qs4cx_weight(key, scale, h, wd, weights_wh);
+            ops->register_qs4cx_weight(key, scale, h, wd, w_bits);
           // The expert weights come in two shapes: gate_up is [K, 2*inter]
           // and down [inter, N_out]. Sorted here for the warm-up below by
           // the identity that tells them apart, gate_up.width == 2 *
@@ -570,7 +573,7 @@ void Transformer::repack_weight() {
         moe_warm.K = gu_h;
         moe_warm.inter = dn_h;
         moe_warm.N_out = dn_w;
-        moe_warm.weights_wh = weights_wh;
+        moe_warm.w_bits = w_bits;
       }
     };
   try {
@@ -594,7 +597,7 @@ void Transformer::repack_weight() {
       moe_warm.ops->gemm_qs4cx_moe_layer_fp32(
         moe_warm.gu_data, moe_warm.gu_scale, moe_warm.dn_data,
         moe_warm.dn_scale, row_index, row_count, row_weight, act.data(),
-        out.data(), M, K, moe_warm.inter, N_out, moe_warm.weights_wh);
+        out.data(), M, K, moe_warm.inter, N_out, moe_warm.w_bits);
       ml_logd("MoE HTP kernel warmed up at load (M=%u, %u experts)", M, E);
     }
     // The deferred FC registrations (see fc_pending above). A CPU-engine

@@ -299,7 +299,9 @@ public:
   // this model -- and copying that per layer is the kind of cost this call
   // exists to remove.
   //
-  // weights_wh says the nibbles are already in the HMX weight-tile layout
+  // w_bits says how the nibbles are stored: 0 = plain QS4CX (the backend
+  // converts), 4 = QS4CX_WH (already in the HMX weight-tile layout),
+  // 2 = QS2CX_WH (half that, expanded on the DSP -- doc 54)
   // (htp_wh_layout.h) with a per-output-channel column sum after the scales,
   // so the implementation registers them as they are instead of converting
   // and baking. It is a flag rather than a colsum pointer because the sums
@@ -315,7 +317,7 @@ public:
                             const std::vector<float> &row_weight,
                             const float *act, float *out, unsigned int M,
                             unsigned int K, unsigned int inter,
-                            unsigned int N_out, bool weights_wh);
+                            unsigned int N_out, unsigned int w_bits);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate
@@ -438,12 +440,12 @@ public:
   // register returns false and the caller moves on.
   virtual bool register_qs4cx_weight(void *data, const float *scale,
                                      unsigned int K, unsigned int N,
-                                     bool weights_wh) {
+                                     unsigned int w_bits) {
     (void)data;
     (void)scale;
     (void)K;
     (void)N;
-    (void)weights_wh;
+    (void)w_bits;
     return false;
   }
 
@@ -472,6 +474,7 @@ public:
     int fd;
     size_t off_gu, off_dn;
     unsigned int K, inter, N_out;
+    unsigned int w_bits = 4; /**< [plan 229] 4 QS4CX_WH, 2 QS2CX_WH */
   };
 
   // How many expert slots the caller will ever hold at once (the LRU's

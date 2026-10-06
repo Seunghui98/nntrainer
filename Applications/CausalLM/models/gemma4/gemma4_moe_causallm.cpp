@@ -62,11 +62,13 @@ void Gemma4MoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   moe_engine = nntr_cfg.value("moe_engine", std::string("cpu"));
   moe_layer_dtype = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
   // The two expert layouts: nntr_quantize_stream fuses gate | up for
-  // QS4CX_WH (the HTP layer's), every other dtype keeps them apart
-  // (gemma4_moe's)
-  NNTR_THROW_IF((moe_engine == "htp") != (moe_layer_dtype == "QS4CX_WH"),
+  // QS4CX_WH and QS2CX_WH (the HTP layer's), every other dtype keeps them
+  // apart (gemma4_moe's)
+  NNTR_THROW_IF((moe_engine == "htp") != (moe_layer_dtype == "QS4CX_WH" ||
+                                          moe_layer_dtype == "QS2CX_WH"),
                 std::invalid_argument)
-    << "[Gemma4MoE] moe_engine=htp takes QS4CX_WH experts and only it does "
+    << "[Gemma4MoE] moe_engine=htp takes QS4CX_WH or QS2CX_WH experts and "
+       "only they do "
        "(moe_engine="
     << moe_engine << ", moe_layer_dtype=" << moe_layer_dtype << ")";
 #ifdef ENABLE_HEXKL
