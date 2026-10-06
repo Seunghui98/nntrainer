@@ -178,6 +178,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   h->colsum_w = (int32_t *)(a + n4);
   h->bias = (float *)(a + 2u * n4);
   h->borrowed = borrow;
+  h->wh2 = 0;
   h->K = K;
   h->N = N;
   if (!borrow) {
@@ -263,7 +264,7 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
                                      uint32_t vtcm_size, uint32_t K, uint32_t N,
                                      const uint8_t *wh, const float *w_scale,
                                      const int32_t *colsum_w, const float *bias,
-                                     uint32_t *out_handle) {
+                                     int wh2, uint32_t *out_handle) {
   uint32_t wh_bytes = 0;
   uint32_t slot;
   int rc;
@@ -285,11 +286,14 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
   if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
     return AEE_ENOMEMORY;
   }
-  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, wh, w_scale,
-                                   colsum_w, bias, /*borrow=*/1);
+  /* Borrowed, so the length only places the arena tail: WH2 is half. */
+  rc =
+    hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh2 ? wh_bytes / 2u : wh_bytes,
+                                wh, w_scale, colsum_w, bias, /*borrow=*/1);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
+  tbl->slots[slot].wh2 = wh2 != 0;
   *out_handle = slot;
   return AEE_SUCCESS;
 }
@@ -297,8 +301,9 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
 int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
                                    const float *w_scale,
-                                   const int32_t *colsum_w) {
+                                   const int32_t *colsum_w, int wh2) {
   hexkl_weight_u8i4 *w;
+  uint32_t wh_bytes;
   if (!tbl || !wh || (!w_scale != !colsum_w) ||
       h >= HEXKL_MM_U8I4_MAX_WEIGHTS) {
     return AEE_EBADPARM;
@@ -309,14 +314,15 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
     return AEE_EBADPARM;
   }
   w->wh_bytes = (uint8_t *)wh;
+  w->wh2 = wh2 != 0;
+  wh_bytes = (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
+             (N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
   if (w_scale) {
     memcpy(w->w_scale, w_scale, sizeof(float) * N);
     memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
     memset(w->bias, 0, sizeof(float) * N);
   } else {
-    hexkl_weight_u8i4_tail_from_arena(w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
-                                           (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
-                                           WEIGHT_TILE_BYTES_U8I4);
+    hexkl_weight_u8i4_tail_from_arena(w, wh2 ? wh_bytes / 2u : wh_bytes);
   }
   return AEE_SUCCESS;
 }
@@ -347,7 +353,7 @@ int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
     return AEE_EBADPARM;
   }
   h = &tbl->slots[handle];
-  if (!h->in_use) {
+  if (!h->in_use || h->wh2) { /* a WH2 slot has half the bytes */
     return AEE_EBADPARM;
   }
   wh_bytes = (h->K / HEXKL_HMX_INT8_BLOCK_N_INNER) *

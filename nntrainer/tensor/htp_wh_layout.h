@@ -100,6 +100,31 @@ inline void whPack(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
 }
 
 /**
+ * @brief Bytes a K x N weight occupies as WH2: the WH layout with each
+ *  nibble cut to a 2-bit code, half of whBytes (doc 57).
+ *
+ * WH2 byte j carries WH bytes 2j and 2j+1 -- slots 4j..4j+3, two bits each,
+ * slot 4j in bits 0-1 -- so it is a byte-wise compression of the WH bytes
+ * and every offset into a weight halves. A code c is the int4 value c - 2,
+ * i.e. int2 in [-2, 1]; the DSP expands it back into the WH nibble before
+ * the HMX reads it (hvx_expand_wh2), so the matmul never sees WH2.
+ */
+inline size_t wh2Bytes(uint32_t K, uint32_t N) { return whBytes(K, N) / 2u; }
+
+/** @brief WH bytes -> WH2, for values already in [-2, 1]. A nibble out of
+ *  that range is a caller bug; it is masked, not checked. */
+inline void wh2FromWh(const uint8_t *wh, size_t wh_len, uint8_t *out) {
+  for (size_t j = 0; j < wh_len / 2u; ++j) {
+    uint8_t b = 0;
+    for (uint32_t q = 0; q < 4u; ++q) {
+      const uint8_t nib = (wh[2u * j + q / 2u] >> (4u * (q % 2u))) & 0x0Fu;
+      b |= static_cast<uint8_t>(((nib + 2u) & 3u) << (2u * q));
+    }
+    out[j] = b;
+  }
+}
+
+/**
  * @brief The whole pages of [src, src + len) -- what the arena copy can hand
  *        back to the OS once a weight's bytes are in the arena.
  *

@@ -466,4 +466,16 @@ interface nntr_hvx : remote_handle64 {
                                           rout sequence<uint32> h_gu,
                                           rout sequence<uint32> h_dn,
                                           rout uint32 n_done, rout int32 err);
+
+   // [doc 57] Expert weights as 2-bit codes. bits = 2: every later
+   // weight_swap_u8i4_arena / weight_swap_batch_u8i4_arena reads its
+   // weights from the arena as WH2 -- half the bytes, scales and column
+   // sums right after them -- and the MoE layer call expands them in VTCM.
+   // bits = 4 (the default) is the WH nibble layout. Nothing else changes:
+   // FC, attention and the dense MLP never pass through the swap.
+   AEEResult set_expert_bits(in uint32 bits);
+
+   // [doc 57] hvx_expand_wh2 on its own, for the device check of the byte
+   // order: dst gets 2 * len(src) bytes. len(src) a multiple of 128.
+   AEEResult expand_wh2(in sequence<uint8> src, rout sequence<uint8> dst);
 };

@@ -59,6 +59,7 @@ typedef struct {
   nntr_hvx_arena arenas[NNTR_HVX_MAX_ARENAS];
   hexkl_moe_scratch moe_scratch; /**< the MoE layer call's heap scratch,
                                       grown on demand, freed in close() */
+  int expert_wh2; /**< set_expert_bits(2): expert swaps register WH2 (doc 57) */
 } nntr_hvx_session;
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the

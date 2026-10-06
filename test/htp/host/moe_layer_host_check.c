@@ -34,6 +34,27 @@ static float gelu_sig(float g) {
   return g / (1.f + expf(-t));
 }
 
+/* Overwrites w's nibbles with int4 values in [-2, 1] -- what an int2
+   weight is once expanded -- and returns the same bytes as WH2
+   (htp_wh_layout.h's wh2FromWh, in C). */
+static uint8_t *make_int2(W *w) {
+  const uint32_t n = (w->K / 32u) * (w->N / 32u) * 512u;
+  uint8_t *wh = (uint8_t *)w->nib;
+  uint8_t *wh2 = (uint8_t *)malloc(n / 2u);
+  for (uint32_t j = 0; j < n / 2u; ++j) {
+    uint8_t b = 0;
+    for (uint32_t q = 0; q < 4u; ++q) {
+      const uint32_t c = rnd() & 3u;
+      b |= (uint8_t)(c << (2u * q));
+      if (q % 2u == 0u)
+        wh[2u * j + q / 2u] = 0;
+      wh[2u * j + q / 2u] |= (uint8_t)(((c + 14u) & 15u) << (4u * (q % 2u)));
+    }
+    wh2[j] = b;
+  }
+  return wh2;
+}
+
 /* The straightforward reference: per routed row, quantize, gate_up,
    act(gate)*up, requantize, down, weighted accumulate. */
 static void ref_layer(int gelu, uint32_t M, uint32_t K, uint32_t inter,
@@ -298,6 +319,97 @@ int main(void) {
       bad_row, c1, rw, act, got, HVX_GLU_SILU, NULL, &scratch);
     printf("row_index >= M    : rc=%d (want %d)\n", r, AEE_EBADPARM);
     fail |= (r != AEE_EBADPARM);
+  }
+  /* WH2 experts (doc 57): the same int2-valued weights as WH and as WH2.
+     The WH2 call has no tail path, so it is held to the reference, not to
+     the WH call's bytes. Lazy: every expansion runs as late as the
+     background lane allows, so a wait on the wrong job or on too few
+     units, or a staging buffer refilled before its expansion ran, reads
+     wrong. Eager: as early as allowed, so a WH region overwritten while
+     the matmul still reads it reads wrong. */
+  {
+    const uint32_t B0 = 2u * NE; /* slots past the ones above */
+    W ig[8], id[8];
+    uint32_t h4g[8], h4d[8], h2g[8], h2d[8];
+    for (uint32_t e = 0; e < NE; ++e) {
+      h4g[e] = B0 + e;
+      h4d[e] = B0 + NE + e;
+      h2g[e] = B0 + 2u * NE + e;
+      h2d[e] = B0 + 3u * NE + e;
+      make_weight(h4g[e], K, 2 * inter, &ig[e]);
+      make_weight(h4d[e], inter, N_out, &id[e]);
+      g_tbl.slots[h2g[e]] = g_tbl.slots[h4g[e]];
+      g_tbl.slots[h2g[e]].wh_bytes = make_int2(&ig[e]);
+      g_tbl.slots[h2g[e]].wh2 = 1;
+      g_tbl.slots[h2d[e]] = g_tbl.slots[h4d[e]];
+      g_tbl.slots[h2d[e]].wh_bytes = make_int2(&id[e]);
+      g_tbl.slots[h2d[e]].wh2 = 1;
+    }
+    float *want2 = (float *)calloc(M * N_out, sizeof(float));
+    float *o = (float *)malloc(sizeof(float) * M * N_out);
+    ref_layer(1, M, K, inter, N_out, NE, ig, id, rc_, ridx, rw, act, want2);
+    const uint32_t *hgs[3] = {h4g, h2g, h2g};
+    const uint32_t *hds[3] = {h4d, h2d, h2d};
+    const char *name[3] = {"WH  int2 values  ", "WH2 eager bg lane",
+                           "WH2 lazy bg lane "};
+    for (int t = 0; t < 3; ++t) {
+      g_bg_lazy = (t == 2);
+      hexkl_probe_us[HEXKL_PROBE_DMA_KB] = 0;
+      int r = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hgs[t],
+        hds[t], ridx, rc_, rw, act, o, HVX_GLU_GELU_TANH, NULL, &scratch);
+      g_bg_lazy = 0;
+      uint32_t bad2 = 0;
+      for (uint32_t i = 0; i < M * N_out; ++i) {
+        const double d = fabs((double)o[i] - (double)want2[i]);
+        if (d / (fabs((double)want2[i]) + 1e-6) > 1e-5)
+          ++bad2;
+      }
+      printf("%s : rc=%d mismatches=%u weight DMA %llu KB\n", name[t], r, bad2,
+             (unsigned long long)hexkl_probe_us[HEXKL_PROBE_DMA_KB]);
+      fail |= (r != 0 || bad2 != 0);
+    }
+    /* Half the weight bytes cross the DMA, 4 active experts; the counter
+       truncates each push to whole KB, as the device's does. */
+    {
+      const uint64_t kb2 =
+        4u * ((((K / 32u) * ((2u * inter) / 32u) * 256u) >> 10) +
+              (((inter / 32u) * (N_out / 32u) * 256u) >> 10));
+      printf("WH2 weight DMA    : %llu KB (want %llu)\n",
+             (unsigned long long)hexkl_probe_us[HEXKL_PROBE_DMA_KB],
+             (unsigned long long)kb2);
+      fail |= (hexkl_probe_us[HEXKL_PROBE_DMA_KB] != kb2);
+    }
+    /* A WH2 gate_up beside a WH down is refused, before any work. */
+    {
+      uint32_t mix[8];
+      memcpy(mix, h4d, sizeof mix);
+      int r = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, h2g,
+        mix, ridx, rc_, rw, act, o, HVX_GLU_GELU_TANH, NULL, &scratch);
+      printf("WH2 + WH mixed    : rc=%d (want %d)\n", r, AEE_EBADPARM);
+      fail |= (r != AEE_EBADPARM);
+    }
+    free(want2);
+    free(o);
+  }
+  /* Where the WH2 staging fits: the call carves 2 x (gate_up + down) / 2
+     off the top of the arena, then lays out the rest as usual. */
+  {
+    const uint32_t vt = 8300u * 1024u;
+    hexkl_moe_layout R;
+    uint32_t st = 2u * ((2816u / 32u) * (1408u / 32u) * 256u +
+                        (704u / 32u) * (2816u / 32u) * 256u);
+    int r = hexkl_mm_u8i4_moe_layout(2816, 704, 2816, (vt - st) & ~2047u, &R);
+    printf("gemma4 WH2 layout : rc=%d total=%.2f + staging %.2f MiB of %.2f\n",
+           r, R.total / 1048576.0, st / 1048576.0, vt / 1048576.0);
+    fail |= (r != 0);
+    st = 2u * ((2048u / 32u) * (3584u / 32u) * 256u +
+               (1792u / 32u) * (2048u / 32u) * 256u);
+    r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, (vt - st) & ~2047u, &R);
+    printf("LFM2 WH2 layout   : rc=%d (want %d: does not fit)\n", r,
+           AEE_ENOMEMORY);
+    fail |= (r != AEE_ENOMEMORY);
   }
   {
     hexkl_moe_layout R;

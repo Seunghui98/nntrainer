@@ -26,6 +26,7 @@
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_expand_wh2.h"
 #include "hvx_quant_u8.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
@@ -420,10 +421,10 @@ void nntr_hvx_arenas_put_all(nntr_hvx_session *s) {
  *  how big the mapping behind it is. Overflow-safe in 64-bit. */
 static const uint8_t *arena_weight_at(nntr_hvx_session *s, uint32 arena,
                                       uint32 wh_off, uint32 K, uint32 N,
-                                      int tail) {
+                                      int tail, int wh2) {
   const nntr_hvx_arena *a = nntr_hvx_arena_slot(s, arena);
-  const uint64_t bytes =
-    (uint64_t)(K / 32u) * (N / 32u) * 512u + (tail ? 8u * (uint64_t)N : 0u);
+  const uint64_t bytes = (uint64_t)(K / 32u) * (N / 32u) * (wh2 ? 256u : 512u) +
+                         (tail ? 8u * (uint64_t)N : 0u);
   if (!a) {
     return NULL;
   }
@@ -452,13 +453,13 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
          (unsigned)K, (unsigned)N);
     return AEE_EBADPARM;
   }
-  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0);
+  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0, /*wh2=*/0);
   if (!wh) {
     return AEE_EBADPARM;
   }
   return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
                                           wh, w_scale, colsum_w, bias,
-                                          w_handle);
+                                          /*wh2=*/0, w_handle);
 }
 
 /** @brief One weight of a swap: registered from the arena with the given
@@ -468,12 +469,14 @@ static int swap_register_one(nntr_hvx_session *s, uint32 K, uint32 N,
                              uint32 arena, uint32 wh_off, const float *w_scale,
                              const int32 *colsum_w, const float *bias,
                              uint32 *out) {
-  const uint8_t *wh = arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL);
+  const uint8_t *wh =
+    arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL, s->expert_wh2);
   if (!wh) {
     return AEE_EBADPARM;
   }
   return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
-                                          wh, w_scale, colsum_w, bias, out);
+                                          wh, w_scale, colsum_w, bias,
+                                          s->expert_wh2, out);
 }
 
 /** @brief The IDL's "nothing to release" for weight_swap_u8i4_arena. */
@@ -538,8 +541,10 @@ int nntr_hvx_weight_swap_u8i4_arena(
       s->weights_u8i4.slots[old_gu].N == n_gu &&
       s->weights_u8i4.slots[old_dn].K == inter &&
       s->weights_u8i4.slots[old_dn].N == N_out) {
-    const uint8_t *wg = arena_weight_at(s, arena, off_gu, K, n_gu, tail);
-    const uint8_t *wd = arena_weight_at(s, arena, off_dn, inter, N_out, tail);
+    const uint8_t *wg =
+      arena_weight_at(s, arena, off_gu, K, n_gu, tail, s->expert_wh2);
+    const uint8_t *wd =
+      arena_weight_at(s, arena, off_dn, inter, N_out, tail, s->expert_wh2);
     /* 512: the registry's WEIGHT_TILE_BYTES_U8I4, which rebind also checks
        -- checked here too so the second rebind cannot refuse after the
        first has landed. */
@@ -548,10 +553,11 @@ int nntr_hvx_weight_swap_u8i4_arena(
       return AEE_EBADPARM;
     }
     rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu, wg,
-                                        gu_scale, gu_colsum);
+                                        gu_scale, gu_colsum, s->expert_wh2);
     if (rc == AEE_SUCCESS) {
-      rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
-                                          N_out, wd, dn_scale, dn_colsum);
+      rc =
+        hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter, N_out,
+                                       wd, dn_scale, dn_colsum, s->expert_wh2);
     }
     if (rc != AEE_SUCCESS) { /* unreachable after the checks above */
       return rc;
@@ -1071,12 +1077,13 @@ enum {
   MOE_T_MM,        /**< the HMX issue loop, timed rather than left a residual */
   MOE_T_DMA_KB,    /**< NOT us: kilobytes pushed through the DMA ring */
   MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
-  MOE_T_ALLOC,   /**< the layer call's own malloc and free */
+  MOE_T_ALLOC,     /**< the layer call's own malloc and free */
   MOE_T_DMA_FIRST_KB, /**< NOT us: KB that first wait covered */
-  MOE_T_DRAIN_DN,  /**< the down-weight drain, apart from gate_up's */
-  MOE_T_PUSH,      /**< hexkl_dma_ring_push2d itself */
-  MOE_T_STAGE,     /**< copying the FastRPC buffers to and from cached heap */
+  MOE_T_DRAIN_DN,     /**< the down-weight drain, apart from gate_up's */
+  MOE_T_PUSH,         /**< hexkl_dma_ring_push2d itself */
+  MOE_T_STAGE, /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
+  MOE_T_EXPAND, /**< WH2 experts: worker us expanding, hidden or not */
   MOE_N_STAGES
 };
 
@@ -1102,6 +1109,7 @@ static void moe_fill_stage_us(uint32 *stage_us, uint32 dsp_total) {
   stage_us[MOE_T_DRAIN_DN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN_DN];
   stage_us[MOE_T_PUSH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PUSH];
   stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  stage_us[MOE_T_EXPAND] = (uint32)hexkl_probe_us[HEXKL_PROBE_EXPAND];
 }
 
 /** @brief Shared by both entry points so they cannot drift on what they
@@ -1355,4 +1363,33 @@ int nntr_hvx_mm_u8i4_gate_up_swiglu_timed(remote_handle64 handle, uint32 M,
   stage_us[GU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
   stage_us[GU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
+}
+
+int nntr_hvx_set_expert_bits(remote_handle64 handle, uint32 bits) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || (bits != 2u && bits != 4u)) {
+    return AEE_EBADPARM;
+  }
+  s->expert_wh2 = bits == 2u;
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_expand_wh2(remote_handle64 handle, const uint8 *src, int srcLen,
+                        uint8 *dst, int dstLen) {
+  uint8_t *raw, *a, *b;
+  if (!handle || srcLen <= 0 || (srcLen % 128) != 0 || dstLen != 2 * srcLen) {
+    return AEE_EBADPARM;
+  }
+  /* The FastRPC buffers carry no 128-byte alignment promise. */
+  raw = (uint8_t *)malloc((size_t)srcLen * 3u + 128u);
+  if (!raw) {
+    return AEE_ENOMEMORY;
+  }
+  a = (uint8_t *)(((uintptr_t)raw + 127u) & ~(uintptr_t)127u);
+  b = a + srcLen;
+  memcpy(a, src, (size_t)srcLen);
+  hvx_expand_wh2(b, a, (uint32_t)srcLen);
+  memcpy(dst, b, (size_t)dstLen);
+  free(raw);
+  return AEE_SUCCESS;
 }

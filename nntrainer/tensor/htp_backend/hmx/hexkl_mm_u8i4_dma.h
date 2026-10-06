@@ -48,6 +48,11 @@ typedef struct {
   void *arrays;      /**< the one allocation the three arrays sit in */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
+  /** wh_bytes holds WH2 (2-bit codes, half the bytes; htp_wh_layout.h's
+      wh2Bytes) rather than WH nibbles. Only the MoE layer call reads such a
+      weight -- it expands it in VTCM -- and only an expert swap makes one;
+      every other kernel reads wh_bytes as WH and must not be handed it. */
+  int wh2;
 } hexkl_weight_u8i4;
 
 typedef struct {
@@ -97,12 +102,15 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
  *
  * @a wh must be WEIGHT_TILE_BYTES_U8I4-aligned: every DMA out of it starts
  * on a tile boundary and the ring's 2D descriptors assume it.
+ *
+ * Nonzero @a wh2 says @a wh is WH2 (half the bytes, see hexkl_weight_u8i4's
+ * wh2), so arena scales and column sums follow it at half the offset.
  */
 int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
                                      uint32_t vtcm_size, uint32_t K, uint32_t N,
                                      const uint8_t *wh, const float *w_scale,
                                      const int32_t *colsum_w, const float *bias,
-                                     uint32_t *out_handle);
+                                     int wh2, uint32_t *out_handle);
 
 /**
  * @brief [doc 52 section 10.25] Points a live arena-borrowed slot at new
@@ -111,7 +119,8 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
  *        bias zeroed. What an expert swap does when the retired pair has
  *        the new expert's shape -- no allocation, no free, no slot search.
  *        NULL @a w_scale and @a colsum_w take them from the arena after
- *        @a wh, as hexkl_weight_u8i4_register_arena does.
+ *        @a wh, as hexkl_weight_u8i4_register_arena does, and @a wh2 is
+ *        that call's too.
  *
  * @return AEE_SUCCESS, or AEE_EBADPARM (changing nothing) for a free,
  *         owned or differently shaped slot, or an unaligned @a wh.
@@ -119,7 +128,7 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
 int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
                                    const float *w_scale,
-                                   const int32_t *colsum_w);
+                                   const int32_t *colsum_w, int wh2);
 
 /** @brief Whether any live slot borrows bytes inside [base, base+bytes). */
 int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,

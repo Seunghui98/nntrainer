@@ -8,6 +8,7 @@
 #include "hexkl_probe.h"
 #include "hvx_conv_gate_f32.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_expand_wh2.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_scale_add_f32.h"
@@ -224,19 +225,58 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
 /* The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot
-   show here, and a wait for too many only as a hang on device. */
+   show here, and a wait for too many only as a hang on device.
+   g_bg_lazy turns that around (doc 57): a unit runs only when a wait
+   reaches it, every earlier job's units first, as the real lane's order
+   allows -- the LATEST schedule the pool could give. A wait for too few
+   units, on the wrong job, or a buffer refilled before the job reading it
+   ran then reads as a wrong result here. */
+int g_bg_lazy;
+static hvx_bg_job *g_bg_q[4096];
+static uint32_t g_bg_head, g_bg_tail;
+static void bg_run_until(hvx_bg_job *job, uint32_t n) {
+  /* Already that far: return, as the real wait does, without running
+     anything queued behind it. */
+  while (job->low < (n < job->n_units ? n : job->n_units) &&
+         g_bg_head != g_bg_tail) {
+    hvx_bg_job *j = g_bg_q[g_bg_head];
+    const uint32_t stop = (j == job && n < j->n_units) ? n : j->n_units;
+    while (j->low < stop) {
+      j->func(j->n_units, j->low, j->ctx);
+      j->done[j->low++] = 1;
+    }
+    if (j->low < j->n_units)
+      return; /* this job, n units in */
+    ++g_bg_head;
+    if (j == job)
+      return;
+  }
+}
 void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
   (void)pool;
+  job->low = 0;
+  for (uint32_t u = 0; u < job->n_units; ++u)
+    job->done[u] = 0;
+  if (g_bg_lazy) {
+    if (g_bg_tail >= 4096u)
+      abort();
+    g_bg_q[g_bg_tail++] = job;
+    return;
+  }
   for (uint32_t u = 0; u < job->n_units; ++u) {
     job->func(job->n_units, u, job->ctx);
     job->done[u] = 1;
   }
+  job->low = job->n_units;
 }
 void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, hvx_bg_job *job,
                              uint32_t n) {
   (void)pool;
-  (void)job;
-  (void)n;
+  if (g_bg_lazy) {
+    bg_run_until(job, n);
+    if (g_bg_head == g_bg_tail)
+      g_bg_head = g_bg_tail = 0;
+  }
 }
 
 void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
@@ -510,4 +550,16 @@ void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m_valid,
                             uint32_t n_out, hvx_worker_pool *pool) {
   (void)gate, (void)up, (void)m_valid, (void)n_out, (void)pool;
   abort();
+}
+
+/* ---- WH2 -> WH, byte for byte what hvx_expand_wh2 computes ---- */
+void hvx_expand_wh2(uint8_t *dst, const uint8_t *src, uint32_t n_src) {
+  for (uint32_t j = 0; j < n_src; ++j) {
+    for (uint32_t h = 0; h < 2u; ++h) {
+      const uint32_t c0 = (src[j] >> (4u * h)) & 3u;
+      const uint32_t c1 = (src[j] >> (4u * h + 2u)) & 3u;
+      dst[2u * j + h] =
+        (uint8_t)(((c0 + 14u) & 15u) | (((c1 + 14u) & 15u) << 4));
+    }
+  }
 }

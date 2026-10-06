@@ -97,8 +97,8 @@ enum {
       At 31.6 GB/s measured and 5.6 GB/s averaged, something is serialising
       and the push is one of two candidates. */
   HEXKL_PROBE_PUSH,
-  HEXKL_PROBE_DRAIN,        /**< hexkl_dma_ring_drain */
-  HEXKL_PROBE_SWIGLU,       /**< hvx_swiglu_inplace_f32 (fused layer only) */
+  HEXKL_PROBE_DRAIN,  /**< hexkl_dma_ring_drain */
+  HEXKL_PROBE_SWIGLU, /**< hvx_swiglu_inplace_f32 (fused layer only) */
   /** Routing multiply + accumulate into the layer output (MoE layer call
       only). Its own slot rather than sharing ACC_COPY: the first
       measurement of that call had 104.8 ms in a bucket ACC_READ and this
@@ -118,6 +118,10 @@ enum {
    *  is running, 0 when layer_run fell back to the vendor copy. One number
    *  that says which path the numbers beside it came from. */
   HEXKL_PROBE_ACC_STRIDE,
+  /** WH2 experts only (doc 57): microseconds the workers spent expanding
+      WH2 into WH, summed over workers -- the WORK, hidden or not. What of
+      it was exposed shows in DRAIN and DRAIN_DN, which time the waits. */
+  HEXKL_PROBE_EXPAND,
   HEXKL_PROBE_N
 };
 

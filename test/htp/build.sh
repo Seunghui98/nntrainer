@@ -84,7 +84,7 @@ SRCS="$SRCS $BACKEND/hmx/hexkl_attn_dtype.c $BACKEND/hmx/hexkl_attn_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_swiglu_f32.c $BACKEND/hvx/hvx_conv_gate_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_scale_add_f32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c $BACKEND/hvx/hvx_expand_wh2.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c $BACKEND/hvx/hvx_softmax_blocked_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
 

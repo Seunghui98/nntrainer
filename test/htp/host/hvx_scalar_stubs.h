@@ -37,4 +37,8 @@ float rndf(void);
 extern hexkl_weight_u8i4_table g_tbl;
 void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w);
 
+/* Nonzero: background-lane units run when a wait reaches them, not at
+   submit (hvx_scalar_stubs.c). */
+extern int g_bg_lazy;
+
 #endif /* HVX_SCALAR_STUBS_H */

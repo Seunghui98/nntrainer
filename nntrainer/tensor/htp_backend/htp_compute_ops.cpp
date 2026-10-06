@@ -174,6 +174,7 @@ enum {
   HTP_MOE_T_PUSH,
   HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
+  HTP_MOE_T_EXPAND, /**< WH2 experts (doc 57): worker us, not exposed us */
   HTP_MOE_N_STAGES
 };
 
@@ -362,6 +363,7 @@ public:
       b.dma_kb += stage_us[HTP_MOE_T_DMA_KB];
       b.dma_first_us += stage_us[HTP_MOE_T_DMA_FIRST];
       b.drain_dn_us += stage_us[HTP_MOE_T_DRAIN_DN];
+      b.expand_us += stage_us[HTP_MOE_T_EXPAND];
       b.dma_first_kb += stage_us[HTP_MOE_T_DMA_FIRST_KB];
       b.alloc_us += stage_us[HTP_MOE_T_ALLOC];
       b.push_us += stage_us[HTP_MOE_T_PUSH];
@@ -432,6 +434,11 @@ private:
         hexkl_probe.h for why that left the 4.9 ms unreadable. */
     uint64_t drain_dn_us = 0;
     uint64_t dma_first_kb = 0;
+    /** WH2 experts (doc 57): the workers' time expanding int2 -> int4,
+        summed over workers. Work done beside the HMX, so it is reported
+        and NOT subtracted from the residual; what of it was exposed is in
+        the drain columns, which time the waits. */
+    uint64_t expand_us = 0;
     /** The layer call's own malloc and free -- about 12.8 MB a call. Was
         unnamed in the residual, which read 1019 us on the bake path and
         23888 on the weight-cache path with the kernel unchanged. */
@@ -576,10 +583,11 @@ private:
         std::fprintf(stderr,
                      "\n[HTP-PROFILE]     weight DMA: %.0f KB/call, first "
                      "%.0f KB took %.0f us = %.1f GB/s; averaged over the "
-                     "call %.1f GB/s",
+                     "call %.1f GB/s; int2 expand (worker) %.1f us/call",
                      kb, first_kb, first_us,
                      first_us > 0.0 ? first_kb * 1.024 / first_us : 0.0,
-                     dsp_us > 0.0 ? kb * 1.024 / dsp_us : 0.0);
+                     dsp_us > 0.0 ? kb * 1.024 / dsp_us : 0.0,
+                     static_cast<double>(b.expand_us) / b.calls);
       }
       if (b.misses != 0 || b.miss_rpc_us != 0) {
         std::fprintf(
