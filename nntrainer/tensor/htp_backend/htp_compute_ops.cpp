@@ -1262,12 +1262,12 @@ public:
     // stay in the tree, unused, in case a caller that is not this one
     // ever legitimately arrives with pre-quantized bytes already in hand.
     //
-    // In row chunks when the activation would not fit VTCM beside the
-    // slice double buffer (fcMaxRows): the dense FFN's down projection is
-    // K = 7168, 3.1 MiB of u8 rows at M = 444 and 7 at M = 1024. Each
-    // chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms;
-    // one call covers every K = 2048 weight up to 1,920 rows.
-    const unsigned int step = fcMaxRows(K);
+    // In row chunks of fcRowStep: the VTCM cap (fcMaxRows) -- the dense
+    // FFN's down projection is K = 7168, 3.1 MiB of u8 rows at M = 444 and
+    // 7 at M = 1024 -- and prefillRows(), so the hybrid's qkv / o_proj at
+    // P1024 stage 512-row buffers like every other prefill call (#236).
+    // Each chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms.
+    const unsigned int step = fcRowStep(K);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       invokeLayer(session, fh.handles.data(),
@@ -1294,6 +1294,16 @@ public:
       static_cast<unsigned int>((kVtcmBudget - kSliceDouble) / K);
     rows -= rows % 64u;
     return rows < 64u ? 64u : rows;
+  }
+
+  /** @brief [#236] Rows per FC call: fcMaxRows(K), capped at prefillRows()
+   *  when that is set, so no M > 1 FC asks FastRPC for staging classes the
+   *  other prefill entries never use (#225's P1024 qkv died at M = 1024 with
+   *  AEE_ERPC). Rows are independent in the layer kernel, so the chunks'
+   *  bytes are the whole call's (fc_layer_host_check). */
+  static unsigned int fcRowStep(unsigned int K) {
+    const unsigned int cap = fcMaxRows(K);
+    return prefillRows() != 0 ? std::min(cap, prefillRows()) : cap;
   }
 
   // Several Q4_0 weights that share ONE activation -- LFM2-MoE decode's
@@ -1339,8 +1349,8 @@ public:
     // M == 1, and the attention q/k/v projections at prefill (qkv_layer,
     // doc 51 section 2.21) -- 444 rows, where a heap copy in between
     // would be 5 MB a call. Row chunks as gemm_q4_0_accel_fp32 makes them,
-    // for the same VTCM reason.
-    const unsigned int step = fcMaxRows(K);
+    // for the same reasons.
+    const unsigned int step = fcRowStep(K);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       std::vector<float *> dsts(n);
@@ -1371,8 +1381,12 @@ public:
       get_or_register_qs4cx(matAdata, matAscale, session, K, N);
 
     // ponytail: see gemm_q4_0_accel_fp32's identical comment -- reverted
-    // from invokeLayerU8In for the same reason.
-    invokeLayer(session, &handle, 1, matBdata, matCdata, M, N, K);
+    // from invokeLayerU8In for the same reason. Row chunks as there.
+    const unsigned int step = fcRowStep(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step)
+      invokeLayer(session, &handle, 1, matBdata + static_cast<size_t>(m0) * K,
+                  matCdata + static_cast<size_t>(m0) * N,
+                  std::min(step, M - m0), N, K);
   }
 
   // Same grouping as gemm_q4_0_batch_fp32, for QS4CX weights -- see the
@@ -1399,18 +1413,17 @@ public:
       n_total += N[i];
     }
 
-    // Same stage-then-hand-out shape as gemm_q4_0_batch_fp32 -- see that
-    // function's comment for why: mm_u8i4_layer returns one contiguous
-    // block per handle, matCdata is one pointer per weight.
-    std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
-    invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
-                out_cat.data(), M, n_total, K);
-
-    size_t off = 0;
-    for (size_t i = 0; i < n; ++i) {
-      const size_t block = static_cast<size_t>(M) * N[i];
-      std::memcpy(matCdata[i], out_cat.data() + off, block * sizeof(float));
-      off += block;
+    // Same row chunks and per-handle blocks as gemm_q4_0_batch_fp32 -- see
+    // that function's comment: mm_u8i4_layer returns one contiguous block
+    // per handle, copyOut hands each weight its block.
+    const unsigned int step = fcRowStep(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      std::vector<float *> dsts(n);
+      for (size_t i = 0; i < n; ++i)
+        dsts[i] = matCdata[i] + static_cast<size_t>(m0) * N[i];
+      invokeLayer(session, handles.data(), static_cast<int>(n),
+                  matBdata + static_cast<size_t>(m0) * K, nullptr,
+                  std::min(step, M - m0), n_total, K, &N, &dsts);
     }
   }
 
