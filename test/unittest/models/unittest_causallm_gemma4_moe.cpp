@@ -72,7 +72,10 @@ void setupGemma4MoeDeterministicWeights(TinyGemma4MoeCausalLM &model) {
 
         weight.setValue(0.0f);
         if (layer.getType() == "rms_norm" ||
-            layer.getType() == "reshaped_rms_norm") {
+            layer.getType() == "reshaped_rms_norm" ||
+            layer.getType() == "residual_add") {
+          // residual_add: the post norm's gamma and, without a per-layer
+          // input, the layer scalar (1 keeps the residual path live)
           weight.setValue(1.0f);
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0, 0, 1, 0, 1.0f);
@@ -202,9 +205,11 @@ TEST_P(Gemma4MoeTinyModelTest, WeightBearingLayerOrderMatchesConverter) {
     // gate, up, down, post_ffn_norm_1; _sparse_moe holds pre_ffn_norm_2,
     // router_norm, the router and the experts, post_ffn_norm_2 -- each in
     // the file's order, so the tensor order is unchanged by the fusion.
+    // _post_attention_norm and _post_ffn_norm are the residual adds that
+    // hold those norms' gammas, the latter the layer scalar too.
     std::vector<std::string> block = {p + "_qkv"};
     for (const char *n : {"_attention_out", "_post_attention_norm", "_ffn",
-                          "_sparse_moe", "_post_ffn_norm", "_layer_scalar"})
+                          "_sparse_moe", "_post_ffn_norm"})
       block.push_back(p + n);
     expected.insert(expected.end(), block.begin(), block.end());
   }

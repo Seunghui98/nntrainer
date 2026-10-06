@@ -62,7 +62,10 @@ void setupGemma4DeterministicWeights(TinyGemma4CausalLM &model) {
 
         weight.setValue(0.0f);
         if (layer.getType() == "rms_norm" ||
-            layer.getType() == "reshaped_rms_norm") {
+            layer.getType() == "reshaped_rms_norm" ||
+            layer.getType() == "residual_add") {
+          // residual_add: the post norm's gamma and, without a per-layer
+          // input, the layer scalar (1 keeps the residual path live)
           weight.setValue(1.0f);
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0, 0, 1, 0, 1.0f);
