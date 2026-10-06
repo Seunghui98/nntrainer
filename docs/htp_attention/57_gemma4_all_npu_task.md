@@ -358,5 +358,30 @@ config(`g4-npu-512/nntr_config.json`)에 더할 키:
 1. 기기 gtest `unittest_hvx_attn_f16 --gtest_filter='*PrefillWideHeads*'` (hd 512 커널 게이트).
 2. `g4-npu-512` 일반 빌드: prefill/decode TPS, 512토큰 텍스트.
 3. 446토큰 `NNTR_PPL=1`: nll (기준 4.556; QS4CX FC면 4.510 근처 기대).
-4. `--profile` 빌드로 `g4-prof-npu` → `prefill_timeline.py --by-op --by-layer`.
-5. 각 단계를 가르려면 config 키를 하나씩 켠다: `attention_engine`만(§5-3), 거기에 engine 키 셋(§5-2·5-4), 마지막에 QS4CX 파일(§5-8).
+4. `--profile` 빌드로 `g4-prof-npu` → `prefill_timeline.py --config nntr_config.json --by-op --by-layer`. 이 브랜치의 그래프 이름(`qkv`, `ffn`, `post_attention_norm`, `post_ffn_norm`, `attention`)을 CPU/NPU 열로 가른다.
+5. 각 단계를 가르려면 config 키를 하나씩 켠다: `attention_engine`만(§5-3), 거기에 engine 키 셋(§5-2·5-4·9.3·9.5), 마지막에 QS4CX 파일(§5-8). router(§9.4)는 `moe_engine`을 따른다.
+
+§9.3–9.5 이후 `[HTP-PROFILE]` 표에서 새로 보이는 행: FC 행 `K=2816 N=2816`(post_attention_norm의 epilogue), `K=5632 N=2816`(post_ffn_norm: dense+MoE 두 addend), `K=2816 N=128`(router). RoPE는 qkv 호출 안이라 행이 따로 없다(호출 시간에 포함). 기대 효과(산술): §3의 CPU 몫 중 norm·add·scalar 약 420 ms + router 191 ms + RoPE(§3에서 attention 본체에 섞여 있던 몫)가 DSP 호출로 바뀐다. 호출당 전송 0.1–0.2 ms × 층당 3회 × 30층 ≈ 10–20 ms가 새 비용. **기기 미측정.**
+
+정확도 게이트: nll이 4.51±0.02 밖이면 §9.3(epilogue)·§9.5(RoPE)를 config로는 끌 수 없으므로 `NNTR_MOE_DIFF`처럼 층별 대조가 필요하다. 가장 빠른 분리: `attn_proj_engine: cpu`(qkv·attention_out·post_attention_norm이 CPU로, RoPE도 CPU 경로) → nll이 돌아오면 §9.5/9.3-attention 쪽, 아니면 `dense_ffn_engine: cpu`로 §9.3-ffn 쪽.
+
+### 9.6 지금 기준 층별 실행 위치 (prefill, 2026-10-06 코드 기준, 기기 미측정)
+
+config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(qkv, attention, attention_out, post_attention_norm, ffn, router, MoE, post_ffn_norm; dense만 있는 층은 6회).
+
+| 그래프 노드 | 하는 일 | 어디서 | 비고 |
+|---|---|---|---|
+| `embedding0` | 토큰 임베딩, ×√hidden | **CPU** | 남긴다 |
+| `layer{i}_qkv` | attention_norm → q/k/v 투영(QS4CX) → q_norm·k_norm·v_norm·√hd → RoPE | NPU 1호출 | `mm_u8i4_layer_norm`(+rope) |
+| `layer{i}_attention` | HMX flash attention(hd 256/512); k/v fp16 캐시 변환은 CPU memcpy급 | NPU | `attn_f16_prefill` |
+| `layer{i}_attention_out` | o 투영(QS4CX) | NPU 1호출 | 512열 슬라이스 |
+| `layer{i}_post_attention_norm` | post_attention_norm + 잔차 add | NPU 1호출 | `rmsnorm_add_f32`; decode(M=1)는 CPU |
+| `layer{i}_ffn` | pre_ffn_norm → gate/up(QS4CX) → GeGLU → down → post_ffn_norm_1 | NPU 1호출 | dense FFN 호출 |
+| `layer{i}_sparse_moe` router | pre_ffn_norm_2·router_norm → 2816×128 로짓 | NPU 1호출 | softmax·top-8·가중치 정규화는 CPU(작음) |
+| `layer{i}_sparse_moe` experts | 128 expert 중 8, GeGLU, post_ffn_norm_2 | NPU 1호출 | `mm_u8i4_moe_layer_norm`, flash 선읽기 |
+| `layer{i}_post_ffn_norm` | dense+MoE 합 → post_ffn_norm → 잔차 add → layer_scalar | NPU 1호출 | `rmsnorm_add_f32`(x2); decode는 CPU |
+| KV 공유 층(마지막 N층) | prefill을 건너뜀(skip_prefill) | — | decode 전용; q는 FC+norm+scalar, RoPE는 core |
+| `output_norm`, `lm_head`, softcap | 마지막 행만 | **CPU** | lm_head 370 MB 등록 비용 → 기기 측정 뒤 결정 |
+| ARM staging memcpy | 호출마다 입력/출력 복사 | **CPU** | `[HTP-PROFILE] arm staging` |
+
+
