@@ -19,8 +19,8 @@ The log does not say where a node ran, so the unit column comes from the
 run's nntr_config.json: the engine keys and their *_htp_layers lists, by
 the rule the model builders apply (an empty list means every layer). An
 "htp" engine runs the prefill (M > 1) on the NPU; decode is not shown
-here. Every other node is CPU. The MoE node is NPU though its router and
-top-k run on the CPU inside it (NNTR_M0_PROFILE splits them).
+here. Every other node is CPU. The MoE node is NPU though its top-k runs
+on the CPU inside it (NNTR_M0_PROFILE splits them).
 """
 import argparse
 import collections
@@ -30,13 +30,18 @@ import re
 LAYER = re.compile(r"^layer(\d+)_(.+)$")
 ROW = re.compile(r"^\s*(\S+):forward\((\w+)\)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)")
 
-# op name in the graph -> (engine key, layer list key)
+# op name in the graph -> (engine key, layer list key or None). The fused
+# names (qkv, ffn, the two residual adds that carry the post norms) follow
+# the projection before them, as the model builder gives them its engine;
+# the unfused names stay for older graphs.
 ENGINE_KEYS = {
     **{op: ("attn_proj_engine", "attn_proj_htp_layers")
-       for op in ("wq", "wk", "wv", "attention_out")},
+       for op in ("wq", "wk", "wv", "qkv", "attention_out",
+                  "post_attention_norm")},
     **{op: ("dense_ffn_engine", "dense_ffn_htp_layers")
-       for op in ("ffn_gate", "ffn_up", "ffn_down")},
+       for op in ("ffn_gate", "ffn_up", "ffn_down", "ffn", "post_ffn_norm")},
     "sparse_moe": ("moe_engine", "moe_htp_layers"),
+    "attention": ("attention_engine", None),
 }
 
 
@@ -49,6 +54,8 @@ def unit_fn(config_path):
         keys = ENGINE_KEYS.get(op)
         if keys is None or cfg.get(keys[0], "cpu") != "htp":
             return "CPU"
+        if keys[1] is None:
+            return "NPU"
         ids = {int(t) for t in str(cfg.get(keys[1], "")).split(",") if t.strip()}
         return "NPU" if not ids or layer in ids else "CPU"
 
