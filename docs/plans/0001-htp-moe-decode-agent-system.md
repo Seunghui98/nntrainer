@@ -179,7 +179,7 @@ sets everything below; agents put that line first in every shell.
 | Host build | `build/` (`meson setup build -Denable-transformer=true -Denable-tflite-backbone=false -Denable-tflite-interpreter=false`; no `flatc` here) | host gtests, `nntr_quantize_stream`, `run_host_checks.sh` |
 | Models | `/local/mnt/workspace/models/lfm2.5-8b-a1b/{hf,fp32,q40,q40-qs4cx-wh}` (§11) | `NNTR_MODEL_DIR` |
 | clang-format-14 | `~/.local/bin/clang-format-14` | AGENTS.md rule, changed lines only |
-| adb | `/usr/bin/adb` | **Since 2026-10-02 no device is attached and agents do not run adb** (§12, 2026-10-02 row): a task that needs silicon numbers files its handoff as an issue / issue comment (`needs-user` + `state:needs-measurement`, full path and commands) and the user runs it from a device-farm session. Between 2026-09-30 and 2026-10-01 agents ran the sittings themselves (`adb -s <serial>`, serial named by the issue or the user, handoff doc as the record, text approval the user's); that row applies again only when the user attaches a unit and says so. **Gemma (2026-10-02, user):** the Gemma sittings (#201 S5 / S6) run on a Galaxy S26 Ultra attached to this workstation via adb (§4.2, §12 row); who runs that adb (agent or user) is not yet decided |
+| adb | `/usr/bin/adb` | **Since 2026-10-02 no device is attached and agents do not run adb** (§12, 2026-10-02 row): a task that needs silicon numbers files its handoff as an issue / issue comment (`needs-user` + `state:needs-measurement`, full path and commands) and the user runs it from a device-farm session. Between 2026-09-30 and 2026-10-01 agents ran the sittings themselves (`adb -s <serial>`, serial named by the issue or the user, handoff doc as the record, text approval the user's); that row applies again only when the user attaches a unit and says so. **Gemma (2026-10-02 / 10-06, user):** the Gemma sittings (#201 S5 / S6) run on a Galaxy S26 Ultra attached to this workstation via adb, and **the agent drives that adb itself** (decided 2026-10-06; serial given by the user when attached, handoff doc as the record, text approval the user's — the 2026-10-01 row's rule set). The no-adb / handoff-via-issue rule stays for the S25 / LFM2.5 route only |
 
 **No Hexagon simulator in this project** (user decision 2026-09-21). Kernel
 correctness is decided by host scalar specs and bit-identity checks (gate 1)
@@ -206,13 +206,18 @@ column. Its serial is given by the user when attached.
 **Device scope since 2026-10-02 (user):** two routes by model.
 **LFM2.5-8B-A1B** keeps the S25 / device-farm handoff route of the
 2026-10-02 row (the user runs the filled handoff from a farm session);
-#222's config-of-record sitting is the closing LFM2.5 sitting, after which
-the LFM2.5 table is closed out. **Gemma (#201 S5 / S6)** sittings run on a
-Galaxy S26 Ultra attached to this workstation via adb; whether an agent or
-the user drives that adb is the user's call (the 2026-10-01 row allowed
-agents on `R5KL20NFRCK`; it is not yet extended to this unit). Results are
-read inside one sitting as before; the S26 Ultra is a new BENCHMARK column,
-not a continuation of the S25 one.
+#222's config-of-record sitting (2026-10-02, farm `R3CY205ZMND`) was meant
+to be the closing LFM2.5 sitting; it failed (one PD cannot load the FC WH
+copies, hybrid P1024 `AEE_ENOMEMORY`, hybrid accuracy +42 % prefill PPL —
+LEDGER rule 63, §2 #222 row), so **the LFM2.5 table of record is now 9
+cells × 3 cases** (P64 / P512 / P1024 × G64 / G512 / G1024, for CPU only,
+hybrid and E2E one PD, all on the config of record, `init_seq_len 1024`;
+user 2026-10-06) and closes after #225's fix (FC weights as `QS4CX_WH` in
+the model file), on the base `htp_first_version` (§5). **Gemma (#201 S5 /
+S6)** sittings run on a Galaxy S26 Ultra attached to this workstation via
+adb, **driven by the agent** (user 2026-10-06; the 2026-10-01 row's rule set
+applies to that unit). Results are read inside one sitting as before; the
+S26 Ultra is a new BENCHMARK column, not a continuation of the S25 one.
 
 Handoff rules (user decisions Q3, Q13, Q18, Q19):
 
@@ -249,6 +254,17 @@ Handoff rules (user decisions Q3, Q13, Q18, Q19):
   cycle; merging them is the user's decision (Q16).
 * Work branches `htp/<issue#>-<slug>`, PRs into `htp_moe`, linear history
   (rebase, never merge commits — the static check rejects empty bodies).
+* **Two bases since 2026-10-06 (user):** `htp_decode` carries the Gemma
+  track (#201 S4 → S6; upstream nntrainer/nntrainer#4296 pinned at
+  `d345c3470` is merged into it by #201 S4). The LFM2.5 remainder (#225:
+  the FC weights as `QS4CX_WH` in the model file, then the 9 × 3 table of
+  record) lives on **`htp_first_version`**, which the user fast-forwarded to
+  `htp_decode` @ `c7ec6c64a` and then merged PR #223 into (`b7c1d4ff6`);
+  #225's plans, PRs and handoffs target `htp_first_version`, never
+  `htp_decode`. The supervisor's docs stay on `htp_decode`; a doc hunk a
+  PR lands on `htp_first_version` is mirrored verbatim into `htp_decode`
+  by the supervisor (PR #223's two BENCHMARK artifact rows and LEDGER §3a
+  note, cycle 33) so the two copies merge cleanly later.
 * `hvx_impl` is frozen: no cycles, no deletion. Its issues are closed or
   labelled out of the queue (§7).
 * **Upstream-shaped** (Q14): follow AGENTS.md (DCO sign-off, `[component]`
@@ -373,6 +389,8 @@ recorded in BENCHMARK.md's artifact section once built.
 
 | date | decision |
 |---|---|
+| 2026-10-06 | **#201 S4 unblocked; the agent drives adb on the attached S26 Ultra (user, on #201).** (a) Upstream nntrainer/nntrainer#4296 (Gemma 4 on the CPU) is merged into `htp_decode` now, pinned at `d345c3470`, the four conflicting files (`quantize.cpp`, `neuralnet.cpp`, `fallback.{h,cpp}`) resolved by the implementer; (b) the Gemma HTP MoE layer (`QS4CX_WH` experts + pool, modelled on `lfm2_moe_layer.cpp`) and the `nntr_quantize_stream` `QS4CX_WH` writer for Gemma's `expert_*` names move from S5 into S4; (c) a generated Gemma tiny fixture at head_dim ≥ 64 (default 64 / global 128) is added next to #4296's hd8 one, which stays. The rest of S4 is: the pin merge → name-keyed parameter hand-over + backend binding (one RoPE table per op, `ROUTER_BIAS`, `HEXKL_MOE_FLAG_GEGLU`) → fixture → `run_inproc_e2e.sh` Gemma lines, as several PRs. **Device:** Gemma (S5 / S6) sittings run on the S26 Ultra attached to the workstation and **the agent drives that adb itself** (closes the 2026-10-02 open question; §4.1 / §4.2); the no-adb / handoff-via-issue rule stays for the S25 / LFM2.5 route. The `google/gemma-4-26B-A4B` files are not on the workstation yet; the user brings them for S5. Same day: PR #221 (S4 graph builder) merged `78e597a5b` |
+| 2026-10-06 | **The #222 closing sitting failed; the LFM2.5 table of record is 9 cells × 3 cases after #225, on `htp_first_version` (user, on #222).** The 2026-10-02 farm sitting (`R3CY205ZMND`) read: one PD + C = 28 cannot load the engine keys' FC WH copies (`mapped=3712 MiB, fastrpc_mmap(32 MiB) failed`), the hybrid fails at P1024 in `nntr_hvx_mm_u8i4_conv_block` (`AEE_ENOMEMORY`: the conv block's M-proportional DSP-heap scratch beside the ≈ 216 MiB of WH copies), and the hybrid's accuracy fails (prefill PPL 90.31 → 128.31, +42 %; decode PPL 1.2108 → 1.3752, +13.6 %; G64 text loops) — two stacked quantizations (Q4_0 then per-column qs4cx at load). Decisions: the Qnew C = 24 follow-up is **cancelled**; the table of record is **P64 / P512 / P1024 × G64 / G512 / G1024 for CPU only, hybrid and E2E one PD, all on the config of record (`init_seq_len 1024` stays)**; the fix is **option (b): the FC weights stored as `QS4CX_WH` in the model file** by the packer, one copy for HTP prefill (HMX) and E2E decode (WH GEMV), the CPU keeping Q4_0 — filed as **#225** (p0, `state:needs-plan`, base `htp_first_version`); its accuracy threshold (contract §1's ≤ 1.02 × A vs #201's "loops / off-context fail") is open, `needs-user` before the handoff. **PR #223 was retargeted to `htp_first_version` and merged there (`b7c1d4ff6`)**; `htp_first_version` = `htp_decode` @ `c7ec6c64a` + #223. #222 closed `completed` (the config of record is in, `docs/measurements/config/q40-qs4cx-wh.nntr_config.json`); no LFM2.5 row of record moves (the handoff is unfilled; the numbers live in #222's comments and the farm session's logs). Devices: LFM2.5 on the S25 via the farm (user runs); Gemma on the attached S26 Ultra (agent drives adb) |
 | 2026-10-02 | **Gemma device measurements run on a Galaxy S26 Ultra attached to the workstation via adb (user).** The Gemma sittings (#201 S5 / S6: Gemma-4-26B-A4B end to end on the NPU, then its levers) happen on an S26 Ultra connected to the workstation, not through the device farm; the S25 / device-farm handoff route of the row below stays for LFM2.5, whose closing sitting is #222. The S26 Ultra gets its own BENCHMARK column (the S25 column is frozen; the #208 developer-unit appendix is not its baseline). **Open: who runs adb on that S26** — the 2026-10-01 row allowed agents on `R5KL20NFRCK`; until the user says so for this unit, agents do not run adb (§4.1) and Gemma sittings are filed as handoffs |
 | 2026-10-02 | **The LFM2.5 table is closed out on the #222 config of record, then the project moves to Gemma (user, on #222).** The proposed `nntr_config.json` is adopted in full (`conv_block_engine`, `dense_ffn_engine`, `attn_proj_engine` = `htp`, `init_seq_len 1024`, the pure fixes), overriding plan 222's "adopt conv_block only"; the PPL cost of `attn_proj` / `dense_ffn` (doc 51: +4.5 / +4.2 %) is accepted and re-read in the closing sitting. Where the engine keys conflict with the decode-side code they are resolved so that they take effect at prefill without breaking either decode path (PR #223: the one-layer `dense_ffn` form now asks `htpDecodeRowResident`; host qs4cx converter fix; decode unchanged on both paths). The closing sitting (`docs/measurements/222-config-refresh.md`, PR #223, S25 via the farm) is being run by the user; the LFM2.5 prefill / decode rows of record move only through its mirrored old-config / new-config A pair, and no LFM2.5 number is folded before PR #223 merges. Same day: PR #218 merged as `238a280b7` — `NNTR_MOE_FADVISE` env-only, default **not flipped** (prefill −7 to −18 %, rule 62); #216 closed |
 | 2026-10-02 | **No device on the workstation: agents do not run adb; every device measurement is a filed handoff the user runs from a session on the device farm (user).** The S25 Ultra `R3CY10WM83Y` is disconnected from the workstation. From this date a task that needs silicon numbers ends in a handoff (`docs/measurements/<n>-*.md` on the branch: variants, staged set + md5s, the run script, expected log lines, empty tables) **and** a GitHub issue or an issue comment on the task issue that carries the full handoff path and the commands, labelled `needs-user` + `state:needs-measurement`; the user runs it from another session connected to the device farm, fills the tables, and the supervisor folds them (§4.2 rule set unchanged: control first, A/B inside one sitting, md5 gate, text approval by the user). This replaces the 2026-10-01 "agents run adb" row and the §4.1 adb row for as long as no unit is attached; when a unit is attached again the user says so and the 2026-10-01 row applies. The #216 lever's two sittings (23:06–23:36 KST on 2026-10-01) ran before the disconnect and are folded in cycle 30 |
