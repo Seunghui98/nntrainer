@@ -32,9 +32,11 @@ def bundle(viewer_path, traces):
     raise SystemExit("%s has no embedded-traces slot" % viewer_path)
   emb = {}
   for spec in traces:
-    name, _, path = spec.partition("=")
-    if not path:
-      path, name = name, os.path.basename(name)
+    # split on the LAST '=': names may carry one (NNTR_HTP_PROFILE=2), paths
+    # practically never do
+    name, sep, path = spec.rpartition("=")
+    if not sep:
+      path, name = spec, os.path.basename(spec)
     with open(path) as f:
       emb[name] = json.load(f)
   payload = json.dumps(emb, separators=(",", ":")).replace("</", "<\\/")
