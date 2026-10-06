@@ -309,6 +309,7 @@ int nntr_hvx_close(remote_handle64 handle) {
   }
   hvx_worker_pool_destroy(s->quant_pool);
   free(s->fc_l2);
+  free(s->norm_rows);
   if (s->vtcm_ctx) {
     HAP_compute_res_release(s->vtcm_ctx);
   }

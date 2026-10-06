@@ -99,6 +99,23 @@ interface nntr_hvx : remote_handle64 {
                                  rout sequence<float> out_cat,
                                  rout sequence<uint32> stage_us);
 
+   // mm_u8i4_layer with the RMSNorms a block runs around its projections
+   // folded into the call (doc 57 section 5 step 4), so the rows do not
+   // round-trip for them. pre_gamma (K floats, or empty for none): every
+   // activation row is normed over its K floats, times gamma, before the
+   // quantizer. post_chunk (one per handle, or empty for none; 0 = that
+   // handle untouched) and post_gamma (the chunks of every normed handle
+   // in call order, concatenated): handle i's output rows are normed per
+   // post_chunk[i]-wide piece (N_i for a whole-row norm, the head dim for
+   // a per-head one), times its gamma, in place. eps for both.
+   AEEResult mm_u8i4_layer_norm(in uint32 M, in uint32 K, in float eps,
+                                in sequence<float> pre_gamma,
+                                in sequence<uint32> post_chunk,
+                                in sequence<float> post_gamma,
+                                in sequence<uint32> w_handles,
+                                in sequence<float> act_f32,
+                                rout sequence<float> out_cat);
+
    // Same as mm_u8i4_layer, but the caller has already quantized AND
    // AH-tile-packed the activation on the ARM side (htp_act_quant.h's
    // htp_quant_pack_u8_ah, bit-for-bit matching hvx_quant_rows_u8_params +
@@ -344,6 +361,23 @@ interface nntr_hvx : remote_handle64 {
                                      in sequence<float> act_f32,
                                      rout sequence<float> out_f32,
                                      rout sequence<uint32> stage_us);
+
+   // mm_u8i4_moe_layer with the block's norms folded in, as
+   // mm_u8i4_layer_norm does for the FC call: pre_gamma (K floats, or
+   // empty) norms every activation row before the call, post_gamma (N_out
+   // floats, or empty) norms every output row after it, in place.
+   AEEResult mm_u8i4_moe_layer_norm(in uint32 M, in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 act,
+                                    in float eps,
+                                    in sequence<float> pre_gamma,
+                                    in sequence<float> post_gamma,
+                                    in sequence<uint32> h_gate_up,
+                                    in sequence<uint32> h_down,
+                                    in sequence<uint32> row_index,
+                                    in sequence<uint32> row_count,
+                                    in sequence<float> row_weight,
+                                    in sequence<float> act_f32,
+                                    rout sequence<float> out_f32);
 
    // [doc 51 section 2] An LFM2 conv block -- in_proj, a*c, causal conv1d,
    // *b, out_proj -- in one call, so its four M x C f32 intermediates never

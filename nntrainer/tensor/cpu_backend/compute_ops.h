@@ -210,6 +210,22 @@ public:
                                     unsigned int M, std::vector<unsigned int> N,
                                     unsigned int K);
 
+  // gemm_q4_0_batch_fp32 with the RMSNorms a block runs around its
+  // projections folded into the same accelerator call (doc 57 section 5
+  // step 4), so the rows do not leave the accelerator for them: pre_gamma
+  // (K floats, or nullptr) norms every activation row before the
+  // quantizer; post_chunk[i] (one per weight; 0 = none) and post_gamma
+  // (the chunks of every normed weight in call order, concatenated) norm
+  // weight i's output rows per post_chunk[i]-wide piece, in place. eps
+  // for both. A backend without it says so and the layer norms itself.
+  virtual bool supports_gemm_q4_0_batch_norm_fp32() const { return false; }
+  virtual void gemm_q4_0_batch_norm_fp32(
+    std::vector<void *> matAdata, float *matBdata,
+    std::vector<float *> matCdata, unsigned int M, std::vector<unsigned int> N,
+    unsigned int K, const float *pre_gamma,
+    const std::vector<unsigned int> &post_chunk, const float *post_gamma,
+    float eps);
+
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,
@@ -305,7 +321,8 @@ public:
     const std::vector<unsigned int> &row_count,
     const std::vector<float> &row_weight, const float *act, float *out,
     unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
-    bool weights_wh, bool gelu = false);
+    bool weights_wh, bool gelu = false, const float *pre_gamma = nullptr,
+    const float *post_gamma = nullptr, float eps = 0.0f);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate
@@ -503,12 +520,21 @@ public:
   // "expert" whose down output is summed into out.
   // register_q4_0_dense_ffn is the load-time twin, like the two above.
   virtual bool supports_gemm_q4_0_dense_ffn_fp32() const { return false; }
+  // pre_gamma (K floats) / post_gamma (N floats), nullptr for none, and
+  // eps: the RMSNorms before and after the block, folded into the call as
+  // gemm_q4_0_batch_norm_fp32 folds them.
   virtual void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
                                         const float *act, float *out,
                                         unsigned int M, unsigned int K,
                                         unsigned int I, unsigned int N,
-                                        bool gelu = false) {
+                                        bool gelu = false,
+                                        const float *pre_gamma = nullptr,
+                                        const float *post_gamma = nullptr,
+                                        float eps = 0.0f) {
     (void)gelu;
+    (void)pre_gamma;
+    (void)post_gamma;
+    (void)eps;
     (void)up;
     (void)gate;
     (void)down;
