@@ -317,7 +317,8 @@ MoE 층의 router(`router_norm` + 2816×128 f32 dot, CPU 191 ms/30층)를 prefil
 - 게이트: M>1, E%32==0, E≤128, FP32. decode(M=1)는 CPU dot(호출 1회 비용 > 2816×128 MAC).
 - 검증: `router_rows_host_check`(ROUTER ROWS OK, worst_rel 2.6e-7, 4 shape + 거부 3), `swap_host_check`가 skel 파일을 새 entry와 함께 링크, `htp_syntax_check.sh`, `unittest_causallm_models`(CPU 경로).
 - ponytail: 가중치 1.4 MB가 호출마다 FastRPC로 넘어간다(층당 prefill 1회). profile에서 K=2816 N=128 행으로 보인다.
-- CPU에 남는 것(prefill): embedding, RoPE(attention 호출 전 q/k 회전), softmax top-8(작음), lm_head·softcap. → RoPE는 §9.5.
+- (2026-10-06 추가) softmax·top-8·가중치 정규화도 같은 호출 안으로: `hvx_router_topk_rows_f32`(기존 `hvx_softmax_rows_f32` 재사용 + 첫 최대값 스캔, 동률이면 낮은 index = CPU comparator). host check에서 CPU 선택과 **mismatch 0**(정수 로짓의 정확한 동률 포함), 가중치 worst_rel 2.8e-7. 층은 sel/weight로 `expert_assignments`와 prefetch 힌트(top-8+5)를 바로 만든다. sigmoid router(LFM2)는 기존대로 로짓만.
+- CPU에 남는 것(prefill): embedding, RoPE(attention 호출 전 q/k 회전), lm_head·softcap. → RoPE는 §9.5.
 
 ### 9.5 RoPE를 qkv 호출의 post 단계로 (2026-10-06), 기기 미측정
 
@@ -326,7 +327,7 @@ MoE 층의 router(`router_norm` + 2816×128 f32 dot, CPU 191 ms/30층)를 prefil
 - 검증: `rope_rows_host_check`(CPU 커널 연산 순서와 비트 일치, hd 256·512(partial 0.25)·64, 거부 3), `swap_host_check`(확장된 entry 링크), `htp_syntax_check.sh`, `unittest_causallm_models`(Gemma4 golden logits가 CPU 경로의 RoPE 이동을 검증).
 - KV 공유 층(`createSharedAttention`)은 q만 FC+norm+scalar로 만들고 core의 RoPE를 그대로 쓴다(prefill을 건너뛰는 층).
 - ponytail: `rope_scaling_factor`는 1.0 가정(yarn은 거부 → core의 use_rope를 켠다).
-- CPU에 남는 것(prefill): embedding, softmax top-8(작음), lm_head·softcap, ARM staging memcpy.
+- CPU에 남는 것(prefill): embedding, lm_head·softcap, ARM staging memcpy.
 
 ### 9.2 기기 실행 가이드 (이 브랜치)
 
@@ -377,7 +378,7 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 | `layer{i}_attention_out` | o 투영(QS4CX) | NPU 1호출 | 512열 슬라이스 |
 | `layer{i}_post_attention_norm` | post_attention_norm + 잔차 add | NPU 1호출 | `rmsnorm_add_f32`; decode(M=1)는 CPU |
 | `layer{i}_ffn` | pre_ffn_norm → gate/up(QS4CX) → GeGLU → down → post_ffn_norm_1 | NPU 1호출 | dense FFN 호출 |
-| `layer{i}_sparse_moe` router | pre_ffn_norm_2·router_norm → 2816×128 로짓 | NPU 1호출 | softmax·top-8·가중치 정규화는 CPU(작음) |
+| `layer{i}_sparse_moe` router | pre_ffn_norm_2·router_norm → 2816×128 로짓 → softmax·top-8·가중치 | NPU 1호출 | expert_assignments 구성만 CPU |
 | `layer{i}_sparse_moe` experts | 128 expert 중 8, GeGLU, post_ffn_norm_2 | NPU 1호출 | `mm_u8i4_moe_layer_norm`, flash 선읽기 |
 | `layer{i}_post_ffn_norm` | dense+MoE 합 → post_ffn_norm → 잔차 add → layer_scalar | NPU 1호출 | `rmsnorm_add_f32`(x2); decode는 CPU |
 | KV 공유 층(마지막 N층) | prefill을 건너뜀(skip_prefill) | — | decode 전용; q는 FC+norm+scalar, RoPE는 core |
