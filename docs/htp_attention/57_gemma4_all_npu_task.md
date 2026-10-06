@@ -351,9 +351,10 @@ config(`g4-npu-512/nntr_config.json`)에 더할 키:
 "attn_proj_engine": "htp",
 "dense_ffn_engine": "htp",
 "moe_engine": "htp",
-"fc_layer_dtype": "QS4CX",
-"model_tensor_type": "QS4CX-FP32"
+"fc_layer_dtype": "QS4CX"
 ```
+
+`model_tensor_type`은 기존 값(`Q4_0-FP32`)을 그대로 둔다. 이 키는 dtype을 따로 받지 않는 층 전부의 기본 가중치 dtype이라, QS4CX로 바꾸면 의도하지 않은 층까지 바뀐다. FC(qkv, attention_out, dense FFN)는 `fc_layer_dtype`을, expert는 `moe_layer_dtype`(`QS4CX_WH`)을 읽는다.
 
 측정 순서(§7.5의 `cool` 뒤, 한 번에 하나):
 1. 기기 gtest `unittest_hvx_attn_f16 --gtest_filter='*PrefillWideHeads*'` (hd 512 커널 게이트).
