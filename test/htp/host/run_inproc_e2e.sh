@@ -122,6 +122,22 @@
 #                              all-resident E run of the same fixture)
 #   E2E e2e pds=2 refused ok   (#211: NNTR_HTP_E2E_PDS is a guard, the
 #                              two-PD path is gone)
+# and, since plan 201 S4, the Gemma 4 MoE fixture at head_dim 64 / global
+# 128 (gemma4_moe_tiny_hd64: two KV cache widths, k = v full layer,
+# seeded norms and layer_scalar, the final soft-cap) through #4296's CPU
+# model (gemma4_moe, QS4CX experts), the HTP MoE layer alone (lfm2_moe's
+# softmax router, QS4CX_WH, GeGLU) and NNTR_HTP_E2E=1 (the list built
+# after load, its parameters handed by name), all-resident and pooled:
+#   E2E gemma64 tokens off==cpu 8/8 expected_mismatch=0   (the HTP MoE
+#                              layer against #4296's CPU one)
+#   E2E eval gemma64-off-vs-cpu ... min_snr_db=<x>     (printed)
+#   E2E fwd gemma64 e3 calls/token=1.00 attn_caches=2 timeouts=0 ok
+#   E2E eval gemma64-e3 ... min_snr_db=<x>             (x >= 20 gated, vs the
+#                              off run; measured 27.6, a swapped gamma,
+#                              router scale, q | k gamma, up / gate or a
+#                              dropped layer_scalar reads 0-10)
+#   E2E tokens gemma64 e3==off 8/8 expected_mismatch=0
+#   E2E e3 pool C=2 gemma64 == e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -161,6 +177,7 @@ GOLDEN="$HERE/golden/lfm2_moe_tiny"
 GOLDEN64="$HERE/golden/lfm2_moe_tiny_hd64"
 FIX25="$ROOT/test/unittest/models/causallm_reference/lfm2_moe_tiny_lfm25"
 GOLDEN25="$HERE/golden/lfm2_moe_tiny_lfm25"
+FIXG="$ROOT/test/unittest/models/causallm_reference/gemma4_moe_tiny_hd64"
 EVAL="python3 $ROOT/tools/htp/htp_dump_eval.py"
 PROMPT=16
 STEPS=8
@@ -193,6 +210,13 @@ if [ ! -f "$FIX64/nntr_lfm2_moe_tiny_fp32.bin" ]; then
   echo "  git checkout -- $FIX64/" >&2
   exit 1
 fi
+GENG="test/unittest/models/causallm_reference/generators/generate_gemma4_moe_reference.py"
+if [ ! -f "$FIXG/nntr_gemma4_moe_tiny_fp32.bin" ]; then
+  echo "E2E FAIL gemma hd64 fixture weights missing: run" >&2
+  echo "  python3 $GENG --hidden 128 --inter 64 --heads 2 --kv-heads 1 --head-dim 64 --global-head-dim 128 --global-kv-heads 1 --layer-types sliding_attention,sliding_attention,full_attention --max-pos 32 --sliding-window 8 --experts 8 --top-k 2 --moe-inter 32 --final-softcap 30 --random-layer-scalar --random-norms --router-scale 50 --seed 12 --out $FIXG" >&2
+  echo "  git checkout -- $FIXG/" >&2
+  exit 1
+fi
 if [ ! -f "$FIX25/nntr_lfm2_moe_tiny_fp32.bin" ]; then
   echo "E2E FAIL lfm25 fixture weights missing: run" >&2
   echo "  python3 $GEN --dim 2048 --n-heads 32 --n-kv-heads 8 --head-dim 64 --max-pos 2048 --layer-types conv,conv,attention,conv,attention,conv --num-dense 2 --rope-theta 5000000 --moe-inter 256 --out $FIX25" >&2
@@ -221,6 +245,7 @@ run_e2e() { # run_e2e <label> <model dir> <engine> <dump dir> <log> [args]
     --steps $STEPS --moe-engine "$engine" --dump "$dump" "$@" 2>&1 | tee "$log"
   grep -q '^E2E gen ' "$log" || { echo "E2E FAIL no gen line in $label"; exit 1; }
 }
+logits_only() { mkdir -p "$2" && cp "$1"/logits_*.f32 "$2/"; }
 calls_per_token() { # the backend's close-time summary line
   sed -n 's/.*forward calls=[0-9]* tokens=[0-9]* calls\/token=\([0-9.]*\).*/\1/p' "$1"
 }
@@ -339,6 +364,28 @@ for c in 1 2; do
   PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=$c \
     run_e2e q25-e3pool$c "$OUT/htp25q" htp "$OUT/dump_25e3pool$c" "$OUT/25e3pool$c.log" --max-seq 2048
 done
+# [plan 201 S4] the Gemma 4 MoE fixture: #4296's CPU model (QS4CX
+# experts), the HTP MoE layer alone (QS4CX_WH), the E2E token, and the
+# token with a pool of 2 of the 8 experts a layer
+"$Q" "$FIXG" -o "$OUT/g64cpu" --fc_dtype Q4_0 --moe_dtype QS4CX \
+  --embd_dtype Q4_0 > "$OUT/q_g64cpu.log"
+"$Q" "$FIXG" -o "$OUT/g64htp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64htp.log"
+run_gemma() { # run_gemma <label> <model> <engine> [env...]: run_e2e on FIXG
+  local label=$1 model=$2 engine=$3
+  shift 3
+  local rc=0
+  env "$@" "$E2E" --model "$OUT/$model" --tokenizer "$FIXG/tokenizer.json" \
+    --prompt $PROMPT --steps $STEPS --moe-engine "$engine" \
+    --dump "$OUT/dump_$label" --max-seq 32 > "$OUT/$label.log" 2>&1 || rc=$?
+  if [ $rc != 0 ] || ! grep -q '^E2E gen ' "$OUT/$label.log"; then
+    echo "E2E FAIL $label rc=$rc"; tail -3 "$OUT/$label.log"; exit 1
+  fi
+}
+run_gemma g64cpu g64cpu cpu
+run_gemma g64off g64htp htp
+run_gemma g64e3 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3pool2 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -441,6 +488,36 @@ for d in "64e3 64e3pool2 hd64 2" "25e3 25e3pool1 lfm25 1" "25e3 25e3pool2 lfm25 
     echo "E2E FAIL e3 pool C=$4 $3: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
   fi
 done
+# [plan 201 S4] the Gemma lines: the HTP MoE layer against #4296's CPU
+# model by tokens (its SNR printed: QS4CX on both, the HTP's quantizer and
+# GeGLU against the CPU's); the E2E token one call a token on both
+# attention caches, its logits within the floor of the off run and its
+# tokens by the policy; the pool bit-identical to the all-resident token.
+# The floor: the off run reads 27.6 dB at worst, every hand-over mutant
+# 0-10 (plan 201 S4, PR body), 20 sits between.
+for d in g64cpu g64off g64e3 g64e3pool2; do logits_only "$OUT/dump_$d" "$OUT/ref_$d"; done
+$EVAL --label 'gemma64 off==cpu' --tokens-policy "$OUT/ref_g64cpu" "$OUT/ref_g64off" | tail -1 || fail=1
+$EVAL --label gemma64-off-vs-cpu --allow-diff "$OUT/ref_g64cpu" "$OUT/ref_g64off" | tail -1 || true
+calls="$(calls_per_token "$OUT/g64e3.log")"
+caches="$(grep -c '^\[HTP\] attn_m1: registered ' "$OUT/g64e3.log" || true)"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3.log")"
+if [ "$calls" = 1.00 ] && [ "$caches" = 2 ] && grep -q ' timeouts=0 stale=0 ' <<< "$close"; then
+  echo "E2E fwd gemma64 e3 calls/token=1.00 attn_caches=2 timeouts=0 ok"
+else
+  echo "E2E FAIL gemma64 e3: calls/token=${calls:-none} attn_caches=$caches close=[$close]"; fail=1
+fi
+$EVAL --label gemma64-e3 --allow-diff --snr-floor 20 "$OUT/ref_g64off" "$OUT/ref_g64e3" | tail -1 || fail=1
+$EVAL --label 'gemma64 e3==off' --tokens-policy "$OUT/ref_g64off" "$OUT/ref_g64e3" | tail -1 || fail=1
+ev="$($EVAL --label e3pool-gemma64-C2 "$OUT/ref_g64e3" "$OUT/ref_g64e3pool2" | tail -1 || true)"
+calls="$(calls_per_token "$OUT/g64e3pool2.log")"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3pool2.log")"
+misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/g64e3pool2.log")"
+if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+   grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+  echo "E2E e3 pool C=2 gemma64 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
+else
+  echo "E2E FAIL e3 pool C=2 gemma64: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+fi
 if [ $rc_pds = 1 ] &&
   grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
   echo "E2E e2e pds=2 refused ok"
@@ -483,7 +560,6 @@ grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=20
 # (moe_00010, a near-tie), which the logits-only compare cannot skip, so
 # D is gated against B -- the step this PR adds; the tokens policy stays
 # against off.
-logits_only() { mkdir -p "$2" && cp "$1"/logits_*.f32 "$2/"; }
 logits_only "$OUT/dump_fwd" "$OUT/ref_fwd"
 logits_only "$OUT/dump_64fwd" "$OUT/ref_64fwd"
 logits_only "$OUT/dump_htp" "$OUT/ref_off"

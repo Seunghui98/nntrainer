@@ -20,6 +20,22 @@ read inputs, or a stated guess.
 
 **Status 2026-10-01: S0, S1 and S2 done and merged (#202, #203; S26 port #206); S4 next; S3 waits for the S26 numbers (#208).**
 
+**Status 2026-10-06 (S4):** the kernels and the builder are merged
+(#209, #210, #213, #214, #221). The remainder is in four stacked PRs after the user's
+2026-10-06 answers: #226 the #4296 pin merge (`d345c3470`), #227 the
+name-keyed hand-over at load plus the backend binding (per-op RoPE, a
+second attention cache, `ROUTER_BIAS`, the GeGLU flag), #231 the Gemma
+HTP MoE layer (`lfm2_moe`'s softmax router) and the `QS4CX_WH` gate | up
+writer, and the step-(4) PR with the hd64 fixture and the in-process
+E2E Gemma lines. Gate met on the host: `E2E fwd gemma64 e3
+calls/token=1.00 attn_caches=2`, logits ≥ 20 dB of the HTP-off run
+(27.6 measured, the hand-over mutants 0.2–9.8), tokens 8/8 against the
+off and the CPU runs, and the pool `bit_identical=1`. S4 is done when
+these merge. For S5: the sliding layers' attention cache at 26B shape
+(≈ 800 MiB at max_seq 4096) has to be sized; the #4296 CPU layers that
+have no hook still run on stale rows at decode; the final soft-cap
+stays on the CPU.
+
 ## 0. Decisions, and what is left for the user
 
 | # | decision (user, 2026-09-30) |

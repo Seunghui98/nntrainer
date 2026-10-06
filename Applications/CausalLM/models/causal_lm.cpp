@@ -237,6 +237,47 @@ void CausalLM::allocateAndBindKVCache() {
   kv_cache_bound = true;
 }
 
+std::vector<float *> CausalLM::buildInferenceInputs(float *input_sample) {
+  struct CacheInput {
+    std::string name;
+    float *data;
+    unsigned int width;
+  };
+  std::vector<CacheInput> cache_inputs;
+  cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto &kc = kv_cache.getKeyCache(i);
+    auto &vc = kv_cache.getValueCache(i);
+    cache_inputs.push_back({"cache_k_l" + std::to_string(i),
+                            reinterpret_cast<float *>(kc.getData()),
+                            static_cast<unsigned int>(kc.width())});
+    cache_inputs.push_back({"cache_v_l" + std::to_string(i),
+                            reinterpret_cast<float *>(vc.getData()),
+                            static_cast<unsigned int>(vc.width())});
+  }
+  std::sort(
+    cache_inputs.begin(), cache_inputs.end(),
+    [](const auto &lhs, const auto &rhs) { return lhs.name < rhs.name; });
+
+  const auto dims = model->getInputDimension();
+  std::vector<bool> used(cache_inputs.size(), false);
+  std::vector<float *> inputs;
+  inputs.reserve(dims.size());
+  inputs.push_back(input_sample);
+  for (size_t idx = 1; idx < dims.size(); ++idx) {
+    size_t j = 0;
+    while (j < cache_inputs.size() &&
+           (used[j] || cache_inputs[j].width != dims[idx].width()))
+      ++j;
+    NNTR_THROW_IF(j == cache_inputs.size(), std::runtime_error)
+      << "CausalLM: no KV cache buffer of width " << dims[idx].width()
+      << " for model input " << idx;
+    used[j] = true;
+    inputs.push_back(cache_inputs[j].data);
+  }
+  return inputs;
+}
+
 void CausalLM::setKVCachePosition(unsigned int pos) {
   kv_cache.setPosition(pos);
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
@@ -590,30 +631,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    */
   std::vector<int64_t> token_ids;
   input.push_back(input_sample);
-  auto build_inference_inputs = [&]() {
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
-    }
-
-    std::sort(
-      cache_inputs.begin(), cache_inputs.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
-
-    std::vector<float *> inference_inputs;
-    inference_inputs.reserve(1 + cache_inputs.size());
-    inference_inputs.push_back(input_sample);
-    for (const auto &cache_input : cache_inputs)
-      inference_inputs.push_back(cache_input.second);
-    return inference_inputs;
-  };
-  input = build_inference_inputs();
+  input = buildInferenceInputs(input_sample);
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;

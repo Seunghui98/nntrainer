@@ -86,6 +86,22 @@ causallm_test::DifferentialModel gemma4MoEModel() {
   };
 }
 
+/**
+ * @brief [plan 201 S4] The HTP decode fixture: head_dim 64 sliding layers
+ *        beside a head_dim 128 full one (two KV cache widths), seeded norm
+ *        weights, router scales and layer_scalar, a decisive router and the
+ *        final soft-cap (generate_gemma4_moe_reference.py's flags in its
+ *        meta.json's run, see run_inproc_e2e.sh)
+ */
+causallm_test::DifferentialModel gemma4MoEHd64Model() {
+  return {
+    "gemma4_moe_tiny_hd64",
+    [](causallm::json &cfg, causallm::json &gen_cfg, causallm::json &nntr_cfg) {
+      return std::make_unique<ReferenceGemma4MoE>(cfg, gen_cfg, nntr_cfg);
+    },
+  };
+}
+
 #if !defined(_WIN32)
 /**
  * @brief Differential descriptor with bounded virtual expert weights enabled
@@ -132,6 +148,14 @@ TEST(Gemma4MoEDifferentialTest, FP32MatchesHFReference) {
  */
 TEST(Gemma4MoEDifferentialTest, Q40CloseToFP32Reference) {
   causallm_test::runQ40DifferentialChecks(gemma4MoEModel());
+}
+
+/**
+ * @brief [plan 201 S4] The hd64 fixture's FP32 prefill logits and greedy
+ *        tokens match HF: two cache widths, seeded norms, soft-cap
+ */
+TEST(Gemma4MoEDifferentialTest, Hd64FP32MatchesHFReference) {
+  causallm_test::runFp32DifferentialChecks(gemma4MoEHd64Model());
 }
 
 #if !defined(_WIN32)
