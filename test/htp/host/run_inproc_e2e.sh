@@ -169,6 +169,15 @@
 #                              run's, one image per graph FC -- 7 a layer,
 #                              6 on a full-attention layer with
 #                              attention_k_eq_v, which has no _wv)
+#   E2E fwd lfm25 fcwh kinds=all calls/token=1.00 q4m1_handles=1 wh_handles=28
+#     e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=<n> ok
+#   E2E eval e3fcwh-lfm25-vs-off ... min_snr_db=<x>   (printed, not gated)
+#   E2E tokens e3fcwh==off-lfm25 8/8 expected_mismatch=0
+#   E2E ppl-decode e3fcwh-lfm25 off=<ppl> wh=<ppl> delta=<%> top1=7/7
+#                              (#225 PR 2: the one-PD token's FC and dense
+#                              FFN on the sidecar's WH handles, the lm_head
+#                              alone Q4M1; NNTR_PPL_DECODE forced on the
+#                              hybrid's continuation)
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -492,6 +501,19 @@ PROMPT=1024 NNTR_HTP_PROFILE=1 \
   run_e2e q25w-p2x "$OUT/htp25w" htp "$OUT/dump_25wp2x" "$OUT/25wp2x.log" --max-seq 2048 --repack
 PROMPT=1024 NNTR_HTP_PREFILL_ROWS=0 NNTR_HTP_PROFILE=1 \
   run_e2e q25w-p1x "$OUT/htp25w" htp "$OUT/dump_25wp1x" "$OUT/25wp1x.log" --max-seq 2048 --repack
+# [#225 PR 2] the decode FC set on the sidecar's WH handles: the one-session
+# E1 and the pool of 8 against the one-PD run above, then NNTR_PPL_DECODE:
+# the hybrid writes its continuation, the one-PD run is forced on it
+echo "== [#225 PR 2] lfm25 sidecar: KINDS=all, NNTR_HTP_E2E=1 pool C=2, PPL forced"
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25w-e1 "$OUT/htp25w" htp "$OUT/dump_25we1" "$OUT/25we1.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q25w-e3pool2 "$OUT/htp25w" htp "$OUT/dump_25we3pool2" "$OUT/25we3pool2.log" --max-seq 2048 --repack
+rm -f "$OUT/w.ids"
+PROMPT=512 NNTR_PPL_DECODE="$OUT/w.ids" \
+  run_e2e q25w-offppl "$OUT/htp25w" htp "$OUT/dump_25woffppl" "$OUT/25woffppl.log" --max-seq 2048 --repack --run
+PROMPT=512 NNTR_PPL_DECODE="$OUT/w.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25w-e3ppl "$OUT/htp25w" htp "$OUT/dump_25we3ppl" "$OUT/25we3ppl.log" --max-seq 2048 --repack --run
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -778,6 +800,35 @@ cp "$OUT"/dump_25qoff/logits_*.f32 "$OUT/lq/"; cp "$OUT"/dump_25koff/logits_*.f3
 cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lw/"
 $EVAL --label fcwh-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lw" | tail -1 || true
 $EVAL --label requant-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lk" | tail -1 || true
+# [#225 PR 2] (6) the one-PD token's FC and dense FFN ops on the sidecar's
+# WH handles (HTP_GRAPH_FEED_WH), the lm_head alone Q4M1 (one slice: vocab
+# 32): the bind banner's counts on the one-PD and the one-session run, one
+# call a token, the one-PD token equal to E1's and to the pool C=2 run's,
+# every logit; (7) against the hybrid, whose decode FCs are the CPU's Q4_0:
+# the tokens by the policy, and the decode logits' SNR printed, not gated
+# -- two int4 quantizations of the fixture's random FCs (per column from
+# f32, and Q4_0 blocks with a Q8_0 row; PR 1's prefill line above reads
+# 2.5 dB for the same reason), so it is the size of the format change, and
+# (6) is the wiring check
+wq="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/25we3.log")"
+wq1="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/25we1.log")"
+read -r w_q4m1 w_wh <<< "${wq:-x x}"
+we="$($EVAL --label e3fcwh==e1fcwh-lfm25 "$OUT/dump_25we1" "$OUT/dump_25we3" | tail -1 || true)"
+wp="$($EVAL --label e3fcwh-pool-C2-lfm25 "$OUT/dump_25we3" "$OUT/dump_25we3pool2" | tail -1 || true)"
+echo "$we"; echo "$wp"
+calls_wp="$(calls_per_token "$OUT/25we3pool2.log")"
+misses_w="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/25we3pool2.log")"
+if [ "$w_q4m1" = 1 ] && [ "$w_wh" = 28 ] && [ "$wq1" = "$wq" ] &&
+  [ "$calls_w" = 1.00 ] && [ "$calls_wp" = 1.00 ] && [ "${misses_w:-0}" -gt 0 ] &&
+  grep -q 'bit_identical=1' <<< "$we" && grep -q 'bit_identical=1' <<< "$wp"; then
+  echo "E2E fwd lfm25 fcwh kinds=all calls/token=1.00 q4m1_handles=$w_q4m1 wh_handles=$w_wh e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=$misses_w ok"
+else
+  echo "E2E FAIL fwd lfm25 fcwh: bind=[${wq:-none}] e1=[${wq1:-none}] calls/token=${calls_w:-none}/${calls_wp:-none} misses=${misses_w:-none}"; fail=1
+fi
+mkdir -p "$OUT/lwo" "$OUT/lw3"
+cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lwo/"; cp "$OUT"/dump_25we3/logits_*.f32 "$OUT/lw3/"
+$EVAL --label e3fcwh-lfm25-vs-off --allow-diff "$OUT/lwo" "$OUT/lw3" | tail -1 || true
+$EVAL --label 'e3fcwh==off-lfm25' --tokens-policy "$OUT/dump_25woff" "$OUT/dump_25we3" | tail -1 || fail=1
 if [ $rc_pds = 1 ] &&
   grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
   echo "E2E e2e pds=2 refused ok"
@@ -1086,6 +1137,19 @@ if [ "$(dec_field "$OUT/g64fwd.log" source)" = file ] &&
   awk -v a="$off" -v b="$on" 'BEGIN{exit !(a + 0 > 0 && b + 0 > 0 && a + 0 < 1e30 && b + 0 < 1e30)}'; then
   echo "$line delta=$(awk -v a="$off" -v b="$on" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') top1=$top1"
   [ "$top1" = "$((STEPS - 1))/$((STEPS - 1))" ] || fail=1
+else
+  echo "E2E FAIL $line (not finite, or not forced)"; fail=1
+fi
+# [#225 PR 2] (8) the sidecar model's one-PD token (WH FC set) forced on the
+# hybrid's continuation (CPU Q4_0 decode FCs): the host shape of the
+# device's G4 read, on random weights -- printed; gated: forced, finite
+po="$(dec_field "$OUT/25woffppl.log" ppl)"
+pw="$(dec_field "$OUT/25we3ppl.log" ppl)"
+line="E2E ppl-decode e3fcwh-lfm25 off=${po:-none} wh=${pw:-none}"
+if [ "$(dec_field "$OUT/25woffppl.log" source)" = self ] &&
+  [ "$(dec_field "$OUT/25we3ppl.log" source)" = file ] &&
+  awk -v a="$po" -v b="$pw" 'BEGIN{exit !(a + 0 > 0 && b + 0 > 0 && a + 0 < 1e30 && b + 0 < 1e30)}'; then
+  echo "$line delta=$(awk -v a="$po" -v b="$pw" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') top1=$(dec_field "$OUT/25we3ppl.log" top1)"
 else
   echo "E2E FAIL $line (not finite, or not forced)"; fail=1
 fi
