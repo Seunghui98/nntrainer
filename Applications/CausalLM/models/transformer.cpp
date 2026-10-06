@@ -387,6 +387,7 @@ void Transformer::repack_weight() {
   struct PendingDense {
     nntrainer::ComputeOps *ops;
     void *up, *gate, *down;
+    const float *up_s, *gate_s, *down_s; /**< QS4CX scales; null for Q4_0 */
     unsigned int K, I, N;
   };
   std::vector<PendingDense> dense_pending;
@@ -442,12 +443,16 @@ void Transformer::repack_weight() {
           auto &up = weights[0]->getVariableRef();
           auto &gate = weights[1]->getVariableRef();
           auto &down = weights[2]->getVariableRef();
-          if (up.getDataType() == ml::train::TensorDim::DataType::Q4_0 &&
-              gate.getDataType() == ml::train::TensorDim::DataType::Q4_0 &&
-              down.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+          const auto wtype = up.getDataType();
+          const bool qs4cx = wtype == ml::train::TensorDim::DataType::QS4CX;
+          if ((wtype == ml::train::TensorDim::DataType::Q4_0 || qs4cx) &&
+              gate.getDataType() == wtype && down.getDataType() == wtype) {
             dense_pending.push_back({context.getComputeOps(),
                                      up.getData<char>(), gate.getData<char>(),
                                      down.getData<char>(),
+                                     qs4cx ? up.getScale<float>() : nullptr,
+                                     qs4cx ? gate.getScale<float>() : nullptr,
+                                     qs4cx ? down.getScale<float>() : nullptr,
                                      static_cast<unsigned int>(up.height()),
                                      static_cast<unsigned int>(up.width()),
                                      static_cast<unsigned int>(down.width())});
@@ -649,7 +654,8 @@ void Transformer::repack_weight() {
     // MoE layer kernel's scratch to this shape's row count.
     bool dense_warmed = false;
     for (const auto &p : dense_pending) {
-      if (!p.ops->register_q4_0_dense_ffn(p.up, p.gate, p.down, p.K, p.I, p.N))
+      if (!p.ops->register_q4_0_dense_ffn(p.up, p.gate, p.down, p.K, p.I, p.N,
+                                          p.up_s, p.gate_s, p.down_s))
         continue;
       if (dense_warmed || !p.ops->supports_gemm_q4_0_dense_ffn_fp32())
         continue;
@@ -658,7 +664,9 @@ void Transformer::repack_weight() {
       std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
       std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
       p.ops->gemm_q4_0_dense_ffn_fp32(p.up, p.gate, p.down, act.data(),
-                                      out.data(), M, p.K, p.I, p.N);
+                                      out.data(), M, p.K, p.I, p.N, false,
+                                      nullptr, nullptr, 0.0f, p.up_s, p.gate_s,
+                                      p.down_s);
       ml_logd("dense FFN HTP kernel warmed up at load (M=%u, K=%u, I=%u, N=%u)",
               M, p.K, p.I, p.N);
     }

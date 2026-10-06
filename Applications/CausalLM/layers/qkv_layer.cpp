@@ -307,13 +307,21 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // without a gamma -- one more projection on the accelerator instead of
   // a copy and a norm on the CPU.
   const auto q4 = ml::train::TensorDim::DataType::Q4_0;
+  const auto qs4cx = ml::train::TensorDim::DataType::QS4CX;
+  const auto wtype = Qweight.getDataType();
   auto *ops = input_step.getOps();
-  if (rows > 1 && (in_norm || feature_size) && ops != nullptr &&
+  // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
+  // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1).
+  if ((in_norm || feature_size) && ops != nullptr &&
       ops->supports_gemm_q4_0_batch_norm_fp32() &&
+      (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&
       input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
-      Qweight.getDataType() == q4 && Kweight.getDataType() == q4 &&
-      (v_from_k || context.getWeight(weight_idx[WV]).getDataType() == q4)) {
+      (wtype == q4 || wtype == qs4cx) && Kweight.getDataType() == wtype &&
+      (v_from_k || context.getWeight(weight_idx[WV]).getDataType() == wtype)) {
     std::vector<void *> wdata = {Qweight.getData<char>(), Kweight.getData<char>()};
+    std::vector<float *> wscale;
+    if (wtype == qs4cx)
+      wscale = {Qweight.getScale<float>(), Kweight.getScale<float>()};
     std::vector<unsigned int> widths = {
       static_cast<unsigned int>(Qhidden_step_dim.width()),
       static_cast<unsigned int>(Khidden_step_dim.width())};
@@ -334,6 +342,8 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor &Vweight =
       context.getWeight(weight_idx[v_from_k ? WK : WV]);
     wdata.push_back(Vweight.getData<char>());
+    if (wtype == qs4cx)
+      wscale.push_back(Vweight.getScale<float>());
     widths.push_back(static_cast<unsigned int>(Vhidden_step_dim.width()));
     dsts.push_back(context.getOutput(QKVParams::V).getData<float>());
     if (v_norm) {
@@ -343,7 +353,7 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       chunks.push_back(0u);
     }
     ops->gemm_q4_0_batch_norm_fp32(
-      wdata, input_step.getData<float>(), dsts, rows, widths,
+      wdata, wscale, input_step.getData<float>(), dsts, rows, widths,
       input_step_dim.width(),
       in_norm ? context.getWeight(weight_idx[IN_GAMMA]).getData<float>()
               : nullptr,
