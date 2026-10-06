@@ -10,6 +10,7 @@
 
 #include <cpu_backend.h>
 #include <htp_wh_layout.h>
+#include <htp_wh_palette.h>
 
 #include <algorithm>
 #include <cctype>
@@ -377,8 +378,11 @@ DType parseDType(const std::string &value) {
     return DType::QS4CX;
   if (dtype == "QS4CX_WH")
     return DType::QS4CX_WH;
-  throw std::invalid_argument("Unsupported dtype: " + value +
-                              " (supported: FP32, Q4_0, Q4_K, Q6_K, QS4CX)");
+  if (dtype == "QS2CX_WH")
+    return DType::QS2CX_WH;
+  throw std::invalid_argument(
+    "Unsupported dtype: " + value +
+    " (supported: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH, QS2CX_WH)");
 }
 
 const char *dtypeName(DType dtype) {
@@ -395,6 +399,8 @@ const char *dtypeName(DType dtype) {
     return "QS4CX";
   case DType::QS4CX_WH:
     return "QS4CX_WH";
+  case DType::QS2CX_WH:
+    return "QS2CX_WH";
   default:
     throw std::invalid_argument("Unknown dtype");
   }
@@ -473,11 +479,65 @@ size_t quantizedSize(DType dtype, size_t rows, size_t columns, bool repack,
     // cheaply recompute from packed nibbles.
     return checkedMultiply(rows, qs4cxRowBytes(columns) + 2 * sizeof(float),
                            name);
+  case DType::QS2CX_WH:
+    // Two bits a weight instead of four, and one four-byte palette for the
+    // whole tensor -- not per row, so this is the one dtype whose size is
+    // not a clean multiple of the row count. Whole 32 x 32 tiles only: the
+    // code bytes are whBytes2(K, N), which equals rows * columns / 4 only
+    // then, and the loaders find the palette and the scales after it.
+    if (rows % 32 != 0 || columns % 32 != 0)
+      throw std::invalid_argument(name +
+                                  " QS2CX_WH shape must be multiples of 32");
+    return checkedMultiply(rows, columns / 4 + 2 * sizeof(float), name) +
+           nntrainer::WH_PALETTE_LEVELS;
   default:
     break;
   }
   throw std::invalid_argument("Unknown dtype for " + name);
 }
+
+/**
+ * @brief How far the MoE expert codes are restricted toward 2 bits
+ *
+ * group_k = 0 leaves QS4CX_WH exactly as it is today, which is the default
+ * and what every existing model directory was built with. Anything else
+ * still writes 4-bit bytes -- the values are just restricted to four levels
+ * a group, so the file runs on today's kernel and its perplexity is the
+ * perplexity a real 2-bit expert would have (htp_wh_palette.h).
+ */
+struct PaletteOptions {
+  /** k-values one palette covers; 0 = off, >= K = one group: with
+      per_column false one palette for the tensor (QS2CX_WH's) */
+  uint32_t group_k = 0u;
+  /** one palette per (column, group) -- the accuracy control, not shippable */
+  bool per_column = false;
+  /** restrict "_gate_up" experts */
+  bool on_gate_up = true;
+  /** restrict "_down" experts */
+  bool on_down = true;
+  /** refit w_scale by least squares once the codes are restricted. Free
+      accuracy given fixed codes, but it is a second change riding on the
+      same perplexity number, so it can be turned off to attribute. */
+  bool refit_scale = true;
+
+  bool active() const { return group_k != 0u; }
+
+  /** @brief Routed experts only (layer{i}_expert{e}_{gate_up,down}), and
+   *         only the half the run asked for: a shared expert's or an
+   *         unfused gate / up weight is left alone. */
+  bool appliesTo(const std::string &name) const {
+    const size_t at = name.rfind("_expert");
+    if (!active() || at == std::string::npos || at + 7 >= name.size() ||
+        !std::isdigit(static_cast<unsigned char>(name[at + 7])))
+      return false;
+    const auto ends = [&](const char *s, size_t n) {
+      return name.size() >= n && name.compare(name.size() - n, n, s) == 0;
+    };
+    if (ends("_gate_up", 8))
+      return on_gate_up;
+    return ends("_down", 5) && on_down;
+  }
+};
 
 class TensorWriter {
 public:
@@ -496,6 +556,10 @@ public:
     dry_run_(dry_run) {}
 
   bool isDryRun() const { return dry_run_; }
+
+  /** @brief Byte count is unchanged by the palette, so the dry run does not
+   *         need this -- only the real pass does. */
+  void setPalette(const PaletteOptions &p) { palette_ = p; }
 
   /** @brief FP32 source bytes the layout walk consumed (dry run only) */
   size_t expectedInputBytes() const { return expected_input_bytes_; }
@@ -547,9 +611,10 @@ public:
     }
     // An embedding is a lookup, not a matmul against the HMX unit, so there
     // is nothing for a weight-tile layout to be right for.
-    if (dtype == DType::QS4CX_WH) {
+    if (dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH) {
       throw std::invalid_argument(
-        "QS4CX_WH is a weight layout for the HTP matmul and cannot be used "
+        std::string(dtypeName(dtype)) +
+        " is a weight layout for the HTP matmul and cannot be used "
         "for an embedding");
     }
     quantizedSize(dtype, rows, columns, false, name);
@@ -605,11 +670,12 @@ public:
     // ponytail: the fix if a model ever needs it is to hold the whole WH
     // image -- K*N/2 bytes, 3.5 MB for the largest -- and fill it block by
     // block, not to change the tile order.
-    if (dtype == DType::QS4CX_WH && source_bytes > MAX_TENSOR_BUFFER_BYTES) {
+    if ((dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH) &&
+        source_bytes > MAX_TENSOR_BUFFER_BYTES) {
       throw std::invalid_argument(
         name + " is " + std::to_string(source_bytes) + " bytes, over the " +
-        std::to_string(MAX_TENSOR_BUFFER_BYTES) +
-        " QS4CX_WH can write in one pass. Quantize this tensor as QS4CX.");
+        std::to_string(MAX_TENSOR_BUFFER_BYTES) + " " + dtypeName(dtype) +
+        " can write in one pass. Quantize this tensor as QS4CX.");
     }
     if (source_bytes <= MAX_TENSOR_BUFFER_BYTES) {
       std::vector<float> source(tensorElements(input_size, output_size, name));
@@ -811,7 +877,7 @@ private:
         /*is_nxk=*/true);
       writeBytes(nibbles.data(), nibbles.size(), name);
       return;
-    } else if (dtype == DType::QS4CX_WH) {
+    } else if (dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH) {
       // Same quantizer, then a repack. Going through quant_qs4cx_f32 rather
       // than quantizing straight into tiles keeps this bit-identical to the
       // QS4CX path above: the values and scales are the ones the device has
@@ -833,20 +899,68 @@ private:
       // across this model.
       const size_t K = columns, N = rows;
       std::vector<int8_t> rm(checkedMultiply(K, N, name));
-      const size_t colsum_begin = pending_colsums_.size();
-      pending_colsums_.resize(colsum_begin + N, 0.0f);
       const size_t stride = qs4cxRowBytes(columns);
       for (size_t n = 0; n < N; ++n) {
         const uint8_t *row =
           reinterpret_cast<const uint8_t *>(nibbles.data()) + n * stride;
-        int32_t sum = 0;
         for (size_t k = 0; k < K; ++k) {
           const uint8_t byte = row[k >> 1];
           const uint8_t nibble = (k & 1u) ? (byte >> 4) : (byte & 0x0Fu);
-          const int8_t q =
-            static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
-          rm[k * N + n] = q;
-          sum += q;
+          rm[k * N + n] = static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
+        }
+      }
+
+      // The 2-bit restriction. Done here rather than at whPack so it works
+      // on the same k-major int8 the DSP expansion produces, which is what
+      // lets whPack2 + whExpand2 be byte-compared against whPack.
+      //
+      // QS2CX_WH restricts unconditionally and per tensor: the format holds
+      // exactly four codes and no group axis, so there is nothing to ask.
+      // QS4CX_WH restricts only when --moe_palette_g says to, and then only
+      // to measure -- it still writes four-bit bytes.
+      const bool two_bit = (dtype == DType::QS2CX_WH);
+      const uint32_t pal_g = two_bit ? UINT32_MAX : palette_.group_k;
+      const bool pal_percol = two_bit ? false : palette_.per_column;
+      const bool pal_refit = two_bit ? true : palette_.refit_scale;
+      std::vector<int8_t> pal;
+      if (two_bit || palette_.appliesTo(name)) {
+        pal.resize(nntrainer::whPaletteEntries(static_cast<uint32_t>(K),
+                                               static_cast<uint32_t>(N), pal_g,
+                                               pal_percol));
+        nntrainer::whPaletteQuantize(rm.data(), static_cast<uint32_t>(K),
+                                     static_cast<uint32_t>(N), pal_g,
+                                     pal_percol, pal.data());
+        if (pal_refit) {
+          // quant_qs4cx_f32 picked the scale for sixteen levels; four levels
+          // want a different one. With the codes now fixed, the least-squares
+          // scale is closed form -- and the stored float already IS the
+          // dequant multiplier (fallback_internal.cpp stores 1/scale), so it
+          // drops straight in.
+          for (size_t n = 0; n < N; ++n) {
+            const float *src = source.data() + n * K;
+            double num = 0.0, den = 0.0;
+            for (size_t k = 0; k < K; ++k) {
+              const double q = static_cast<double>(rm[k * N + n]);
+              num += static_cast<double>(src[k]) * q;
+              den += q * q;
+            }
+            if (den > 0.0) {
+              pending_scales_[scale_begin + n] = static_cast<float>(num / den);
+            }
+          }
+        }
+      }
+
+      // Column sums after the palette, because they correct the activation
+      // zero point against the weights the matmul will actually see.
+      // Recomputing them from packed nibbles at load costs about 20 seconds
+      // across this model, which is why they are baked here at all.
+      const size_t colsum_begin = pending_colsums_.size();
+      pending_colsums_.resize(colsum_begin + N, 0.0f);
+      for (size_t n = 0; n < N; ++n) {
+        int32_t sum = 0;
+        for (size_t k = 0; k < K; ++k) {
+          sum += rm[k * N + n];
         }
         // Held as float so it travels beside the scales in one array and
         // lands in the file as the f32 the loader reads; the values are
@@ -854,6 +968,17 @@ private:
         pending_colsums_[colsum_begin + n] = static_cast<float>(sum);
       }
 
+      if (two_bit) {
+        // Codes then the four palette bytes, so the tensor reads back as
+        // [codes][palette][scales][colsums] -- QS2CX_WH_Tensor::size().
+        std::vector<uint8_t> wh(nntrainer::whBytes2(K, N));
+        nntrainer::whPack2(rm.data(), static_cast<uint32_t>(K),
+                           static_cast<uint32_t>(N), pal.data(), wh.data());
+        writeBytes(reinterpret_cast<const char *>(wh.data()), wh.size(), name);
+        writeBytes(reinterpret_cast<const char *>(pal.data()),
+                   nntrainer::WH_PALETTE_LEVELS, name);
+        return;
+      }
       std::vector<uint8_t> wh(nntrainer::whBytes(K, N));
       nntrainer::whPack(rm.data(), static_cast<uint32_t>(K),
                         static_cast<uint32_t>(N), wh.data());
@@ -877,7 +1002,8 @@ private:
    * once they have written a tensor's last chunk.
    */
   void flushQs4cxScales(DType dtype, const std::string &name) {
-    if (dtype != DType::QS4CX && dtype != DType::QS4CX_WH)
+    if (dtype != DType::QS4CX && dtype != DType::QS4CX_WH &&
+        dtype != DType::QS2CX_WH)
       return;
     if (pending_scales_.empty())
       return;
@@ -964,6 +1090,8 @@ private:
   std::vector<float> pending_colsums_;
   /** QS4CX per-channel scales awaiting flushQs4cxScales() */
   std::vector<float> pending_scales_;
+  /** Off by default: an unasked-for run is byte-identical to before */
+  PaletteOptions palette_;
 };
 
 void validateSourceConfig(const json &nntr_cfg) {
@@ -1087,12 +1215,14 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
                     prefix + "_sparse_moe router_per_expert_scale");
 
     // The experts in --moe_dtype (the fc dtype unless set). [plan 201 S4]
-    // QS4CX_WH is the HTP MoE layer's (lfm2_moe, moe_engine=htp): gate and
-    // up fused into one [2 * inter, hidden] weight, as LFM2's experts.
+    // QS4CX_WH (and QS2CX_WH, its 2-bit form) is the HTP MoE layer's
+    // (lfm2_moe, moe_engine=htp): gate and up fused into one
+    // [2 * inter, hidden] weight, as LFM2's experts.
     for (size_t expert = 0; expert < model.num_experts; ++expert) {
       const std::string expert_prefix =
         prefix + "_expert" + std::to_string(expert);
-      if (quant.moe_dtype == DType::QS4CX_WH) {
+      if (quant.moe_dtype == DType::QS4CX_WH ||
+          quant.moe_dtype == DType::QS2CX_WH) {
         writer.writeFcConcat(model.hidden_size, model.moe_intermediate_size,
                              model.moe_intermediate_size, quant.moe_dtype,
                              expert_prefix + "_gate_up");
@@ -1348,11 +1478,29 @@ void printUsage(const char *program) {
     << "  --output_bin <name>   Output .bin filename\n"
     << "  --config <path>       Read target dtype fields and filename from an "
        "nntr config\n"
+    << "  --moe_palette_g <n>   Restrict MoE expert QS4CX_WH codes to four "
+       "levels per\n"
+    << "                        n input values (0 = off, 'max' = all of K: "
+       "one\n"
+    << "                        palette a tensor, QS2CX_WH's). Still\n"
+    << "                        writes 4-bit bytes: this is the perplexity "
+       "of a 2-bit\n"
+    << "                        expert, measurable on today's kernel\n"
+    << "  --moe_palette_scope <s>  group (default) or colgroup (accuracy "
+       "control only)\n"
+    << "  --moe_palette_on <t>  gate_up, down, or both (default)\n"
+    << "  --moe_palette_refit <b>  on (default) or off -- least-squares "
+       "w_scale for\n"
+    << "                        the restricted codes\n"
     << "  -h, --help            Show this help\n\n"
     << "Architectures: Qwen3MoeForCausalLM, Lfm2MoeForCausalLM, "
        "Gemma4ForCausalLM,\n"
     << "               Gemma4ForConditionalGeneration\n"
-    << "Supported dtypes: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH\n"
+    << "Supported dtypes: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH, "
+       "QS2CX_WH\n"
+    << "QS2CX_WH is QS4CX_WH at two bits: four int4 codes a tensor, expanded\n"
+    << "back to the int4 lattice in the DSP's VTCM. Half the bytes, same\n"
+    << "arithmetic after the matmul.\n"
     << "QS4CX_WH is QS4CX pre-arranged into HMX weight tiles: it loads "
        "without\n"
     << "the on-device conversion that costs 48% of prefill, and no CPU "
@@ -1381,6 +1529,7 @@ int run(int argc, char **argv) {
   std::string target_isa = "DEFAULT";
   std::string output_bin;
   std::filesystem::path target_config;
+  PaletteOptions palette;
   // Which dtypes the command line actually asked for, so --config fills in
   // the rest instead of overruling them. Without this,
   // "--config old.json --moe_dtype QS4CX_WH" quietly quantizes to whatever
@@ -1412,7 +1561,26 @@ int run(int argc, char **argv) {
       output_bin = requireValue(argument);
     else if (argument == "--config")
       target_config = requireValue(argument);
-    else if (argument == "--help" || argument == "-h") {
+    else if (argument == "--moe_palette_g") {
+      const std::string v = requireValue(argument);
+      palette.group_k = (v == "max") ? UINT32_MAX : (uint32_t)std::stoul(v);
+    } else if (argument == "--moe_palette_scope") {
+      const std::string v = requireValue(argument);
+      if (v != "group" && v != "colgroup")
+        throw std::invalid_argument("--moe_palette_scope: group or colgroup");
+      palette.per_column = (v == "colgroup");
+    } else if (argument == "--moe_palette_on") {
+      const std::string v = requireValue(argument);
+      if (v != "gate_up" && v != "down" && v != "both")
+        throw std::invalid_argument("--moe_palette_on: gate_up, down or both");
+      palette.on_gate_up = (v != "down");
+      palette.on_down = (v != "gate_up");
+    } else if (argument == "--moe_palette_refit") {
+      const std::string v = requireValue(argument);
+      if (v != "on" && v != "off")
+        throw std::invalid_argument("--moe_palette_refit: on or off");
+      palette.refit_scale = (v == "on");
+    } else if (argument == "--help" || argument == "-h") {
       printUsage(argv[0]);
       return EXIT_SUCCESS;
     } else {
@@ -1533,6 +1701,15 @@ int run(int argc, char **argv) {
             << "  Embedding dtype: " << dtypeName(quant.embedding_dtype) << '\n'
             << "  LM head dtype: " << dtypeName(quant.lmhead_dtype) << '\n'
             << "  Target ISA: " << isaName(quant.target_isa) << '\n';
+  if (palette.active()) {
+    std::cout
+      << "  MoE palette: 4 levels per "
+      << (palette.group_k == UINT32_MAX ? std::string("all of K")
+                                        : std::to_string(palette.group_k))
+      << (palette.per_column ? " per column" : " shared by columns") << ", on "
+      << (palette.on_gate_up ? (palette.on_down ? "both" : "gate_up") : "down")
+      << ", w_scale refit " << (palette.refit_scale ? "on" : "off") << '\n';
+  }
 
   const auto walk = [&](TensorWriter &tensor_writer) {
     if (is_qwen3_moe)
@@ -1580,6 +1757,7 @@ int run(int argc, char **argv) {
   }
 
   TensorWriter writer(input, output, quant.target_isa);
+  writer.setPalette(palette);
   walk(writer);
   output.close();
   if (!output)
