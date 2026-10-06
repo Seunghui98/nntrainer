@@ -263,3 +263,31 @@ adb shell 'cd /data/local/tmp/nntrainer/causallm && sh g4_int2_bench.sh' 2>&1 | 
 | 이름 | dsp | drain a+b | int2 expand (worker) | weight DMA KB/call | mm |
 |---|---|---|---|---|---|
 | (기기 미측정) | | | | | |
+
+## 6. expert 적재 경로 최적화 (계획, 미측정)
+
+§5.2에서 읽기 한계는 flash가 아니라 reader 스레드 한 개(0.4~0.6 GB/s)이고, 실행 간 편차가 0.9 s다. 그래서 순서는 (1) 편차 통제 → (2) 있는 손잡이 sweep → (3) 코드 변경이다.
+
+### 6.1 측정 규칙
+- 같은 설정을 2회 이상, 설정을 번갈아, 사이에 60 s 휴식. `test/htp/g4_expert_sweep.sh`가 이 규칙으로 돌고 온도도 찍는다.
+- 판정 열: prefill ms, read-ahead 노출 ms, reader ms/expert(→ 합산 GB/s = reader 수 × 1.52 MB / ms), miss ms/miss.
+
+### 6.2 손잡이 (코드 변경 없음)
+| 손잡이 | 지금 | 볼 것 |
+|---|---|---|
+| `NNTR_MOE_PREFETCH_READERS` | 4 | 2/4/6/8: 합산 속도가 어디서 멈추나(flash 3.0 GB/s 또는 uncached 쓰기 4.9 GB/s). 계산 스레드와의 경합은 prefill ms로 |
+| `NNTR_NUM_THREADS` | 8 | 6 + reader 6: 코어를 나눠 주면 전체가 빨라지나 |
+| `NNTR_MOE_PREFETCH` (깊이) | 전부 | 1: 한 층 앞만. 메모리 압박·과잉 읽기 대비 노출 |
+| `NNTR_MOE_CACHE_EXPERTS` | 16 | 32 (int2라 arena는 int4 C=16과 같음): 읽을 양 10% 감소, miss 감소 |
+| `NNTR_MOE_PREFETCH_CPUS` | caller 제외 전부 | big 코어만 / little 코어만 |
+
+### 6.3 코드 변경 후보 (sweep 결과를 보고 고른다)
+1. **page cache 선읽기 분리**: 다음 층 expert에 `posix_fadvise(WILLNEED)`(또는 `readahead()`)를 걸어 flash→page cache는 커널이 깊은 큐로, page cache→arena 복사만 reader가 한다. reader 한 스레드의 QD1 한계를 우회한다. 가장 싸다.
+2. **bounce buffer**: cached heap에 pread 후 arena로 큰 단위 memcpy. uncached 쓰기가 per-thread 한계라면 효과, flash라면 없음.
+3. **slot 단위 한 번에 읽기**: gate_up+down이 파일에서 연속(expert당 1.52 MB 1회 pread)인지 확인. 지금은 2회.
+4. **읽기 순서**: 라우팅이 많이 쓰는 expert부터(prefill은 전부 쓰므로 해당 없음), decode는 top-k 확률 순.
+5. **read-ahead의 과잉 읽기**: 더미에서만 문제(§5.2). 실제 모델에선 해당 없음.
+
+### 6.4 int4 비교
+같은 sweep을 i4same 파일(`NNTR_MOE_EXPERT_BITS=4`)로 한 번 더 돌리면 모든 열이 int4/int2 쌍으로 나온다. 특히 reader ms/expert(바이트 2배)와 노출 ms.
+
