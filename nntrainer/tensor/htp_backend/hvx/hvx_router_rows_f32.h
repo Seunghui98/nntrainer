@@ -41,4 +41,27 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
                         uint32_t M, uint32_t K, uint32_t E,
                         hvx_worker_pool *pool);
 
+/**
+ * @brief The softmax router's selection over M rows of logits, in place:
+ *        p = softmax(logits row) (hvx_softmax_rows_f32), the n_sel largest
+ *        p in descending order with an exact tie going to the lower index
+ *        (the CPU layer's comparator), and the routing weights of the
+ *        first top_k: p[e] * (1 / sum of their p) * scale[e], in that order
+ *        of operations.
+ *
+ * @param p       M rows of E floats: the logits in, the probabilities out
+ * @param scale   E floats, the per-expert scale
+ * @param sel     M rows of n_sel indices out
+ * @param weight  M rows of top_k weights out
+ * @param E       a multiple of 32, at most 128
+ * @param top_k   1..n_sel
+ * @param n_sel   top_k..E (the extra are the caller's prefetch hint)
+ * @param pool    the worker pool rows are split across; NULL = inline
+ * @return 0, or -1 for a shape the kernel does not take (nothing written)
+ */
+int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
+                             float *weight, uint32_t M, uint32_t E,
+                             uint32_t top_k, uint32_t n_sel,
+                             hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_ROUTER_ROWS_F32_H__ */

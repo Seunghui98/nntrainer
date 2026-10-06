@@ -298,7 +298,8 @@ done
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
   -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
   -o "$OUT/router_rows_host_check" \
-  "$HERE/router_rows_host_check.c" "$BACKEND/hvx/hvx_router_rows_f32.c" -lm
+  "$HERE/router_rows_host_check.c" "$BACKEND/hvx/hvx_router_rows_f32.c" \
+  "$BACKEND/hvx/hvx_softmax_f32.c" -lm
 
 "$OUT/router_rows_host_check"
 

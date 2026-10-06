@@ -16,6 +16,7 @@
 #include <hvx_hexagon_protos.h>
 
 #include "hvx_convert.h"
+#include "hvx_softmax_f32.h"
 
 /** @brief f32 lanes per HVX vector at 128B. */
 #define LANES 32u
@@ -79,5 +80,61 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
   }
   rows_ctx c = {x, w, logits, M, K, E};
   hvx_worker_pool_run(pool, rows_worker, &c, M);
+  return 0;
+}
+
+typedef struct {
+  float *p;
+  const float *scale;
+  uint32_t *sel;
+  float *weight;
+  uint32_t M, E, top_k, n_sel;
+} topk_ctx;
+
+static void topk_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const topk_ctx *c = (const topk_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
+  if (lo >= hi)
+    return;
+  hvx_softmax_rows_f32(c->p, c->p, lo, hi, c->E, 1.0f);
+  for (uint32_t r = lo; r < hi; ++r) {
+    const float *pr = c->p + (size_t)r * c->E;
+    uint32_t *sr = c->sel + (size_t)r * c->n_sel;
+    uint32_t taken[4] = {0u, 0u, 0u, 0u}; /* E <= 128 */
+    /* n_sel passes of a first-maximum scan: strict > in index order is
+       the CPU comparator's tie rule (the lower index wins) */
+    for (uint32_t k = 0; k < c->n_sel; ++k) {
+      uint32_t best = c->E;
+      for (uint32_t e = 0; e < c->E; ++e) {
+        if (taken[e >> 5] & (1u << (e & 31u)))
+          continue;
+        if (best == c->E || pr[e] > pr[best])
+          best = e;
+      }
+      taken[best >> 5] |= 1u << (best & 31u);
+      sr[k] = best;
+    }
+    float wsum = 0.0f;
+    for (uint32_t k = 0; k < c->top_k; ++k)
+      wsum += pr[sr[k]];
+    const float inv = 1.0f / wsum;
+    float *wr = c->weight + (size_t)r * c->top_k;
+    for (uint32_t k = 0; k < c->top_k; ++k)
+      wr[k] = pr[sr[k]] * inv * c->scale[sr[k]];
+  }
+}
+
+int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
+                             float *weight, uint32_t M, uint32_t E,
+                             uint32_t top_k, uint32_t n_sel,
+                             hvx_worker_pool *pool) {
+  if (!p || !scale || !sel || !weight || M == 0u || E == 0u ||
+      E % LANES != 0u || E > EV_MAX * LANES || top_k == 0u || n_sel < top_k ||
+      n_sel > E) {
+    return -1;
+  }
+  topk_ctx c = {p, scale, sel, weight, M, E, top_k, n_sel};
+  hvx_worker_pool_run(pool, topk_worker, &c, M);
   return 0;
 }

@@ -69,6 +69,74 @@ static double run(uint32_t M, uint32_t K, uint32_t E) {
   return worst;
 }
 
+/* The selection against the CPU layer's own (std::exp softmax in float,
+   partial_sort with the lower index winning a tie): the same experts in
+   the same order, the weights within tol of the CPU's. */
+static int run_topk(uint32_t M, uint32_t E, uint32_t top_k, uint32_t n_sel,
+                    int ties) {
+  float *p = malloc(sizeof(float) * M * E), *lg = malloc(sizeof(float) * M * E);
+  float *scale = malloc(sizeof(float) * E);
+  uint32_t *sel = malloc(sizeof(uint32_t) * M * n_sel);
+  float *w = malloc(sizeof(float) * M * top_k);
+  unsigned seed = 17u + M + E;
+  for (uint32_t i = 0; i < M * E; ++i)
+    lg[i] = ties ? (float)((int)(frand(&seed) * 3.0f)) : frand(&seed) * 6.0f;
+  for (uint32_t e = 0; e < E; ++e)
+    scale[e] = 0.5f + 0.5f * (frand(&seed) + 1.0f);
+  memcpy(p, lg, sizeof(float) * M * E);
+  if (hvx_router_topk_rows_f32(p, scale, sel, w, M, E, top_k, n_sel, NULL)) {
+    printf("router topk M=%u E=%u: rejected\n", M, E);
+    return 1;
+  }
+  int bad_sel = 0;
+  double worst = 0.0;
+  float *pr = malloc(sizeof(float) * E);
+  uint32_t *idx = malloc(sizeof(uint32_t) * E);
+  for (uint32_t r = 0; r < M; ++r) {
+    const float *l = lg + (size_t)r * E;
+    float mx = l[0];
+    for (uint32_t e = 1; e < E; ++e)
+      mx = l[e] > mx ? l[e] : mx;
+    float sum = 0.0f;
+    for (uint32_t e = 0; e < E; ++e)
+      sum += pr[e] = expf(l[e] - mx);
+    for (uint32_t e = 0; e < E; ++e) {
+      pr[e] /= sum;
+      idx[e] = e;
+    }
+    for (uint32_t k = 0; k < n_sel; ++k) /* selection sort, CPU comparator */
+      for (uint32_t j = k + 1; j < E; ++j)
+        if (pr[idx[j]] > pr[idx[k]] ||
+            (pr[idx[j]] == pr[idx[k]] && idx[j] < idx[k])) {
+          const uint32_t t = idx[k];
+          idx[k] = idx[j];
+          idx[j] = t;
+        }
+    float wsum = 0.0f;
+    for (uint32_t k = 0; k < top_k; ++k)
+      wsum += pr[idx[k]];
+    for (uint32_t k = 0; k < n_sel; ++k)
+      bad_sel += sel[(size_t)r * n_sel + k] != idx[k];
+    for (uint32_t k = 0; k < top_k; ++k) {
+      const double ref = pr[idx[k]] * (1.0f / wsum) * scale[idx[k]];
+      const double d = fabs(w[(size_t)r * top_k + k] - ref) / fabs(ref);
+      if (d > worst)
+        worst = d;
+    }
+  }
+  printf("router topk M=%u E=%u top_k=%u n_sel=%u ties=%d: sel mismatches=%d "
+         "weight worst_rel=%g\n",
+         M, E, top_k, n_sel, ties, bad_sel, worst);
+  free(p);
+  free(lg);
+  free(scale);
+  free(sel);
+  free(w);
+  free(pr);
+  free(idx);
+  return bad_sel != 0 || worst > 1e-5;
+}
+
 int main(void) {
   int fail = 0;
   const double tol = 2e-6; /* f32 partial sums every 256 of 2816 terms */
@@ -76,6 +144,18 @@ int main(void) {
   fail |= run(5, 2048, 32) > tol;   /* the sigmoid router's width */
   fail |= run(9, 300, 64) > tol;    /* K not a multiple of the chunk */
   fail |= run(1, 256, 128) > tol;   /* one row, one chunk */
+  /* the softmax router's selection: top-8 plus the 5 prefetch hints */
+  fail |= run_topk(7, 128, 8, 13, 0);
+  fail |= run_topk(5, 128, 8, 8, 1); /* integer logits: exact ties */
+  fail |= run_topk(3, 32, 4, 6, 0);
+  {
+    float p[32], sc[32], w[4];
+    uint32_t sl[4];
+    const int r1 = hvx_router_topk_rows_f32(p, sc, sl, w, 1, 32, 4, 3, NULL);
+    const int r2 = hvx_router_topk_rows_f32(p, sc, sl, w, 1, 48, 4, 4, NULL);
+    printf("topk rejections: n_sel<top_k=%d E%%32=%d\n", r1, r2);
+    fail |= !(r1 == -1 && r2 == -1);
+  }
   {
     float x[32], w[32 * 32], y[32];
     memset(y, 0, sizeof y);
