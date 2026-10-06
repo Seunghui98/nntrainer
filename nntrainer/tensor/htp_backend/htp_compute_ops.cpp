@@ -4673,6 +4673,33 @@ private:
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
                       unsigned int inter, unsigned int N_out, int kind = 0) {
+    // [#225] A long prefill in row chunks, each with its rows' share of the
+    // routing: the session scratch grows with M (the cached activation and
+    // its AH tiles), and at P1024 it no longer fits beside the weights.
+    // Every row's result is its own -- per-row quantization, experts added
+    // in index order -- so the chunks give the whole call's bytes.
+    const unsigned int step = prefillRows();
+    if (step != 0 && M > step) {
+      for (unsigned int m0 = 0; m0 < M; m0 += step) {
+        const unsigned int m = std::min(step, M - m0);
+        std::vector<unsigned int> ri, rc(row_count.size(), 0);
+        std::vector<float> rw;
+        for (size_t e = 0, at = 0; e < row_count.size(); at += row_count[e++]) {
+          for (unsigned int j = 0; j < row_count[e]; ++j) {
+            const unsigned int r = row_index[at + j];
+            if (r >= m0 && r < m0 + m) {
+              ri.push_back(r - m0);
+              rw.push_back(row_weight[at + j]);
+              ++rc[e];
+            }
+          }
+        }
+        invokeMoeLayer(
+          session, h_gu, h_dn, ri, rc, rw, act + static_cast<size_t>(m0) * K,
+          out + static_cast<size_t>(m0) * N_out, m, K, inter, N_out, kind);
+      }
+      return;
+    }
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
 
@@ -4825,10 +4852,13 @@ private:
   void invokeConvBlock(remote_handle64 session, const ConvHandles &ch,
                        const float *conv_w, const float *act, float *out,
                        float *state, unsigned int M, unsigned int K,
-                       unsigned int C, unsigned int N_out) {
+                       unsigned int C, unsigned int N_out,
+                       const float *hist = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
-    const int conv_len = 3 * static_cast<int>(C);
+    // [#225] A chunk after the first carries the conv's two history rows
+    // after the taps, [5 x C] (hexkl_conv_block_run's hist): no IDL change
+    const int conv_len = (hist != nullptr ? 5 : 3) * static_cast<int>(C);
     const int state_len = 2 * static_cast<int>(C);
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
@@ -4838,15 +4868,16 @@ private:
       stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float));
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
-    const size_t small_bytes =
-      static_cast<size_t>(conv_len + state_len) * sizeof(float);
+    const size_t small_bytes = static_cast<size_t>(7) * C * sizeof(float);
     if (!conv_buf_ || conv_buf_->size() < small_bytes)
       conv_buf_ = std::make_unique<HtpRpcBuffer>(small_bytes);
     float *conv_f32 = reinterpret_cast<float *>(conv_buf_->data());
-    float *state_f32 = conv_f32 + conv_len;
+    float *state_f32 = conv_f32 + 5 * C;
     stagedMemcpy(act_f32, act, static_cast<size_t>(act_len) * sizeof(float));
-    std::memcpy(conv_f32, conv_w,
-                static_cast<size_t>(conv_len) * sizeof(float));
+    std::memcpy(conv_f32, conv_w, static_cast<size_t>(3) * C * sizeof(float));
+    if (hist != nullptr)
+      std::memcpy(conv_f32 + 3 * C, hist,
+                  static_cast<size_t>(state_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
@@ -5498,7 +5529,28 @@ private:
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const ConvHandles &ch =
       get_or_register_conv(in_proj, out_proj, session, K, C, N);
-    invokeConvBlock(session, ch, conv_w, act, out, state, M, K, C, N);
+    // [#225] In row chunks like invokeMoeLayer's, each after the first
+    // continuing from the state the one before handed back
+    const unsigned int step = prefillRows() != 0 ? prefillRows() : M;
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      invokeConvBlock(session, ch, conv_w, act + static_cast<size_t>(m0) * K,
+                      out + static_cast<size_t>(m0) * N, state,
+                      std::min(step, M - m0), K, C, N,
+                      m0 != 0 ? state : nullptr);
+    }
+  }
+
+  /** @brief [#225] Rows per call of the prefill kernels whose session
+   *  scratch grows with M (conv block, dense FFN, MoE layer): 512, the
+   *  prefill the DSP heap held beside the FC weights in #222's sitting
+   *  where 1024 failed with AEE_ENOMEMORY. NNTR_HTP_PREFILL_ROWS=<n> sets
+   *  another, 0 one call per prefill (the host check of the chunking). */
+  static unsigned int prefillRows() {
+    static const unsigned int rows = [] {
+      const char *v = std::getenv("NNTR_HTP_PREFILL_ROWS");
+      return v != nullptr ? static_cast<unsigned int>(std::atoi(v)) : 512u;
+    }();
+    return rows;
   }
 
   bool register_q4_0_conv_block(void *in_proj, void *out_proj, unsigned int K,

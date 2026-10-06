@@ -159,9 +159,10 @@
 #     heap-path heap_kib=<n> e3 calls/token=1.00 ok
 #   E2E eval fcwh==wh-lfm25 ... bit_identical=1
 #   E2E eval fcwh-nokeys==off-lfm25 ... bit_identical=1 ... sidecar=unopened ok
+#   E2E keys lfm25-p2x prompt=1024 chunks=512 ... logits bit_identical=1 ok
 #                              (#225: the keys reading the FC WH sidecar,
 #                              its images in the arena and through the heap
-#                              path)
+#                              path; P1024 in 512-row prefill chunks)
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -454,7 +455,8 @@ PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
 # [#225] the same keys on the model packed with the FC WH sidecar (its main
 # file must be htp25q's): hybrid with the images in the arena, the same
 # with every image through the heap path (NNTR_HTP_FC_WH_HEAP=1), the
-# one-PD run (decode still on Q4M1 in PR 1).
+# one-PD run (decode still on Q4M1 in PR 1); then prompt 1024 in 512-row
+# prefill chunks (the default) against one call (NNTR_HTP_PREFILL_ROWS=0).
 # --repack: the app's load (main.cpp), where the sidecar is opened and the
 # FCs registered before the first prefill
 "$Q" "$FIX25" -o "$OUT/htp25w" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
@@ -470,13 +472,17 @@ c.update(conv_block_engine="htp", dense_ffn_engine="htp",
          attn_proj_engine="htp", init_seq_len=1024)
 json.dump(c, open(sys.argv[1], "w"), indent=4)
 PY
-echo "== [#225] lfm25 keys + FC WH sidecar: arena, heap, NNTR_HTP_E2E=1"
+echo "== [#225] lfm25 keys + FC WH sidecar: arena, heap, NNTR_HTP_E2E=1, P1024 chunked / whole"
 PROMPT=512 run_e2e q25w-off "$OUT/htp25w" htp "$OUT/dump_25woff" "$OUT/25woff.log" --max-seq 2048 --repack
 PROMPT=512 run_e2e q25w-nokeys "$OUT/htp25wn" htp "$OUT/dump_25wn" "$OUT/25wn.log" --max-seq 2048 --repack
 PROMPT=512 NNTR_HTP_FC_WH_HEAP=1 \
   run_e2e q25w-heap "$OUT/htp25w" htp "$OUT/dump_25wheap" "$OUT/25wheap.log" --max-seq 2048 --repack
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25w-e3 "$OUT/htp25w" htp "$OUT/dump_25we3" "$OUT/25we3.log" --max-seq 2048 --repack
+PROMPT=1024 \
+  run_e2e q25w-p2x "$OUT/htp25w" htp "$OUT/dump_25wp2x" "$OUT/25wp2x.log" --max-seq 2048 --repack
+PROMPT=1024 NNTR_HTP_PREFILL_ROWS=0 \
+  run_e2e q25w-p1x "$OUT/htp25w" htp "$OUT/dump_25wp1x" "$OUT/25wp1x.log" --max-seq 2048 --repack
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -683,7 +689,9 @@ fi
 # MoE call and the logits; (3) the one-PD run on the sidecar model;
 # (3b) no engine key: the sidecar named in the config, never opened, the
 # logits those of the keyless model without one (the CPU-only and Aoff
-# configs of the handoff); (4) printed, not
+# configs of the handoff); (4) P1024 in two 512-row prefill chunks against
+# one call, logits; the chunked run makes more MoE calls, which says it
+# chunked; (5) printed, not
 # gated: the keys' logits against the keyless hybrid (CPU Q4_0 FCs), the
 # sidecar's and the load-time re-quantization's, side by side
 wb="$(sed -n 's/^\[HTP\] fc wh: file=.* handles=\([0-9]*\) arena_kib=\([0-9]*\) heap_kib=\([0-9]*\) requant=\([0-9]*\)$/\1 \2 \3 \4/p' "$OUT/25woff.log")"
@@ -699,13 +707,22 @@ else
   echo "E2E FAIL keys fcwh-lfm25: banner=[${wb:-none}] heap-run=[${wh_heap:-none}] main_same=$w_main_same calls/token=${calls_w:-none}"; fail=1
 fi
 $EVAL --label 'fcwh==wh-lfm25' "$OUT/dump_25woff" "$OUT/dump_25wheap" | tail -1 || fail=1
-mkdir -p "$OUT/lq" "$OUT/lk" "$OUT/lw" "$OUT/lwn"
+mkdir -p "$OUT/p1x" "$OUT/p2x" "$OUT/lq" "$OUT/lk" "$OUT/lw" "$OUT/lwn"
 cp "$OUT"/dump_25wn/logits_*.f32 "$OUT/lwn/"
 nk="$($EVAL --label fcwh-nokeys==off-lfm25 "$OUT/lwn" "$OUT/dump_25qoff" | tail -1 || true)"
 if grep -q 'bit_identical=1' <<< "$nk" && ! grep -q '^\[HTP\] fc wh:' "$OUT/25wn.log"; then
   echo "$nk sidecar=unopened ok"
 else
   echo "E2E FAIL fcwh-nokeys-lfm25: [$nk]"; fail=1
+fi
+cp "$OUT"/dump_25wp1x/logits_*.f32 "$OUT/p1x/"; cp "$OUT"/dump_25wp2x/logits_*.f32 "$OUT/p2x/"
+n1="$(grep -c moe_layer "$OUT/dump_25wp1x/manifest.txt" || true)"
+n2="$(grep -c moe_layer "$OUT/dump_25wp2x/manifest.txt" || true)"
+p2="$($EVAL --label lfm25-p2x "$OUT/p1x" "$OUT/p2x" | tail -1 || true)"
+if grep -q 'bit_identical=1' <<< "$p2" && [ "${n2:-0}" -gt "${n1:-0}" ]; then
+  echo "E2E keys lfm25-p2x prompt=1024 chunks=512 moe_calls=$n2 whole=$n1 logits bit_identical=1 ok"
+else
+  echo "E2E FAIL keys lfm25-p2x: [$p2] moe_calls=$n2 whole=$n1"; fail=1
 fi
 cp "$OUT"/dump_25qoff/logits_*.f32 "$OUT/lq/"; cp "$OUT"/dump_25koff/logits_*.f32 "$OUT/lk/"
 cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lw/"
