@@ -562,8 +562,12 @@ interface nntr_hvx : remote_handle64 {
    // register for the whole shape (24 MiB at the LFM2.5 shape and max_seq
    // 2048) and freed at release or close. layer
    // is the attention-layer ordinal. Not wired into the model here: #85's
-   // ATTN_M1 slot stays NULL. One cache per session: a second register
-   // without a release is AEE_EBADSTATE. A bad shape or a position out
+   // ATTN_M1 slot stays NULL. One cache per shape: [plan 201 S4] a second
+   // register of another (n_kv, gqa, head_dim) is the session's second
+   // cache (Gemma 4's full layers), kv_append names it with
+   // HTP_ATTN_KV_CACHE_B in layer (htp_graph_desc.h); a second of the same
+   // shape, or a third, without a release is AEE_EBADSTATE (release frees
+   // both). A bad shape or a position out
    // of range is AEE_EINVALIDFORMAT, a hole (pos or kv_from past the
    // layer's length) or a missing cache AEE_EBADSTATE; never AEE_EBADPARM,
    // which stays the stale-skel symptom.

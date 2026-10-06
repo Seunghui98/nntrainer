@@ -105,6 +105,10 @@ typedef struct {
                                  attn_m1_register; NULL = none. Borrows
                                  quant_pool, so it is freed in close()
                                  before hvx_worker_pool_destroy */
+  hvx_attn_m1_ctx *attn_m1_b; /**< [plan 201 S4] a second cache of another
+                                 shape (Gemma 4's full layers): the second
+                                 attn_m1_register of a different shape;
+                                 freed with attn_m1 */
   struct nntr_hvx_dspq *dspq; /**< [#141] the MoE call's dspqueue thread
                                  (nntr_hvx_dspq.c); NULL = no queue.
                                  Stopped first in close() */

@@ -196,6 +196,11 @@ enum {
 #define HTP_GRAPH_MAX_BAN 32u
 /** @brief An EXPERTS table entry for an expert that is not resident. */
 #define HTP_GRAPH_NO_HANDLE 0xFFFFFFFFu
+/** @brief [plan 201 S4] attn_m1_kv_append's layer word: this bit names the
+ *  session's second attention cache (the second attn_m1_register, of
+ *  another shape: Gemma 4's full layers), the rest the layer's ordinal
+ *  among the ATTN_M1 ops of that shape (hexkl_graph_init's ordinal). */
+#define HTP_ATTN_KV_CACHE_B 0x80000000u
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
 /** @brief A layer's FFN kind. [plan 201 S4] DENSE_MOE: Gemma 4's dense

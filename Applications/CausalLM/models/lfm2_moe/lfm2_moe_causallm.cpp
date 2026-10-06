@@ -60,6 +60,12 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
   MOE_ENGINE = nntr_cfg.value("moe_engine", std::string("cpu"));
   MOE_HTP_LAYERS =
     parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
+#ifdef ENABLE_HEXKL
+  // [plan 201 S4] SwiGLU experts: the session's GeGLU flag stays clear
+  // (set_moe_geglu throws when a Gemma model of this process sent it set)
+  if (MOE_ENGINE == "htp")
+    nntrainer::get_htp_ops()->set_moe_geglu(false);
+#endif
 
 #ifdef ENABLE_HEXKL
   // [#85] NNTR_HTP_FORWARD=1: describe this model's decode step to the HTP

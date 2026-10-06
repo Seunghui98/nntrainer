@@ -1122,6 +1122,17 @@ constexpr unsigned int kDecodeMaxHeadDim = 128;
 } // namespace
 #endif /* NNTR_HTP_INPROC */
 
+/** [plan 201 S4] set_moe_geglu's flag (HTP_MOE_FLAG_GEGLU) and whether
+ *  sendMoeOptsOnce has sent the word it goes into. */
+static std::atomic<bool> &moeGeglu() {
+  static std::atomic<bool> on{false};
+  return on;
+}
+static std::atomic<bool> &moeOptsSent() {
+  static std::atomic<bool> sent{false};
+  return sent;
+}
+
 class HtpComputeOps : public CpuComputeOps {
 public:
   /** [#130] The per-token entry's call count at close, the one line the
@@ -1706,11 +1717,42 @@ public:
           : i + 1;
     }
     kv_len_.assign(n_attn, 0);
+    // [plan 201 S4] the attention shapes, in list order (one cache each,
+    // at most two: Gemma 4's sliding and full layers)
+    attn_op_.assign(n_attn, 0);
+    attn_cache_.assign(n_attn, 0);
+    attn_cache_ord_.assign(n_attn, 0);
+    {
+      std::vector<const htp_graph_op *> shapes;
+      std::vector<uint32_t> per_shape;
+      for (uint32_t i = 0; i < n_ops; ++i) {
+        const htp_graph_op *op = htp_graph_op_cat(words.data(), i);
+        if (op->kind != HTP_OP_ATTN_M1)
+          continue;
+        size_t c = 0;
+        while (c < shapes.size() &&
+               (shapes[c]->n_kv != op->n_kv || shapes[c]->gqa != op->gqa ||
+                shapes[c]->head_dim != op->head_dim))
+          ++c;
+        if (c == shapes.size()) {
+          if (c == 2u)
+            throw std::invalid_argument(
+              "set_decode_graph_desc: a third attention shape (the session "
+              "holds two caches)");
+          shapes.push_back(op);
+          per_shape.push_back(0u);
+        }
+        const uint32_t ord = attn_ordinal_[i];
+        attn_op_[ord] = i;
+        attn_cache_[ord] = static_cast<uint32_t>(c);
+        attn_cache_ord_[ord] = per_shape[c]++;
+      }
+    }
+    load_params_.clear();
     std::fill(std::begin(kind_next_), std::end(kind_next_), 0u);
     cur_pos_ = HTP_GRAPH_NO_OP;
     clearPending();
     seed_ordinal_ = HTP_GRAPH_NO_OP;
-    rope_bound_ = false;
     attn_registered_ = false;
     moe_bound_ = 0;
     moe_op_by_handle_.clear();
@@ -1741,6 +1783,64 @@ public:
     }
     q4_pending_.push_back({data, K, N, canonical});
     return true;
+  }
+
+  /** [plan 201 S4] compute_ops.h: one f32 parameter of op @a op handed at
+   *  load by the weight's name. The length is checked against the record
+   *  now (hexkl_graph.c's graph_param_len), the pointer kept and bound
+   *  after graph_init; the op's hook then binds nothing. */
+  bool set_decode_graph_param(unsigned op, unsigned which, const float *data,
+                              unsigned n) override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    if (graph_words_.empty())
+      return false;
+    if (graph_inited_)
+      throw std::runtime_error(
+        "set_decode_graph_param: the graph is already initialised");
+    if (op >= param_bound_.size() || data == nullptr)
+      throw std::invalid_argument("set_decode_graph_param: op " +
+                                  std::to_string(op) + " of " +
+                                  std::to_string(param_bound_.size()));
+    const htp_graph_op *rec = graphOp(op);
+    uint32_t want = 0;
+    switch (which) {
+    case HTP_GRAPH_PARAM_GAMMA:
+      want = rec->kind == HTP_OP_RMSNORM   ? rec->K
+             : rec->kind == HTP_OP_QK_NORM ? 2u * rec->head_dim
+                                           : 0u;
+      break;
+    case HTP_GRAPH_PARAM_ROUTER_W:
+      want = rec->kind == HTP_OP_ROUTER_TOPK ? rec->K * rec->n_experts : 0u;
+      break;
+    case HTP_GRAPH_PARAM_ROUTER_BIAS:
+      want = rec->kind != HTP_OP_ROUTER_TOPK ? 0u
+             : rec->eps_bits != 0u           ? rec->K + rec->n_experts
+                                             : rec->n_experts;
+      break;
+    case HTP_GRAPH_PARAM_ROPE_TABLE:
+      want = rec->kind == HTP_OP_ROPE ? graph_words_[6] * rec->head_dim : 0u;
+      break;
+    default:
+      break;
+    }
+    if (want == 0u || n != want)
+      throw std::invalid_argument(
+        "set_decode_graph_param: op " + std::to_string(op) + " (" +
+        htp_graph_kind_name(rec->kind) + ") parameter " +
+        std::to_string(which) + " of " + std::to_string(n) + " floats, want " +
+        std::to_string(want));
+    load_params_.push_back({op, which, data, n});
+    param_bound_[op] = 1;
+    return true;
+  }
+
+  /** [plan 201 S4] compute_ops.h: the model's gated activation; read once
+   *  by sendMoeOptsOnce, so it is set before the first MoE call. */
+  void set_moe_geglu(bool on) override {
+    if (moeOptsSent().load() && moeGeglu().load() != on)
+      throw std::runtime_error("set_moe_geglu: the MoE options were already "
+                               "sent with the other activation");
+    moeGeglu().store(on);
   }
 
   /** [#132 Part B] One weight's rows [r0, r0 + rows) as a Q4M1 handle:
@@ -2012,10 +2112,24 @@ public:
       break;
     case HTP_OP_ATTN_M1: {
       const uint32_t ord = attn_ordinal_[op];
-      if (!rope_bound_) {
-        setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, param,
-                 param_len, graph_words_[6] * 64u, "RoPE table");
-        rope_bound_ = true;
+      // [plan 201 S4] the layer's RoPE table goes to its own ROPE op,
+      // max_seq x head_dim: Gemma 4's layers differ in theta and rotary
+      // variant even at one head_dim; the DSP shares equal tables, so
+      // LFM2's layers still hold one
+      uint32_t r = op;
+      while (r > 0u && graphOp(r)->kind != HTP_OP_ROPE)
+        --r;
+      if (graphOp(r)->kind != HTP_OP_ROPE || graphOp(r)->layer != rec->layer)
+        throw std::runtime_error("decode_op_fp32: ATTN_M1 op " +
+                                 std::to_string(op) + " has no ROPE op");
+      if (!param_bound_[r]) {
+        if (param == nullptr || param_len == 0u) {
+          --kind_next_[kind]; // the layer builds its table and calls again
+          return 3;
+        }
+        setParam(session, r, HTP_GRAPH_PARAM_ROPE_TABLE, param, param_len,
+                 graph_words_[6] * rec->head_dim, "RoPE table");
+        param_bound_[r] = 1;
       }
       // The DSP cache must hold rows [0, pos): seed it from the layer's
       // copy after any jump (the first token after a prefill, a second
@@ -2142,10 +2256,14 @@ public:
     }
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const htp_graph_op *rec = graphOp(kind_ops_[HTP_OP_ATTN_M1][0]);
+    // [plan 201 S4] the layer's own shape and cache
+    const htp_graph_op *rec = graphOp(attn_op_[seed_ordinal_]);
     const int n = static_cast<int>(n_rows * rec->n_kv * rec->head_dim);
-    const int err = nntr_hvx_attn_m1_kv_append(session, seed_ordinal_, 0u,
-                                               n_rows, k_rows, n, v_rows, n);
+    const uint32_t layer =
+      attn_cache_ord_[seed_ordinal_] |
+      (attn_cache_[seed_ordinal_] ? HTP_ATTN_KV_CACHE_B : 0u);
+    const int err = nntr_hvx_attn_m1_kv_append(session, layer, 0u, n_rows,
+                                               k_rows, n, v_rows, n);
     if (err != AEE_SUCCESS) {
       throw std::runtime_error("nntr_hvx_attn_m1_kv_append failed at layer " +
                                std::to_string(seed_ordinal_) + ", " +
@@ -2522,6 +2640,9 @@ public:
                    static_cast<unsigned>(t.size()),
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
+      // [plan 201 S4] the parameters the model handed at load, by name
+      for (const LoadParam &p : load_params_)
+        setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
     } catch (...) {
       nntr_hvx_graph_release(session);
       if (!e2e_)
@@ -2535,11 +2656,20 @@ public:
                  htp_graph_kinds_str(resident_mask_, names, sizeof(names)),
                  moe_ops_.size());
     // [#130] the session's KV cache for the resident ATTN_M1 ops: one
-    // ordinal per attention layer, the shape from the first record
-    if (!kind_ops_[HTP_OP_ATTN_M1].empty()) {
-      const htp_graph_op *rec = graphOp(kind_ops_[HTP_OP_ATTN_M1][0]);
-      const uint32_t n_attn =
-        static_cast<uint32_t>(kind_ops_[HTP_OP_ATTN_M1].size());
+    // ordinal per attention layer, the shape from the first record;
+    // [plan 201 S4] a second cache for a second shape (Gemma 4's full
+    // layers), registered second so the DSP files it as attn_m1_b
+    for (uint32_t c = 0; c < 2u; ++c) {
+      const htp_graph_op *rec = nullptr;
+      uint32_t n_attn = 0;
+      for (uint32_t op : kind_ops_[HTP_OP_ATTN_M1]) {
+        if (attn_cache_[attn_ordinal_[op]] != c)
+          continue;
+        rec = rec ? rec : graphOp(op);
+        ++n_attn;
+      }
+      if (rec == nullptr)
+        continue;
       const uint32_t max_seq = graph_words_[6];
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq);
@@ -2573,6 +2703,7 @@ public:
    *  [HTP-PROFILE]'s m1_gemv= and blocks= are the per-call proof. */
   void sendMoeOptsOnce(remote_handle64 session) {
     std::call_once(moe_opts_once_, [session]() {
+      moeOptsSent().store(true);
       const char *env = std::getenv("NNTR_MOE_HTP_M1_GEMV");
       const char *lead_env = std::getenv("NNTR_MOE_HTP_GEMV_LEAD_KB");
       const char *rows1_env = std::getenv("NNTR_MOE_HTP_GEMV_ROWS1");
@@ -2590,7 +2721,7 @@ public:
       const uint32_t flags =
         htp_moe_opts_flags(env, lead_env, rows1_env, feed_env) |
         htp_moe_opts_dma_bypass(std::getenv("NNTR_MOE_DMA_BYPASS")) |
-        queue_bits;
+        queue_bits | (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
       const char *source = env != nullptr ? "env" : "default";
       uint32_t applied = 0;
       const int err = nntr_hvx_moe_set_opts(session, flags, &applied);
@@ -6346,8 +6477,19 @@ private:
   std::vector<uint8_t> param_bound_;
   std::vector<uint32_t> conv_next_pos_;
   std::vector<uint32_t> kv_len_;
-  bool rope_bound_ = false;
   bool attn_registered_ = false;
+  /** [plan 201 S4] per attention ordinal its op, its session cache (0, or
+   *  1 for the second attn_m1_register: another (n_kv, gqa, head_dim)) and
+   *  its ordinal within that cache (hexkl_graph_init's) */
+  std::vector<uint32_t> attn_op_, attn_cache_, attn_cache_ord_;
+  /** [plan 201 S4] the f32 parameters the model handed at load
+   *  (set_decode_graph_param), bound after graph_init */
+  struct LoadParam {
+    uint32_t op, which;
+    const float *data;
+    uint32_t n;
+  };
+  std::vector<LoadParam> load_params_;
   uint32_t seed_ordinal_ = HTP_GRAPH_NO_OP;
   uint32_t pending_op_ = HTP_GRAPH_NO_OP;
   std::vector<float> pending_in_;
