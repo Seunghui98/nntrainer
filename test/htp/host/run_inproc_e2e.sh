@@ -479,9 +479,9 @@ PROMPT=512 NNTR_HTP_FC_WH_HEAP=1 \
   run_e2e q25w-heap "$OUT/htp25w" htp "$OUT/dump_25wheap" "$OUT/25wheap.log" --max-seq 2048 --repack
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25w-e3 "$OUT/htp25w" htp "$OUT/dump_25we3" "$OUT/25we3.log" --max-seq 2048 --repack
-PROMPT=1024 \
+PROMPT=1024 NNTR_HTP_PROFILE=1 \
   run_e2e q25w-p2x "$OUT/htp25w" htp "$OUT/dump_25wp2x" "$OUT/25wp2x.log" --max-seq 2048 --repack
-PROMPT=1024 NNTR_HTP_PREFILL_ROWS=0 \
+PROMPT=1024 NNTR_HTP_PREFILL_ROWS=0 NNTR_HTP_PROFILE=1 \
   run_e2e q25w-p1x "$OUT/htp25w" htp "$OUT/dump_25wp1x" "$OUT/25wp1x.log" --max-seq 2048 --repack
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
@@ -719,10 +719,20 @@ cp "$OUT"/dump_25wp1x/logits_*.f32 "$OUT/p1x/"; cp "$OUT"/dump_25wp2x/logits_*.f
 n1="$(grep -c moe_layer "$OUT/dump_25wp1x/manifest.txt" || true)"
 n2="$(grep -c moe_layer "$OUT/dump_25wp2x/manifest.txt" || true)"
 p2="$($EVAL --label lfm25-p2x "$OUT/p1x" "$OUT/p2x" | tail -1 || true)"
-if grep -q 'bit_identical=1' <<< "$p2" && [ "${n2:-0}" -gt "${n1:-0}" ]; then
-  echo "E2E keys lfm25-p2x prompt=1024 chunks=512 moe_calls=$n2 whole=$n1 logits bit_identical=1 ok"
+# [#236] the M>1 FC rows' calls / rows summed: the qkv and o_proj FCs step
+# by prefillRows() too, so the chunked run carries the same rows in calls of
+# 512 (every FC call of this prompt is 1024 or 512 rows) and the whole run
+# in fewer
+fc_sum() { sed -n 's/.*M>1 FC *calls=\([0-9]*\) *rows=\([0-9]*\).*/\1 \2/p' "$1" |
+  awk '{c+=$1; r+=$2} END {print c+0, r+0}'; }
+read -r f2 r2 <<< "$(fc_sum "$OUT/25wp2x.log")"
+read -r f1 r1 <<< "$(fc_sum "$OUT/25wp1x.log")"
+if grep -q 'bit_identical=1' <<< "$p2" && [ "${n2:-0}" -gt "${n1:-0}" ] &&
+  [ "$f1" -gt 0 ] && [ "$f2" -gt "$f1" ] && [ "$f2" = $((r2 / 512)) ] &&
+  [ $((r2 % 512)) = 0 ] && [ "$r2" = "$r1" ]; then
+  echo "E2E keys lfm25-p2x prompt=1024 chunks=512 moe_calls=$n2 whole=$n1 fc_calls=$f2 whole=$f1 fc_rows=$r2 logits bit_identical=1 ok"
 else
-  echo "E2E FAIL keys lfm25-p2x: [$p2] moe_calls=$n2 whole=$n1"; fail=1
+  echo "E2E FAIL keys lfm25-p2x: [$p2] moe_calls=$n2 whole=$n1 fc_calls=$f2/$r2 whole=$f1/$r1"; fail=1
 fi
 cp "$OUT"/dump_25qoff/logits_*.f32 "$OUT/lq/"; cp "$OUT"/dump_25koff/logits_*.f32 "$OUT/lk/"
 cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lw/"
