@@ -47,17 +47,6 @@ public:
   ScalarMultiplier(float value = 1.0f) { set(value); }
 };
 
-/**
- * @brief UseWeight property to determine whether to load scalar from weight
- * file
- */
-class UseWeight : public nntrainer::Property<bool> {
-public:
-  static constexpr const char *key = "use_weight"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;       /**< property type */
-  UseWeight(bool value = false) { set(value); }
-};
-
 } // namespace props
 
 /**

@@ -150,6 +150,18 @@ public:
 };
 
 /**
+ * @brief use_weight: the layer's scalar comes from the weight file (one
+ *        float), not from a property. scalar_multiply's, shared with
+ *        residual_add, which folds the block's scalar into its add.
+ */
+class UseWeight : public nntrainer::Property<bool> {
+public:
+  static constexpr const char *key = "use_weight"; /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag;       /**< property type */
+  UseWeight(bool value = false) { set(value); }
+};
+
+/**
  * @brief out_norm: likewise the RMSNorm of the layer's output (its gamma
  *        is the last weight in the file).
  */
