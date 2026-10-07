@@ -383,3 +383,34 @@ cd /data/local/tmp/nntrainer/causallm && sh g4_io_dma_probe.sh models/gemma4-26b
 - dense MLP는 **블록 융합 콜**(51 §1: `dense_ffn_engine`, MoE 커널로 up·gate·down 한 콜, 10.4 ms/층 vs ARM 19.5)로 이득이 확인됐다. Gemma는 GeGLU라 `dense_ffn_layer`에 act 선택(이미 커널엔 `act` 인자가 있다)과 `Gemma4CausalLM`이 `dense_ffn_engine` 키를 읽게 하는 일이 남는다. 예상: 층당 −9 ms × 30 = **−0.3 s**.
 - 순서: (1) dense_ffn GeGLU + Gemma 연결 — 작고 검증된 길, −0.3 s. (2) attention 블록 한 콜 — 큰 일(−2 s 이상 가능), 30/45 문서 설계 재사용. (3) 그 뒤 prefill은 읽기 바닥(reader 4개 3.0 s, 6개 2.0 s)에 닿고, 그때 int2와 reader 수가 시간으로 나타난다.
 
+## 9. 프로파일이 말하는 최적화 후보 (2026-10-07, 우선순위순)
+
+근거는 §5.2·§7.4b·§8의 실측이다. "예상"은 산술이며 기기 미측정.
+
+### 9.1 prefill (정상 빌드 4.0 s 기준, 비중은 §8의 프로파일 빌드에서)
+
+| # | 대상 | 지금 | 근거 | 예상 절감 | 크기 |
+|---|---|---|---|---|---|
+| 1 | **attention 블록 한 콜** (q/k/v proj + RoPE + mha_core + out proj) | mha_core 36% + proj ~23% ≈ **2.3 s** | HTP attention 커널은 있고 CPU 대비 prefill 43~65×(ref_14). FC 개별 콜은 포장 고정비로 손해(50 §3.7)라 블록으로만 | −1.5~−2 s | 큼 (45 Phase C/D) |
+| 2 | **dense MLP 블록 콜** (`dense_ffn_engine`, GeGLU 추가) | ~10% ≈ 0.4 s | LFM2 실측 19.5 → 10.4 ms/층(51 §1.4) | −0.2 s | 작음 |
+| 3 | **MoE 층 호스트 몫** | lfm2_moe 1371 ms 중 HTP host 659 → **~0.7 s가 호스트**(router dot, top-k, gather, read-ahead 등록 RPC, scatter) | `NNTR_M0_PROFILE=1`이 단계별로 쪼개 준다(43 §5). 아직 안 봄 | 모름, 측정 먼저 | 작음~중 |
+| 4 | **elementwise 500 ms** (scalar_multiply 190, rms_norm 136, reshaped 72, addition 58, activation 47) | 8% | `q_scaled`가 층당 4 ms = 512×4096 f32 곱에 4 ms → 비정상적으로 느림(단일 스레드 `Tensor::multiply`). q 스케일은 wq 가중치나 attention scale에 접을 수 있다. `layer_scalar`도 addition에 접힘 | −0.2 s | 작음 |
+| 5 | **MoE HTP 콜 내부** 0.66 s | acc_read 22%, requant 8%, drain 12%(확장 노출 2.4 ms/call) | acc_read는 HMX 누산기 읽기(46 §), 확장 노출은 MOE_EXPAND_SPLIT·워커 수 | −0.1 s | 중 |
+| 6 | **reader expert당 고정비 1.4 ms** | int4 4.70 / int2 3.06 ms/expert | pread 2회 → 1회(gate_up·down 연속), 등록 RPC 묶기 | 지금은 시간 0(숨음). 1·2 뒤 읽기가 바닥이 되면 int2 2.57 → ~1.4 s | 작음 |
+| 7 | reader 수 4 → 6 | 합산 1.68 → 2.58 GB/s | §5.2 | 6과 같은 시점에 효과 | 환경변수 |
+
+1·2가 끝나면 prefill ≈ 4.0 − 2.0 − 0.2 ≈ 1.8 s(예상)이고, 그때 읽기(int4 3.95 s / int2 2.57 s / 6+7 적용 int2 ~0.9 s)가 바닥이 된다. **int4로는 1.8 s에 못 내려간다. int2 + 6 + 7이 있어야 한다.**
+
+### 9.2 decode (실제 라우팅 기준, §7.4b int4 실측)
+
+| # | 대상 | 지금 | 예상 |
+|---|---|---|---|
+| 1 | **miss 비용** | 토큰당 126 miss × 2.45 ms ≈ 309 ms → decode는 사실상 전부 읽기 | int2: miss당 1.57 ms(−36%). 고정비 제거(9.1-6)로 int4 ~1.1 / int2 ~0.6 ms |
+| 2 | **miss 수** | C=16 → 층당 ~4.2 miss | int2 C=32는 arena가 int4 C=16과 같다(1408 MiB) → miss 감소. 더미가 아닌 실제 라우팅 trace로 `tools/moe_expert_cache_sim.py`에 넣어 C별 miss율을 먼저 본다 |
+| 3 | DMA 노출 | int4 160 us/call | int2 84 us: −86 us/call, −2.6 ms/token (실측) |
+| 4 | MoE 밖 CPU 44 ms/token | lm_head 262144×2816 Q4_0, dense MLP, proj | 9.1의 1·2가 decode에도 적용되면 줄어든다 |
+
+### 9.3 측정 먼저 할 것
+- `NNTR_M0_PROFILE=1`로 MoE 층 호스트 0.7 s 분해 (9.1-3).
+- 실제 가중치 int2 파일(양자화기에 `--moe_bits 2` 추가 필요: 지금 더미 도구는 int4 값을 거칠게 줄이는 것이라 정확도 없음)로 decode miss 비용 확인 (9.2-1). 정확도는 별도 문제.
+
