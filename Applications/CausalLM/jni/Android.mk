@@ -45,10 +45,14 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
-    $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend
+    $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend \
+    $(NNTRAINER_ROOT)/nntrainer/tensor
 # htp_backend is here for one header: swiglu_det.h, the deterministic SwiGLU
 # the MoE layer shares with the DSP. It is header-only and builds on any
-# target, so this costs nothing on a non-HTP build.
+# target, so this costs nothing on a non-HTP build. nntrainer/tensor is
+# here for htp_wh_palette.h (NNTR_MOE_DIFF's 2-bit reader), which is not
+# installed and reaches the kernel's code order through its own relative
+# include of htp_backend/hvx/hvx_expand_i2i4.h; header-only as well.
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
