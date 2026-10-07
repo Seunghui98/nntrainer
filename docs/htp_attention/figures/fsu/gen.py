@@ -420,8 +420,103 @@ def figC():
     return "\n".join(o)
 
 
+
+# --------------------------------------- prefill, presentation style
+def figP():
+    o = [HEAD.format(title="Prefill Expert Prefetch")]
+    o.append(text(80, 88, "Prefill: Expert Prefetch", "t1"))
+    o.append(text(80, 134, "Layer N 연산 중 Layer N+1의 expert를 Flash에서 미리 읽어, Flash I/O를 NPU 연산과 overlap", "t2"))
+    x0, c = 360, 165
+    r = (10.94 / 5.01 - 1) * c          # totals keep the measured ratio
+
+    def lane_lbl(y, s):
+        o.append(text(340, y + 36, s, "sm", "end", 'style="font-weight:500"'))
+
+    def blk(x, y, w, fill, s, size=17):
+        o.append(rect(x, y, w - 4, 56, fill, 5))
+        o.append(text(x + (w - 4) / 2, y + 35, s, "lblw", "middle", f'style="font-size:{size}px"'))
+
+    def idle(x, y, w):
+        o.append(f'<rect x="{x}" y="{y}" width="{w - 4}" height="56" rx="5" fill="none" '
+                 f'stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>')
+        o.append(text(x + (w - 4) / 2, y + 35, "idle", "xs", "middle"))
+
+    # baseline
+    o.append(text(80, 236, "Baseline", "h3"))
+    o.append(text(80, 264, "On-demand read", "sm"))
+    o.append(text(80, 290, "Expert cache 5 slot/layer", "sm"))
+    lane_lbl(214, "NPU")
+    lane_lbl(280, "Flash")
+    for i in range(4):
+        t = x0 + i * (r + c)
+        idle(t, 214, r)
+        blk(t, 280, r, "var(--read)", f"Read L{i + 1}")
+        blk(t + r, 214, c, "var(--npu)", f"Compute L{i + 1}")
+    # prefetch
+    o.append(text(80, 412, "Expert Prefetch", "h3"))
+    o.append(text(80, 440, "Read-ahead, LRU", "sm"))
+    o.append(text(80, 466, "Expert cache 16 slot/layer", "sm"))
+    lane_lbl(390, "NPU")
+    lane_lbl(456, "Flash")
+    for i in range(4):
+        blk(x0 + i * c, 390, c, "var(--npu)", f"Compute L{i + 1}")
+        blk(x0 + i * c + 8, 456, 0.77 * c, "var(--read)", f"Prefetch L{i + 2}", 15)
+    # time axis and the saving
+    xe1, xe2 = x0 + 4 * (r + c), x0 + 4 * c
+    o.append(f'<path d="M{x0},540 L{xe1 + 30},540" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>')
+    o.append(text(xe1 + 36, 546, "time", "xs"))
+    o.append(f'<path d="M{xe2 + 14},423 L{xe1 - 6},423" stroke="#52514e" stroke-width="2" '
+             f'stroke-dasharray="4 5" marker-end="url(#ah)" marker-start="url(#ah)"/>')
+    o.append(text((xe2 + xe1) / 2, 410, "Prefill latency −54%", "lbl", "middle", 'style="font-weight:700"'))
+    o.append(text((xe2 + xe1) / 2, 458, "10.94 s → 5.01 s", "sm", "middle"))
+    o.append(text(x0, 576, "Gantt는 개념도: 4개 layer만 표시, 두 행의 전체 길이 비는 실측 비(10.94 : 5.01)", "xs"))
+
+    # cache occupancy
+    o.append(text(80, 640, "Expert cache 점유 (DRAM, NPU-mapped · 30 layer 공유 · LRU)", "h3"))
+    sc = 1440 / 480
+
+    def occ(y, name, segs, note):
+        o.append(text(80, y + 34, name, "lbl", extra='style="font-weight:700"'))
+        x = x0
+        for n, f, lb, ink in segs:
+            o.append(rect(x, y, n * sc - 3, 50, f, 4))
+            if lb:
+                o.append(text(x + n * sc / 2, y + 32, lb, ink, "middle", 'style="font-size:17px"'))
+            x += n * sc
+        if note:
+            o.append(text(x + 14, y + 32, note, "sm"))
+    occ(660, "5 slot/layer · 150", [(128, "var(--npu)", "Layer N (in use) 128", "lblw"),
+                                    (22, "var(--idle)", "", "sm")],
+        "남은 22 slot < 다음 layer 128 → prefetch 불가")
+    occ(728, "16 slot/layer · 480", [(128, "var(--npu)", "Layer N (in use)", "lblw"),
+                                     (128, "var(--npu-t)", "Layer N+1 (ready)", "lbl"),
+                                     (128, "var(--read)", "Layer N+2 (prefetching)", "lblw"),
+                                     (96, "var(--idle)", "free", "sm")], "")
+
+    # measured table
+    ty = 816
+    cols = [(80, "구성"), (470, "Prefill latency"), (790, "I/O stall"),
+            (1080, "동기 expert read"), (1420, "Prefetch expert")]
+    o.append(rect(80, ty, 1760, 52, "var(--idle)", 6))
+    for x, h in cols:
+        o.append(text(x + 20, ty + 34, h, "lbl", extra='style="font-weight:700"'))
+    rows = [("Baseline · 5 slot/layer", "10.94 s", "7.10 s", "2,893", "—"),
+            ("Expert Prefetch · 16 slot/layer", "5.01 s", "0.01 s", "0", "3,360")]
+    for k, row in enumerate(rows):
+        y = ty + 52 + k * 50
+        o.append(f'<path d="M80,{y + 50} L1840,{y + 50}" stroke="#e1e0d9" stroke-width="2"/>')
+        for (x, _), v in zip(cols, row):
+            o.append(text(x + 20, y + 34, v, "lbl", extra='style="font-weight:700"' if k == 1 else ""))
+    o.append(text(80, ty + 194, "Lower bound (산술): prefill 1회 Flash read ≈10 GB ÷ 3.0 GB/s ≈ 3.3 s. "
+                                "NPU 연산이 빨라질수록 이 한계가 드러남.", "sm"))
+    o.append(text(80, 1052, "측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, 446-token prompt, MoE만 NPU 구성, 2026-10-02.", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
+
 for name, fn in [("fsu_1_placement", fig1), ("fsu_2_prefill_prefetch", fig2),
                  ("fsu_3_decode_cache", fig3), ("fsu_a_overview", figA),
-                 ("fsu_b_prefill_before_after", figB), ("fsu_c_decode_hits", figC)]:
+                 ("fsu_b_prefill_before_after", figB), ("fsu_c_decode_hits", figC),
+                 ("fsu_prefill_prefetch", figP)]:
     open(f"{name}.html", "w").write(fn())
 print("ok")
