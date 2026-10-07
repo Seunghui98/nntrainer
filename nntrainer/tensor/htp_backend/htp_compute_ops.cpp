@@ -2879,8 +2879,8 @@ public:
       for (const FcWhEntry &e : entries) {
         const uint64_t want = whBytes(e.K, e.N) + 2u * sizeof(float) * e.N;
         if (e.K % WH_TILE != 0 || e.N % WH_TILE != 0 || e.bytes != want ||
-            e.off > size || e.bytes > size - e.off ||
-            !index.emplace(e.key, e).second) {
+            e.off < fcWhHeaderBytes(vc[1]) || e.off > size ||
+            e.bytes > size - e.off || !index.emplace(e.key, e).second) {
           throw std::runtime_error("bad index entry " +
                                    std::string(e.name, strnlen(e.name, 64)));
         }
@@ -4910,9 +4910,13 @@ private:
     if (err != AEE_SUCCESS) {
       std::string hint;
       if (static_cast<unsigned>(err) == 0x8000040Eu) {
-        hint = " (AEE_EBADPARM -- if the shapes are right, the DSP skel on "
-               "the device predates mm_u8i4_conv_block: rebuild it with "
-               "test/htp/build.sh and push libnntr_hvx_skel.so)";
+        hint = std::string(" (AEE_EBADPARM -- if the shapes are right, the "
+                           "DSP skel on the device predates ") +
+               (hist != nullptr ? "the chunked conv block (conv_wLen 5 C, "
+                                  "#225)"
+                                : "mm_u8i4_conv_block") +
+               ": rebuild it with test/htp/build.sh and push "
+               "libnntr_hvx_skel.so)";
       }
       throw std::runtime_error(
         std::string(timed ? "nntr_hvx_mm_u8i4_conv_block_timed"

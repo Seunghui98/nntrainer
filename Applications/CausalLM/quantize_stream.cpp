@@ -1317,8 +1317,11 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
 
     writer.copyFp32(model.hidden_size, prefix + "_attention_norm");
     // [#225] The seven FCs the one-PD graph runs (FC q | k | v, o and
-    // DENSE_FFN up, gate, down) also go to the FC WH sidecar when it is on;
-    // the per-layer-input FCs below are no graph op and stay out.
+    // DENSE_FFN up, gate, down) also go to the FC WH sidecar when it is on.
+    // The per-layer-input FCs below are no op of that graph and stay out;
+    // a Gemma model that has them (hidden_size_per_layer_input != 0; the
+    // MoE ones have 0) and routes them to the HTP by an engine key would
+    // need them flagged too, or fcwhFind refuses them at load.
     writer.writeFc(model.hidden_size, query_width, quant.fc_dtype,
                    prefix + "_wq", true);
     writer.copyFp32(head_dim, prefix + "_q_norm");
