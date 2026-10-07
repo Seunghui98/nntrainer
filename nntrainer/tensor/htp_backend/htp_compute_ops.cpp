@@ -1463,6 +1463,115 @@ public:
       profile.addInvoke(M, K, E, elapsed, nullptr);
   }
 
+  // The lm_head (see the base declaration): the canonical Q4_0 rows as
+  // Q4M1 slices of kLmHeadSliceRows -- the same nibbles and scales,
+  // reordered (q4m1_from_q4_0), no requantization -- placed in the arena
+  // on the first call and attached by offset, then one call per row runs
+  // the norm, every slice's GEMV and the softcap. A tied weight is ~415 MB
+  // at a 262144 vocabulary: past the DSP heap (it refused at ~100 MiB), so
+  // the arena or nothing. A placement or attach refused leaves the
+  // lm_head on the CPU for the run, said once on stderr.
+  // ponytail: it is placed after every other weight, in the address space
+  // they leave; a second session's arena (the decode graph's S2) is the
+  // upgrade if the first one has no room on a device.
+  bool lm_head_q4_0_fp32(const void *w, unsigned int K, unsigned int N,
+                         const float *x, const float *gamma, float eps,
+                         float softcap, float *y) override {
+    if (w == nullptr || K == 0 || K % 64 != 0 || K > 8192 || N == 0 ||
+        N % 32 != 0)
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const std::vector<uint32_t> *h = lmHeadHandles(w, session, K, N);
+    if (h == nullptr)
+      return false;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, K * sizeof(float)).data());
+    float *out = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(N) * sizeof(float)).data());
+    stagedMemcpy(act, x, K * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_lm_head_q4m1_f32(
+      session, eps, gamma, gamma ? static_cast<int>(K) : 0, softcap, h->data(),
+      static_cast<int>(h->size()), act, static_cast<int>(K), out,
+      static_cast<int>(N));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_lm_head_q4m1_f32 failed: err=" + std::to_string(err) +
+        " (K=" + std::to_string(K) + " N=" + std::to_string(N) + ")");
+    }
+    stagedMemcpy(y, out, static_cast<size_t>(N) * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(1, K, N, elapsed, nullptr);
+    return true;
+  }
+
+  /** @brief The lm_head weight's Q4M1 slice handles, placed on first use;
+   *  nullptr when they could not be (then for good, said once). */
+  const std::vector<uint32_t> *lmHeadHandles(const void *w,
+                                             remote_handle64 session,
+                                             unsigned int K, unsigned int N) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = lm_head_.find(w);
+    if (it != lm_head_.end())
+      return it->second.ok ? &it->second.h : nullptr;
+    LmHeadSlices lh;
+    const uint8_t *canonical = static_cast<const uint8_t *>(w);
+    const size_t row_bytes = static_cast<size_t>(K / 32u) * Q4_CPU_BLOCK_BYTES;
+    size_t left = 0;
+    for (uint32_t r0 = 0; r0 < N; r0 += kLmHeadSliceRows)
+      left +=
+        q4m1_bytes(K, std::min<uint32_t>(kLmHeadSliceRows, N - r0)) + 4096u;
+    const size_t total = left;
+    const uint64_t t0 = HtpProfile::nowUs();
+    std::string why;
+    for (uint32_t r0 = 0; r0 < N; r0 += kLmHeadSliceRows) {
+      const uint32_t rows = std::min<uint32_t>(kLmHeadSliceRows, N - r0);
+      const uint32_t bytes = static_cast<uint32_t>(q4m1_bytes(K, rows));
+      std::vector<uint8_t> q4m1(bytes);
+      q4m1_from_q4_0(canonical + r0 * row_bytes, K, rows, q4m1.data());
+      uint32_t handle = 0, chunk = 0, off = 0;
+      int err;
+      if (ensureArena(session) && place(session, bytes, left, &chunk, &off)) {
+        std::memcpy(arena_chunks_[chunk].buf->data() + off, q4m1.data(), bytes);
+        err = nntr_hvx_q4m1_attach(session, arena_chunks_[chunk].dsp_id, off, K,
+                                   rows, &handle);
+        if (err != AEE_SUCCESS)
+          why = "q4m1_attach err=" + std::to_string(err);
+      } else {
+        err = nntr_hvx_q4m1_register(session, K, rows, q4m1.data(),
+                                     static_cast<int>(bytes), &handle);
+        if (err != AEE_SUCCESS)
+          why = "no arena room (" + arena_fail_ +
+                "), q4m1_register err=" + std::to_string(err);
+      }
+      if (err != AEE_SUCCESS)
+        break;
+      lh.h.push_back(handle);
+      left = left > bytes + 4096u ? left - bytes - 4096u : 0u;
+    }
+    if (!why.empty()) {
+      for (uint32_t handle : lh.h)
+        nntr_hvx_q4m1_release(session, handle);
+      std::fprintf(stderr,
+                   "[HTP] lm_head stays on the CPU: slice %zu of %u rows "
+                   "refused (%s)\n",
+                   lh.h.size(), N, why.c_str());
+      lm_head_[w] = LmHeadSlices{};
+      return nullptr;
+    }
+    lh.ok = true;
+    std::fprintf(stderr,
+                 "[HTP] lm_head on the NPU: %u x %u Q4_0 as %zu Q4M1 slices, "
+                 "%.1f MiB, placed in %.0f ms\n",
+                 N, K, lh.h.size(), static_cast<double>(total) / (1u << 20),
+                 static_cast<double>(HtpProfile::nowUs() - t0) / 1000.0);
+    return &(lm_head_[w] = std::move(lh)).h;
+  }
+
   // A QS4CX weight was quantized once, straight from FP32, and already
   // holds the int4 values this registry wants -- so the seam is
   // htp_qs4cx_from_packed's bit rearrangement plus a colsum, not a second
@@ -6250,6 +6359,13 @@ private:
   };
   std::vector<Q4Pending> q4_pending_;
   std::vector<uint32_t> q4m1_handles_;
+  /** @brief The lm_head's slices by weight (lmHeadHandles); ok false: it
+   *  could not be placed and stays on the CPU. */
+  struct LmHeadSlices {
+    bool ok = false;
+    std::vector<uint32_t> h;
+  };
+  std::map<const void *, LmHeadSlices> lm_head_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */

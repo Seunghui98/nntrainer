@@ -768,6 +768,18 @@ interface nntr_hvx : remote_handle64 {
                          rout sequence<float> y,
                          rout sequence<uint32> stats);
 
+   // [57 section 9.7] The lm_head of one row as one call: x (K floats)
+   // normed by gamma (K floats, or empty for none) with eps, quantized
+   // once in the CPU's Q4_0 FC order (hvx_q4m1_prep), then every slice h[p]
+   // (registered or attached Q4M1 weights of K columns, in vocab order)
+   // into its rows of y, and y capped by softcap * tanh(y / softcap)
+   // (hvx_softcap_f32; 0 for none). y is the slices' rows summed. A model
+   // path, unlike fc_q4m1_f32: AEE_EINVALIDFORMAT for a bad shape,
+   // AEE_EBADITEM for a bad handle.
+   AEEResult lm_head_q4m1_f32(in float eps, in sequence<float> gamma,
+                              in float softcap, in sequence<uint32> h,
+                              in sequence<float> x, rout sequence<float> y);
+
    // The FC's vector quantizer (hvx_q4m1_prep, = q8_0_quant_cpu_det, the
    // CPU's nntr_quantize_row_q8_0): xLen % 64 == 0, <= 8192 floats into
    // xLen int8 and xLen/32 f16 scales.

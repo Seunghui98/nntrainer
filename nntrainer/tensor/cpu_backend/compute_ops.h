@@ -260,6 +260,20 @@ public:
                      unsigned int n_sel = 0, const float *scale = nullptr,
                      unsigned int *sel = nullptr, float *weight = nullptr);
 
+  // The lm_head of one row (doc 57 section 9.7): y (N floats) = the Q4_0
+  // weight w (N rows of K, canonical block_q4_0 -- a tied embedding's own
+  // bytes) times rmsnorm(x) * gamma (gamma nullptr: x as it is), then
+  // softcap * tanh(y / softcap) (softcap 0: none). False when the backend
+  // cannot run it (no such call, a shape it does not take, or a weight it
+  // could not place); the caller then runs the same three on the CPU.
+  virtual bool lm_head_q4_0_fp32(const void *w, unsigned int K, unsigned int N,
+                                 const float *x, const float *gamma, float eps,
+                                 float softcap, float *y) {
+    (void)w, (void)K, (void)N, (void)x, (void)gamma, (void)eps, (void)softcap,
+      (void)y;
+    return false;
+  }
+
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,
