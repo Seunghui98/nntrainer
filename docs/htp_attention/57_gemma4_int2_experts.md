@@ -414,3 +414,22 @@ cd /data/local/tmp/nntrainer/causallm && sh g4_io_dma_probe.sh models/gemma4-26b
 - `NNTR_M0_PROFILE=1`로 MoE 층 호스트 0.7 s 분해 (9.1-3).
 - 실제 가중치 int2 파일(양자화기에 `--moe_bits 2` 추가 필요: 지금 더미 도구는 int4 값을 거칠게 줄이는 것이라 정확도 없음)로 decode miss 비용 확인 (9.2-1). 정확도는 별도 문제.
 
+## 10. LFM2(53)에서는 flash IO bound였는데 Gemma에서는 왜 안 보이나
+
+53 §3.1의 "상주 7xx vs 오프로딩 6xx TPS"는 **warm 상주(743) vs cold C=16(618)**이다. warm에서는 C=8/16 모두 상주와 같았다(606/592 vs 597 ms). 즉 LFM2도 IO bound는 **cold에서만**이었고, 그때 바닥은 flash 3.0 GB/s였다.
+
+IO bound 여부는 "읽을 바이트 ÷ 3.0 GB/s"와 "계산 시간"의 비로 정해진다:
+
+| 모델·구성 | prefill 중 읽을 바이트 | flash 시간 (3.0 GB/s) | 계산 시간 (읽기 없을 때) | 비 | 판정 |
+|---|---:|---:|---:|---:|---|
+| LFM2 C=16 (53) | 22 × 16 × 5.55 MB = 1.95 GB | 0.65 s | 0.60 s (전 층 HTP) | 1.1 | **cold IO bound** (실측 0.72 s) |
+| LFM2 C=8 (53) | 2.93 GB | 0.98 s | 0.60 s | 1.6 | cold IO bound (실측 1.02 s) |
+| Gemma int4 C=16 | 3360 × 3.01 MB = 10.1 GB | 3.4 s | **4.0 s** (attention·proj·dense가 CPU) | 0.85 | 턱밑에서 숨음 (probe: 노출 0) |
+| Gemma int2 C=16 | 5.1 GB | 1.7 s | 4.0 s | 0.43 | 숨음 |
+| Gemma int4, 계산을 HTP로 옮긴 뒤 (§9.1 1·2, 예상 1.8 s) | 10.1 GB | 3.4 s | 1.8 s | 1.9 | **IO bound가 된다** |
+| Gemma int2, 같은 조건 | 5.1 GB | 1.7 s | 1.8 s | 0.94 | 턱밑 → §9.1 6·7 필요 |
+
+- Gemma는 읽을 바이트가 LFM2의 5배인데 계산 시간이 6.7배라 **아직** IO bound가 아니다. CPU에 남은 attention·projection이 읽기를 가려 주고 있는 셈이다.
+- 그 계산을 HTP로 옮기면(LFM2처럼) int4는 바로 IO bound가 되고, int2라야 턱밑이다. int2 + reader 고정비 제거 + reader 6개(§9.1 6·7)로 읽기를 ~0.9 s까지 내리면 여유가 생긴다.
+- **Gemma의 지금 측정이 warm인지 cold인지는 확인하지 않았다.** int4 reader 4.70 ms/3.01 MB × 4 = 2.56 GB/s는 flash 상한(3.0)에 가까워 int4(13 GB 파일)는 page cache에 안 들어가 **사실상 cold**였을 가능성이 있다. int2(7.2 GB)는 3.06 ms/1.52 MB × 4 = 2.0 GB/s로 바이트당 더 느려(고정비) 판단 불가. 53 §9 방식(다른 큰 파일을 읽어 page cache를 비운 뒤 여러 번, 가장 느린 값)으로 cold를 따로 재야 한다. int4 파일을 읽으면 int2 페이지가 밀리고, 그 반대도 된다.
+
