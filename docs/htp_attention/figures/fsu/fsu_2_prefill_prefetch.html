@@ -1,0 +1,145 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>prefill expert 선읽기</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="prefill expert 선읽기">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="92" class="t1" text-anchor="start" >prefill: 층 L을 계산하는 동안 뒤 층의 expert를 flash에서 미리 읽는다</text>
+<text x="80" y="140" class="t2" text-anchor="start" >프롬프트 수백 토큰이 top-8로 퍼지면 층마다 128 expert가 거의 다 쓰인다. 그래서 무엇을 읽을지 그 층의 라우터보다 먼저 안다</text>
+<text x="80" y="235" class="lane" text-anchor="start" >NPU</text>
+<text x="80" y="261" class="lane2" text-anchor="start" >HMX · HVX</text>
+<text x="80" y="345" class="lane" text-anchor="start" >ARM</text>
+<text x="80" y="371" class="lane2" text-anchor="start" >자기 배치 offset 등록</text>
+<text x="80" y="415" class="lane" text-anchor="start" >flash 리더 ×4</text>
+<text x="80" y="441" class="lane2" text-anchor="start" >pread → 칸</text>
+<text x="80" y="575" class="lane" text-anchor="start" >칸 풀 480칸</text>
+<text x="80" y="601" class="lane2" text-anchor="start" >그 순간의 구성</text>
+<rect x="352" y="205" width="206" height="76" rx="6" fill="var(--npu)" />
+<text x="366" y="238" class="lblw" text-anchor="start" >층 L 계산</text>
+<text x="366" y="266" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">qkv·attn·FFN·MoE</text>
+<rect x="330" y="315" width="18" height="46" rx="3" fill="var(--host)" />
+<rect x="352" y="385" width="158" height="76" rx="6" fill="var(--read)" />
+<text x="366" y="418" class="lblw" text-anchor="start" >L+2 배치</text>
+<text x="366" y="446" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">128개 읽기</text>
+<rect x="352" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu)" />
+<rect x="406.93333333333334" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu-t)" />
+<rect x="461.8666666666667" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--read)" />
+<rect x="516.8" y="545" width="39.2" height="56" rx="3" fill="var(--idle)" />
+<rect x="590" y="205" width="206" height="76" rx="6" fill="var(--npu)" />
+<text x="604" y="238" class="lblw" text-anchor="start" >L+1 계산</text>
+<text x="604" y="266" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">qkv·attn·FFN·MoE</text>
+<rect x="568" y="315" width="18" height="46" rx="3" fill="var(--host)" />
+<rect x="590" y="385" width="158" height="76" rx="6" fill="var(--read)" />
+<text x="604" y="418" class="lblw" text-anchor="start" >L+3 배치</text>
+<text x="604" y="446" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">128개 읽기</text>
+<rect x="590" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu)" />
+<rect x="644.9333333333333" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu-t)" />
+<rect x="699.8666666666666" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--read)" />
+<rect x="754.7999999999998" y="545" width="39.2" height="56" rx="3" fill="var(--idle)" />
+<rect x="828" y="205" width="206" height="76" rx="6" fill="var(--npu)" />
+<text x="842" y="238" class="lblw" text-anchor="start" >L+2 계산</text>
+<text x="842" y="266" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">qkv·attn·FFN·MoE</text>
+<rect x="806" y="315" width="18" height="46" rx="3" fill="var(--host)" />
+<rect x="828" y="385" width="158" height="76" rx="6" fill="var(--read)" />
+<text x="842" y="418" class="lblw" text-anchor="start" >L+4 배치</text>
+<text x="842" y="446" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">128개 읽기</text>
+<rect x="828" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu)" />
+<rect x="882.9333333333333" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu-t)" />
+<rect x="937.8666666666666" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--read)" />
+<rect x="992.7999999999998" y="545" width="39.2" height="56" rx="3" fill="var(--idle)" />
+<rect x="1066" y="205" width="206" height="76" rx="6" fill="var(--npu)" />
+<text x="1080" y="238" class="lblw" text-anchor="start" >L+3 계산</text>
+<text x="1080" y="266" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">qkv·attn·FFN·MoE</text>
+<rect x="1044" y="315" width="18" height="46" rx="3" fill="var(--host)" />
+<rect x="1066" y="385" width="158" height="76" rx="6" fill="var(--read)" />
+<text x="1080" y="418" class="lblw" text-anchor="start" >L+5 배치</text>
+<text x="1080" y="446" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">128개 읽기</text>
+<rect x="1066" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu)" />
+<rect x="1120.9333333333334" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu-t)" />
+<rect x="1175.8666666666668" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--read)" />
+<rect x="1230.8000000000002" y="545" width="39.2" height="56" rx="3" fill="var(--idle)" />
+<rect x="1304" y="205" width="206" height="76" rx="6" fill="var(--npu)" />
+<text x="1318" y="238" class="lblw" text-anchor="start" >L+4 계산</text>
+<text x="1318" y="266" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">qkv·attn·FFN·MoE</text>
+<rect x="1282" y="315" width="18" height="46" rx="3" fill="var(--host)" />
+<rect x="1304" y="385" width="158" height="76" rx="6" fill="var(--read)" />
+<text x="1318" y="418" class="lblw" text-anchor="start" >L+6 배치</text>
+<text x="1318" y="446" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">128개 읽기</text>
+<rect x="1304" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu)" />
+<rect x="1358.9333333333334" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu-t)" />
+<rect x="1413.8666666666668" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--read)" />
+<rect x="1468.8000000000002" y="545" width="39.2" height="56" rx="3" fill="var(--idle)" />
+<rect x="1542" y="205" width="206" height="76" rx="6" fill="var(--npu)" />
+<text x="1556" y="238" class="lblw" text-anchor="start" >L+5 계산</text>
+<text x="1556" y="266" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">qkv·attn·FFN·MoE</text>
+<rect x="1520" y="315" width="18" height="46" rx="3" fill="var(--host)" />
+<rect x="1542" y="385" width="158" height="76" rx="6" fill="var(--read)" />
+<text x="1556" y="418" class="lblw" text-anchor="start" >L+7 배치</text>
+<text x="1556" y="446" class="lblw" text-anchor="start" style="font-weight:400;font-size:16px">128개 읽기</text>
+<rect x="1542" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu)" />
+<rect x="1596.9333333333334" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--npu-t)" />
+<rect x="1651.8666666666668" y="545" width="52.93333333333333" height="56" rx="3" fill="var(--read)" />
+<rect x="1706.8000000000002" y="545" width="39.2" height="56" rx="3" fill="var(--idle)" />
+<rect x="352" y="618" width="18" height="18" rx="3" fill="var(--npu)" />
+<text x="380" y="633" class="sm" text-anchor="start" >지금 층이 쓰는 중</text>
+<rect x="652" y="618" width="18" height="18" rx="3" fill="var(--npu-t)" />
+<text x="680" y="633" class="sm" text-anchor="start" >다음 층 것, 읽기 끝남</text>
+<rect x="952" y="618" width="18" height="18" rx="3" fill="var(--read)" />
+<text x="980" y="633" class="sm" text-anchor="start" >그 다음 층 것, 읽는 중</text>
+<rect x="1252" y="618" width="18" height="18" rx="3" fill="var(--idle)" />
+<text x="1280" y="633" class="sm" text-anchor="start" >빈 칸 (끝난 층에서 비움)</text>
+<path d="M431.0,463 L431.0,486 L815,486 L815,368" stroke="#eb6834" stroke-width="3" fill="none" stroke-dasharray="8 6" marker-end="url(#ahr)"/>
+<text x="445.0" y="516" class="lbl" text-anchor="start" font-weight="700" fill="#eb6834">두 층 뒤 자기 차례에 받는다: 다 읽혀 있으면 대기 0</text>
+<path d="M330,668 L1760,668" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>
+<text x="1770" y="674" class="sm" text-anchor="start" >시간</text>
+<text x="330" y="700" class="sm" text-anchor="start" >층 계산 ≈167 ms (prefill 5.01 s ÷ 30층, 실측) · 배치 읽기 ≈128 ms (128 × 2.87 MiB ÷ 3.0 GB/s, 산술) → 읽기가 계산 뒤에 숨는다</text>
+<text x="330" y="726" class="xs" text-anchor="start" >층 하나가 끝나면 그 128칸이 비고, 칸이 허용하는 만큼 뒤 층 배치를 줄 세운다(리더는 호출 스레드의 코어를 피해 고정)</text>
+<rect x="80" y="762" width="560" height="230" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="80" y="762" width="8" height="230" rx="4" fill="var(--npu)" />
+<text x="110" y="806" class="h3" text-anchor="start" >C=16 (기본): 선읽기 자리 있음</text>
+<text x="110" y="870" class="big" text-anchor="start" >대기 10 ms</text>
+<text x="110" y="912" class="sm" text-anchor="start" >선읽기 3,360개 · 동기 읽기 0개</text>
+<text x="110" y="942" class="sm" text-anchor="start" >prefill 5.01 s (89 TPS)</text>
+<rect x="680" y="762" width="560" height="230" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="680" y="762" width="8" height="230" rx="4" fill="var(--crit)" />
+<text x="710" y="806" class="h3" text-anchor="start" >⚠ C=5: 칸 150개, 한 층이 거의 다 차지</text>
+<text x="710" y="870" class="big" text-anchor="start" >대기 7.10 s</text>
+<text x="710" y="912" class="sm" text-anchor="start" >선읽기 자리 없음 → 동기 읽기 2,893개</text>
+<text x="710" y="942" class="sm" text-anchor="start" >prefill 10.94 s (41 TPS)</text>
+<rect x="1280" y="762" width="560" height="230" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="1280" y="762" width="8" height="230" rx="4" fill="var(--muted)" />
+<text x="1310" y="806" class="h3" text-anchor="start" >바닥: flash 대역폭</text>
+<text x="1310" y="870" class="big" text-anchor="start" >≈ 3.3 s</text>
+<text x="1310" y="912" class="sm" text-anchor="start" >prefill 1회 ≈10 GB ÷ 3.0 GB/s (산술)</text>
+<text x="1310" y="942" class="sm" text-anchor="start" >NPU가 빨라질수록 드러남: 준비율 94→77%</text>
+<text x="80" y="1040" class="xs" text-anchor="start" >실측: Galaxy S25 Ultra(Hexagon V79), 446토큰, MoE만 NPU 구성, 2026-10-02 (문서 55 §10.11–10.12). 모든 연산 NPU 구성(이번 브랜치)은 기기 미측정. 그림의 막대 길이는 위 두 숫자의 비율.</text>
+</svg></body></html>

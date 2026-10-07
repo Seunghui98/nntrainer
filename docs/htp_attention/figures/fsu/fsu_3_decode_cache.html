@@ -1,0 +1,110 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>decode expert 캐시</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="decode expert 캐시">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="92" class="t1" text-anchor="start" >decode: 라우터가 고른 뒤에야 안다 → LRU 캐시에 남기고, 없으면 그때 읽는다</text>
+<text x="80" y="140" class="t2" text-anchor="start" >토큰 하나는 층마다 128개 중 8개만 쓴다. 어떤 8개인지 라우터 전에는 모르니 미리 읽을 수 없고, 칸에 남겨 둔 것이 맞기를 기대한다</text>
+<rect x="80" y="200" width="380" height="200" rx="12" fill="var(--host-t)" />
+<text x="106" y="248" class="h3" text-anchor="start" >① 라우터</text>
+<text x="434" y="248" class="sm" text-anchor="end" >ARM</text>
+<text x="106" y="300" class="lbl" text-anchor="start" >1행이라 CPU가 더 빠름</text>
+<text x="106" y="334" class="lbl" text-anchor="start" >top-8 + 후보 5개</text>
+<path d="M464,300 L494,300" stroke="#52514e" stroke-width="3" marker-end="url(#ah)"/>
+<rect x="500" y="200" width="380" height="200" rx="12" fill="var(--host-t)" />
+<text x="526" y="248" class="h3" text-anchor="start" >② 칸 풀 확인</text>
+<text x="854" y="248" class="sm" text-anchor="end" >ARM</text>
+<text x="526" y="300" class="lbl" text-anchor="start" >8개 중 칸에 있는 것</text>
+<text x="526" y="334" class="lbl" text-anchor="start" >= 히트, 없는 것 = 미스</text>
+<path d="M884,300 L914,300" stroke="#52514e" stroke-width="3" marker-end="url(#ah)"/>
+<rect x="920" y="200" width="380" height="200" rx="12" fill="var(--read-t)" />
+<text x="946" y="248" class="h3" text-anchor="start" >③ 미스만 읽기</text>
+<text x="1274" y="248" class="sm" text-anchor="end" >flash</text>
+<text x="946" y="300" class="lbl" text-anchor="start" >미스 1개 = 2.87 MiB</text>
+<text x="946" y="334" class="lbl" text-anchor="start" >pread → 칸 → 등록</text>
+<path d="M1304,300 L1334,300" stroke="#52514e" stroke-width="3" marker-end="url(#ah)"/>
+<rect x="1340" y="200" width="380" height="200" rx="12" fill="var(--npu-t)" />
+<text x="1366" y="248" class="h3" text-anchor="start" >④ MoE 호출</text>
+<text x="1694" y="248" class="sm" text-anchor="end" >NPU</text>
+<text x="1366" y="300" class="lbl" text-anchor="start" >8 expert로 계산</text>
+<text x="1366" y="334" class="lbl" text-anchor="start" >칸 offset으로 DMA</text>
+<text x="80" y="470" class="h3" text-anchor="start" >예: 한 토큰, 한 층의 top-8</text>
+<rect x="80" y="492" width="124" height="84" rx="8" fill="var(--npu)" />
+<text x="142" y="530" class="lblw" text-anchor="middle" >#17</text>
+<text x="142" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">히트</text>
+<rect x="220" y="492" width="124" height="84" rx="8" fill="var(--npu)" />
+<text x="282" y="530" class="lblw" text-anchor="middle" >#3</text>
+<text x="282" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">히트</text>
+<rect x="360" y="492" width="124" height="84" rx="8" fill="var(--read)" />
+<text x="422" y="530" class="lblw" text-anchor="middle" >#88</text>
+<text x="422" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">미스</text>
+<rect x="500" y="492" width="124" height="84" rx="8" fill="var(--npu)" />
+<text x="562" y="530" class="lblw" text-anchor="middle" >#41</text>
+<text x="562" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">히트</text>
+<rect x="640" y="492" width="124" height="84" rx="8" fill="var(--npu)" />
+<text x="702" y="530" class="lblw" text-anchor="middle" >#120</text>
+<text x="702" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">히트</text>
+<rect x="780" y="492" width="124" height="84" rx="8" fill="var(--npu)" />
+<text x="842" y="530" class="lblw" text-anchor="middle" >#9</text>
+<text x="842" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">히트</text>
+<rect x="920" y="492" width="124" height="84" rx="8" fill="var(--read)" />
+<text x="982" y="530" class="lblw" text-anchor="middle" >#64</text>
+<text x="982" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">미스</text>
+<rect x="1060" y="492" width="124" height="84" rx="8" fill="var(--npu)" />
+<text x="1122" y="530" class="lblw" text-anchor="middle" >#102</text>
+<text x="1122" y="560" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">히트</text>
+<text x="1210" y="528" class="lbl" text-anchor="start" >히트 → 바로 계산</text>
+<text x="1210" y="562" class="lbl" text-anchor="start" >미스 → flash에서 읽은 뒤 계산 (토큰이 기다린다)</text>
+<rect x="80" y="620" width="1760" height="120" rx="12" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<text x="110" y="664" class="h3" text-anchor="start" >⑤ LRU 갱신</text>
+<text x="110" y="702" class="lbl" text-anchor="start" >쓴 8개에 라우터가 다음으로 꼽은 후보 5개까지 "최근 사용"으로 올린다. 가장 오래 안 쓴 칸부터 비워 미스를 채운다</text>
+<rect x="80" y="772" width="560" height="220" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="80" y="772" width="8" height="220" rx="4" fill="var(--npu)" />
+<text x="110" y="816" class="h3" text-anchor="start" >LFM2 실측 (32 expert/층, C=16)</text>
+<text x="110" y="880" class="big" text-anchor="start" >히트 85%</text>
+<text x="110" y="922" class="sm" text-anchor="start" >decode 21.7 TPS (상주 24.0)</text>
+<text x="110" y="952" class="sm" text-anchor="start" >C=8이면 히트 57%, 17.9 TPS</text>
+<rect x="680" y="772" width="560" height="220" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="680" y="772" width="8" height="220" rx="4" fill="var(--read)" />
+<text x="710" y="816" class="h3" text-anchor="start" >미스 비용</text>
+<text x="710" y="880" class="big" text-anchor="start" >2.87 MiB/개</text>
+<text x="710" y="922" class="sm" text-anchor="start" >÷ 3.0 GB/s ≈ 1 ms + 등록 (산술)</text>
+<text x="710" y="952" class="sm" text-anchor="start" >decode 속도는 미스 수가 정한다</text>
+<rect x="1280" y="772" width="560" height="220" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="1280" y="772" width="8" height="220" rx="4" fill="var(--muted)" />
+<text x="1310" y="816" class="h3" text-anchor="start" >Gemma (128 expert/층, C=16)</text>
+<text x="1310" y="880" class="big" text-anchor="start" >기기 미측정</text>
+<text x="1310" y="922" class="sm" text-anchor="start" >층당 칸 16 / expert 128</text>
+<text x="1310" y="952" class="sm" text-anchor="start" >히트율은 라우팅 분포에 달림</text>
+<text x="80" y="1040" class="xs" text-anchor="start" >출처: LFM2 수치는 문서 53 §3(2026-09-29 실측). 칩의 히트/미스 배치는 예시. Gemma decode 히트율과 TPS는 아직 재지 않았다.</text>
+</svg></body></html>
