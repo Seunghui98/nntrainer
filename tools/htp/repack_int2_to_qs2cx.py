@@ -24,13 +24,17 @@
 #   repack_int2_to_qs2cx.py <in.bin> <config.json> <out.bin>
 #                           [--skip-verify | --verify-only]
 #
-# Writes <out.bin>, every *.json beside <in.bin> next to it, and
-# nntr_config.json with moe_layer_dtype QS2CX_WH and the new
+# Writes <out.bin>, <config.json> and the *.json / *.model files beside
+# <in.bin> next to it, and nntr_config.json with moe_layer_dtype QS2CX_WH and the new
 # model_file_name. Then compiles and runs repack_int2_check.cc, which walks
 # both files with this script's segment table and checks every byte:
 # copies equal, every expert's whUnpack2 (the loader's own reader) equal
 # to the input's sl/4 decode, the input's colsum equal to its decoded
-# column sums, the palette, scale and colsum bytes. Streams: one expert
+# column sums, the palette, scale and colsum bytes. What it cannot see:
+# the input decode IS the layout assumption, and a column sum is blind to
+# the order of k inside a column, so an external file that moved rows
+# within a column (or swapped gate and up) passes; only a model output
+# against a reference catches that (#229 S5-0). Streams: one expert
 # tensor (about 1 MB) in memory at a time.
 
 import argparse
@@ -59,7 +63,8 @@ def segments(cfg, nntr):
     # 2026-10-07) is the same; anything else stops here or fails the size
     # check. Upgrade: read the external converter's tensor table if it ever
     # ships one.
-    if c.get("hidden_size_per_layer_input", 0) or not c.get("tie_word_embeddings", True):
+    tied = c.get("tie_word_embeddings", cfg.get("tie_word_embeddings", True))
+    if c.get("hidden_size_per_layer_input", 0) or not tied:
         sys.exit("unsupported: per-layer input or untied head")
     fc = FC_BYTES[nntr["fc_layer_dtype"]]
     emb = FC_BYTES[nntr["embedding_dtype"]]
@@ -167,14 +172,22 @@ def main():
                 if kind == "C":
                     copy_n(fi, fo, k)
                     continue
-                fo.write(repack_codes(fi.read(k * nn // 4)))
+                codes = fi.read(k * nn // 4)
+                if len(codes) != k * nn // 4:
+                    sys.exit("input ended early")
+                fo.write(repack_codes(codes))
                 fo.write(PALETTE)
                 copy_n(fi, fo, 8 * nn)
                 if n % 1000 == 0:
                     print(f"  {n}/{len(rows)} segments", flush=True)
+        # the tokenizer and generation files (quantize_stream.cpp's
+        # copyAuxiliaryFiles copies the same kinds), and the config the
+        # layout was computed from
         for name in os.listdir(src_dir):
-            if name.endswith(".json") and name != "nntr_config.json":
+            skip = ("nntr_config.json", "config.json")
+            if name.endswith((".json", ".model")) and name not in skip:
                 shutil.copy(os.path.join(src_dir, name), out_dir)
+        shutil.copy(a.config, os.path.join(out_dir, "config.json"))
         nntr["moe_layer_dtype"] = "QS2CX_WH"
         nntr["model_file_name"] = os.path.basename(a.output)
         with open(os.path.join(out_dir, "nntr_config.json"), "w") as f:

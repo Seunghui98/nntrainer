@@ -16,8 +16,9 @@
  * (copied) or `E in_off out_off K N` (an expert). The segments must tile
  * both files with no gap. Per expert: the input's codes decoded by the
  * external layout (tile byte sl/4, shift 2*(sl%4), value code - 2) must
- * sum, per column, to the input's colsum -- the check that the layout
- * assumption still holds for the file at hand -- and equal whUnpack2 of the
+ * sum, per column, to the input's colsum -- which catches a file whose
+ * tile order or column placement differs from the assumption, but not a
+ * reordering of k inside a column -- and equal whUnpack2 of the
  * output's codes element for element; the output's palette is fe ff 00 01;
  * scale and colsum are copied. Prints `REPACK CHECK ... ok` or exits 1.
  * Built and run by the script (--verify-only to rerun it alone).
@@ -46,14 +47,18 @@ struct Seg {
 const uint8_t *mapFile(const char *path, size_t *size) {
   const int fd = open(path, O_RDONLY);
   struct stat st;
-  if (fd < 0 || fstat(fd, &st) != 0) {
-    std::perror(path);
+  void *p = MAP_FAILED;
+  if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+    *size = static_cast<size_t>(st.st_size);
+    p = mmap(nullptr, *size, PROT_READ, MAP_PRIVATE, fd, 0);
+  }
+  if (fd >= 0)
+    close(fd);
+  if (p == MAP_FAILED) {
+    std::printf("REPACK CHECK FAIL cannot map %s\n", path);
     return nullptr;
   }
-  *size = static_cast<size_t>(st.st_size);
-  void *p = mmap(nullptr, *size, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-  return p == MAP_FAILED ? nullptr : static_cast<const uint8_t *>(p);
+  return static_cast<const uint8_t *>(p);
 }
 
 /** @return 0 if the expert checks, else which check failed (1..4) */
@@ -112,8 +117,10 @@ int main(int argc, char **argv) {
   size_t ic = 0, oc = 0;
   while (std::fscanf(tf, " %c %zu %zu %zu %zu", &s.kind, &s.in_off, &s.out_off,
                      &s.a, &s.b) == 5) {
-    if (s.in_off != ic || s.out_off != oc) {
-      std::printf("REPACK CHECK FAIL gap at segment %zu\n", segs.size());
+    if ((s.kind != 'C' && s.kind != 'E') || (s.kind == 'E' && s.b == 0) ||
+        s.in_off != ic || s.out_off != oc) {
+      std::printf("REPACK CHECK FAIL bad or misplaced segment %zu\n",
+                  segs.size());
       return 1;
     }
     const size_t n = s.kind == 'C' ? s.a : s.a * s.b / 4 + 8 * s.b;
