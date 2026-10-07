@@ -240,6 +240,26 @@ test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
   suite: 'unittests'
 )
 
+# The integer softmax of the row-blocked attention kernel (plan 23, R3):
+# the scalar definition against an exact softmax, through a model of the
+# convert unit's int16 output.
+unittest_hvx_softmax_q_exe = executable(
+  'unittest_hvx_softmax_q',
+  ['unittest_hvx_softmax_q.cpp',
+   '../../nntrainer/tensor/htp_backend/hvx/hvx_softmax_q.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hvx'),
+  dependencies: nntrainer_test_main_deps,
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hvx_softmax_q', unittest_hvx_softmax_q_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hvx_softmax_q')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 # The CPU A8W8 attention over that registry (libnntrainer's CPU side of
 # attention_kv_dtype), against an exact f32 reference.
 unittest_cpu_kv_q_attention_exe = executable(
