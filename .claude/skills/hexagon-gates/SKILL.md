@@ -37,8 +37,8 @@ bash test/htp/host/run_host_checks.sh
 bash tools/htp_syntax_check.sh
 bash test/htp/host/run_inproc_e2e.sh      # SDK headers + qaic sourced; no device
 ```
-Pass: every gtest `[  PASSED  ]` — 6 for `*Lfm2Moe*` (3 differential + 3
-tiny-model), none skipped; `run_host_checks.sh` prints `ALL CHECKS PASS`
+Pass: every gtest `[  PASSED  ]` — 7 for `*Lfm2Moe*` (3 differential + 3
+tiny-model + `FcWhSidecarMatchesWhQuantize`, since PR #255), none skipped; `run_host_checks.sh` prints `ALL CHECKS PASS`
 and `WORKER POOL LANES OK`; the syntax check exits 0; `run_inproc_e2e.sh`
 prints `E2E eval golden … bit_identical=1`, `E2E eval hmx-loop …
 bit_identical=1`, `E2E tokens htp==cpu 8/8`, `E2E eval cpu … min_snr_db=`

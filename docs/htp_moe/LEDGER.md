@@ -32,7 +32,7 @@ project now takes is nntrainer/nntrainer#4296 (Gemma 4 on the CPU),
 nntrainer/nntrainer#4408 ("[WIP][DRAFT][HTP] Run gemma-4-26B-A4B on the HTP
 with flash offload", Seunghui98, `refs/pr/4408`) — watch sha
 **`28771a928`** (PR updated 2026-10-02 09:32 UTC; unchanged in cycles 35–40,
-re-checked 2026-10-07 evening in cycle 40: `gh pr view` head `28771a928`, 100 commits) — and `htp_first_version`, which is **closed and
+re-checked 2026-10-08 in cycle 41: `gh pr view` head `28771a928`, 100 commits, PR updated 2026-10-02) — and `htp_first_version`, which is **closed and
 frozen since cycle 38 (user, 2026-10-06 night: finished with PR #246,
 `77a01902f`)**: 51 commits ahead of `htp_decode` @ `9323ad52d`, read once
 here, not watched further. Of those, the code commits `htp_decode` does not
@@ -49,7 +49,7 @@ needs is plan 234's revision (cycle 38, planner); cycle 36 of this copy
 had read `78dace26f` (PR #237's sync, PR #233 merged `0e8888bde`). A port
 issue is filed when the Gemma model needs something (#234 is the first).
 Reference, not watched: #4410 (`refs/pr/4410` @ `0d603f29a`, unchanged
-2026-10-07 evening, cycle 40 — PR still open; the 2-bit / ternary expert stack #229 S1 ported in cycle 36,
+2026-10-08, cycle 41 — PR still open, head `0d603f29a` unchanged; the 2-bit / ternary expert stack #229 S1 ported in cycle 36,
 PRs #238 / #239 on `htp_decode`, with its u8i2 GEMV mask fixed on the way,
 rule 66; **device gate passed on v79 2026-10-06, §2 #229 row; its test
 PR #244 merged `8971aa873`, cycle 39**). #4327
@@ -1679,6 +1679,68 @@ Gemma's). **For the orchestrator (contract text outside §1's numbers):**
 the same script; §1's Accuracy row — S5-0's reference is the hybrid `off`
 run, no CPU twin; §12 gains the 2026-10-07 decisions above.
 
+**Cycle 41 (2026-10-08, base `htp_decode` @ `ee86803ef`): no filled
+handoff, no `state:measured` issue, no device; #234 P3 and #253 merged,
+P4 under way with the device sitting inside its PR.** **(1) Merged by
+the user since cycle 40, both into `htp_decode`:** PR #255 (`479b6eb42`,
+#234 P3 — the FC WH sidecar's prefill half on `htp_decode`: cherry-picks
+of `htp_first_version`'s `db2c27a11` / `7b622617a` / `75f6f007d` /
+`a3d966164` / `366c06c57` as `5cae83ff0` / `bd08d9e9b` / `d0bf7c5ba` /
+`57d52c554` / `ed6f923c8`, plan files 225 / 236 unchanged, one review-fix
+commit `3052be80f`; the quantizer flags Gemma's seven graph FCs, the
+loader does **not** yet open the sidecar for Gemma — that is P4; host
+gate `INPROC E2E PASS`, 155 / 155 old lines unchanged, five new lines
+incl. `E2E quant fcwh-gemma64 main=same images=20 ok`, `*Lfm2Moe*` **7 /
+7**, `unittest_causallm_models` 115 / 115; rung 2 v79 `2a7165ec…` / v81
+`5348539c…`, IDL unchanged; nothing ran on a device) and PR #256
+(`ee86803ef`, #253 — the host RoPE cos / sin table sized by
+`max_timestep`, `precompute_freqs` takes it at `mha_core.cpp` :681 /
+:1551 / :1602, numerics bit-identical (no RoPE type reads the table
+length); the 26B dummy loads on the host with the **original**
+`config.json`, host peak RSS 4 237 232 → 2 636 628 kB (4.04 → 2.51 GiB,
+−1.53 GiB); `run_inproc_e2e.sh` gemma64 / hd64 lines identical; a
+`forwarding()` check refuses a timestep past the table). Also on the
+base: `385c17030` (cycle-40 errata — the dummy gate's reference is the
+hybrid `off` run; the RSS line is not the sum of the arenas). PR #254
+(guide, cycles 37–40) still open, no review comments. **(2) Lesson (new,
+from P3):** plan 234's "7 images × layers" for the Gemma sidecar was
+wrong — a full-attention layer under `attention_k_eq_v` has no `_wv`, so
+the count is 7 × sliding + 6 × full (gemma64 = 2 × 7 + 1 × 6 = **20**,
+not 21); the gate now derives the expected names from `config.json`, so
+the 26B's count (30 layers) comes from its own config and is not a number
+to write down in advance. The same lesson is why the `hexagon-gates`
+skill's "6 for `*Lfm2Moe*`" became 7 this cycle (`FcWhSidecarMatchesWhQuantize`,
+PR #255). Open from P3's review, for P4's gate: a duplicate `fcWhKey`
+refuses the whole sidecar at load by design (plan 225 §5) and the packer
+does not check for one — on the 26B dummy the orchestrator read md5s of
+`wq` / `wk` / `wo` / `ffn_gate` for layers 0–3, 5, 11 as all distinct, so
+it will not trigger on this file; the check itself is P4's. **(3) Rule
+72's status:** with #253 in, the `max_position_embeddings` 4096 device
+config copy is **no longer needed once the device confirms** — the next
+#201 S5 sitting (P4's, same PR) loads the 26B with the original
+`config.json` and records host / device peak RSS before vs after; until
+that line is read, rule 72's copy stays the fallback and the Artifacts
+row names whichever config ran. **(4) User decisions (contract §12):**
+Hadamard #110 stays parked (`needs-user`, no action); standing: follow
+upstream #4408 / #4410 each cycle — re-checked 2026-10-08: #4408 head
+`28771a928` (updated 2026-10-02), #4410 head `0d603f29a` (updated
+2026-10-06), **no new commits**, nothing to classify. **(5) Board:** #253
+**closed `completed`** (PR #256 `ee86803ef`; device confirm = one line in
+the next S5 sitting, tracked on #201); #234 `state:in-progress` p0 (P3
+done comment; **P4 in progress on `htp/234-p4-fcwh-decode`** — the one-PD
+FC / DENSE_FFN ops on the WH handles with the WH GEMV, the Gemma loader
+opening the sidecar, the duplicate-key check, and the device sitting
+folded into the same PR; labels untouched); #201 `in-progress` p0; #229
+`planned` p1 (S2 after P4); #137 `planned` p2; #110 `needs-plan` +
+`needs-user` p2; #76 cycle comment. Queue ≥ 2 (#229, #137, #110), nothing
+new derived. "Now" rows and contract §1 numbers unchanged (no device
+number this cycle; §1's References row already names both upstream heads).
+**Next after P4:** the S5 sitting inside P4's PR is the next measured
+cell (E16 on the WH FC set vs the hybrid `off` A16 of the same sitting,
+prefill gate −5 % — the sidecar changes the prefill weight layout — plus
+the #253 device confirm line and ㉟'s RSS / arena bytes); then #229 S2
+(2-bit FCs on that path).
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
@@ -2877,7 +2939,13 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
     `config.json` copy (identical numbers below 4096 for both RoPE types,
     the original kept as `config.orig.json`) and the Artifacts row names
     the copy's md5; a load that dies after the `token driver: on` line with
-    a Scudo map failure is this, not a DSP fault.
+    a Scudo map failure is this, not a DSP fault. *(Cycle 41: #253 merged,
+    PR #256 `ee86803ef` — the table is sized by `max_timestep`; the 26B
+    dummy loads on the host with the original `config.json`, host peak
+    RSS 4.04 → 2.51 GiB; the config copy is retired once the next #201
+    S5 sitting (P4's PR) confirms the load on the device with the
+    original config and records peak RSS before vs after — until that
+    line, the copy stays the fallback.)*
 
 ## 2. Verdicts (measured, closed)
 
