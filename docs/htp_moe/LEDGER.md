@@ -31,8 +31,8 @@ project now takes is nntrainer/nntrainer#4296 (Gemma 4 on the CPU),
 **Gemma watch (since cycle 35, user 2026-10-06, #234):** upstream
 nntrainer/nntrainer#4408 ("[WIP][DRAFT][HTP] Run gemma-4-26B-A4B on the HTP
 with flash offload", Seunghui98, `refs/pr/4408`) — watch sha
-**`28771a928`** (PR updated 2026-10-02 09:32 UTC; unchanged in cycles 35–38,
-re-checked 2026-10-07) — and `htp_first_version`, which is **closed and
+**`28771a928`** (PR updated 2026-10-02 09:32 UTC; unchanged in cycles 35–39,
+re-checked 2026-10-07 in cycle 39) — and `htp_first_version`, which is **closed and
 frozen since cycle 38 (user, 2026-10-06 night: finished with PR #246,
 `77a01902f`)**: 51 commits ahead of `htp_decode` @ `9323ad52d`, read once
 here, not watched further. Of those, the code commits `htp_decode` does not
@@ -49,9 +49,10 @@ needs is plan 234's revision (cycle 38, planner); cycle 36 of this copy
 had read `78dace26f` (PR #237's sync, PR #233 merged `0e8888bde`). A port
 issue is filed when the Gemma model needs something (#234 is the first).
 Reference, not watched: #4410 (`refs/pr/4410` @ `0d603f29a`, unchanged
-2026-10-07; the 2-bit / ternary expert stack #229 S1 ported in cycle 36,
+2026-10-07, cycle 39; the 2-bit / ternary expert stack #229 S1 ported in cycle 36,
 PRs #238 / #239 on `htp_decode`, with its u8i2 GEMV mask fixed on the way,
-rule 66; **device gate passed on v79 2026-10-06, §2 #229 row**). #4327
+rule 66; **device gate passed on v79 2026-10-06, §2 #229 row; its test
+PR #244 merged `8971aa873`, cycle 39**). #4327
 stays frozen at `f923bf29` (not watched).
 
 `hvx_conv_gate_f32.{c,h}` (upstream `7f81560b`) reached `htp_moe` through
@@ -1518,6 +1519,83 @@ closed. Queue ≥ 2 (#229, #137, #110), nothing derived. Open PRs into
 `28771a928` unchanged, #4410 `0d603f29a` unchanged, #4327 not watched.
 "Now" unchanged.
 
+**Cycle 39 (2026-10-07, base `htp_decode` @ `0490e161a`): the 26B files
+are on the workstation — as a DUMMY; the Gemma device is the attached S25
+`R3CY205ZMND`, the agent drives adb; #234 P5 and the cycle-38 PRs merged;
+no handoff, no row, no `state:measured` issue.** **(1) Merged by the user
+since cycle 38, all into `htp_decode`:** PR #244 (`8971aa873`, #229's
+u8i2 device gtest — ㊳'s v79 half is on `htp_decode`), PR #249
+(`a43a7ffc0`, #234 **P5**: `NNTR_MOE_DIFF` / `NNTR_MOE_SHADOW` on the MoE
+layer call for 4- and 2-bit experts, `whUnpack` / `whUnpack2` on the host,
+a failed reference throws under shadow; gate `INPROC E2E PASS` 476 / 477
+lines identical, `ALL CHECKS PASS` ×4, diff 34.8–43.7 dB on every layer of
+lfm25 / gemma64 at 4 and 2 bits, Gemma 4-bit shadow tokens == CPU 8 / 8;
+**the one-PD token is not covered** — an E3 run prints only the prefill
+lines, so S5's first token-level accuracy read stays `--dump` +
+`htp_dump_eval.py`), PR #242 (`53084edf1`, `tools/htp/sitting_lock.sh` +
+the contract §4.1 adb row — the lock is the rule of record on this copy
+now), PR #241 (`0490e161a`, guide cycles 35–36). No open PR into
+`htp_decode`. #234 P3 (FC WH sidecar, prefill half) is the implementer's
+next; P4 after it; P6 waits for S5's miss numbers. **(2) The 26B files
+(user, 2026-10-07, `~/Downloads/gemma4_26b/`):** `config.json`
+(`Gemma4ForConditionalGeneration`, `text_config`: 30 layers, hidden 2816,
+128 experts `top_k_experts` 8, `moe_intermediate_size` 704, dense
+`intermediate_size` 2112, `head_dim` 256 / `global_head_dim` 512,
+`sliding_window` 1024, 16 q / 8 kv heads, vocab 262144,
+`final_logit_softcapping` 30, `tie_word_embeddings` true, RoPE full =
+proportional θ 1e6 partial 0.25 / sliding θ 1e4; md5 `b2062bfe…`),
+`nntr_config.json` (md5 `c2d0298d…`: `moe_engine htp`, `moe_layer_dtype
+QS4CX_WH`, FC / embedding / lm_head `Q4_0`, `Q4_0-FP32`, `init_seq_len
+1024`, `max_seq_len 2048`, `num_to_generate 512`, **`moe_cache_experts
+16`**, `model_file_name nntr_gemma4_int2.bin`, a long summarization
+`sample_input`), `tokenizer.json` (md5 `9e33baac…`, 32 170 070 B),
+`generation_config.json` (bos 2, eos 1, pad 0, `do_sample false`), and the
+weight blob **`nntr_gemma4_int2.bin`, 7 226 112 120 B, md5
+`9b4e93493d6e870afdef05b1ba99ccd0`** — a nntrainer `.bin`, not
+safetensors (the P2 reader and ㊵'s guard do not apply to it). **The blob
+is a DUMMY (user, 2026-10-07): the right shape and format, not the real
+checkpoint.** Consequences: (a) the text / PPL / accuracy gates of
+contract §1 **do not apply** to any run on it — what counts is the path
+(loads, routes, `calls/token=1.00`, `attn_caches=2`), **bit-identity NPU
+vs CPU on the same dummy weights** (tokens of the E2E run == the CPU run of
+the same file, MoE dumps vs the pool-less / hybrid run `bit_identical=1`;
+the host fixture's cycle-34 reading is tokens 8 / 8 with SNR 27.6 dB, not
+logits-identical), and the speed / memory readings (tok/s, peak RSS,
+`mapped=`, arena bytes — ㉟'s baseline); (b) the user's text approval
+column is empty by construction until the real file; (c) the exact bin
+format is **another agent's** task this cycle — not derived here; two
+facts for it: the blob's name says `int2` while `nntr_config.json` names
+`QS4CX_WH` for the experts, and 7.23 GB sits between the 4-bit
+(≈ 10.8 GiB experts alone, plan 234 §3) and 2-bit (≈ 5.4 GiB) expert sums
+plus ≈ 1.2–1.6 GiB of Q4_0 FC / embedding (tied head) bytes — consistent
+with 2-bit experts, to be confirmed by that agent, not assumed. The repo's
+26B config (`res/gemma4/gemma4-26b-a4b/nntr_config.json`, `89618392…`,
+P1) differs from the user's in `model_file_name`, `max_seq_len` (4096 vs
+2048), `num_to_generate` (256 vs 512), the `chat_input` vs `sample_input`
+form and the absence of `moe_cache_experts` — the user's file is the one a
+sitting runs; the repo's is the tree's template. **(3) Device (user,
+2026-10-07): the Gemma measurement device is the Galaxy S25 Ultra
+`R3CY205ZMND` (v79), attached, and the agent drives adb itself — no farm
+handoff.** The S26 `R5KL20NFRCK` clause (contract §1 / §4.1, BENCHMARK
+Goals, #76) lapses until an S26 is attached again; ㊳'s v81 half is
+deferred, not blocked. Every sitting takes `.sitting.lock` first (PR
+#242). **(4) Board:** #234 `state:in-progress` p1 (P3 next; P5 done);
+#229 `state:planned` + `needs-user` (S0 — the format is now the format
+agent's reading + the user's confirmation that the dummy's format is the
+real checkpoint's; ㊳ v79 done); #201 `state:in-progress` p0, **`needs-user`
+removed** (its two reasons — the files and the device — are met); #137
+`planned` p2; #110 `needs-plan` + `needs-user` p2; #76 refreshed. Queue
+≥ 2 (#229, #137, #110); nothing new derived — the next deliverable is
+**#201 S5-0 (㊶)**, the first dummy-file path sitting on `R3CY205ZMND`,
+owned by #201 as S4 was. **Upstream:** #4408 `28771a928` and #4410
+`0d603f29a` unchanged (re-checked 2026-10-07), nothing to decide. "Now"
+unchanged; BENCHMARK's Gemma goal row carries the file / device facts, no
+cell. **For the orchestrator (contract text outside §1's numbers, not
+edited by the supervisor):** §1's Model row ("files are being produced",
+"S26"), §1's Accuracy row (dummy ⇒ path + bit-identity + speed / memory
+only, until the real file), §4.1's adb row (S25 = the Gemma device, agent
+drives adb), §4.1 line "through PR #242 (open)" → merged `53084edf1`.
+
 ## 1. Rules (device disagreed with reasoning; do not re-derive)
 
 Inherited from the PR's device work, with their sources:
@@ -2795,9 +2873,10 @@ Learned in this project (cycle 22: #150, #90, #99, #152, #158, unit
 | ㉟ | **Peak memory < 2 GB — deferred constraint (user 2026-10-06, cycle 35; contract §1).** Stated: Gemma decode E2E should keep process peak RSS incl. the ION arenas under 2 GB (pool + FC set + KV caches + DSP heap + scratch), flash streaming (the expert pool / FSU) covering what does not fit. Same day: **considered last, after the ternary 26B decodes end to end on the S26** — not a gate on S5 / S6, so plan 229's one-PD sizing (C ≈ 57–66 on a 3.8 GB arena) stands for S5 and ㉞ (a)'s cache sizing works to rule 63's budget. For S5 and its levers: every Gemma row records peak RSS and the arena bytes (`mapped=` line, pool C, FC set, cache bytes) so the later stage starts from measured numbers. When promoted (after S5 / S6): one issue per budget term, gate = peak RSS < 2 GB on the S26 with text / SNR unchanged vs the unconstrained A and the pool's miss cost (㉜) re-read at the smaller C | sizing from S5's first sitting; which terms (pool C, KV `max_seq`, FC set bits) carry the cut | S5's first sitting (#201), #229 (2-bit halves the slots), #234 |
 | ㊱ | **Closed by #236 (cycle 36, 2026-10-06; §2 #236 row, rule 69): B loads and runs P1024 × G64 / G512 / G1024 on the config of record (53.24 / 53.06 / 48.64, prefill 726 / 723 / 711, `heap_kib=75776`), chunked == unchunked bit-identical on the host, prefill +9 % over Bfb, E2E Q unchanged; the old set fails in the same sitting. B is the hybrid's P1024 case of record; PR #243 and the text approval are the user's.** Originally:**Filed as #236 (p1, `state:needs-plan`, cycle 34; rule 64).** The hybrid's attention qkv FC at P1024 goes to the DSP as one M = 1024 call (`gemm_q4_0_batch_fp32` chunks by `fcMaxRows(K)` = 1920 at K = 2048, not by PR #230's `prefillRows()` = 512) and fails `AEE_ERPC` beside the FC WH overflow on the heap (`heap_kib=75776`); the same call runs on the one PD (`heap_kib=0`). Fix: the FC entries (`gemm_q4_0_accel_fp32`, `gemm_q4_0_batch_fp32`, and the qs4cx twins) take `prefillRows()` as their cap too, host-proven bit-identical chunked vs unchunked (the `CONV BLOCK CHUNKED BIT-IDENTICAL` template); then B's three P1024 cells are re-read on the config of record (Bfb is the case of record there until then) with the loop check against A — Bfb P1024 G64 / G512 loop where A does not, so the re-read also answers whether that is the fallback's or the length's | hybrid B loads and runs P1024 × G64 / G512 / G1024 on the config of record (no VOID, no `AEE_ERPC`); chunked == unchunked bit-identical on the host at M = 1024, K = 2048, 3 handles; prefill ≥ −5 % of the unchunked P512 cell (727–739); E2E Q unchanged (`calls/token=1.00`, `heap_kib=0`) | PR #233 merged; the user's text approval of the P512 cells |
 | ㊲ | **Runner defect, docs-only (cycle 34):** `225-run.sh`'s `gen()` keeps `[HTP]` banners that print inside the generated text (`dspq: on queue=0x…`, `graph: init …` — stdout not line-terminated), so its `speed.txt` text column reads DIFF for every NPU run and the `every r2 text == its r1` check reports `BAD … got '2'` on a byte-identical pair (the queue address differs). Fix on PR #233's branch: strip `\[HTP[^\n]*\n` anywhere in the captured text before comparing (and in `loops.txt`'s input); the filled handoff's text-vs-A column was recomputed that way by hand. Filed as a comment on #225, not an issue | the next runner's `speed.txt` reads `same` for r2 vs r1 on every NPU cell; `loops.txt` computed on banner-free text | PR #233 |
-| ㊳ | **Cycle 38: v79 read — the expand gtest and the new u8i2-vs-twin layer gtest pass on the S25 `R3CY205ZMND` (§2 #229 row, 2026-10-06; PR #244 open); v81 still open.** Was: the 2-bit expert stack (#229 S1, PRs #238 / #239, cycle 36) has no device reading. `HvxExpandI2I4.MatchesScalarBitExact` passed on v79 in upstream #4410 and never ran on v81; the u8i2 LUT GEMV (`hvx_gemv_u8i2*`, mask fixed per rule 66) had no device gtest — PR #244 adds `HmxMmU8I4Layer.MoeLayerU8I2GemvMatchesI4Twin` at the Gemma expert shape (12 cells bit-identical on v79); the host holds it bit-identical to the 4-bit palette twin on lfm25 / gemma64 E2E and the pool (C = 1 / 2). What is left: a v81 run of both gtests when an S26 is attached, and S4's `NNTR_HTP_DUMP` MoE dumps of a 2-bit model against its palette twin on a device | expand + u8i2 gtests PASS on v81; 2-bit vs palette-twin dumps `bit_identical=1` on the device; then the S5 2-bit floor (plan 229 §3.2) is a number | #229 S2–S4 (after #234); the S26 unit; PR #244 merge (user) |
+| ㊳ | **Cycle 39: PR #244 merged `8971aa873`; the Gemma device is the S25 `R3CY205ZMND` (user 2026-10-07), so the v81 half is deferred until an S26 is attached again, not a blocker.** Cycle 38: v79 read — the expand gtest and the new u8i2-vs-twin layer gtest pass on the S25 `R3CY205ZMND` (§2 #229 row, 2026-10-06); v81 still open. Was: the 2-bit expert stack (#229 S1, PRs #238 / #239, cycle 36) has no device reading. `HvxExpandI2I4.MatchesScalarBitExact` passed on v79 in upstream #4410 and never ran on v81; the u8i2 LUT GEMV (`hvx_gemv_u8i2*`, mask fixed per rule 66) had no device gtest — PR #244 adds `HmxMmU8I4Layer.MoeLayerU8I2GemvMatchesI4Twin` at the Gemma expert shape (12 cells bit-identical on v79); the host holds it bit-identical to the 4-bit palette twin on lfm25 / gemma64 E2E and the pool (C = 1 / 2). What is left: a v81 run of both gtests when an S26 is attached, and S4's `NNTR_HTP_DUMP` MoE dumps of a 2-bit model against its palette twin on a device | expand + u8i2 gtests PASS on v81; 2-bit vs palette-twin dumps `bit_identical=1` on the device; then the S5 2-bit floor (plan 229 §3.2) is a number | #229 S2–S4 (after #234); the S26 unit; PR #244 merge (user) |
 | ㊴ | **Cycle 36 (close-out): (1) decided — `NNTR_MOE_TIER=2` is the LFM E2E default (PR #245, `HtpBackend::e2eRequested() ? 2 : 0`; the tiered 9 × 3 E2E column is measured, §2 #219t row); (2) / (3) stay open and are not pursued on LFM2.5 (user) — they move to Gemma's one PD with rule 68's reading (the G64 residual = start cost ÷ G + misses × copy, scaling with P; `tier_waits` 0 / 3 / 3 at P64 / P512 / P1024) and the ≈ 170 MiB ARM Q4_0 FC set the E2E loads and never reads (`cpu fc skipped` = 32 × tokens) as the RSS item beside (3).** Originally:**#219's remainder (cycle 35b, 2026-10-06; §2 #219 row, rule 65; ㊳ is `htp_decode`'s cycle-36 item for #229 S1) — three things, none a code change the gate asks for yet.** (1) **The default is the user's call** (`needs-user` on #219): flip `NNTR_MOE_TIER=2` (one-thread copy; G1 pass on every run, decode 48.47 sd 0.23 at G 64, refaults ≤ 81, `pswpin` ≤ 168) as the E2E one-PD default, or keep it env-only as #218's fadvise; `=1` (8-slice copy) is dominated on every axis and should not be the default either way. (2) **`tier_waits` 3–4 a run at every G** (G2 wants ≤ 2): the decode start's refill backlog from the prefill batch (constant across G, the host saw 2 waits behind `refill_ms=42.5`), not a growing race; lever = drain the refill queue (or `poolSync` on it) before the first decode token, cost ≈ one refill's time off the first token, not the per-token path; worth ≈ 3–4 × 1 ms a run — small, a hygiene item. (3) **`pswpin` non-zero with the tier** (0–1261; `=1` once 2105 / `pswpout` 3621): the sum anon 766 + tier 467 + ION 3 776 MiB is at the S25's edge; a cheaper tier (hold only the complement's gate \| up images the pool actually re-reads, or drop the tier's slots the arena holds twice at load) or a smaller RSS recovers the ≈ 0.5 GiB. Also open: a tiered 9 × 3 E2E column (P64 / P512 / P1024 × G) is its own sitting on the same unit class as #225's Q cells — not filed until the default is decided | (1) a decision; (2) `tier_waits ≤ 2` on every run with decode unchanged; (3) `pswpin = pswpout = 0` in every tiered window | #219 `needs-user`; PR #240 |
 | ㊵ | **#234 P2's safetensors order guard does not catch two same-size swapped tensors (PR #248, cycle 38):** `nntr_quantize_stream` now reads the converter's `.safetensors` and refuses a header whose tensor order it cannot follow (§10.5 of plan 234), but two tensors of equal byte size in each other's place pass the guard and produce a plausibly wrong model — the `QS4CX_WH` trap of contract §2 ("a wrong layout yields plausible wrong text, not an error") in a new place. Matters once the user's 26B ternary files arrive (#229 S0 / #201 S5): the first Gemma conversion needs a per-tensor identity check beyond size (name-keyed, as #227's hand-over is) or a CPU-vs-HTP shadow on the converted model before any sitting | the first 26B conversion is verified by name-keyed tensor identity or a CPU run of the converted model that matches the reference tokens; or the guard is extended to names | #234 P3 / plan 234 revision; #201 S5 |
+| ㊶ | **#201 S5-0 — the first 26B sitting, on the DUMMY file (cycle 39, 2026-10-07).** The files are on the workstation (`~/Downloads/gemma4_26b/`, bin md5 `9b4e9349…`, 7 226 112 120 B, a nntrainer `.bin` — cycle 39 (2)), the blob is a dummy of the right shape and format, the device is the attached S25 `R3CY205ZMND` and the agent drives adb. So S5's first sitting is a **path** sitting, not an accuracy one: A = CPU run of the same file (`moe_engine` off / CPU MoE cache, the bit-identity reference, host x86 if the phone cannot hold it), E = `NNTR_HTP_E2E=1` one PD through the pool at the config's `moe_cache_experts 16` and at the largest C that loads (the one-PD budget on the S25 is the 3 840 MiB ceiling minus the Q4M1 FC set ≈ 790 MiB and the tied Q4M1 head ≈ 415, plan 234 §3 — P3 / P4 are not prerequisites: the S4 graph binds FC / DENSE_FFN from `q4_pending_` as Q4M1), prompt 512, G 64 / 512 / 1024, cool start, `.sitting.lock` taken. Prerequisite: the format agent's reading of the bin (the `int2` name vs the config's `QS4CX_WH`) and the loader accepting it — the first attempt is a host load (`run_inproc_e2e.sh`-style registration on the real file: dumps only, never a number, §3a) before the phone | loads on the phone (`mapped=`, `calls/token=1.00`, `attn_caches=2`, pool misses / token printed); tokens of E == A over the prompt set on the same dummy weights and MoE dumps `bit_identical=1` vs the pool-less run; tok/s at the three G + peak RSS + arena bytes recorded (㉟'s baseline); prefill of E vs A recorded (no −5 % gate — nothing of the DMA ring / pool / layout changes in this sitting); no text / PPL column (dummy) | #201 (S5-0), the format agent's answer; plan 229 S4's A / B2 / B2-C rows follow on the same file once the 2-bit path is what the bin holds |
 
 ## 3a. Guide and tooling notes
 
