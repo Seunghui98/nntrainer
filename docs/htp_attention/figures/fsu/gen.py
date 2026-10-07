@@ -518,7 +518,7 @@ def figP():
 # --------------------------------------------- expert memory, as tables
 def figT():
     o = [HEAD.format(title="Expert memory and prefetch")]
-    o.append(text(80, 88, "Gemma-4 26B-A4B: Expert 메모리와 Prefetch 양", "t1"))
+    o.append(text(80, 88, "Gemma-4 26B-A4B: Expert 메모리와 Prefetch (512-token)", "t1"))
     o.append(text(80, 134, "Expert weight는 Flash에 두고, DRAM의 Expert cache에는 일부만 올린다 (moe_cache_experts = slot/layer)", "t2"))
 
     def table(x, y, widths, header, rows, title, bold_last=False, hl_col=None):
@@ -528,54 +528,58 @@ def figT():
         o.append(rect(x, y, tw, 44, "var(--idle)", 6))
         cx = x
         for w, h in zip(widths, header):
-            o.append(text(cx + 16, y + 30, h, "sm", extra='style="font-weight:700;fill:#0b0b0b"'))
+            o.append(text(cx + 14, y + 30, h, "sm", extra='style="font-weight:700;fill:#0b0b0b"'))
             cx += w
         y += 44
         for k, row in enumerate(rows):
             cx = x
             for j, (w, v) in enumerate(zip(widths, row)):
                 st = 'style="font-weight:700"' if (bold_last and k == len(rows) - 1) or j == hl_col else ""
-                o.append(text(cx + 16, y + 29, v, "sm" if j == 0 else "lbl", extra=st if j else ""))
+                o.append(text(cx + 14, y + 29, v, "sm" if j == 0 else "lbl", extra=st if j else ""))
                 cx += w
             y += 42
             o.append(f'<path d="M{x},{y} L{x + tw},{y}" stroke="#e1e0d9" stroke-width="2"/>')
         return y
 
-    # left: sizes and file
-    y = table(80, 200, [430, 400], ["항목", "크기"], [
+    lw = [360, 300]
+    y = table(80, 200, lw, ["항목", "크기"], [
         ("MoE layer × expert", "30 × 128 = 3,840개"),
         ("Expert 1개 (int4 + scale)", "3.01 MB (2.87 MiB)"),
         ("Layer 1개 (128 expert)", "385 MB"),
-        ("Token 1개 · layer 1개 (top-8)", "24 MB"),
-        ("Expert 전체", "11.56 GB (10.77 GiB)"),
+        ("Token 1개 (30 layer × top-8)", "240개 = 722 MB"),
+        ("Expert 전체", "11.56 GB"),
     ], "Expert 크기", bold_last=True)
-    table(80, y + 60, [430, 400], ["구성", "크기"], [
+    table(80, y + 56, lw, ["구성", "크기"], [
         ("Expert (QS4CX_WH)", "11.55 GB"),
         ("Attention · dense FFN (QS4CX)", "0.82 GB"),
         ("Embedding = lm_head (Q4_0)", "0.42 GB"),
         ("Router 등 FP32", "0.04 GB"),
-        ("합계 (산술)", "≈ 12.8 GB"),
+        ("합계 (실측 12,240 MiB)", "12.83 GB"),
     ], "모델 파일 (Flash)", bold_last=True)
-    # right: cache and prefetch, prefill
-    y = table(960, 200, [400, 230, 250], ["항목", "5 slot/layer", "16 slot/layer (기본)"], [
-        ("Cache slot", "150", "480"),
-        ("Cache 크기 (DRAM)", "0.45 GB", "1.45 GB (12.5%)"),
-        ("한 시점 prefetch 양", "공간 없음", "256개 ≈ 0.77 GB"),
-        ("Flash read / prefill (상한)", "11.11 GB", "10.12 GB"),
-        ("Flash 하한 (÷ 3.0 GB/s)", "3.70 s", "3.37 s"),
-        ("Prefetch expert (실측)", "—", "3,360개 (10.1 GB)"),
-        ("동기 read · I/O stall (실측)", "2,893개 · 7.10 s", "0개 · 0.01 s"),
-        ("Prefill latency (실측)", "10.94 s", "5.01 s"),
-    ], "Prefill: Expert cache와 Prefetch (446-token prompt)", hl_col=2)
-    table(960, y + 60, [400, 480], ["항목", "값"], [
-        ("Token당 사용 expert", "30 × 8 = 240개 (722 MB)"),
-        ("전부 miss일 때 Flash read", "722 MB → 0.24 s"),
-        ("Hit rate", "기기 미측정 (LFM2 C=16: 85%)"),
-    ], "Decode: token 1개")
-    o.append(text(80, 1012, "Cache 크기 = slot × 3.01 MB, arena는 256 MiB chunk로 할당(16 slot/layer: 1,408 MiB). "
-                            "한 시점 prefetch 양 = Layer N+1(ready) + N+2(prefetching).", "xs"))
-    o.append(text(80, 1042, "실측: Galaxy S25 Ultra (Hexagon V79), MoE만 NPU 구성, 2026-10-02 (문서 55 §10.11). "
-                            "그 밖의 값은 문서 55 §3.2·§4 산술. 파일 합계는 같은 식으로 Q4_0-FC 파일 12.93 GB(실측 12.94 GB)를 재현.", "xs"))
+
+    rw = [330, 215, 300, 215]
+    hdr = ["항목", "8 slot/layer", "16 slot/layer (기본)", "24 slot/layer"]
+    y = table(780, 200, rw, hdr, [
+        ("Cache slot", "240", "480", "720"),
+        ("Cache 크기 (DRAM)", "0.72 GB", "1.45 GB", "2.17 GB"),
+        ("미리 올려 두는 양 (산술)", "0 (112 < 128)", "256개 ≈ 0.77 GB", "512개 ≈ 1.54 GB"),
+        ("Flash read / prefill (상한)", "10.84 GB", "10.12 GB", "9.39 GB"),
+        ("Flash 하한 (÷ 3.0 GB/s)", "3.61 s", "3.37 s", "3.13 s"),
+        ("Prefetch (실측)", "—", "3,360개 · 대기 0 ms", "—"),
+        ("Prefill latency (실측)", "4.85 s", "4.27 s", "4.15 s"),
+    ], "Prefill (512-token prompt)", hl_col=2)
+    table(780, y + 56, rw, hdr, [
+        ("Decode 속도 (실측)", "4.51 TPS", "3.39 TPS", "3.47 TPS"),
+        ("Cache miss (실측)", "81,348", "62,198", "41,955"),
+        ("Hit rate (계산)", "34%", "49%", "66%"),
+        ("Flash read / token", "478 MB", "366 MB", "247 MB"),
+        ("Read 시간 / miss (실측)", "0.76 ms", "1.58 ms", "2.27 ms"),
+    ], "Decode (512 token 생성)", hl_col=2)
+    o.append(text(80, 990, "미리 올려 두는 양: 다음 layer(128개) 단위로만 queue → (slot − 현재 layer 128) ÷ 128 layer. "
+                           "Hit rate = 1 − miss ÷ (512 token × 240). Flash read / token = miss ÷ 512 × 3.01 MB.", "xs"))
+    o.append(text(80, 1018, "C가 커지면 hit는 오르지만 miss당 read가 느려진다(ION arena가 커질수록 OS page cache가 줄어드는 것으로 추정, 미측정).", "xs"))
+    o.append(text(80, 1046, "실측: Galaxy S25 Ultra (Hexagon V79), FC·MoE NPU 구성, 2026-10-02 (문서 55 §10.14·10.15, 57 §3). "
+                            "이번 브랜치(전 연산 NPU)는 기기 미측정.", "xs"))
     o.append(TAIL)
     return "\n".join(o)
 
