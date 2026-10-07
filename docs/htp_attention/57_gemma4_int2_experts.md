@@ -338,6 +338,28 @@ int2 실측(§5.2)과 int4 산술로 expert 경로를 세 단계로 나눠 적�
 - decode TPS가 같은 이유: miss가 없어(더미 라우팅) 읽기 이득이 0이고, DMA 이득은 int4 drain을 봐야 안다(최대 +1.7 TPS 산술).
 - int2가 시간으로 보이는 조건: (a) cold 또는 page cache 밖 (b) 실제 라우팅의 decode miss (c) CPU 계산을 HTP로 옮겨 prefill이 읽기 바닥에 닿을 때.
 
+### 7.4b probe 실측 (2026-10-07, rep=2; **앱이 `--profile` 빌드인 채로 측정** → prefill_ms·decode_tps 절대값은 부풀어 있고, reader·miss·DSP 쪽 per-expert 값은 유효)
+
+int4 = 실제 가중치(라우팅이 층당 ~104 expert), int2 = 더미(~43 expert). 그래서 호출당 값은 expert 수로 나눠 비교한다.
+
+| 지표 | int4 | int2 | 비 | 판정 |
+|---|---:|---:|---:|---|
+| reader ms/expert (flash→arena, 숨은 transport) | 4.70 (3.01 MB) | 3.06 (1.52 MB) | 0.65 | **절반이 아니다.** t = 1.39 ms + 1.10 ms/MB: expert당 고정비 1.4 ms(pread 2회·등록 등)가 있어 바이트 절반이 시간 35% 절감으로 나온다 |
+| read-ahead 노출 | 0.0 ms | 0.0 ms | | 둘 다 완전히 숨음(profile 빌드라 prefill이 6 s로 길어서). 정상 빌드(prefill 4.0 s)에서 int4 읽기 총량 3360×4.70/4 = **3.95 s**는 여유 0, int2 **2.57 s**는 여유 1.4 s |
+| 동기 miss ms/miss (read-ahead 끔) | 2.65 | 2.29 | 0.86 | 고정비 지배. 바이트는 절반인데 시간은 14%만 준다 |
+| read-ahead가 숨긴 prefill 시간 (nopf − pf) | 13.7 − 6.0 = **7.7 s** | 7.2 − 5.6 = 1.6 s | | int4 실제 라우팅은 prefill miss ~2600회 → 읽기가 전부 드러나면 +7.7 s |
+| DMA KB/call ÷ expert | 2.84 MiB | 1.42 MiB | 0.50 | 바이트 정확히 절반 (구조상) |
+| decode 호출 dsp | 1486 us | 1400 us | 0.94 | −86 us/call, 30층 → **−2.6 ms/token** |
+| decode drain (DMA·확장 노출) | 142.5+17.6 = 160 | 73+11 = 84 | 0.53 | int4 decode는 DMA가 160 us 드러나 있었고 int2가 그 절반으로 줄였다. 확장은 decode에서 **완전히 숨음** |
+| prefill drain / expert | 892/104 = 8.6 us | 2764/43 = 64 us | 7.5 | **확장이 prefill에서는 일부 드러난다**: 호출당 약 2.4 ms(11%), 31콜 → 74 ms(prefill의 ~2%) |
+| expand (worker) | 0 | prefill 7885 us/call, decode 1472 | | 일의 양. decode 1472 us는 워커 n개에 분산되어 호출 1400 us 안에 숨음 |
+
+읽는 법:
+- **flash transport는 절반이 안 된다**(0.65×). expert당 고정비 1.4 ms를 없애면(gate_up+down을 pread 1회로, 등록 RPC 묶기) 0.5×에 가까워진다. 이것이 §6.3-3의 근거.
+- **prefill에서 int2가 시간 이득이 없는 이유가 확정됐다**: int4도 read-ahead가 100% 숨긴다(노출 0). 다만 정상 빌드 기준 int4는 읽기 3.95 s vs prefill 4.0 s로 **턱밑**이고, CPU 계산이 조금만 줄면 int4는 드러나고 int2는 1.4 s 여유가 있다.
+- **decode는 int2가 호출당 −86 us**(DMA 노출 절반). 토큰당 −2.6 ms로 작다. 더미 라우팅이라 miss 이득은 안 보인다(int4 실제 라우팅은 decode miss 64k회 × 2.45 ms가 전부 decode 시간이다 → 2.2 TPS; 실제 모델 int2는 miss당 1.57 ms로 **miss 비용 36% 절감**이 decode에 그대로 나타날 것. 미측정).
+- **확장 노출**: decode 0, prefill 호출당 ~2.4 ms. 원인 후보는 호출 첫 expert(숨길 앞 matmul이 없음, 183 us)와 워커의 epilogue 경합. §2.4의 손잡이(MOE_EXPAND_SPLIT, 워커 수)로 줄일 수 있으나 prefill의 2%라 우선순위 낮음.
+
 ### 7.5 probe 실행
 ```
 cd /data/local/tmp/nntrainer/causallm && sh g4_io_dma_probe.sh models/gemma4-26b-a4b-qs4cx-wh models/gemma4-26b-a4b-int2-wh
