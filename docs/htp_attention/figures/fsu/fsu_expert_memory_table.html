@@ -34,7 +34,7 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <rect width="1920" height="1080" fill="var(--surface)"/>
 
 <text x="80" y="88" class="t1" text-anchor="start" >Gemma-4 26B-A4B: Expert 메모리와 Prefetch (512-token)</text>
-<text x="80" y="134" class="t2" text-anchor="start" >Expert weight는 Flash에 두고, DRAM의 Expert cache에는 일부만 올린다 (moe_cache_experts = slot/layer)</text>
+<text x="80" y="134" class="t2" text-anchor="start" >Expert weight는 Flash에 두고, DRAM의 Expert cache(30 layer 공유)에는 일부만 올린다. 1 slot = expert 1개(3.01 MB)</text>
 <text x="80" y="200" class="h3" text-anchor="start" >Expert 크기</text>
 <rect x="80" y="218" width="660" height="44" rx="6" fill="var(--idle)" />
 <text x="94" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">항목</text>
@@ -76,13 +76,13 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <text x="780" y="200" class="h3" text-anchor="start" >Prefill (512-token prompt)</text>
 <rect x="780" y="218" width="1060" height="44" rx="6" fill="var(--idle)" />
 <text x="794" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">항목</text>
-<text x="1124" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">8 slot/layer</text>
-<text x="1339" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">16 slot/layer (기본)</text>
-<text x="1639" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">24 slot/layer</text>
-<text x="794" y="291" class="sm" text-anchor="start" >Cache slot</text>
-<text x="1124" y="291" class="lbl" text-anchor="start" >240</text>
-<text x="1339" y="291" class="lbl" text-anchor="start" style="font-weight:700">480</text>
-<text x="1639" y="291" class="lbl" text-anchor="start" >720</text>
+<text x="1124" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">240 slot</text>
+<text x="1339" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">480 slot (기본)</text>
+<text x="1639" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">720 slot</text>
+<text x="794" y="291" class="sm" text-anchor="start" >설정값 moe_cache_experts (×30)</text>
+<text x="1124" y="291" class="lbl" text-anchor="start" >8</text>
+<text x="1339" y="291" class="lbl" text-anchor="start" style="font-weight:700">16</text>
+<text x="1639" y="291" class="lbl" text-anchor="start" >24</text>
 <path d="M780,304 L1840,304" stroke="#e1e0d9" stroke-width="2"/>
 <text x="794" y="333" class="sm" text-anchor="start" >Cache 크기 (DRAM)</text>
 <text x="1124" y="333" class="lbl" text-anchor="start" >0.72 GB</text>
@@ -117,9 +117,9 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <text x="780" y="612" class="h3" text-anchor="start" >Decode (512 token 생성)</text>
 <rect x="780" y="630" width="1060" height="44" rx="6" fill="var(--idle)" />
 <text x="794" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">항목</text>
-<text x="1124" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">8 slot/layer</text>
-<text x="1339" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">16 slot/layer (기본)</text>
-<text x="1639" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">24 slot/layer</text>
+<text x="1124" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">240 slot</text>
+<text x="1339" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">480 slot (기본)</text>
+<text x="1639" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">720 slot</text>
 <text x="794" y="703" class="sm" text-anchor="start" >Decode 속도 (실측)</text>
 <text x="1124" y="703" class="lbl" text-anchor="start" >4.51 TPS</text>
 <text x="1339" y="703" class="lbl" text-anchor="start" style="font-weight:700">3.39 TPS</text>
@@ -146,6 +146,6 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <text x="1639" y="871" class="lbl" text-anchor="start" >2.27 ms</text>
 <path d="M780,884 L1840,884" stroke="#e1e0d9" stroke-width="2"/>
 <text x="80" y="990" class="xs" text-anchor="start" >미리 올려 두는 양: 다음 layer(128개) 단위로만 queue → (slot − 현재 layer 128) ÷ 128 layer. Hit rate = 1 − miss ÷ (512 token × 240). Flash read / token = miss ÷ 512 × 3.01 MB.</text>
-<text x="80" y="1018" class="xs" text-anchor="start" >C가 커지면 hit는 오르지만 miss당 read가 느려진다(ION arena가 커질수록 OS page cache가 줄어드는 것으로 추정, 미측정).</text>
+<text x="80" y="1018" class="xs" text-anchor="start" >Cache가 커지면 hit는 오르지만 miss당 read가 느려진다(ION arena가 커질수록 OS page cache가 줄어드는 것으로 추정, 미측정).</text>
 <text x="80" y="1046" class="xs" text-anchor="start" >실측: Galaxy S25 Ultra (Hexagon V79), FC·MoE NPU 구성, 2026-10-02 (문서 55 §10.14·10.15, 57 §3). 이번 브랜치(전 연산 NPU)는 기기 미측정.</text>
 </svg></body></html>

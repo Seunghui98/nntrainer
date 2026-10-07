@@ -444,7 +444,7 @@ def figP():
     # baseline
     o.append(text(80, 236, "Baseline", "h3"))
     o.append(text(80, 264, "On-demand read", "sm"))
-    o.append(text(80, 290, "Expert cache 5 slot/layer", "sm"))
+    o.append(text(80, 290, "Expert cache 150 slot (0.45 GB)", "sm"))
     lane_lbl(214, "NPU")
     lane_lbl(280, "Flash")
     for i in range(4):
@@ -455,7 +455,7 @@ def figP():
     # prefetch
     o.append(text(80, 412, "Expert Prefetch", "h3"))
     o.append(text(80, 440, "Read-ahead, LRU", "sm"))
-    o.append(text(80, 466, "Expert cache 16 slot/layer", "sm"))
+    o.append(text(80, 466, "Expert cache 480 slot (1.45 GB)", "sm"))
     lane_lbl(390, "NPU")
     lane_lbl(456, "Flash")
     for i in range(4):
@@ -485,10 +485,10 @@ def figP():
             x += n * sc
         if note:
             o.append(text(x + 14, y + 32, note, "sm"))
-    occ(660, "5 slot/layer · 150", [(128, "var(--npu)", "Layer N (in use) 128", "lblw"),
+    occ(660, "150 slot · 0.45 GB", [(128, "var(--npu)", "Layer N (in use) 128", "lblw"),
                                     (22, "var(--idle)", "", "sm")],
         "남은 22 slot < 다음 layer 128 → prefetch 불가")
-    occ(728, "16 slot/layer · 480", [(128, "var(--npu)", "Layer N (in use)", "lblw"),
+    occ(728, "480 slot · 1.45 GB", [(128, "var(--npu)", "Layer N (in use)", "lblw"),
                                      (128, "var(--npu-t)", "Layer N+1 (ready)", "lbl"),
                                      (128, "var(--read)", "Layer N+2 (prefetching)", "lblw"),
                                      (96, "var(--idle)", "free", "sm")], "")
@@ -500,8 +500,8 @@ def figP():
     o.append(rect(80, ty, 1760, 52, "var(--idle)", 6))
     for x, h in cols:
         o.append(text(x + 20, ty + 34, h, "lbl", extra='style="font-weight:700"'))
-    rows = [("Baseline · 5 slot/layer", "10.94 s", "7.10 s", "2,893", "—"),
-            ("Expert Prefetch · 16 slot/layer", "5.01 s", "0.01 s", "0", "3,360")]
+    rows = [("Baseline · cache 150 slot", "10.94 s", "7.10 s", "2,893", "—"),
+            ("Expert Prefetch · cache 480 slot", "5.01 s", "0.01 s", "0", "3,360")]
     for k, row in enumerate(rows):
         y = ty + 52 + k * 50
         o.append(f'<path d="M80,{y + 50} L1840,{y + 50}" stroke="#e1e0d9" stroke-width="2"/>')
@@ -519,7 +519,7 @@ def figP():
 def figT():
     o = [HEAD.format(title="Expert memory and prefetch")]
     o.append(text(80, 88, "Gemma-4 26B-A4B: Expert 메모리와 Prefetch (512-token)", "t1"))
-    o.append(text(80, 134, "Expert weight는 Flash에 두고, DRAM의 Expert cache에는 일부만 올린다 (moe_cache_experts = slot/layer)", "t2"))
+    o.append(text(80, 134, "Expert weight는 Flash에 두고, DRAM의 Expert cache(30 layer 공유)에는 일부만 올린다. 1 slot = expert 1개(3.01 MB)", "t2"))
 
     def table(x, y, widths, header, rows, title, bold_last=False, hl_col=None):
         o.append(text(x, y, title, "h3"))
@@ -558,9 +558,9 @@ def figT():
     ], "모델 파일 (Flash)", bold_last=True)
 
     rw = [330, 215, 300, 215]
-    hdr = ["항목", "8 slot/layer", "16 slot/layer (기본)", "24 slot/layer"]
+    hdr = ["항목", "240 slot", "480 slot (기본)", "720 slot"]
     y = table(780, 200, rw, hdr, [
-        ("Cache slot", "240", "480", "720"),
+        ("설정값 moe_cache_experts (×30)", "8", "16", "24"),
         ("Cache 크기 (DRAM)", "0.72 GB", "1.45 GB", "2.17 GB"),
         ("미리 올려 두는 양 (산술)", "0 (112 < 128)", "256개 ≈ 0.77 GB", "512개 ≈ 1.54 GB"),
         ("Flash read / prefill (상한)", "10.84 GB", "10.12 GB", "9.39 GB"),
@@ -577,7 +577,7 @@ def figT():
     ], "Decode (512 token 생성)", hl_col=2)
     o.append(text(80, 990, "미리 올려 두는 양: 다음 layer(128개) 단위로만 queue → (slot − 현재 layer 128) ÷ 128 layer. "
                            "Hit rate = 1 − miss ÷ (512 token × 240). Flash read / token = miss ÷ 512 × 3.01 MB.", "xs"))
-    o.append(text(80, 1018, "C가 커지면 hit는 오르지만 miss당 read가 느려진다(ION arena가 커질수록 OS page cache가 줄어드는 것으로 추정, 미측정).", "xs"))
+    o.append(text(80, 1018, "Cache가 커지면 hit는 오르지만 miss당 read가 느려진다(ION arena가 커질수록 OS page cache가 줄어드는 것으로 추정, 미측정).", "xs"))
     o.append(text(80, 1046, "실측: Galaxy S25 Ultra (Hexagon V79), FC·MoE NPU 구성, 2026-10-02 (문서 55 §10.14·10.15, 57 §3). "
                             "이번 브랜치(전 연산 NPU)는 기기 미측정.", "xs"))
     o.append(TAIL)
