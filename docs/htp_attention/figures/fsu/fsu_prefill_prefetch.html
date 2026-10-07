@@ -34,7 +34,7 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <rect width="1920" height="1080" fill="var(--surface)"/>
 
 <text x="80" y="88" class="t1" text-anchor="start" >Prefill: Expert Prefetch</text>
-<text x="80" y="134" class="t2" text-anchor="start" >Layer N 연산 중 Layer N+1의 expert를 Flash에서 미리 읽어, Flash I/O를 NPU 연산과 overlap</text>
+<text x="80" y="134" class="t2" text-anchor="start" >Layer N 연산 중 Layer N+2의 expert 128개를 Flash에서 미리 읽어(N+1은 이미 준비됨), Flash I/O를 NPU 연산과 overlap</text>
 <text x="80" y="236" class="h3" text-anchor="start" >Baseline</text>
 <text x="80" y="264" class="sm" text-anchor="start" >On-demand read</text>
 <text x="80" y="290" class="sm" text-anchor="start" >Expert cache 150 slot (0.45 GB)</text>
@@ -72,19 +72,19 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <rect x="360" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
 <text x="440.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L1</text>
 <rect x="368" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="429.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L2</text>
+<text x="429.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L3</text>
 <rect x="525" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
 <text x="605.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L2</text>
 <rect x="533" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="594.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L3</text>
+<text x="594.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L4</text>
 <rect x="690" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
 <text x="770.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L3</text>
 <rect x="698" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="759.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L4</text>
+<text x="759.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L5</text>
 <rect x="855" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
 <text x="935.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L4</text>
 <rect x="863" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="924.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L5</text>
+<text x="924.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L6</text>
 <path d="M360,540 L1831.197604790419,540" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>
 <text x="1837.197604790419" y="546" class="xs" text-anchor="start" >time</text>
 <path d="M1034,423 L1795.197604790419,423" stroke="#52514e" stroke-width="2" stroke-dasharray="4 5" marker-end="url(#ah)" marker-start="url(#ah)"/>

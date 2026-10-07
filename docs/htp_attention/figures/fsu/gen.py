@@ -425,7 +425,7 @@ def figC():
 def figP():
     o = [HEAD.format(title="Prefill Expert Prefetch")]
     o.append(text(80, 88, "Prefill: Expert Prefetch", "t1"))
-    o.append(text(80, 134, "Layer N 연산 중 Layer N+1의 expert를 Flash에서 미리 읽어, Flash I/O를 NPU 연산과 overlap", "t2"))
+    o.append(text(80, 134, "Layer N 연산 중 Layer N+2의 expert 128개를 Flash에서 미리 읽어(N+1은 이미 준비됨), Flash I/O를 NPU 연산과 overlap", "t2"))
     x0, c = 360, 165
     r = (10.94 / 5.01 - 1) * c          # totals keep the measured ratio
 
@@ -460,7 +460,7 @@ def figP():
     lane_lbl(456, "Flash")
     for i in range(4):
         blk(x0 + i * c, 390, c, "var(--npu)", f"Compute L{i + 1}")
-        blk(x0 + i * c + 8, 456, 0.77 * c, "var(--read)", f"Prefetch L{i + 2}", 15)
+        blk(x0 + i * c + 8, 456, 0.77 * c, "var(--read)", f"Prefetch L{i + 3}", 15)
     # time axis and the saving
     xe1, xe2 = x0 + 4 * (r + c), x0 + 4 * c
     o.append(f'<path d="M{x0},540 L{xe1 + 30},540" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>')
