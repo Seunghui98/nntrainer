@@ -118,6 +118,7 @@ SRCS="$SRCS $BACKEND/hmx/hexkl_attn_f16.c $BACKEND/hmx/hexkl_kv_tiles_f16.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_attn_q.c $BACKEND/hmx/hexkl_kv_q.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_attn_decode_f16.c $BACKEND/hvx/hvx_attn_decode_q.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_kv_quant.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_softmax_q.c $BACKEND/hmx/hexkl_attn_q2.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -mhmx -G0 -O3 -fPIC -shared \

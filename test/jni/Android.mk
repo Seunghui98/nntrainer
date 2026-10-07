@@ -1117,11 +1117,13 @@ LOCAL_LDLIBS := -llog -landroid
 LOCAL_SRC_FILES := \
 	 ../unittest/unittest_hvx_attn_q.cpp \
 	 ../htp/generated/nntr_hvx_stub.c \
-	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hmx/hexkl_kv_q.c
+	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hmx/hexkl_kv_q.c \
+	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hvx/hvx_softmax_q.c
 
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
 	 $(LOCAL_PATH)/../unittest \
 	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hmx \
+	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hvx \
 	 $(HEXAGON_SDK_ROOT)/incs \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
 	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
