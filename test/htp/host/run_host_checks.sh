@@ -313,6 +313,16 @@ done
 
 "$OUT/rope_rows_host_check"
 
+# The final logit softcap the lm_head call applies (doc 57 section 9.7):
+# the real HVX source on the lane emulation against cap * tanh(x / cap) in
+# double over a 262 144-wide row with a scalar tail (SOFTCAP OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/softcap_host_check" \
+  "$HERE/softcap_host_check.c" "$BACKEND/hvx/hvx_softcap_f32.c" -lm
+
+"$OUT/softcap_host_check"
+
 # The CPU-order Q4_0 FC (#132 PR 2): the spec q4_gemv_cpu_det.h against an
 # independent model of the Android CPU's quantizer and fused chain, six
 # mutants (Q4 GEMV CPU-ORDER OK), and the REAL DSP source hvx_q4_gemv_f32.c
