@@ -52,8 +52,14 @@ public:
 void setupGemma4DeterministicWeights(TinyGemma4CausalLM &model) {
   model.forEachLayer(
     [](ml::train::Layer &layer, nntrainer::RunLayerContext &context, void *) {
-      if (layer.getName() == "output_of_causallm")
+      if (layer.getName() == "output_of_causallm") {
+        // the tied weight is the embedding's; its own weight is the
+        // folded output norm's gamma, 1 as every norm here
+        for (unsigned int i = 0; i < context.getNumWeights(); ++i)
+          if (context.getWeightName(i).find("gamma") != std::string::npos)
+            context.getWeight(i).setValue(1.0f);
         return;
+      }
 
       for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
         auto &weight = context.getWeight(i);
