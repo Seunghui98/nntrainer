@@ -97,7 +97,7 @@ ninja -C build
 ./build/test/unittest/unittest_nntrainer_cpu_backend --gtest_filter='*qs4cx*'
 NNTR_QUANTIZE_BIN=$PWD/build/Applications/CausalLM/nntr_quantize \
 NNTR_QUANTIZE_STREAM_BIN=$PWD/build/Applications/CausalLM/nntr_quantize_stream \
-  ./build/Applications/CausalLM/unittest_causallm_models --gtest_filter='*Lfm2Moe*'   # 6 PASSED, none skipped
+  ./build/Applications/CausalLM/unittest_causallm_models --gtest_filter='*Lfm2Moe*'   # 7 PASSED since PR #255 (FcWhSidecarMatchesWhQuantize), none skipped
 bash test/htp/host/run_host_checks.sh     # prints ALL CHECKS PASS and WORKER POOL LANES OK, then (since PR #119) GRAPH CHECKS PASS,
                                           #   then (since PRs #125 / #126) M1 OPS BIT-IDENTICAL and ATTN M1 BIT-IDENTICAL
 bash tools/htp_syntax_check.sh
