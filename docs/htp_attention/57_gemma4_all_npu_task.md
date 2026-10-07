@@ -329,6 +329,20 @@ MoE 층의 router(`router_norm` + 2816×128 f32 dot, CPU 191 ms/30층)를 prefil
 - ponytail: `rope_scaling_factor`는 1.0 가정(yarn은 거부 → core의 use_rope를 켠다).
 - CPU에 남는 것(prefill): embedding, lm_head·softcap, ARM staging memcpy.
 
+### 9.7 output_norm·lm_head·softcap 한 호출 (2026-10-07), 기기 미측정
+
+prefill의 마지막 행과 decode의 매 토큰에서 CPU였던 output_norm(RMSNorm) → tied lm_head(262144×2816 Q4_0) → final softcap(30)을 DSP 한 호출 `lm_head_q4m1_f32`로 옮겼다.
+
+- 가중치: embedding과 공유하는 canonical Q4_0을 그대로 쓴다. 첫 호출 때 `q4m1_from_q4_0`(같은 nibble·scale의 재배열, 재양자화 없음)으로 16384행 슬라이스 16개(약 415 MB)를 만들어 arena에 놓고 `q4m1_attach`로 붙인다. 파일·양자화 명령은 바뀌지 않는다.
+- DSP 한 호출: RMSNorm(`hvx_rmsnorm_rows_f32`) → 활성값 1회 양자화(`hvx_q4m1_prep`, CPU Q4_0 FC 순서) → 슬라이스 16개 GEMV(PR 4385의 `nntr_hvx_fc_q4m1_graph`, 그래프 LM_HEAD op과 같은 경로) → softcap(`hvx_softcap_f32`, 새 커널).
+- 그래프: tied일 때 `output_norm` 층과 `logit_softcapping` 층이 없어지고 `output_of_causallm`(tie_word_embeddings)이 `in_norm`·`epsilon`·`softcap`을 가진다. gamma는 output_norm의 gamma가 있던 파일 위치에서 읽는다(가중치 offset은 그래프 순서로 매기고 공유 가중치는 건너뛰므로 같은 자리). **기존 bin 그대로 로드된다.**
+- config: `"lmhead_engine": "htp"`. 기본은 `cpu`(CPU 경로는 기존 세 층과 같은 연산 순서).
+- 실패 시: arena에 자리가 없으면 `[HTP] lm_head stays on the CPU: ... refused (...)`를 한 번 찍고 CPU로 돈다(성능만 손해). 성공하면 `[HTP] lm_head on the NPU: 262144 x 2816 Q4_0 as 16 Q4M1 slices, ... MiB, placed in ... ms`.
+- NNTR_PPL: 채점 행도 같은 호출을 softcap 없이 쓴다(이전과 같은 uncapped logit). 즉 446토큰 nll이 NPU lm_head로 계산된다.
+- 검증: `softcap_host_check`(262151폭, |err|/cap 2.1e-7), skel 파일 host syntax check, `htp_syntax_check.sh`, `unittest_causallm_models`(Gemma4 golden logits·HF 대조·Q4_0 round trip이 fold한 CPU 경로와 gamma 읽기를 검증).
+- ponytail: arena는 다른 모든 가중치 뒤에 남은 주소 공간에 놓인다. 모자라면 decode graph의 두 번째 session(S2) arena로 옮기는 것이 다음 단계.
+- 이로써 prefill에서 CPU에 남는 연산은 embedding뿐(k/v fp16 캐시 쓰기, staging memcpy, expert 목록 구성은 데이터 이동).
+
 ### 9.2 기기 실행 가이드 (이 브랜치)
 
 ```bash
@@ -351,6 +365,7 @@ config(`g4-npu-512/nntr_config.json`)에 더할 키:
 "attn_proj_engine": "htp",
 "dense_ffn_engine": "htp",
 "moe_engine": "htp",
+"lmhead_engine": "htp",
 "fc_layer_dtype": "QS4CX"
 ```
 
@@ -383,7 +398,7 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 | `layer{i}_sparse_moe` experts | 128 expert 중 8, GeGLU, post_ffn_norm_2 | NPU 1호출 | `mm_u8i4_moe_layer_norm`, flash 선읽기 |
 | `layer{i}_post_ffn_norm` | dense+MoE 합 → post_ffn_norm → 잔차 add → layer_scalar | NPU 1호출 | `rmsnorm_add_f32`(x2); decode는 CPU |
 | KV 공유 층(마지막 N층) | prefill을 건너뜀(skip_prefill) | — | decode 전용; q는 FC+norm+scalar, RoPE는 core |
-| `output_norm`, `lm_head`, softcap | 마지막 행만 | **CPU** | lm_head 370 MB 등록 비용 → 기기 측정 뒤 결정 |
+| `output_of_causallm` (output_norm → lm_head → softcap) | 마지막 행만 | NPU 1호출 | `lmhead_engine: htp`, Q4M1 16 슬라이스(§9.7). arena에 자리 없으면 CPU |
 | ARM staging memcpy | 호출마다 입력/출력 복사 | **CPU** | `[HTP-PROFILE] arm staging` |
 
 
