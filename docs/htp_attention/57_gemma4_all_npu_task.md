@@ -434,3 +434,21 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 - 그림 `figures/fsu/fsu_prefill_prefetch.png`를 이 비교로 바꿨다.
 
 기기 gtest(2026-10-07, 3f29c72d 위 일반 빌드): `unittest_hvx_attn_f16` **28/28 통과**(hd 512 `PrefillWideHeads` 포함). §9.2 측정 순서 1번 게이트 통과.
+
+### 9.9 전부-NPU 설정 첫 실행 (2026-10-07, 사용자 실행): prefill 9.38 s, 더 느려짐
+
+조건: 오프라인 QS4CX FC bin(`nntr_gemma4_qs4cx_fc_arm.bin`), engine 키 5개 모두 htp(attention·lm_head 포함), C=16, 446토큰 prompt(Thyme 초록, §2의 512토큰 prompt와 다름), 생성 1토큰, `NNTR_HTP_PROFILE=1`.
+
+| | 값 | 비고 |
+|---|---|---|
+| prefill | **9378 ms** (47.6 TPS, 446토큰) | §9.8의 6250 ms(512토큰, attention·lm_head CPU)보다 느림. 토큰당 21 ms vs 12 ms |
+| HTP layer calls (M>1 합) | 약 1.71 s | router 291, MoE 643, dense 191, qkv 291, o 138, epilogue 111 ms |
+| ARM staging | 190 ms | |
+| lm_head 배치 | 739 ms, RSS +970 MB | 첫 prefill 안에서 Q4_0→Q4M1 변환·arena 배치. `[HTP] lm_head on the NPU` |
+| prefetch | 3360/3360 제때, 대기 0 | flash는 병목 아님 |
+| peak RSS | 2.77 GB (+arena 1856 MiB) | lm_head 전 1.71 GB |
+| 출력 | `"<i></i>"` 반복 (512 생성 실행에서) | 수치 결함 의심. 원인(lm_head NPU / attention NPU / QS4CX bin) 미분리 |
+
+- 표에 잡히는 NPU 시간 약 1.9 s + lm_head 0.74 s를 빼도 **약 6.7 s가 표 밖**이다. 표는 FC·MoE 모양의 호출만 세고 **attention 호출(`attn_f16_prefill`)은 세지 않는다.** 그래서 NPU attention 시간이 보이지 않는다. 가장 큰 용의자.
+- 64행짜리 FC 호출이 새로 보인다(N=1024 ×5, N=2048 ×50, K=4096 ×25 등, 합계 약 60 ms). 출처 미확인, 작다.
+- 다음: `attention_engine: cpu`로 한 번, `lmhead_engine: cpu`로 한 번 돌려 둘의 몫을 가른다. 그다음 `--profile` 빌드로 `prefill_timeline.py --by-op`.
