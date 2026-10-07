@@ -30,7 +30,8 @@ Gate (issue):
   writing (`--verify-only` reruns it, `--skip-verify` skips). Reads both
   files by mmap with the script's segment table; per expert it decodes the
   input by the external rule, checks it against the input's own colsum
-  (guards the layout assumption on a new file), and compares it with the
+  (catches a different tile order or column placement on a new file; not
+  a reordering of k inside a column), and compares it with the
   real `whUnpack2` (`htp_wh_palette.h`) of the output.
 
 No change under `nntrainer/`, `Applications/` or `test/`.
