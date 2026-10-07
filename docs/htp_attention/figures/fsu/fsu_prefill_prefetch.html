@@ -35,77 +35,72 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 
 <text x="80" y="88" class="t1" text-anchor="start" >Prefill: Expert Prefetch</text>
 <text x="80" y="134" class="t2" text-anchor="start" >Layer N 연산 중 Layer N+2의 expert 128개를 Flash에서 미리 읽어(N+1은 이미 준비됨), Flash I/O를 NPU 연산과 overlap</text>
-<text x="80" y="236" class="h3" text-anchor="start" >Baseline</text>
+<text x="80" y="236" class="h3" text-anchor="start" >Prefetch off</text>
 <text x="80" y="264" class="sm" text-anchor="start" >On-demand read</text>
-<text x="80" y="290" class="sm" text-anchor="start" >Expert cache 150 slot (0.45 GB)</text>
+<text x="80" y="290" class="sm" text-anchor="start" >Expert cache 480 slot (1.45 GB)</text>
 <text x="340" y="250" class="sm" text-anchor="end" style="font-weight:500">NPU</text>
 <text x="340" y="316" class="sm" text-anchor="end" style="font-weight:500">Flash</text>
-<rect x="360.0" y="214" width="191.2994011976048" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
-<text x="455.6497005988024" y="249" class="xs" text-anchor="middle" >idle</text>
-<rect x="360.0" y="280" width="191.2994011976048" height="56" rx="5" fill="var(--read)" />
-<text x="455.6497005988024" y="315" class="lblw" text-anchor="middle" style="font-size:17px">Read L1</text>
-<rect x="555.2994011976048" y="214" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="635.7994011976048" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L1</text>
-<rect x="720.2994011976048" y="214" width="191.2994011976048" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
-<text x="815.9491017964071" y="249" class="xs" text-anchor="middle" >idle</text>
-<rect x="720.2994011976048" y="280" width="191.2994011976048" height="56" rx="5" fill="var(--read)" />
-<text x="815.9491017964071" y="315" class="lblw" text-anchor="middle" style="font-size:17px">Read L2</text>
-<rect x="915.5988023952095" y="214" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="996.0988023952095" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L2</text>
-<rect x="1080.5988023952095" y="214" width="191.2994011976048" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
-<text x="1176.248502994012" y="249" class="xs" text-anchor="middle" >idle</text>
-<rect x="1080.5988023952095" y="280" width="191.2994011976048" height="56" rx="5" fill="var(--read)" />
-<text x="1176.248502994012" y="315" class="lblw" text-anchor="middle" style="font-size:17px">Read L3</text>
-<rect x="1275.8982035928143" y="214" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="1356.3982035928143" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L3</text>
-<rect x="1440.8982035928143" y="214" width="191.2994011976048" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
-<text x="1536.5479041916167" y="249" class="xs" text-anchor="middle" >idle</text>
-<rect x="1440.8982035928143" y="280" width="191.2994011976048" height="56" rx="5" fill="var(--read)" />
-<text x="1536.5479041916167" y="315" class="lblw" text-anchor="middle" style="font-size:17px">Read L4</text>
-<rect x="1636.197604790419" y="214" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="1716.697604790419" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L4</text>
-<text x="80" y="412" class="h3" text-anchor="start" >Expert Prefetch</text>
+<rect x="360.0" y="214" width="80.5376" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
+<text x="400.2688" y="249" class="xs" text-anchor="middle" >idle</text>
+<rect x="360.0" y="280" width="80.5376" height="56" rx="5" fill="var(--read)" />
+<text x="400.2688" y="315" class="lblw" text-anchor="middle" style="font-size:15px">Read L1</text>
+<rect x="444.5376" y="214" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="582.5376" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L1</text>
+<rect x="724.5376" y="214" width="80.5376" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
+<text x="764.8063999999999" y="249" class="xs" text-anchor="middle" >idle</text>
+<rect x="724.5376" y="280" width="80.5376" height="56" rx="5" fill="var(--read)" />
+<text x="764.8063999999999" y="315" class="lblw" text-anchor="middle" style="font-size:15px">Read L2</text>
+<rect x="809.0752" y="214" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="947.0752" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L2</text>
+<rect x="1089.0752" y="214" width="80.5376" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
+<text x="1129.344" y="249" class="xs" text-anchor="middle" >idle</text>
+<rect x="1089.0752" y="280" width="80.5376" height="56" rx="5" fill="var(--read)" />
+<text x="1129.344" y="315" class="lblw" text-anchor="middle" style="font-size:15px">Read L3</text>
+<rect x="1173.6127999999999" y="214" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="1311.6127999999999" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L3</text>
+<rect x="1453.6127999999999" y="214" width="80.5376" height="56" rx="5" fill="none" stroke="#898781" stroke-width="2" stroke-dasharray="7 6"/>
+<text x="1493.8816" y="249" class="xs" text-anchor="middle" >idle</text>
+<rect x="1453.6127999999999" y="280" width="80.5376" height="56" rx="5" fill="var(--read)" />
+<text x="1493.8816" y="315" class="lblw" text-anchor="middle" style="font-size:15px">Read L4</text>
+<rect x="1538.1504" y="214" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="1676.1504" y="249" class="lblw" text-anchor="middle" style="font-size:17px">Compute L4</text>
+<text x="80" y="412" class="h3" text-anchor="start" >Prefetch on</text>
 <text x="80" y="440" class="sm" text-anchor="start" >Read-ahead, LRU</text>
 <text x="80" y="466" class="sm" text-anchor="start" >Expert cache 480 slot (1.45 GB)</text>
 <text x="340" y="426" class="sm" text-anchor="end" style="font-weight:500">NPU</text>
 <text x="340" y="492" class="sm" text-anchor="end" style="font-weight:500">Flash</text>
-<rect x="360" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="440.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L1</text>
-<rect x="368" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="429.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L3</text>
-<rect x="525" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="605.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L2</text>
-<rect x="533" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="594.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L4</text>
-<rect x="690" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="770.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L3</text>
-<rect x="698" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="759.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L5</text>
-<rect x="855" y="390" width="161" height="56" rx="5" fill="var(--npu)" />
-<text x="935.5" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L4</text>
-<rect x="863" y="456" width="123.05" height="56" rx="5" fill="var(--read)" />
-<text x="924.525" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L6</text>
-<path d="M360,540 L1831.197604790419,540" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>
-<text x="1837.197604790419" y="546" class="xs" text-anchor="start" >time</text>
-<path d="M1034,423 L1795.197604790419,423" stroke="#52514e" stroke-width="2" stroke-dasharray="4 5" marker-end="url(#ah)" marker-start="url(#ah)"/>
-<text x="1410.5988023952095" y="410" class="lbl" text-anchor="middle" style="font-weight:700">Prefill latency −54%</text>
-<text x="1410.5988023952095" y="458" class="sm" text-anchor="middle" >10.94 s → 5.01 s</text>
-<text x="360" y="576" class="xs" text-anchor="start" >Gantt는 개념도: 4개 layer만 표시, 두 행의 전체 길이 비는 실측 비(10.94 : 5.01)</text>
-<text x="80" y="640" class="h3" text-anchor="start" >Expert cache 점유 (DRAM, NPU-mapped · 30 layer 공유 · LRU)</text>
-<text x="80" y="694" class="lbl" text-anchor="start" style="font-weight:700">150 slot · 0.45 GB</text>
-<rect x="360" y="660" width="381.0" height="50" rx="4" fill="var(--npu)" />
-<text x="552.0" y="692" class="lblw" text-anchor="middle" style="font-size:17px">Layer N (in use) 128</text>
-<rect x="744.0" y="660" width="63.0" height="50" rx="4" fill="var(--idle)" />
-<text x="824.0" y="692" class="sm" text-anchor="start" >남은 22 slot < 다음 layer 128 → prefetch 불가</text>
-<text x="80" y="762" class="lbl" text-anchor="start" style="font-weight:700">480 slot · 1.45 GB</text>
-<rect x="360" y="728" width="381.0" height="50" rx="4" fill="var(--npu)" />
-<text x="552.0" y="760" class="lblw" text-anchor="middle" style="font-size:17px">Layer N (in use)</text>
-<rect x="744.0" y="728" width="381.0" height="50" rx="4" fill="var(--npu-t)" />
-<text x="936.0" y="760" class="lbl" text-anchor="middle" style="font-size:17px">Layer N+1 (ready)</text>
-<rect x="1128.0" y="728" width="381.0" height="50" rx="4" fill="var(--read)" />
-<text x="1320.0" y="760" class="lblw" text-anchor="middle" style="font-size:17px">Layer N+2 (prefetching)</text>
-<rect x="1512.0" y="728" width="285.0" height="50" rx="4" fill="var(--idle)" />
-<text x="1656.0" y="760" class="sm" text-anchor="middle" style="font-size:17px">free</text>
+<rect x="360" y="390" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="498.0" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L1</text>
+<rect x="368" y="456" width="211.6" height="56" rx="5" fill="var(--read)" />
+<text x="473.8" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L3</text>
+<rect x="640" y="390" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="778.0" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L2</text>
+<rect x="648" y="456" width="211.6" height="56" rx="5" fill="var(--read)" />
+<text x="753.8" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L4</text>
+<rect x="920" y="390" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="1058.0" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L3</text>
+<rect x="928" y="456" width="211.6" height="56" rx="5" fill="var(--read)" />
+<text x="1033.8" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L5</text>
+<rect x="1200" y="390" width="276" height="56" rx="5" fill="var(--npu)" />
+<text x="1338.0" y="425" class="lblw" text-anchor="middle" style="font-size:17px">Compute L4</text>
+<rect x="1208" y="456" width="211.6" height="56" rx="5" fill="var(--read)" />
+<text x="1313.8" y="491" class="lblw" text-anchor="middle" style="font-size:15px">Prefetch L6</text>
+<path d="M360,540 L1848.1504,540" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>
+<text x="1854.1504" y="546" class="xs" text-anchor="start" >time</text>
+<path d="M1494,423 L1812.1504,423" stroke="#52514e" stroke-width="2" stroke-dasharray="4 5" marker-end="url(#ah)" marker-start="url(#ah)"/>
+<text x="1649.0752" y="410" class="lbl" text-anchor="middle" style="font-weight:700">Prefill latency −23%</text>
+<text x="1649.0752" y="458" class="sm" text-anchor="middle" >8.14 s → 6.25 s</text>
+<text x="360" y="576" class="xs" text-anchor="start" >Gantt는 개념도: 4개 layer만 표시, 두 행의 전체 길이 비는 실측 비(8.14 : 6.25)</text>
+<text x="80" y="640" class="h3" text-anchor="start" >Expert cache 480 slot 점유, prefetch on (DRAM, NPU-mapped · 30 layer 공유 · LRU)</text>
+<text x="80" y="718" class="lbl" text-anchor="start" style="font-weight:700">480 slot · on</text>
+<rect x="360" y="684" width="381.0" height="50" rx="4" fill="var(--npu)" />
+<text x="552.0" y="716" class="lblw" text-anchor="middle" style="font-size:17px">Layer N (in use)</text>
+<rect x="744.0" y="684" width="381.0" height="50" rx="4" fill="var(--npu-t)" />
+<text x="936.0" y="716" class="lbl" text-anchor="middle" style="font-size:17px">Layer N+1 (ready)</text>
+<rect x="1128.0" y="684" width="381.0" height="50" rx="4" fill="var(--read)" />
+<text x="1320.0" y="716" class="lblw" text-anchor="middle" style="font-size:17px">Layer N+2 (prefetching)</text>
+<rect x="1512.0" y="684" width="285.0" height="50" rx="4" fill="var(--idle)" />
+<text x="1656.0" y="716" class="sm" text-anchor="middle" style="font-size:17px">free</text>
 <rect x="80" y="816" width="1760" height="52" rx="6" fill="var(--idle)" />
 <text x="100" y="850" class="lbl" text-anchor="start" style="font-weight:700">구성</text>
 <text x="490" y="850" class="lbl" text-anchor="start" style="font-weight:700">Prefill latency</text>
@@ -113,17 +108,18 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 <text x="1100" y="850" class="lbl" text-anchor="start" style="font-weight:700">동기 expert read</text>
 <text x="1440" y="850" class="lbl" text-anchor="start" style="font-weight:700">Prefetch expert</text>
 <path d="M80,918 L1840,918" stroke="#e1e0d9" stroke-width="2"/>
-<text x="100" y="902" class="lbl" text-anchor="start" >Baseline · cache 150 slot</text>
-<text x="490" y="902" class="lbl" text-anchor="start" >10.94 s</text>
-<text x="810" y="902" class="lbl" text-anchor="start" >7.10 s</text>
-<text x="1100" y="902" class="lbl" text-anchor="start" >2,893</text>
-<text x="1440" y="902" class="lbl" text-anchor="start" >—</text>
+<text x="100" y="902" class="lbl" text-anchor="start" >Prefetch off · cache 480 slot</text>
+<text x="490" y="902" class="lbl" text-anchor="start" >8.14 s</text>
+<text x="810" y="902" class="lbl" text-anchor="start" >2.22 s</text>
+<text x="1100" y="902" class="lbl" text-anchor="start" >1,024</text>
+<text x="1440" y="902" class="lbl" text-anchor="start" >0</text>
 <path d="M80,968 L1840,968" stroke="#e1e0d9" stroke-width="2"/>
-<text x="100" y="952" class="lbl" text-anchor="start" style="font-weight:700">Expert Prefetch · cache 480 slot</text>
-<text x="490" y="952" class="lbl" text-anchor="start" style="font-weight:700">5.01 s</text>
-<text x="810" y="952" class="lbl" text-anchor="start" style="font-weight:700">0.01 s</text>
+<text x="100" y="952" class="lbl" text-anchor="start" style="font-weight:700">Prefetch on · cache 480 slot</text>
+<text x="490" y="952" class="lbl" text-anchor="start" style="font-weight:700">6.25 s</text>
+<text x="810" y="952" class="lbl" text-anchor="start" style="font-weight:700">0 ms</text>
 <text x="1100" y="952" class="lbl" text-anchor="start" style="font-weight:700">0</text>
 <text x="1440" y="952" class="lbl" text-anchor="start" style="font-weight:700">3,360</text>
-<text x="80" y="1010" class="sm" text-anchor="start" >Lower bound (산술): prefill 1회 Flash read ≈10 GB ÷ 3.0 GB/s ≈ 3.3 s. NPU 연산이 빨라질수록 이 한계가 드러남.</text>
-<text x="80" y="1052" class="xs" text-anchor="start" >측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, 446-token prompt, MoE만 NPU 구성, 2026-10-02.</text>
+<text x="80" y="1002" class="sm" text-anchor="start" >Prefetch는 뒤 layer의 router 결과를 미리 알 수 없어 그 layer의 expert 128개를 모두 읽는다(3,360개 ≈ 10.1 GB). off는 router가 고른 expert 중 cache에 없는 것만 읽는다(1,024개).</text>
+<text x="80" y="1036" class="sm" text-anchor="start" >I/O stall: off는 동기 read 시간, on은 prefetch를 기다린 시간(exposed wait).</text>
+<text x="80" y="1062" class="xs" text-anchor="start" >측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, 512-token prompt, MoE·FC·dense FFN NPU 구성(attention·lm_head CPU), NNTR_MOE_PREFETCH=0 / 기본값, 2026-10-07.</text>
 </svg></body></html>

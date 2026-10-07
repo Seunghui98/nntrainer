@@ -420,3 +420,15 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 - 텍스트: 원문을 요약 없이 복사. base 체크포인트의 알려진 동작(55 §10.x)이라 회귀가 아니다.
 - prefill HTP 호출(decode 행 제외)은 약 1.77 s. router 행 `K=2816 N=128`이 10.3 ms/호출 × 30 = 310 ms로 §3의 CPU router 191 ms보다 느리다.
 - prefill이 기준보다 2.3 s 느린 원인은 아직 모른다. 같은 조건(HTP_PROFILE 없이) 재측정과 `--profile` 빌드의 `prefill_timeline.py` 분해가 먼저다.
+
+같은 bin·config로 이어서 잰 것(`cool` 사이, C=16):
+
+| | prefill | prefill 동기 expert read | prefetch |
+|---|---|---|---|
+| `NNTR_HTP_PROFILE` 없음 | 6330 ms | — | — |
+| `NNTR_MOE_PREFETCH=0` | 8137 ms | 1,024 (2,220 ms, 2.17 ms/miss) | 0 |
+| 기본(prefetch on) | 6250 ms | 0 | 3,360, 대기 0 ms |
+
+- 프로파일 없이도 6.3 s라서 §2 대비 느려진 것은 측정 조건이 아니라 실제 회귀다. 원인 미확인.
+- prefetch는 뒤 layer의 routing을 모르므로 layer의 128개를 모두 읽는다(3,360). off는 routed miss만 읽는다(1,024, layer당 약 34). 그래도 on이 1.9 s(23%) 빠르다.
+- 그림 `figures/fsu/fsu_prefill_prefetch.png`를 이 비교로 바꿨다.
