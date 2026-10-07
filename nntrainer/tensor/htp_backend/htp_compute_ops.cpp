@@ -4699,6 +4699,13 @@ private:
     return true;
   }
 
+  /** [#234 P4] compute_ops.h: the E2E list's Q4_0 weights are still to
+   *  bind, so the sidecar can serve its FC / DENSE_FFN ops (bindQ4m1). */
+  bool has_decode_graph_q4_0() override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    return e2e_ && !q4_pending_.empty() && !q4m1_bound_;
+  }
+
   /** [#132 Part B E3, #211] Places the Q4M1 set on S1's own new arena
    *  chunks: at load after the MoE arena (the model calls
    *  finish_decode_graph_q4_0 after repack_weight), else at graph init.
