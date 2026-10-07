@@ -432,3 +432,5 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 - 프로파일 없이도 6.3 s라서 §2 대비 느려진 것은 측정 조건이 아니라 실제 회귀다. 원인 미확인.
 - prefetch는 뒤 layer의 routing을 모르므로 layer의 128개를 모두 읽는다(3,360). off는 routed miss만 읽는다(1,024, layer당 약 34). 그래도 on이 1.9 s(23%) 빠르다.
 - 그림 `figures/fsu/fsu_prefill_prefetch.png`를 이 비교로 바꿨다.
+
+기기 gtest(2026-10-07, 3f29c72d 위 일반 빌드): `unittest_hvx_attn_f16` **28/28 통과**(hd 512 `PrefillWideHeads` 포함). §9.2 측정 순서 1번 게이트 통과.
