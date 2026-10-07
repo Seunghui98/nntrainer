@@ -198,6 +198,17 @@ built" notes are in revision 1 and the PR bodies).
   `--fc_wh_sidecar` byte-identical in its main `.bin` to the run without
   the flag, the sidecar's index naming 7 × layers FC images (`E2E quant
   fcwh-gemma64 main=same images=<n> ok`). Rung 2 (conv block + `conv_wLen`).
+  **As built (branch `htp/234-p3-fcwh-prefill`):** only `db2c27a11`
+  (`quantize_stream.cpp`, `htp_wh_layout.h`, where `whUnpack` was already
+  in from #249) and `7b622617a` (`htp_e2e_test.cpp`, beside the Gemma model
+  switch) conflicted; `75f6f007d`, `a3d966164` and `366c06c57` applied
+  without one, and the `run_inproc_e2e.sh` hunks merged after the keys
+  block by themselves. "7 × layers" is 7 × layers minus the
+  `attention_k_eq_v` full-attention layers (no `_wv`): gemma64 has
+  `images=20` (2 sliding × 7 + 1 full × 6), and the gate builds the list
+  of expected names from `config.json`, so the 26B's own count comes from
+  its own config. `*Lfm2Moe*` is now 7 / 7 and `unittest_causallm_models`
+  115 / 115 (with `FcWhSidecarMatchesWhQuantize`).
 * **P4. One-PD decode FC / DENSE_FFN on the sidecar (#225 PR 2 = #233)** —
   `b73e01b1a` (kernel + `fc_wh_det.h` + host check; `run_host_checks.sh`
   hunk re-placed after the 2-bit cells), `7efd22adf` rebased (`bindQ4m1`

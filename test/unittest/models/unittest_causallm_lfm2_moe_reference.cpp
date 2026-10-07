@@ -29,9 +29,15 @@
 
 #include <gtest/gtest.h>
 
+#include <htp_wh_layout.h>
 #include <lfm2_moe_causallm.h>
 
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -78,6 +84,92 @@ TEST(Lfm2MoeDifferentialTest, Q40MatchesHFReference) {
  */
 TEST(Lfm2MoeDifferentialTest, StreamQuantizeMatchesInMemory) {
   causallm_test::runStreamQuantizeParityChecks(lfm2MoeModel());
+}
+
+/** @brief A whole file's bytes */
+std::vector<char> readAll(const std::filesystem::path &p) {
+  std::ifstream f(p, std::ios::binary);
+  return std::vector<char>(std::istreambuf_iterator<char>(f),
+                           std::istreambuf_iterator<char>());
+}
+
+/**
+ * @brief [#225] nntr_quantize_stream --fc_wh_sidecar leaves the main file
+ *        as a run without it writes it, and each sidecar image is the
+ *        bytes a --fc_dtype QS4CX_WH run writes for that FC
+ *
+ * The QS4CX_WH run's file is the Q4_0 run's with every FC's Q4_0 bytes
+ * replaced by its WH image, so one walk over the index checks the images,
+ * their keys, the q4_off each entry records and everything between them.
+ */
+TEST(Lfm2MoeDifferentialTest, FcWhSidecarMatchesWhQuantize) {
+  namespace fs = std::filesystem;
+  const fs::path fix = causallm_test::findFixtureDir("lfm2_moe_tiny");
+  const char *bin = std::getenv("NNTR_QUANTIZE_STREAM_BIN");
+  if (!fs::exists(fix / "nntr_lfm2_moe_tiny_fp32.bin"))
+    GTEST_SKIP() << "Fixtures absent - run the generate_*_reference.py script";
+  if (bin == nullptr || std::string(bin).empty())
+    GTEST_SKIP() << "NNTR_QUANTIZE_STREAM_BIN not set - sidecar test skipped";
+
+  const fs::path base = fs::temp_directory_path() / "nntrainer_fcwh_sidecar";
+  fs::remove_all(base);
+  auto quantize = [&](const char *dir, const std::string &args) {
+    const std::string cmd =
+      std::string(bin) + " " + fix.string() + " -o " + (base / dir).string() +
+      " --moe_dtype QS4CX_WH " + args + " > " +
+      (base / (std::string(dir) + ".log")).string() + " 2>&1";
+    fs::create_directories(base / dir);
+    return std::system(cmd.c_str()) == 0;
+  };
+  ASSERT_TRUE(quantize("side", "--fc_dtype Q4_0 --fc_wh_sidecar"));
+  ASSERT_TRUE(quantize("plain", "--fc_dtype Q4_0"));
+  ASSERT_TRUE(quantize("wh", "--fc_dtype QS4CX_WH"));
+
+  std::ifstream cf(base / "side" / "nntr_config.json");
+  const auto cfg = causallm::json::parse(cf);
+  ASSERT_EQ(cfg.value("fc_wh_format", ""), nntrainer::FCWH_FORMAT);
+  const std::string main_bin = cfg["model_file_name"].get<std::string>();
+  const auto q4 = readAll(base / "side" / main_bin);
+  EXPECT_EQ(q4, readAll(base / "plain" / main_bin));
+  std::ifstream wcf(base / "wh" / "nntr_config.json");
+  const auto wh =
+    readAll(base / "wh" /
+            causallm::json::parse(wcf)["model_file_name"].get<std::string>());
+  const auto side =
+    readAll(base / "side" / cfg["fc_wh_file_name"].get<std::string>());
+
+  ASSERT_GE(side.size(), 16u);
+  ASSERT_EQ(std::memcmp(side.data(), nntrainer::FCWH_MAGIC, 8), 0);
+  uint32_t vc[2];
+  std::memcpy(vc, side.data() + 8, sizeof(vc));
+  EXPECT_EQ(vc[0], nntrainer::FCWH_VERSION);
+  // conv in/out x 2 layers, q/k/v/o x 1, the dense up/gate/down x 1
+  ASSERT_EQ(vc[1], 11u);
+  std::vector<nntrainer::FcWhEntry> e(vc[1]);
+  std::memcpy(e.data(), side.data() + 16, e.size() * sizeof(e[0]));
+
+  size_t q = 0, w = 0;
+  for (const auto &x : e) {
+    const size_t q4_len = static_cast<size_t>(x.N) * (x.K / 32) * 18;
+    ASSERT_LE(x.q4_off + q4_len, q4.size()) << x.name;
+    ASSERT_LE(x.off + x.bytes, side.size()) << x.name;
+    const size_t gap = x.q4_off - q;
+    ASSERT_LE(w + gap + x.bytes, wh.size()) << x.name;
+    EXPECT_TRUE(
+      std::equal(q4.begin() + q, q4.begin() + x.q4_off, wh.begin() + w))
+      << "before " << x.name;
+    w += gap;
+    EXPECT_TRUE(std::equal(side.begin() + x.off, side.begin() + x.off + x.bytes,
+                           wh.begin() + w))
+      << x.name;
+    EXPECT_EQ(x.key, nntrainer::fcWhKey(q4.data() + x.q4_off, q4_len))
+      << x.name;
+    q = x.q4_off + q4_len;
+    w += x.bytes;
+  }
+  EXPECT_EQ(q4.size() - q, wh.size() - w);
+  EXPECT_TRUE(std::equal(q4.begin() + q, q4.end(), wh.begin() + w));
+  fs::remove_all(base);
 }
 
 } // namespace

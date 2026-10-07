@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 
@@ -23,6 +24,7 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
+#include <htp_wh_layout.h>
 #include <lfm2_moe_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
@@ -148,6 +150,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   ATTENTION_KV_DTYPE = nntr_cfg.value("attention_kv_dtype", std::string());
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
+  FC_WH_FILE_NAME = nntr_cfg.value("fc_wh_file_name", std::string());
+  FC_WH_FORMAT = nntr_cfg.value("fc_wh_format", std::string());
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -303,6 +307,7 @@ void Transformer::load_weight(const std::string &weight_path) {
       "initialize() before load_weight().");
   }
 
+  WEIGHT_DIR = std::filesystem::path(weight_path).parent_path().string();
   try {
     model->load(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {
@@ -578,6 +583,29 @@ void Transformer::repack_weight() {
     };
   try {
     model->forEachLayer(fn, nullptr);
+    // [#225] The FC WH sidecar, handed to every backend that registers a
+    // pending FC before it registers any. A CPU-engine layer's ops are
+    // pending too and answer false, so a model whose keys route no FC to
+    // an accelerator (the CPU-only and no-keys configs) never opens it.
+    if (!FC_WH_FILE_NAME.empty()) {
+      NNTR_THROW_IF(FC_WH_FORMAT != nntrainer::FCWH_FORMAT, std::runtime_error)
+        << "fc_wh_format \"" << FC_WH_FORMAT << "\" in nntr_config.json, this "
+        << "build reads \"" << nntrainer::FCWH_FORMAT
+        << "\": re-run nntr_quantize_stream --fc_wh_sidecar";
+      const std::filesystem::path p(FC_WH_FILE_NAME);
+      const std::string path =
+        p.is_absolute() ? p.string()
+                        : (std::filesystem::path(WEIGHT_DIR) / p).string();
+      std::set<nntrainer::ComputeOps *> backends;
+      for (const auto &f : fc_pending)
+        backends.insert(f.ops);
+      for (const auto &d : dense_pending)
+        backends.insert(d.ops);
+      for (const auto &c : conv_pending)
+        backends.insert(c.ops);
+      for (auto *b : backends)
+        b->set_fc_wh_file(path.c_str());
+    }
     // The MoE warm-up (doc 47 section 20.1, lever 6): one call through the
     // layer kernel at load, now after the walk (see PendingMoeWarm).
     if (moe_warm.ops != nullptr) {
