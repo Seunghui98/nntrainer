@@ -6,7 +6,8 @@ const path = require('path');
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1920, height: 1080 },
                                        deviceScaleFactor: 2 });
-  for (const n of ['fsu_1_placement', 'fsu_2_prefill_prefetch', 'fsu_3_decode_cache']) {
+  for (const n of ['fsu_1_placement', 'fsu_2_prefill_prefetch', 'fsu_3_decode_cache',
+                  'fsu_a_overview', 'fsu_b_prefill_before_after', 'fsu_c_decode_hits']) {
     await page.goto('file://' + path.join(__dirname, n + '.html'));
     await page.evaluate(() => document.fonts.ready);
     const ok = await page.evaluate(() => document.fonts.check('700 20px "Noto Sans KR"'));

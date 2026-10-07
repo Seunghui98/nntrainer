@@ -1,0 +1,117 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>decode 작업대 히트</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="decode 작업대 히트">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="92" class="t1" text-anchor="start" >decode: 작업대에 있으면 바로 계산, 없으면 가져올 때까지 기다린다</text>
+<text x="80" y="140" class="t2" text-anchor="start" >토큰마다 라우터가 128개 중 8개를 고른다. 무엇을 고를지 미리 모르니, 최근에 쓴 것을 작업대에 남겨 둔다</text>
+<text x="80" y="214" class="h3" text-anchor="start" >토큰 1</text>
+<rect x="80" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="116" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="152" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="188" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="224" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="260" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="296" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="332" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<text x="80" y="292" class="sm" text-anchor="start" >8개 모두 작업대에 있음</text>
+<rect x="80" y="312" width="296" height="70" rx="8" fill="var(--npu)" />
+<text x="228.0" y="354.0" class="lblw" text-anchor="middle" >MoE 계산</text>
+<text x="420" y="214" class="h3" text-anchor="start" >토큰 2</text>
+<rect x="420" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="456" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="492" y="232" width="30" height="30" rx="4" fill="var(--read)" />
+<rect x="528" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="564" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="600" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="636" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="672" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<text x="420" y="292" class="sm" text-anchor="start" >8개 중 7개 작업대에 있음</text>
+<rect x="420" y="312" width="116" height="70" rx="8" fill="var(--crit)" />
+<text x="478.0" y="343.0" class="lblw" text-anchor="middle" >⚠ 대기</text>
+<text x="478.0" y="369.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">1개 읽기</text>
+<rect x="540" y="312" width="296" height="70" rx="8" fill="var(--npu)" />
+<text x="688.0" y="354.0" class="lblw" text-anchor="middle" >MoE 계산</text>
+<text x="880" y="214" class="h3" text-anchor="start" >토큰 3</text>
+<rect x="880" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="916" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="952" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="988" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1024" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1060" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1096" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1132" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<text x="880" y="292" class="sm" text-anchor="start" >8개 모두 작업대에 있음</text>
+<rect x="880" y="312" width="296" height="70" rx="8" fill="var(--npu)" />
+<text x="1028.0" y="354.0" class="lblw" text-anchor="middle" >MoE 계산</text>
+<text x="1220" y="214" class="h3" text-anchor="start" >토큰 4</text>
+<rect x="1220" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1256" y="232" width="30" height="30" rx="4" fill="var(--read)" />
+<rect x="1292" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1328" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1364" y="232" width="30" height="30" rx="4" fill="var(--read)" />
+<rect x="1400" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1436" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<rect x="1472" y="232" width="30" height="30" rx="4" fill="var(--npu)" />
+<text x="1220" y="292" class="sm" text-anchor="start" >8개 중 6개 작업대에 있음</text>
+<rect x="1220" y="312" width="236" height="70" rx="8" fill="var(--crit)" />
+<text x="1338.0" y="343.0" class="lblw" text-anchor="middle" >⚠ 대기</text>
+<text x="1338.0" y="369.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">2개 읽기</text>
+<rect x="1460" y="312" width="296" height="70" rx="8" fill="var(--npu)" />
+<text x="1608.0" y="354.0" class="lblw" text-anchor="middle" >MoE 계산</text>
+<path d="M80,412 L1830,412" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>
+<text x="1836" y="418" class="sm" text-anchor="start" >시간</text>
+<rect x="80" y="442" width="22" height="22" rx="4" fill="var(--npu)" />
+<text x="112" y="460" class="sm" text-anchor="start" >작업대에 있음 (히트)</text>
+<rect x="380" y="442" width="22" height="22" rx="4" fill="var(--read)" />
+<text x="412" y="460" class="sm" text-anchor="start" >없음 (미스)</text>
+<text x="80" y="540" class="h3" text-anchor="start" style="font-size:26px">작업대에 있을 확률이 높을수록 빠르다</text>
+<text x="80" y="572" class="sm" text-anchor="start" >LFM2-8B-A1B 실측 (층당 expert 32개), decode 속도</text>
+<text x="80" y="640" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">칸 8개/층</text>
+<text x="80" y="668" class="sm" text-anchor="start" >히트 57%</text>
+<rect x="420" y="612" width="820.4166666666666" height="52" rx="4" fill="var(--npu)" />
+<text x="1254.4166666666665" y="648" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">17.9 토큰/s</text>
+<text x="80" y="732" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">칸 16개/층</text>
+<text x="80" y="760" class="sm" text-anchor="start" >히트 85%</text>
+<rect x="420" y="704" width="994.5833333333334" height="52" rx="4" fill="var(--npu)" />
+<text x="1428.5833333333335" y="740" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">21.7 토큰/s</text>
+<text x="80" y="824" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">전부 올림</text>
+<text x="80" y="852" class="sm" text-anchor="start" >히트 100%</text>
+<rect x="420" y="796" width="1100.0" height="52" rx="4" fill="var(--npu)" />
+<text x="1534.0" y="832" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">24.0 토큰/s</text>
+<path d="M420,598 L420,880" stroke="#c3c2b7" stroke-width="2"/>
+<rect x="80" y="900" width="1760" height="100" rx="12" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<text x="110" y="942" class="lbl" text-anchor="start" >Gemma-4 26B-A4B는 층당 expert가 128개라 같은 칸 16개로는 히트율이 더 낮을 수 있다 — 기기 미측정.</text>
+<text x="110" y="976" class="sm" text-anchor="start" >작업대 정리: 쓴 8개와 라우터가 다음으로 꼽은 5개를 "최근"으로 올리고, 가장 오래 안 쓴 칸부터 비운다(LRU).</text>
+<text x="80" y="1050" class="xs" text-anchor="start" >출처: 문서 53 §3(LFM2, 2026-09-29 실측). 토큰별 히트/미스는 예시.</text>
+</svg></body></html>

@@ -30,9 +30,9 @@ svg {{ display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }}
 </style></head><body>
 <svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="{title}">
 <defs>
- <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
   <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
- <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
   <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
 </defs>
 <rect width="1920" height="1080" fill="var(--surface)"/>
@@ -258,7 +258,170 @@ def fig3():
     return "\n".join(o)
 
 
+
+# ------------------------------------------------- simple set (for slides)
+def chip(x, y, w, h, fill, label, sub=None, txt="lblw"):
+    o = [rect(x, y, w, h, fill, 8),
+         text(x + w / 2, y + (h / 2 + 7 if sub is None else h / 2 - 4), label,
+              txt, "middle")]
+    if sub:
+        o.append(text(x + w / 2, y + h / 2 + 22, sub, txt, "middle",
+                      'style="font-weight:400;font-size:16px"'))
+    return "\n".join(o)
+
+
+def figA():
+    o = [HEAD.format(title="expert 스트리밍 한눈에")]
+    o.append(text(80, 92, "11.6 GB짜리 expert를 1.4 GB 작업대로 돌린다", "t1"))
+    o.append(text(80, 140, "전부 메모리에 올릴 수 없으니 창고(flash)에 두고, 지금·곧 쓸 것만 작업대(DRAM)에 올려 NPU가 계산한다", "t2"))
+    # to-scale size bars
+    W = 1760
+    o.append(text(80, 214, "expert 전체 3,840개 = 11.6 GB (flash)", "h3"))
+    for l in range(30):
+        o.append(rect(80 + l * W / 30, 230, W / 30 - 3, 54, "var(--read)", 3, None, 'opacity="0.75"'))
+    o.append(text(80, 318, "작업대에 올라가는 양 = 480칸 ≈ 1.4 GB (12%)", "h3"))
+    o.append(rect(80, 334, W * 1.4 / 11.6, 54, "var(--npu)", 4))
+    o.append(text(80 + W * 1.4 / 11.6 + 16, 370, "← 나머지 88%는 필요할 때 창고에서 가져온다", "lbl"))
+    # warehouse -> workbench -> worker
+    boxes = [(80, "창고", "Flash (UFS)", ["모든 expert가 있다", "크지만 느리다: 3.0 GB/s"], "var(--read-t)", "var(--read)"),
+             (700, "작업대", "DRAM 칸 480개", ["지금 쓰는 것 + 곧 쓸 것", "빈 칸은 다 쓴 것부터 비운다"], "#e6eef9", "var(--npu)"),
+             (1320, "작업자", "NPU (Hexagon)", ["작업대 위의 expert만", "가지고 계산한다"], "var(--npu-t)", "var(--npu)")]
+    for x, h, sub, lines, bg, ac in boxes:
+        o.append(rect(x, 440, 520, 250, bg, 14))
+        o.append(text(x + 32, 500, h, "big", extra='style="font-size:40px"'))
+        o.append(text(x + 32 + 40 * len(h) + 18, 498, sub, "lane2", extra='style="font-size:20px"'))
+        for i, ln in enumerate(lines):
+            o.append(text(x + 32, 560 + 40 * i, ln, "lbl", extra='style="font-size:24px"'))
+    o.append('<path d="M604,565 L692,565" stroke="#eb6834" stroke-width="5" marker-end="url(#ahr)"/>')
+    o.append(text(650, 540, "가져오기", "sm", "middle"))
+    o.append('<path d="M1224,565 L1312,565" stroke="#52514e" stroke-width="5" marker-end="url(#ah)"/>')
+    o.append(text(1270, 540, "계산", "sm", "middle"))
+    # two situations
+    o.append(rect(80, 740, 860, 250, "#fff", 14, None, 'style="stroke:var(--ring);stroke-width:2"'))
+    o.append(rect(80, 740, 10, 250, "var(--npu)", 4))
+    o.append(text(118, 792, "prefill (프롬프트 읽기)", "h3", extra='style="font-size:26px"'))
+    o.append(text(118, 842, "무엇이 필요한지 미리 안다 (층마다 거의 전부)", "lbl", extra='style="font-size:22px"'))
+    o.append(text(118, 882, "→ 계산하는 동안 다음 층 것을 미리 가져온다", "lbl", extra='style="font-size:22px;font-weight:700"'))
+    o.append(text(118, 930, "기다림 7.10 s → 0.01 s (실측, 칸 5 → 16개/층)", "sm"))
+    o.append(rect(980, 740, 860, 250, "#fff", 14, None, 'style="stroke:var(--ring);stroke-width:2"'))
+    o.append(rect(980, 740, 10, 250, "var(--read)", 4))
+    o.append(text(1018, 792, "decode (한 토큰씩 생성)", "h3", extra='style="font-size:26px"'))
+    o.append(text(1018, 842, "라우터가 고르기 전에는 모른다 (128개 중 8개)", "lbl", extra='style="font-size:22px"'))
+    o.append(text(1018, 882, "→ 쓴 것을 작업대에 남겨 두고, 없으면 그때 가져온다", "lbl", extra='style="font-size:22px;font-weight:700"'))
+    o.append(text(1018, 930, "작업대에 있을 확률(히트율)이 속도를 정한다", "sm"))
+    o.append(text(80, 1040, "nntrainer의 일반 FSU(층 단위 swap)가 아니라 MoE 층이 expert 단위로 관리하는 경로. "
+                            "크기는 문서 55 §3.2 산술, 기다림은 55 §10.11 실측(MoE만 NPU 구성, 2026-10-02).", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
+
+def figB():
+    o = [HEAD.format(title="prefill 선읽기 전후")]
+    o.append(text(80, 92, "prefill: 계산하는 동안 다음 층을 미리 가져오면 기다림이 사라진다", "t1"))
+    o.append(text(80, 140, "같은 프롬프트(446토큰), 같은 모델. 달라진 것은 작업대 크기(층당 칸 수) 하나다", "t2"))
+    x0 = 330
+    w = 170                          # one layer's compute
+    wait = (10.94 / 5.01 - 1) * w    # the two totals keep the measured ratio
+    # panel 1: no read-ahead
+    o.append(text(80, 222, "칸 5개/층", "lane", extra='style="font-size:26px"'))
+    o.append(text(80, 256, "prefill 10.94 s", "h3", extra='fill="#d03b3b"'))
+    x = x0
+    for i in range(4):
+        o.append(chip(x, 200, wait - 4, 72, "var(--crit)", "⚠ 기다림", "flash에서 읽기"))
+        x += wait
+        o.append(chip(x, 200, w - 4, 72, "var(--npu)", f"층 {i + 1} 계산"))
+        x += w
+    o.append(text(x0, 300, "읽기와 계산이 번갈아: 층마다 expert를 다 읽을 때까지 NPU가 논다", "sm"))
+    # panel 2: read-ahead
+    o.append(text(80, 392, "칸 16개/층", "lane", extra='style="font-size:26px"'))
+    o.append(text(80, 426, "prefill 5.01 s", "h3", extra='fill="#2a78d6"'))
+    for i in range(4):
+        o.append(chip(x0 + i * w + 8, 346, w - 20, 64, "var(--read)", f"층 {i + 2}", "가져오기"))
+        o.append(chip(x0 + i * w, 418, w - 4, 72, "var(--npu)", f"층 {i + 1} 계산"))
+    o.append(text(x0 + 4 * w + 20, 384, "← flash: 다음 층 것", "sm"))
+    o.append(text(x0 + 4 * w + 20, 462, "← NPU: 쉬지 않고 계산", "sm"))
+    o.append(text(x0, 530, "기다림 칸이 없다: 층 N을 계산하는 동안 층 N+1이 이미 작업대에 올라온다", "lbl",
+                  extra='style="font-weight:700"'))
+    # why: workbench size
+    o.append(text(80, 610, "왜 작업대 크기가 결정적인가", "h3", extra='style="font-size:26px"'))
+    def bench(y, total, segs, label, note):
+        sc = 1500 / 480
+        o.append(text(80, y + 34, label, "lbl", extra='style="font-weight:700"'))
+        x = 330
+        for n, f, lb in segs:
+            o.append(rect(x, y, n * sc - 3, 50, f, 4))
+            if lb:
+                o.append(text(x + n * sc / 2, y + 32, lb, "lblw" if f != "var(--idle)" else "sm", "middle"))
+            x += n * sc
+        o.append(text(330 + total * sc + 14, y + 32, note, "sm"))
+    bench(630, 150, [(128, "var(--npu)", "지금 층 128"), (22, "var(--idle)", "")],
+          "칸 5개/층 = 150칸", "남는 22칸 → 다음 층(128)이 안 들어간다")
+    bench(710, 480, [(128, "var(--npu)", "지금 층 128"), (128, "var(--npu-t)", ""),
+                     (128, "var(--read)", "그다음 층 가져오는 중"), (96, "var(--idle)", "")],
+          "칸 16개/층 = 480칸", "")
+    o.append(text(330 + 128 * 1500 / 480 + 200, 742, "다음 층 128 (준비됨)", "lbl", "middle"))
+    # cards
+    o.append(card(80, 800, 560, 200, "var(--crit)", "칸 5개/층", "기다림 7.10 s",
+                  ["flash에서 기다리며 읽은 expert 2,893개"], "⚠ "))
+    o.append(card(680, 800, 560, 200, "var(--npu)", "칸 16개/층 (기본)", "기다림 0.01 s",
+                  ["미리 가져온 expert 3,360개"]))
+    o.append(card(1280, 800, 560, 200, "var(--muted)", "그래도 남는 바닥", "≈ 3.3 s",
+                  ["prefill마다 약 10 GB를 3.0 GB/s로 읽는다 (산술)"]))
+    o.append(text(80, 1050, "실측: Galaxy S25 Ultra, MoE만 NPU 구성, 2026-10-02 (문서 55 §10.11). 막대는 개념도이고 "
+                            "두 줄의 길이 비만 실측(10.94 : 5.01)에 맞췄다. 모든 연산 NPU 구성은 기기 미측정.", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
+
+def figC():
+    o = [HEAD.format(title="decode 작업대 히트")]
+    o.append(text(80, 92, "decode: 작업대에 있으면 바로 계산, 없으면 가져올 때까지 기다린다", "t1"))
+    o.append(text(80, 140, "토큰마다 라우터가 128개 중 8개를 고른다. 무엇을 고를지 미리 모르니, 최근에 쓴 것을 작업대에 남겨 둔다", "t2"))
+    toks = [("토큰 1", [1, 1, 1, 1, 1, 1, 1, 1]), ("토큰 2", [1, 1, 0, 1, 1, 1, 1, 1]),
+            ("토큰 3", [1, 1, 1, 1, 1, 1, 1, 1]), ("토큰 4", [1, 0, 1, 1, 0, 1, 1, 1])]
+    x = 80
+    for name, hits in toks:
+        miss = hits.count(0)
+        wait = 120 * miss
+        width = 300 + wait
+        o.append(text(x, 214, name, "h3"))
+        for i, h in enumerate(hits):
+            o.append(rect(x + i * 36, 232, 30, 30, "var(--npu)" if h else "var(--read)", 4))
+        o.append(text(x, 292, f"8개 중 {8 - miss}개 작업대에 있음" if miss else "8개 모두 작업대에 있음", "sm"))
+        cx = x
+        if miss:
+            o.append(chip(cx, 312, wait - 4, 70, "var(--crit)", "⚠ 대기", f"{miss}개 읽기"))
+            cx += wait
+        o.append(chip(cx, 312, 296, 70, "var(--npu)", "MoE 계산"))
+        x += width + 40
+    o.append('<path d="M80,412 L1830,412" stroke="#c3c2b7" stroke-width="2" marker-end="url(#ah)"/>')
+    o.append(text(1836, 418, "시간", "sm"))
+    for i, (f, lb) in enumerate([("var(--npu)", "작업대에 있음 (히트)"), ("var(--read)", "없음 (미스)")]):
+        o.append(rect(80 + i * 300, 442, 22, 22, f, 4))
+        o.append(text(112 + i * 300, 460, lb, "sm"))
+    # chart: hit rate vs decode TPS (LFM2, measured)
+    o.append(text(80, 540, "작업대에 있을 확률이 높을수록 빠르다", "h3", extra='style="font-size:26px"'))
+    o.append(text(80, 572, "LFM2-8B-A1B 실측 (층당 expert 32개), decode 속도", "sm"))
+    rows = [("칸 8개/층", 57, 17.9), ("칸 16개/층", 85, 21.7), ("전부 올림", 100, 24.0)]
+    bx, bw_max = 420, 1100
+    for i, (lb, hr, tps) in enumerate(rows):
+        y = 600 + i * 92
+        o.append(text(80, y + 40, lb, "lbl", extra='style="font-size:22px;font-weight:700"'))
+        o.append(text(80, y + 68, f"히트 {hr}%", "sm"))
+        bwid = bw_max * tps / 24.0
+        o.append(rect(bx, y + 12, bwid, 52, "var(--npu)", 4))
+        o.append(text(bx + bwid + 14, y + 48, f"{tps} 토큰/s", "lbl", extra='style="font-size:22px;font-weight:700"'))
+    o.append('<path d="M420,598 L420,880" stroke="#c3c2b7" stroke-width="2"/>')
+    o.append(rect(80, 900, 1760, 100, "#fff", 12, None, 'style="stroke:var(--ring);stroke-width:2"'))
+    o.append(text(110, 942, "Gemma-4 26B-A4B는 층당 expert가 128개라 같은 칸 16개로는 히트율이 더 낮을 수 있다 — 기기 미측정.", "lbl"))
+    o.append(text(110, 976, "작업대 정리: 쓴 8개와 라우터가 다음으로 꼽은 5개를 \"최근\"으로 올리고, 가장 오래 안 쓴 칸부터 비운다(LRU).", "sm"))
+    o.append(text(80, 1050, "출처: 문서 53 §3(LFM2, 2026-09-29 실측). 토큰별 히트/미스는 예시.", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
+
 for name, fn in [("fsu_1_placement", fig1), ("fsu_2_prefill_prefetch", fig2),
-                 ("fsu_3_decode_cache", fig3)]:
+                 ("fsu_3_decode_cache", fig3), ("fsu_a_overview", figA),
+                 ("fsu_b_prefill_before_after", figB), ("fsu_c_decode_hits", figC)]:
     open(f"{name}.html", "w").write(fn())
 print("ok")
