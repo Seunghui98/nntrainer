@@ -402,3 +402,21 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 | ARM staging memcpy | 호출마다 입력/출력 복사 | **CPU** | `[HTP-PROFILE] arm staging` |
 
 
+
+### 9.8 첫 기기 실행 (2026-10-07, 3f29c72d, 사용자 실행)
+
+빌드 수정 세 개가 먼저 필요했다: IDL 인자 이름 `out`(qaic 예약어, 0456e0ee), DSP에 없는 `<malloc.h>`·`<stddef.h>` 누락(e6fcee38), DSP 이미지에 없는 `tanhf`(3f29c72d). 셋 다 host 빌드에서는 드러나지 않는다.
+
+조건: `models/gemma4-26b-a4b-qs4cx-wh`(Q4_0 FC bin), 512토큰 요약 prompt, 생성 512, C=16, `NNTR_HTP_PROFILE=1`, 일반 빌드. config의 engine 키는 로그로 추정(qkv·o·dense·epilogue·router 행이 보임). `lmhead_engine` 없음(lm_head 줄이 안 찍힘 → CPU).
+
+| | 이번 | §2 기준(전부 NPU, 일반 빌드) |
+|---|---|---|
+| prefill | 6271 ms, 81.6 TPS | 3986 ms, 128.5 TPS |
+| decode | 4.26 TPS | 3.41 TPS |
+| expert miss (decode) | 56,760 (1.45 ms/miss, 읽기 82.5 s = decode의 69%) | 62,198 (C=16, §10.14) |
+| prefetch | 3,360 / 3,360 제때, 대기 0 ms | 같음 |
+| peak RSS | 2.35 GB | — |
+
+- 텍스트: 원문을 요약 없이 복사. base 체크포인트의 알려진 동작(55 §10.x)이라 회귀가 아니다.
+- prefill HTP 호출(decode 행 제외)은 약 1.77 s. router 행 `K=2816 N=128`이 10.3 ms/호출 × 30 = 310 ms로 §3의 CPU router 191 ms보다 느리다.
+- prefill이 기준보다 2.3 s 느린 원인은 아직 모른다. 같은 조건(HTP_PROFILE 없이) 재측정과 `--profile` 빌드의 `prefill_timeline.py` 분해가 먼저다.
