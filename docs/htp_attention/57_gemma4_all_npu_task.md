@@ -356,7 +356,7 @@ adb push Applications/CausalLM/jni/libs/arm64-v8a/{nntrainer_causallm,libcausall
 adb push builddir/android_build_result/lib/arm64-v8a/{libnntrainer.so,libccapi-nntrainer.so} $D/
 ```
 
-모델: FC를 QS4CX로 다시 양자화한다(§7.3 명령에서 `--fc_dtype QS4CX`, 약 15분, 12.2 GB). 기존 Q4_0 bin도 로드되지만 FC가 로드 시 재양자화 경로를 탄다.
+모델: FC를 QS4CX로 다시 양자화한다(§7.3 명령에서 `--fc_dtype QS4CX`, 약 15분, 약 12.83 GB — 산술: expert 11.549 + FC int4 0.823 + embedding Q4_0 0.415 + router 0.044 GB. 같은 식이 Q4_0-FC 파일을 12.933 GB로 내어 실측 12.936 GB와 맞는다). 기존 Q4_0 bin도 로드되지만 FC가 로드 시 재양자화 경로를 탄다.
 
 config(`g4-npu-512/nntr_config.json`)에 더할 키:
 

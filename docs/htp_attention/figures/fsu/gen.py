@@ -514,9 +514,75 @@ def figP():
     return "\n".join(o)
 
 
+
+# --------------------------------------------- expert memory, as tables
+def figT():
+    o = [HEAD.format(title="Expert memory and prefetch")]
+    o.append(text(80, 88, "Gemma-4 26B-A4B: Expert 메모리와 Prefetch 양", "t1"))
+    o.append(text(80, 134, "Expert weight는 Flash에 두고, DRAM의 Expert cache에는 일부만 올린다 (moe_cache_experts = slot/layer)", "t2"))
+
+    def table(x, y, widths, header, rows, title, bold_last=False, hl_col=None):
+        o.append(text(x, y, title, "h3"))
+        y += 18
+        tw = sum(widths)
+        o.append(rect(x, y, tw, 44, "var(--idle)", 6))
+        cx = x
+        for w, h in zip(widths, header):
+            o.append(text(cx + 16, y + 30, h, "sm", extra='style="font-weight:700;fill:#0b0b0b"'))
+            cx += w
+        y += 44
+        for k, row in enumerate(rows):
+            cx = x
+            for j, (w, v) in enumerate(zip(widths, row)):
+                st = 'style="font-weight:700"' if (bold_last and k == len(rows) - 1) or j == hl_col else ""
+                o.append(text(cx + 16, y + 29, v, "sm" if j == 0 else "lbl", extra=st if j else ""))
+                cx += w
+            y += 42
+            o.append(f'<path d="M{x},{y} L{x + tw},{y}" stroke="#e1e0d9" stroke-width="2"/>')
+        return y
+
+    # left: sizes and file
+    y = table(80, 200, [430, 400], ["항목", "크기"], [
+        ("MoE layer × expert", "30 × 128 = 3,840개"),
+        ("Expert 1개 (int4 + scale)", "3.01 MB (2.87 MiB)"),
+        ("Layer 1개 (128 expert)", "385 MB"),
+        ("Token 1개 · layer 1개 (top-8)", "24 MB"),
+        ("Expert 전체", "11.56 GB (10.77 GiB)"),
+    ], "Expert 크기", bold_last=True)
+    table(80, y + 60, [430, 400], ["구성", "크기"], [
+        ("Expert (QS4CX_WH)", "11.55 GB"),
+        ("Attention · dense FFN (QS4CX)", "0.82 GB"),
+        ("Embedding = lm_head (Q4_0)", "0.42 GB"),
+        ("Router 등 FP32", "0.04 GB"),
+        ("합계 (산술)", "≈ 12.8 GB"),
+    ], "모델 파일 (Flash)", bold_last=True)
+    # right: cache and prefetch, prefill
+    y = table(960, 200, [400, 230, 250], ["항목", "5 slot/layer", "16 slot/layer (기본)"], [
+        ("Cache slot", "150", "480"),
+        ("Cache 크기 (DRAM)", "0.45 GB", "1.45 GB (12.5%)"),
+        ("한 시점 prefetch 양", "공간 없음", "256개 ≈ 0.77 GB"),
+        ("Flash read / prefill (상한)", "11.11 GB", "10.12 GB"),
+        ("Flash 하한 (÷ 3.0 GB/s)", "3.70 s", "3.37 s"),
+        ("Prefetch expert (실측)", "—", "3,360개 (10.1 GB)"),
+        ("동기 read · I/O stall (실측)", "2,893개 · 7.10 s", "0개 · 0.01 s"),
+        ("Prefill latency (실측)", "10.94 s", "5.01 s"),
+    ], "Prefill: Expert cache와 Prefetch (446-token prompt)", hl_col=2)
+    table(960, y + 60, [400, 480], ["항목", "값"], [
+        ("Token당 사용 expert", "30 × 8 = 240개 (722 MB)"),
+        ("전부 miss일 때 Flash read", "722 MB → 0.24 s"),
+        ("Hit rate", "기기 미측정 (LFM2 C=16: 85%)"),
+    ], "Decode: token 1개")
+    o.append(text(80, 1012, "Cache 크기 = slot × 3.01 MB, arena는 256 MiB chunk로 할당(16 slot/layer: 1,408 MiB). "
+                            "한 시점 prefetch 양 = Layer N+1(ready) + N+2(prefetching).", "xs"))
+    o.append(text(80, 1042, "실측: Galaxy S25 Ultra (Hexagon V79), MoE만 NPU 구성, 2026-10-02 (문서 55 §10.11). "
+                            "그 밖의 값은 문서 55 §3.2·§4 산술. 파일 합계는 같은 식으로 Q4_0-FC 파일 12.93 GB(실측 12.94 GB)를 재현.", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
+
 for name, fn in [("fsu_1_placement", fig1), ("fsu_2_prefill_prefetch", fig2),
                  ("fsu_3_decode_cache", fig3), ("fsu_a_overview", figA),
                  ("fsu_b_prefill_before_after", figB), ("fsu_c_decode_hits", figC),
-                 ("fsu_prefill_prefetch", figP)]:
+                 ("fsu_prefill_prefetch", figP), ("fsu_expert_memory_table", figT)]:
     open(f"{name}.html", "w").write(fn())
 print("ok")
