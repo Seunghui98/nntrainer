@@ -1139,15 +1139,40 @@ interface nntr_hvx : remote_handle64 {
                        rout sequence<uint32> stats);
 
    // The row-blocked kernel (hexkl_attn_q2) over a fixed-scale cache.
-   // Same operands as attn_q_prefill without br/bc, softcap or sinks.
+   // Same operands as attn_q_prefill without br/bc, softcap or sinks;
+   // q_scale is n_head_q per-head Q scales, or empty to have the kernel
+   // measure them.
    // stats_us = { qprep, dma, qk, softmax, pv, epilogue, total, n_blocks,
    // kcycles }.
    AEEResult attn_q2_prefill(in uint32 kv_handle, in uint32 n_q,
                              in uint32 cache_from, in uint32 cache_to,
                              in uint32 n_head_q, in uint32 window,
                              in sequence<float> q_f32,
+                             in sequence<float> q_scale,
                              rout sequence<float> out_f32,
                              rout sequence<uint32> stats_us);
+
+   // HVX issue-rate probe, n iterations each: stats = { cycles per vadd
+   // (8 independent chains), per Q15 vmpy (8 chains), per exp2 chain of the
+   // softmax (4 chains), per VTCM vector load (8 streams) }.
+   AEEResult probe_hvx_rate(in uint32 n, rout sequence<uint32> stats);
+
+   // attn_q_step's counterpart for the row-blocked kernel over a cache in
+   // fixed-scale mode: appends rows [row0, row0 + n) from k_rows / v_rows
+   // (empty = nothing to append), then hexkl_attn_q2_prefill. q_scale is
+   // n_head_q per-head Q scales (required). stats_us = { append us,
+   // attention us, 0, total us, append quantize us, append stage us,
+   // append bake us, rows appended, kernel: qk, softmax, pv, hmx wait }.
+   AEEResult attn_q2_step(in uint32 kv_handle, in uint32 row0,
+                          in sequence<uint16> k_rows, in sequence<uint16> v_rows,
+                          in uint32 n_q, in uint32 cache_from, in uint32 cache_to,
+                          in uint32 n_head_q, in uint32 window,
+                          in sequence<float> q_f32, in sequence<float> q_scale,
+                          rout sequence<float> out_f32,
+                          rout sequence<uint32> stats_us);
+
+   // The int8 WH tile permutation (hexkl_kv_q_wh_i8_pos), 1024 entries.
+   AEEResult probe_wh_i8_pos(rout sequence<uint16> pos);
 
    // The HVX integer softmax of one 64-row block over int16 score tiles
    // (hvx_softmax_q), for the bit-exact check against the scalar

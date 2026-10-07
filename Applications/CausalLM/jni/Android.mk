@@ -186,6 +186,22 @@ LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 
+# Build gemma4_attn_bench executable (one Gemma-4 attention layer, timed)
+include $(CLEAR_VARS)
+
+LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_MODULE := gemma4_attn_bench
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := ../bench/gemma4_attn_bench.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
+
+include $(BUILD_EXECUTABLE)
+
 # Build test_api executable
 include $(CLEAR_VARS)
 

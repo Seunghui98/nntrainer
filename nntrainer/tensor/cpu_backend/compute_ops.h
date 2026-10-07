@@ -780,6 +780,58 @@ public:
   virtual void kv_cache_q_release(int handle) { (void)handle; }
 
   /**
+   * @brief The row-blocked int8 attention (hexkl_attn_q2) over a cache in
+   *        fixed-scale mode: K one scale per KV head, V one per (KV head,
+   *        dim), Q one per query head, all given by the caller as a
+   *        quantized model's encodings give them. kv_cache_q_set_fixed_scales
+   *        must be called once after kv_cache_q_register and before the
+   *        first append; sdpa_q2_kvcache then has sdpa_q_kvcache's contract
+   *        with the per-head Q scales added and softcap / sinks removed
+   *        (neither exists in the models this path serves). head_dim up to
+   *        512.
+   */
+  virtual bool supports_kv_cache_q2() const { return false; }
+  virtual bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
+                                           unsigned int head_dim,
+                                           const float *s_k, const float *s_v) {
+    (void)handle;
+    (void)n_head_kv;
+    (void)head_dim;
+    (void)s_k;
+    (void)s_v;
+    return false;
+  }
+  virtual bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
+                               unsigned int append_rows, unsigned int kv_stride,
+                               const uint16_t *k_rows, const uint16_t *v_rows,
+                               const float *q, const float *q_scale,
+                               unsigned int q_stride, unsigned int n_q,
+                               unsigned int cache_from, unsigned int cache_to,
+                               unsigned int n_head_q, unsigned int n_head_kv,
+                               unsigned int head_dim, unsigned int window,
+                               float *out, unsigned int out_stride) {
+    (void)handle;
+    (void)append_row0;
+    (void)append_rows;
+    (void)kv_stride;
+    (void)k_rows;
+    (void)v_rows;
+    (void)q;
+    (void)q_scale;
+    (void)q_stride;
+    (void)n_q;
+    (void)cache_from;
+    (void)cache_to;
+    (void)n_head_q;
+    (void)n_head_kv;
+    (void)head_dim;
+    (void)window;
+    (void)out;
+    (void)out_stride;
+    return false;
+  }
+
+  /**
    * @brief sdpa_fp16_kvcache() over a registered quantized cache, with the
    *        rows the cache is missing appended in the same round trip:
    *        rows [append_row0, append_row0 + append_rows) are written from

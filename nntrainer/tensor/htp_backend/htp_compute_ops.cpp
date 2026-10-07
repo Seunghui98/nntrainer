@@ -6493,9 +6493,11 @@ public:
                           unsigned int n_head_kv,
                           unsigned int head_dim) override {
     HtpBackend &hb = HtpBackend::global();
+    // head_dim up to 512 is the registry's limit; the column-blocked
+    // kernel below checks its own 256 at call time.
     if (!hb.enabled() || kind > 1 || max_rows == 0 || max_rows > 0xFFFFu ||
         n_head_kv == 0 || head_dim == 0 || (head_dim % 32) != 0 ||
-        head_dim > 256) {
+        head_dim > 512) {
       return -1;
     }
     uint32_t h = 0;
@@ -6573,6 +6575,65 @@ public:
     }
     if (err != AEE_SUCCESS) {
       ml_logw("HTP quantized attention step failed: 0x%x; CPU fallback", err);
+      return false;
+    }
+    return true;
+  }
+
+  // --- the row-blocked kernel over a fixed-scale int8 cache ---
+
+  bool supports_kv_cache_q2() const override {
+    return HtpBackend::global().enabled();
+  }
+
+  bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
+                                   unsigned int head_dim, const float *s_k,
+                                   const float *s_v) override {
+    HtpBackend &hb = HtpBackend::global();
+    if (!hb.enabled() || handle < 0 || !s_k || !s_v || n_head_kv == 0 ||
+        head_dim == 0) {
+      return false;
+    }
+    const int err = nntr_hvx_kv_set_fixed_scales_q(
+      static_cast<remote_handle64>(hb.handle()), static_cast<uint32_t>(handle),
+      s_k, static_cast<int>(n_head_kv), s_v,
+      static_cast<int>(n_head_kv * head_dim));
+    if (err != AEE_SUCCESS) {
+      ml_logw("HTP quantized KV cache: fixed scales failed: 0x%x", err);
+      return false;
+    }
+    return true;
+  }
+
+  bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
+                       unsigned int append_rows, unsigned int kv_stride,
+                       const uint16_t *k_rows, const uint16_t *v_rows,
+                       const float *q, const float *q_scale,
+                       unsigned int q_stride, unsigned int n_q,
+                       unsigned int cache_from, unsigned int cache_to,
+                       unsigned int n_head_q, unsigned int n_head_kv,
+                       unsigned int head_dim, unsigned int window, float *out,
+                       unsigned int out_stride) override {
+    HtpBackend &hb = HtpBackend::global();
+    if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
+        (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
+        head_dim > 512 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
+        q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
+        !q_scale ||
+        (append_rows != 0 &&
+         (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
+      return false;
+    }
+    const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
+    const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
+    const int rows_len = static_cast<int>(append_rows * kv_stride);
+    uint32_t stats[12] = {0};
+    const int err = nntr_hvx_attn_q2_step(
+      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, q, q_len, q_scale,
+      static_cast<int>(n_head_q), out, q_len, stats, 12);
+    if (err != AEE_SUCCESS) {
+      ml_logw("HTP row-blocked attention step failed: 0x%x; CPU fallback", err);
       return false;
     }
     return true;
