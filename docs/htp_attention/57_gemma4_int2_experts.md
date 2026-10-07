@@ -344,3 +344,20 @@ cd /data/local/tmp/nntrainer/causallm && sh g4_io_dma_probe.sh models/gemma4-26b
 ```
 요약 줄의 열: prefill_ms, decode_tps, read(prefetch_n, exposed_ms, reader_ms, miss, ms/miss), prefill call(dsp, drain, mm, dma_kb, expand), decode call(같음). rep=2끼리 비교한다.
 
+## 8. prefill CPU 몫의 분해 (2026-10-07, `--profile` 빌드, 생성 1토큰, int2 C=16)
+
+레이어 종류별 누적 (prefill 5.82 s + 1토큰 생성 0.45 s; 프로파일 빌드라 평소 4.0 s보다 느리고 비중만 본다):
+
+| 종류 | ms | 비중 | 내용 |
+|---|---:|---:|---|
+| mha_core | 2249 | 36% | attention 본체 (QKᵀ, softmax, PV), CPU |
+| fully_connected | 2110 | 34% | 층당 wq ≈20, attention_out ≈21, wk ≈6.5, (wv), ffn_gate/up/down ≈20 → **projection ≈1.4 s, dense MLP ≈0.6 s** (29·28층 표본으로 나눈 추정) |
+| lfm2_moe | 1371 | 22% | MoE 층 전체(HTP 콜 0.66 s + 라우팅·read-ahead 등록·호스트 몫) |
+| scalar_multiply + rms_norm + 기타 | 530 | 8% | |
+
+판정:
+- **attention 본체(mha_core)가 단일 최대다.** 54 §R7은 "attention은 CPU 유지"였는데, Gemma는 full 층 head_dim 512·sliding 256, 512토큰에서 층당 75 ms가 CPU에 남는다. HTP attention 커널(`hexkl_attn_u8`, 30~37 문서, 디바이스 검증: prefill에서 CPU 대비 43~65×)은 있으나 **`mha_core.cpp`에 연결되어 있지 않다**(ComputeOps 훅 없음).
+- projection을 **FC 개별 콜**로 HTP에 보내는 것은 LFM2에서 **prefill 손해**로 닫혔다(50 §3.7: 콜당 포장 고정비). Gemma도 같다. 유효한 길은 50 §6의 "왕복 자체를 없애기" = **attention 블록 한 콜**(q/k/v projection + RoPE + attention + out projection)이다. 45 Phase C/D.
+- dense MLP는 **블록 융합 콜**(51 §1: `dense_ffn_engine`, MoE 커널로 up·gate·down 한 콜, 10.4 ms/층 vs ARM 19.5)로 이득이 확인됐다. Gemma는 GeGLU라 `dense_ffn_layer`에 act 선택(이미 커널엔 `act` 인자가 있다)과 `Gemma4CausalLM`이 `dense_ffn_engine` 키를 읽게 하는 일이 남는다. 예상: 층당 −9 ms × 30 = **−0.3 s**.
+- 순서: (1) dense_ffn GeGLU + Gemma 연결 — 작고 검증된 길, −0.3 s. (2) attention 블록 한 콜 — 큰 일(−2 s 이상 가능), 30/45 문서 설계 재사용. (3) 그 뒤 prefill은 읽기 바닥(reader 4개 3.0 s, 6개 2.0 s)에 닿고, 그때 int2와 reader 수가 시간으로 나타난다.
+
