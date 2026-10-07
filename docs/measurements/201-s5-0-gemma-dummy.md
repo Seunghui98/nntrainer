@@ -96,6 +96,10 @@ Every run below uses it, A and E alike. The real fix is to size the
 table by `max_timestep` at `mha_core.cpp:681` / `:1551` / `:1602`. That
 is left as a follow-up, not done in this sitting.
 
+**Superseded by #253** (`docs/plans/253-rope-table-size.md`, LEDGER
+rule 71): the table is now `max_timestep` rows, so the device's original
+`config.json` loads as is and the 4096 edit is no longer needed.
+
 **Second attempt loads and runs** (`load2_E16_G64.log`):
 
 ```
