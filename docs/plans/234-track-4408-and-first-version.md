@@ -1,280 +1,332 @@
 # 234 — `htp_decode` stays the Gemma base: what to bring over from upstream #4408 and from `htp_first_version`, in what order, and what each port costs
 
-Issue: dlwlzzero/nntrainer#234 (p1). Base `htp_decode` @ `a19d4dd4e`.
-Sources: upstream nntrainer/nntrainer#4408 (`refs/pr/4408`, head
-`28771a928`, 47 own commits over merge-base `7a8e2609e`; its docs 55 / 56 /
-57 read with `git show refs/pr/4408:docs/htp_attention/…`) and
-`origin/htp_first_version` (13 commits over `htp_decode`: #222 / #225 /
-#219, PR #233 open there). Plan 229 (`229-ternary-lut-decode.md`) is the
-format plan this one feeds; plan 201 the structure.
+Issue: dlwlzzero/nntrainer#234 (p1, `state:in-progress`). **Revision 2,
+2026-10-07.** Base `htp_decode` @ `9323ad52d` (P1 = PR #247 and P2 = PR #248
+merged). Sources: upstream nntrainer/nntrainer#4408 (`refs/pr/4408`, head
+`28771a928`, unchanged) and `origin/htp_first_version` @ `77a01902f`, which
+the user declared **finished** on 2026-10-07 (last merge PR #246): 51
+commits over `htp_decode` (13 merges, 38 own; 15 touch code). Plan 229
+(`229-ternary-lut-decode.md`) is the format plan this one feeds; plan 201
+the structure.
 
 **User, 2026-10-06:** the goal is the ternary 26B-A4B decoding end to end
 on the one-PD path; no tok/s target; the 2 GB peak-memory constraint is
-considered **last**, after decode works on the device (plan 229 S7). Nothing
-in this plan's order depends on the memory limit.
+considered **last** (plan 229 S7). **User, 2026-10-07:** `htp_first_version`
+is closed; re-survey all 51 commits and port what the Gemma work needs.
 
-Evidence tags: **[C]** read on `htp_decode` at `path:line`; **[A]** the
-commit's `git apply --check` against this tree, run in this session
-(dry run only — no port was built or tested here); **[M-4408]** measured by
-#4408's author on the S25 `R3CY10WM83Y` (doc 55 §10.x), 4-bit `QS4CX_WH`
-from a bf16 checkpoint, hybrid path (CPU attention); **[M-LFM]** this
-project's LFM2.5 silicon record (LEDGER rule cited); **[G]** arithmetic.
+Evidence tags: **[C]** read on `htp_decode` @ `9323ad52d` at `path:line`;
+**[A]** `git apply --check` of the commit against that tree, run in this
+session (dry run only — nothing built or run here); **[D]** read in
+`git diff origin/htp_decode origin/htp_first_version` (the real delta — the
+#237 sync carried `htp_decode` code back, so per-commit stats overstate it);
+**[M-4408]** / **[M-LFM]** as before; **[G]** arithmetic.
 
 ## 1. Goal and gate
 
 Acceptance (issue): "which commits from each source come to `htp_decode`,
 in what order, expected conflicts with the S4 code, and the host gate (LFM
 and Gemma E2E lines unchanged, `INPROC E2E PASS`)". Measurable form, per
-port PR:
+port PR (every PR runs the whole set; the "new" column is what that PR adds):
 
 | gate | where | pass |
 |---|---|---|
-| LFM lines unchanged | `test/htp/host/run_inproc_e2e.sh` | `INPROC E2E PASS`; every `bit_identical=1` line of the header block (`run_inproc_e2e.sh:19-166` [C]) still prints; `E2E e3 pool C=1 lfm25 / C=2 … == e3 bit_identical=1` with the same `misses=` |
-| Gemma lines unchanged | same script, the block at `:367-388` / `:491-520` [C] | `E2E gemma64 tokens off==cpu 8/8`, `E2E fwd gemma64 e3 calls/token=1.00 attn_caches=2 timeouts=0 ok`, `gemma64-e3 … min_snr_db` ≥ 20 (27.63 at cycle 34), `E2E tokens gemma64 e3==off 8/8`, `E2E e3 pool C=2 gemma64 == e3 bit_identical=1` |
-| HF differential | `test/unittest/models/unittest_causallm_gemma4_reference.cpp:82-111` [C] — the base already holds an HF-reference test on `gemma4_moe_tiny` / `_hd64` (PR #232); #4408's `06862c37f` is **not** ported | `unittest_causallm_models` all pass, the Gemma cases included |
-| host checks | `test/htp/host/run_host_checks.sh`, `tools/htp_syntax_check.sh`, `*Lfm2Moe*` | `ALL CHECKS PASS`, exit 0, 6 / 6 |
-| the quantizer guard (port 2) | a new check in the quantizer's unit test | a `.safetensors` whose header permutes two same-sized tensors is **refused at the dry run** with both names and sizes (doc 55 §10.5's failure, reproduced on the tiny fixture); the unpermuted file quantizes byte-identical to the `.bin` path |
+| LFM lines unchanged | `test/htp/host/run_inproc_e2e.sh` | `INPROC E2E PASS`; every `bit_identical=1` line of the header block (`run_inproc_e2e.sh:19-166` [C]) still prints; `E2E e3 pool C=1 lfm25 / C=2 … == e3 bit_identical=1` (`:544`) with the same `misses=` |
+| Gemma lines unchanged | `:391-425`, `:575` [C] | `E2E gemma64 tokens off==cpu 8/8`, `E2E fwd gemma64 e3 calls/token=1.00 attn_caches=2 timeouts=0 ok`, `gemma64-e3 … min_snr_db` ≥ 20 (27.63 at cycle 34), `E2E e3 pool C=2 gemma64 == e3 bit_identical=1` |
+| 2-bit lines unchanged (#238 / #239) | `:593`, `:607` [C] | `E2E 2bit lfm25 / gemma64 e3 == palette-twin bit_identical=1`, `E2E 2bit pool C=1 / C=2 … bit_identical=1` with the same `misses=` |
+| keys line unchanged (P1) | `:641` [C] | `E2E keys lfm25 prefill-moved=1 htp_fc_rows=4 e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=15 … q4m1_handles=23 cpu-fc-skipped=70 per_token=10 ok` — same numbers |
+| HF differential | `test/unittest/models/unittest_causallm_gemma4_reference.cpp` [C] | `unittest_causallm_models` all pass (114 / 114 at P2), 0 skipped |
+| host checks | `test/htp/host/run_host_checks.sh`, `tools/htp_syntax_check.sh`, `*Lfm2Moe*`, `*qs4cx*` | `ALL CHECKS PASS`, `WORKER POOL LANES OK`, exit 0, 6 / 6, 2 / 2 |
 | standing | prefill ≥ −5 % of the same sitting's A; text identical to the CPU run; `QS4CX_WH` has no CPU fallback | no device cell in this issue — the ports are host-gated; the first device reading of all of them is plan 201 S5 / plan 229 S4 |
 
-Host state at the start of this plan: `INPROC E2E PASS` on `htp_decode`
-per LEDGER cycle 34 (`874938550` / `b6d2f3a0e`). **Not re-run in this
-session**; the first port PR re-establishes it on its base commit before
-changing anything.
+Host state at the start of this revision: `INPROC E2E PASS` on `htp_decode`
+@ `9323ad52d` per PR #248's comment (477 / 478 lines identical to the #247
+run, the odd one a wake-split timing line). Not re-run in this session.
 
 ## 2. Where it lives
 
-The two lineages are not the same Gemma. `htp_decode`'s MoE Gemma is
-upstream #4296's (`Applications/CausalLM/models/gemma4/gemma4_moe_causallm.cpp`,
-`gemma4_moe_layer.cpp`, `res/gemma4/gemma4_moe_weight_converter.py`) with
-plan 201 S4's hand-over to `lfm2_moe` when `moe_engine=htp`
-(`gemma4_moe_causallm.cpp:58-69, :303-327` [C]) and the `QS4CX_WH` gate | up
-writer in `quantize_stream.cpp:1041-1120` [C]. #4408's is Seunghui98's own:
-`gemma4_causallm.cpp` grown an `enable_moe_block` path (`1cffe5e25`), the
-`lfm2_moe` layer given a `router_type` (`11fefbb76`), its own converter
-(`228a02641`, fused gate_up, router gamma folded) and its own fixture
-(`06862c37f`). Every model-side commit of #4408 therefore collides with S4
-by construction, not by line drift; the portable parts are the ones that
-sit under the model: the quantizer's input path, the diagnostics, the tool.
+### 2.1 The 51 commits of `htp_first_version`, classified
 
-| candidate | verdict | why | `apply --check` [A] | conflicts with S4 code |
-|---|---|---|---|---|
-| **#4408** `9dd2c76de` quantizer reads a converter-written `.safetensors` | **port** (P2) | `htp_decode`'s quantizer refuses anything but `.bin` (`quantize_stream.cpp:1498-1500` [C]); the base converter already writes safetensors (`weight_converter.py:81-89`, `gemma4_moe_weight_converter.py:104-107` [C]); the 100 GB FP32 intermediate is what the user's PC produces | clean | none |
-| **#4408** `f9c09eaa2` "one tensor read is one tensor the converter wrote" | **port** (P2) | the §10.5 guard: byte totals per layer were equal while the order was wrong; the guard costs one comparison per tensor and names the first disagreement at the dry run. On `htp_decode` the converter is #4296's and the writer #231's — a different pair, same hazard | fails at `:1486` (the `is_gemma4_moe` dtype check moved) | `quantize_stream.cpp` only: `TensorWriter` ctor and `expectSourceTensor` around `:489`, `:743`, the Gemma dtype check `:1491` |
-| **#4408** `7dbd876ed` `whUnpack` | **port** (P3) | ten lines, the inverse of `whPack` (`htp_wh_layout.h:60-99` [C]); the host reference of P3 needs it; also simplifies `wh_pack_unpacks_like_the_load_path` | clean | none |
-| **#4408** `a7c527ac2` `NNTR_MOE_DIFF` / `NNTR_MOE_SHADOW` | **port, rebased** (P3) | the one instrument that splits a wrong device text between the MoE call and what feeds it, in one run (input stats + SNR per layer); the first 26B run on this tree will want it (#4408's first run was noise, §10.4) | fails at `lfm2_moe_layer.cpp:20` | `lfm2_moe_layer.cpp`: the hook that returns before the LRU on the token path (`:1199-1206`, plan 201 §2.3) means the diff runs only on the hybrid / `NNTR_HTP_FORWARD` call, not inside the one-PD token — state that in the ported comment; the pool's `ExpertFileDesc` (`compute_ops.h:435-441`) replaces its `getFd()` read |
-| **#4408** `93c2a6ff6` `f33ed210a` `e8d2604ec` `tools/prefill_timeline.py` | **port** (P4, optional) | a profile-build fold per node / per layer / CPU-vs-NPU; nothing on this tree folds a `--profile` build that way (`tools/htp_fc_report.py` reads the HTP stage lines only) | first clean, next two need the file | none (new file) |
-| **#4408** `1cffe5e25` `res/gemma4/gemma4-26b-a4b/nntr_config.json` | **port the file only**, rewritten (P1) | the base has no 26B config; #4408's is FP32 / `moe_engine: cpu` / `moe_cache_experts 16` / `skip_prefill: true` (the PPL trap of §10.9). Ours: `moe_engine: htp`, `moe_layer_dtype: QS4CX_WH` (the base's own guard `gemma4_moe_causallm.cpp:67` [C]), the #222 engine keys, `skip_prefill: false`, `init_seq_len 1024` | code part fails (other `gemma4_causallm.cpp`) | none for the file |
-| **#4408** `228a02641` converter MoE tensors | **skip** | a second converter for a second model class; `gemma4_moe_weight_converter.py` is the base's and matches the #231 writer. One idea is kept as a P2 check, not code: its "lazy slice" exists here as `TensorSlice` (`:22-39` [C]) | fails | whole file |
-| **#4408** `11fefbb76` `1cffe5e25` (code) `42d1ac61f` `3fde10415` router type / MoE block on `gemma4_causallm` / projections on engine keys / string `use_bidirectional_attention` | **skip** | the base's `Gemma4MoECausalLM` does each already (S4; the issue lists them as overlap). `42d1ac61f`'s engine keys are the #222 keys on this tree; §10.12's finding about them is a LEDGER rule (§3) | fail | — |
-| **#4408** `7becfdc97` `69db273ae` `66c41a5ab` QS4CX FCs of an MoE model, registered at load, sliced like Q4_0 | **skip, superseded** | §10.15 measured it: prefill nll 4.510 (better) but decode text loops and peak RSS +0.8 GB (the ARM holds both the original and the KleidiAI pack). `htp_first_version`'s FC WH sidecar (`db2c27a11` + `7b622617a`, below) stores the FC once, in the DSP's format, with no load-time copy — rule 63's consequence, and the path plan 229 needs for 2-bit FCs | two clean, one fails | — |
-| **#4408** `89b426f4c` QS4CX pack only where read | **skip** | the base's E2E already quantizes and runs a QS4CX CPU Gemma on x86 (`run_inproc_e2e.sh:370-385` [C]) | fails | — |
-| **#4408** `06862c37f` `d02cd45d6` `0dcb2789f` `3bc74999e` `757e81902` fixture / HF test / device gtests / GeGLU | **skip** | S4 has each (`gemma4_moe_tiny{,_hd64}`, `unittest_causallm_gemma4_reference.cpp`, `HEXKL_MOE_FLAG_GEGLU`) | fail / "already exists" | — |
-| **#4408** docs 55 / 56 / 57 | **not carried as files**; §10.5–10.15 become LEDGER rules (§3) | — | — | — |
-| **hfv** `c0fa4e419` convert the host ISA's Q4_0 repack before the qs4cx re-quantization | **port** (P1) | the in-process E2E with the engine keys on x86 needs it (`f92ec3596` depends on it) | clean | none |
-| **hfv** `d541bda3a` skip the dense_ffn CPU FFN on a row the HTP runs whole | **port** (P1) | Gemma has a dense FFN in every layer; the CPU must not redo the row | clean | none |
-| **hfv** `f92ec3596` the config of record's engine keys in the in-process E2E | **port, rebased** (P1) | the E2E line that proves all kinds resident on the host | fails at `htp_e2e_test.cpp:119`, `run_inproc_e2e.sh:122` | `run_inproc_e2e.sh`: the header block and the lfm25 section moved for the Gemma block (`:367-388`); `htp_e2e_test.cpp` flag parsing |
-| **hfv** `db2c27a11` `--fc_wh_sidecar` writes the FC weights as `QS4CX_WH` images | **port** (P5) | the FC-on-WH path plan 229 §3.2 needs (floor 45 → 61 only with 2-bit FCs on WH); LFM-only today — the Gemma writer gains it in plan 229 S2 | clean | none; `quantize_stream.cpp` additive |
-| **hfv** `7b622617a` read the FC WH sidecar into the arena at load | **port, rebased** (P5) | the loader half of the same path; removes the load-time re-quantization rule 63 names | fails at `htp_compute_ops.cpp:97`, `htp_wh_layout.h:99` | `htp_compute_ops.cpp`: the FC placement `e2ePlaceFc` (plan 201 §2.2 `:4085`) and the arena chunk list moved with #201 S1 / #211; `htp_wh_layout.h`: `whUnpack` (P3) lands in the same spot — order P3 before P5 |
-| **hfv** `75f6f007d` prefill in 512-row chunks; the conv block reads its history | **port, rebased** (P5) | P1024 on the HTP FCs fails `AEE_ENOMEMORY` without it (rule 63 b); Gemma prompts 512 / 1024 are the sitting lengths. The conv-block half is LFM-only and harmless | fails at `run_inproc_e2e.sh:131` | `run_inproc_e2e.sh` only |
-| **hfv** `32b1bc6de` `dbda0fc25` `cc9b20d0c` `69c05f517` the ARM tier (#219, PR #224) | **later** | measured on nothing yet (#219 `state:needs-measurement`); its tier size is `n_layers × E − capacity` (plan 219 §3), which on Gemma is ≈ 3 300 experts — needs a cap before it can even start; and plan 229 S7 says it cannot fit under 2 GB. Re-read after S5's first miss numbers | first clean, third fails | `run_inproc_e2e.sh` |
-| **hfv** `2c60e5215` `69928f26b` `4617545f5` plan 225 + its guide / Artifacts rows | **carry with P5** (docs only) | the plan the sidecar code cites; the Artifacts row is already mirrored (cycle 34) | — | — |
-| **hfv** `06ed17b7b` single-base docs rewrite | **not carried** (issue) | — | — | — |
-| **hfv** PR #233 (#225 PR 2: decode FC / DENSE_FFN on the FC WH set, `b73e01b1a` + `7efd22adf` on `htp/225-fcwh-e2e`) | **later, as a unit after it merges there** | it is the decode half of P5 and the file plan 229 S2's 2-bit FC GEMV sits on; porting an open PR twice is the stale-stub trap in another form | — | `htp_compute_ops.cpp` FC ops, `hexkl_mm_u8i4_fc_m1_run` |
+By PR, oldest first. "already-in" = present on `htp_decode` by patch-id
+(`git cherry`) or as a rebased port; "skip" = not needed by the Gemma work
+or a docs hunk the supervisor mirrors (§6). The real code delta [D] is 15
+commits in six files that matter: `quantize_stream.cpp`,
+`htp_compute_ops.cpp` (+954 / −… net), `hexkl_graph.{c,h}`,
+`hexkl_mm_u8i4_moe.{c,h}`, `hexkl_conv_block.{c,h}`, `htp_wh_layout.h`,
+`htp_graph_desc.h`, `transformer.{cpp,h}`, `compute_ops.h`,
+`lfm2_moe_layer.cpp`, `nntr_hvx_mm_u8i4.c`, the host checks and
+`run_inproc_e2e.sh`. **No IDL change** (`test/htp/nntr_hvx.idl` differs
+only by the 2-bit entries `htp_decode` has and `htp_first_version` lacks [D]).
 
-Consumers that move with a changed contract: **none of the ports changes
-the IDL** (`test/htp/nntr_hvx.idl`), `generate_stub.sh` or the skel — P5's
-loader reads a file into the arena the DSP already maps. The quantizer's
-format tag moves twice: P2 (input `.safetensors`, no output change) and P5
-(`--fc_wh_sidecar`, a second output file; the loader check is the sidecar
-header `7b622617a` adds to `htp_wh_layout.h`). `NNTR_HTP_PROFILE` stage
-tables and `tools/htp_fc_report.py` are untouched; P4 adds a tool beside
-them. `HtpComputeOps` moves only in P5.
+| PR (there) | commits | verdict | Gemma relevance [C] |
+|---|---|---|---|
+| #223 (#222 config of record) | `c0fa4e419`, `d541bda3a` | **already-in** (patch-id: `f3db7c60b`, `6e7544d6b`) | — |
+| | `f92ec3596` | **already-in** (rebased as `36f9e05d6`, PR #247) | — |
+| | `ddb7d9ad8` (config json + 222 measurement files) | skip → supervisor mirror | — |
+| #230 (#225 PR 1, FC WH sidecar, prefill half) | `db2c27a11` quantizer `--fc_wh_sidecar` | **port (P3)**, with a Gemma extension: the flag is gated `is_lfm2_moe && fc_dtype == Q4_0` and only `writeLfm2Moe`'s `writeFc` calls pass `fc_wh = true` (the commit's hunks at its `:354` and `:209-246`); `writeGemma4Moe` (`quantize_stream.cpp:1247` [C]) must flag its `_wq / _wk / _wv / _attention_out / _ffn_up / _ffn_gate / _ffn_down` the same way | **needed**: without a Gemma sidecar the one-PD FC / DENSE_FFN ops stay Q4M1 (plan 229 §3.2 row A, not A′), and plan 229 S2's 2-bit FCs have no file to extend |
+| | `7b622617a` loader: `set_fc_wh_file`, `registerFcWh`, `fcwhFind`, `whUnpack`, `FcWhEntry` + `FCWH_FORMAT` in `htp_wh_layout.h`, `fc_wh_file_name` in `transformer.cpp`, `--repack` in `htp_e2e_test` | **port (P3)**; **it carries `whUnpack`**, so #4408's `7dbd876ed` is dropped from P5 | **shared**: `get_or_register_fc` / `_dense` (`htp_compute_ops.cpp:5015`, `:5130` [C]) are what P4's one-PD bind calls for Gemma's FC / DENSE_FFN ops. One Gemma gap: `transformer.cpp` opens the sidecar only for backends with a pending **keyed** FC / dense / conv (its hunk at `repack_weight`), and Gemma sets no engine keys (`FFN_ENGINE` and the #222 keys are read by `lfm2_causallm.cpp:363-377` only [C]) — P4 fixes that |
+| | `75f6f007d` prefill in 512-row chunks (`prefillRows()`, `invokeMoeLayer` chunking, conv-block history `hist`, `conv_wLen == 5 C` in `nntr_hvx_mm_u8i4.c`) | **port (P3)** | **half shared**: `invokeMoeLayer` (`:4599` [C]) is Gemma's MoE prefill too (`tryMoeLayerOnAccelerator` → `gemm_qs4cx_moe_layer_fp32`, `lfm2_moe_layer.cpp:771` [C], the layer Gemma hands over to under `moe_engine=htp`), so a Gemma P1024 prefill on the HTP gets the chunking; the conv half is LFM-only and harmless (DSP source change, no IDL change — `conv_wLen` 3 C or 5 C) |
+| | `2c60e5215`, `69928f26b` plan 225; `4617545f5` guide / Artifacts | plan file **carried with P3** (the code cites it); guide → supervisor | — |
+| #224 (#219, the ARM tier) | `32b1bc6de` the tier, `dbda0fc25` preload names the misses, `cc9b20d0c` E2E tier lines + preload at load | **later, conditional (P6)** | **shared path, Gemma-unsized**: `tier_qs4cx_wh_experts` is called from `Lfm2MoELayer::preloadExperts` (`:578` [C]) for every expert that did not fit, with no cap — on the 26B that is 3 840 − C experts × 2.87 MiB ≈ 10.8 GiB of anon memory at 4 bits (5.4 at 2) [G, plan 229 §7.1]; `posix_memalign` would fail or swap before the first token. Needs a byte cap before it can even start on Gemma; plan 229 §7 says it cannot hold under 2 GB at all |
+| | `69c05f517`, `469ecf007`, `149481ec4`, `0761995ff` (219 measurement + cycle 35b) | skip → supervisor mirror | — |
+| #233 (#225 PR 2, one-PD decode FC / DENSE_FFN on WH) | `b73e01b1a` `hexkl_mm_u8i4_fc_m1_run` + `fc_wh_det.h` + host check | **port (P4)** | **needed**: the M=1 FC kernel on WH tiles that plan 229 S2's u8i2 FC variant extends (`hvx_gemm_u8i4_wh_col` per column tile; S2 adds the `bits == 2` → `hvx_gemm_u8i2_wh_col` branch, the per-handle `bits` the 2-bit registry already carries, `hexkl_mm_u8i4_moe.c:158, :667` [C]) |
+| | `7efd22adf` `HTP_GRAPH_FEED_WH`, `bindQ4m1` WH branch, `graph_wh_flags`, `fcwhLeft` chunk | **port (P4)** | **shared**: Gemma's graph binds FC (q \| k \| v, o) and DENSE_FFN (up, gate, down) from `q4_pending_` (`gemma4_moe_causallm.cpp:227-262` [C]); the WH DENSE_FFN runs the MoE kernel with `env->moe_flags`, so the session's `HEXKL_MOE_FLAG_GEGLU` (`hexkl_graph.c:475` [C]) applies — Gemma's GeGLU dense FFN comes for free; dense inter 2 112 → `denseChunkCols` = 1 056, 2 chunks ≤ `HTP_GRAPH_WH_DENSE_MAX_CHUNKS` 16 [G]; q \| k \| v parts ≤ `HTP_GRAPH_MAX_PARTS` 32 [G] |
+| | `c8a0a4792` config of record names the sidecar; `51b2b4477`, `f08cccfeb`, `fc1902ecf`, `5f0a5994f` | skip → supervisor mirror (the `docs/measurements/config/*.json` are LFM artifacts) | — |
+| #237 (sync of `htp_decode` into `htp_first_version`) | `da5e2d7d8`, `f11372b9c`, `78dace26f` | **already-in by construction** (they carry `htp_decode`'s S4 back; nothing to port) | — |
+| #243 (#236, qkv FC chunks at P1024) | `a3d966164` `fcRowStep(K) = min(fcMaxRows, prefillRows)` on the four FC entries + `fc_layer_host_check` cell | **port (P3)** — clean [A], 57 lines | **LFM hybrid only today**: the four entries (`gemm_q4_0_accel_fp32 :1236`, `_batch :1317`, `gemm_qs4cx_fp32`, `_batch :1381` [C]) run only for a `fully_connected` with engine `htp`, i.e. the #222 keys, which Gemma does not set; Gemma's FC prefill is on the CPU. Ported for parity (the same source on both lineages, one less future conflict) and because it is the P1024 hybrid's fix of record (rule 64 / 67); it becomes Gemma-relevant the day Gemma gains keys |
+| | `366c06c57` E2E `lfm25-p2x … fc_calls=` line; `abcd0db26` plan 236; `445b4e987`, `3d61c1aff` (236 handoff / measurement) | E2E line + plan file **with P3**; measurement → supervisor | — |
+| #245 (#219 default) | `cdbf66f20` `NNTR_MOE_TIER` unset = 2 under `NNTR_HTP_E2E=1`; `0235d9d79` its E2E line | **not as-is (P6)**: the blanket default would make every Gemma E2E build the tier — see #224 above | LFM-only unless capped |
+| | `20711f83a`, `0c991b009`, `fa6db699a`, `6923850d0` | skip → supervisor mirror | — |
+| #246 (guide close-out) | `21266c9a5`, `e3ee91cc1` (cycle 36 that side), `d39c30f85` (contract §4.1 S25 adb) | skip → supervisor mirror (`htp_decode`'s cycle-36 row already names the S25 `R3CY205ZMND` as the attached unit, contract §12 [C]) | — |
+| #230/#233 era docs | `06ed17b7b` single-base rewrite | **not carried** (issue) | — |
+
+### 2.2 The #4408 side (unchanged verdicts, two done)
+
+| candidate | verdict |
+|---|---|
+| `9dd2c76de`, `f9c09eaa2` quantizer `.safetensors` + order guard | **done** (PR #248: `4322bd291`, `89cccb137`, `cf1c97b4f`, `25416ed5b`) |
+| `1cffe5e25` 26B `nntr_config.json` (file only, rewritten) | **done** (PR #247: `1d434b250`) |
+| `7dbd876ed` `whUnpack` | **dropped**: `7b622617a` brings the same function (P3) |
+| `a7c527ac2` `NNTR_MOE_DIFF` / `NNTR_MOE_SHADOW` | **port, rebased (P5)**; still fails at `lfm2_moe_layer.cpp:20` [A] |
+| `93c2a6ff6` `f33ed210a` `e8d2604ec` `tools/prefill_timeline.py` | **port, optional (P5)**; first clean [A] |
+| everything model-side, the QS4CX-FC route, the fixtures / gtests, docs 55–57 | **skip** as in revision 1 (the lineage argument of §3 stands); §10.x findings → LEDGER rules (§6) |
+
+### 2.3 Consumers that move with a changed contract
+
+* **IDL / stub / skel**: no IDL change in any port. DSP sources change in
+  P3 (`hexkl_conv_block.{c,h}`, `nntr_hvx_mm_u8i4.c`'s `conv_wLen`) and P4
+  (`hexkl_mm_u8i4_moe.{c,h}`, `hexkl_graph.{c,h}`, `htp_graph_desc.h`), so
+  rung 2 runs on both, both arches, md5s in the PR.
+* **`HtpComputeOps`** (`compute_ops.h`): P3 adds `set_fc_wh_file`; P6 adds
+  `tier_qs4cx_wh_experts`. Both are additive virtuals with a `false` / no-op
+  default (the CPU backend answers them).
+* **The quantizer's format tag**: P3 adds a second output (`<stem>_fcwh.bin`,
+  `fc_wh_file_name` / `fc_wh_format = "QS4CX_WH/1"` in `nntr_config.json`);
+  the loader check is `FCWH_MAGIC` / `FCWH_VERSION` + `Transformer`'s
+  `FC_WH_FORMAT` compare. Plan 229 S2 bumps `FCWH_FORMAT` once for bits.
+* **`NNTR_HTP_PROFILE` stage tables / `tools/htp_fc_report.py`**: untouched
+  by P3–P6. P4's WH FC / DENSE_FFN ops keep their kind names (`FC`,
+  `DENSE_FFN`) in the per-kind lines, so the #225 `prof_Q` breakdown reads as
+  before; P5 adds a tool beside them.
+* **The loader check for Gemma**: `Gemma4MoECausalLM::setupParameters`'s
+  `QS4CX_WH | QS2CX_WH` gate (`:67` [C]) is untouched; the sidecar is keyed
+  by the Q4_0 bytes (`fcWhKey`), not by names, so #4296's names need no
+  mapping.
 
 ## 3. Design
 
-**Chosen: port by layer, lowest first — tooling and quantizer input (P1,
-P2), then diagnostics (P3, P4), then the FC WH path (P5) — each a PR into
-`htp_decode` gated by the unchanged E2E lines; nothing of #4408's model
-code.** The reason is the lineage split above: #4408's model-side commits
-are a parallel implementation of what S4 built on #4296, and the base's
-tests (HF reference, E2E Gemma lines, pool bit-identity) already cover the
-same ground. What #4408 has that the base lacks is below the model —
-reading the PC's `.safetensors`, refusing a wrong tensor order before a byte
-is written, and seeing inside a wrong device text — plus a record of
-device findings. Those are cheap and conflict-free, so they go first and
-are on the tree before the 26B files arrive. The FC WH path is larger and
-touches `htp_compute_ops.cpp`, so it goes last among the ports, but still
-before plan 229 S2 (whose 2-bit FC writer extends it).
+**Chosen: finish the FC WH path first (P3 prefill half → P4 decode half),
+each a PR into `htp_decode` gated by the unchanged E2E lines, with the two
+Gemma-specific additions inside those PRs (the Gemma writer's `fc_wh` flag
+in P3; opening the sidecar for an E2E graph with no keyed FC in P4). Then
+the #4408 diagnostics (P5), and the tier only after S5's first miss numbers
+and with a cap (P6).** The reason is plan 229 §3.2: the 26B floor crosses
+50 tok/s only with the FC set at 2 bits, and 2-bit FCs sit on exactly this
+path — the sidecar file (S2 extends its writer), `registerFcWh` (S2 sizes it
+by `bits`), `hexkl_mm_u8i4_fc_m1_run` (S2 adds the u8i2 column branch).
+Porting P3 and P4 before S2 means S2 extends one tree instead of porting a
+diverged one, and the Gemma-specific gaps (§2.1) are found on the host now,
+on the tiny fixture, not on the device with the 26B files.
 
-**Rejected: merge `htp_first_version` into `htp_decode` wholesale** (13
-commits, one merge commit). It would carry the tier (#219, unmeasured and
-Gemma-unsized), the single-base docs rewrite the issue excludes, and the
-#222 closing-sitting docs, and it would make the three real conflicts
-(`run_inproc_e2e.sh`, `htp_compute_ops.cpp`, `htp_wh_layout.h`) one
-unreviewable hunk. Cherry-picks keep each port's gate its own.
+**Rejected: merge `htp_first_version` into `htp_decode` wholesale** (one
+merge commit). It would carry the tier and its blanket default (which the
+Gemma E2E cannot run), the docs rewrite the issue excludes, and it would
+fold the real conflict — `htp_first_version` knows nothing of the 2-bit
+`w_bits` API that #238 / #239 put on every path the sidecar and the tier
+touch — into one unreviewable hunk. Cherry-picks keep each port's gate its
+own, and each port is re-expressed on the `w_bits` API as it lands.
 
-**What #4408's device findings become (LEDGER rules; worded for Gemma on
-the one-PD path, and marked as 4-bit-from-bf16 findings).** #4408 ran
-4-bit `QS4CX` from a bf16 checkpoint; the user's 26B is ternary, whose three
-levels fit int4 (and the 2-bit palette) exactly, so the *accuracy* findings
-about the weight format do not transfer as numbers — only as the mechanism
-and the measurement method.
+**Rejected: skip #236 (`a3d966164`) as LFM-only.** It is clean, 57 lines,
+host-checked, and the P1024 hybrid's fix of record; leaving it out keeps a
+known divergence in the four FC entries for no saving.
 
-| finding [M-4408] | rule candidate |
-|---|---|
-| §10.5–10.6: a 100 GB FP32 file whose MoE tensor order differed from the quantizer's passed the byte-total dry run and gave noise on the device; fixed by the per-tensor guard | **A byte-total check cannot see tensor order; every quantizer read must map to exactly one source tensor, refused at the dry run** (P2's guard is the rule's code) |
-| §10.7 / §10.10: the HTP kernel equals the CPU `QS4CX` kernel within 0.007 nat; FP16 attention 0.01; the per-column scale over K = 2816 costs 0.098–0.116 nat against Q4_0's block-32 scale (weight SNR 17.2 vs 21.2 dB) | **On a 4-bit-from-bf16 checkpoint the per-column `QS4CX` scale is the accuracy gap, not the kernel** (0.1 nat on the 26B); the decomposition method — x86 QS4CX vs device HTP vs device Q4_0 on one prompt with `NNTR_PPL=1` — is the way to read a Gemma gap. For ternary weights the scale question is plan 229 S0's (per column / per group), and this rule's number is not expected to apply |
-| §10.9: a least-squares per-channel scale raised weight SNR 17.2 → 18.9 dB and **worsened** nll by 0.032; reverted (`221212159`) | **Weight MSE is not a proxy for nll on this model; a quantizer change is read on nll, never on SNR alone** |
-| §10.12: the attention projections on the HTP via load-time Q4_0 → QS4CX re-quantization cost +0.46 nat; the dense MLP +0.13 | **the same mechanism as LFM's rule 63** (two stacked quantizations); confirms the rule 63 consequence (store the FC once, in the DSP's format: P5) on the 26B |
-| §10.14: with every FC on the HTP, C = 32 fails `nntr_hvx_weight_register_u8i4` and C = 40 `swap_u8i4_arena` with `AEE_ENOMEMORY`; the C ceiling is 24–32 on the hybrid; decode fastest at C = 8 because ms/miss rises with C (0.76 / 1.58 / 2.27 at C = 8 / 16 / 24, 2.87 MiB experts) | **The pool's C ceiling falls as more kinds move to the HTP (one 4 GiB address space, rule 8); on the 26B the arena + DSP heap must be summed against 3840 per configuration before a sitting** (rule 63 d restated for Gemma). The ms/miss-vs-C reading is LFM's ㉜ again (page cache squeezed by the arena) and is read on `pgpgin` / refaults, not assumed |
-| §10.14's miss counts: 81 348 / 62 198 / 41 955 misses over 512 generated tokens at C = 8 / 16 / 24 (hit 34 / 49 / 66 % of 240 routed uses a token) | **the first Gemma hit-rate points** — plan 229 S7 and plan 201 §3.4's "unknown for Gemma" use them until S5's own trace; they are hybrid-path LRU numbers on one prompt |
-| §10.11: prefill 447 tokens at C = 5 vs 16: 40.9 vs 89.3 TPS (synchronous expert reads 2 893 vs 0); RoPE table built for 262 144 positions (≈ 800 ms, 1.5 GiB) | **C ≥ 5 keeps the prefill read-ahead alive (30 C ≥ 128 + slack); the RoPE table must be sized by `max_seq_len`** — check `MHACoreLayer::precompute_freqs` on this tree before S5 (not verified here) |
-| §10.13 / §10.15: prefill 512 / 1024 on the hybrid 110.7 / 116.0 TPS; decode 2.8–4.5 TPS on the hybrid | not rules: hybrid numbers; the one-PD path is the structure (plan 201); they go to BENCHMARK's Gemma block as "upstream, hybrid, S25" context rows |
+**The expected conflicts, by file** (what the implementer meets; [A] for
+the failing hunks, [C] for the lines on `htp_decode`):
 
-Contract §2 and doc 45 §3: no wall moves; the arena budget moves only
-with P5 (the FC set as WH images, same bytes as the Q4M1 set it replaces,
-the DSP heap loses the rule 63 copies); `QS4CX_WH` keeps no CPU fallback
-(P5's sidecar is read by the HTP only, the CPU keeps its own Q4_0 until
-PR #233 decides decode); `_det` and bit-identity: the ports change no
-kernel; the Gemma E2E lines are the proof.
+| file | with | what moved |
+|---|---|---|
+| `quantize_stream.cpp` | P2 (#248) + #238 | `TensorWriter` ctor takes P2's source-tensor argument and #238's `PaletteOptions` / `setPalette` (`:508`, `:558`, `:573` [C]); `writeFc` (`:660`) gains `db2c27a11`'s `bool fc_wh` beside P2's `expectSourceTensor`; `writeFcConcat` (`:720`) is unaffected (experts, not FCs); the help text and the `is_lfm2_moe` gate at main (`:1676`) |
+| `htp_compute_ops.cpp` | #238 / #239 (`w_bits`), #211, P1's `56a9e3f3b` | `7b622617a`'s `registerFcWh` / `fcwhFind` go next to `get_or_register_fc` `:5015` / `_dense` `:5130` (4-bit only: the sidecar is `QS4CX_WH/1`); `7efd22adf`'s `bindQ4m1` branch at `:1944`; `75f6f007d`'s `invokeMoeLayer` `:4599`, `invokeConvBlock` `:4756`, `prefillRows()`; `a3d966164`'s `fcRowStep` beside `fcMaxRows` `:1285`. P6 (the tier) collides hardest: `readWeight(…, w_bits, …)` `:5783`, `expertStride(K, N, w_bits)` `:5431`, `codeBytes` `:5438`, `ArenaEntry::pal` `:5300`, `registerStaged`'s 2-bit branch `:5579` — the tier's `tierRead` / `readExpert` must size by `codeBytes(…, d.w_bits) + paletteBytes + 8 N`, not `whBytes` |
+| `htp_wh_layout.h` | #238 | `7b622617a`'s hunk after `whPack` (`:99` [A]) lands beside `whBytes2` / `whPack2`; additive |
+| `hexkl_graph.h` / `.c` | #239 | the `rebind_fn` carries `pal_gu` / `pal_dn` on `htp_decode` [D]; `7efd22adf`'s WH runner hunks apply clean [A] and are additive |
+| `hexkl_mm_u8i4_moe.{c,h}` | #238 / #239 | `b73e01b1a`'s `fc_m1_run` applies clean [A]; the 2-bit `hexkl_moe_expand_chunk` and the `bits == 2` M=1 dispatch (`:158`, `:667`, `:1513` [C]) stay; `fc_m1_run` refuses a 2-bit handle until S2 (state it in the function comment) |
+| `run_inproc_e2e.sh` | P1 (#247), #239, S4 | every test hunk fails [A]: the keys block is at `:610-641` [C], the 2-bit block `:580-610`, the Gemma block `:391-425`; the new lines go after the keys line, in the order the commits add them |
+| `htp_e2e_test.cpp` | P1 | `--repack` (`7b622617a`) and the tier's preload (`cc9b20d0c`) near the flag parse `:63-100` [C] |
+| `moe_layer_host_check.c`, `run_host_checks.sh`, `graph_host_check.c` | #238 (`hvx_expand_i2i4.c` in the link lines `:41-60`, the 2-bit cells), S4 (the Gemma mutants `:294`) | `b73e01b1a`'s FC WH cells and `7efd22adf`'s `GRAPH FC WH` mutant slot in after the existing ones |
+| `transformer.cpp` / `lfm2_moe_layer.cpp` / `compute_ops.h` | #238 (`w_bits` instead of `weights_wh`) | `7b622617a`'s `transformer.cpp` hunk is the sidecar block at the end of `repack_weight`'s walk (additive); `dbda0fc25` applies clean [A]; `compute_ops.h`'s two new virtuals are additive |
+
+Contract §2 and doc 45 §3: no wall moves; the arena budget moves with P3 /
+P4 (the FC set as WH images in their own chunk, `fcwhLeft`, in place of the
+Q4M1 set it replaces; the DSP heap loses the rule 63 copies — plan 225
+§3.5's LFM sum 3 691 of 3 840; the Gemma sum is plan 229 §7.1's, re-stated
+in P4's PR for the 26B shape: FC set ≈ 790 MiB + lm_head Q4M1 ≈ 415 + pool);
+`QS4CX_WH` keeps no CPU fallback (the sidecar is read by the HTP only; the
+CPU keeps Q4_0, which is also why the Gemma one-PD RSS carries the 888 MiB
+of dead originals plan 229 §7.1 names — S7's business); `_det` before every
+quantizer and bit-identity: `fc_wh_det.h` is `fc_m1_run`'s spec
+(`FC WH BIT-IDENTICAL` + its mutant), the chunked prefill is proven
+bit-identical to the whole call (`lfm25-p2x`), and the Gemma E2E lines are
+the hand-over proof.
 
 ## 4. Steps
 
 Each step is one PR into `htp_decode`, ending in rung 1 of
-`.claude/skills/hexagon-gates` (host checks); rung 2 (skel) only where
-noted; no step needs a device. Order is by dependency, not by size.
+`.claude/skills/hexagon-gates` (host checks, the §1 table) and, where DSP
+sources change, rung 2 (both arches, md5s in the PR); rung 3 once per PR.
+No step needs a device. P1 and P2 are done (PRs #247, #248; their "as
+built" notes are in revision 1 and the PR bodies).
 
-* **P1. Tooling for the 26B config and the engine-key E2E** — cherry-pick
-  `c0fa4e419`, `d541bda3a`, then `f92ec3596` rebased onto the current
-  `run_inproc_e2e.sh` (the lfm25 section after the Gemma block); add
-  `res/gemma4/gemma4-26b-a4b/nntr_config.json` written for this tree
-  (`moe_engine: htp`, `moe_layer_dtype: QS4CX_WH`, the #222 keys all `htp`,
-  `init_seq_len 1024`, `max_seq_len 4096`, `skip_prefill: false`,
-  `moe_cache_size` = the pool C the sitting sets, `sample_input` with the
-  Gemma chat template). Gate: rung 1 — `INPROC E2E PASS` with the new
-  engine-key line and every existing line unchanged; `*Lfm2Moe*` 6 / 6.
-  *As built (PR for P1):* the 26B file leaves out the #222 keys and
-  `moe_cache_size`. The keys are read only by `lfm2_causallm.cpp:363-377`,
-  `moe_cache_size` only by the CPU `gemma4_moe` layer, and the HTP pool is
-  `NNTR_MOE_CACHE_EXPERTS`. `d541bda3a`'s skip is LFM-only: Gemma builds no
-  `DenseFfnLayer`, so whether the Gemma one-PD decode still runs its dense
-  MLP on the CPU is open. The keys line exposed a hang from `ed2660ddc`
-  (`exp_live` read out of bounds on 4-bit M>1 calls); P1 carries the fix.
-* **P2. The quantizer reads the PC's file and refuses a wrong order** —
-  `9dd2c76de` (clean), then `f9c09eaa2` rebased (the ctor / dtype-check
-  hunks around `:489` / `:1491`); drop the "Gemma4 MoE FC/expert dtype must
-  be FP32 or Q4_0" check only if the writer path proves it dead (it guards
-  `writeFc` dtypes the Gemma writer passes through — keep it otherwise).
-  Add the permuted-header check of §1 to the quantizer's unit test on the
-  tiny fixture, and a `.bin` vs `.safetensors` byte-identity check on the
-  same fixture (the commit's own check, re-done on #4296's converter).
-  Gate: rung 1 — `unittest_causallm_models` incl. the two new cases; E2E
-  lines unchanged (the E2E quantizes `.bin` fixtures, so this is a no-op
-  there by construction — say so in the PR).
-  *As built (PR for P2, stacked on P1):* both commits ported, authors
-  kept. Conflict only in `quantize_stream.cpp`: `PaletteOptions` (#238)
-  and `writer.setPalette` kept beside `SourceTensor` and the new ctor
-  argument; `writeFcConcat` (#231, the Gemma `QS4CX_WH` / `QS2CX_WH`
-  gate | up writer) checks its two source tensors one by one. The "FP32
-  or Q4_0" Gemma dtype check (now `:1737`) is untouched and kept: it
-  reads `--fc_dtype` only, the experts' `QS4CX_WH` / `QS2CX_WH` come in
-  through `--moe_dtype`. The §1 gate as built differs in
-  one point: the guard compares **sizes**, so a swap of two same-sized
-  tensors is not detectable by it (the converter's keys and the
-  quantizer's names are different spellings; upstream chose not to map
-  them). The test therefore reproduces §10.5 as it happened — router
-  scale before the router matrix, offsets consistent, byte total equal —
-  which is refused at the dry run with both names and sizes and an empty
-  output; the same bytes as a `.bin` quantize (control). A header whose
-  keys are in another order is **reordered** by `data_offsets`, not
-  refused, and quantizes byte-identical to the `.bin` (Q4_0 and
-  `QS4CX_WH`). The fixture's `.safetensors` is the converter's output,
-  written by `generate_gemma4_moe_reference.py` beside the `.bin`. One
-  addition beyond #4408, from the port's review: the reader refuses a
-  header it cannot follow positionally (a non-F32 tensor, offsets that do
-  not tile the payload, no tensors, a wrapping header length).
-* **P3. The diagnostic pair** — `7dbd876ed` (clean), then `a7c527ac2`
-  rebased: the diff runs on the layer's CPU-side call (the hybrid /
-  `NNTR_HTP_FORWARD` path), reads expert bytes through the pool's
-  `ExpertFileDesc`, and prints the input stats + SNR per layer; the
-  `ponytail:` says it does not reach inside the one-PD token (the router
-  hook returns first) — the token path's instrument is the E2E `--dump` +
-  `$EVAL` SNR (`run_inproc_e2e.sh:491-510`). Gate: rung 1 — on the hd64
-  Gemma fixture with `NNTR_MOE_DIFF=8`, SNR ≥ 30 dB on every layer (the
-  commit's own expectation 30–45); `NNTR_MOE_SHADOW=1` tokens == the CPU
-  run 8 / 8; both unset → every E2E line unchanged.
-* **P4. `tools/prefill_timeline.py`** — the three commits squashed to one
-  (new file). Gate: `python3 -I tools/prefill_timeline.py` on a saved
-  `--profile` log from `docs/measurements/` parses and prints; no other
-  check (a tool). Optional; can ride with P3.
-* **P5. The FC WH sidecar (prefill half)** — `db2c27a11` (clean),
-  `7b622617a` rebased onto the post-#211 `htp_compute_ops.cpp` (the one-PD
-  FC placement; `whUnpack` from P3 already in `htp_wh_layout.h`),
-  `75f6f007d` rebased (its `run_inproc_e2e.sh` hunk), plus the plan 225
-  docs. The Gemma writer does **not** gain `--fc_wh_sidecar` here — that
-  is plan 229 S2's `bits = 2` writer, which extends this path once. Gate:
-  rung 1 — the sidecar E2E lines `7b622617a` adds (lfm25 loads the sidecar,
-  `bit_identical=1` against the re-quantized run is **not** expected —
-  the commit's own line states the sidecar is the f32-quantized set; read
-  its line as it is written there), every other line unchanged; rung 2 —
-  the skel is rebuilt once for the md5 because DSP sources moved since the
-  last staged set, `UNDEFINED SYMBOLS OK` (no IDL change expected; if
-  `75f6f007d`'s `nntr_hvx_mm_u8i4.c` hunk changes a signature, the stub is
-  regenerated and the PR says so).
-* **Later, not in this issue:** PR #233's decode half after it merges on
-  `htp_first_version`; the tier (#219) after S5's miss numbers and with a
-  Gemma-sized cap; plan 229 S1 (the #4410 2-bit stack) is independent of
-  P1–P4 and may run in parallel, but lands after P5 if it touches the FC
-  path.
+* **P3. The FC WH sidecar, prefill half (#225 PR 1 + #236)** — in order:
+  `db2c27a11` rebased onto the P2 / #238 `TensorWriter` (the `bool fc_wh`
+  argument beside `expectSourceTensor`; lift the `is_lfm2_moe` gate to
+  `is_lfm2_moe || is_gemma4_moe` and flag `writeGemma4Moe`'s seven FC
+  `writeFc` calls — not the per-layer-input FCs, which are no graph op —
+  the help text says "LFM2-MoE / Gemma4-MoE"); `7b622617a` rebased
+  (`htp_wh_layout.h` after `whPack2`, `htp_e2e_test.cpp --repack` beside
+  P1's flags, `registerFcWh` 4-bit only with a `ponytail:` naming S2);
+  `75f6f007d` rebased (`run_inproc_e2e.sh` after the keys line);
+  `a3d966164` (clean) + `366c06c57` rebased; plan files 225 and 236
+  copied as they are. The commit authors are kept.
+  Gate: rung 1 — every §1 line unchanged, plus the new lines as the
+  commits print them: `E2E keys fcwh-lfm25 handles=28 arena_kib=… heap=0
+  requant=0 main=same heap-path heap_kib=… e3 calls/token=1.00 ok`,
+  `E2E eval fcwh==wh-lfm25 … bit_identical=1`, `E2E eval
+  fcwh-nokeys==off-lfm25 bit_identical=1 sidecar=unopened ok`, `E2E keys
+  lfm25-p2x prompt=1024 chunks=512 moe_calls=… whole=… fc_calls=… fc_rows=…
+  logits bit_identical=1 ok`; `CONV BLOCK CHUNKED BIT-IDENTICAL` and the
+  `fc_layer_host_check` chunk cell in `ALL CHECKS PASS`; **and one Gemma
+  line this plan adds**: the gemma64 fixture quantized with
+  `--fc_wh_sidecar` byte-identical in its main `.bin` to the run without
+  the flag, the sidecar's index naming 7 × layers FC images (`E2E quant
+  fcwh-gemma64 main=same images=<n> ok`). Rung 2 (conv block + `conv_wLen`).
+* **P4. One-PD decode FC / DENSE_FFN on the sidecar (#225 PR 2 = #233)** —
+  `b73e01b1a` (kernel + `fc_wh_det.h` + host check; `run_host_checks.sh`
+  hunk re-placed after the 2-bit cells), `7efd22adf` rebased (`bindQ4m1`
+  at `:1944`, `graph_host_check.c` after the Gemma mutants,
+  `run_inproc_e2e.sh` after P3's lines). **Gemma addition**: in
+  `Transformer::repack_weight`'s sidecar block, also hand the file to
+  `get_htp_ops()` when `NNTR_HTP_E2E` is requested and the backend holds
+  pending Q4_0 graph weights (`finish_decode_graph_q4_0`'s `q4_pending_`),
+  so a model with no keyed FC (Gemma) opens it for the bind. Gate: rung 1 —
+  §1 unchanged, the commit's lines `E2E fwd lfm25 fcwh kinds=all
+  calls/token=1.00 q4m1_handles=1 wh_handles=28 e3==e1 bit_identical=1 pool
+  C=2 bit_identical=1 misses=… ok`, `E2E tokens e3fcwh==off-lfm25 8/8`,
+  `E2E ppl-decode e3fcwh-lfm25 … top1=7/7`, `GRAPH FC WH OK` + `GRAPH FC WH
+  MUTANT CAUGHT`, `FC WH BIT-IDENTICAL … ` + `FC WH MUTANT CAUGHT`; **the
+  Gemma lines this plan adds**: `E2E fwd gemma64 fcwh kinds=all
+  calls/token=1.00 attn_caches=2 q4m1_handles=1 wh_handles=<n>`, `E2E
+  tokens gemma64-fcwh==off 8/8`, `gemma64-fcwh … min_snr_db` ≥ 20 against
+  the CPU run, `E2E e3 pool C=2 gemma64-fcwh == e3 bit_identical=1` (the
+  MoE dumps are the sidecar-less run's: the experts did not move). Rung 2
+  (`hexkl_graph.c`, `hexkl_mm_u8i4_moe.c`, `htp_graph_desc.h`). The PR body
+  re-states the 26B arena sum (§3) and says the LM_HEAD stays Q4M1.
+* **P5. The #4408 diagnostics** — `a7c527ac2` rebased on the pool's
+  `ExpertFileDesc` (`compute_ops.h:471-484` [C]; the diff runs on the
+  layer's CPU-side call, the `ponytail:` says it does not reach inside the
+  one-PD token — the token path's instrument is the E2E `--dump` + `$EVAL`
+  SNR); `prefill_timeline.py` ×3 squashed, optional. Gate: rung 1 — hd64
+  Gemma fixture with `NNTR_MOE_DIFF=8`: SNR ≥ 30 dB on every layer;
+  `NNTR_MOE_SHADOW=1` tokens == the CPU run 8 / 8; both unset → every line
+  unchanged; `python3 -I tools/prefill_timeline.py` on a saved `--profile`
+  log parses. Independent of P3 / P4; may run in parallel with them, lands
+  after P4 if it touches `htp_compute_ops.cpp`.
+* **P6. The ARM tier (#219), conditional — after plan 201 S5's first miss
+  numbers, not before.** `32b1bc6de` re-expressed on the `w_bits` API
+  (§3's table), `dbda0fc25` (clean), `cc9b20d0c` rebased; **not**
+  `cdbf66f20` / `0235d9d79` as they are: on `htp_decode` the knob stays
+  env-only (`NNTR_MOE_TIER` unset = 0 on every path) **and** the tier takes
+  a byte cap (`NNTR_MOE_TIER_MIB`, default the LFM complement's ≈ 480) above
+  which it logs `tier: skipped complement_mib=… cap=…` and holds nothing —
+  the `posix_memalign` of a 10.8 GiB complement must not be reachable from
+  a config. The LFM default of record (`=2` under E2E, user 2026-10-06)
+  can then be re-stated per model in `nntr_config.json`, not in code. Gate:
+  rung 1 — §1 unchanged, `E2E e3 pool tier=1 C=2 hd64 / … == tier=0
+  bit_identical=1 … tier_reads=0`, and a Gemma line: the gemma64 E2E with
+  `NNTR_MOE_TIER=2` and a cap below its complement prints the skip line and
+  every Gemma line unchanged. Whether P6 happens at all is decided by S5's
+  misses / token at the pool C the 26B allows (plan 201 §3.4, plan 229
+  §7.3): the tier pays only where the miss cost is the largest term, which
+  on LFM was G = 64 (rule 65).
+* **Not in this issue:** plan 229 S2 (2-bit FCs on the P3 / P4 path: the
+  `FCWH_FORMAT` bump, `registerFcWh` by `bits`, `fc_m1_run`'s u8i2 column
+  branch) — lands after P4; LEDGER ㉞ (sliding cache sizing, hook-less CPU
+  layers) is orthogonal; the single-base docs.
 
-**Device measurement**: none in this plan. The first device run of
-everything above is plan 201 S5 (Gemma on the attached S26,
-`R5KL20NFRCK`), whose handoff variants are plan 229 S4's (A / B2 / B2-C /
-B2-S4) once the ternary files exist; until then an LFM bridge sitting on
-the farm S25 (one PD, Q28: A vs the P5 sidecar set) would read the sidecar
-loader's effect on RSS, DSP heap and the P1024 `AEE_ENOMEMORY` — filed on
-#225 / #233's side, not here.
+**Device measurement**: none in P3–P6. The first device run of everything
+above is plan 201 S5 (the 26B files; the attached unit is the S25 Ultra
+`R3CY205ZMND` since cycle 36, the S26 `R5KL20NFRCK` when re-attached), whose
+handoff variants are plan 229 S4's (A / B2 / B2-C / B2-S4) once the ternary
+files exist. An LFM bridge sitting (one PD, Q28: A vs the P3 + P4 set on
+`htp_decode`) would only re-read what #225's sitting already read on
+`htp_first_version` (`fc wh: … arena_kib=221184 heap_kib=0 requant=0`,
+`calls/token=1.00`, LEDGER §2 #225 row) and is not filed.
 
 ## 5. Risks
 
-* **The converter / writer pair on this tree is untested on the real
-  checkpoint** (the base's HF test writes the fixture directly, as #4408's
-  did — doc 55 §10.5's blind spot). P2's guard is the mitigation; the
-  residual is a wrong-but-consistent pair (gate / up swapped on both
-  sides), which only a device text or P3's SNR shows. The handoff table
-  carries P3's per-layer SNR line next to the text.
-* **Ternary ≠ #4408's 4-bit**: every accuracy number of doc 55 is from a
-  bf16 → int4 per-column recipe; a ternary checkpoint with a per-group
-  scale (plan 229 S0, needs-user) re-opens the format question with no
-  number from #4408 to lean on.
-* **Stale skel / stub** on P5 (DSP sources moved): md5s on both ends, one
-  tree per sitting (rule 3). No IDL change expected; the PR checks.
-* **Address space**: P5 moves the FC set from the Q4M1 arena to WH images
-  of the same size and removes the rule 63 heap copies — the budget sum
-  (pool + FC set + heap + scratch ≤ 3840) is re-stated in the PR for the
-  Gemma shape; the ceiling cell after every run.
-* **`htp_first_version` keeps moving** (PR #233, the tier's sitting): a
-  port is pinned to a sha in its PR body; a later divergence is a new
-  issue, not a silent re-port.
-* **Host-vs-device gap**: these ports prove bytes (P2), SNR on a fixture
-  (P3) and the loader's mechanics (P5) on the host; DMA rate, DVFS, thermal
-  drift and the page cache enter only at S5, where the handoff's A / B
-  pairs inside one sitting make them visible (rules 13, 52, 61).
+* **The Gemma sidecar is untested on the real 26B until S5.** P3 proves
+  the writer on the gemma64 fixture (image count, main `.bin` byte-identical)
+  and P4 the bind and the texts; the 26B's `fcWhKey` collisions (8 KiB of
+  each weight, `htp_wh_layout.h` `ponytail:`) across 30 × 7 FC weights are
+  arithmetic until the file exists — P4's `set_fc_wh_file` refuses a
+  duplicate key at load, so a collision is a load failure, not a wrong
+  matmul.
+* **The `w_bits` re-expression of the tier (P6)** is the one port that
+  rewrites, not re-places; its host gate (`tier_reads=0`, bit-identity
+  against `tier=0`) covers the 4-bit path; the 2-bit tier path (a 2-bit
+  model with the tier on) needs its own E2E line in P6 or is declared
+  unsupported there.
+* **Ternary ≠ #4408's 4-bit**: unchanged from revision 1 — doc 55's
+  accuracy numbers do not transfer; plan 229 S0 (needs-user) decides the
+  scale scope that the sidecar's `w_scale` per column either matches or not.
+* **Stale skel / stub** on P3 and P4 (DSP sources moved, IDL not): md5s
+  on both ends, one tree per sitting (rule 3). A skel older than P3's
+  `conv_wLen` 5 C refuses the chunked conv block with `AEE_EBADPARM`; a
+  skel older than P4 refuses `HTP_GRAPH_FEED_WH` at `graph_init` — both
+  are load-time failures, named in the PRs.
+* **Address space**: P4 moves the FC set into its own arena chunk sized by
+  `fcwhLeft`; on the 26B the sum (pool + FC set ≈ 790 + lm_head Q4M1 ≈ 415
+  + heap ≈ 150 + KV) against 3 840 fixes the pool C S5 can ask for — the PR
+  re-states it; the ceiling cell after every run.
+* **`htp_first_version` is closed**, so the stale-source risk of revision
+  1 is gone; the residual is the supervisor's mirror of its docs (§6)
+  disagreeing with this tree's code state — each port PR's body names the
+  sha it ported and the mirror cites that.
+* **Host-vs-device gap**: these ports prove bytes (P3), the bind and the
+  texts on fixtures (P4), SNR (P5) and the tier's mechanics (P6) on the
+  host; DMA rate, DVFS, thermal drift and the page cache enter only at S5,
+  where the handoff's A / B pairs inside one sitting make them visible
+  (rules 13, 52, 61).
 
 ## 6. Docs to update
 
-* **`docs/htp_moe/LEDGER.md`**: §Upstream gains PR #4408 (`28771a928`,
-  open, what is taken: P2 / P3 / P4; what is not: the model side, the
-  QS4CX FC route) and `htp_first_version`'s state (13 commits, what is
-  ported, #233 pending); §1 the rule candidates of §3 (as rules only
-  where measured by #4408 — marked `[M-4408, 4-bit, hybrid, S25]`); open
-  item: the tier's Gemma sizing; ㉜ gains the §10.14 ms/miss-vs-C
-  reading.
-* **`docs/htp_moe/BENCHMARK.md`**: the Gemma block gains an "upstream
-  #4408, hybrid, S25" context row set (prefill 110.7 / 116.0 at 512 /
-  1024, decode 2.8–4.5, nll 4.556 / 4.510, C sweep) marked not of record;
-  Artifacts: the 26B `nntr_config.json` md5 once it exists.
-* **Plan 229**: S1's "expected conflicts" gains P5 as a prerequisite for
-  the FC path; S7 (the 2 GB budget) appended by this issue.
-* **Plan 201**: the S5 paragraph points at P1–P5 as the host prerequisites
-  and at #233 for decode FCs.
+* **Mirroring decision (this plan's answer to the user's question):** the
+  `htp_first_version` docs — LEDGER cycles 33–36 of that side, BENCHMARK's
+  LFM2.5 close-out table and Artifacts rows, the guide refresh
+  (`21266c9a5`), the measurement files under `docs/measurements/` (219 /
+  222 / 225 / 236 and `config/*.json`), the contract §4.1 hunk
+  (`d39c30f85`) — are **the supervisor's mirror, not the port PRs'**
+  (`htp_decode`'s cycle 36 already states "LEDGER / BENCHMARK mirrored with
+  `htp_first_version`", `9c92d0ac8`). The port PRs carry only the two plan
+  files their code cites (`225-fc-qs4cx-wh-model-file.md`,
+  `236-qkv-fc-prefill-chunks.md`, with P3) and this plan's "as built"
+  notes. `06ed17b7b` is not carried.
+* **`docs/htp_moe/LEDGER.md`** (supervisor): §Upstream — `htp_first_version`
+  closed at `77a01902f`, the classification of §2.1 (15 code commits: 3
+  already-in, 7 ported in P3 / P4, 3 + 2 conditional in P6), #4408 watch
+  unchanged; §1 — the rule candidates of revision 1 §3 (marked
+  `[M-4408, 4-bit, hybrid, S25]`), and one new candidate from this survey:
+  **a load-time structure sized by "everything that did not fit" needs a
+  cap before it meets a second model** (the tier on the 26B, §2.1); open
+  items — ㉜ gains the P6 condition, ㊳ unchanged, a new item for "Gemma
+  engine keys" (whether the hybrid's FC prefill ever moves to the HTP for
+  Gemma — until then #236 is LFM-only).
+* **`docs/htp_moe/BENCHMARK.md`** (supervisor): Artifacts — the gemma64
+  fixture's sidecar md5 once P3 lands is **not** an artifact (fixture);
+  the 26B sidecar's md5 joins the `nntr_config.json` row when the files
+  exist; the Gemma block keeps the "#4408 hybrid S25" context rows of
+  revision 1.
+* **Plan 229**: S2's prerequisite is now "P4 merged" (not "P5"); S2's
+  expected conflicts gain `registerFcWh` and `fc_m1_run`'s per-handle
+  `bits`; §7.1's "FC set on WH (P5 sidecar)" reads P3 / P4.
+* **Plan 201**: the S5 paragraph points at P3 / P4 as the host
+  prerequisites for the FC kinds on WH, and at P6 as a lever gated on S5's
+  miss numbers.
