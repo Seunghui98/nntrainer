@@ -196,6 +196,17 @@ public:
 };
 
 /**
+ * @brief softcap: y = softcap * tanh(y / softcap) on a layer's output (the
+ *        final logit softcap, folded into the tied lm_head); 0 for none.
+ */
+class Softcap : public nntrainer::Property<float> {
+public:
+  Softcap(float val = 0.0f) : nntrainer::Property<float>(val) {}
+  using prop_tag = nntrainer::float_prop_tag;
+  static constexpr const char *key = "softcap";
+};
+
+/**
  * @brief out_norm: likewise the RMSNorm of the layer's output (its gamma
  *        is the last weight in the file).
  */

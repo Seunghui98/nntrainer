@@ -11,6 +11,7 @@
  *
  */
 
+#include <acti_func.h>
 #include <cpu_backend.h>
 #include <htp_decode_hook.h>
 #include <layer_context.h>
@@ -35,13 +36,16 @@ enum TieWordEmbeddingParams {
   weight,
   bias,
   candidate_weight,
-  candidate_hidden_step
+  candidate_hidden_step,
+  norm_gamma
 };
 
 TieWordEmbedding::TieWordEmbedding() :
   LayerImpl(),
   tieword_embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
-                          nntrainer::props::Unit(), nntrainer::props::Scale()) {
+                          nntrainer::props::Unit(), nntrainer::props::Scale(),
+                          props::InNorm(), nntrainer::props::Epsilon(),
+                          props::Softcap()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -177,6 +181,21 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
     weight_idx[TieWordEmbeddingParams::bias] = context.requestWeight(
       bias_dim, bias_initializer, nntrainer::WeightRegularizer::NONE, 1.0f,
       bias_decay, "bias", true);
+  }
+
+  in_norm = std::get<props::InNorm>(tieword_embedding_props).get();
+  softcap = std::get<props::Softcap>(tieword_embedding_props).get();
+  NNTR_THROW_IF(softcap < 0.0f, std::invalid_argument)
+    << "lm head: softcap must be >= 0";
+  if (in_norm) {
+    // FP32 whatever the weights are, as the rms_norm layer requests it
+    weight_idx[TieWordEmbeddingParams::norm_gamma] = context.requestWeight(
+      ml::train::TensorDim(
+        1, 1, 1, in_dim.width(),
+        ml::train::TensorDim::TensorType(context.getFormat(),
+                                         nntrainer::TensorDim::DataType::FP32)),
+      nntrainer::props::InitializerInfo::Enum::NONE,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
   }
 }
 
@@ -509,22 +528,67 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
     }
   };
 
+  // One raw input row's logits with the folded output norm and softcap
+  // (doc 57 section 9.7): the accelerator runs the three as one call when
+  // it can; otherwise the rms_norm layer's kernel and gamma multiply, the
+  // head above, and the logit_softcapping layer's arithmetic, in that
+  // layer's order. cap false: the NNTR_PPL rows, scored uncapped as they
+  // were before the fold.
+  const auto f32 = nntrainer::TensorDim::DataType::FP32;
+  const float eps =
+    std::get<nntrainer::props::Epsilon>(tieword_embedding_props).get();
+  const bool no_bias =
+    !std::get<nntrainer::props::DisableBias>(*layer_impl_props).empty() &&
+    std::get<nntrainer::props::DisableBias>(*layer_impl_props).get();
+  nntrainer::ComputeOps *ops = input_.getOps();
+  auto head_of = [&](nntrainer::Tensor &row, nntrainer::Tensor &out, bool cap) {
+    const float c = cap ? softcap : 0.0f;
+    if (no_bias && ops != nullptr && row.getDataType() == f32 &&
+        weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 &&
+        ops->lm_head_q4_0_fp32(
+          weight.getData<uint8_t>(), row.width(), out.width(),
+          row.getData<float>(),
+          in_norm
+            ? context.getWeight(weight_idx[TieWordEmbeddingParams::norm_gamma])
+                .getData<float>()
+            : nullptr,
+          eps, c, out.getData<float>()))
+      return;
+    if (in_norm) {
+      NNTR_THROW_IF(row.getDataType() != f32, std::invalid_argument)
+        << "lm head: in_norm is FP32 only";
+      nntrainer::Tensor normed(row.getDim());
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        row.getData<float>(), normed.getData<float>(), 1, row.width(), eps);
+      normed.multiply_i(
+        context.getWeight(weight_idx[TieWordEmbeddingParams::norm_gamma]));
+      logits_of(normed, out);
+    } else {
+      logits_of(row, out);
+    }
+    if (c > 0.0f) {
+      float *y = out.getData<float>();
+      const float inv = 1.0f / c;
+      for (size_t i = 0; i < out.size(); ++i)
+        y[i] = nntrainer::ActiFunc::tanhFloat<float>(y[i] * inv) * c;
+    }
+  };
+
   for (unsigned int b = 0; b < b_size; ++b) {
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
       b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
-    // [#132 Part B] a decode row's lm_head on the HTP (no bias there)
-    if (b_size == 1 && to - from == 1 &&
-        input_step.getDataType() == nntrainer::TensorDim::DataType::FP32 &&
-        !std::get<nntrainer::props::DisableBias>(*layer_impl_props).empty() &&
-        std::get<nntrainer::props::DisableBias>(*layer_impl_props).get() &&
+    // [#132 Part B] a decode row's lm_head on the HTP (no bias there, and
+    // nothing folded: the resident graph's op is the head alone)
+    if (b_size == 1 && to - from == 1 && !in_norm && softcap == 0.0f &&
+        input_step.getDataType() == f32 && no_bias &&
         causallm::htpDecodeLmHead(
           from, input_step.getData<float>(), input_step.width(),
           hidden_step.getData<float>(), hidden_step.width()))
       continue;
-    logits_of(input_step, hidden_step);
+    head_of(input_step, hidden_step, true);
   }
 
   // NNTR_PPL: every other prefill row through the same lambda into a
@@ -541,7 +605,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         break;
       nntrainer::Tensor row = input_.getSharedDataTensor(
         input_step_dim, static_cast<size_t>(t) * input_.width(), true);
-      logits_of(row, scratch);
+      head_of(row, scratch, false);
       ppl_nll_ += nllOf(scratch.getData<float>(), vocab, ppl_targets_[pos]);
       ++ppl_count_;
     }
@@ -598,6 +662,11 @@ void TieWordEmbedding::read(
         }
       }
     }
+  } else if (in_norm) {
+    // the lm_head's own weight: the folded output norm's gamma, where the
+    // output_norm layer's was (the tied weight stays the embedding's)
+    context.getWeight(weight_idx[TieWordEmbeddingParams::norm_gamma])
+      .read(file, start_offset, read_from_offset);
   }
 }
 
@@ -619,6 +688,9 @@ void TieWordEmbedding::read(
         }
       }
     }
+  } else if (in_norm) {
+    context.getWeight(weight_idx[TieWordEmbeddingParams::norm_gamma])
+      .read(src, start_offset, read_from_offset, file_fd);
   }
 }
 
@@ -628,6 +700,13 @@ void TieWordEmbedding::save(std::ofstream &file,
                             bool trainable,
                             nntrainer::TensorDim::DataType dtype,
                             ml::train::ISA target_isa) const {
+  // the lm_head's folded norm gamma, FP32 whatever the target dtype (the
+  // rms_norm layer's save)
+  if (mode_ == mode::lm_head && in_norm) {
+    run_context.getWeight(weight_idx[TieWordEmbeddingParams::norm_gamma])
+      .save(file);
+    return;
+  }
   // Only read when mode is embedding
   if (mode_ == mode::embedding) {
     // @note shared weights are only be saved at the first access
