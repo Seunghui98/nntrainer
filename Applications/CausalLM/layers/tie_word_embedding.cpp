@@ -603,8 +603,12 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
     // [#132 Part B] a decode row's lm_head on the HTP (no bias there, and
-    // nothing folded: the resident graph's op is the head alone)
-    if (b_size == 1 && to - from == 1 && !in_norm && softcap == 0.0f &&
+    // nothing folded: the resident graph's op is the head alone). [#260]
+    // Folded too when the row is resident: the list's final RMSNORM and
+    // its LM_HEAD's softcap are the DSP's.
+    if (b_size == 1 && to - from == 1 &&
+        ((!in_norm && softcap == 0.0f) ||
+         causallm::htpDecodeRowResident(from)) &&
         input_step.getDataType() == f32 && no_bias &&
         causallm::htpDecodeLmHead(
           from, input_step.getData<float>(), input_step.width(),

@@ -453,10 +453,24 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       << "qkv_layer: in_norm is FP32 only";
     nntrainer::Tensor normed = context.getTensor(tensor_idx[T_IN])
                                  .getSharedDataTensor(input_step_dim, 0, true);
-    nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-      input_step.getData<float>(), normed.getData<float>(), rows,
-      input_step_dim.width(), epsilon);
-    normed.multiply_i(context.getWeight(weight_idx[IN_GAMMA]));
+    // [#260] one decode row: the input norm is the layer's RMSNORM op (the
+    // token's first op at layer 0); once the row is resident the DSP runs
+    // the whole token -- norms, projections, RoPE -- and nothing below is
+    // read
+    const bool hooked =
+      rows == 1 && input_dim.batch() == 1 &&
+      htpDecodeRmsNorm(from, input_step.getData<float>(),
+                       normed.getData<float>(),
+                       context.getWeight(weight_idx[IN_GAMMA]).getData<float>(),
+                       input_step_dim.width(), epsilon);
+    if (hooked && htpDecodeRowResident(from))
+      return;
+    if (!hooked) {
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        input_step.getData<float>(), normed.getData<float>(), rows,
+        input_step_dim.width(), epsilon);
+      normed.multiply_i(context.getWeight(weight_idx[IN_GAMMA]));
+    }
     input_step = normed;
   }
 
