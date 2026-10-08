@@ -239,3 +239,187 @@ their new DSP kernels ship with host checks (5), `_det` stays before every quant
 * Contract §1 References: `refs/pr/4415` as the prefill reference (already); add the
   merge commit once landed. `docs/htp_moe/guide` (03-performance) prefill section after
   the sitting.
+
+## 7. Revision 2 (2026-10-08 evening)
+
+Supersedes §3–§5 where they differ. Inputs: the implementer's audit on #260 (the new
+26B file `nntr_gemma4_qs4cx_fc_arm.bin`, 12.83 GB, is in **#4415's tensor layout**;
+`htp/260-4415-prefill` @ `bd544ead6` = 8 commits on the merge of `refs/pr/4415` @
+`86bb496b6`, kept as evidence — host checks pass, gtests 122/122, both skels build,
+inproc E2E fails untriaged) and the user's rules of 2026-10-08: (1) #4415's prefill
+**unchanged** — their MoE layer, DSP router, norms-in-call, per-layer LRU, GeGLU
+arithmetic, FC registration, hooks; (2) our one-PD decode **on top**, optimization on
+the decode side only; (3) no data-type conversion of the weight files. §3's "ours wins
+on `lfm2_moe_layer.cpp`" and the §3 rules 1, 3 (GeGLU bit), 5 (sidecar first) are
+withdrawn; rules 4, 6, 7 survive in the form below.
+
+### 7.1 (A) The base and what of ours comes in
+
+**Base = `refs/pr/4415` @ `86bb496b6`**, branch `htp/260-r2-4415-base` off it; `git merge
+htp_decode` with the tie-break reversed against §3: **theirs (= the base, `--ours` on that
+branch) wins every prefill-path hunk**, our side enters only as decode-side members and
+LFM-only files. Verified on both trees (`git diff --stat refs/pr/4415 htp_decode`):
+
+| file | resolution |
+|---|---|
+| `models/lfm2_moe/lfm2_moe_layer.{cpp,h}` (theirs: `RouterType`/`InNorm`/`RouterNorm`/`OutNorm`, `router_logits_fp32`, `g_expert_lru` + `expert_lru.h`, read-ahead) | **theirs, byte for byte, as `lfm2_moe` — the Gemma MoE layer.** Ours (`MoERouter`, `routeSoftmax`, `w_bits` / 2-bit `moeReadExpertWeight`, `set_decode_moe_experts` hand-over at `:1080–1097`, diff / shadow) comes in **renamed**: type `lfm2_moe_pool`, class `Lfm2MoePoolLayer`, file `lfm2_moe_pool_layer.cpp`; `lfm2_moe_causallm.cpp:140` creates it; `transformer.cpp:479,488,495,553,569`'s `getType() == "lfm2_moe"` become one `isMoeLayer()` helper that accepts both (load-path only). The 7 `*Lfm2Moe*` gtests and every LFM inproc line run on it unchanged |
+| `htp_backend/hmx/hexkl_mm_u8i4_moe.{c,h}` | theirs (layer kernel, `HEXKL_MOE_FLAG_GELU_TANH 0x80000`, IDL `act`) **plus** our ours-only functions, additive: `hexkl_mm_u8i4_fc_m1_run` (+`HEXKL_FC_M1_MAX_PARTS`, P4's token FC), `hexkl_moe_expand_chunk` (2-bit, LFM), `hexkl_dma_lane_push2d`, `hexkl_dma_ring_drain`. Our `HEXKL_MOE_FLAG_GEGLU 0x200000` and the DMA_Q field (#177, bits 19–20) go: the token driver ORs their bit 19 into the resident MOE op; DMA_Q returns at bits ≥ 22 only if the M=1 feed reads it (`moe_opts_host_check` decides), never for the prefill kernel |
+| GeGLU: `swiglu_det.h`, `hvx_swiglu_det.h` | **theirs for both prefill and the decode token** (`t = g (C0 + C1 g²)`, `GEGLU_DET_C0/C1`): one inline serves the layer kernel, the dense GeGLU and the token's MOE op, so a second order would be a second kernel. `test/htp/host/geglu_host_check.c` (ours-only) stays and is re-gated against their `geglu_det_one` (its SPEC part is f64, its KERNEL part the scalar twin — both pass on their order; the `run_host_checks.sh` silu-mutant must still fail). The implementer's `78fa63243` (probe to our order) is **not** carried; `unittest_hvx_softmax`'s GeGLU reference = theirs |
+| `htp_compute_ops.cpp` | theirs for `invokeFc`, `get_or_register_fc/qs4cx/wh`, `gemm_q4_0_batch_norm_fp32`, `router_logits_fp32`, `invokeMoeLayer`, `lm_head_q4_0_prepare`, attention — i.e. no `prefillRows()` / `NNTR_HTP_PREFILL_ROWS` (#225 / #236 `fcRowStep`: their one call per prefill stands). Ours, additive: the one-PD token driver (`PoolServer`, `poolServe/Answer/Harvest/Sync/Refresh`, `set_decode_moe_experts`, `e2eStart` one-PD form replacing their `h2`/`graph2` two-session state — "one PD only", 2026-10-01), `add_decode_graph_q4_0/qs4cx` + `bindQ4m1` (the implementer's `bd544ead6` is the right shape: a QS4CX weight binds the WH handles their `get_or_register_qs4cx` → `htp_qs4cx_from_packed` makes, never Q4M1), `set_decode_graph_desc/param`, `set_fc_wh_file` + `fcwhFind`/`registerFcWh` (LFM's sidecar; a 3-line lookup ahead of their order, a no-op without `fc_wh_file_name` — Gemma sets none), the 2-bit arena entries. Our `set_moe_geglu` is dropped (their per-call `act`) |
+| `compute_ops.h` | union: their virtuals (`accelerates_qs4cx_at_m1`, `supports_router_logits_fp32`, `lm_head_q4_0_*`, `gemm_q4_0_batch_norm_fp32`, kv_q) + ours decode-side (`set_decode_moe_experts`, `set_decode_graph_param`, `has_decode_graph_q4_0`, `set_fc_wh_file`, `add_decode_graph_qs4cx`) |
+| DSP decode sources (`hexkl_graph.c` +568, `hexkl_token.c`, `hvx_attn_m1_f32.c`, `hvx_m1_ops_f32.c`, `htp_graph_desc.h`, `nntr_hvx_token/dspq/mailbox.c`, `hvx_expand_i2i4.*`) and their host checks (`graph/token/m1_ops/attn_m1_host_check.c`, `run_inproc_e2e.sh`) | ours (nothing of theirs' prefill lives there). Name clash `hvx_softcap_f32`: **ours** (the E2E LM_HEAD's, worker-pool form) is renamed `hvx_softcap_m1_f32` this time, theirs keeps its name (reverse of `188c491ff`); the libc-import allowance of `188c491ff` and the in-process skel list of `f709168b4` are re-applied as is |
+| `nntr_hvx.idl` | theirs (108 methods) + our 3 ours-only (`expand_i2i4`, `weight_register_u2i4_arena`, `weight_swap_batch_u2i4_arena`); skel md5 changes (rule 3) |
+| `quantize_stream.cpp` | theirs for `Gemma4MoePlan` / `writeGemma4Moe` (`_pre_ffn_norm_2`, `_router_norm` scale-folded, `_router`, `_per_expert_scale`, experts, `_post_ffn_norm_2` — `quantize_stream.cpp:1079`) and the QS4CX FC writer; ours additive for the sidecar, palette, `QS2CX_WH`, the order guard |
+| `gemma4_causallm.{cpp,h}` | theirs whole (`createMoe` at `:555` with `in_norm`/`router_norm`/`out_norm`/`cache_experts`, `ENABLE_MOE_BLOCK`, the engine keys, `FOLD_OUTPUT_NORM`). Not virtual, not throwing |
+| `gemma4_moe_causallm.{cpp,h}` (ours) | shrinks to a decode-side subclass of their `Gemma4CausalLM`: `setupParameters` (NNTR_HTP_E2E, their `MOE_ENGINE`/`MOE_LAYER_DTYPE`), `load_weight` (the E2E list, §7.2), `repack_weight` (`finish_decode_graph_q4_0`). `createFeedForwardBlock` / `createMoe` overrides deleted; `main.cpp:303` keeps the class for the 26B |
+| `mha_core.cpp` | theirs for `forwarding` (incl. `9b6d59a09`), the RoPE table (`rope_rows`, their `faf832c0f`), int8 KV opt-in (`kv_cache_quant` unset → fp16 master). Ours only inside `htpDecodeAttention` (`:661`, decode row): the any-head-dim `build_rope_table` for the ROPE op (hd 256 / 512) built with `use_rope` off (`b1f984049`'s 4 lines) |
+| `causallm_common_properties.h`, `nntr_config.json` (26B), fixtures, `unittest_causallm_gemma4*.cpp` | theirs + our `MoERouter` (for `lfm2_moe_pool`); the 26B config = theirs' keys (§7.3); fixtures §7.3 |
+
+Rejected: one MoE class (theirs + our hand-over + `w_bits`). It puts `w_bits` into their
+`gemm_qs4cx_moe_layer_fp32` signature and the 2-bit read into their prefill layer (rule 1),
+and re-gates the 7 `*Lfm2Moe*` gtests and the `2bit lfm25` lines on their code. Two classes
+cost one rename and one helper.
+
+### 7.2 (B) The decode graft
+
+* **Hand-over LRU → pool = what ours already does, grafted into their layer** (~20 lines,
+  decode side): at the first accelerated call of each virtual layer,
+  `ops->set_decode_moe_experts(all, [](need, load, evict){ g_expert_lru.acquire(need, load,
+  evict); })` (ours `:1080–1097`). The pool's slots **are** the LRU's registered slots
+  (`experts_` / `handle_cache_` → `poolSync` tables; a miss inside the token: S1 asks, the ARM
+  runs `pool_fn_` = `ExpertLru::acquire`, `releaseExpert` frees the slot, S1 reads into it,
+  `poolRefresh` touches the routed keys). One slot set, 1.38 GB at C = 16 (30 × 16 × 2.9 MiB
+  4-bit), not two: `mapped` MiB per cell is the check. Eviction ownership stays with
+  `ExpertLru` on both sides; the next prefill / turn runs their per-layer `acquire` +
+  read-ahead as today and sets `pool_dirty_`, so the next token re-sends the tables
+  (ours `:1492–1502`). `reserve_qs4cx_wh_expert_slots(capacity)` stays theirs.
+* **Decode-row hooks in their MoE layer**: the resident check (`htpDecodeRouter`, theirs
+  `:1655`) moves ahead of `normRows(in_norm)` / `normRows(router_norm)` / `routerLogitsOnAccelerator`
+  inside `total_tokens == 1` only — prefill never reaches it. Their other hooks stay; the
+  `b1f984049` relaxations (qkv returns after the input norm when resident and before its
+  RoPE; a fused `residual_add` row skipped when resident; the tied head's LM_HEAD hook fires
+  with `in_norm`/`softcap` when the E2E graph is set) are re-applied — each is inside the
+  `to - from == 1 && htpDecodeRowResident(from)` branch.
+* **E2E list on their weight names** (`htp_graph_gemma_build` unchanged; `load_weight` keys
+  every weight as `<layer>:<weight>` and under the owning layer, `67bd698a7`): RMSNORM
+  `_qkv:in_norm_gamma`, `_post_attention_norm:gamma`, **`_sparse_moe:in_norm_gamma`,
+  `_sparse_moe:out_norm_gamma`**, `_ffn:in_norm_gamma`, `_ffn:out_norm_gamma`,
+  `_post_ffn_norm:gamma`; tail `output_of_causallm:gamma`; QK_NORM `_qkv:q_norm_gamma |
+  k_norm_gamma`; ADD scalar `_post_ffn_norm:scalar_multiplier`; **ROUTER_TOPK: W =
+  `_sparse_moe:gate` [H×E], BIAS = `_sparse_moe:router_norm_gamma` | `_sparse_moe:expert_bias`
+  — the gamma as is (scale and H^-0.5 already folded in their file; our `rs[f] * hs` goes)**;
+  FC `_qkv:qweight/kweight(/vweight)`, `_attention_out:weight`; DENSE_FFN `_ffn:up, :gate, :down`
+  by name (gate-first file, up-first list); LM_HEAD `embedding0:Embedding` (tied).
+* **FC / DENSE_FFN at M = 1**: QS4CX weights bind the WH handles their load-time
+  `register_qs4cx_weight` (`transformer.cpp:570`) made — `add_decode_graph_qs4cx` →
+  `get_or_register_fc/dense(key, K, N, scale)` (`bd544ead6`), read by `hexkl_mm_u8i4_fc_m1_run`
+  in the token. Their own M = 1 answer is the hybrid's: `accelerates_qs4cx_at_m1() = true`
+  sends a QS4CX FC row through `gemm_q4_0_batch_norm_fp32` (64-row pad, one call per FC) —
+  that is A's decode, not E's. One image set; no Q4M1 for QS4CX (contract §2). #258's u8
+  per-row activation stays the known accuracy term of this path.
+* **LM_HEAD**: Q4M1 from the Q4_0 embedding (`add_decode_graph_q4_0(tied)`), 396 MiB. Their
+  `lm_head_q4_0_prepare` would place a second copy → **E runs `lmhead_engine: cpu`** at step 1
+  (last row on the CPU, ≈ 18 ms a prefill, their §9.12); one lookup (§3 rule 6) later.
+* **ATTN_M1 seed**: their `htpDecodeAttention` already seeds from the CPU-side fp16 cache
+  (`mha_core.cpp:696`, `htpDecodeKvSeed`); their rpcmem allocator keeps it host-readable
+  (`causal_lm.cpp:153,185`, runs for the subclass since `load_weight` calls the base). Only
+  with `kv_cache_quant` unset: **q8 is an A-only control cell**, E never runs on q8.
+* **Softcap**: `shape.softcap = TIE_WORD_EMBEDDINGS ? FINAL_LOGIT_SOFTCAPPING : 0` (the DSP
+  caps; their tied head folds it) — `b1f984049`'s line; the §3 rule 7 ponytail closes.
+
+### 7.3 (C) Gates, fixtures, config, sitting
+
+* **LFM lines unchanged**: `run_inproc_e2e.sh` lfm25 / hd64 lines (`tokens off==cpu 8/8`,
+  `e3==off`, `2bit lfm25 == palette-twin bit_identical=1`, `pool C=1/C=2`) and the 7
+  `*Lfm2Moe*` gtests on `lfm2_moe_pool`, compared line for line with the pre-merge run
+  captured on `origin/htp_decode` (the implementer has it). See (D) for the qkv fold.
+* **Gemma hd64 fixture re-written in their layout** (`router_norm` folded, between
+  `_pre_ffn_norm_2` and `_router`): our `generate_gemma4_moe_reference.py` keeps its shape
+  flags (`--head-dim 64 --global-head-dim 128 …`, `run_inproc_e2e.sh:266`) and writes
+  `router_norm = router_scale · H^-0.5` in place of `router_scale` (one block); their
+  `unittest_causallm_gemma4_moe*.cpp` take it as the order check. FCs of the fixture as
+  `QS4CX` (`--fc_dtype QS4CX`, their writer) so the gemma64 lines exercise the QS4CX bind;
+  the `2bit gemma64` lines are dropped (Gemma's file is 4-bit; the 2-bit path is gated on
+  lfm25). Gate lines: `E2E gemma64 tokens off==cpu 8/8`, `E2E fwd gemma64 e3
+  calls/token=1.00 attn_caches=2`, `E2E tokens gemma64 e3==off 8/8`, `E2E e3 pool C=2
+  gemma64 bit_identical=1`, plus their five (`RMSNORM/ROUTER/ROPE ROWS OK`, `SOFTCAP OK`,
+  `tile_f16_host_check`). A 26B-only host load line is not a substitute (no x86 load of
+  12.83 GB).
+* **Rung 2**: `test/htp/build.sh` v79 + `HEX_ARCH=v81`, `UNDEFINED SYMBOLS OK`, `ARCH OK`;
+  md5 recorded; stub regenerated (IDL changed). Rung 3: `build_android.sh --htp` without
+  `--cache`.
+* **Config for the sitting** (`nntr_gemma4_qs4cx_fc_arm.bin` + its `nntr_config.json`):
+  theirs' keys — `fc_layer_dtype QS4CX`, `moe_layer_dtype QS4CX_WH`, `moe_engine htp`,
+  `moe_cache_experts 16`, `attention_engine / attn_proj_engine / dense_ffn_engine htp`,
+  `lmhead_engine htp` for A, `cpu` for E (above), `init_seq_len 1024`, no `attention_kv_dtype`.
+  No `fc_wh_file_name` (rule 3: no conversion; QS4CX → WH is `htp_qs4cx_from_packed`, a
+  lossless repack).
+* **Sitting** (S25 `R3CY205ZMND`, `.sitting.lock`, reboot, cool start per G block, md5 ==):
+  **A** = pure #4415 hybrid (their LRU decode; the implementer's step-1 numbers in
+  `docs/measurements/260-step1-4415-pure.md` are A's first reading, re-run in E's sitting);
+  **E** = their prefill + our one-PD decode (`NNTR_HTP_E2E=1`); prompts 447 / 1023; G 64 /
+  512 / 1024; **q8** = A with `attention_kv_dtype q8`, 447 and 1023 at G 64, prefill column
+  only. 12 + 2 runs. Gates: E prefill MoE dumps == A `bit_identical=1`; E tokens == A under
+  plan 130 §3.5 (near-tie flips; A's decode FCs are their 64-row QS4CX call, E's the WH M=1
+  — not bit-identical by construction); E prefill ≥ −5 % of A's (same code); per-kind DSP
+  lines, `calls/token = 1.00`, peak RSS, `mapped`, `heap_used_kib`, S1 ceiling, zone0.
+  Expected: A decode 3–5 tok/s (their §9.13 / §9.16, miss-bound), E ≈ 15–16 at G 512 if P4's
+  F16 carries over (same token path, same 789 MiB of WH FC bytes).
+
+### 7.4 (D) The LFM2 side effect
+
+Their `qkv_layer.cpp:389–392` takes the fused DSP call whenever `(in_norm || feature_size)`
+and `rows > 1`: LFM2.5's per-head q / k norm (`feature_size`, no `in_norm`) moves from the
+CPU into the call at prefill, which is the logprob move the audit saw. **Keep LFM on the old
+path**: one opt-in property on `qkv_layer` (`norm_in_call`, default `true`; LFM2's
+`lfm2_causallm.cpp:100` sets `false`) — 6 lines, default-preserving, so their Gemma prefill
+is untouched and the LFM lines stay byte-identical. Accepting the move would re-baseline
+every LFM host line and leave the frozen LFM device rows (cycle 36) on a different prefill
+numerics than their reference run.
+
+### 7.5 (E) Risks
+
+* **Two expert caches**: not two by design (§7.2); the proof is `mapped` ≈ pool 1380 + FC 789
+  + head 396 (+ `attn_m1` 440) per cell, and the token driver's "the ARM's pool and S1's
+  table must agree" throw if the LRU and S1 diverge. Address space (rule 71, 3 840 MiB on
+  this unit): ≈ 3.0 GB + their attention tiles on the DSP heap per call + DSP heap ≈ 0.6 GB
+  — C 16 sits at the edge; ladder C 12 → 8 (S5-0: flat within 3 %), `lmhead_engine cpu` for
+  E keeps the head placed once. An int8 KV copy is never beside it (q8 is A-only).
+* **Their §9.10 regressions carried**: #1 dense registration by name (`transformer.cpp`,
+  taken), #3 lm_head placement at load, #4 KV in rpcmem (`installKVCacheSharedAllocator`
+  — verify once on the host that the subclass reaches `causal_lm.cpp:185`), #5 / #6 router /
+  RoPE rows via ION, #7 in_norm on the CPU (theirs). Their §9.9 "broken output" was never
+  attributed; the dummy cannot show it — the hd64 fixture and MoE dumps are the only reading.
+* **Their head still moving**: pinned at `86bb496b6`; 14 commits past plan v1 (int8 KV /
+  A8W8 opt-in, `9b6d59a09` fp16 staging skip). Later commits are folded at ⑧, not here.
+* **Stale skel** (rule 3): IDL = theirs + 3; `AEE_EBADPARM` on the first fused call = the
+  device's skel predates the merge; md5 line in the handoff. **DVFS / thermal**: A first and
+  last, cool start per G; **DMA rate** per unit (rule 34: `R3CY205ZMND` 31.2 GB/s) — no
+  cross-unit comparison with their `R3CY10WM83Y` numbers beyond the order of magnitude.
+* **Host-vs-device**: hd 256 / 512 fused RoPE, hd-512 `attn_f16` multi-block and the WH M=1 FC
+  on 26B shapes are device-only; the host gemma64 lines cover hd 64 / 128.
+
+### 7.6 Steps and size
+
+1. **Base** (≈ 1.5 d): branch off `refs/pr/4415`, merge `htp_decode` per the §7.1 table
+   (theirs-wins on the prefill path; `lfm2_moe_pool` rename + `isMoeLayer`; token driver,
+   `add_decode_graph_qs4cx`, DSP decode sources, IDL +3, `norm_in_call`, GeGLU theirs,
+   `hvx_softcap_m1_f32`). Gate: rung 0, `ninja -C build`, `*Lfm2Moe*` 7/7, their + our
+   `unittest_causallm_models`, `run_host_checks.sh` `ALL CHECKS PASS` with their five OK
+   lines and `geglu_host_check` on their order, **every LFM inproc line == the captured
+   pre-merge run**.
+2. **Gemma decode graft** (≈ 1.5 d): §7.2 (hand-over + resident check in their layer, the
+   name map, the hooks, softcap, `lmhead_engine cpu` for E), the fixture in their layout
+   (§7.3). Gate: the four gemma64 lines + rung 2 (v79 + v81) + rung 3, md5s staged.
+3. **First deliverable — device (unavoidable), ≈ 0.5 d: E at 447, G 512, with A 447 G 512
+   in the same sitting** (cool start, md5 ==): the gates of §7.3; the number goes to #260 and
+   `docs/measurements/260-r2-e2e.md` as a lever cell labelled "QS4CX file, WH M=1 FC (#258)".
+4. **The grid** (≈ 0.5 d sitting + 0.5 d docs): the remaining 12 runs (A / E × 447 / 1023 ×
+   G 64 / 512 / 1024, the two q8 prefill controls), BENCHMARK Gemma row (prefill cells for
+   A and E at 447 / 1023, E decode re-read on the 4-bit QS4CX file), LEDGER cycle entry
+   (rule: "two MoE layer classes — their `lfm2_moe` for Gemma prefill, our `lfm2_moe_pool`
+   for LFM; the pool is the LRU's slot set"), §2 verdict row, open items (lm_head once,
+   their DSP router as a lever cell, ⑧ reconcile list, #258), contract §1 References
+   (merge commit). **≈ 4 days to the first deliverable, ≈ 5 to the grid.** If step 2
+   overruns by a day: ship steps 1 + the A sitting (their prefill numbers on our base) and
+   file E as the follow-up with the failing gemma64 line named.
