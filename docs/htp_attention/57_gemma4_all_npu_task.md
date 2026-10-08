@@ -562,3 +562,35 @@ nntrainer/nntrainer#4343(haehun, `htp/quant-dequant-hvx-opt`)에서 이 브랜�
 - attention 트레이스(한 층, 1023행): `kv_write_us≈500`, `accel_call_us 52–55 ms`, DSP 쪽 `wall_us 41–43 ms`(dsp 33 ms). 즉 **호출 wrapper 안에서 11–13 ms, by-op 노드(§9.13 91 ms)까지 다시 ~36 ms**가 host에 있다. 코드로 원인이 잡혔다: Android fp16 빌드에서 `MHACoreLayer::incremental_forwarding`이 f32 query 스텝을 **fp16 Q/K/V/O 텐서 4개로 새로 할당·변환**한 뒤 `one_batch_incremental_forwarding`에 넘기고, 가속 경로(`AccelF32Io`)는 그 fp16 Q를 **다시 스칼라 루프로 f32**로 풀어 DSP에 보내고, 출력은 f32→fp16(`io.commit`)→f32(`output_step.copyData`)로 두 번 더 변환한다. 1023행이면 Q 4.2M·K/V 2.1M·out 4.2M 원소를 다섯 번 변환하고 25 MB를 매 층 새로 page-fault한다.
 - 고침(커밋 아래): 가속 경로가 켜져 있으면(`compute_ops_ && is_causal && (supports_sdpa_fp16_kvcache || kv_cache_quant 준비)`) fp16 스테이징을 건너뛰고 f32 스텝 텐서를 그대로 넘긴다. KV cache 쓰기는 `HalfTensor::copyData`가 f32→fp16을 NEON으로 하므로 그대로, Q·out은 포인터 직결. 기대: 층당 ~36+11 ms → 수 ms, prefill **−1.0~−1.3 s** (기기 미측정). 가속 호출이 실패하면 non-Android 빌드가 늘 쓰던 f32 query CPU 경로로 떨어진다.
 - 다음 측정: (A) 같은 설정으로 by-op의 attention 노드와 `accel_call_us`가 DSP `wall_us`에 붙는지; (B) §9.15의 `attention_kv_dtype: q8`로 DSP 41 → ~18–25 ms가 되는지와 nll.
+
+### 9.17 int8 row-blocked attention 기기 결과와 주변 비용 제거 (2026-10-08, 1024 token, all-NPU)
+
+PR 4343 커널(`attention_kv_dtype: q8`, §9.15)을 켠 세 번의 실행. 모두 1024 token, 엔진 5개 htp, `max_seq_len 1088`(int8 KV cache가 DSP heap에 들어가도록).
+
+| 실행 | attention 호출(`accel_call_us`, sliding 층) | prefill |
+|---|---|---|
+| fp16 (§9.16 스테이징 우회 후) | 52–55 ms → 노드 56.7 ms | 5,120 ms |
+| int8, PR 그대로 | 40–45 ms → 노드 44.3 ms | 5,605 ms(프로파일 빌드) / 4,967 ms |
+| int8 + 트레이스 분해 (6c559ff7) | 28–36 ms | 4,967 ms |
+| int8 + Q·out ION (0583c9eb) + NEON 보정 (2e3eadd1) | **17–18 ms** (첫 층 28: ION 풀 첫 할당) | **4,864 ms** |
+
+분해(한 sliding 층, 1024행, 마지막 실행): host 보정 0.6 ms(스칼라 때 6.7–7.4) · FastRPC 전송 2.5 ms(`wall 14.0 − total 11.4`; ION 전엔 7–12.6) · DSP append 6.7 ms(quant 5.7 + bake 1.0; K/V 1024행 int8 양자화를 HMX 스레드 혼자) · **DSP 커널 4.65 ms**(qk 1.75, softmax 1.86, pv 1.15, wait 0.1) · Q/out memcpy ≈4 ms(`arm staging memcpy` 458 → 583 ms, +1,155 MB) · kv_write 0.55. PR 실측 18.4 ms/층(v81)과 같은 자리.
+
+- 생성 문장은 fp16·int8 모두 `■s a, a/A/AA/A/A/`로 글자까지 같다 → attention 밖 엔진이 깨뜨린다. 가르기(PPL) 결과 아직 없음.
+- MoE 행 `K=2816 N=2816 M>1`은 §9.13의 41.5 ms/call이 router 블로킹(4e903b97) 이후 네 번 연속 49–51 ms(+290 ms). 원인 미확인(기기 미측정 가설: 열, 또는 router가 빨라져 MoE 호출이 prefetch reader의 flash burst와 더 겹침). 프로파일 2단계가 융합 MoE 호출의 DSP 단계를 못 주니 `mm_u8i4_moe_layer_norm`의 timed 변형이 먼저다.
+- 실행 간 노이즈 ±3–5%(MoE 행 1,526–1,576, FC 행 ±10%) → 100 ms 단위 비교는 냉각 후 3회가 필요.
+
+**남은 prefill 4.86 s의 구성(마지막 실행, 산술)과 다음 항목** — flash 바닥 3.4 s(C=16)까지 1.46 s:
+
+| # | 항목 | 지금 | 기대 | 방법 |
+|---|---|---|---|---|
+| 0 | 출력 깨짐 원인 엔진 | — | 정확도 게이트 | 엔진 하나씩 cpu로 돌려 nll 비교 |
+| 1 | MoE 호출 회귀 | 50.8 ms/층 (1,576) | 41.5 (−0.29 s) | timed 변형으로 DSP 단계(gather·requant·mm·swiglu·scatter) 보기, 4e903b97 전후 비교 |
+| 2 | 노드 간 activation 복사 | staging memcpy 583 ms(7.8 GB, 14 GB/s) | −0.4~0.5 s | 연속 NPU 노드 사이 activation을 ION에 상주(KV cache의 `setSharedAllocator`처럼), 호출 출력 버퍼를 다음 호출 입력으로 |
+| 3 | epilogue `residual_add` 2호출/층 | ≈0.46 s(9.7+5.7 ms/층) | −0.3 s | o-proj·down 호출의 post 단계로 합쳐 round trip 2개 제거 (2와 겹침) |
+| 4 | router | 8.7 ms/층 (262) | 2 ms (−0.2 s) | w(1.4 MB)를 VTCM에, 루프를 행 바깥·k 안쪽으로: 지금은 k-chunk마다 x 11.5 MB를 다시 읽음(127 MB/호출, 메모리 bound) |
+| 5 | attention append | 6.7 ms/층 (0.2 s) | −0.12 s / −0.2 s | K/V 양자화를 worker에 분산; 또는 qkv 호출 post 단계에서 K/V를 int8 마스터로 바로 써 append 자체 제거(skel) |
+| 6 | FC 효율 (qkv·dense·o) | qkv N=8192 17.9 ms/call = 2.6 TOPS | −0.3~0.5 s(불확실) | PROFILE=2 FC 분해로 quant/mm/acc/dequant worker 중 병목 확인 뒤 |
+| 7 | flash 바닥 | 3.4 s | 3.1 s | 1–6 뒤 compute < 3.4 s가 되면 C=24, 그 뒤는 읽기 속도 |
+
+decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽기 141 ms/token, 호출 85회/token.
