@@ -842,18 +842,24 @@ int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
 
 /** @brief The activation rows normed into the session's scratch (grown to
  *  M x K floats), for the *_norm entries. NULL when the heap refuses. */
-static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
-                                 uint32 M, uint32 K, const float *gamma,
-                                 float eps) {
-  const size_t n = (size_t)M * K;
+static int norm_rows_reserve(nntr_hvx_session *s, size_t n) {
   if (s->norm_rows_n < n) {
     free(s->norm_rows);
     s->norm_rows = (float *)memalign(128, n * sizeof(float));
     s->norm_rows_n = s->norm_rows ? (uint32_t)n : 0u;
     if (!s->norm_rows) {
       FARF(ERROR, "norm_rows: no heap for %u floats", (unsigned)n);
-      return NULL;
+      return 0;
     }
+  }
+  return 1;
+}
+
+static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
+                                 uint32 M, uint32 K, const float *gamma,
+                                 float eps) {
+  if (!norm_rows_reserve(s, (size_t)M * K)) {
+    return NULL;
   }
   if (hvx_rmsnorm_rows_f32(act_f32, s->norm_rows, M, K, K, gamma, eps,
                            s->quant_pool) != 0) {
@@ -918,17 +924,20 @@ int nntr_hvx_mm_u8i4_layer_norm(
     }
   }
 
-  const float *act = act_f32;
+  /* The pre norm goes into the quant pass, rows normed four at a time into
+     a worker's slice of norm_rows: the normed rows stay in cache. */
+  hexkl_mm_opts opts = {.pool = s->quant_pool};
   if (pre_gammaLen != 0) {
-    act = norm_rows_in(s, act_f32, M, K, pre_gamma, eps);
-    if (!act) {
+    if (!norm_rows_reserve(s, (size_t)M * K)) {
       return AEE_ENOMEMORY;
     }
+    opts.pre_scratch = s->norm_rows;
+    opts.pre_gamma = pre_gamma;
+    opts.pre_eps = eps;
   }
   rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
                                s->config_off, M, K, w_handles,
-                               (uint32_t)w_handlesLen, act, out_cat,
-                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+                               (uint32_t)w_handlesLen, act_f32, out_cat, &opts);
   if (rc != AEE_SUCCESS) {
     return rc;
   }

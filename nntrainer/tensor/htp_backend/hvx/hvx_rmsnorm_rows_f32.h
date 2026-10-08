@@ -39,6 +39,11 @@ int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
                          uint32_t chunk, const float *gamma, float eps,
                          hvx_worker_pool *pool);
 
+/** @brief One row of hvx_rmsnorm_rows_f32 with chunk = n, inline on the
+ *         caller: the same arithmetic, so the same floats. */
+void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
+                         uint32_t n, float eps);
+
 /**
  * @brief The decoder block's epilogue, streamed: out[r][j] = scale *
  *        (out[r][j] + (x[r][j] + x2[r][j]) * rs(r) * gamma[j]), with rs the

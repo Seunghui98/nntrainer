@@ -407,6 +407,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   if (o->act_ah_prepacked != NULL && o->act_scale == NULL) {
     return AEE_EBADPARM; // prepacked bytes need the caller's own scale/zp
   }
+  if (o->pre_scratch != NULL && o->act_scale != NULL) {
+    return AEE_EBADPARM; // the pre norm rides on the params scan
+  }
 
   const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
   const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
@@ -542,8 +545,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   } else {
     HEXKL_PROBE_T0(p0);
     if (act_scale == NULL) {
-      rc0 = hvx_quant_params_pack_u8_ah(act_f32, M, m_pad, K, loc_scale, loc_zp,
-                                        vtcm_base + act_off, o->pool);
+      rc0 = hvx_quant_params_pack_u8_ah(act_f32, M, m_pad, K, o->pre_gamma,
+                                        o->pre_eps, o->pre_scratch, loc_scale,
+                                        loc_zp, vtcm_base + act_off, o->pool);
       act_scale = loc_scale;
       act_zp = loc_zp;
     } else {

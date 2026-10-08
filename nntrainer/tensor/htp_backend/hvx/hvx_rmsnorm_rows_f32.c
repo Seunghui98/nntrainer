@@ -72,6 +72,11 @@ static void norm_chunk(const float *x, float *y, const float *gamma,
   }
 }
 
+void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
+                         uint32_t n, float eps) {
+  norm_chunk(x, y, gamma, n, eps);
+}
+
 static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const rows_ctx *c = (const rows_ctx *)v;
   const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
