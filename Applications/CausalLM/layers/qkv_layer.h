@@ -211,13 +211,14 @@ private:
              nntrainer::props::Epsilon, props::VNorm, props::VFromK,
              props::QScale, props::InNorm, props::Rope, props::RopeTheta,
              props::RopeScalingType, props::RopePartialRotaryFactor,
-             nntrainer::props::MaxTimestep>
+             nntrainer::props::MaxTimestep, props::NormInCall>
     qkv_props;
   std::array<unsigned int, 6>
     weight_idx; /**< [in_gamma,] q, [q_gamma,] k, [k_gamma,] v */
   std::array<unsigned int, 4>
     tensor_idx; /**< q, k (and v) before the norm; the normed input */
   bool in_norm = false;
+  bool norm_in_call = true; /**< props::NormInCall */
   unsigned int feature_size = 0;
   bool v_norm = false;
   bool v_from_k = false;

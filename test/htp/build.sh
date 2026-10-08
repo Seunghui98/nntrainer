@@ -6,7 +6,7 @@
 # Prerequisite: source $HEXAGON_SDK_ROOT/setup_sdk_env.source
 #   The SDK must be 6.1.1.0 or newer: HexKL ships libhexkl_micro.a for v79
 #   only from lib/6.1.1.0 up. 6.4.0.1 is the verified combination.
-# Override the target with: HEX_ARCH=v75 ./build.sh
+# Override the target with: HEX_ARCH=v81 ./build.sh (the S26 Ultra; v79 = S25)
 # Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
 
 set -eu
@@ -53,7 +53,7 @@ if [ ! -f "$HEXKL_LIB" ]; then
     else
         echo "That version exists but has no ${HEXKL_TOOLS_VARIANT}_${HEX_ARCH} build. Available:" >&2
         ls -1 "$HEXKL_ROOT/lib/$HEXKL_SDK_VER" 2>/dev/null | sed 's/^/  /' >&2
-        echo "HexKL provides v79 only for lib/6.1.1.0 and newer." >&2
+        echo "Pick an HEX_ARCH (or HEXKL_SDK_VER) from the list above." >&2
     fi
     exit 1
 fi
@@ -110,6 +110,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_router_rows_f32.c $BACKEND/hvx/hvx_rope_rows_f32.c 
 SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c $BACKEND/hvx/hvx_softmax_blocked_f32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_expand_i2i4.c"
 SRCS="$SRCS nntr_hvx_fc_q4.c build/hvx_q4_gemv_f32.o build/nntr_hvx_sf_probe.o"
 SRCS="$SRCS nntr_hvx_mailbox.c"
 # nntrainer/nntrainer#4343: fp16 and quantized (int8 / int4) KV-cache attention
@@ -145,6 +146,9 @@ READELF="$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-readelf"
 # __register_frame_info_bases) and libc. Anything else -- in particular a
 # hexkl_*/hvx_*/nntr_* function -- is a project file missing from SRCS; the
 # linker accepts it, the on-device loader does not (#97: 0x80000406).
+# ceil, ldexp, ldexpf, lround and _Log (#260: #4415's int8 attention,
+# hvx_softmax_q.c / hexkl_attn_q2.c) sit in the toolchain's libc.a beside
+# the sqrtf / rintf / lroundf already listed; libm.a is an empty archive.
 # rintf, sqrtf, memcmp and __truncsfhf2 (the sibling of __extendhfsf2) came in
 # with the fp16 / quantized attention kernels of nntrainer/nntrainer#4343.
 UND=$("$READELF" --dyn-syms build/libnntr_hvx_skel.so | awk '$7=="UND" && $8!="" {print $8}')
@@ -155,7 +159,7 @@ if [ -z "$UND" ]; then
     echo "Error: $READELF returned no undefined symbols; guard cannot run" >&2
     exit 1
 fi
-BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|dspqueue_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$|rintf$|sqrtf$|memcmp$|__truncsfhf2$)' || true)
+BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|dspqueue_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$|rintf$|sqrtf$|memcmp$|__truncsfhf2$|ceil$|ldexp$|ldexpf$|lround$|_Log$)' || true)
 if [ -n "$BAD" ]; then
     echo "Error: skel has undefined symbols the DSP image will not provide:" >&2
     echo "$BAD" | sed 's/^/  /' >&2
@@ -174,6 +178,14 @@ if [ -n "$STRONG_DSPQ" ]; then
     exit 1
 fi
 echo "UNDEFINED SYMBOLS OK ($(echo "$UND" | wc -l) runtime imports)"
+# Both arches write the same file name (the phone loads it by name), so the
+# ELF e_flags are the only thing that tells a v79 skel from a v81 one.
+if ! "$READELF" -h build/libnntr_hvx_skel.so | grep -q "Flags:.*0x${HEX_ARCH#v}\b"; then
+    echo "Error: skel ELF flags do not say $HEX_ARCH:" >&2
+    "$READELF" -h build/libnntr_hvx_skel.so | grep Flags: >&2
+    exit 1
+fi
+echo "ARCH OK ($(echo "$HEX_ARCH" | tr v V))"
 
 echo "built: $SCRIPT_DIR/build/libnntr_hvx_skel.so ($HEX_ARCH, hexkl $HEXKL_SDK_VER)"
 echo "NOTE: this is the DSP skel only. If nntr_hvx.idl changed, the ARM client"

@@ -10,11 +10,13 @@
 
 #include <cpu_backend.h>
 #include <htp_wh_layout.h>
+#include <htp_wh_palette.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -377,8 +379,11 @@ DType parseDType(const std::string &value) {
     return DType::QS4CX;
   if (dtype == "QS4CX_WH")
     return DType::QS4CX_WH;
-  throw std::invalid_argument("Unsupported dtype: " + value +
-                              " (supported: FP32, Q4_0, Q4_K, Q6_K, QS4CX)");
+  if (dtype == "QS2CX_WH")
+    return DType::QS2CX_WH;
+  throw std::invalid_argument(
+    "Unsupported dtype: " + value +
+    " (supported: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH, QS2CX_WH)");
 }
 
 const char *dtypeName(DType dtype) {
@@ -395,6 +400,8 @@ const char *dtypeName(DType dtype) {
     return "QS4CX";
   case DType::QS4CX_WH:
     return "QS4CX_WH";
+  case DType::QS2CX_WH:
+    return "QS2CX_WH";
   default:
     throw std::invalid_argument("Unknown dtype");
   }
@@ -473,11 +480,65 @@ size_t quantizedSize(DType dtype, size_t rows, size_t columns, bool repack,
     // cheaply recompute from packed nibbles.
     return checkedMultiply(rows, qs4cxRowBytes(columns) + 2 * sizeof(float),
                            name);
+  case DType::QS2CX_WH:
+    // Two bits a weight instead of four, and one four-byte palette for the
+    // whole tensor -- not per row, so this is the one dtype whose size is
+    // not a clean multiple of the row count. Whole 32 x 32 tiles only: the
+    // code bytes are whBytes2(K, N), which equals rows * columns / 4 only
+    // then, and the loaders find the palette and the scales after it.
+    if (rows % 32 != 0 || columns % 32 != 0)
+      throw std::invalid_argument(name +
+                                  " QS2CX_WH shape must be multiples of 32");
+    return checkedMultiply(rows, columns / 4 + 2 * sizeof(float), name) +
+           nntrainer::WH_PALETTE_LEVELS;
   default:
     break;
   }
   throw std::invalid_argument("Unknown dtype for " + name);
 }
+
+/**
+ * @brief How far the MoE expert codes are restricted toward 2 bits
+ *
+ * group_k = 0 leaves QS4CX_WH exactly as it is today, which is the default
+ * and what every existing model directory was built with. Anything else
+ * still writes 4-bit bytes -- the values are just restricted to four levels
+ * a group, so the file runs on today's kernel and its perplexity is the
+ * perplexity a real 2-bit expert would have (htp_wh_palette.h).
+ */
+struct PaletteOptions {
+  /** k-values one palette covers; 0 = off, >= K = one group: with
+      per_column false one palette for the tensor (QS2CX_WH's) */
+  uint32_t group_k = 0u;
+  /** one palette per (column, group) -- the accuracy control, not shippable */
+  bool per_column = false;
+  /** restrict "_gate_up" experts */
+  bool on_gate_up = true;
+  /** restrict "_down" experts */
+  bool on_down = true;
+  /** refit w_scale by least squares once the codes are restricted. Free
+      accuracy given fixed codes, but it is a second change riding on the
+      same perplexity number, so it can be turned off to attribute. */
+  bool refit_scale = true;
+
+  bool active() const { return group_k != 0u; }
+
+  /** @brief Routed experts only (layer{i}_expert{e}_{gate_up,down}), and
+   *         only the half the run asked for: a shared expert's or an
+   *         unfused gate / up weight is left alone. */
+  bool appliesTo(const std::string &name) const {
+    const size_t at = name.rfind("_expert");
+    if (!active() || at == std::string::npos || at + 7 >= name.size() ||
+        !std::isdigit(static_cast<unsigned char>(name[at + 7])))
+      return false;
+    const auto ends = [&](const char *s, size_t n) {
+      return name.size() >= n && name.compare(name.size() - n, n, s) == 0;
+    };
+    if (ends("_gate_up", 8))
+      return on_gate_up;
+    return ends("_down", 5) && on_down;
+  }
+};
 
 /** @brief One tensor of a .safetensors header: its name and its payload size,
  *  in the order the payload stores them. See TensorWriter::source_tensors_. */
@@ -501,12 +562,35 @@ public:
                const std::vector<SourceTensor> *source_tensors = nullptr) :
     input_(input),
     output_(output),
+    out_(&output),
     target_isa_(target_isa),
     source_bytes_(source_bytes),
     dry_run_(dry_run),
     source_tensors_(source_tensors) {}
 
   bool isDryRun() const { return dry_run_; }
+
+  /** @brief Byte count is unchanged by the palette, so the dry run does not
+   *         need this -- only the real pass does. */
+  void setPalette(const PaletteOptions &p) { palette_ = p; }
+  /**
+   * @brief [#225] From now on every writeFc(..., fc_wh = true) also writes
+   *        its weight as a QS4CX_WH image into @a sidecar, quantized from
+   *        the same transposed f32 the main file's copy came from.
+   * @param sidecar nullptr in the dry run, which only counts the images
+   * @param count   the dry run's count: the index is written last, into the
+   *                room reserved for it here
+   */
+  void enableFcWh(std::ofstream *sidecar, uint32_t count) {
+    fcwh_on_ = true;
+    sidecar_ = sidecar;
+    if (sidecar_ != nullptr)
+      sidecar_->seekp(
+        static_cast<std::streamoff>(nntrainer::fcWhHeaderBytes(count)));
+  }
+
+  uint32_t fcWhCount() const { return fcwh_count_; }
+  std::vector<nntrainer::FcWhEntry> &fcWhEntries() { return fcwh_; }
 
   /** @brief FP32 source bytes the layout walk consumed (dry run only) */
   size_t expectedInputBytes() const { return expected_input_bytes_; }
@@ -561,9 +645,10 @@ public:
     }
     // An embedding is a lookup, not a matmul against the HMX unit, so there
     // is nothing for a weight-tile layout to be right for.
-    if (dtype == DType::QS4CX_WH) {
+    if (dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH) {
       throw std::invalid_argument(
-        "QS4CX_WH is a weight layout for the HTP matmul and cannot be used "
+        std::string(dtypeName(dtype)) +
+        " is a weight layout for the HTP matmul and cannot be used "
         "for an embedding");
     }
     quantizedSize(dtype, rows, columns, false, name);
@@ -593,9 +678,10 @@ public:
    * blocked transpose to cap memory use.
    */
   void writeFc(size_t input_size, size_t output_size, DType dtype,
-               const std::string &name) {
+               const std::string &name, bool fc_wh = false) {
     const size_t source_bytes = tensorBytes(input_size, output_size, name);
     expectSourceTensor(source_bytes, name);
+    const bool wh = fc_wh && fcwh_on_;
     if (dtype == DType::FP32) {
       if (dry_run_) {
         expected_input_bytes_ += source_bytes;
@@ -607,24 +693,28 @@ public:
 
     // Validate the complete shape before writing any part of this tensor.
     quantizedSize(dtype, output_size, input_size, true, name);
-    if (dry_run_) {
-      expected_input_bytes_ += source_bytes;
-      return;
-    }
-
+    if (wh)
+      quantizedSize(DType::QS4CX_WH, output_size, input_size, true, name);
     // A WH tile spans 32 inputs and 32 outputs and the tiles come out
     // k-major, so a weight written in row blocks would need its output
     // reordered afterwards. Every weight this dtype is for fits the buffer
     // (the largest is 29 MB against 64), so the blocked path is refused
-    // rather than built.
+    // rather than built -- in the dry run, before any byte is written.
     // ponytail: the fix if a model ever needs it is to hold the whole WH
     // image -- K*N/2 bytes, 3.5 MB for the largest -- and fill it block by
     // block, not to change the tile order.
-    if (dtype == DType::QS4CX_WH && source_bytes > MAX_TENSOR_BUFFER_BYTES) {
+    if ((dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH || wh) &&
+        source_bytes > MAX_TENSOR_BUFFER_BYTES) {
       throw std::invalid_argument(
         name + " is " + std::to_string(source_bytes) + " bytes, over the " +
-        std::to_string(MAX_TENSOR_BUFFER_BYTES) +
-        " QS4CX_WH can write in one pass. Quantize this tensor as QS4CX.");
+        std::to_string(MAX_TENSOR_BUFFER_BYTES) + " " +
+        (wh ? "QS4CX_WH" : dtypeName(dtype)) + " can write in one pass. " +
+        (wh ? "Drop --fc_wh_sidecar." : "Quantize this tensor as QS4CX."));
+    }
+    if (dry_run_) {
+      expected_input_bytes_ += source_bytes;
+      fcwh_count_ += wh ? 1u : 0u;
+      return;
     }
     if (source_bytes <= MAX_TENSOR_BUFFER_BYTES) {
       std::vector<float> source(tensorElements(input_size, output_size, name));
@@ -636,12 +726,55 @@ public:
             source[input * output_size + output];
         }
       }
+      const std::streamoff main_off = output_.tellp();
       writeQuantized(transposed, output_size, input_size, dtype, true, name);
       flushQs4cxScales(dtype, name);
+      if (wh)
+        writeFcWh(transposed, input_size, output_size, name, main_off);
       return;
     }
 
     writeBlockedTransposed(input_size, output_size, dtype, name);
+  }
+
+  /**
+   * [plan 201 S4] Two FC weights stored one after the other in the FP32
+   * file ([input, out_a] then [input, out_b], Gemma 4's expert gate and
+   * up) written as one [out_a + out_b, input] weight: the fused gate | up
+   * expert of the HTP MoE layer (Lfm2MoELayer's expert_gate_up). Only for
+   * a quantized dtype, and only in one pass, like QS4CX_WH's writeFc.
+   */
+  void writeFcConcat(size_t input_size, size_t out_a, size_t out_b, DType dtype,
+                     const std::string &name) {
+    const size_t a_bytes = tensorBytes(input_size, out_a, name);
+    const size_t b_bytes = tensorBytes(input_size, out_b, name);
+    expectSourceTensor(a_bytes, name + " (gate half)");
+    expectSourceTensor(b_bytes, name + " (up half)");
+    const size_t output_size = out_a + out_b;
+    if (dtype == DType::FP32)
+      throw std::invalid_argument(name + ": a fused FC is written quantized");
+    quantizedSize(dtype, output_size, input_size, true, name);
+    if (dry_run_) {
+      expected_input_bytes_ += a_bytes + b_bytes;
+      return;
+    }
+    if (a_bytes + b_bytes > MAX_TENSOR_BUFFER_BYTES)
+      throw std::invalid_argument(name + " is over the " +
+                                  std::to_string(MAX_TENSOR_BUFFER_BYTES) +
+                                  " bytes a fused FC writes in one pass");
+    std::vector<float> a(tensorElements(input_size, out_a, name));
+    std::vector<float> b(tensorElements(input_size, out_b, name));
+    readFloats(a, name);
+    readFloats(b, name);
+    std::vector<float> transposed(output_size * input_size);
+    for (size_t input = 0; input < input_size; ++input) {
+      for (size_t o = 0; o < out_a; ++o)
+        transposed[o * input_size + input] = a[input * out_a + o];
+      for (size_t o = 0; o < out_b; ++o)
+        transposed[(out_a + o) * input_size + input] = b[input * out_b + o];
+    }
+    writeQuantized(transposed, output_size, input_size, dtype, true, name);
+    flushQs4cxScales(dtype, name);
   }
 
   void requireEndOfFile() {
@@ -715,14 +848,35 @@ private:
     ++source_cursor_;
   }
 
+  /** @brief The sidecar image of one FC weight: writeQuantized's QS4CX_WH
+   *  branch on the stream swapped to the sidecar, so the bytes are the ones
+   *  a --fc_dtype QS4CX_WH run would put in the main file. */
+  void writeFcWh(const std::vector<float> &transposed, size_t K, size_t N,
+                 const std::string &name, std::streamoff main_off) {
+    if (name.size() >= sizeof(nntrainer::FcWhEntry::name))
+      throw std::invalid_argument(name + ": name too long for the FC WH index");
+    nntrainer::FcWhEntry e{};
+    std::memcpy(e.name, name.data(), name.size());
+    e.K = static_cast<uint32_t>(K);
+    e.N = static_cast<uint32_t>(N);
+    e.q4_off = static_cast<uint64_t>(main_off);
+    e.off = static_cast<uint64_t>(sidecar_->tellp());
+    out_ = sidecar_;
+    writeQuantized(transposed, N, K, DType::QS4CX_WH, true, name);
+    flushQs4cxScales(DType::QS4CX_WH, name);
+    out_ = &output_;
+    e.bytes = static_cast<uint64_t>(sidecar_->tellp()) - e.off;
+    fcwh_.push_back(e);
+  }
+
   void writeBytes(const void *source, size_t bytes, const std::string &name) {
     if (bytes >
         static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
       throw std::overflow_error("Write size is too large for " + name);
     }
-    output_.write(static_cast<const char *>(source),
-                  static_cast<std::streamsize>(bytes));
-    if (!output_)
+    out_->write(static_cast<const char *>(source),
+                static_cast<std::streamsize>(bytes));
+    if (!*out_)
       throw std::runtime_error("Failed to write " + name);
   }
 
@@ -845,7 +999,7 @@ private:
         /*is_nxk=*/true);
       writeBytes(nibbles.data(), nibbles.size(), name);
       return;
-    } else if (dtype == DType::QS4CX_WH) {
+    } else if (dtype == DType::QS4CX_WH || dtype == DType::QS2CX_WH) {
       // Same quantizer, then a repack. Going through quant_qs4cx_f32 rather
       // than quantizing straight into tiles keeps this bit-identical to the
       // QS4CX path above: the values and scales are the ones the device has
@@ -867,20 +1021,68 @@ private:
       // across this model.
       const size_t K = columns, N = rows;
       std::vector<int8_t> rm(checkedMultiply(K, N, name));
-      const size_t colsum_begin = pending_colsums_.size();
-      pending_colsums_.resize(colsum_begin + N, 0.0f);
       const size_t stride = qs4cxRowBytes(columns);
       for (size_t n = 0; n < N; ++n) {
         const uint8_t *row =
           reinterpret_cast<const uint8_t *>(nibbles.data()) + n * stride;
-        int32_t sum = 0;
         for (size_t k = 0; k < K; ++k) {
           const uint8_t byte = row[k >> 1];
           const uint8_t nibble = (k & 1u) ? (byte >> 4) : (byte & 0x0Fu);
-          const int8_t q =
-            static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
-          rm[k * N + n] = q;
-          sum += q;
+          rm[k * N + n] = static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
+        }
+      }
+
+      // The 2-bit restriction. Done here rather than at whPack so it works
+      // on the same k-major int8 the DSP expansion produces, which is what
+      // lets whPack2 + whExpand2 be byte-compared against whPack.
+      //
+      // QS2CX_WH restricts unconditionally and per tensor: the format holds
+      // exactly four codes and no group axis, so there is nothing to ask.
+      // QS4CX_WH restricts only when --moe_palette_g says to, and then only
+      // to measure -- it still writes four-bit bytes.
+      const bool two_bit = (dtype == DType::QS2CX_WH);
+      const uint32_t pal_g = two_bit ? UINT32_MAX : palette_.group_k;
+      const bool pal_percol = two_bit ? false : palette_.per_column;
+      const bool pal_refit = two_bit ? true : palette_.refit_scale;
+      std::vector<int8_t> pal;
+      if (two_bit || palette_.appliesTo(name)) {
+        pal.resize(nntrainer::whPaletteEntries(static_cast<uint32_t>(K),
+                                               static_cast<uint32_t>(N), pal_g,
+                                               pal_percol));
+        nntrainer::whPaletteQuantize(rm.data(), static_cast<uint32_t>(K),
+                                     static_cast<uint32_t>(N), pal_g,
+                                     pal_percol, pal.data());
+        if (pal_refit) {
+          // quant_qs4cx_f32 picked the scale for sixteen levels; four levels
+          // want a different one. With the codes now fixed, the least-squares
+          // scale is closed form -- and the stored float already IS the
+          // dequant multiplier (fallback_internal.cpp stores 1/scale), so it
+          // drops straight in.
+          for (size_t n = 0; n < N; ++n) {
+            const float *src = source.data() + n * K;
+            double num = 0.0, den = 0.0;
+            for (size_t k = 0; k < K; ++k) {
+              const double q = static_cast<double>(rm[k * N + n]);
+              num += static_cast<double>(src[k]) * q;
+              den += q * q;
+            }
+            if (den > 0.0) {
+              pending_scales_[scale_begin + n] = static_cast<float>(num / den);
+            }
+          }
+        }
+      }
+
+      // Column sums after the palette, because they correct the activation
+      // zero point against the weights the matmul will actually see.
+      // Recomputing them from packed nibbles at load costs about 20 seconds
+      // across this model, which is why they are baked here at all.
+      const size_t colsum_begin = pending_colsums_.size();
+      pending_colsums_.resize(colsum_begin + N, 0.0f);
+      for (size_t n = 0; n < N; ++n) {
+        int32_t sum = 0;
+        for (size_t k = 0; k < K; ++k) {
+          sum += rm[k * N + n];
         }
         // Held as float so it travels beside the scales in one array and
         // lands in the file as the f32 the loader reads; the values are
@@ -888,6 +1090,17 @@ private:
         pending_colsums_[colsum_begin + n] = static_cast<float>(sum);
       }
 
+      if (two_bit) {
+        // Codes then the four palette bytes, so the tensor reads back as
+        // [codes][palette][scales][colsums] -- QS2CX_WH_Tensor::size().
+        std::vector<uint8_t> wh(nntrainer::whBytes2(K, N));
+        nntrainer::whPack2(rm.data(), static_cast<uint32_t>(K),
+                           static_cast<uint32_t>(N), pal.data(), wh.data());
+        writeBytes(reinterpret_cast<const char *>(wh.data()), wh.size(), name);
+        writeBytes(reinterpret_cast<const char *>(pal.data()),
+                   nntrainer::WH_PALETTE_LEVELS, name);
+        return;
+      }
       std::vector<uint8_t> wh(nntrainer::whBytes(K, N));
       nntrainer::whPack(rm.data(), static_cast<uint32_t>(K),
                         static_cast<uint32_t>(N), wh.data());
@@ -911,7 +1124,8 @@ private:
    * once they have written a tensor's last chunk.
    */
   void flushQs4cxScales(DType dtype, const std::string &name) {
-    if (dtype != DType::QS4CX && dtype != DType::QS4CX_WH)
+    if (dtype != DType::QS4CX && dtype != DType::QS4CX_WH &&
+        dtype != DType::QS2CX_WH)
       return;
     if (pending_scales_.empty())
       return;
@@ -990,6 +1204,7 @@ private:
 
   std::ifstream &input_;
   std::ofstream &output_;
+  std::ostream *out_; /**< where writeBytes goes: output_, or the sidecar */
   ml::train::ISA target_isa_;
   size_t source_bytes_ = 0;
   bool dry_run_ = false;
@@ -1002,6 +1217,13 @@ private:
   std::vector<float> pending_colsums_;
   /** QS4CX per-channel scales awaiting flushQs4cxScales() */
   std::vector<float> pending_scales_;
+  /** Off by default: an unasked-for run is byte-identical to before */
+  PaletteOptions palette_;
+  /** [#225] the FC WH sidecar: on, its stream, its index, the dry count */
+  bool fcwh_on_ = false;
+  std::ofstream *sidecar_ = nullptr;
+  std::vector<nntrainer::FcWhEntry> fcwh_;
+  uint32_t fcwh_count_ = 0;
 };
 
 void validateSourceConfig(const json &nntr_cfg) {
@@ -1094,26 +1316,33 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
       checkedMultiply(kv_heads, head_dim, prefix + " KV width");
 
     writer.copyFp32(model.hidden_size, prefix + "_attention_norm");
+    // [#225] The seven FCs the one-PD graph runs (FC q | k | v, o and
+    // DENSE_FFN up, gate, down) also go to the FC WH sidecar when it is on.
+    // The per-layer-input FCs below are no op of that graph and stay out;
+    // a Gemma model that has them (hidden_size_per_layer_input != 0; the
+    // MoE ones have 0) and routes them to the HTP by an engine key would
+    // need them flagged too, or fcwhFind refuses them at load.
     writer.writeFc(model.hidden_size, query_width, quant.fc_dtype,
-                   prefix + "_wq");
+                   prefix + "_wq", true);
     writer.copyFp32(head_dim, prefix + "_q_norm");
-    writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype, prefix + "_wk");
+    writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype, prefix + "_wk",
+                   true);
     writer.copyFp32(head_dim, prefix + "_k_norm");
     if (!model.attention_k_eq_v || is_sliding) {
       writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
-                     prefix + "_wv");
+                     prefix + "_wv", true);
     }
     writer.writeFc(query_width, model.hidden_size, quant.fc_dtype,
-                   prefix + "_attention_out");
+                   prefix + "_attention_out", true);
 
     writer.copyFp32(model.hidden_size, prefix + "_post_attention_norm");
     writer.copyFp32(model.hidden_size, prefix + "_pre_ffn_norm");
     writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                   prefix + "_ffn_gate");
+                   prefix + "_ffn_gate", true);
     writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                   prefix + "_ffn_up");
+                   prefix + "_ffn_up", true);
     writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
-                   prefix + "_ffn_down");
+                   prefix + "_ffn_down", true);
 
     // The MoE half of the block, in the compiled graph's order (checked by
     // unittest_causallm_gemma4_moe) that res/gemma4/weight_converter.py
@@ -1131,6 +1360,10 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
       prefix + "_router");
     writer.copyFp32(model.num_experts, prefix + "_per_expert_scale");
 
+    // The experts in --moe_dtype (the fc dtype unless set). [plan 201 S4]
+    // QS4CX_WH (and QS2CX_WH, its 2-bit form) is the HTP MoE layer's
+    // (lfm2_moe, moe_engine=htp): gate and up fused into one
+    // [2 * inter, hidden] weight, as LFM2's experts.
     for (size_t expert = 0; expert < model.num_experts; ++expert) {
       const std::string expert_prefix =
         prefix + "_expert" + std::to_string(expert);
@@ -1222,23 +1455,23 @@ void writeLfm2Moe(TensorWriter &writer, const Lfm2MoePlan &model,
       // (weight_dtype=FP32 in the graph), out_proj comes back to hidden_size.
       writer.writeFc(model.hidden_size,
                      checkedMultiply(3, model.conv_dim, prefix + "_conv_in"),
-                     quant.fc_dtype, prefix + "_conv_in_proj");
+                     quant.fc_dtype, prefix + "_conv_in_proj", true);
       writer.copyFp32(
         tensorElements(model.conv_l_cache, model.conv_dim, prefix + "_conv"),
         prefix + "_conv_conv");
       writer.writeFc(model.conv_dim, model.hidden_size, quant.fc_dtype,
-                     prefix + "_conv_out_proj");
+                     prefix + "_conv_out_proj", true);
     } else {
       writer.writeFc(model.hidden_size, query_width, quant.fc_dtype,
-                     prefix + "_wq");
+                     prefix + "_wq", true);
       writer.copyFp32(model.head_dim, prefix + "_q_norm");
       writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
-                     prefix + "_wk");
+                     prefix + "_wk", true);
       writer.copyFp32(model.head_dim, prefix + "_k_norm");
       writer.writeFc(model.hidden_size, kv_width, quant.fc_dtype,
-                     prefix + "_wv");
+                     prefix + "_wv", true);
       writer.writeFc(query_width, model.hidden_size, quant.fc_dtype,
-                     prefix + "_attention_out");
+                     prefix + "_attention_out", true);
     }
 
     writer.copyFp32(model.hidden_size, prefix + "_ffn_norm");
@@ -1246,11 +1479,11 @@ void writeLfm2Moe(TensorWriter &writer, const Lfm2MoePlan &model,
     if (layer < model.num_dense_layers) {
       // Dense SwiGLU FFN, in NNTrainer's historical up, gate, down order.
       writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                     prefix + "_ffn_up");
+                     prefix + "_ffn_up", true);
       writer.writeFc(model.hidden_size, model.intermediate_size, quant.fc_dtype,
-                     prefix + "_ffn_gate");
+                     prefix + "_ffn_gate", true);
       writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
-                     prefix + "_ffn_down");
+                     prefix + "_ffn_down", true);
     } else {
       // Router gate and expert bias are never quantized: Lfm2MoELayer::save
       // forces both to DataType::NONE regardless of the requested dtype, and
@@ -1341,8 +1574,17 @@ void copyAuxiliaryFiles(const std::filesystem::path &model_dir,
 void writeOutputConfig(const std::filesystem::path &model_dir,
                        const std::filesystem::path &output_dir,
                        const std::string &output_bin,
-                       const QuantizationPlan &quant, json nntr_cfg) {
+                       const QuantizationPlan &quant, json nntr_cfg,
+                       const std::string &fc_wh_bin) {
   nntr_cfg["model_file_name"] = output_bin;
+  // [#225] Only a run that wrote the sidecar names it; a stale pair copied
+  // from the source config would point the loader at another file.
+  nntr_cfg.erase("fc_wh_file_name");
+  nntr_cfg.erase("fc_wh_format");
+  if (!fc_wh_bin.empty()) {
+    nntr_cfg["fc_wh_file_name"] = fc_wh_bin;
+    nntr_cfg["fc_wh_format"] = nntrainer::FCWH_FORMAT;
+  }
   nntr_cfg["model_tensor_type"] =
     std::string(dtypeName(quant.fc_dtype)) + "-FP32";
   nntr_cfg["fc_layer_dtype"] = dtypeName(quant.fc_dtype);
@@ -1368,6 +1610,48 @@ void writeOutputConfig(const std::filesystem::path &model_dir,
   file << nntr_cfg.dump(4) << '\n';
 }
 
+/**
+ * @brief [#225] Closes the sidecar: each entry's key from its Q4_0 bytes in
+ *        the finished main file, then the header into the room enableFcWh
+ *        reserved, then the size check.
+ */
+void finishFcWh(std::vector<nntrainer::FcWhEntry> &entries, uint32_t count,
+                const std::filesystem::path &main_path, std::ofstream &sidecar,
+                const std::filesystem::path &sidecar_path) {
+  if (entries.size() != count) {
+    throw std::runtime_error(
+      "FC WH sidecar: the walk wrote " + std::to_string(entries.size()) +
+      " images, the dry run counted " + std::to_string(count));
+  }
+  std::ifstream main(main_path, std::ios::binary);
+  for (auto &e : entries) {
+    std::vector<char> q4(quantizedSize(DType::Q4_0, e.N, e.K, true, e.name));
+    main.seekg(static_cast<std::streamoff>(e.q4_off));
+    main.read(q4.data(), static_cast<std::streamsize>(q4.size()));
+    if (!main)
+      throw std::runtime_error(std::string("FC WH sidecar: cannot re-read ") +
+                               e.name + " from " + main_path.string());
+    e.key = nntrainer::fcWhKey(q4.data(), q4.size());
+  }
+  const uint64_t end = entries.empty()
+                         ? nntrainer::fcWhHeaderBytes(count)
+                         : entries.back().off + entries.back().bytes;
+  sidecar.seekp(0);
+  const uint32_t version = nntrainer::FCWH_VERSION;
+  sidecar.write(nntrainer::FCWH_MAGIC, sizeof(nntrainer::FCWH_MAGIC));
+  sidecar.write(reinterpret_cast<const char *>(&version), sizeof(version));
+  sidecar.write(reinterpret_cast<const char *>(&count), sizeof(count));
+  sidecar.write(reinterpret_cast<const char *>(entries.data()),
+                static_cast<std::streamsize>(entries.size() *
+                                             sizeof(nntrainer::FcWhEntry)));
+  sidecar.close();
+  if (!sidecar || std::filesystem::file_size(sidecar_path) != end) {
+    throw std::runtime_error("Failed to finalize " + sidecar_path.string());
+  }
+  std::cout << "  FC WH sidecar: " << sidecar_path << " (" << count
+            << " weights, " << (end >> 20) << " MiB)\n";
+}
+
 void printUsage(const char *program) {
   std::cout
     << "Usage: " << program << " <model_path> [options]\n\n"
@@ -1384,11 +1668,35 @@ void printUsage(const char *program) {
     << "  --output_bin <name>   Output .bin filename\n"
     << "  --config <path>       Read target dtype fields and filename from an "
        "nntr config\n"
+    << "  --moe_palette_g <n>   Restrict MoE expert QS4CX_WH codes to four "
+       "levels per\n"
+    << "                        n input values (0 = off, 'max' = all of K: "
+       "one\n"
+    << "                        palette a tensor, QS2CX_WH's). Still\n"
+    << "                        writes 4-bit bytes: this is the perplexity "
+       "of a 2-bit\n"
+    << "                        expert, measurable on today's kernel\n"
+    << "  --moe_palette_scope <s>  group (default) or colgroup (accuracy "
+       "control only)\n"
+    << "  --moe_palette_on <t>  gate_up, down, or both (default)\n"
+    << "  --moe_palette_refit <b>  on (default) or off -- least-squares "
+       "w_scale for\n"
+    << "                        the restricted codes\n"
+    << "  --fc_wh_sidecar       LFM2-MoE / Gemma4-MoE, --fc_dtype Q4_0: "
+       "also write\n"
+    << "                        the FC weights as QS4CX_WH images into <bin "
+       "stem>_fcwh.bin\n"
+    << "                        (the HTP reads them; fc_wh_file_name in "
+       "nntr_config)\n"
     << "  -h, --help            Show this help\n\n"
     << "Architectures: Qwen3MoeForCausalLM, Lfm2MoeForCausalLM, "
        "Gemma4ForCausalLM,\n"
     << "               Gemma4ForConditionalGeneration\n"
-    << "Supported dtypes: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH\n"
+    << "Supported dtypes: FP32, Q4_0, Q4_K, Q6_K, QS4CX, QS4CX_WH, "
+       "QS2CX_WH\n"
+    << "QS2CX_WH is QS4CX_WH at two bits: four int4 codes a tensor, expanded\n"
+    << "back to the int4 lattice in the DSP's VTCM. Half the bytes, same\n"
+    << "arithmetic after the matmul.\n"
     << "QS4CX_WH is QS4CX pre-arranged into HMX weight tiles: it loads "
        "without\n"
     << "the on-device conversion that costs 48% of prefill, and no CPU "
@@ -1419,6 +1727,8 @@ int run(int argc, char **argv) {
   std::string target_isa = "DEFAULT";
   std::string output_bin;
   std::filesystem::path target_config;
+  PaletteOptions palette;
+  bool fc_wh_sidecar = false;
   // Which dtypes the command line actually asked for, so --config fills in
   // the rest instead of overruling them. Without this,
   // "--config old.json --moe_dtype QS4CX_WH" quietly quantizes to whatever
@@ -1450,7 +1760,28 @@ int run(int argc, char **argv) {
       output_bin = requireValue(argument);
     else if (argument == "--config")
       target_config = requireValue(argument);
-    else if (argument == "--help" || argument == "-h") {
+    else if (argument == "--moe_palette_g") {
+      const std::string v = requireValue(argument);
+      palette.group_k = (v == "max") ? UINT32_MAX : (uint32_t)std::stoul(v);
+    } else if (argument == "--moe_palette_scope") {
+      const std::string v = requireValue(argument);
+      if (v != "group" && v != "colgroup")
+        throw std::invalid_argument("--moe_palette_scope: group or colgroup");
+      palette.per_column = (v == "colgroup");
+    } else if (argument == "--moe_palette_on") {
+      const std::string v = requireValue(argument);
+      if (v != "gate_up" && v != "down" && v != "both")
+        throw std::invalid_argument("--moe_palette_on: gate_up, down or both");
+      palette.on_gate_up = (v != "down");
+      palette.on_down = (v != "gate_up");
+    } else if (argument == "--moe_palette_refit") {
+      const std::string v = requireValue(argument);
+      if (v != "on" && v != "off")
+        throw std::invalid_argument("--moe_palette_refit: on or off");
+      palette.refit_scale = (v == "on");
+    } else if (argument == "--fc_wh_sidecar") {
+      fc_wh_sidecar = true;
+    } else if (argument == "--help" || argument == "-h") {
       printUsage(argv[0]);
       return EXIT_SUCCESS;
     } else {
@@ -1533,6 +1864,14 @@ int run(int argc, char **argv) {
     throw std::invalid_argument(
       "Gemma4 MoE FC dtype must be FP32, Q4_0 or QS4CX");
   }
+  // [#225] The sidecar is the HTP prefill's copy of the CPU's Q4_0 FCs: it
+  // is keyed by those Q4_0 bytes, and only the LFM2 and Gemma4 MoE walks
+  // mark their FCs.
+  if (fc_wh_sidecar &&
+      ((!is_lfm2_moe && !is_gemma4_moe) || quant.fc_dtype != DType::Q4_0)) {
+    throw std::invalid_argument("--fc_wh_sidecar needs Lfm2MoeForCausalLM or "
+                                "a Gemma4 MoE, and --fc_dtype Q4_0");
+  }
   const std::string input_bin =
     nntr_cfg.at("model_file_name").get<std::string>();
   const std::string input_ext =
@@ -1579,10 +1918,10 @@ int run(int argc, char **argv) {
     uint64_t header_len = 0;
     for (int i = 7; i >= 0; --i)
       header_len = (header_len << 8) | len_bytes[i];
-    data_start = 8 + header_len;
-    if (data_start >= std::filesystem::file_size(input_path))
+    if (header_len >= std::filesystem::file_size(input_path) - 8)
       throw std::runtime_error("safetensors header length is past the end of " +
                                input_path.string());
+    data_start = 8 + header_len;
     std::string header_json(static_cast<size_t>(header_len), '\0');
     input.read(header_json.data(), static_cast<std::streamsize>(header_len));
     if (!input)
@@ -1591,21 +1930,42 @@ int run(int argc, char **argv) {
     // Named, not a temporary: items() hands back a proxy that refers to the
     // object, and a temporary one dies before the loop reads it.
     const json header = json::parse(header_json);
+    // The walk reads FP32 positionally, so the header must describe exactly
+    // that: F32 tensors tiling the payload from byte 0 with no gap or
+    // overlap. An HF checkpoint (BF16) or a hand-edited header is named
+    // here rather than as a size mismatch blamed on the layout.
     std::vector<std::pair<uint64_t, SourceTensor>> at;
     for (const auto &entry : header.items()) {
       if (entry.key() == "__metadata__")
         continue;
+      if (entry.value().at("dtype").get<std::string>() != "F32")
+        throw std::runtime_error(entry.key() + " in " + input_path.string() +
+                                 " is " + entry.value().at("dtype").dump() +
+                                 "; this tool reads an F32 .safetensors only");
       const auto &offsets = entry.value().at("data_offsets");
       const uint64_t begin = offsets.at(0).get<uint64_t>();
       const uint64_t end = offsets.at(1).get<uint64_t>();
+      if (end < begin)
+        throw std::runtime_error(entry.key() + " ends before it begins in " +
+                                 input_path.string());
       at.emplace_back(
         begin, SourceTensor{entry.key(), static_cast<size_t>(end - begin)});
     }
+    if (at.empty())
+      throw std::runtime_error(input_path.string() + " lists no tensors");
     std::sort(at.begin(), at.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
     source_tensors.reserve(at.size());
-    for (auto &pair : at)
+    uint64_t next = 0;
+    for (auto &pair : at) {
+      if (pair.first != next)
+        throw std::runtime_error(
+          pair.second.name + " starts at payload byte " +
+          std::to_string(pair.first) + ", the tensor before it ends at " +
+          std::to_string(next) + ": the header does not tile the payload");
+      next = pair.first + pair.second.bytes;
       source_tensors.push_back(std::move(pair.second));
+    }
     input.seekg(static_cast<std::streamoff>(data_start));
   }
   std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
@@ -1623,6 +1983,15 @@ int run(int argc, char **argv) {
             << "  Embedding dtype: " << dtypeName(quant.embedding_dtype) << '\n'
             << "  LM head dtype: " << dtypeName(quant.lmhead_dtype) << '\n'
             << "  Target ISA: " << isaName(quant.target_isa) << '\n';
+  if (palette.active()) {
+    std::cout
+      << "  MoE palette: 4 levels per "
+      << (palette.group_k == UINT32_MAX ? std::string("all of K")
+                                        : std::to_string(palette.group_k))
+      << (palette.per_column ? " per column" : " shared by columns") << ", on "
+      << (palette.on_gate_up ? (palette.on_down ? "both" : "gate_up") : "down")
+      << ", w_scale refit " << (palette.refit_scale ? "on" : "off") << '\n';
+  }
 
   const auto walk = [&](TensorWriter &tensor_writer) {
     if (is_qwen3_moe)
@@ -1640,9 +2009,13 @@ int run(int argc, char **argv) {
   // same code, consuming nothing, and compare the total against the file.
   const uintmax_t source_bytes =
     std::filesystem::file_size(input_path) - data_start;
+  const std::vector<SourceTensor> *source_header =
+    source_tensors.empty() ? nullptr : &source_tensors;
   TensorWriter probe(input, output, quant.target_isa,
                      static_cast<size_t>(source_bytes), /*dry_run=*/true,
-                     source_tensors.empty() ? nullptr : &source_tensors);
+                     source_header);
+  if (fc_wh_sidecar)
+    probe.enableFcWh(nullptr, 0);
   walk(probe);
   if (probe.expectedInputBytes() != source_bytes) {
     const bool file_is_short = probe.expectedInputBytes() > source_bytes;
@@ -1672,15 +2045,31 @@ int run(int argc, char **argv) {
   }
 
   TensorWriter writer(input, output, quant.target_isa, 0, /*dry_run=*/false,
-                      source_tensors.empty() ? nullptr : &source_tensors);
+                      source_header);
+  writer.setPalette(palette);
+  std::string fc_wh_bin;
+  std::ofstream sidecar;
+  if (fc_wh_sidecar) {
+    // Named after the main file: its keys are that file's Q4_0 bytes (that
+    // ISA's repack), so two runs into one directory must not share it.
+    fc_wh_bin = std::filesystem::path(output_bin).stem().string() + "_fcwh.bin";
+    sidecar.open(output_dir / fc_wh_bin, std::ios::binary | std::ios::trunc);
+    if (!sidecar.is_open())
+      throw std::runtime_error("Failed to open " + fc_wh_bin);
+    writer.enableFcWh(&sidecar, probe.fcWhCount());
+  }
   walk(writer);
   output.close();
   if (!output)
     throw std::runtime_error("Failed to finalize " + output_path.string());
+  if (fc_wh_sidecar)
+    finishFcWh(writer.fcWhEntries(), probe.fcWhCount(), output_path, sidecar,
+               output_dir / fc_wh_bin);
 
   if (!std::filesystem::equivalent(model_dir, output_dir))
     copyAuxiliaryFiles(model_dir, output_dir);
-  writeOutputConfig(model_dir, output_dir, output_bin, quant, nntr_cfg);
+  writeOutputConfig(model_dir, output_dir, output_bin, quant, nntr_cfg,
+                    fc_wh_bin);
 
   const uintmax_t input_size = source_bytes;
   const uintmax_t output_size = std::filesystem::file_size(output_path);

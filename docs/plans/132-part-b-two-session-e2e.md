@@ -1,5 +1,7 @@
 # 132 — PR 2 Part B: the two-session NPU end-to-end decode (decision D = (1) + (2))
 
+> Superseded by #211 (one PD only, `211-one-pd-only.md`); kept as the record of the design and its measurements.
+
 Issue: dlwlzzero/nntrainer#132 (p1). Decision D (user, 2026-09-30): **(1)**
 Part B is the two-session end-to-end design of `178-second-dsp-session.md`
 §3 (S1 = router + MoE, S2 = everything else, one call per session per

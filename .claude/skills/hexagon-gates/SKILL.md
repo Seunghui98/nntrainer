@@ -37,8 +37,8 @@ bash test/htp/host/run_host_checks.sh
 bash tools/htp_syntax_check.sh
 bash test/htp/host/run_inproc_e2e.sh      # SDK headers + qaic sourced; no device
 ```
-Pass: every gtest `[  PASSED  ]` — 6 for `*Lfm2Moe*` (3 differential + 3
-tiny-model), none skipped; `run_host_checks.sh` prints `ALL CHECKS PASS`
+Pass: every gtest `[  PASSED  ]` — 7 for `*Lfm2Moe*` (3 differential + 3
+tiny-model + `FcWhSidecarMatchesWhQuantize`, since PR #255), none skipped; `run_host_checks.sh` prints `ALL CHECKS PASS`
 and `WORKER POOL LANES OK`; the syntax check exits 0; `run_inproc_e2e.sh`
 prints `E2E eval golden … bit_identical=1`, `E2E eval hmx-loop …
 bit_identical=1`, `E2E tokens htp==cpu 8/8`, `E2E eval cpu … min_snr_db=`
@@ -83,12 +83,16 @@ a device gtest second.
 
 ```
 ./test/htp/build.sh                       # v79; HEXKL_ROOT / HEXKL_SDK_VER from env.sh
+HEX_ARCH=v81 ./test/htp/build.sh          # v81 (S26 Ultra); or export before sourcing env.sh
 md5sum test/htp/build/libnntr_hvx_skel.so
 ```
 Pass: `test/htp/build/libnntr_hvx_skel.so` exists, `-Wall -Werror` clean,
 and `build.sh` printed `UNDEFINED SYMBOLS OK (<n> runtime imports)` (a
 project symbol left out of `SRCS` links fine and fails on the device with
-`0x80000406`, #97; the guard prints the offending names and exits 1).
+`0x80000406`, #97; the guard prints the offending names and exits 1) and
+`ARCH OK (V79)` / `ARCH OK (V81)` (the ELF flags match `HEX_ARCH`; both
+arches write the same file name, #168). On `htp_decode` a change to the
+DSP sources passes this rung for both arches.
 `build.sh` regenerates the FastRPC stub/skel from `test/htp/nntr_hvx.idl`;
 when the IDL changed, the host side must be rebuilt too (rung 1 and 3),
 or the device fails with `AEE_EBADPARM (0x8000040E)`. Variants:
@@ -151,11 +155,29 @@ Fresh checkout or new `git worktree` (the #105 sitting's rebuild lost
   point at another package.
 A handoff's rebuild recipe lists these four lines.
 
-## 4. Device (user only)
+## 4. Device
 
-Never run here. Write a handoff (`hexagon-handoff` skill), set
+On `htp_decode` the agent runs the sitting itself (contract §4.1 adb row,
+user 2026-09-30): `adb -s <serial>` with the serial the issue or the user
+names, never a default; the handoff (`hexagon-handoff` skill) is still
+written first and filled as the record. Elsewhere: write the handoff, set
 `state:needs-measurement`, stop. Performance conclusions are drawn only
 from filled handoff tables read as an A/B inside one sitting.
+
+**The phone is shared: take the sitting lock first (user, 2026-10-06).**
+Before any `adb push` / `adb shell` that runs a test or a model, and
+before a device gtest in rung 3:
+
+```
+tools/htp/sitting_lock.sh take <serial> "<issue#> <what>" <expect_min>   # exit 1 = someone else holds it: do not touch the phone, report the holder
+...                                                                      # the sitting
+tools/htp/sitting_lock.sh release <serial>                               # on every exit path, failure included
+```
+
+The lock is `/data/local/tmp/nntrainer/.sitting.lock` on the device and
+holds `owner= purpose= start= expect_min=`. `status <serial>` prints it.
+Never delete another owner's lock; if it looks stale (start older than
+expect_min by hours), say so to the user instead.
 
 ## Kernel review list (apply to any `test/htp/*.c`, `htp_backend/**` change)
 

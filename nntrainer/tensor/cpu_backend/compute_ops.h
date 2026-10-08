@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
@@ -168,6 +169,24 @@ public:
                               const unsigned int ldb, float *C,
                               const unsigned int ldc);
 
+  /**
+   * @brief One activation against several q4_0 weights in a single call.
+   *
+   * Shares the online q8_0 quantization of the activation and a single
+   * thread barrier across all weights, instead of repeating both per weight.
+   * Only worthwhile for M > 1; callers must query the predicate first.
+   *
+   * @note @a matAdata holds the weights and @a matBdata the activation --
+   * the reverse of gemm_q4_0_fp32's naming, kept for source compatibility
+   * with the accelerator backends that introduced this entry point.
+   */
+  virtual bool supports_gemm_q4_0_batch_fp32() const { return false; }
+  virtual void gemm_q4_0_batch_fp32(std::vector<void *> matAdata,
+                                    float *matBdata,
+                                    std::vector<float *> matCdata,
+                                    unsigned int M, std::vector<unsigned int> N,
+                                    unsigned int K);
+
   // ===========================================================================
   // Quantized weight packing / quantization
   // ===========================================================================
@@ -203,13 +222,6 @@ public:
   // CPU subclasses leave both the impl (default-throw) and predicate
   // (default false) untouched. Accelerator subclasses override both.
   // ===========================================================================
-  virtual bool supports_gemm_q4_0_batch_fp32() const { return false; }
-  virtual void gemm_q4_0_batch_fp32(std::vector<void *> matAdata,
-                                    float *matBdata,
-                                    std::vector<float *> matCdata,
-                                    unsigned int M, std::vector<unsigned int> N,
-                                    unsigned int K);
-
   // gemm_q4_0_batch_fp32 with the RMSNorms a block runs around its
   // projections folded into the same accelerator call (doc 57 section 5
   // step 4), so the rows do not leave the accelerator for them: pre_gamma
@@ -364,7 +376,10 @@ public:
   // this model -- and copying that per layer is the kind of cost this call
   // exists to remove.
   //
-  // weights_wh says the nibbles are already in the HMX weight-tile layout
+  // w_bits says how the nibbles are stored: 0 = plain QS4CX (the backend
+  // converts), 4 = QS4CX_WH (already in the HMX weight-tile layout),
+  // 2 = QS2CX_WH (half that, expanded on the DSP -- doc 54); 1 reads as 4
+  // (#4415's lfm2_moe passes its bool weights_wh here)
   // (htp_wh_layout.h) with a per-output-channel column sum after the scales,
   // so the implementation registers them as they are instead of converting
   // and baking. It is a flag rather than a colsum pointer because the sums
@@ -382,7 +397,7 @@ public:
     const std::vector<unsigned int> &row_count,
     const std::vector<float> &row_weight, const float *act, float *out,
     unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
-    bool weights_wh, bool gelu = false, const float *pre_gamma = nullptr,
+    unsigned int w_bits, bool gelu = false, const float *pre_gamma = nullptr,
     const float *post_gamma = nullptr, float eps = 0.0f);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
@@ -409,6 +424,27 @@ public:
     return false;
   }
 
+  // [plan 201 S4] One f32 parameter of the decode list's op @a op (which:
+  // HTP_GRAPH_PARAM_*, n floats), handed by the model at load by the
+  // weight's name instead of by its layer's hook order (Gemma 4 runs its
+  // two FFN branches in the other order than its list). The backend checks
+  // the length now, keeps the pointer and binds it at graph init, so the
+  // data must stay where it is until the first decode token (a resident
+  // weight, or a buffer the model owns); the op's hook then binds
+  // nothing. False when the backend takes none.
+  virtual bool set_decode_graph_param(unsigned op, unsigned which,
+                                      const float *data, unsigned n) {
+    (void)op;
+    (void)which;
+    (void)data;
+    (void)n;
+    return false;
+  }
+  // [plan 201 S4] The model's gated activation for the accelerator's MoE
+  // experts and dense FFN: true = GeGLU (gelu_tanh(gate) * up, Gemma 4),
+  // false = SwiGLU (the default). Set before the first MoE call.
+  virtual void set_moe_geglu(bool on) { (void)on; }
+
   // [#130] The per-token hook a CPU layer calls at one decode row before
   // running its own kernel: kind is the op kind of htp_graph_desc.h, pos
   // the absolute token position, in / out the row (in may be null when
@@ -418,7 +454,9 @@ public:
   // 0 when the op is not resident (the layer runs its CPU path), 1 when
   // out was written by the accelerator, 2 when the attention cache must
   // be seeded first: the layer then hands rows [0, pos) of its KV cache to
-  // decode_kv_seed_fp32 and calls again. Plain scalars and pointers: core
+  // decode_kv_seed_fp32 and calls again; [plan 201 S4] 3 when an attention
+  // hook brought no RoPE table and its ROPE op has none bound: the layer
+  // builds its table and calls again. Plain scalars and pointers: core
   // gains no accelerator type.
   virtual int decode_op_fp32(unsigned kind, unsigned pos, const float *in,
                              unsigned in_len, float *out, unsigned out_len,
@@ -456,6 +494,10 @@ public:
   // logits. take_decode_token_id: the id of the last decode token whose
   // logits did not come back, once; false when there is none.
   virtual bool finish_decode_graph_q4_0() { return false; }
+  // [#234 P4] True when the one-PD decode list (NNTR_HTP_E2E=1) holds Q4_0
+  // weights it has not bound yet: the loader then hands this backend the
+  // FC WH sidecar (set_fc_wh_file) even when no layer keyed an FC to it.
+  virtual bool has_decode_graph_q4_0() { return false; }
   virtual void set_decode_logits(bool want) { (void)want; }
   // [#132 Part B E3] The ids the caller's greedy pick sets to -inf (its
   // bad words): an id taken with take_decode_token_id skips them too.
@@ -483,12 +525,12 @@ public:
   // register returns false and the caller moves on.
   virtual bool register_qs4cx_weight(void *data, const float *scale,
                                      unsigned int K, unsigned int N,
-                                     bool weights_wh) {
+                                     unsigned int w_bits) {
     (void)data;
     (void)scale;
     (void)K;
     (void)N;
-    (void)weights_wh;
+    (void)w_bits;
     return false;
   }
 
@@ -505,6 +547,15 @@ public:
     return false;
   }
 
+  // [#225] The FC WH sidecar (htp_wh_layout.h) the model names in
+  // nntr_config.json's fc_wh_file_name: the three register_q4_0_* hooks
+  // then take each Q4_0 weight's image from it instead of re-quantizing.
+  // Called once, before them. false: this backend does not read one.
+  virtual bool set_fc_wh_file(const char *path) {
+    (void)path;
+    return false;
+  }
+
   // A QS4CX_WH expert pair the loader never read (a virtual weight, doc
   // 52), and where its bytes are: gate_up [K, 2 * inter] at off_gu and down
   // [inter, N_out] at off_dn in the model file behind fd, each laid out as
@@ -517,6 +568,7 @@ public:
     int fd;
     size_t off_gu, off_dn;
     unsigned int K, inter, N_out;
+    unsigned int w_bits = 4; /**< [plan 229] 4 QS4CX_WH, 2 QS2CX_WH */
   };
 
   // How many expert slots the caller will ever hold at once (the LRU's
@@ -563,6 +615,25 @@ public:
   }
   virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() {
     return {};
+  }
+
+  // [plan 201 S1] The pool's policy for the per-token entry's miss path:
+  // makes every key of need resident, calling evict for each key that
+  // leaves (before any load) and load for each that must come in -- the
+  // layer's ExpertLru::acquire.
+  using ExpertPoolFn =
+    std::function<void(const std::vector<const void *> &need,
+                       const std::function<void(const void *)> &load,
+                       const std::function<void(const void *)> &evict)>;
+
+  // [plan 201 S1] One MoE layer's experts (all of them, expert order), in
+  // layer order across calls, and the pool's policy: with NNTR_HTP_E2E=1
+  // the backend serves S1's misses from these while a decode token runs.
+  // A backend without the per-token entry ignores it.
+  virtual void set_decode_moe_experts(const std::vector<ExpertFileDesc> &all,
+                                      const ExpertPoolFn &pool) {
+    (void)all;
+    (void)pool;
   }
 
   // Undoes the above for one expert: both handles released, the slot back

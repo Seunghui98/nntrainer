@@ -87,33 +87,111 @@
 #                              bit_identical lines above hold with it)
 #   E2E fwd tiny all-kinds refused: AEE_ESCHEMENOTSUPPORTED   (head_dim 8:
 #                              no one-call token on the hd8 fixture)
-# and, since #132 Part B E3, the same token on two sessions in this process
-# (NNTR_HTP_E2E=1: S1 the router and the experts, S2 the rest on a lite
-# open with no VTCM, its FC set in an attached arena, the MoE rounds over
-# the mailbox page; one dspqueue packet per session per token). Not the
-# device's two PDs -- one address space, no cache maintenance, no transport
+# and, since #132 Part B E3 (one PD since #211), the one-PD token in this
+# process (NNTR_HTP_E2E=1: every kind, the FC set on S1's arena chunks, the
+# pool's miss rounds on the page; one dspqueue packet a token). Not the
+# device's PD -- one address space, no cache maintenance, no transport
 # time -- but every ARM-side step of the device path:
 #   E2E eval e3==e1-hd64 / -lfm25 ... bit_identical=1  (logits, the Android-
 #                              order E1 run of the same model)
-#   E2E fwd hd64 / lfm25 e3 calls/token=1.00 hops/token=4.00 / 8.00
-#                              timeouts=0/0 id_mismatch=0 ok
+#   E2E fwd hd64 / lfm25 e3 calls/token=1.00 hops/token=0.00
+#                              timeouts=0 id_mismatch=0 unmap_fail=0 ok
 #   E2E tokens e3-run==e1-run-lfm25 8/8 id_only=1      (run(): only the id
 #                              comes back, the CPU takes it)
 #   E2E tokens e3-run==e1-run-lfm25-ban 8/8 id_only=1  (bad_word_ids = the
-#                              token the unbanned run picks: S2's argmax
+#                              token the unbanned run picks: the DSP's argmax
 #                              skips it, LM_BAN, as the CPU's -inf does)
 #   E2E ppl-decode e3==e1-hd64 steps=7 identical=1     (NNTR_PPL_DECODE
 #                              forced on E1's path: the logits come back)
 #   E2E teardown 25off / 25e3 arena chunks unmapped n/n mapped_kib=0
 #                              freed_while_mapped=0  (E5i: the S1 arena
 #                              released on the DSP, then unmapped, before
-#                              the close; one session and two)
-#   E2E arena retry cap=100 refused=2 bit_identical=1  (E5g: a boot whose
+#                              the close; hybrid and E2E)
+#   E2E arena retry cap=200 refused=1 bit_identical=1  (E5g: a boot whose
 #                              last 256 MiB window is taken; the stand-in
-#                              refuses maps past 100 MiB and keeps a refused
-#                              fd, as the driver did; S1's chunk halves to
-#                              64 MiB and the run equals the uncapped one)
-# and, since #194 S1 (htp_moe_ppl), the same two-session token with lever
+#                              refuses maps past 200 MiB and keeps a refused
+#                              fd, as the driver did; the MoE chunk halves
+#                              to 128 MiB, the FC set's 64 fits beside it
+#                              (#211: one PD holds both), and the run
+#                              equals the uncapped one)
+#   E2E e3 pool C=2 hd64 / C=1 lfm25 / C=2 lfm25 == e3 bit_identical=1
+#                              misses=<n> calls/token=1.00 timeouts=0
+#                              (plan 201 S1: NNTR_MOE_CACHE_EXPERTS with
+#                              NNTR_HTP_E2E=1, the miss rounds served by the
+#                              ARM's pool server; logits against the
+#                              all-resident E run of the same fixture)
+#   E2E e2e pds=2 refused ok   (#211: NNTR_HTP_E2E_PDS is a guard, the
+#                              two-PD path is gone)
+# and, since plan 201 S4, the Gemma 4 MoE fixture at head_dim 64 / global
+# 128 (gemma4_moe_tiny_hd64: two KV cache widths, k = v full layer,
+# seeded norms and layer_scalar, the final soft-cap) through #4296's CPU
+# model (gemma4_moe, QS4CX experts), the HTP MoE layer alone (lfm2_moe's
+# softmax router, QS4CX_WH, GeGLU) and NNTR_HTP_E2E=1 (the list built
+# after load, its parameters handed by name), all-resident and pooled:
+#   E2E gemma64 tokens off==cpu 8/8 expected_mismatch=0   (the HTP MoE
+#                              layer against #4296's CPU one)
+#   E2E eval gemma64-off-vs-cpu ... min_snr_db=<x>     (printed)
+#   E2E fwd gemma64 e3 calls/token=1.00 attn_caches=2 timeouts=0 ok
+#   E2E eval gemma64-e3 ... min_snr_db=<x>             (x >= 20 gated, vs the
+#                              off run; measured 27.6, a swapped gamma,
+#                              router scale, q | k gamma, up / gate or a
+#                              dropped layer_scalar reads 0-10)
+#   E2E tokens gemma64 e3==off 8/8 expected_mismatch=0
+#   E2E e3 pool C=2 gemma64 == e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+# and, since plan 229 S1 (#4410's QS2CX_WH: 2-bit expert codes and a
+# per-tensor palette of four int4 values), the one-PD token on 2-bit
+# experts against the 4-bit model restricted to the same four levels
+# (QS4CX_WH --moe_palette_g max, the "palette twin"): prefill on the HMX
+# path's VTCM expansion, decode on the u8i2 LUT GEMV, the same int32 sums,
+# so every MoE call and every logit equal the twin's; and through the pool:
+#   E2E 2bit lfm25 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
+#   E2E tokens 2bit==twin-lfm25 8/8 expected_mismatch=0
+#   E2E 2bit pool C=1 / C=2 lfm25 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+#   E2E 2bit gemma64 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
+#   E2E tokens 2bit==twin-gemma64 8/8 expected_mismatch=0
+#   E2E 2bit pool C=2 gemma64 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+#   E2E keys lfm25 prefill-moved=1 htp_fc_rows=<n> e3==e1 bit_identical=1 pool C=2
+#     bit_identical=1 misses=<n> calls/token=1.00 q4m1_handles=23
+#     cpu-fc-skipped=<n> per_token=10 ok
+#                              (#222: the config of record's engine keys and
+#                              init_seq_len 1024 on the lfm25 fixture)
+#   E2E keys fcwh-lfm25 handles=<n> arena_kib=<n> heap=0 requant=0 main=same
+#     heap-path heap_kib=<n> e3 calls/token=1.00 ok
+#   E2E eval fcwh==wh-lfm25 ... bit_identical=1
+#   E2E eval fcwh-nokeys==off-lfm25 ... bit_identical=1 ... sidecar=unopened ok
+#   E2E keys lfm25-p2x prompt=1024 conv-chunks=512 ... logits bit_identical=1 ok
+#                              (#225: the keys reading the FC WH sidecar,
+#                              its images in the arena and through the heap
+#                              path; P1024 with the conv block in 512-row
+#                              chunks, MoE and FC one call each since #260)
+#   E2E quant fcwh-gemma64 main=same images=<n> ok
+#                              (#234 P3: the Gemma 4 MoE writer's sidecar:
+#                              main .bin byte-identical to the flagless
+#                              run's, one image per graph FC -- 7 a layer,
+#                              6 on a full-attention layer with
+#                              attention_k_eq_v, which has no _wv)
+#   E2E fwd lfm25 fcwh kinds=all calls/token=1.00 q4m1_handles=1 wh_handles=28
+#     e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=<n> ok
+#   E2E eval e3fcwh-lfm25-vs-off ... min_snr_db=<x>   (printed, not gated)
+#   E2E tokens e3fcwh==off-lfm25 8/8 expected_mismatch=0
+#   E2E ppl-decode e3fcwh-lfm25 off=<ppl> wh=<ppl> delta=<%> top1=7/7
+#                              (#225 PR 2: the one-PD token's FC and dense
+#                              FFN on the sidecar's WH handles, the lm_head
+#                              alone Q4M1; NNTR_PPL_DECODE forced on the
+#                              hybrid's continuation)
+#   E2E fwd gemma64 fcwh kinds=all calls/token=1.00 attn_caches=2
+#     q4m1_handles=1 wh_handles=17 ok
+#   E2E eval gemma64-fcwh-vs-cpu ... min_snr_db=<x>   (printed, not gated)
+#   E2E tokens gemma64-fcwh==off <n>/8 expected_mismatch=<m>   (the policy)
+#   E2E eval gemma64x-fcwh-vs-q4m1 ... min_snr_db=<x>  (x >= 20 gated)
+#   E2E tokens gemma64x-fcwh==q4m1 8/8 expected_mismatch=0
+#   E2E e3 pool C=2 gemma64-fcwh == e3 bit_identical=1 misses=<n> ...
+#     moe_dumps==sidecar-less files=<n> bit_identical=1
+#                              (#234 P4: the Gemma 4 sidecar model's one-PD
+#                              token, opened for the bind with no keyed FC;
+#                              gemma64x: the same fixture with int4-exact
+#                              FCs, so both sides hold the same weights)
+# and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
 #   E2E ppl-decode hd64 levers=0x2 e0=<ppl> l1=<ppl> delta=<%> ok   (|delta|
@@ -123,7 +201,7 @@
 #   E2E eval l1-lfm25 ... min_snr_db=<x>               (x >= 30 gated, vs E0;
 #                              bit_identical=0, else the lever is not wired)
 #   E2E levers banner e0=0x0 l1=0x2 ok
-#   E2E L0 wake split closes: disp s1=.. s2=.. s2_pkt=.. ret s2=.. clk_resid=..
+#   E2E L0 wake split closes: disp=.. pkt=.. ret=.. clk_resid=..
 #   E2E ppl-decode alts steps=7 ok                     (NNTR_PPL_DECODE_ALTS:
 #                              the step lines gain the ids' logits)
 # and, since #141 step 2, the M==1 MoE calls over dspqueue
@@ -152,6 +230,7 @@ GOLDEN="$HERE/golden/lfm2_moe_tiny"
 GOLDEN64="$HERE/golden/lfm2_moe_tiny_hd64"
 FIX25="$ROOT/test/unittest/models/causallm_reference/lfm2_moe_tiny_lfm25"
 GOLDEN25="$HERE/golden/lfm2_moe_tiny_lfm25"
+FIXG="$ROOT/test/unittest/models/causallm_reference/gemma4_moe_tiny_hd64"
 EVAL="python3 $ROOT/tools/htp/htp_dump_eval.py"
 PROMPT=16
 STEPS=8
@@ -184,6 +263,13 @@ if [ ! -f "$FIX64/nntr_lfm2_moe_tiny_fp32.bin" ]; then
   echo "  git checkout -- $FIX64/" >&2
   exit 1
 fi
+GENG="test/unittest/models/causallm_reference/generators/generate_gemma4_moe_reference.py"
+if [ ! -f "$FIXG/nntr_gemma4_moe_tiny_fp32.bin" ]; then
+  echo "E2E FAIL gemma hd64 fixture weights missing: run" >&2
+  echo "  python3 $GENG --hidden 128 --inter 64 --heads 2 --kv-heads 1 --head-dim 64 --global-head-dim 128 --global-kv-heads 1 --layer-types sliding_attention,sliding_attention,full_attention --max-pos 32 --sliding-window 8 --experts 8 --top-k 2 --moe-inter 32 --final-softcap 30 --random-layer-scalar --random-norms --router-scale 50 --seed 12 --out $FIXG" >&2
+  echo "  git checkout -- $FIXG/" >&2
+  exit 1
+fi
 if [ ! -f "$FIX25/nntr_lfm2_moe_tiny_fp32.bin" ]; then
   echo "E2E FAIL lfm25 fixture weights missing: run" >&2
   echo "  python3 $GEN --dim 2048 --n-heads 32 --n-kv-heads 8 --head-dim 64 --max-pos 2048 --layer-types conv,conv,attention,conv,attention,conv --num-dense 2 --rope-theta 5000000 --moe-inter 256 --out $FIX25" >&2
@@ -212,6 +298,7 @@ run_e2e() { # run_e2e <label> <model dir> <engine> <dump dir> <log> [args]
     --steps $STEPS --moe-engine "$engine" --dump "$dump" "$@" 2>&1 | tee "$log"
   grep -q '^E2E gen ' "$log" || { echo "E2E FAIL no gen line in $label"; exit 1; }
 }
+logits_only() { mkdir -p "$2" && cp "$1"/logits_*.f32 "$2/"; }
 calls_per_token() { # the backend's close-time summary line
   sed -n 's/.*forward calls=[0-9]* tokens=[0-9]* calls\/token=\([0-9.]*\).*/\1/p' "$1"
 }
@@ -294,9 +381,9 @@ done
 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS NNTR_HTP_FC_FEED=l2 \
   NNTR_INPROC_X86_Q8=1 \
   run_e2e hd64-e1l2 "$OUT/htp64q" htp "$OUT/dump_64e1l2" "$OUT/64e1l2.log" --max-seq 32
-# [#132 Part B E3] the two-session token (NNTR_HTP_E2E=1; its packets ride
-# dspqueue, so these runs set NNTR_HTP_DSPQ=1)
-echo "== [#132 Part B E3] hd64 / lfm25, NNTR_HTP_E2E=1 (two sessions)"
+# [#132 Part B E3, #211] the one-PD token (NNTR_HTP_E2E=1; its packets
+# ride dspqueue, so these runs set NNTR_HTP_DSPQ=1)
+echo "== [#132 Part B E3] hd64 / lfm25, NNTR_HTP_E2E=1 (one PD)"
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3 "$OUT/htp64q" htp "$OUT/dump_64e3" "$OUT/64e3.log" --max-seq 32
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
@@ -318,9 +405,184 @@ NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KIND
   run_e2e q64-e1ppl "$OUT/htp64q" htp "$OUT/dump_64e1ppl" "$OUT/64e1ppl.log" --max-seq 32 --run
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q64-e3ppl "$OUT/htp64q" htp "$OUT/dump_64e3ppl" "$OUT/64e3ppl.log" --max-seq 32 --run
-PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=100 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+PROMPT=512 NNTR_HTP_PROFILE=1 NNTR_INPROC_MMAP_CAP_MIB=200 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
   run_e2e q25-e3cap "$OUT/htp25q" htp "$OUT/dump_25e3cap" "$OUT/25e3cap.log" --max-seq 2048
-# [#194 S1] lever L1 on the same two-session token
+# [plan 201 S1] the expert pool (NNTR_MOE_CACHE_EXPERTS) inside the
+# per-token entry: S1's miss rounds served by the ARM's pool server, a pool
+# of half the experts (hd64 C=2: 4 of 8; lfm25 C=2: 8 of 16) and a quarter
+# (lfm25 C=1), against the all-resident E runs above
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q64-e3pool2 "$OUT/htp64q" htp "$OUT/dump_64e3pool2" "$OUT/64e3pool2.log" --max-seq 32
+for c in 1 2; do
+  PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=$c \
+    run_e2e q25-e3pool$c "$OUT/htp25q" htp "$OUT/dump_25e3pool$c" "$OUT/25e3pool$c.log" --max-seq 2048
+done
+# [plan 201 S4] the Gemma 4 MoE fixture: #4296's CPU model (QS4CX
+# experts), the HTP MoE layer alone (QS4CX_WH), the E2E token, and the
+# token with a pool of 2 of the 8 experts a layer
+"$Q" "$FIXG" -o "$OUT/g64cpu" --fc_dtype Q4_0 --moe_dtype QS4CX \
+  --embd_dtype Q4_0 > "$OUT/q_g64cpu.log"
+"$Q" "$FIXG" -o "$OUT/g64htp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64htp.log"
+# [#234 P3] the same with the FC WH sidecar: checked below; run since P4
+"$Q" "$FIXG" -o "$OUT/g64htpw" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 --fc_wh_sidecar > "$OUT/q_g64htpw.log"
+run_gemma() { # run_gemma <label> <model> <engine> [env...]: run_e2e on FIXG
+  local label=$1 model=$2 engine=$3
+  shift 3
+  local rc=0
+  env "$@" "$E2E" --model "$OUT/$model" --tokenizer "$FIXG/tokenizer.json" \
+    --prompt $PROMPT --steps $STEPS --moe-engine "$engine" \
+    --dump "$OUT/dump_$label" --max-seq 32 ${G_ARGS:-} > "$OUT/$label.log" 2>&1 || rc=$?
+  if [ $rc != 0 ] || ! grep -q '^E2E gen ' "$OUT/$label.log"; then
+    echo "E2E FAIL $label rc=$rc"; tail -3 "$OUT/$label.log"; exit 1
+  fi
+}
+run_gemma g64cpu g64cpu cpu
+run_gemma g64off g64htp htp
+run_gemma g64e3 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3pool2 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# [#234 P4] the sidecar model's one-PD token (FC / DENSE_FFN on its WH
+# handles), all experts resident and a pool of 2, and the sidecar-less
+# token beside them; --repack as the app's main runs it (repack_weight is
+# where the loader hands the sidecar over)
+G_ARGS=--repack run_gemma g64e3r g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+G_ARGS=--repack run_gemma g64e3w g64htpw htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+G_ARGS=--repack run_gemma g64e3wpool2 g64htpw htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# and gemma64x, the bind check's fixture: every FC weight int4-exact (per
+# column q * 2^e, each 32-row block holding a -8 and the column a 7, so
+# Q4_0 and the sidecar's QS4CX_WH hold the same values) and the q / k norm
+# gammas at 0.3. The plain fixture's two quantizations read -4 dB apart
+# (Q4_0 against f32 FCs reads the same), and its peaked sliding softmax
+# turns the WH path's u8 row quantization of q and k into 9.5 dB even on
+# int4-exact weights; at 0.3 the WH token reads 31 dB against the Q4M1 one
+python3 - "$ROOT/tools/htp" "$FIXG" "$OUT/fixg_x" <<'PY'
+import json, math, os, shutil, struct, sys
+tools, src, dst = sys.argv[1:4]
+sys.path.insert(0, tools)
+from fc_wh_sidecar_from_q4 import fcs
+shutil.copytree(src, dst)
+cfg = json.load(open(src + "/config.json"))
+c = cfg.get("text_config", cfg)
+b = dst + "/" + json.load(open(src + "/nntr_config.json"))["model_file_name"]
+rows, size = fcs(cfg, dict.fromkeys(
+    ("fc_layer_dtype", "embedding_dtype", "moe_layer_dtype"), "FP32"))
+if os.path.getsize(b) not in (size, size + 4 * c["vocab_size"] * c["hidden_size"]):
+    sys.exit("gemma64x: the f32 layout walk disagrees with the file size")
+f = open(b, "r+b")
+for name, o, K, N in rows:
+    f.seek(o)
+    w = list(struct.unpack("<%df" % (K * N), f.read(4 * K * N)))
+    for n in range(N):
+        s = 2.0 ** round(math.log2(max(abs(w[k * N + n]) for k in range(K)) / 8))
+        for k in range(K):
+            q = -8 if k % 32 == 0 else 7 if k == 1 else round(w[k * N + n] / s)
+            w[k * N + n] = max(-8, min(7, q)) * s
+    if name.endswith(("_wq", "_wk")):  # q_norm / k_norm follow
+        hd = c["head_dim"] if c["layer_types"][int(name[5:name.index("_")])] \
+            == "sliding_attention" else c["global_head_dim"]
+        w += [0.3] * hd
+    f.seek(o)
+    f.write(struct.pack("<%df" % len(w), *w))
+PY
+"$Q" "$OUT/fixg_x" -o "$OUT/g64x" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64x.log"
+"$Q" "$OUT/fixg_x" -o "$OUT/g64xw" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 --fc_wh_sidecar > "$OUT/q_g64xw.log"
+G_ARGS=--repack run_gemma g64xe3 g64x htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+G_ARGS=--repack run_gemma g64xe3w g64xw htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+# [plan 229] QS2CX_WH experts and their 4-bit palette twin (header above)
+"$Q" "$FIX25" -o "$OUT/htp25q2" --fc_dtype Q4_0 --moe_dtype QS2CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_htp25q2.log"
+"$Q" "$FIX25" -o "$OUT/htp25qp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --moe_palette_g max --embd_dtype Q4_0 > "$OUT/q_htp25qp.log"
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3p "$OUT/htp25qp" htp "$OUT/dump_25e3p" "$OUT/25e3p.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25-e3q2 "$OUT/htp25q2" htp "$OUT/dump_25e3q2" "$OUT/25e3q2.log" --max-seq 2048
+for c in 1 2; do
+  PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=$c \
+    run_e2e q25-e3q2pool$c "$OUT/htp25q2" htp "$OUT/dump_25e3q2pool$c" "$OUT/25e3q2pool$c.log" --max-seq 2048
+done
+"$Q" "$FIXG" -o "$OUT/g64htp2" --fc_dtype Q4_0 --moe_dtype QS2CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64htp2.log"
+"$Q" "$FIXG" -o "$OUT/g64htpp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --moe_palette_g max --embd_dtype Q4_0 > "$OUT/q_g64htpp.log"
+run_gemma g64e3p g64htpp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3q2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3q2pool2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# [#222] the config of record's keys on the same model: conv_block,
+# dense_ffn and attn_proj on the HTP (their prefill on the HTP FC kernels,
+# load-time registration and warm-ups), init_seq_len 1024; hybrid (off),
+# the one-session E1 run and the one-PD run, the last with a pool of C=2
+# (8 of the fixture's 16 experts)
+cp -a "$OUT/htp25q" "$OUT/htp25k"
+python3 - "$OUT/htp25k/nntr_config.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.update(conv_block_engine="htp", dense_ffn_engine="htp",
+         attn_proj_engine="htp", init_seq_len=1024)
+json.dump(c, open(sys.argv[1], "w"), indent=4)
+PY
+echo "== [#222] lfm25 with the engine keys: off, KINDS=all, NNTR_HTP_E2E=1, pool C=2"
+PROMPT=512 NNTR_HTP_PROFILE=1 run_e2e q25k-off "$OUT/htp25k" htp "$OUT/dump_25koff" "$OUT/25koff.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25k-e1a "$OUT/htp25k" htp "$OUT/dump_25ke1a" "$OUT/25ke1a.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25k-e3 "$OUT/htp25k" htp "$OUT/dump_25ke3" "$OUT/25ke3.log" --max-seq 2048
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q25k-e3pool2 "$OUT/htp25k" htp "$OUT/dump_25ke3pool2" "$OUT/25ke3pool2.log" --max-seq 2048
+# [#225] the same keys on the model packed with the FC WH sidecar (its main
+# file must be htp25q's): hybrid with the images in the arena, the same
+# with every image through the heap path (NNTR_HTP_FC_WH_HEAP=1), the
+# one-PD run (decode still on Q4M1 in PR 1); then prompt 1024 in 512-row
+# conv-block chunks (the default) against one call (NNTR_HTP_PREFILL_ROWS=0).
+# --repack: the app's load (main.cpp), where the sidecar is opened and the
+# FCs registered before the first prefill
+"$Q" "$FIX25" -o "$OUT/htp25w" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 --fc_wh_sidecar > "$OUT/q_htp25w.log"
+w_main_same=0
+cmp -s "$OUT/htp25q/$(sed -n 's/.*"model_file_name": "\(.*\)".*/\1/p' "$OUT/htp25q/nntr_config.json")" \
+  "$OUT/htp25w/$(sed -n 's/.*"model_file_name": "\(.*\)".*/\1/p' "$OUT/htp25w/nntr_config.json")" && w_main_same=1
+cp -a "$OUT/htp25w" "$OUT/htp25wn" # no keys: the sidecar named, never opened
+python3 - "$OUT/htp25w/nntr_config.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.update(conv_block_engine="htp", dense_ffn_engine="htp",
+         attn_proj_engine="htp", init_seq_len=1024)
+json.dump(c, open(sys.argv[1], "w"), indent=4)
+PY
+echo "== [#225] lfm25 keys + FC WH sidecar: arena, heap, NNTR_HTP_E2E=1, P1024 chunked / whole"
+PROMPT=512 run_e2e q25w-off "$OUT/htp25w" htp "$OUT/dump_25woff" "$OUT/25woff.log" --max-seq 2048 --repack
+PROMPT=512 run_e2e q25w-nokeys "$OUT/htp25wn" htp "$OUT/dump_25wn" "$OUT/25wn.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_FC_WH_HEAP=1 \
+  run_e2e q25w-heap "$OUT/htp25w" htp "$OUT/dump_25wheap" "$OUT/25wheap.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25w-e3 "$OUT/htp25w" htp "$OUT/dump_25we3" "$OUT/25we3.log" --max-seq 2048 --repack
+PROMPT=1024 NNTR_HTP_PROFILE=1 \
+  run_e2e q25w-p2x "$OUT/htp25w" htp "$OUT/dump_25wp2x" "$OUT/25wp2x.log" --max-seq 2048 --repack
+PROMPT=1024 NNTR_HTP_PREFILL_ROWS=0 NNTR_HTP_PROFILE=1 \
+  run_e2e q25w-p1x "$OUT/htp25w" htp "$OUT/dump_25wp1x" "$OUT/25wp1x.log" --max-seq 2048 --repack
+# [#225 PR 2] the decode FC set on the sidecar's WH handles: the one-session
+# E1 and the pool of 8 against the one-PD run above, then NNTR_PPL_DECODE:
+# the hybrid writes its continuation, the one-PD run is forced on it
+echo "== [#225 PR 2] lfm25 sidecar: KINDS=all, NNTR_HTP_E2E=1 pool C=2, PPL forced"
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25w-e1 "$OUT/htp25w" htp "$OUT/dump_25we1" "$OUT/25we1.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q25w-e3pool2 "$OUT/htp25w" htp "$OUT/dump_25we3pool2" "$OUT/25we3pool2.log" --max-seq 2048 --repack
+rm -f "$OUT/w.ids"
+PROMPT=512 NNTR_PPL_DECODE="$OUT/w.ids" \
+  run_e2e q25w-offppl "$OUT/htp25w" htp "$OUT/dump_25woffppl" "$OUT/25woffppl.log" --max-seq 2048 --repack --run
+PROMPT=512 NNTR_PPL_DECODE="$OUT/w.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25w-e3ppl "$OUT/htp25w" htp "$OUT/dump_25we3ppl" "$OUT/25we3ppl.log" --max-seq 2048 --repack --run
+# [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
+rc_pds=0
+NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
+  --tokenizer "$FIX/tokenizer.json" --prompt $PROMPT --steps $STEPS \
+  --moe-engine htp --max-seq 32 > "$OUT/64pds2.log" 2>&1 || rc_pds=$?
+tail -1 "$OUT/64pds2.log"
+# [#194 S1] lever L1 on the same token
 NNTR_PPL_DECODE="$OUT/e3.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
   run_e2e q64-l1ppl "$OUT/htp64q" htp "$OUT/dump_64l1ppl" "$OUT/64l1ppl.log" --max-seq 32 --run
 PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_PPL_LEVERS=2 \
@@ -403,6 +665,285 @@ if [ $rc = 1 ] && grep -q '^E2E FAIL set_decode_graph_desc: AEE_ESCHEMENOTSUPPOR
 else
   echo "E2E FAIL all kinds at head_dim 8 not refused (rc=$rc)"; fail=1
 fi
+for d in "64e3 64e3pool2 hd64 2" "25e3 25e3pool1 lfm25 1" "25e3 25e3pool2 lfm25 2"; do
+  set -- $d
+  ev="$($EVAL --label "e3pool-$3-C$4" "$OUT/dump_$1" "$OUT/dump_$2" | tail -1 || true)"
+  calls="$(calls_per_token "$OUT/$2.log")"
+  close="$(grep -o 'token driver: close .*' "$OUT/$2.log")"
+  misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/$2.log")"
+  if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+     grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+    echo "E2E e3 pool C=$4 $3 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
+  else
+    echo "E2E FAIL e3 pool C=$4 $3: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+  fi
+done
+# [plan 201 S4] the Gemma lines: the HTP MoE layer against #4296's CPU
+# model by tokens (its SNR printed: QS4CX on both, the HTP's quantizer and
+# GeGLU against the CPU's); the E2E token one call a token on both
+# attention caches, its logits within the floor of the off run and its
+# tokens by the policy; the pool bit-identical to the all-resident token.
+# The floor: the off run reads 27.6 dB at worst, every hand-over mutant
+# 0-10 (plan 201 S4, PR body), 20 sits between.
+for d in g64cpu g64off g64e3 g64e3pool2; do logits_only "$OUT/dump_$d" "$OUT/ref_$d"; done
+$EVAL --label 'gemma64 off==cpu' --tokens-policy "$OUT/ref_g64cpu" "$OUT/ref_g64off" | tail -1 || fail=1
+$EVAL --label gemma64-off-vs-cpu --allow-diff "$OUT/ref_g64cpu" "$OUT/ref_g64off" | tail -1 || true
+calls="$(calls_per_token "$OUT/g64e3.log")"
+caches="$(grep -c '^\[HTP\] attn_m1: registered ' "$OUT/g64e3.log" || true)"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3.log")"
+if [ "$calls" = 1.00 ] && [ "$caches" = 2 ] && grep -q ' timeouts=0 stale=0 ' <<< "$close"; then
+  echo "E2E fwd gemma64 e3 calls/token=1.00 attn_caches=2 timeouts=0 ok"
+else
+  echo "E2E FAIL gemma64 e3: calls/token=${calls:-none} attn_caches=$caches close=[$close]"; fail=1
+fi
+$EVAL --label gemma64-e3 --allow-diff --snr-floor 20 "$OUT/ref_g64off" "$OUT/ref_g64e3" | tail -1 || fail=1
+$EVAL --label 'gemma64 e3==off' --tokens-policy "$OUT/ref_g64off" "$OUT/ref_g64e3" | tail -1 || fail=1
+ev="$($EVAL --label e3pool-gemma64-C2 "$OUT/ref_g64e3" "$OUT/ref_g64e3pool2" | tail -1 || true)"
+calls="$(calls_per_token "$OUT/g64e3pool2.log")"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3pool2.log")"
+misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/g64e3pool2.log")"
+if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+   grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+  echo "E2E e3 pool C=2 gemma64 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
+else
+  echo "E2E FAIL e3 pool C=2 gemma64: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+fi
+# [#234 P4] the sidecar model's one-PD token: the bind banner (the tied
+# lm_head the one Q4M1 handle, every FC part and dense chunk pair a WH
+# handle: 2 sliding layers x (q k v o + gate|up, down) + the full layer's
+# k = v (no v) = 6 + 6 + 5), one call a token on both caches. Against the
+# CPU model (SNR printed) and the off run (tokens by the policy) the plain
+# fixture compares two int4 quantizations of its FCs; the gate is
+# gemma64x's, same weights on both sides: the WH token against the Q4M1
+# token, its logits above 20 dB (a wrong part or chunk reads below 0) and
+# its tokens 8/8. Then its prefill MoE dumps are the sidecar-less token's
+# (the experts did not move; a Gemma prefill FC stays on the CPU, no
+# keys) and its pool of 2 bit-identical to it (logits: the pool splits
+# prefill calls)
+for d in g64e3r g64e3w g64e3wpool2 g64xe3 g64xe3w; do logits_only "$OUT/dump_$d" "$OUT/ref_$d"; done
+gq="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/g64e3w.log")"
+read -r g_q4m1 g_wh <<< "${gq:-x x}"
+calls="$(calls_per_token "$OUT/g64e3w.log")"
+caches="$(grep -c '^\[HTP\] attn_m1: registered ' "$OUT/g64e3w.log" || true)"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3w.log")"
+if [ "$g_q4m1" = 1 ] && [ "$g_wh" = 17 ] && [ "$calls" = 1.00 ] &&
+   [ "$caches" = 2 ] && grep -q ' timeouts=0 stale=0 ' <<< "$close" &&
+   grep -q ' wh_handles=17$' "$OUT/g64xe3w.log"; then
+  echo "E2E fwd gemma64 fcwh kinds=all calls/token=1.00 attn_caches=2 q4m1_handles=$g_q4m1 wh_handles=$g_wh ok"
+else
+  echo "E2E FAIL fwd gemma64 fcwh: bind=[${gq:-none}] calls/token=${calls:-none} attn_caches=$caches close=[$close]"; fail=1
+fi
+$EVAL --label gemma64-fcwh-vs-cpu --allow-diff "$OUT/ref_g64cpu" "$OUT/ref_g64e3w" | tail -1 || true
+$EVAL --label 'gemma64-fcwh==off' --tokens-policy "$OUT/ref_g64off" "$OUT/ref_g64e3w" | tail -1 || fail=1
+$EVAL --label gemma64x-fcwh-vs-q4m1 --allow-diff --snr-floor 20 "$OUT/ref_g64xe3" "$OUT/ref_g64xe3w" | tail -1 || fail=1
+$EVAL --label 'gemma64x-fcwh==q4m1' --tokens-policy "$OUT/ref_g64xe3" "$OUT/ref_g64xe3w" | tail -1 || fail=1
+mkdir -p "$OUT/moe_g64e3r" "$OUT/moe_g64e3w"
+for d in g64e3r g64e3w; do
+  find "$OUT/dump_$d" -maxdepth 1 -type f ! -name 'logits_*' -exec cp {} "$OUT/moe_$d/" \;
+done
+em="$($EVAL --label gemma64-fcwh-moe==e3 "$OUT/moe_g64e3r" "$OUT/moe_g64e3w" | tail -1 || true)"
+ev="$($EVAL --label e3pool-gemma64-fcwh-C2 "$OUT/ref_g64e3w" "$OUT/ref_g64e3wpool2" | tail -1 || true)"
+calls="$(calls_per_token "$OUT/g64e3wpool2.log")"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3wpool2.log")"
+misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/g64e3wpool2.log")"
+nm="$(sed -n 's/.* files=\([0-9]*\) .*/\1/p' <<< "$em")"
+if grep -q 'bit_identical=1' <<< "$ev" && grep -q 'bit_identical=1' <<< "$em" &&
+   [ "${nm:-0}" -gt 0 ] && [ "$calls" = 1.00 ] &&
+   grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+  echo "E2E e3 pool C=2 gemma64-fcwh == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0 moe_dumps==sidecar-less files=$nm bit_identical=1"
+else
+  echo "E2E FAIL e3 pool C=2 gemma64-fcwh: pool=[$ev] moe=[$em] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+fi
+# [plan 229] the 2-bit lines: every dumped file (the prefill MoE calls'
+# inputs and outputs, the logits) of the 2-bit token equals its palette
+# twin's, one call a token, no timeout; the pool's logits equal the
+# all-resident 2-bit token's with misses served (logits: a pool smaller
+# than a prefill layer's experts splits its calls, as the 4-bit gemma64
+# line above).
+two_bit() { # two_bit <label> <ref run> <2-bit run> <pool runs...>
+  local label=$1 ref=$2 got=$3 p ev calls close misses
+  shift 3
+  ev="$($EVAL --label "2bit-$label" "$OUT/dump_$ref" "$OUT/dump_$got" | tail -1 || true)"
+  calls="$(calls_per_token "$OUT/$got.log")"
+  close="$(grep -o 'token driver: close .*' "$OUT/$got.log")"
+  if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+     grep -q ' timeouts=0 stale=0 ' <<< "$close"; then
+    echo "E2E 2bit $label e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0"
+  else
+    echo "E2E FAIL 2bit $label: [$ev] calls/token=${calls:-none} close=[$close]"; fail=1
+  fi
+  $EVAL --label "2bit==twin-$label" --tokens-policy "$OUT/dump_$ref" "$OUT/dump_$got" | tail -1 || fail=1
+  logits_only "$OUT/dump_$got" "$OUT/ref_$got"
+  for p in "$@"; do
+    logits_only "$OUT/dump_$p" "$OUT/ref_$p"
+    ev="$($EVAL --label "2bit-$label-$p" "$OUT/ref_$got" "$OUT/ref_$p" | tail -1 || true)"
+    calls="$(calls_per_token "$OUT/$p.log")"
+    close="$(grep -o 'token driver: close .*' "$OUT/$p.log")"
+    misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/$p.log")"
+    if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
+       grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+      echo "E2E 2bit pool C=${p##*pool} $label == 2bit e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
+    else
+      echo "E2E FAIL 2bit pool $p: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+    fi
+  done
+}
+two_bit lfm25 25e3p 25e3q2 25e3q2pool1 25e3q2pool2
+two_bit gemma64 g64e3p g64e3q2 g64e3q2pool2
+# [#222] with the keys: the prefill moved (step 0's logits differ from the
+# keyless run's), and the decode paths hold as without them -- the one-PD
+# token equal to E1's of the same model, one call per token, the pool
+# equal to the all-resident run, 23 handles (the keys' one-layer forms
+# hand the same weights), the CPU's FC work skipped at every resident row
+# (conv_block 4, qkv 2, attention_out 2, dense_ffn 2), and E1 against the
+# keys' own hybrid run by the tokens policy
+mkdir -p "$OUT/k0a" "$OUT/k0b"
+cp "$OUT/dump_25qoff/logits_0.f32" "$OUT/k0a/"; cp "$OUT/dump_25koff/logits_0.f32" "$OUT/k0b/"
+k0="$($EVAL --label keys-prefill --allow-diff --snr-floor 0 "$OUT/k0a" "$OUT/k0b" | tail -1 || true)"
+k3="$($EVAL --label e3==e1-lfm25-keys "$OUT/dump_25ke1a" "$OUT/dump_25ke3" | tail -1 || true)"
+kp="$($EVAL --label e3pool-lfm25-keys-C2 "$OUT/dump_25ke3" "$OUT/dump_25ke3pool2" | tail -1 || true)"
+kt="$($EVAL --label 'e1==off-lfm25-keys' --tokens-policy "$OUT/dump_25koff" "$OUT/dump_25ke1a" | tail -1 || true)"
+echo "$k0"; echo "$k3"; echo "$kp"; echo "$kt"
+calls="$(calls_per_token "$OUT/25ke3.log")"
+calls_p="$(calls_per_token "$OUT/25ke3pool2.log")"
+handles="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) .*/\1/p' "$OUT/25ke1a.log")"
+skipped="$(sed -n 's/^\[HTP\] graph: cpu fc skipped=\([0-9]*\)$/\1/p' "$OUT/25ke1a.log")"
+toks="$(sed -n 's/.*forward calls=[0-9]* tokens=\([0-9]*\) .*/\1/p' "$OUT/25ke1a.log")"
+misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/25ke3pool2.log")"
+rows="$(grep -cE 'HTP-PROFILE\]   K=[0-9 ]+N=[0-9 ]+M>1 (conv|dense|FC) +calls=[1-9]' "$OUT/25koff.log" || true)"
+if grep -q 'bit_identical=0' <<< "$k0" && grep -q 'bit_identical=1' <<< "$k3" &&
+  [ "${rows:-0}" -ge 3 ] &&
+  grep -q 'bit_identical=1' <<< "$kp" && grep -q '^E2E tokens' <<< "$kt" && ! grep -q 'unexpected=' <<< "$kt" &&
+  [ "$calls" = 1.00 ] && [ "$calls_p" = 1.00 ] && [ "${misses:-0}" -gt 0 ] &&
+  [ "$handles" = 23 ] && [ -n "$toks" ] && [ "${skipped:-0}" = $((10 * toks)) ]; then
+  echo "E2E keys lfm25 prefill-moved=1 htp_fc_rows=$rows e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=$misses calls/token=1.00 q4m1_handles=23 cpu-fc-skipped=$skipped per_token=10 ok"
+else
+  echo "E2E FAIL keys lfm25: htp_fc_rows=${rows:-none} calls/token=${calls:-none}/${calls_p:-none} handles=${handles:-none} skipped=${skipped:-none} tokens=${toks:-none} misses=${misses:-none}"; fail=1
+fi
+# [#225] (1) the sidecar's banner: every FC prefill weight from the file,
+# none re-quantized, nothing on the heap -- and with NNTR_HTP_FC_WH_HEAP=1
+# everything on it; (2) fcwh==wh: the images as they lie in the file (the
+# arena, the way get_or_register_wh places a WH tensor) against the same
+# images through whUnpack and the DSP's bake (the hybrid's overflow), every
+# MoE call and the logits; (3) the one-PD run on the sidecar model;
+# (3b) no engine key: the sidecar named in the config, never opened, the
+# logits those of the keyless model without one (the CPU-only and Aoff
+# configs of the handoff); (4) P1024 in two 512-row prefill chunks against
+# one call, logits; the chunked run makes more MoE calls, which says it
+# chunked; (5) printed, not
+# gated: the keys' logits against the keyless hybrid (CPU Q4_0 FCs), the
+# sidecar's and the load-time re-quantization's, side by side
+wb="$(sed -n 's/^\[HTP\] fc wh: file=.* handles=\([0-9]*\) arena_kib=\([0-9]*\) heap_kib=\([0-9]*\) requant=\([0-9]*\)$/\1 \2 \3 \4/p' "$OUT/25woff.log")"
+wh_heap="$(sed -n 's/^\[HTP\] fc wh: file=.* arena_kib=\([0-9]*\) heap_kib=\([0-9]*\) requant=0$/\1 \2/p' "$OUT/25wheap.log")"
+read -r w_handles w_arena w_heap w_requant <<< "${wb:-x x x x}"
+read -r h_arena h_heap <<< "${wh_heap:-x x}"
+calls_w="$(calls_per_token "$OUT/25we3.log")"
+if [ "$w_main_same" = 1 ] && [ "$w_heap" = 0 ] && [ "$w_requant" = 0 ] &&
+  [ "${w_handles:-0}" -gt 0 ] 2> /dev/null && [ "$h_arena" = 0 ] &&
+  [ "$h_heap" = "$w_arena" ] && [ "$calls_w" = 1.00 ]; then
+  echo "E2E keys fcwh-lfm25 handles=$w_handles arena_kib=$w_arena heap=0 requant=0 main=same heap-path heap_kib=$h_heap e3 calls/token=1.00 ok"
+else
+  echo "E2E FAIL keys fcwh-lfm25: banner=[${wb:-none}] heap-run=[${wh_heap:-none}] main_same=$w_main_same calls/token=${calls_w:-none}"; fail=1
+fi
+$EVAL --label 'fcwh==wh-lfm25' "$OUT/dump_25woff" "$OUT/dump_25wheap" | tail -1 || fail=1
+mkdir -p "$OUT/p1x" "$OUT/p2x" "$OUT/lq" "$OUT/lk" "$OUT/lw" "$OUT/lwn"
+cp "$OUT"/dump_25wn/logits_*.f32 "$OUT/lwn/"
+nk="$($EVAL --label fcwh-nokeys==off-lfm25 "$OUT/lwn" "$OUT/dump_25qoff" | tail -1 || true)"
+if grep -q 'bit_identical=1' <<< "$nk" && ! grep -q '^\[HTP\] fc wh:' "$OUT/25wn.log"; then
+  echo "$nk sidecar=unopened ok"
+else
+  echo "E2E FAIL fcwh-nokeys-lfm25: [$nk]"; fail=1
+fi
+cp "$OUT"/dump_25wp1x/logits_*.f32 "$OUT/p1x/"; cp "$OUT"/dump_25wp2x/logits_*.f32 "$OUT/p2x/"
+n1="$(grep -c moe_layer "$OUT/dump_25wp1x/manifest.txt" || true)"
+n2="$(grep -c moe_layer "$OUT/dump_25wp2x/manifest.txt" || true)"
+p2="$($EVAL --label lfm25-p2x "$OUT/p1x" "$OUT/p2x" | tail -1 || true)"
+# [#236, #260] the M>1 FC rows' calls / rows summed. Since #4415's
+# prefill (#260) the MoE layer and the FCs take one call per prefill again
+# (no prefillRows() step); only the conv block still chunks. So the
+# chunked run carries the same MoE and FC calls as the whole one, and the
+# logits stay bit-identical.
+fc_sum() { sed -n 's/.*M>1 FC *calls=\([0-9]*\) *rows=\([0-9]*\).*/\1 \2/p' "$1" |
+  awk '{c+=$1; r+=$2} END {print c+0, r+0}'; }
+read -r f2 r2 <<< "$(fc_sum "$OUT/25wp2x.log")"
+read -r f1 r1 <<< "$(fc_sum "$OUT/25wp1x.log")"
+if grep -q 'bit_identical=1' <<< "$p2" && [ "${n2:-0}" -gt 0 ] &&
+  [ "${n2:-0}" = "${n1:-0}" ] && [ "$f1" -gt 0 ] && [ "$f2" = "$f1" ] &&
+  [ "$r2" = "$r1" ]; then
+  echo "E2E keys lfm25-p2x prompt=1024 conv-chunks=512 moe_calls=$n2 whole=$n1 fc_calls=$f2 whole=$f1 fc_rows=$r2 logits bit_identical=1 ok"
+else
+  echo "E2E FAIL keys lfm25-p2x: [$p2] moe_calls=$n2 whole=$n1 fc_calls=$f2/$r2 whole=$f1/$r1"; fail=1
+fi
+# [#234 P3] the Gemma writer's sidecar: the main file untouched, and the
+# index names exactly the graph FCs the config's layers hold
+gw="$(python3 - "$OUT/g64htp" "$OUT/g64htpw" "$FIXG/config.json" <<'PY'
+import filecmp, json, struct, sys
+a, b, cfg = sys.argv[1:4]
+ca, cb = (json.load(open(d + "/nntr_config.json")) for d in (a, b))
+same = filecmp.cmp(a + "/" + ca["model_file_name"],
+                   b + "/" + cb["model_file_name"], shallow=False)
+c = json.load(open(cfg))
+c = c.get("text_config", c)
+kv = c.get("attention_k_eq_v", False)
+want = []
+for i, t in enumerate(c["layer_types"]):
+    sfx = ["wq", "wk"] + ([] if kv and t == "full_attention" else ["wv"])
+    sfx += ["attention_out", "ffn_gate", "ffn_up", "ffn_down"]
+    want += ["layer%d_%s" % (i, s) for s in sfx]
+f = open(b + "/" + cb["fc_wh_file_name"], "rb").read()
+n = struct.unpack_from("<I", f, 12)[0]
+names = [f[16 + 104 * i:16 + 104 * i + 64].rstrip(b"\0").decode()
+         for i in range(n)]
+ok = (f[:8] == b"NNTRFCWH" and cb.get("fc_wh_format") == "QS4CX_WH/1"
+      and "fc_wh_file_name" not in ca and sorted(names) == sorted(want))
+print("main=%s images=%d want=%d %s" % ("same" if same else "differs", n,
+                                         len(want), "ok" if same and ok else "bad"))
+PY
+)" || gw="error"
+if [ "${gw##* }" = ok ]; then
+  echo "E2E quant fcwh-gemma64 ${gw% want=* ok} ok"
+else
+  echo "E2E FAIL quant fcwh-gemma64: [$gw]"; fail=1
+fi
+cp "$OUT"/dump_25qoff/logits_*.f32 "$OUT/lq/"; cp "$OUT"/dump_25koff/logits_*.f32 "$OUT/lk/"
+cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lw/"
+$EVAL --label fcwh-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lw" | tail -1 || true
+$EVAL --label requant-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lk" | tail -1 || true
+# [#225 PR 2] (6) the one-PD token's FC and dense FFN ops on the sidecar's
+# WH handles (HTP_GRAPH_FEED_WH), the lm_head alone Q4M1 (one slice: vocab
+# 32): the bind banner's counts on the one-PD and the one-session run, one
+# call a token, the one-PD token equal to E1's and to the pool C=2 run's,
+# every logit; (7) against the hybrid, whose decode FCs are the CPU's Q4_0:
+# the tokens by the policy, and the decode logits' SNR printed, not gated
+# -- two int4 quantizations of the fixture's random FCs (per column from
+# f32, and Q4_0 blocks with a Q8_0 row; PR 1's prefill line above reads
+# 2.5 dB for the same reason), so it is the size of the format change, and
+# (6) is the wiring check
+wq="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/25we3.log")"
+wq1="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/25we1.log")"
+read -r w_q4m1 w_wh <<< "${wq:-x x}"
+we="$($EVAL --label e3fcwh==e1fcwh-lfm25 "$OUT/dump_25we1" "$OUT/dump_25we3" | tail -1 || true)"
+wp="$($EVAL --label e3fcwh-pool-C2-lfm25 "$OUT/dump_25we3" "$OUT/dump_25we3pool2" | tail -1 || true)"
+echo "$we"; echo "$wp"
+calls_wp="$(calls_per_token "$OUT/25we3pool2.log")"
+misses_w="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/25we3pool2.log")"
+if [ "$w_q4m1" = 1 ] && [ "$w_wh" = 28 ] && [ "$wq1" = "$wq" ] &&
+  [ "$calls_w" = 1.00 ] && [ "$calls_wp" = 1.00 ] && [ "${misses_w:-0}" -gt 0 ] &&
+  grep -q 'bit_identical=1' <<< "$we" && grep -q 'bit_identical=1' <<< "$wp"; then
+  echo "E2E fwd lfm25 fcwh kinds=all calls/token=1.00 q4m1_handles=$w_q4m1 wh_handles=$w_wh e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=$misses_w ok"
+else
+  echo "E2E FAIL fwd lfm25 fcwh: bind=[${wq:-none}] e1=[${wq1:-none}] calls/token=${calls_w:-none}/${calls_wp:-none} misses=${misses_w:-none}"; fail=1
+fi
+mkdir -p "$OUT/lwo" "$OUT/lw3"
+cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lwo/"; cp "$OUT"/dump_25we3/logits_*.f32 "$OUT/lw3/"
+$EVAL --label e3fcwh-lfm25-vs-off --allow-diff "$OUT/lwo" "$OUT/lw3" | tail -1 || true
+$EVAL --label 'e3fcwh==off-lfm25' --tokens-policy "$OUT/dump_25woff" "$OUT/dump_25we3" | tail -1 || fail=1
+if [ $rc_pds = 1 ] &&
+  grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
+  echo "E2E e2e pds=2 refused ok"
+else
+  echo "E2E FAIL NNTR_HTP_E2E_PDS=2 not refused (rc=$rc_pds)"; fail=1
+fi
 # (f) the hd64 fixture: its own golden with the switch off; with it on, 12
 # calls per token, the SNR floor, the token policy, and the init lines
 $EVAL --label golden-hd64 "$GOLDEN64" "$OUT/dump_64off" | tail -1 || fail=1
@@ -439,7 +980,6 @@ grep -q '^\[HTP\] attn_m1: registered layers=2 kv=8 gqa=4 head_dim=64 max_seq=20
 # (moe_00010, a near-tie), which the logits-only compare cannot skip, so
 # D is gated against B -- the step this PR adds; the tokens policy stays
 # against off.
-logits_only() { mkdir -p "$2" && cp "$1"/logits_*.f32 "$2/"; }
 logits_only "$OUT/dump_fwd" "$OUT/ref_fwd"
 logits_only "$OUT/dump_64fwd" "$OUT/ref_64fwd"
 logits_only "$OUT/dump_htp" "$OUT/ref_off"
@@ -499,21 +1039,22 @@ done
 grep -q '^\[HTP\] graph: q4m1 weights=12 handles=12 feed=l2$' "$OUT/64e1l2.log" ||
   { echo "E2E FAIL hd64 e1 l2: no feed=l2 line"; fail=1; }
 $EVAL --label e1-feed-l2 "$OUT/dump_64e1" "$OUT/dump_64e1l2" | tail -1 || fail=1
-# (h3) [#132 Part B E3] two sessions: every logit equal to the one-session
-# E1 run (Android order) of the same model, one packet per token, 2 hops
-# per MoE layer, no timeout, S2's argmax equal to the logits' first
-# maximum; run() with only the id back equals E1's run(); the PPL decode
-# step lines (17 digits) equal E1's
-for d in "hd64 64e3 64e1a 4.00" "lfm25 25e3 25e1a 8.00"; do
-  read -r fx tag ref hops <<< "$d"
+# (h3) [#132 Part B E3, #211] one PD: every logit equal to the one-session
+# E1 run (Android order) of the same model, one packet per token, no hop,
+# no timeout, the DSP's argmax equal to the logits' first maximum, nothing
+# left mapped; run() with only the id back equals E1's run(); the PPL
+# decode step lines (17 digits) equal E1's
+for d in "hd64 64e3 64e1a" "lfm25 25e3 25e1a"; do
+  read -r fx tag ref <<< "$d"
   $EVAL --label "e3==e1-$fx" "$OUT/dump_$ref" "$OUT/dump_$tag" | tail -1 || fail=1
   close="$(grep '^\[HTP\] token driver: close ' "$OUT/$tag.log" || true)"
   calls="$(calls_per_token "$OUT/$tag.log")"
-  if [ "$calls" = 1.00 ] && grep -q " hops/token=$hops " <<< "$close" &&
-    grep -q ' timeouts=0/0 stale=0/0 ' <<< "$close" &&
+  if [ "$calls" = 1.00 ] && grep -q " hops/token=0.00 " <<< "$close" &&
+    grep -q ' timeouts=0 stale=0 ' <<< "$close" &&
     grep -q ' id_mismatch=0 ' <<< "$close" &&
-    grep -q '^\[HTP\] s2: fc arena weights=' "$OUT/$tag.log"; then
-    echo "E2E fwd $fx e3 calls/token=$calls hops/token=$hops timeouts=0/0 id_mismatch=0 ok"
+    grep -q '^\[HTP\] e2e: fc arena weights=' "$OUT/$tag.log" &&
+    grep -q '^\[HTP\] e2e: close .* unmap_fail=0 detach_fail=0 ' "$OUT/$tag.log"; then
+    echo "E2E fwd $fx e3 calls/token=$calls hops/token=0.00 timeouts=0 id_mismatch=0 unmap_fail=0 ok"
   else
     echo "E2E FAIL $fx e3: calls/token=${calls:-none} close=[$close]"; fail=1
   fi
@@ -521,7 +1062,7 @@ done
 cap_eval="$($EVAL --label e3cap "$OUT/dump_25e3" "$OUT/dump_25e3cap" | tail -1 || true)"
 refused=$(grep -c 'arena: [0-9]* MiB refused' "$OUT/25e3cap.log" || true)
 if grep -q 'bit_identical=1' <<< "$cap_eval" && [ "$refused" -ge 1 ]; then
-  echo "E2E arena retry cap=100 refused=$refused bit_identical=1"
+  echo "E2E arena retry cap=200 refused=$refused bit_identical=1"
 else
   echo "E2E FAIL arena retry under a cap: refused=$refused [$cap_eval]"; fail=1
 fi
@@ -532,8 +1073,8 @@ fi
 for t in 25off 25e3; do
   un="$(sed -n 's/.*arena: chunks unmapped \([0-9]*\)\/\([0-9]*\) .*/\1 \2/p' "$OUT/$t.log")"
   ex="$(grep -o 'INPROC rpc exit: .*' "$OUT/$t.log" | head -1)"
-  # the arena goes after the other hooks (E: after S2's close line)
-  late="$(grep -n 'arena: chunks unmapped\|s2: close' "$OUT/$t.log" | tail -1)"
+  # the arena goes after the other hooks (E: after the e2e close line)
+  late="$(grep -n 'arena: chunks unmapped\|e2e: close' "$OUT/$t.log" | tail -1)"
   if read -r a b <<< "$un" && [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" -gt 0 ] &&
     [ "$ex" = "INPROC rpc exit: mapped_kib=0 freed_while_mapped=0" ] &&
     grep -q 'arena: chunks unmapped' <<< "$late"; then
@@ -708,6 +1249,19 @@ if [ "$(dec_field "$OUT/g64fwd.log" source)" = file ] &&
 else
   echo "E2E FAIL $line (not finite, or not forced)"; fail=1
 fi
+# [#225 PR 2] (8) the sidecar model's one-PD token (WH FC set) forced on the
+# hybrid's continuation (CPU Q4_0 decode FCs): the host shape of the
+# device's G4 read, on random weights -- printed; gated: forced, finite
+po="$(dec_field "$OUT/25woffppl.log" ppl)"
+pw="$(dec_field "$OUT/25we3ppl.log" ppl)"
+line="E2E ppl-decode e3fcwh-lfm25 off=${po:-none} wh=${pw:-none}"
+if [ "$(dec_field "$OUT/25woffppl.log" source)" = self ] &&
+  [ "$(dec_field "$OUT/25we3ppl.log" source)" = file ] &&
+  awk -v a="$po" -v b="$pw" 'BEGIN{exit !(a + 0 > 0 && b + 0 > 0 && a + 0 < 1e30 && b + 0 < 1e30)}'; then
+  echo "$line delta=$(awk -v a="$po" -v b="$pw" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') top1=$(dec_field "$OUT/25we3ppl.log" top1)"
+else
+  echo "E2E FAIL $line (not finite, or not forced)"; fail=1
+fi
 
 # (j) [#194 S1] lever L1: the hd64 PPL forced on E1's path against E0's
 # (the unset run, q64-e3ppl), lfm25's logits against E0's by SNR (and not
@@ -725,12 +1279,13 @@ l1_line="$($EVAL --label l1-lfm25 --allow-diff --snr-floor 30 "$OUT/dump_25e3" "
 echo "$l1_line"
 grep -q 'bit_identical=0' <<< "$l1_line" ||
   { echo "E2E FAIL l1-lfm25 bit-identical to E0: the lever is not wired"; fail=1; }
-# [#194 L0] the wake split closes on one clock: disp + S2's packet time +
-# ret = the ARM's round trip, to within 50 us a token, nothing negative
+# [#194 L0] the wake split closes on one clock: disp + the DSP's packet
+# time + its wall + ret = the ARM's round trip, to within 50 us a token,
+# nothing negative
 wk="$(grep -h 'L0 wake us/token' "$OUT/25e3.log" || true)"
 if awk -v l="$wk" 'BEGIN{n = split(l, f, "[ =]"); ok = n > 0; for (i = 1; i < n; ++i) {
     if (f[i] == "clk_resid") { r = f[i + 1]; if (r < 0) r = -r; ok = ok && r < 50; seen = 1 }
-    if (f[i] == "s1" || f[i] == "s2" || f[i] == "s2_pkt") ok = ok && f[i + 1] + 0 >= 0 }
+    if (f[i] == "disp" || f[i] == "pkt" || f[i] == "ret") ok = ok && f[i + 1] + 0 >= 0 }
     exit !(ok && seen)}'; then
   echo "E2E L0 wake split closes: ${wk#*us/token }"
 else

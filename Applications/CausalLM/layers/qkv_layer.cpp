@@ -56,7 +56,8 @@ QKVLayer::QKVLayer() :
             props::FeatureSize(), nntrainer::props::Epsilon(), props::VNorm(),
             props::VFromK(), props::QScale(), props::InNorm(), props::Rope(),
             props::RopeTheta(), props::RopeScalingType(),
-            props::RopePartialRotaryFactor(), nntrainer::props::MaxTimestep()) {
+            props::RopePartialRotaryFactor(), nntrainer::props::MaxTimestep(),
+            props::NormInCall()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -132,6 +133,7 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
   v_from_k = std::get<props::VFromK>(qkv_props).get();
   q_scale = std::get<props::QScale>(qkv_props).get();
   in_norm = std::get<props::InNorm>(qkv_props).get();
+  norm_in_call = std::get<props::NormInCall>(qkv_props).get();
   rope = std::get<props::Rope>(qkv_props).get();
   // v from the raw k projection: v's width is k's, and the raw k lands in
   // the norm scratch below, so the norm (feature_size) must be on.
@@ -386,7 +388,7 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
   // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1). The
   // accelerator's RoPE takes a head dim whose half is a multiple of 32.
-  if ((in_norm || feature_size) && ops != nullptr &&
+  if ((in_norm || (feature_size && norm_in_call)) && ops != nullptr &&
       ops->supports_gemm_q4_0_batch_norm_fp32() &&
       (!rope || (feature_size / 2) % 32 == 0) &&
       (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&

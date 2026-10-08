@@ -20,7 +20,7 @@
  *
  *   htp_e2e_test --model <quantized dir> --tokenizer <tokenizer.json>
  *                [--prompt 16] [--steps 8] [--moe-engine htp|cpu]
- *                [--dump <dir>] [--max-seq N] [--run]
+ *                [--dump <dir>] [--max-seq N] [--run] [--repack]
  *
  * The prompt is deterministic, ids[i] = 1 + (7 i mod 30): inside the
  * 32-token vocabulary, never bos (0) or eos (31). Output:
@@ -33,10 +33,16 @@
  * steps - 1 (run emits the prefill token plus that many), no E2E step
  * lines, and E2E gen read back from the model's token history. It is the
  * path NNTR_PPL_DECODE lives on.
+ * The model class follows config.json's architectures: Gemma4ForCausalLM
+ * is the Gemma 4 MoE fixture ([plan 201 S4]), anything else LFM2-MoE.
+ * --repack calls repack_weight after the load, as the app's main does
+ * (#225): the load-time FC registrations, the FC WH sidecar and the
+ * warm-up calls (which the MoE dumps then hold too).
  * Exit 0, or 1 with `E2E FAIL <reason>` on any exception.
  */
 
 #include <causallm_test_utils.h>
+#include <gemma4_moe_causallm.h>
 #include <lfm2_moe_causallm.h>
 
 #include <algorithm>
@@ -54,7 +60,7 @@ namespace {
 struct Options {
   std::string model, tokenizer, engine = "htp", dump;
   unsigned prompt = 16, steps = 8, max_seq = 0;
-  bool run = false;
+  bool run = false, repack = false;
 };
 
 Options parse(int argc, char **argv) {
@@ -82,6 +88,8 @@ Options parse(int argc, char **argv) {
       o.max_seq = static_cast<unsigned>(std::stoul(value()));
     else if (a == "--run")
       o.run = true;
+    else if (a == "--repack")
+      o.repack = true;
     else
       throw std::invalid_argument("unknown option " + a);
   }
@@ -107,6 +115,10 @@ void writeLogits(const std::string &dir, size_t step, const float *p,
   std::fclose(f);
 }
 
+template <typename Model>
+int runModel(const Options &o, nlohmann::json &cfg, nlohmann::json &gen,
+             nlohmann::json &nntr, const std::string &weights);
+
 int run(const Options &o) {
   namespace fs = std::filesystem;
   const fs::path dir = o.model;
@@ -119,7 +131,22 @@ int run(const Options &o) {
   nntr["num_to_generate"] = o.run ? o.steps - 1 : o.steps;
   // the prefill buffer; the fixture says 4. run() records the prefill's
   // token only when the prompt is shorter than it, as in the app's config.
-  nntr["init_seq_len"] = o.run ? o.prompt + 1 : o.prompt;
+  // A config that asks for more keeps it (#222: init_seq_len 1024).
+  nntr["init_seq_len"] =
+    std::max(nntr.value("init_seq_len", 0u), o.run ? o.prompt + 1 : o.prompt);
+  if (nntr["init_seq_len"].get<unsigned>() > o.max_seq)
+    throw std::invalid_argument("the config's init_seq_len is above --max-seq");
+  const bool gemma = cfg.contains("architectures") &&
+                     cfg["architectures"].is_array() &&
+                     !cfg["architectures"].empty() &&
+                     cfg["architectures"][0] == "Gemma4ForCausalLM";
+  // Gemma 4 nests its shape in text_config; the model lifts it the same
+  // way (Gemma4Transformer::sanitizeConfig), before the override below
+  if (gemma && cfg.contains("text_config"))
+    for (auto it = cfg["text_config"].begin(); it != cfg["text_config"].end();
+         ++it)
+      if (!cfg.contains(it.key()))
+        cfg[it.key()] = it.value();
   if (cfg.value("max_position_embeddings", 0u) < o.max_seq)
     cfg["max_position_embeddings"] = o.max_seq;
   const std::string weights =
@@ -133,10 +160,19 @@ int run(const Options &o) {
     setenv("NNTR_HTP_DUMP", o.dump.c_str(), 1);
   }
 
-  causallm_test::CausalLMTestAdapter<causallm::Lfm2MoeCausalLM> model(cfg, gen,
-                                                                      nntr);
+  return gemma
+           ? runModel<causallm::Gemma4MoECausalLM>(o, cfg, gen, nntr, weights)
+           : runModel<causallm::Lfm2MoeCausalLM>(o, cfg, gen, nntr, weights);
+}
+
+template <typename Model>
+int runModel(const Options &o, nlohmann::json &cfg, nlohmann::json &gen,
+             nlohmann::json &nntr, const std::string &weights) {
+  causallm_test::CausalLMTestAdapter<Model> model(cfg, gen, nntr);
   model.initializeModel();
   model.loadWeight(weights);
+  if (o.repack)
+    model.repack_weight();
 
   std::vector<unsigned int> ids(o.prompt);
   for (unsigned i = 0; i < o.prompt; ++i)

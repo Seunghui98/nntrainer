@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 
@@ -23,7 +24,9 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
+#include <htp_wh_layout.h>
 #include <lfm2_moe_layer.h>
+#include <lfm2_moe_pool_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
@@ -32,6 +35,15 @@
 #include <tie_word_embedding.h>
 
 namespace causallm {
+
+namespace {
+/** @brief [#260] The two MoE layer classes the load path registers alike:
+ *  #4415's lfm2_moe (Gemma) and the one-PD pool's lfm2_moe_pool (LFM2). */
+bool isMoeLayer(const ml::train::Layer &l) {
+  return l.getType() == Lfm2MoELayer::type ||
+         l.getType() == Lfm2MoePoolLayer::type;
+}
+} // namespace
 
 /**
  * @brief Load a file as a binary string.
@@ -148,6 +160,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   ATTENTION_KV_DTYPE = nntr_cfg.value("attention_kv_dtype", std::string());
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
+  FC_WH_FILE_NAME = nntr_cfg.value("fc_wh_file_name", std::string());
+  FC_WH_FORMAT = nntr_cfg.value("fc_wh_format", std::string());
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -308,6 +322,7 @@ void Transformer::load_weight(const std::string &weight_path) {
       "initialize() before load_weight().");
   }
 
+  WEIGHT_DIR = std::filesystem::path(weight_path).parent_path().string();
   try {
     model->load(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {
@@ -409,7 +424,7 @@ void Transformer::repack_weight() {
     std::vector<void *> gu_data, dn_data;
     std::vector<float *> gu_scale, dn_scale;
     unsigned int K = 0, inter = 0, N_out = 0;
-    bool weights_wh = false;
+    unsigned int w_bits = 0u; /**< 0 QS4CX, 4 QS4CX_WH, 2 QS2CX_WH */
   } moe_warm;
 
   // The tied lm_head, prepared after the walk: on its accelerator it is
@@ -513,7 +528,7 @@ void Transformer::repack_weight() {
       }
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected" &&
-          l.getType() != "qkv_layer" && l.getType() != "lfm2_moe")
+          l.getType() != "qkv_layer" && !isMoeLayer(l))
         return;
 
       // An accelerator-dispatched MoE layer registers its expert weights
@@ -522,20 +537,19 @@ void Transformer::repack_weight() {
       // a backend that has nothing to register says so and is skipped. The
       // expert weight tensors are [K, N] as the kernel sees them; the router
       // gate and expert bias are FP32 and never reach this branch.
-      auto *ops = l.getType() == "lfm2_moe" ? context.getComputeOps() : nullptr;
+      auto *ops = isMoeLayer(l) ? context.getComputeOps() : nullptr;
       // [doc 50] A fully_connected layer under engine=htp registers its
       // Q4_0 weight here for the same reason: gemm_q4_0_accel_fp32's first
       // call converts and registers it, and that first call is in the
       // first prefill. A CPU-engine layer's ops answer false; nothing else
       // changes for it. The weight is [K, N] as dot() reads it.
-      auto *fc_ops =
-        l.getType() == "lfm2_moe" ? nullptr : context.getComputeOps();
+      auto *fc_ops = isMoeLayer(l) ? nullptr : context.getComputeOps();
 
       auto weights = context.getWeights();
       std::vector<void *> gu_data, dn_data;
       std::vector<float *> gu_scale, dn_scale;
       unsigned int gu_h = 0, gu_w = 0, dn_h = 0, dn_w = 0;
-      bool weights_wh = false;
+      unsigned int w_bits = 0u;
       for (auto &w : weights) {
         auto &t = w->getVariableRef();
         const auto dtype = t.getDataType();
@@ -555,10 +569,13 @@ void Transformer::repack_weight() {
                                 static_cast<unsigned int>(t.width())});
         }
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
-                    dtype == ml::train::TensorDim::DataType::QS4CX_WH)) {
+                    dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
+                    dtype == ml::train::TensorDim::DataType::QS2CX_WH)) {
           const auto h = static_cast<unsigned int>(t.height());
           const auto wd = static_cast<unsigned int>(t.width());
-          weights_wh = dtype == ml::train::TensorDim::DataType::QS4CX_WH;
+          w_bits = dtype == ml::train::TensorDim::DataType::QS4CX_WH   ? 4u
+                   : dtype == ml::train::TensorDim::DataType::QS2CX_WH ? 2u
+                                                                       : 0u;
           // [doc 52] A virtual expert has no bytes here: preloadExperts
           // below reads it from the model file into the accelerator's slot
           // pool, keyed by the tensor itself, and the warm-up passes that
@@ -567,7 +584,7 @@ void Transformer::repack_weight() {
             t.isVirtual() ? static_cast<void *>(&t) : t.getData<char>();
           float *scale = t.isVirtual() ? nullptr : t.getScale<float>();
           if (!t.isVirtual())
-            ops->register_qs4cx_weight(key, scale, h, wd, weights_wh);
+            ops->register_qs4cx_weight(key, scale, h, wd, w_bits);
           // The expert weights come in two shapes: gate_up is [K, 2*inter]
           // and down [inter, N_out]. Sorted here for the warm-up below by
           // the identity that tells them apart, gate_up.width == 2 *
@@ -591,11 +608,12 @@ void Transformer::repack_weight() {
       // until it is full, so the first prefill maps no arena chunk. A
       // layer whose experts did not all fit cannot host the warm-up call.
       bool moe_all_resident = true;
-      if (ops && l.getType() == "lfm2_moe") {
-        auto *moe = dynamic_cast<Lfm2MoELayer *>(
-          static_cast<nntrainer::LayerNode &>(l).getLayer());
-        if (moe)
+      if (ops && isMoeLayer(l)) {
+        auto *layer = static_cast<nntrainer::LayerNode &>(l).getLayer();
+        if (auto *moe = dynamic_cast<Lfm2MoELayer *>(layer))
           moe_all_resident = moe->preloadExperts(context);
+        else if (auto *pool = dynamic_cast<Lfm2MoePoolLayer *>(layer))
+          moe_all_resident = pool->preloadExperts(context);
       }
       // [doc 47 section 20.1, lever 6] One warm-up call through the layer
       // kernel at load, so the first prefill does not pay the first call's
@@ -606,8 +624,7 @@ void Transformer::repack_weight() {
       // enough, since all of that is per session, not per layer. Zero
       // input, output discarded. Skipped, harmlessly, when the shapes do
       // not read as an expert pair.
-      if (ops && moe_warm.ops == nullptr && moe_all_resident &&
-          l.getType() == "lfm2_moe" &&
+      if (ops && moe_warm.ops == nullptr && moe_all_resident && isMoeLayer(l) &&
           ops->supports_gemm_qs4cx_moe_layer_fp32() && !gu_data.empty() &&
           gu_data.size() == dn_data.size() && gu_w == 2 * dn_h &&
           gu_h == dn_w) {
@@ -619,11 +636,41 @@ void Transformer::repack_weight() {
         moe_warm.K = gu_h;
         moe_warm.inter = dn_h;
         moe_warm.N_out = dn_w;
-        moe_warm.weights_wh = weights_wh;
+        moe_warm.w_bits = w_bits;
       }
     };
   try {
     model->forEachLayer(fn, nullptr);
+    // [#225] The FC WH sidecar, handed to every backend that registers a
+    // pending FC before it registers any. A CPU-engine layer's ops are
+    // pending too and answer false, so a model whose keys route no FC to
+    // an accelerator (the CPU-only and no-keys configs) never opens it.
+    if (!FC_WH_FILE_NAME.empty()) {
+      NNTR_THROW_IF(FC_WH_FORMAT != nntrainer::FCWH_FORMAT, std::runtime_error)
+        << "fc_wh_format \"" << FC_WH_FORMAT << "\" in nntr_config.json, this "
+        << "build reads \"" << nntrainer::FCWH_FORMAT
+        << "\": re-run nntr_quantize_stream --fc_wh_sidecar";
+      const std::filesystem::path p(FC_WH_FILE_NAME);
+      const std::string path =
+        p.is_absolute() ? p.string()
+                        : (std::filesystem::path(WEIGHT_DIR) / p).string();
+      std::set<nntrainer::ComputeOps *> backends;
+      for (const auto &f : fc_pending)
+        backends.insert(f.ops);
+      for (const auto &d : dense_pending)
+        backends.insert(d.ops);
+      for (const auto &c : conv_pending)
+        backends.insert(c.ops);
+#ifdef ENABLE_HEXKL
+      // [#234 P4] the one-PD decode list binds its FC / DENSE_FFN ops to
+      // the sidecar's images too, so a model that keys no FC (Gemma 4)
+      // opens it for that bind
+      if (nntrainer::get_htp_ops()->has_decode_graph_q4_0())
+        backends.insert(nntrainer::get_htp_ops());
+#endif
+      for (auto *b : backends)
+        b->set_fc_wh_file(path.c_str());
+    }
     // The MoE warm-up (doc 47 section 20.1, lever 6): one call through the
     // layer kernel at load, now after the walk (see PendingMoeWarm).
     if (moe_warm.ops != nullptr) {
@@ -643,7 +690,7 @@ void Transformer::repack_weight() {
       moe_warm.ops->gemm_qs4cx_moe_layer_fp32(
         moe_warm.gu_data, moe_warm.gu_scale, moe_warm.dn_data,
         moe_warm.dn_scale, row_index, row_count, row_weight, act.data(),
-        out.data(), M, K, moe_warm.inter, N_out, moe_warm.weights_wh);
+        out.data(), M, K, moe_warm.inter, N_out, moe_warm.w_bits);
       ml_logd("MoE HTP kernel warmed up at load (M=%u, %u experts)", M, E);
     }
     // The deferred FC registrations (see fc_pending above). A CPU-engine

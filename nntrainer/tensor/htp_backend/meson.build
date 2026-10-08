@@ -96,14 +96,22 @@ if get_option('htp-inproc')
     # the session's close() releases the two KV tables of nntrainer#4343;
     # the attention entries that fill them are device-only (see above)
     'hmx/hexkl_kv_tiles_f16.c',
-    'hmx/hexkl_kv_q.c',
+    # hmx/hexkl_kv_q.c: in nntrainer_sources already (cpu_backend, #4415)
     'hvx/hvx_worker_pool.c',
+    'hvx/hvx_expand_i2i4.c',
     'hvx/hvx_gather_ah_u8.c',
     'hvx/hvx_scale_add_f32.c',
     'hvx/hvx_conv_gate_f32.c',
     'hvx/hvx_m1_ops_f32.c',
     'hvx/hvx_attn_m1_f32.c',
     'hvx/hvx_q4_gemv_f32.c',
+    # [#260] #4415's fused prefill entries (norm / RoPE / router rows,
+    # the lm_head softcap)
+    'hvx/hvx_rmsnorm_rows_f32.c',
+    'hvx/hvx_rope_rows_f32.c',
+    'hvx/hvx_router_rows_f32.c',
+    'hvx/hvx_softmax_f32.c',
+    'hvx/hvx_softcap_f32.c',
     htp_host_dir / 'standin' / 'hvx_scalar.c',
     htp_host_dir / 'inproc' / 'hexkl_micro_standin.c',
     htp_host_dir / 'inproc' / 'rpc_standin.c',
@@ -126,7 +134,9 @@ if get_option('htp-inproc')
       'generated', 'hmx', 'hvx', '.', '..'),
     dependencies: [hexkl_dep, thread_dep, libm_dep],
     c_args: ['-ffp-contract=off', '-include', 'malloc.h',
-             '-Wno-format-truncation', '-DNNTR_Q4M1_HOST_ID'],
+             '-Wno-format-truncation', '-DNNTR_Q4M1_HOST_ID',
+             # hvx_softmax_util.h's float <-> bits puns (#4415's router)
+             '-fno-strict-aliasing'],
     pic: true,
     build_by_default: false,
   )

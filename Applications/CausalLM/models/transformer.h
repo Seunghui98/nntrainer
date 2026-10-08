@@ -404,6 +404,12 @@ protected:
   std::string ATTENTION_KV_DTYPE;
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
+  /** [#225] "fc_wh_file_name" / "fc_wh_format": the FC WH sidecar the HTP
+   *  prefill reads, relative to the weight file's directory (WEIGHT_DIR,
+   *  set by load_weight) unless absolute; empty when the model has none. */
+  std::string FC_WH_FILE_NAME;
+  std::string FC_WH_FORMAT;
+  std::string WEIGHT_DIR;
   /** Engine of createMlp's three FCs (ffn_up, ffn_gate, ffn_down): "cpu"
    *  (default) or "htp", bounded to FFN_HTP_LAYERS when that set is not
    *  empty. A model that wants them accelerated sets these before

@@ -66,6 +66,19 @@ public:
 };
 
 /**
+ * @brief [plan 201 S4] The MoE router: "sigmoid" (LFM2: sigmoid scores plus
+ *        an expert bias for the selection) or "softmax" (Gemma 4: an
+ *        un-normed router input RMS-normed and scaled, softmax, top-k,
+ *        renormalised, times a per-expert scale)
+ */
+class MoERouter : public nntrainer::Property<std::string> {
+public:
+  MoERouter(std::string value = "sigmoid") { set(value); };
+  static constexpr const char *key = "moe_router";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
  * @brief Per-layer expert cache size C for the streamed (virtual) expert
  *  path, doc 52/55. 0 keeps the experts resident. NNTR_MOE_CACHE_EXPERTS in
  *  the environment overrides it, so one device can sweep C without a
@@ -147,6 +160,19 @@ public:
   InNorm(bool val = false) : nntrainer::Property<bool>(val) {}
   using prop_tag = nntrainer::bool_prop_tag;
   static constexpr const char *key = "in_norm";
+};
+
+/**
+ * @brief norm_in_call: [#260] qkv_layer's per-head q / k norms
+ *        (feature_size) go into the accelerator's projection call with
+ *        no in_norm too (#4415's default). LFM2 sets it false: its prefill
+ *        keeps the norms on the CPU, as before #4415.
+ */
+class NormInCall : public nntrainer::Property<bool> {
+public:
+  NormInCall(bool val = true) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "norm_in_call";
 };
 
 /**

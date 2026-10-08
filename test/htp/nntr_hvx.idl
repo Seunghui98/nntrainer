@@ -639,8 +639,12 @@ interface nntr_hvx : remote_handle64 {
    // register for the whole shape (24 MiB at the LFM2.5 shape and max_seq
    // 2048) and freed at release or close. layer
    // is the attention-layer ordinal. Not wired into the model here: #85's
-   // ATTN_M1 slot stays NULL. One cache per session: a second register
-   // without a release is AEE_EBADSTATE. A bad shape or a position out
+   // ATTN_M1 slot stays NULL. One cache per shape: [plan 201 S4] a second
+   // register of another (n_kv, gqa, head_dim) is the session's second
+   // cache (Gemma 4's full layers), kv_append names it with
+   // HTP_ATTN_KV_CACHE_B in layer (htp_graph_desc.h); a second of the same
+   // shape, or a third, without a release is AEE_EBADSTATE (release frees
+   // both). A bad shape or a position out
    // of range is AEE_EINVALIDFORMAT, a hole (pos or kv_from past the
    // layer's length) or a missing cache AEE_EBADSTATE; never AEE_EBADPARM,
    // which stays the stale-skel symptom.
@@ -679,7 +683,10 @@ interface nntr_hvx : remote_handle64 {
    // with op == HTP_GRAPH_NO_OP), or a ROUTER_TOPK op's gate weight
    // (K x n_experts, [K][E]) and bias (n_experts) (#132), or [#132 Part
    // B E3] an LM_HEAD op's banned ids (LM_BAN: 1..32 u32 in the f32
-   // words, the argmax skips them). The copy lives on the DSP heap for
+   // words, the argmax skips them), or [plan 201 S1] a MOE op's expert
+   // table (EXPERTS: 2 x n_experts u32 handles, h_gu then h_dn, each
+   // HTP_GRAPH_NO_HANDLE or a registered weight of the op's shape, else
+   // AEE_EINVHANDLE; re-sendable). The copy lives on the DSP heap for
    // the graph's life (plan 130 section 3.1), so the per-token calls
    // carry activations only. A wrong length or a kind that does not take
    // which is AEE_EINVALIDFORMAT, an op or which out of range
@@ -825,22 +832,21 @@ interface nntr_hvx : remote_handle64 {
    AEEResult sf_probe(in uint32 op, in sequence<float> a,
                       in sequence<float> b, rout sequence<float> o);
 
-   // [#132 Part B E2] The two-session token driver (nntr_hvx_token.c over
-   // hmx/hexkl_token.c; plan 132-part-b-two-session-e2e.md section 3.2).
-   // start maps the mailbox page the ARM side allocated and fastrpc_mmap'd
-   // into both sessions (mbox_fd; mbox_bytes >= 16896, HEXKL_MBOX_BYTES)
-   // and records the role: 0 = S2, the main session (op 0 to the argmax),
-   // 1 = S1, the MoE server (ROUTER_TOPK + MOE). A wait for the other
-   // session spins spin_us, then polls every 50 us, and fails the token
-   // with AEE_EEXPIRED 1 s later. The tokens themselves are dspqueue
-   // packets (HTP_DSPQ_OP_TOKEN, htp_dspq_wire.h) on the session's dspq
-   // thread. AEE_EBADSTATE: a driver is already running;
-   // AEE_EINVALIDFORMAT: role or page size. Never AEE_EBADPARM. close()
-   // stops a driver still running.
+   // [#132 Part B E2, #211] The one-PD token driver (nntr_hvx_token.c over
+   // hmx/hexkl_token.c). start maps the mailbox page the ARM side
+   // allocated and fastrpc_mmap'd into the session (mbox_fd; mbox_bytes >=
+   // 18432, HEXKL_MBOX_BYTES): the expert pool's miss lines. role must be
+   // 0 (op 0 to the argmax); 1, the two-PD path's MoE server, was removed
+   // by #211 and is refused. A miss wait spins spin_us, then polls every
+   // 20 us, and fails the token with AEE_EEXPIRED 1 s later. The tokens
+   // themselves are dspqueue packets (HTP_DSPQ_OP_TOKEN, htp_dspq_wire.h)
+   // on the session's dspq thread. AEE_EBADSTATE: a driver is already
+   // running; AEE_EINVALIDFORMAT: role or page size. Never AEE_EBADPARM.
+   // close() stops a driver still running.
    AEEResult token_driver_start(in int32 mbox_fd, in uint32 mbox_bytes,
                                 in uint32 role, in uint32 spin_us);
-   // Unmaps the page. res (5): [tokens served, hops, timeouts, stale
-   // reads, wait us].
+   // Unmaps the page. res (5): [tokens served, hops (0), timeouts, stale
+   // reads, wait us (0)].
    AEEResult token_driver_stop(rout sequence<uint32> res);
 
    // [#132 Part B E3] q4m1_register's arena form: the K x N Q4M1 weight
@@ -1186,4 +1192,50 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<uint8> p_tiles,
                              rout sequence<int32> rowsum,
                              rout sequence<uint32> stats);
+
+   // [doc 54] The 2-bit expert expansion (hvx_expand_i2i4.h). Same reason
+   // swiglu_det_f32 exists: the HVX form rests on an unverified reading of
+   // V6_vlutvvb, its scalar twin is the specification, and only running
+   // both on the device settles it. codes are QS2CX_WH bytes, pal is the
+   // tensor's four int4 levels, and both outputs come back so a failure
+   // says whether the table or the lookup is wrong.
+   // codesLen must be a multiple of 128; hvx and ref are 2 * codesLen.
+   // ("out" is an IDL reserved word.) The 2-bit entries are appended last,
+   // like weight_swap_u8i4_arena before them, so every method above keeps
+   // its index.
+   AEEResult expand_i2i4(in sequence<uint8> codes, in sequence<int8> pal,
+                         rout sequence<uint8> hvx, rout sequence<uint8> ref);
+
+   // [doc 54] weight_register_u8i4_arena for QS2CX_WH: the arena holds
+   // (K/32)*(N/32)*256 bytes of 2-bit codes instead of 512 of nibbles, and
+   // pal carries the four int4 values they index. The M=1 GEMV reads the
+   // codes through a register LUT; the HMX path expands a chunk in place
+   // after its DMA lands, so the VTCM budget is the 4-bit one and nothing
+   // after the matmul changes. wh_off must be 512-aligned, as for 4 bits.
+   AEEResult weight_register_u2i4_arena(in uint32 K, in uint32 N,
+                                        in uint32 arena, in uint32 wh_off,
+                                        in sequence<int8> pal,
+                                        in sequence<float> w_scale,
+                                        in sequence<int32> colsum_w,
+                                        in sequence<float> bias,
+                                        rout uint32 w_handle);
+
+   // [plan 229] weight_swap_batch_u8i4_arena for QS2CX_WH experts: each
+   // weight's arena span is its (K/32)*(N/32)*256 bytes of codes, then N
+   // f32 scales and N i32 column sums (always in the arena: no arrays),
+   // and pal_gu / pal_dn carry four int4 codes per expert. The swap and
+   // the partial-batch rules are the 4-bit call's; a rebind retags the
+   // slot's width with the bytes.
+   AEEResult weight_swap_batch_u2i4_arena(in uint32 K, in uint32 inter,
+                                          in uint32 N_out,
+                                          in sequence<uint32> old_gu,
+                                          in sequence<uint32> old_dn,
+                                          in sequence<uint32> arena,
+                                          in sequence<uint32> off_gu,
+                                          in sequence<uint32> off_dn,
+                                          in sequence<int8> pal_gu,
+                                          in sequence<int8> pal_dn,
+                                          rout sequence<uint32> h_gu,
+                                          rout sequence<uint32> h_dn,
+                                          rout uint32 n_done, rout int32 err);
 };

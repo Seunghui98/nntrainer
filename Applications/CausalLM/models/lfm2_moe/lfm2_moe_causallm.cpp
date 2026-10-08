@@ -10,7 +10,7 @@
  */
 
 #include <lfm2_moe_causallm.h>
-#include <lfm2_moe_layer.h>
+#include <lfm2_moe_pool_layer.h>
 
 #include <app_context.h>
 #include <engine.h>
@@ -60,6 +60,12 @@ void Lfm2MoeCausalLM::setupParameters(json &cfg, json &generation_cfg,
   MOE_ENGINE = nntr_cfg.value("moe_engine", std::string("cpu"));
   MOE_HTP_LAYERS =
     parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
+#ifdef ENABLE_HEXKL
+  // [plan 201 S4] SwiGLU experts: the session's GeGLU flag stays clear
+  // (set_moe_geglu throws when a Gemma model of this process sent it set)
+  if (MOE_ENGINE == "htp")
+    nntrainer::get_htp_ops()->set_moe_geglu(false);
+#endif
 
 #ifdef ENABLE_HEXKL
   // [#85] NNTR_HTP_FORWARD=1: describe this model's decode step to the HTP
@@ -131,7 +137,7 @@ Tensor Lfm2MoeCausalLM::createMoeLayer(const int layer_id, Tensor input) {
     (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
                                                                : "cpu";
   LayerHandle moe(createLayer(
-    "lfm2_moe",
+    "lfm2_moe_pool",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", MOE_INTERMEDIATE_SIZE),
      withKey("num_experts", NUM_EXPERTS),
@@ -239,10 +245,10 @@ void Lfm2MoeCausalLM::registerCustomLayers() {
 
   try {
     app_context->registerFactory(
-      nntrainer::createLayer<causallm::Lfm2MoELayer>);
+      nntrainer::createLayer<causallm::Lfm2MoePoolLayer>);
   } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register Lfm2MoELayer factory, reason: " << e.what()
-              << std::endl;
+    std::cerr << "failed to register Lfm2MoePoolLayer factory, reason: "
+              << e.what() << std::endl;
   }
 }
 

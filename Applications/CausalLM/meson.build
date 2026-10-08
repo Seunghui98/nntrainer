@@ -405,7 +405,8 @@ if get_option('enable-test')
       args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_causallm_models'),
       timeout: 60,
       suite: 'unittests',
-      env: {'NNTR_QUANTIZE_BIN': e_quantize.full_path()}
+      env: {'NNTR_QUANTIZE_BIN': e_quantize.full_path(),
+            'NNTR_QUANTIZE_STREAM_BIN': e_quantize_stream.full_path()}
     )
   endif
 endif

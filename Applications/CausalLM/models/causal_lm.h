@@ -127,6 +127,20 @@ public:
 
 protected:
   /**
+   * @brief The incremental_inference inputs: @a input_sample, then one KV
+   *        cache buffer per cache input of the graph, in the graph's order.
+   *
+   * The graph takes its inputs in its own order (its input layers in
+   * topological order), not the names'. Each cache input takes the first
+   * unused buffer of its width in name order; with one cache width that is
+   * the name order. [plan 201 S4] With two widths (#4296's Gemma 4:
+   * sliding and full layers) the name order put a narrow buffer under a
+   * wide placeholder on builds whose caches are input layers (no
+   * ENABLE_FP16): a heap overflow.
+   */
+  std::vector<float *> buildInferenceInputs(float *input_sample);
+
+  /**
    * @brief Setup the parameters for the CausalLM model
    */
   virtual void setupParameters(json &cfg, json &generation_cfg,
