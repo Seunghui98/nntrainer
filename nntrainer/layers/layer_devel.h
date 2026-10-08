@@ -429,6 +429,13 @@ public:
               TensorDim dim = weight.getDim();
               size_t K = dim.height();
               size_t N = dim.width();
+              // Bias-like (height 1) tensors stay as they are, as the Q4_0
+              // branch above leaves them: a layer that holds a projection
+              // and a norm gamma (residual_add's proj) keeps the gamma.
+              if (K == 1) {
+                weight.save(file);
+                continue;
+              }
               Tensor weight_t = weight.transpose("0:2:1");
 
               size_t q_size = N * ((K + 1) / 2);
