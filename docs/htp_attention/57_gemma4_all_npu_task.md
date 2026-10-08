@@ -679,3 +679,59 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 | 출력 | 정상 | 정상 ("…town of Ardley, which is located at the mouth of a slow river…") |
 
 - +300 ms는 PR이 host에 넣은 스칼라 루프 둘: Q min/max 보정(층당 11–22 ms, 첫 prefill)과 Q·출력 f32↔u16 변환(30층 ≈ 260 ms). 다음 수정 = 둘을 NEON + 스레드로(기대 −0.5 s, 기기 미측정).
+
+### 9.23 a16 경로의 host 루프 NEON화 (2026-10-08, 38c3f0a4, 기기 실측, 직접 실행)
+
+| 30층 합 (cfgB, 1024행) | PR 최신(6a31ba72) | NEON 8스레드 | NEON 4스레드 | **NEON 1스레드(커밋)** |
+|---|---|---|---|---|
+| Q 보정 | 398 ms | 62–65 | — | **39** |
+| Q f32→u16 | (260, 둘 합) | 62 | 48 | **27** |
+| 출력 u16→f32 | | 41 | 40 | **33** |
+| prefill | 4,791 / 4,796 | 4,731 / 4,824 / 4,696 | 4,867 | **4,661 / 4,605** |
+
+- nll 3.50819(cfgB_ppl)로 변화 없음, 문장 같음.
+- 스레드 분할은 변환을 느리게 했다(prefill 중 CPU 0–5는 expert prefetch reader가 쓴다, 59 profile `reader cpus {0..5}`).
+- attention 호출 합 792 ms = 보정 39 + 변환 60 + `sdpa_q2_kvcache` 451(FastRPC wall 450) + **설명 안 된 242 ms**(층당 ≈8 ms). 후보(코드, 기기 미측정): 첫 호출 안의 lazy `kv_cache_q_register`(DSP heap calloc, `mha_core.cpp:1114`), `kv_cache_q_set_fixed_scales` FastRPC, `q2_q_u16`/`q2_out_u16` 첫 resize의 0 채움, `AccelF32Io::prepare`. 다음 측정 대상.
+
+### 9.24 0단계: attention 호출 안의 숨은 242 ms (2026-10-08, 3d42ddde + addd73ad, 기기 실측, 직접 실행)
+
+설정 분해(`NNTR_HTP_ATTN_TRACE`, 30층 합, cfgB 생성 1): accel_call 774 = **resize 151**(층마다 자기 `q2_q_u16`/`q2_out_u16`를 처음 키우며 8–17 MB×2 0 채움) + **register 56**(첫 호출 안의 lazy `kv_cache_q_register`, DSP heap) + fixed scales 3 + prepare 0 + 보정 40 + Q 변환 28 + `sdpa_q2_kvcache` 459 + 출력 변환 34.
+
+수정: u16 버퍼 한 쌍을 모든 층이 공유(3d42ddde), int8 KV cache 등록을 load walk 끝(lm_head 배치 뒤)으로(addd73ad).
+
+| cfgB | 전(38c3f0a4) | 후 |
+|---|---|---|
+| register / resize | 56 / 151 ms | **0 / 13 ms** |
+| attention accel_call 30층 | 774–792 ms | 578 / 673 / 594 ms |
+| prefill | 4,605 / 4,661 ms | **4,420 / 4,771 / 4,483 ms** (2회차는 보정도 2배, 기기 노이즈) |
+| nll (cfgB_ppl) | 3.50819 | 3.50819 |
+
+남은 attention 호출 몫(30층): `sdpa_q2_kvcache` ≈ 460(DSP append 197 = quant 166 + bake 31, kernel 170, 전송 ≈ 55, Q/out ION memcpy) + 보정 40 + 변환 60.
+
+### 9.25 1번: K/V append 양자화를 HVX worker로 (2026-10-08, c4ab7487, 기기 실측, 직접 실행)
+
+`append_fixed_i8`의 행×head 양자화를 HMX 스레드 혼자 하던 것을 세션 `quant_pool`에 행 단위로 분산(`hexkl_kv_q_append_pool`, `attn_q2_step`만 사용, IDL 변경 없음). 행마다 자기 마스터·scale·colsum만 쓰므로 안전, bake는 HMX 스레드에 남김.
+
+| cfgB, 30층 | 전 | 후 |
+|---|---|---|
+| append quant | 182 ms | **36 ms** |
+| attention accel_call | 578–673 | 425 / 432 / 497 |
+| prefill | 4,420 / 4,771 / 4,483 | **4,217 / 4,260 / 4,453** |
+| nll | 3.50819 | 3.50819(비트 동일) |
+
+### 9.26 F0·2번: FastRPC 비용과 MoE 호출 분해, MoE warm-up (2026-10-08, a772b5ca + eec133c12, 기기 실측)
+
+`NNTR_HTP_PROFILE=2`에서 out_norm만 접힌 MoE 호출은 timed 진입점 + host norm으로(a772b5ca, 측정 전용).
+
+- **MoE 호출 49.3 ms = DSP 47.8(97%) + 전송 1.5.** DSP 단계(호출당): mm 21.1 · acc 읽기 9.6 · requant 6.9 · dequant 3.2 · alloc 2.1 · stage 1.4 · quant 0.8 · DMA 대기 0.9. GeGLU는 worker에 숨음. 가중치 DMA 311 MB/호출(128 expert 거의 전부), 평균 6.7 GB/s.
+- **FastRPC 전송(timed 진입점이 있는 행):** MoE 1.5 ms/call(16 MB ION 2개), o-proj 0.42 ms/call×95. qkv·dense·router·epilogue는 timed 변형이 없어 0으로 나온다 → 큰 버퍼 호출 층당 7회 기준 추정 0.2–0.3 s(기기 미측정).
+- **alloc 2.1 ms/call**은 warm-up이 M=512라 첫 1024행 호출이 scratch(M×K, M×N_out 사본)와 staging class를 키우던 몫 → warm-up을 `INIT_SEQ_LEN` 행으로: alloc 2,107 → 24 us/call.
+
+| cfgB | 전(c4ab7487) | 후(warm-up M) |
+|---|---|---|
+| MoE 행 | 1,575 ms | 1,430 / 1,465 / 1,472 |
+| prefill | 4,217 / 4,260 / 4,453 | **4,087 / 4,147 / 4,165** |
+| nll | 3.50819 | 3.50819 |
+| e2e(로드 포함) | 31.8 s | 30.9 s |
+
+MoE에 남은 큰 몫: acc 읽기 9.6 · requant 6.9 ms/call(커널 작업, `hexkl_mm_u8i4_moe.c`).
