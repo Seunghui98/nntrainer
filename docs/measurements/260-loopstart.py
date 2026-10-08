@@ -1,6 +1,7 @@
-"""Token index where a generated text turns into a loop.
+"""@file    260-loopstart.py
+@brief   #260: token index where a generated text turns into a loop.
 
-usage: python3 -I loopstart.py TOKENIZER LOG...
+usage: python3 260-loopstart.py TOKENIZER LOG...
 Generated text = after the last '<|turn>model' up to the summary banner, with
 [HTP]/[PPL] lines removed. Loop start = the smallest i such that tokens[i:]
 is periodic with some period p <= 64 for at least 3 full periods to the end
