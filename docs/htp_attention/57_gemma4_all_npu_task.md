@@ -510,3 +510,28 @@ projection·dense FFN·MoE만 NPU(attention·lm_head CPU), Q4_0 FC bin, C=16, 10
 - CPU attention 41%, 512(2.07 s, RoPE 표 1 s 포함) 대비 1.45배. `attention_engine: htp`가 다음 측정.
 - MoE 1.67배: weight DMA는 token 무관이라 1024에서는 계산 몫이 커짐.
 - epilogue 2개 0.45 s, post_ffn_norm 9.8 ms/호출: staging(1024행×2 addend) 몫으로 추정, `NNTR_HTP_PROFILE=2`로 확인.
+
+### 9.13 전부 NPU, §9.10 수정본 첫 실측 (2026-10-08, e8f0c7b0, 사용자 실행)
+
+조건: `gemma4-26b-a4b-qs4cx-arm`(QS4CX FC bin), engine 키 5개 htp, C=16, 1023토큰 Ardley prompt, 생성 32, 일반 빌드 + `NNTR_HTP_PROFILE=1`, `NNTR_HTP_ATTN_TRACE=1`.
+
+| | 값 | 비고 |
+|---|---|---|
+| prefill | **6230 ms (164.2 TPS)** | 같은 prompt, attention·lm_head CPU: 6452 ms(§9.12). §9.9의 9378 ms(446토큰)에서 회복 |
+| 출력 | 정상 영어 문장(반복) | §9.9의 `<i></i>` 깨짐 사라짐 |
+| lm_head 배치 | 로드 때 (`placed in 716 ms`, prompt 출력 전) | §9.10 #3 |
+| dense 등록 | 로드 때 (dense 호출 31 = 30 + warm-up) | §9.10 #1 |
+| attention (logcat) | wall 40 ms/층(sliding): DSP 33 = qprep 6.8 · dma 5.9 · **tile 5.3** · qk 1.9 · softmax 1.8 · pv 2.2 · store 9.2 | §9.10 #2 전치: 이전 커널은 같은 모양에서 수십 ms(산술 150+) |
+| router `N=128` | 648 ms (21.6 ms/호출, 1023행) | 아직 발행 병목. §9.14 |
+| decode | 2.96 TPS (32토큰) | miss 102/token × 2 ms = 60%, NPU 호출 85개/token 84 ms |
+| peak RSS | 2.38 GB (+arena 1856 MiB) | lm_head CPU 복사본 생략 전 2.77 |
+
+프로파일 빌드 `--by-op`(노드 합 7054 ms): attention 2737(91 ms/층, **호출 40 ms 밖에 ~45 ms**) · sparse_moe 2184 · qkv 835 · ffn 463 · attention_out 365 · post_ffn_norm 296 · post_attention_norm 155. `NNTR_HTP_PROFILE=2`는 plain FC 경로만 DSP 분해를 주고(o proj: quant 0.66 ms, mm 1.1, acc 0.18) 융합 호출(qkv·MoE·dense·router)은 dsp≈0으로 나온다: 그쪽 DSP 타이머는 아직 없음.
+
+남은 prefill 구성(6.23 s, 산술): MoE 1.29 · attention 호출 1.2 + 호출 밖 ~1.3 · router 0.65 · qkv 0.62 · dense 0.41 · o 0.26 · epilogue 0.19 · staging ~0.3. flash 바닥 3.4 s까지 2.8 s, 전부 계산 쪽.
+
+### 9.14 다음 수정 (2026-10-08)
+
+- router 레지스터 블로킹(E/32·행 수를 컴파일 타임 상수로, w 행을 행 4개에 한 번 로드): host `ROUTER ROWS OK`. 기대 21.6 → 6 ms/호출(산술, 기기 미측정).
+- `mha_core trace:` 로그(`NNTR_HTP_ATTN_TRACE=1`, logcat): K/V cache 쓰기와 accelerator 호출의 호스트 시간을 층마다 찍어 "호출 밖 45 ms"를 가른다.
+- 그다음: attention 호출의 qprep·store(f32 Q/out 16.8 MB ×2 변환, 16 ms) → fp16 입출력; dma·tile(q 블록마다 K/V 재타일) → kv head당 1회; 전송 7 ms → Q/out을 ION으로.
