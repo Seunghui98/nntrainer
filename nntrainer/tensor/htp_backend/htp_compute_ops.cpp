@@ -6628,10 +6628,23 @@ public:
     const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
     const int rows_len = static_cast<int>(append_rows * kv_stride);
     uint32_t stats[12] = {0};
+    const int64_t t0 = now_us();
     const int err = nntr_hvx_attn_q2_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, q, q_len, q_scale,
       static_cast<int>(n_head_q), out, q_len, stats, 12);
+    if (attn_trace_enabled()) {
+      // stats (nntr_hvx_attn_q2_step): append, kernel, -, total, then the
+      // append's quant/stage/bake, rows appended, the kernel's qk, softmax,
+      // pv and worker wait, in microseconds. wall - total is transport.
+      ml_logi("HTP attn trace q2: n_q=%u cache=%u..%u err=0x%x wall_us=%lld "
+              "dsp_us: append=%u (quant=%u stage=%u bake=%u rows=%u) "
+              "kernel=%u (qk=%u softmax=%u pv=%u wait=%u) total=%u",
+              n_q, cache_from, cache_to, err,
+              static_cast<long long>(now_us() - t0), stats[0], stats[4],
+              stats[5], stats[6], stats[7], stats[1], stats[8], stats[9],
+              stats[10], stats[11], stats[3]);
+    }
     if (err != AEE_SUCCESS) {
       ml_logw("HTP row-blocked attention step failed: 0x%x; CPU fallback", err);
       return false;
