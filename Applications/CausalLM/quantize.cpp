@@ -537,6 +537,9 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       // requested FP32 by the layer and stay so whatever this says.
       dtype_map[prefix + "_qkv"] = fc_dtype;
       dtype_map[prefix + "_attention_out"] = fc_dtype;
+      // Gemma-4's post-attention residual_add holding the o-proj (proj,
+      // doc 57 section 9.32); its gamma is height 1 and stays FP32
+      dtype_map[prefix + "_post_attention_norm"] = fc_dtype;
 
       // Attention Gates
       dtype_map[prefix + "_attention_gate_down"] = fc_dtype;

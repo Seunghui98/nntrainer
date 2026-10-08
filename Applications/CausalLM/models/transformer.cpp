@@ -529,9 +529,12 @@ void Transformer::repack_weight() {
         }
         return;
       }
+      // residual_add: its proj weight, when it holds the o-proj (doc 57
+      // section 9.32); its FP32 gamma / scalar are skipped below.
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected" &&
-          l.getType() != "qkv_layer" && l.getType() != "lfm2_moe")
+          l.getType() != "qkv_layer" && l.getType() != "lfm2_moe" &&
+          l.getType() != "residual_add")
         return;
 
       // An accelerator-dispatched MoE layer registers its expert weights
