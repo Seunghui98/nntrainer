@@ -1731,7 +1731,8 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   // and cos/sin rows past it are never indexed. Measured on device: the
   // first layer of each RoPE shape spent about 0.5 s building the full
   // table (doc 57 section 3).
-  const unsigned int rope_rows = std::min(max_position_embeddings, max_timestep);
+  const unsigned int rope_rows =
+    std::min(max_position_embeddings, max_timestep);
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (freqs_fp32 == nullptr) {

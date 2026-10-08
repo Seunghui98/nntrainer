@@ -21,8 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <htp_decode_hook.h>
 #include <deque>
+#include <htp_decode_hook.h>
 #include <htp_wh_layout.h>
 #ifndef _WIN32
 #include <unistd.h>
@@ -658,8 +658,7 @@ static void normRows(const nntrainer::Tensor &src, nntrainer::Tensor &dst,
     << "MoE layer: in_norm / router_norm / out_norm are FP32 only";
   const unsigned int width = src.width();
   nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-    src.getData<float>(), dst.getData<float>(), src.size() / width, width,
-    eps);
+    src.getData<float>(), dst.getData<float>(), src.size() / width, width, eps);
   dst.multiply_i(gamma);
 }
 
@@ -731,10 +730,10 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   // normed copies of the input.
   nntrainer::Tensor &input =
     in_norm ? context.getTensor(experts_in_idx) : raw_input;
-  nntrainer::Tensor &router_in =
-    router_norm ? context.getTensor(router_in_idx)
-    : context.getNumInputs() == 2 ? context.getInput(ROUTER_IN_IDX)
-                                  : input;
+  nntrainer::Tensor &router_in = router_norm ? context.getTensor(router_in_idx)
+                                 : context.getNumInputs() == 2
+                                   ? context.getInput(ROUTER_IN_IDX)
+                                   : input;
   if (in_norm)
     normRows(raw_input, input, context.getWeight(in_gamma_idx), norm_eps);
 
@@ -1602,10 +1601,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // normed copies of the input (per batch, below).
   nntrainer::Tensor &input_ =
     in_norm ? context.getTensor(experts_in_idx) : raw_input_;
-  nntrainer::Tensor &router_in_ =
-    router_norm ? context.getTensor(router_in_idx)
-    : context.getNumInputs() == 2 ? context.getInput(ROUTER_IN_IDX)
-                                  : input_;
+  nntrainer::Tensor &router_in_ = router_norm ? context.getTensor(router_in_idx)
+                                  : context.getNumInputs() == 2
+                                    ? context.getInput(ROUTER_IN_IDX)
+                                    : input_;
 
   nntrainer::Tensor &router_logits_ = context.getTensor(router_logits_idx);
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
@@ -1839,10 +1838,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});
     if (out_norm && !out_normed_on_accel) {
-      auto scratch = context.getTensor(experts_in_idx)
-                       .getSharedDataTensor(
-                         output_step_dim, b * output_step_dim.getFeatureLen(),
-                         true);
+      auto scratch =
+        context.getTensor(experts_in_idx)
+          .getSharedDataTensor(output_step_dim,
+                               b * output_step_dim.getFeatureLen(), true);
       normRows(output, scratch, context.getWeight(out_gamma_idx), norm_eps);
       output.copyData(scratch);
     }

@@ -1523,8 +1523,8 @@ int nntr_hvx_mm_u8i4_moe_layer_norm(
   }
   const int rc = nntr_hvx_mm_u8i4_moe_layer(
     handle, M, K, inter, N_out, act, h_gate_up, h_gate_upLen, h_down, h_downLen,
-    row_index, row_indexLen, row_count, row_countLen, row_weight,
-    row_weightLen, in, act_f32Len, out_f32, out_f32Len);
+    row_index, row_indexLen, row_count, row_countLen, row_weight, row_weightLen,
+    in, act_f32Len, out_f32, out_f32Len);
   if (rc == AEE_SUCCESS && post_gammaLen != 0) {
     hvx_rmsnorm_rows_f32(out_f32, out_f32, M, N_out, N_out, post_gamma, eps,
                          s->quant_pool);

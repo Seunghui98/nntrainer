@@ -263,8 +263,8 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
       nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
     if (v_norm && !v_from_k) {
       tensor_idx[QKVParams::V] = context.requestTensor(
-        output_dims[QKVParams::V], "v_raw", nntrainer::Initializer::NONE,
-        false, nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+        output_dims[QKVParams::V], "v_raw", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
     }
   }
   if (in_norm) {
@@ -395,20 +395,24 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
       (wtype == q4 || wtype == qs4cx) && Kweight.getDataType() == wtype &&
       (v_from_k || context.getWeight(weight_idx[WV]).getDataType() == wtype)) {
-    std::vector<void *> wdata = {Qweight.getData<char>(), Kweight.getData<char>()};
+    std::vector<void *> wdata = {Qweight.getData<char>(),
+                                 Kweight.getData<char>()};
     std::vector<float *> wscale;
     if (wtype == qs4cx)
       wscale = {Qweight.getScale<float>(), Kweight.getScale<float>()};
     std::vector<unsigned int> widths = {
       static_cast<unsigned int>(Qhidden_step_dim.width()),
       static_cast<unsigned int>(Khidden_step_dim.width())};
-    std::vector<float *> dsts = {context.getOutput(QKVParams::Q).getData<float>(),
-                                 context.getOutput(QKVParams::K).getData<float>()};
+    std::vector<float *> dsts = {
+      context.getOutput(QKVParams::Q).getData<float>(),
+      context.getOutput(QKVParams::K).getData<float>()};
     std::vector<unsigned int> chunks;
     std::vector<float> gammas;
     if (feature_size) {
-      const float *gq = context.getWeight(weight_idx[WQ_GAMMA]).getData<float>();
-      const float *gk = context.getWeight(weight_idx[WK_GAMMA]).getData<float>();
+      const float *gq =
+        context.getWeight(weight_idx[WQ_GAMMA]).getData<float>();
+      const float *gk =
+        context.getWeight(weight_idx[WK_GAMMA]).getData<float>();
       chunks = {feature_size, feature_size};
       for (unsigned int j = 0; j < feature_size; ++j)
         gammas.push_back(gq[j] * q_scale);
@@ -537,8 +541,9 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       headNorm(v_from_k ? Khidden_ : Vhidden_, context.getOutput(QKVParams::V),
                nullptr, to - from, feature_size, epsilon);
     } else if (v_from_k) {
-      nntrainer::Tensor v_out = context.getOutput(QKVParams::V)
-                                  .getSharedDataTensor(Khidden_step_dim, 0, true);
+      nntrainer::Tensor v_out =
+        context.getOutput(QKVParams::V)
+          .getSharedDataTensor(Khidden_step_dim, 0, true);
       v_out.copyData(Khidden_step);
     }
   }

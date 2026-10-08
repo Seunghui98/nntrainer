@@ -116,8 +116,8 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
 int hvx_router_rows_f32(const float *x, const float *w, float *logits,
                         uint32_t M, uint32_t K, uint32_t E,
                         hvx_worker_pool *pool) {
-  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u ||
-      E % LANES != 0u || E > EV_MAX * LANES) {
+  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % LANES != 0u ||
+      E > EV_MAX * LANES) {
     return -1;
   }
   rows_ctx c = {x, w, logits, M, K, E};

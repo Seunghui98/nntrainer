@@ -188,7 +188,8 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const unsigned int N = down_w.width();
   const float epsilon = std::get<nntrainer::props::Epsilon>(dense_props).get();
   const float *in_gamma =
-    in_norm ? context.getWeight(weight_idx[IN_GAMMA]).getData<float>() : nullptr;
+    in_norm ? context.getWeight(weight_idx[IN_GAMMA]).getData<float>()
+            : nullptr;
   const float *out_gamma =
     out_norm ? context.getWeight(weight_idx[OUT_GAMMA]).getData<float>()
              : nullptr;

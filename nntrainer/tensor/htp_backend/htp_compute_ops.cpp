@@ -1392,9 +1392,9 @@ public:
     unsigned int rope_slices = 0;
     const float *g = post_gamma;
     for (size_t i = 0; i < n; ++i) {
-      const FcHandles &fh = get_or_register_fc(
-        matAdata[i], session, K, N[i],
-        matAscale.empty() ? nullptr : matAscale[i]);
+      const FcHandles &fh =
+        get_or_register_fc(matAdata[i], session, K, N[i],
+                           matAscale.empty() ? nullptr : matAscale[i]);
       const unsigned int chunk = post_chunk.empty() ? 0u : post_chunk[i];
       unsigned int c0 = 0;
       for (size_t j = 0; j < fh.handles.size(); ++j) {
@@ -3926,9 +3926,9 @@ private:
   /** @brief The RMSNorms folded into one layer call (mm_u8i4_layer_norm):
    *  nothing set = the plain call. */
   struct FusedNorms {
-    const float *pre_gamma = nullptr;            /**< K floats */
+    const float *pre_gamma = nullptr;                      /**< K floats */
     const std::vector<unsigned int> *post_chunk = nullptr; /**< per handle */
-    const float *post_gamma = nullptr;           /**< the chunks, concatenated */
+    const float *post_gamma = nullptr; /**< the chunks, concatenated */
     float eps = 0.0f;
     const float *rope_cs = nullptr; /**< M rows of 2*rope_hd, or nullptr */
     unsigned int rope_hd = 0;       /**< 0: no RoPE */
@@ -5935,10 +5935,12 @@ private:
    *  takes a row slice, so its column sums are recomputed over those rows
    *  -- the kernel's zero-point correction is per chunk. Cached by the up
    *  weight's pointer. */
-  const DenseHandles &get_or_register_dense(
-    void *up, void *gate, void *down, remote_handle64 session, uint32_t K,
-    uint32_t I, uint32_t N, const float *up_s = nullptr,
-    const float *gate_s = nullptr, const float *down_s = nullptr) {
+  const DenseHandles &get_or_register_dense(void *up, void *gate, void *down,
+                                            remote_handle64 session, uint32_t K,
+                                            uint32_t I, uint32_t N,
+                                            const float *up_s = nullptr,
+                                            const float *gate_s = nullptr,
+                                            const float *down_s = nullptr) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = dense_cache_.find(up);
     if (it != dense_cache_.end())
@@ -7505,7 +7507,7 @@ private:
                                      true answers: CPU FC calls skipped */
   StagingPool act_pool_;
   StagingPool out_pool_;
-  StagingPool rope_pool_; /**< the fused projection call's RoPE rows */
+  StagingPool rope_pool_;     /**< the fused projection call's RoPE rows */
   StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
   StagingPool attn_out_pool_; /**< and its f32 output */
   /** @brief ION copies of the MoE routers' gate weights, by address. */

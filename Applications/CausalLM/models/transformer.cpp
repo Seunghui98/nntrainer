@@ -765,10 +765,9 @@ void Transformer::repack_weight() {
       const unsigned int M = 512;
       std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
       std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
-      p.ops->gemm_q4_0_dense_ffn_fp32(p.up, p.gate, p.down, act.data(),
-                                      out.data(), M, p.K, p.I, p.N, false,
-                                      nullptr, nullptr, 0.0f, p.up_s, p.gate_s,
-                                      p.down_s);
+      p.ops->gemm_q4_0_dense_ffn_fp32(
+        p.up, p.gate, p.down, act.data(), out.data(), M, p.K, p.I, p.N, false,
+        nullptr, nullptr, 0.0f, p.up_s, p.gate_s, p.down_s);
       ml_logd("dense FFN HTP kernel warmed up at load (M=%u, K=%u, I=%u, N=%u)",
               M, p.K, p.I, p.N);
     }

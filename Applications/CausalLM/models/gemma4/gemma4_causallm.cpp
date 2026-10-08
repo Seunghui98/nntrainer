@@ -823,10 +823,10 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
        withKey("glu_activation", "tanh_gelu"), withKey("in_norm", "true"),
        withKey("out_norm", ENABLE_MOE_BLOCK ? "true" : "false"),
        withKey("epsilon", std::to_string(NORM_EPS)),
-       withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", ffn_engine)}));
+       withKey("weight_dtype", FC_LAYER_DTYPE),
+       withKey("engine", ffn_engine)}));
     return ffn(input);
   }
-
 
   std::vector<std::string> ffn_gate_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
