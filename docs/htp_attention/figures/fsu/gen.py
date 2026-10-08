@@ -660,10 +660,59 @@ def figO():
     o.append(TAIL)
     return "\n".join(o)
 
+
+# --------------------------------------------- top ops by time, ranked bars
+def figR():
+    """prefill_timeline.py --by-op at 1024 tokens on this branch (doc 57
+    section 9.12), ranked: one bar per op, CPU/NPU by colour."""
+    o = [HEAD.format(title="Top ops by time")]
+    o.append(text(80, 88, "Prefill: 연산별 시간 순위 (1024 token)", "t1"))
+    o.append(text(80, 134, "projection·dense FFN·MoE는 NPU, attention·lm_head는 CPU · 프로파일 빌드, 30 layer 합 7,232 ms", "t2"))
+    rows = [("attention", "mha_core", "CPU", 30, 99.70, 2991.1),
+            ("sparse_moe", "lfm2_moe", "NPU", 30, 71.00, 2129.9),
+            ("qkv", "qkv_layer", "NPU", 30, 27.35, 820.5),
+            ("ffn", "dense_ffn", "NPU", 30, 15.62, 468.6),
+            ("attention_out", "fully_connected", "NPU", 30, 11.69, 350.8),
+            ("post_ffn_norm", "residual_add", "NPU", 30, 9.77, 293.1),
+            ("post_attention_norm", "residual_add", "NPU", 30, 5.30, 159.0),
+            ("output_of_causallm", "tie_word_embedding", "CPU", 1, 17.71, 17.7),
+            ("embedding0", "tie_word_embedding", "CPU", 1, 1.27, 1.3)]
+    total = sum(r[5] for r in rows)
+    fill = {"CPU": "var(--host)", "NPU": "var(--npu)"}
+    x0, bw, y0, rh = 560, 1100, 200, 82
+    o.append(text(80, y0 - 22, "op (type)", "sm"))
+    o.append(text(x0, y0 - 22, "sum over 30 layers", "sm"))
+    o.append(text(1700, y0 - 22, "avg / call", "sm"))
+    for k, (op, typ, u, n, avg, ms) in enumerate(rows):
+        y = y0 + k * rh
+        o.append(text(80, y + 34, op, "lbl", extra='style="font-weight:700"'))
+        o.append(text(80, y + 58, f"{typ} · {u} · n={n}", "sm"))
+        w = max(bw * ms / rows[0][5], 4)
+        o.append(rect(x0, y + 10, w, 50, fill[u], 5))
+        lab = f"{ms:,.0f} ms  ({100 * ms / total:.1f}%)"
+        if w > 260:
+            o.append(text(x0 + w - 14, y + 42, lab, "lblw", "end", 'style="font-size:18px"'))
+        else:
+            o.append(text(x0 + w + 12, y + 42, lab, "lbl"))
+        o.append(text(1700, y + 42, f"{avg:.2f} ms", "lbl"))
+        o.append(f'<path d="M80,{y + rh - 4} L1840,{y + rh - 4}" stroke="#eeede8" stroke-width="2"/>')
+    ly = y0 + len(rows) * rh + 16
+    for i, (f, lb) in enumerate([("var(--host)", "CPU"), ("var(--npu)", "NPU")]):
+        o.append(rect(x0 + i * 120, ly, 22, 22, f, 4))
+        o.append(text(x0 + i * 120 + 32, ly + 18, lb, "sm"))
+    o.append(text(80, ly + 18, f"CPU {sum(r[5] for r in rows if r[2] == 'CPU'):,.0f} ms ({100 * sum(r[5] for r in rows if r[2] == 'CPU') / total:.0f}%) · "
+                              f"NPU {sum(r[5] for r in rows if r[2] == 'NPU'):,.0f} ms", "sm"))
+    o.append(text(80, 1030, "측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin, 1024-token prompt, 2026-10-08, 브랜치 b0bbd264. "
+                            "일반 빌드 prefill 타이머 6,452 ms(158.7 TPS); 프로파일 빌드는 노드마다 동기화해 합이 더 큼.", "xs"))
+    o.append(text(80, 1058, "노드가 9개뿐인 이유: 이 브랜치에서 norm·RoPE·scalar·add·router·GeLU가 NPU 호출(qkv, ffn, residual_add, sparse_moe) 안으로 들어감. "
+                            "attention_engine: htp와 lm_head NPU는 이 실행에 없음(기기 미측정).", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
 for name, fn in [("fsu_1_placement", fig1), ("fsu_2_prefill_prefetch", fig2),
                  ("fsu_3_decode_cache", fig3), ("fsu_a_overview", figA),
                  ("fsu_b_prefill_before_after", figB), ("fsu_c_decode_hits", figC),
                  ("fsu_prefill_prefetch", figP), ("fsu_expert_memory_table", figT),
-                 ("prefill_by_op_512_1024", figO)]:
+                 ("prefill_by_op_512_1024", figO), ("prefill_top_ops_1024", figR)]:
     open(f"{name}.html", "w").write(fn())
 print("ok")
