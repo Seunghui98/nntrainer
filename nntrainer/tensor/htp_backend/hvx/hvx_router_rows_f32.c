@@ -35,40 +35,77 @@ typedef struct {
   uint32_t M, K, E;
 } rows_ctx;
 
+/* One (rows, logit-vectors) block over w rows [k0, k1): NR x EV
+ * accumulators and the EV vectors of one w row as compile-time constants,
+ * so they live in registers and a w row is loaded once per k for all NR
+ * rows. The runtime-indexed acc[RB][EV_MAX] this replaces spilled to the
+ * stack, which made every (k, row, e) step a load, a multiply-add and a
+ * store (doc 57 section 9.10): 9.7 ms a call at 446 rows against the CPU
+ * dot's 6. The operation order per (row, e) is unchanged: the k terms in
+ * order, qf32, rounded to f32 at each KB chunk boundary. */
+#define ROUTER_ROWS_BLOCK(EV, NR)                                              \
+  static void rows_block_##EV##x##NR(const float *x, const float *w,           \
+                                     float *logits, uint32_t K, uint32_t E,    \
+                                     uint32_t k0, uint32_t k1) {               \
+    const HVX_Vector zero = Q6_V_vzero();                                      \
+    HVX_Vector acc[NR][EV];                                                    \
+    for (uint32_t r = 0; r < (NR); ++r) {                                      \
+      const HVX_UVector *lr = (const HVX_UVector *)(logits + (size_t)r * E);   \
+      for (uint32_t e = 0; e < (EV); ++e)                                      \
+        acc[r][e] = k0 ? Q6_Vqf32_vadd_VsfVsf(lr[e], zero) : zero;             \
+    }                                                                          \
+    for (uint32_t k = k0; k < k1; ++k) {                                       \
+      const HVX_UVector *wk = (const HVX_UVector *)(w + (size_t)k * E);        \
+      HVX_Vector wv[EV];                                                       \
+      for (uint32_t e = 0; e < (EV); ++e)                                      \
+        wv[e] = wk[e];                                                         \
+      for (uint32_t r = 0; r < (NR); ++r) {                                    \
+        const HVX_Vector xs = hvx_splat_sf(x[(size_t)r * K + k]);              \
+        for (uint32_t e = 0; e < (EV); ++e)                                    \
+          acc[r][e] = Q6_Vqf32_vadd_Vqf32Vqf32(                                \
+            acc[r][e], Q6_Vqf32_vmpy_VsfVsf(xs, wv[e]));                       \
+      }                                                                        \
+    }                                                                          \
+    for (uint32_t r = 0; r < (NR); ++r) {                                      \
+      HVX_UVector *lr = (HVX_UVector *)(logits + (size_t)r * E);               \
+      for (uint32_t e = 0; e < (EV); ++e)                                      \
+        lr[e] = Q6_Vsf_equals_Vqf32(acc[r][e]);                                \
+    }                                                                          \
+  }
+#define ROUTER_ROWS_EV(EV)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 1)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 2)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 3)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 4)
+ROUTER_ROWS_EV(1)
+ROUTER_ROWS_EV(2)
+ROUTER_ROWS_EV(3)
+ROUTER_ROWS_EV(4)
+#undef ROUTER_ROWS_EV
+#undef ROUTER_ROWS_BLOCK
+
+typedef void (*rows_block_fn)(const float *, const float *, float *, uint32_t,
+                              uint32_t, uint32_t, uint32_t);
+/** [ev - 1][nr - 1] */
+static const rows_block_fn kRowsBlock[EV_MAX][RB] = {
+  {rows_block_1x1, rows_block_1x2, rows_block_1x3, rows_block_1x4},
+  {rows_block_2x1, rows_block_2x2, rows_block_2x3, rows_block_2x4},
+  {rows_block_3x1, rows_block_3x2, rows_block_3x3, rows_block_3x4},
+  {rows_block_4x1, rows_block_4x2, rows_block_4x3, rows_block_4x4},
+};
+
 static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const rows_ctx *c = (const rows_ctx *)v;
   const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
   const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
   const uint32_t ev = c->E / LANES;
-  const HVX_Vector zero = Q6_V_vzero();
   for (uint32_t k0 = 0; k0 < c->K; k0 += KB) {
     const uint32_t k1 = k0 + KB < c->K ? k0 + KB : c->K;
     for (uint32_t r0 = lo; r0 < hi; r0 += RB) {
       const uint32_t nr = r0 + RB < hi ? RB : hi - r0;
-      /* ponytail: the accumulators are indexed by two runtime counts, so
-         the compiler may keep them on the stack (2 KiB); a per-E
-         specialization is the upgrade if this shows in a profile. */
-      HVX_Vector acc[RB][EV_MAX];
-      for (uint32_t r = 0; r < nr; ++r) {
-        const HVX_UVector *lr =
-          (const HVX_UVector *)(c->logits + (size_t)(r0 + r) * c->E);
-        for (uint32_t e = 0; e < ev; ++e)
-          acc[r][e] = k0 ? Q6_Vqf32_vadd_VsfVsf(lr[e], zero) : zero;
-      }
-      for (uint32_t k = k0; k < k1; ++k) {
-        const HVX_UVector *wk = (const HVX_UVector *)(c->w + (size_t)k * c->E);
-        for (uint32_t r = 0; r < nr; ++r) {
-          const HVX_Vector xs = hvx_splat_sf(c->x[(size_t)(r0 + r) * c->K + k]);
-          for (uint32_t e = 0; e < ev; ++e)
-            acc[r][e] = Q6_Vqf32_vadd_Vqf32Vqf32(
-              acc[r][e], Q6_Vqf32_vmpy_VsfVsf(xs, wk[e]));
-        }
-      }
-      for (uint32_t r = 0; r < nr; ++r) {
-        HVX_UVector *lr = (HVX_UVector *)(c->logits + (size_t)(r0 + r) * c->E);
-        for (uint32_t e = 0; e < ev; ++e)
-          lr[e] = Q6_Vsf_equals_Vqf32(acc[r][e]);
-      }
+      kRowsBlock[ev - 1u][nr - 1u](c->x + (size_t)r0 * c->K, c->w,
+                                   c->logits + (size_t)r0 * c->E, c->K, c->E,
+                                   k0, k1);
     }
   }
 }
