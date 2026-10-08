@@ -812,3 +812,11 @@ host `unittest_causallm_models` 94 통과(Gemma-4 MoE tiny 모델 HF 기준 일�
 host `unittest_causallm_models` 94 통과(처음 Q4_0 tiny 모델이 실패: proj 가중치가 NONE 초기화 + dtype 맵 누락 → ones 초기화와 맵 추가로 해결).
 
 오늘 누적(cfgB, 1024토큰 prefill): 4.79 s(PR 4343 a16 직후) → **3.81 s**, nll 3.508 → 3.5045.
+
+### 9.33 router u8×i8(opt-in), dense pack dedupe, qkv 입력 norm을 quant 패스로 (2026-10-08, 929c3b31 + 7567197b + 1d082884, 기기 실측, 직접 실행)
+
+- **router 로짓을 HMX u8×i8로**(929c3b31, `NNTR_HTP_ROUTER_U8I8=1`일 때만): gate 가중치를 expert 열별 대칭 int8 + 열 합으로 한 번 등록, 새 skel 진입점이 norm → `hexkl_mm_u8i8_layer_run` → softmax·top-k. router 행 214 → 99 ms, prefill 약 −45 ms. 하지만 로짓이 CPU와 최대 0.17–0.39 다르다(f32 커널은 2e-5; 비율 0.998–1.0002라 scale 오류는 아님). Gemma-4의 outlier 활성값 옆에서 행별 u8 계단이 거칠고, 그 잡음이 뒤집는 expert 선택은 모델의 선택이 아니다. nll 3.5045 → 3.42045는 더 정확해서가 아니라 다른 routing이라서다. **기본값은 f32 유지.**
+- **dense pack dedupe**(7567197b): dense는 MoE kernel을 intermediate 3 chunk의 "expert"로 빌려 쓰는데, 세 chunk가 같은 1024행을 각각 pack했다. 직전 expert와 행 목록이 같으면 그 slot을 공유한다(M=1 경로 제외). dense host 403 → **390.3 / 389.6 / 388.2 ms**, nll 3.5045 비트 동일.
+- **qkv 입력 norm을 quant 패스 안으로**(1d082884): `mm_u8i4_layer_norm`이 M행 전체를 `norm_rows` 힙에 norm해 쓰고 quant 패스가 DDR에서 두 번 다시 읽던 것을, quant 패스가 4행씩 worker 자기 몫의 scratch에 norm(`hvx_rmsnorm_row_f32` = 같은 `norm_chunk`)한 뒤 cache에 있을 때 params·pack한다(`hexkl_mm_opts.pre_scratch/pre_gamma/pre_eps`). qkv `N=8192` 행 443.6 / 433.1 / 459.2 → **420.6 / 413.7 / 426.6 ms**(`N=10240` 그대로), nll 3.5045 비트 동일, 문장 "…harbour town of Ardley…".
+
+prefill(cfgB, 3회): dedupe 후 4,032 / 3,752 / 4,020, norm 융합 후 3,775 / 3,741 / 3,991 ms. 회당 ±130 ms가 흔들려 −14·−23 ms 이득은 prefill 숫자로는 구분되지 않는다. 행별 host 시간으로 판단했다.
