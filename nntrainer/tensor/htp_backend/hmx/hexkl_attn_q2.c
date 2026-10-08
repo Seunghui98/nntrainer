@@ -869,7 +869,9 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
     }
 
     t0 = now_us();
-    hvx_worker_pool_wait(pool);
+    if (in_flight) {
+      hvx_worker_pool_wait(pool);
+    }
     c.st.us_wait += now_us() - t0;
   }
   if (rc == AEE_SUCCESS) {
