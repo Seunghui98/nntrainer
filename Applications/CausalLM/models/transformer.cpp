@@ -422,11 +422,22 @@ void Transformer::repack_weight() {
     TieWordEmbedding *layer = nullptr;
     nntrainer::RunLayerContext *context = nullptr;
   } tie_pending;
+  // The attention layers' quantized KV caches, registered after the
+  // lm_head for the same reason it waits: they are DSP heap.
+  std::vector<std::pair<MHACoreLayer *, nntrainer::RunLayerContext *>>
+    mha_pending;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm, &tie_pending](
-           ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+    fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm, &tie_pending,
+          &mha_pending](ml::train::Layer &l,
+                        nntrainer::RunLayerContext &context, void *) {
       // forEachLayer hands out LayerNodes.
+      if (l.getType() == MHACoreLayer::type) {
+        if (auto *m = dynamic_cast<MHACoreLayer *>(
+              static_cast<nntrainer::LayerNode &>(l).getLayer()))
+          mha_pending.push_back({m, &context});
+        return;
+      }
       if (l.getType() == TieWordEmbedding::type) {
         auto *tw = dynamic_cast<TieWordEmbedding *>(
           static_cast<nntrainer::LayerNode &>(l).getLayer());
@@ -733,6 +744,8 @@ void Transformer::repack_weight() {
     if (tie_pending.layer != nullptr &&
         !tie_pending.layer->placeLmheadOnAccelerator(*tie_pending.context))
       tie_pending.layer->prepareLmhead(*tie_pending.context);
+    for (auto &p : mha_pending)
+      p.first->registerQuantizedCache(*p.second);
     ml_logd("QS4CX weights repacked successfully");
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to repack weights: " +
