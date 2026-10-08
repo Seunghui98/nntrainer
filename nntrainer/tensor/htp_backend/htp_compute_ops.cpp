@@ -4550,7 +4550,20 @@ private:
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
-    stagedMemcpy(act_f32, act, act_bytes);
+    // NNTR_HTP_PROFILE>=2 on a call with folded norms: the timed entry
+    // (stage breakdown) and the norms on the host around it, so the prefill
+    // MoE and dense calls, which always carry them, have stages too (doc 57
+    // section 9.26). Measurement only; the norms' time is outside the call.
+    const bool host_norms =
+      HtpProfile::global().level() >= 2 && with_norms && !via_dspq;
+    if (host_norms && pre_gamma != nullptr) {
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
+      for (unsigned int r = 0; r < M; ++r)
+        for (unsigned int k = 0; k < K; ++k)
+          act_f32[static_cast<size_t>(r) * K + k] *= pre_gamma[k];
+    } else {
+      stagedMemcpy(act_f32, act, act_bytes);
+    }
 
     // The five small sequences (handles, routing) go from the heap. Tried
     // from one rpcmem buffer (doc 51 section 2.26): transport 627 -> 605
@@ -4561,14 +4574,8 @@ private:
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
     const bool timed = profile.level() >= 2;
-    // NNTR_HTP_PROFILE>=2 on a call whose only fold is the output norm: the
-    // timed entry (stage breakdown) and the norm on the host after it, so
-    // the prefill MoE call, which always carries that norm, has stages too
-    // (doc 57 section 9.26). Measurement only; the norm's time is then
-    // outside the call.
-    const bool host_post_norm =
-      timed && pre_gamma == nullptr && post_gamma != nullptr && !via_dspq;
-    const bool norm_entry = with_norms && !host_post_norm;
+    const bool host_post_norm = host_norms && post_gamma != nullptr;
+    const bool norm_entry = with_norms && !host_norms;
     // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
     // keeps the fastest. Two runs with no functional change between them
     // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
