@@ -598,3 +598,14 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 ### 9.18 정확도 사다리 첫 시도와 인수인계 (2026-10-08)
 
 엔진을 하나씩 cpu로 되돌리는 사다리(사용자 실행)는 두 가지로 막혔다. (1) MoE를 CPU로 둔 실행(전부 CPU 포함)마다 기기 연결이 끊겼다(`waiting for device`, 2회). (2) 나머지 실행은 `[PPL] no positions scored`: config의 `skip_prefill: true`면 lm_head가 prefill을 건너뛰어 채점할 행이 없다. 같은 설정에서 생성 토큰은 전부 decode(M==1) 경로에서 나오므로, 출력 깨짐의 유력 가설은 decode 경로다(기기 미측정). 다음 세션용 인수인계와 다음 실험은 `58_gemma4_prefill_handoff.md`.
+
+### 9.19 P0: skip_prefill 가설의 코드 확인과 사다리 (2026-10-08, 기기 미측정)
+
+코드로 확인한 것(기기 미측정):
+
+- `causal_lm.cpp` `SKIP_PREFILL && init_len > 1` 분기: prompt N−1 토큰만 prefill하고, 마지막 prompt 토큰을 `id_list`에 그대로 넣어 생성 루프로 보낸다. 첫 생성 토큰부터 전부 decode(M==1) 호출의 로짓에서 나온다. prefill 로짓으로 고른 토큰은 하나도 없다.
+- `tie_word_embedding.cpp` `incremental_forwarding_lmhead`: `skip_prefill && from == 0`이면 조기 return → `NNTR_PPL` 채점 루프에 닿지 않는다(§9.18의 `no positions scored`). `NNTR_PPL_DECODE`도 `SKIP_PREFILL`이면 꺼진다.
+- Gemma4 lm_head는 norm·softcap이 접혀 있어(`in_norm`, softcap≠0) decode에서도 `htpDecodeLmHead`가 아닌 `head_of` → `lm_head_q4_0_fp32`(HVX Q4M1) 경로다. prefill 마지막 행과 decode 행이 같은 lm_head 함수를 탄다.
+- `NNTR_HTP_DSPQ=0`은 dspq 큐(decode MoE의 M==1 호출)만 FastRPC로 돌린다. prefill에는 영향 없음.
+
+사다리: `skip_prefill: false`, fp16 attention, seq 2048, 생성 16, MoE htp 고정. acc_0 전부 htp, acc_1 attention cpu, acc_2 +lm_head, acc_3 +dense, acc_4 +attn_proj, acc_5 = acc_0 + `NNTR_HTP_DSPQ=0`. 판정: PPL이 정상이고 첫 토큰이 말이 되는데 이후가 깨지면 decode 경로. 결과는 아래에 이어 적는다.
