@@ -372,6 +372,9 @@ public:
   //
   // gelu says the gated activation between gate_up and down is
   // gelu_tanh(g)*u (Gemma-4) rather than silu(g)*u (LFM2).
+  // add_x2 (doc 57 section 9.30): the block's post-FFN epilogue on the
+  // output, out = add_scale * (act + rmsnorm(moe + add_x2) * add_gamma),
+  // with act the raw rows (pre_gamma set, K == N_out).
   virtual bool supports_gemm_qs4cx_moe_layer_fp32() const { return false; }
   virtual void gemm_qs4cx_moe_layer_fp32(
     const std::vector<void *> &gate_up_data,
@@ -383,7 +386,9 @@ public:
     const std::vector<float> &row_weight, const float *act, float *out,
     unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
     bool weights_wh, bool gelu = false, const float *pre_gamma = nullptr,
-    const float *post_gamma = nullptr, float eps = 0.0f);
+    const float *post_gamma = nullptr, float eps = 0.0f,
+    const float *add_x2 = nullptr, const float *add_gamma = nullptr,
+    float add_scale = 1.0f);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate

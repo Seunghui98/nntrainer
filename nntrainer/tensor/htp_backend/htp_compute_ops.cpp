@@ -1688,10 +1688,11 @@ public:
                                  const std::vector<float> &row_weight,
                                  const float *act, float *out, unsigned int M,
                                  unsigned int K, unsigned int inter,
-                                 unsigned int N_out, bool weights_wh,
-                                 bool gelu, const float *pre_gamma,
-                                 const float *post_gamma,
-                                 float eps) override {
+                                 unsigned int N_out, bool weights_wh, bool gelu,
+                                 const float *pre_gamma,
+                                 const float *post_gamma, float eps,
+                                 const float *add_x2, const float *add_gamma,
+                                 float add_scale) override {
     const size_t n_experts = gate_up_data.size();
     if (n_experts == 0 || gate_up_scale.size() != n_experts ||
         down_data.size() != n_experts || down_scale.size() != n_experts ||
@@ -1757,7 +1758,7 @@ public:
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
                    out, M, K, inter, N_out, 0, gelu ? 1u : 0u, pre_gamma,
-                   post_gamma, eps);
+                   post_gamma, eps, add_x2, add_gamma, add_scale);
   }
 
   /** [#85] NNTR_HTP_FORWARD=1 routes decode's MoE calls through the
@@ -4523,7 +4524,10 @@ private:
                       float *out, unsigned int M, unsigned int K,
                       unsigned int inter, unsigned int N_out, int kind = 0,
                       uint32_t glu = 0, const float *pre_gamma = nullptr,
-                      const float *post_gamma = nullptr, float eps = 0.0f) {
+                      const float *post_gamma = nullptr, float eps = 0.0f,
+                      const float *add_x2 = nullptr,
+                      const float *add_gamma = nullptr,
+                      float add_scale = 1.0f) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
     const bool with_norms = pre_gamma != nullptr || post_gamma != nullptr;
@@ -4554,8 +4558,18 @@ private:
     // (stage breakdown) and the norms on the host around it, so the prefill
     // MoE and dense calls, which always carry them, have stages too (doc 57
     // section 9.26). Measurement only; the norms' time is outside the call.
-    const bool host_norms =
-      HtpProfile::global().level() >= 2 && with_norms && !via_dspq;
+    const bool host_norms = HtpProfile::global().level() >= 2 && with_norms &&
+                            !via_dspq && add_x2 == nullptr;
+    // The post-FFN epilogue's second addend rides its own staging buffer.
+    float *x2_f32 = nullptr;
+    if (add_x2 != nullptr) {
+      if (pre_gamma == nullptr || K != N_out || via_dspq)
+        throw std::invalid_argument(
+          "gemm_qs4cx_moe_layer_fp32: the epilogue needs the raw rows "
+          "(pre_gamma) and K == N_out");
+      x2_f32 = reinterpret_cast<float *>(stage(x2_pool_, out_bytes).data());
+      stagedMemcpy(x2_f32, add_x2, out_bytes);
+    }
     if (host_norms && pre_gamma != nullptr) {
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
       for (unsigned int r = 0; r < M; ++r)
@@ -4594,6 +4608,18 @@ private:
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
                                 glu, timed ? rep_stage : nullptr)
+            : add_x2 != nullptr
+              ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
+                  session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
+                  static_cast<int>(K), post_gamma,
+                  post_gamma ? static_cast<int>(N_out) : 0, add_gamma,
+                  add_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+                  static_cast<int>(h_gu.size()), h_dn.data(),
+                  static_cast<int>(h_dn.size()), row_index.data(),
+                  static_cast<int>(row_index.size()), row_count.data(),
+                  static_cast<int>(row_count.size()), row_weight.data(),
+                  static_cast<int>(row_weight.size()), act_f32, act_len, x2_f32,
+                  out_len, out_f32, out_len)
             : norm_entry
               ? nntr_hvx_mm_u8i4_moe_layer_norm(
                   session, M, K, inter, N_out, glu, eps, pre_gamma,
@@ -6431,6 +6457,7 @@ private:
   StagingPool act_pool_;
   StagingPool out_pool_;
   StagingPool rope_pool_; /**< the fused projection call's RoPE rows */
+  StagingPool x2_pool_;   /**< the MoE call's post-FFN second addend */
   StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
   StagingPool attn_out_pool_; /**< and its f32 output */
   /** @brief ION copies of the MoE routers' gate weights, by address. */
