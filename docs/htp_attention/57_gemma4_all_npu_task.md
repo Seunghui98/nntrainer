@@ -628,3 +628,24 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 - acc_3/4의 죽음: load walk의 `dense_ffn` 분기가 QS4CX pack 없이 return. c9fcb134에서 CPU engine일 때만 pack.
 
 다음(기기 비교만, x86 host 결과는 기기 NEON·KleidiAI 경로와 달라 근거로 쓰지 않는다): `NNTR_ACT_STATS=1`(b62c3ec9)로 acc_0(전부 NPU)과 acc_4(MoE만 NPU, 나머지 기기 CPU NEON)를 같은 prompt로 돌려 노드별 nan·rms를 맞대고, 처음 갈라지는 노드를 찾는다.
+
+### 9.21 P0 원인: DSP router의 qf32 누산 (2026-10-08, 기기 실측, 1024토큰, 직접 실행)
+
+- `NNTR_ACT_STATS=1`(b62c3ec9)로 노드별 첫 NaN = `layer0_sparse_moe`(입력 유한, 출력 725행 NaN).
+- MoE 안을 가르니(임시 계측, 커밋 안 함): out_norm·expert kernel 무관. **NPU router가 726행에서 softmax 확률 0 → top-k가 expert 0..7, weight NaN(0×inf).**
+- top-k 없이 받은 raw logits: 4행 블록마다 1행만 CPU와 같고 3행은 1e37·NaN(64행마다 48). 단일 스레드 skel에서도 같음 → 스레드 경합 아님. 256·7행으로 나눠 불러도 같음 → staging 버퍼 아님. 누산 초기값을 바꾸면 살아남는 행이 1→0으로 바뀜. 4e903b97 이전 kernel은 모든 행이 최대 7 차이(§9.13의 "그럴듯하지만 엉뚱한 문장"). 호스트 lane 에뮬은 M=1025에서도 둘 다 통과.
+- 수정 7eeea62e: 누산을 IEEE sf(`Q6_Vsf_vmpy`/`Q6_Vsf_vadd`)로. 기기에서 모든 행이 CPU dot과 2.3e-5 이내.
+- P1(MoE 호출 +290 ms, 4e903b97 이후)도 같은 원인으로 본다: 726행이 expert 0..7로 몰려 호출이 무거워짐(기기 미측정, 다음 프로파일에서 확인).
+
+사다리(fix 후, `skip_prefill: false`, fp16 attention, seq 2048):
+
+| 실행 | cpu로 둔 엔진 | nll/token | 생성 첫 구절 |
+|---|---|---|---|
+| acc_0 | 없음 | 3.536 | "The text provides a detailed description of the small harbour town of Ardless…" |
+| acc_1 | attention | 3.491 | |
+| acc_2 | +lm_head | 3.491 | |
+| acc_3 | +dense | 3.530 | |
+| acc_4 | +attn_proj (MoE만 NPU) | 3.517 | "The text describes a small harbour town called Ardley…" |
+
+- NPU 몫 대부분은 attention(fp16) +0.045. lm_head 0, dense·attn_proj(QS4CX weight)는 NPU가 같거나 낮다 → weight 양자화 경로보다 attention 정밀도가 먼저 볼 곳(실행 간 노이즈 미측정, 1회씩).
+- 남은 주의: CausalLM 앱은 `-ffast-math`라 `std::isfinite`/`isnan` 검사가 접힌다(이번 디버깅에서 확인). 앱 쪽 NaN 검사는 비트로 해야 한다. `NNTR_ACT_STATS`는 libnntrainer(fast-math 아님)라 유효.
