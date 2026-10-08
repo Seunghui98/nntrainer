@@ -707,3 +707,31 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 | nll (cfgB_ppl) | 3.50819 | 3.50819 |
 
 남은 attention 호출 몫(30층): `sdpa_q2_kvcache` ≈ 460(DSP append 197 = quant 166 + bake 31, kernel 170, 전송 ≈ 55, Q/out ION memcpy) + 보정 40 + 변환 60.
+
+### 9.25 1번: K/V append 양자화를 HVX worker로 (2026-10-08, c4ab7487, 기기 실측, 직접 실행)
+
+`append_fixed_i8`의 행×head 양자화를 HMX 스레드 혼자 하던 것을 세션 `quant_pool`에 행 단위로 분산(`hexkl_kv_q_append_pool`, `attn_q2_step`만 사용, IDL 변경 없음). 행마다 자기 마스터·scale·colsum만 쓰므로 안전, bake는 HMX 스레드에 남김.
+
+| cfgB, 30층 | 전 | 후 |
+|---|---|---|
+| append quant | 182 ms | **36 ms** |
+| attention accel_call | 578–673 | 425 / 432 / 497 |
+| prefill | 4,420 / 4,771 / 4,483 | **4,217 / 4,260 / 4,453** |
+| nll | 3.50819 | 3.50819(비트 동일) |
+
+### 9.26 F0·2번: FastRPC 비용과 MoE 호출 분해, MoE warm-up (2026-10-08, a772b5ca + eec133c12, 기기 실측)
+
+`NNTR_HTP_PROFILE=2`에서 out_norm만 접힌 MoE 호출은 timed 진입점 + host norm으로(a772b5ca, 측정 전용).
+
+- **MoE 호출 49.3 ms = DSP 47.8(97%) + 전송 1.5.** DSP 단계(호출당): mm 21.1 · acc 읽기 9.6 · requant 6.9 · dequant 3.2 · alloc 2.1 · stage 1.4 · quant 0.8 · DMA 대기 0.9. GeGLU는 worker에 숨음. 가중치 DMA 311 MB/호출(128 expert 거의 전부), 평균 6.7 GB/s.
+- **FastRPC 전송(timed 진입점이 있는 행):** MoE 1.5 ms/call(16 MB ION 2개), o-proj 0.42 ms/call×95. qkv·dense·router·epilogue는 timed 변형이 없어 0으로 나온다 → 큰 버퍼 호출 층당 7회 기준 추정 0.2–0.3 s(기기 미측정).
+- **alloc 2.1 ms/call**은 warm-up이 M=512라 첫 1024행 호출이 scratch(M×K, M×N_out 사본)와 staging class를 키우던 몫 → warm-up을 `INIT_SEQ_LEN` 행으로: alloc 2,107 → 24 us/call.
+
+| cfgB | 전(c4ab7487) | 후(warm-up M) |
+|---|---|---|
+| MoE 행 | 1,575 ms | 1,430 / 1,465 / 1,472 |
+| prefill | 4,217 / 4,260 / 4,453 | **4,087 / 4,147 / 4,165** |
+| nll | 3.50819 | 3.50819 |
+| e2e(로드 포함) | 31.8 s | 30.9 s |
+
+MoE에 남은 큰 몫: acc 읽기 9.6 · requant 6.9 ms/call(커널 작업, `hexkl_mm_u8i4_moe.c`).
