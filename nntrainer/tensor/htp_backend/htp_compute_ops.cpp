@@ -1455,11 +1455,10 @@ public:
     const size_t x_len = static_cast<size_t>(M) * K;
     const size_t out_len = static_cast<size_t>(M) * E;
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    float *act =
-      reinterpret_cast<float *>(stage(act_pool_, x_len * sizeof(float)).data());
+    float *act = reinterpret_cast<float *>(
+      stageInput(act_pool_, x, x_len * sizeof(float)).data());
     float *out = reinterpret_cast<float *>(
       stage(out_pool_, out_len * sizeof(float)).data());
-    stagedMemcpy(act, x, x_len * sizeof(float));
     const float *w_shared =
       routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
     const uint64_t t0 = HtpProfile::nowUs();
@@ -3166,14 +3165,54 @@ private:
    * same. With classes, decode stays on the 64 KiB pair. */
   struct StagingPool {
     std::map<size_t, std::unique_ptr<HtpRpcBuffer>> by_class;
+    /** What stageInput last copied into a class's buffer, cleared by any
+     *  other stage() of it (doc 57 section 9.31). */
+    std::map<size_t, std::pair<const void *, size_t>> holds;
   };
-  static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+  static size_t stageClass(size_t bytes) {
     size_t cls = size_t(64) << 10;
     while (cls < bytes)
       cls <<= 1;
+    return cls;
+  }
+  static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+    const size_t cls = stageClass(bytes);
+    pool.holds.erase(cls);
     auto &slot = pool.by_class[cls];
     if (!slot)
       slot = std::make_unique<HtpRpcBuffer>(cls);
+    return *slot;
+  }
+  /** @brief stage() plus the copy of @a bytes from @a src, skipped when the
+   *  buffer still holds exactly that copy: the router, dense and MoE calls
+   *  of a Gemma-4 layer each stage the same 11.5 MB post-attention rows.
+   *  Any other stage() of the buffer forgets the copy, and before skipping
+   *  32 spread 64-byte windows and the tail are compared with @a src, so a
+   *  host tensor rewritten (or another one placed at the same address) is
+   *  copied again. ponytail: a rewrite that keeps every sampled window is
+   *  missed; a full compare costs about what the copy does. */
+  static HtpRpcBuffer &stageInput(StagingPool &pool, const void *src,
+                                  size_t bytes) {
+    const size_t cls = stageClass(bytes);
+    auto &slot = pool.by_class[cls];
+    if (!slot)
+      slot = std::make_unique<HtpRpcBuffer>(cls);
+    auto it = pool.holds.find(cls);
+    if (it != pool.holds.end() && it->second.first == src &&
+        it->second.second == bytes) {
+      const uint8_t *a = static_cast<const uint8_t *>(src);
+      const uint8_t *b = slot->data();
+      bool same =
+        bytes < 64 || std::memcmp(a + bytes - 64, b + bytes - 64, 64) == 0;
+      for (size_t i = 0; same && i < 32 && bytes >= 64; ++i) {
+        const size_t off = (bytes - 64) / 32 * i;
+        same = std::memcmp(a + off, b + off, 64) == 0;
+      }
+      if (same)
+        return *slot;
+    }
+    stagedMemcpy(slot->data(), src, bytes);
+    pool.holds[cls] = {src, bytes};
     return *slot;
   }
 
@@ -4548,8 +4587,13 @@ private:
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
-    HtpRpcBuffer &act_stage =
-      via_dspq ? *dspq_->act : stage(act_pool_, act_bytes);
+    const bool host_prenorm = HtpProfile::global().level() >= 2 && with_norms &&
+                              !via_dspq && add_x2 == nullptr &&
+                              pre_gamma != nullptr;
+    HtpRpcBuffer &act_stage = via_dspq ? *dspq_->act
+                              : host_prenorm
+                                ? stage(act_pool_, act_bytes)
+                                : stageInput(act_pool_, act, act_bytes);
     HtpRpcBuffer &out_stage =
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
@@ -4570,12 +4614,12 @@ private:
       x2_f32 = reinterpret_cast<float *>(stage(x2_pool_, out_bytes).data());
       stagedMemcpy(x2_f32, add_x2, out_bytes);
     }
-    if (host_norms && pre_gamma != nullptr) {
+    if (host_prenorm) {
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
       for (unsigned int r = 0; r < M; ++r)
         for (unsigned int k = 0; k < K; ++k)
           act_f32[static_cast<size_t>(r) * K + k] *= pre_gamma[k];
-    } else {
+    } else if (via_dspq) {
       stagedMemcpy(act_f32, act, act_bytes);
     }
 
