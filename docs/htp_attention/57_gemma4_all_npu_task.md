@@ -679,3 +679,16 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 | 출력 | 정상 | 정상 ("…town of Ardley, which is located at the mouth of a slow river…") |
 
 - +300 ms는 PR이 host에 넣은 스칼라 루프 둘: Q min/max 보정(층당 11–22 ms, 첫 prefill)과 Q·출력 f32↔u16 변환(30층 ≈ 260 ms). 다음 수정 = 둘을 NEON + 스레드로(기대 −0.5 s, 기기 미측정).
+
+### 9.23 a16 경로의 host 루프 NEON화 (2026-10-08, 38c3f0a4, 기기 실측, 직접 실행)
+
+| 30층 합 (cfgB, 1024행) | PR 최신(6a31ba72) | NEON 8스레드 | NEON 4스레드 | **NEON 1스레드(커밋)** |
+|---|---|---|---|---|
+| Q 보정 | 398 ms | 62–65 | — | **39** |
+| Q f32→u16 | (260, 둘 합) | 62 | 48 | **27** |
+| 출력 u16→f32 | | 41 | 40 | **33** |
+| prefill | 4,791 / 4,796 | 4,731 / 4,824 / 4,696 | 4,867 | **4,661 / 4,605** |
+
+- nll 3.50819(cfgB_ppl)로 변화 없음, 문장 같음.
+- 스레드 분할은 변환을 느리게 했다(prefill 중 CPU 0–5는 expert prefetch reader가 쓴다, 59 profile `reader cpus {0..5}`).
+- attention 호출 합 792 ms = 보정 39 + 변환 60 + `sdpa_q2_kvcache` 451(FastRPC wall 450) + **설명 안 된 242 ms**(층당 ≈8 ms). 후보(코드, 기기 미측정): 첫 호출 안의 lazy `kv_cache_q_register`(DSP heap calloc, `mha_core.cpp:1114`), `kv_cache_q_set_fixed_scales` FastRPC, `q2_q_u16`/`q2_out_u16` 첫 resize의 0 채움, `AccelF32Io::prepare`. 다음 측정 대상.
