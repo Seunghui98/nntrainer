@@ -43,6 +43,7 @@
 #ifdef ENABLE_HEXKL
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <cpu_ops_table.h>
 #include <htp_act_quant.h>
 #include <htp_backend.h>
@@ -4560,6 +4561,14 @@ private:
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
     const bool timed = profile.level() >= 2;
+    // NNTR_HTP_PROFILE>=2 on a call whose only fold is the output norm: the
+    // timed entry (stage breakdown) and the norm on the host after it, so
+    // the prefill MoE call, which always carries that norm, has stages too
+    // (doc 57 section 9.26). Measurement only; the norm's time is then
+    // outside the call.
+    const bool host_post_norm =
+      timed && pre_gamma == nullptr && post_gamma != nullptr && !via_dspq;
+    const bool norm_entry = with_norms && !host_post_norm;
     // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
     // keeps the fastest. Two runs with no functional change between them
     // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
@@ -4578,7 +4587,7 @@ private:
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
                                 glu, timed ? rep_stage : nullptr)
-            : with_norms
+            : norm_entry
               ? nntr_hvx_mm_u8i4_moe_layer_norm(
                   session, M, K, inter, N_out, glu, eps, pre_gamma,
                   pre_gamma ? static_cast<int>(K) : 0, post_gamma,
@@ -4589,7 +4598,7 @@ private:
                   static_cast<int>(row_count.size()), row_weight.data(),
                   static_cast<int>(row_weight.size()), act_f32, act_len,
                   out_f32, out_len)
-            : timed  ? nntr_hvx_mm_u8i4_moe_layer_timed(
+            : timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
                         session, M, K, inter, N_out, glu, h_gu.data(),
                         static_cast<int>(h_gu.size()), h_dn.data(),
                         static_cast<int>(h_dn.size()), row_index.data(),
@@ -4638,6 +4647,14 @@ private:
         (via_dspq ? " (via dspq)" : ""));
     }
     stagedMemcpy(out, out_f32, out_bytes);
+    if (host_post_norm) {
+      std::vector<float> raw(out, out + static_cast<size_t>(out_len));
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(raw.data(), out, M, N_out,
+                                                   eps);
+      for (unsigned int r = 0; r < M; ++r)
+        for (unsigned int n = 0; n < N_out; ++n)
+          out[static_cast<size_t>(r) * N_out + n] *= post_gamma[n];
+    }
     dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
                 static_cast<size_t>(out_len), M, K, inter, N_out, kind,
                 row_count);
