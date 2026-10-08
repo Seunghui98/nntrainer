@@ -424,6 +424,20 @@ public:
     return false;
   }
 
+  // [#260] add_decode_graph_q4_0 for a QS4CX FC or dense FFN weight (K x N
+  // codes, @a scale its N per-column f32 scales), in the same list order.
+  // The backend binds the handles its prefill registers from the same bytes
+  // (one image set); no Q4M1 or CPU fallback. Returns false when it takes
+  // none.
+  virtual bool add_decode_graph_qs4cx(const void *data, const float *scale,
+                                      unsigned K, unsigned N) {
+    (void)data;
+    (void)scale;
+    (void)K;
+    (void)N;
+    return false;
+  }
+
   // [plan 201 S4] One f32 parameter of the decode list's op @a op (which:
   // HTP_GRAPH_PARAM_*, n floats), handed by the model at load by the
   // weight's name instead of by its layer's hook order (Gemma 4 runs its
