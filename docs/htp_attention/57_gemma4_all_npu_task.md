@@ -735,3 +735,9 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 | e2e(로드 포함) | 31.8 s | 30.9 s |
 
 MoE에 남은 큰 몫: acc 읽기 9.6 · requant 6.9 ms/call(커널 작업, `hexkl_mm_u8i4_moe.c`).
+
+### 9.27 F1a: MoE 입력 norm을 DSP 호출로 — 이득 없음, 되돌림 (2026-10-08, 기기 실측)
+
+`NNTR_M0_PROFILE=1`(30층): MoE 레이어 2,016 ms = MoE 호출 1,669 + top-k 정리 6 + 기타 341(router FastRPC 274 + CPU in_norm ≈ 67). in_norm을 MoE 호출의 `pre_gamma`(DSP `norm_rows_in`)로 옮긴 시험: nll 3.50819 → 3.5045, 문장 "…harbour town of Ardley…" 유지(첫 토큰 "The" → "<"), prefill 4,133 / 4,066 / 4,152 ms(전 4,087 / 4,147 / 4,165) — 노이즈 안. CPU norm 2.2 ms/층이 DSP 쪽 norm으로 옮겨 갔을 뿐이라 커밋하지 않았다.
+
+expert prefetch(질문 정리): 로드 때 arena 480 slot(층당 16)만 채우고, prefill 중 층 N 계산 동안 층 N+2의 128 expert를 reader 7스레드가 flash에서 읽는다(3,360개/prefill, 노출 대기 0 ms). 30×128×3 MB ≈ 11.5 GB라 미리 다 올릴 수 없다. 지금 prefill은 계산 bound(4.1 s > flash 바닥 3.4 s).
