@@ -692,3 +692,18 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 - nll 3.50819(cfgB_ppl)로 변화 없음, 문장 같음.
 - 스레드 분할은 변환을 느리게 했다(prefill 중 CPU 0–5는 expert prefetch reader가 쓴다, 59 profile `reader cpus {0..5}`).
 - attention 호출 합 792 ms = 보정 39 + 변환 60 + `sdpa_q2_kvcache` 451(FastRPC wall 450) + **설명 안 된 242 ms**(층당 ≈8 ms). 후보(코드, 기기 미측정): 첫 호출 안의 lazy `kv_cache_q_register`(DSP heap calloc, `mha_core.cpp:1114`), `kv_cache_q_set_fixed_scales` FastRPC, `q2_q_u16`/`q2_out_u16` 첫 resize의 0 채움, `AccelF32Io::prepare`. 다음 측정 대상.
+
+### 9.24 0단계: attention 호출 안의 숨은 242 ms (2026-10-08, 3d42ddde + addd73ad, 기기 실측, 직접 실행)
+
+설정 분해(`NNTR_HTP_ATTN_TRACE`, 30층 합, cfgB 생성 1): accel_call 774 = **resize 151**(층마다 자기 `q2_q_u16`/`q2_out_u16`를 처음 키우며 8–17 MB×2 0 채움) + **register 56**(첫 호출 안의 lazy `kv_cache_q_register`, DSP heap) + fixed scales 3 + prepare 0 + 보정 40 + Q 변환 28 + `sdpa_q2_kvcache` 459 + 출력 변환 34.
+
+수정: u16 버퍼 한 쌍을 모든 층이 공유(3d42ddde), int8 KV cache 등록을 load walk 끝(lm_head 배치 뒤)으로(addd73ad).
+
+| cfgB | 전(38c3f0a4) | 후 |
+|---|---|---|
+| register / resize | 56 / 151 ms | **0 / 13 ms** |
+| attention accel_call 30층 | 774–792 ms | 578 / 673 / 594 ms |
+| prefill | 4,605 / 4,661 ms | **4,420 / 4,771 / 4,483 ms** (2회차는 보정도 2배, 기기 노이즈) |
+| nll (cfgB_ppl) | 3.50819 | 3.50819 |
+
+남은 attention 호출 몫(30층): `sdpa_q2_kvcache` ≈ 460(DSP append 197 = quant 166 + bake 31, kernel 170, 전송 ≈ 55, Q/out ION memcpy) + 보정 40 + 변환 60.
