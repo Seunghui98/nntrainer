@@ -655,3 +655,27 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 - acc_0 재현: nll 3.536, 같은 문장.
 - cfgB(int8 attention, seq 1088, `skip_prefill: true`): prefill **4,486 ms**(이전 4,864), decode 2.87 TPS. 출력 "The text discusses the small harbour town of Ardley, which is located at the confluence of a slow river and a cold northern sea…" → decode 경로도 정상.
 - 행별: MoE 1,567 ms(50.5/call, 이전 1,576) · router 276(9.2/call, 이전 262) · qkv 499(538) · dense 418(444) · o 190(218) · K=5632 111(157) · full qkv 122(135) · staging 541(583). −378 ms는 여러 행에 흩어져 1회로는 노이즈(±3–5%)와 못 가른다.
+
+### 9.22 MoE 회귀 가르기 1차, PR 4343 최신 3커밋 (2026-10-08, 기기 실측, 직접 실행)
+
+**MoE 호출 vs prefetch 경합** (cfgB, 생성 1, 냉각 2분, 번갈아 2회씩):
+
+| `NNTR_MOE_PREFETCH` | prefill | MoE `K=2816 N=2816 M>1` |
+|---|---|---|
+| 1 | 4,428 / 4,531 ms | 48.8 / 49.7 ms/call |
+| 0 | 11,376 / 11,482 ms | 46.2 / 46.4 ms/call |
+
+→ flash 경합 몫 ≈ 3 ms/call(≈ 90 ms/prefill). §9.13의 41.5 대비 +9 ms 중 나머지 ≈ 5–6 ms는 경합이 아니다. 다음은 융합 MoE 호출의 DSP 단계 분해(`mm_u8i4_moe_layer_norm`에 timed 변형 없음).
+
+**PR 4343 최신 3커밋 cherry-pick**: f145d8b6(9005bc9f, 16-bit P 정수 softmax), 48f04ddb(a3b066ab, a16/kv8 row-blocked), 4b08b64b(5a213bfc, u16 Q·출력, IDL 변경). 충돌: `hexkl_attn_q2.c`의 void submit(6a31ba72, PR과 `submit_job`만 다름), `htp_compute_ops.cpp`의 Q/out ION 스테이징(유지, u16으로), `mha_core.cpp`의 Q 보정(PR의 min/max 채택 → 2e3eadd1의 NEON abs-max는 Q에서 빠짐).
+
+| | 이전(e6a2022b) | PR 최신 |
+|---|---|---|
+| nll (q8, `skip_prefill: false`) | — (fp16 3.536) | **3.508** |
+| cfgB prefill | 4,428–4,531 ms | **4,796 / 4,791 ms** |
+| staging memcpy | 541 ms | 470 ms |
+| attention `accel_call` 30층 합 | ≈ 540 ms | **1,080 ms** = 보정 398 + RPC wall 421(DSP 366) + host 나머지 260 |
+| DSP kernel (sliding / full) | 4.65 ms / — | 5.1 / 8.4 ms |
+| 출력 | 정상 | 정상 ("…town of Ardley, which is located at the mouth of a slow river…") |
+
+- +300 ms는 PR이 host에 넣은 스칼라 루프 둘: Q min/max 보정(층당 11–22 ms, 첫 prefill)과 Q·출력 f32↔u16 변환(30층 ≈ 260 ms). 다음 수정 = 둘을 NEON + 스레드로(기대 −0.5 s, 기기 미측정).
