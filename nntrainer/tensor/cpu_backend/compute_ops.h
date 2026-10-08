@@ -273,6 +273,15 @@ public:
       (void)y;
     return false;
   }
+  /** @brief Places the lm_head weight for lm_head_q4_0_fp32 ahead of the
+   *  first call (at load, after every other weight: the arena order), so
+   *  the first prefill does not pay for it. True when the calls will run
+   *  here; false leaves the caller on its own path. */
+  virtual bool lm_head_q4_0_prepare(const void *w, unsigned int K,
+                                    unsigned int N) {
+    (void)w, (void)K, (void)N;
+    return false;
+  }
 
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,

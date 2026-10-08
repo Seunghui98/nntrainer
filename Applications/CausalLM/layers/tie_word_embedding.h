@@ -169,6 +169,13 @@ public:
   WIN_EXPORT void prepareLmhead(nntrainer::RunLayerContext &context);
 
   /**
+   * @brief Places the lm_head weight on the layer's accelerator ahead of
+   *        the first call (ComputeOps::lm_head_q4_0_prepare); true when
+   *        it is there, and then prepareLmhead builds no CPU twin.
+   */
+  WIN_EXPORT bool placeLmheadOnAccelerator(nntrainer::RunLayerContext &context);
+
+  /**
    * @brief NNTR_PPL (doc 51 section 2.14): the prompt's teacher-forced
    *        negative log-likelihood at prefill, the accuracy gate that
    *        replaces reading the generated text.

@@ -343,6 +343,28 @@ void TieWordEmbedding::prepareLmhead(nntrainer::RunLayerContext &context) {
   buildLmheadBlocked(weight, weight.height(), weight.width());
 }
 
+bool TieWordEmbedding::placeLmheadOnAccelerator(
+  nntrainer::RunLayerContext &context) {
+  if (mode_ != mode::lm_head || lmhead_blocked_tried_)
+    return false;
+  nntrainer::ComputeOps *ops = context.getComputeOps();
+  const nntrainer::Tensor &weight =
+    context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+  if (ops == nullptr ||
+      weight.getDataType() != nntrainer::TensorDim::DataType::Q4_0)
+    return false;
+  if (!ops->lm_head_q4_0_prepare(weight.getData<uint8_t>(), weight.width(),
+                                 weight.height()))
+    return false;
+  // The calls run there; the blocked twin (a second copy of the weight,
+  // 396 MiB here) would only serve a CPU fallback, which the per-row path
+  // still covers. Measured before this: the placement ran inside the
+  // first prefill, 739 ms, and the twin stayed resident beside it (doc 57
+  // section 9.10).
+  lmhead_blocked_tried_ = true;
+  return true;
+}
+
 void TieWordEmbedding::buildLmheadBlocked(const nntrainer::Tensor &weight,
                                           unsigned int vocab_size,
                                           unsigned int hidden_size) {

@@ -412,17 +412,28 @@ void Transformer::repack_weight() {
     bool weights_wh = false;
   } moe_warm;
 
+  // The tied lm_head, prepared after the walk: on its accelerator it is
+  // placed in the arena, which must come after every other weight (the
+  // chunk-boundary note above), else its blocked CPU twin is built. Both
+  // at load, with every weight loaded, rather than on the first lm_head
+  // call inside the first prefill. The context is the node's own and
+  // outlives the walk.
+  struct PendingTie {
+    TieWordEmbedding *layer = nullptr;
+    nntrainer::RunLayerContext *context = nullptr;
+  } tie_pending;
+
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm](
+    fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm, &tie_pending](
            ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
-      // The tied lm_head's blocked twin (tie_word_embedding.h) is built
-      // here, with every weight loaded, rather than on the first lm_head
-      // call inside the first prefill. forEachLayer hands out LayerNodes.
+      // forEachLayer hands out LayerNodes.
       if (l.getType() == TieWordEmbedding::type) {
         auto *tw = dynamic_cast<TieWordEmbedding *>(
           static_cast<nntrainer::LayerNode &>(l).getLayer());
-        if (tw)
-          tw->prepareLmhead(context);
+        if (tw) {
+          tie_pending.layer = tw;
+          tie_pending.context = &context;
+        }
         return;
       }
       // repack FC and MoE FFN layers -- both can hold QS4CX weights.
@@ -712,6 +723,9 @@ void Transformer::repack_weight() {
         "conv block HTP kernel warmed up at load (M=%u, K=%u, C=%u, N=%u)", M,
         p.K, p.C, p.N);
     }
+    if (tie_pending.layer != nullptr &&
+        !tie_pending.layer->placeLmheadOnAccelerator(*tie_pending.context))
+      tie_pending.layer->prepareLmhead(*tie_pending.context);
     ml_logd("QS4CX weights repacked successfully");
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to repack weights: " +
