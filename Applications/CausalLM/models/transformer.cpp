@@ -438,11 +438,31 @@ void Transformer::repack_weight() {
       // fused set (doc 51), after the walk like the FCs below -- not as
       // three FC weights, which the loop below would otherwise do.
       if (l.getType() == "dense_ffn") {
-        auto weights = context.getWeights();
-        if (weights.size() == 3 && context.getComputeOps()) {
-          auto &up = weights[0]->getVariableRef();
-          auto &gate = weights[1]->getVariableRef();
-          auto &down = weights[2]->getVariableRef();
+        // By name: with its norms folded in (in_norm / out_norm) the layer
+        // also holds two FP32 gammas, and gate_first swaps the first two.
+        // Matched on the weight order of a size()==3 test, the folded
+        // layer skipped this and registered inside the first prefill: a
+        // whole scalar Q4_0 -> QS4CX conversion per layer under the
+        // prefill timer (doc 57 section 9.10).
+        nntrainer::Tensor *up_p = nullptr, *gate_p = nullptr, *down_p = nullptr;
+        for (auto *w : context.getWeights()) {
+          const std::string &name = w->getName();
+          auto ends_with = [&name](const char *tail) {
+            const size_t n = std::strlen(tail);
+            return name.size() >= n &&
+                   name.compare(name.size() - n, n, tail) == 0;
+          };
+          if (ends_with(":up"))
+            up_p = &w->getVariableRef();
+          else if (ends_with(":gate"))
+            gate_p = &w->getVariableRef();
+          else if (ends_with(":down"))
+            down_p = &w->getVariableRef();
+        }
+        if (up_p && gate_p && down_p && context.getComputeOps()) {
+          auto &up = *up_p;
+          auto &gate = *gate_p;
+          auto &down = *down_p;
           const auto wtype = up.getDataType();
           const bool qs4cx = wtype == ml::train::TensorDim::DataType::QS4CX;
           if ((wtype == ml::train::TensorDim::DataType::Q4_0 || qs4cx) &&
