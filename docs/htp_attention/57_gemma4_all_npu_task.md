@@ -452,3 +452,52 @@ config에 engine 키 넷을 모두 `htp`로 준 경우. 층당 DSP 호출 8회(q
 - 표에 잡히는 NPU 시간 약 1.9 s + lm_head 0.74 s를 빼도 **약 6.7 s가 표 밖**이다. 표는 FC·MoE 모양의 호출만 세고 **attention 호출(`attn_f16_prefill`)은 세지 않는다.** 그래서 NPU attention 시간이 보이지 않는다. 가장 큰 용의자.
 - 64행짜리 FC 호출이 새로 보인다(N=1024 ×5, N=2048 ×50, K=4096 ×25 등, 합계 약 60 ms). 출처 미확인, 작다.
 - 다음: `attention_engine: cpu`로 한 번, `lmhead_engine: cpu`로 한 번 돌려 둘의 몫을 가른다. 그다음 `--profile` 빌드로 `prefill_timeline.py --by-op`.
+
+### 9.10 코드 감사: prefill이 9.4 s가 된 원인 7개와 수정 (2026-10-08, 기기 미측정)
+
+§9.8–9.9의 느려짐을 기기 없이 코드로 갈랐다(감사 3건, 핵심은 직접 확인). 기준선 3.99 s(§2) 대비 바뀐 것과 비용(산술). 기기 실측은 §9.11에.
+
+| # | 원인 | prefill 비용 (산술) | 수정 커밋 |
+|---|---|---|---|
+| 1 | **dense FFN weight 등록이 첫 prefill 안으로 들어감.** `transformer.cpp`의 로드 시 등록 루프가 `weights.size() == 3`을 검사하는데, 8e592b2f에서 norm gamma 2개를 넣어 5개가 되면서 실패 → 각 층의 첫 호출이 Q4_0→QS4CX 변환(스칼라, 단일 스레드)을 prefill 타이머 안에서 함. attention CPU 설정에서도 느렸던(§9.8) 정체 | 3–7 s | 600ac20d: 이름(`:up` `:gate` `:down`)으로 선택 |
+| 2 | **attention Kᵀ 타일 전치가 스칼라** (`hvx_tile_f16_rows_to_tile_transposed`: VTCM에서 스칼라 load 256 + store 512/타일) + q 블록마다 K/V 재전치(sliding 14회, full 56회). 문서 20 실측: 같은 커널에서 tile 91 ms vs qk+pv 0.5 ms. §9.9의 표 밖 6.7 s | 4.6–6.3 s | e86e8951: vshuff 네트워크(행 쌍 -4 → 8/16/32/64 버터플라이, 비트반전 저장). host 에뮬레이션에서 정의와 bit-identical(`tile_f16_host_check`), 기기 `ProbeLayoutsMatchHexkl`이 검증. 모델 모양 gtest `PrefillGemma4LayerShapes` 추가 |
+| 3 | **lm_head 배치가 첫 prefill 안** + Q4_0→Q4M1 변환이 스칼라 nibble 단일 스레드 + CPU blocked 복사본(396 MiB)을 engine과 무관하게 생성 | 0.74 s, RSS +396 MiB | 6486e76f: `lm_head_q4_0_prepare`를 로드 끝(FC·dense 등록 뒤, arena 순서)에서 호출, 성공하면 복사본 생략 |
+| 4 | **Gemma KV cache가 힙** (`allocateAndBindKVCache` override가 `setSharedAllocator` 누락) → K/V·Q·out을 호출마다 FastRPC 복사(prefill당 약 610 MB) | 0.2–0.6 s | 7ebacefa: `installKVCacheSharedAllocator()` 공통화 |
+| 5 | router weight 1.44 MB를 호출마다 plain pointer로(pin+map ~155 MB/s) | 0.2–0.3 s | 780dca95: 주소별 ION 복사본 |
+| 6 | RoPE 표 1–2 MB를 qkv 호출마다 plain pointer로 | 0.24 s | 780dca95: ION pool로 staging |
+| 7 | MoE in_norm을 CPU에서(`pre_gamma` nullptr) | 0.05 s | 보류: router가 raw를 따로 norm하므로 커널 pre_gamma로 옮겨도 CPU norm이 router 입력에 남고, MoE 호출의 pre_gamma 경로는 기기 미검증 |
+
+감사에서 같이 확인한 것:
+- 64행 FC 호출(§9.9)은 QS4CX FC bin의 로드 시 warm-up 등록(`transformer.cpp` `fc_warmed ? 64 : 512`). 타이머 밖, 무해.
+- router HVX 커널은 weight를 행마다 다시 읽지 **않는다**(256행 k-chunk, L2 재사용). 느린 건 누산기 배열을 런타임 인덱스로 접근해 스택에 올라간 발행 병목. 레지스터 블로킹(E=128, 4행 고정)이 약 3배의 다음 단계. 수치는 CPU와 같음(eps, layout, 동점 규칙).
+- lm_head 산술은 CPU와 같은 식이지만 DSP 함수 자체는 device·host 수치 검증이 없다. decode의 9.3 ms/token은 396 MiB를 매 token DDR에서 읽는 DMA 상한(44.7 GB/s), 정상.
+- resident KV 경로(`attn_f16_prefill_resident`)는 타일을 DSP heap에 두므로 Gemma(30층 × 2048행 ≈ 440 MiB)에는 못 쓴다. 그래서 전치 커널을 고쳤다.
+- hd 512 gtest는 kv 블록 1개 모양뿐이었다. 블록 2개 이상의 online-softmax 재조정이 hd 512에서 실행된 적이 없었다 → 모델 모양 추가.
+- 깨진 출력(§9.9)의 범인은 코드에서 못 찾았다. 후보: lm_head DSP 산술(미검증), attention hd 512 다중 블록(미검증), QS4CX bin. 기기에서 `lmhead_engine`·`attention_engine`을 하나씩 cpu로 돌려 가른다.
+
+기대(산술): 1–6으로 512토큰 prefill ≈ 3.5–4 s(기준선 회복). attention 전치가 사라지면 NPU attention이 CPU fp16(2.1 s)보다 빨라져 계산 합계가 flash 바닥(3.4 s, C=16) 아래로 들어간다. 그 아래는 cache(C=24: 3.1 s)·읽기 속도의 몫.
+
+### 9.11 기기 측정 가이드 (§9.10 수정본)
+
+```bash
+cd ~/workspace/nntrainer && git pull origin claude/zealous-bell-a2pot9   # 780dca95 이상
+export HEXAGON_SDK_ROOT=$HOME/workspace/Hexagon_SDK/6.4.0.2 HEXKL_ROOT=$HOME/workspace/hxkl-beta2/hexkl_addon ANDROID_NDK=$HOME/workspace/android-ndk-r26d
+./test/htp/build.sh                                      # 타일 헤더가 바뀜: skel 필수
+(cd Applications/CausalLM && ./build_android.sh --htp)
+(cd test/jni && $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. NDK_APPLICATION_MK=./Application.mk \
+   APP_BUILD_SCRIPT=./Android.mk NNTRAINER_ROOT=$PWD/../.. HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT unittest_hvx_attn_f16 -j8)
+export ANDROID_SERIAL=R3CY10WM83Y; D=/data/local/tmp/nntrainer/causallm; M=$D/models/gemma4-26b-a4b-qs4cx-arm
+adb push test/htp/build/libnntr_hvx_skel.so $D/
+adb push Applications/CausalLM/jni/libs/arm64-v8a/{nntrainer_causallm,libcausallm_core.so} $D/
+adb push builddir/android_build_result/lib/arm64-v8a/{libnntrainer.so,libccapi-nntrainer.so} $D/
+T=$(ls test/jni/libs/arm64-v8a/unittest_hvx_attn_f16 2>/dev/null || ls test/jni/obj/local/arm64-v8a/unittest_hvx_attn_f16); adb push $T $D/
+```
+
+순서(각 사이 §7.5 `cool`):
+
+1. **gtest** `adb shell "cd $D && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ./unittest_hvx_attn_f16"`. 게이트: `ProbeLayoutsMatchHexkl`(새 전치가 HexKL과 byte 동일), `PrefillGemma4LayerShapes` 통과. 그 테스트의 `ATTN_F16_FIELD ... field=tile` 값이 층당 수백 µs 이하면 §9.10 #2가 맞은 것(이전 커널은 91 ms/128×1024).
+2. **전부 NPU, 생성 32**: config는 §9.9 것에 `num_to_generate: 32`. `adb shell "cd $D && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. NNTR_NUM_THREADS=8 NNTR_HTP_PROFILE=1 ./nntrainer_causallm $M" 2>&1 | tee s1.log`. 볼 것: `[HTP] lm_head on the NPU ... placed in` 줄이 **prompt 출력 전**(로드)에 나오는지; `weights registered`가 950 → 1,070(dense 120 추가)인지; `prefill:`; 텍스트.
+3. **깨진 출력이면** 같은 config에서 `lmhead_engine: cpu` → 그래도 깨지면 `attention_engine: cpu` → 그래도면 Q4_0 bin 디렉터리(`gemma4-26b-a4b-qs4cx-wh`)로. 정상이 되는 직전 항목이 범인.
+4. **attention 분해**: `adb logcat -c; NNTR_HTP_ATTN_TRACE=1 ...` 로 실행 뒤 `adb logcat -d -s nntrainer | grep 'attn trace f16'` → 층마다 qprep/dma/tile/qk/softmax/pv/store µs. `mha_core: attention over the fp16 KV cache on the accelerator`도 같은 logcat에.
+5. **정확도**: 446토큰 `NNTR_PPL=1`, nll 4.51±0.02(§2). `lmhead_engine` cpu/htp 둘 다 같아야 lm_head DSP 산술이 무죄.
+6. 2가 정상이고 nll이 맞으면 **512토큰 생성 512** 본 측정, 그리고 `NNTR_MOE_PREFETCH=0` 짝(그림용).
