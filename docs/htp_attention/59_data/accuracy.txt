@@ -1,0 +1,7 @@
+# prompt nll, 1024 tokens, skip_prefill false, NNTR_PPL=1
+## acc_0 all NPU, fp16 attention (fix_acc0.log): [PPL] prompt tokens=1024 nll/token=3.53598 ppl=34.3288
+## acc_1 attention cpu: [PPL] prompt tokens=1024 nll/token=3.49096 ppl=32.8173
+## acc_2 +lm_head cpu: [PPL] prompt tokens=1024 nll/token=3.49096 ppl=32.8173
+## acc_3 +dense cpu: [PPL] prompt tokens=1024 nll/token=3.52957 ppl=34.1093
+## acc_4 +attn_proj cpu (MoE only NPU): [PPL] prompt tokens=1024 nll/token=3.51697 ppl=33.6822
+## cfgB_ppl all NPU, int8 a16 attention (PR 4343 latest): [PPL] prompt tokens=1024 nll/token=3.50819 ppl=33.3878

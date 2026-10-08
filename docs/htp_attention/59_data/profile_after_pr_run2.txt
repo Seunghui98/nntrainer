@@ -1,0 +1,52 @@
+# 6a31ba72 (PR 4343 latest 3 commits), cfgB, run 2
+[HTP] moe m1 gemv: on (applied=0x703e1) lead=192KB rows1=1 feed=vtcm dma_bypass=1 source=default
+[HTP] lm_head on the NPU: 262144 x 2816 Q4_0 as 16 Q4M1 slices, 396.1 MiB, placed in 674 ms
+[HTP] arena chunk 0: 256 MiB, dsp_id=0, mapped total 256 MiB, RSS 1661 -> 1661 MB
+[HTP] arena chunk 1: 256 MiB, dsp_id=1, mapped total 512 MiB, RSS 1661 -> 1661 MB
+[HTP] arena chunk 2: 256 MiB, dsp_id=2, mapped total 768 MiB, RSS 1687 -> 1687 MB
+[HTP] arena chunk 3: 256 MiB, dsp_id=3, mapped total 1024 MiB, RSS 1712 -> 1712 MB
+[HTP] arena chunk 4: 256 MiB, dsp_id=4, mapped total 1280 MiB, RSS 1712 -> 1712 MB
+[HTP] arena chunk 5: 128 MiB, dsp_id=5, mapped total 1408 MiB, RSS 1737 -> 1737 MB
+[HTP] arena chunk 6: 256 MiB, dsp_id=6, mapped total 1664 MiB, RSS 2453 -> 2453 MB
+[HTP] arena chunk 7: 192 MiB, dsp_id=7, mapped total 1856 MiB, RSS 2453 -> 2453 MB
+[HTP] dspq: on queue=0x128400000000 dsp_spin_us=1000 arm_spin_us=5000 buffers=2x65536 ion=y
+prefill: 1024 tokens, 4791 ms, 213.734 TPS
+generation: 32 tokens, 11311 ms, 2.8291 TPS
+[HTP-PROFILE] level=1 qos_mode=2 (2=poll 1=PM 0=interrupt-driven -- every transport number below is only comparable to 34_fc_measured.md's 326us/call at qos_mode=2)
+[HTP-PROFILE] weight registration (once per weight, so all of it lands in the first forward)
+[HTP-PROFILE]   weights registered : 950
+[HTP-PROFILE]   convert to registry:     3006.3 ms  (3.16 ms/weight)
+[HTP-PROFILE]   register FastRPC   :     4782.2 ms  (5.03 ms/weight)
+[HTP-PROFILE]   alloc + other      :      571.9 ms
+[HTP-PROFILE]   registration total :     8360.5 ms
+[HTP-PROFILE]   rpcmem/ION buffer  : 950/950 weights (the rest used plain heap -- pinned+mapped per call)
+[HTP-PROFILE] layer calls (M==1 is decode's shape)
+[HTP-PROFILE]   K=2816  N=128   M>1 FC     calls=30      rows=30720    host=    263.7 ms ( 8789.0 us/call)
+[HTP-PROFILE]   K=2816  N=1024  M>1 FC     calls=5       rows=320      host=      1.7 ms (  342.4 us/call)
+[HTP-PROFILE]   K=2816  N=2048  M>1 FC     calls=50      rows=3200     host=     19.3 ms (  385.8 us/call)
+[HTP-PROFILE]   K=2816  N=2816  M>1        calls=31      rows=31232    host=   1539.0 ms (49643.9 us/call)
+[HTP-PROFILE]   K=2816  N=2816  M>1 dense  calls=31      rows=31232    host=    401.7 ms (12958.1 us/call)
+[HTP-PROFILE]   K=2816  N=2816  M>1 FC     calls=30      rows=30720    host=     63.7 ms ( 2123.7 us/call)
+[HTP-PROFILE]   K=2816  N=2816  M==1       calls=960     rows=960      host=    489.7 ms (  510.1 us/call)
+[HTP-PROFILE]     expert misses: 3412 (3.55/call), file read 7550.8 ms (7.87 ms/call, 2.21 ms/miss), swap rpc 82.4 ms (0.09 ms/call) -- outside host= above
+[HTP-PROFILE]   K=2816  N=2816  M==1 dense calls=960     rows=960      host=    427.0 ms (  444.8 us/call)
+[HTP-PROFILE]   K=2816  N=4096  M>1 FC     calls=25      rows=2048     host=     15.6 ms (  625.7 us/call)
+[HTP-PROFILE]   K=2816  N=8192  M>1 FC     calls=30      rows=25920    host=    483.9 ms (16130.5 us/call)
+[HTP-PROFILE]   K=2816  N=8192  M==1 FC    calls=800     rows=800      host=    735.8 ms (  919.8 us/call)
+[HTP-PROFILE]   K=2816  N=10240 M>1 FC     calls=5       rows=5120     host=    114.1 ms (22812.0 us/call)
+[HTP-PROFILE]   K=2816  N=10240 M==1 FC    calls=160     rows=160      host=    168.3 ms ( 1052.1 us/call)
+[HTP-PROFILE]   K=2816  N=262144 M==1 FC    calls=32      rows=32       host=    314.4 ms ( 9824.3 us/call)
+[HTP-PROFILE]   K=4096  N=2816  M>1 FC     calls=75      rows=27200    host=    176.7 ms ( 2356.6 us/call)
+[HTP-PROFILE]   K=4096  N=2816  M==1 FC    calls=800     rows=800      host=    356.0 ms (  445.0 us/call)
+[HTP-PROFILE]   K=5632  N=2816  M>1 FC     calls=30      rows=30720    host=    105.4 ms ( 3513.5 us/call)
+[HTP-PROFILE]   K=8192  N=2816  M>1 FC     calls=20      rows=5440     host=     61.7 ms ( 3084.2 us/call)
+[HTP-PROFILE]   K=8192  N=2816  M==1 FC    calls=160     rows=160      host=    123.4 ms (  771.5 us/call)
+[HTP-PROFILE] layer calls total :     5861.2 ms
+[HTP-PROFILE] arm staging memcpy:      468.8 ms  (7196.8 MB in+out, 16.1 GB/s) -- outside every host= above
+[HTP-PROFILE] HTP host time     :    14690.4 ms (registration + layer calls + staging)
+[HTP-PROFILE] expert cache misses: 3412, file read 7550.8 ms (2.21 ms/miss), swap rpc 82.4 ms (0.02 ms/miss)
+[HTP-PROFILE] expert prefetch: 3360 experts read under the layer calls, exposed wait 0.0 ms (0.00 ms/expert), register rpc 26.4 ms (0.01 ms/expert)
+[HTP-PROFILE] expert prefetch progress: 3360 of 3360 read when their layer asked (100%), caller cpus {6}, reader cpus {0,1,2,3,4,5,7}
+[HTP-PROFILE] expert prefetch readers: 3.79 ms/expert on a reader, 3360 experts
+[HTP] dspq: close calls=960 served=960 bad=0 empty_polls=1783273 dsp_spin_us=1000 stop_err=0x0
+[HTP] arena: chunks unmapped 8/8 mib=1856 (release rc=0x0 put=8)
