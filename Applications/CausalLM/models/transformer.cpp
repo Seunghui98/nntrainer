@@ -603,6 +603,13 @@ void Transformer::repack_weight() {
         backends.insert(d.ops);
       for (const auto &c : conv_pending)
         backends.insert(c.ops);
+#ifdef ENABLE_HEXKL
+      // [#234 P4] the one-PD decode list binds its FC / DENSE_FFN ops to
+      // the sidecar's images too, so a model that keys no FC (Gemma 4)
+      // opens it for that bind
+      if (nntrainer::get_htp_ops()->has_decode_graph_q4_0())
+        backends.insert(nntrainer::get_htp_ops());
+#endif
       for (auto *b : backends)
         b->set_fc_wh_file(path.c_str());
     }

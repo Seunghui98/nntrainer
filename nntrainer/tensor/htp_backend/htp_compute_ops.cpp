@@ -1962,10 +1962,36 @@ public:
   void bindQ4m1(remote_handle64 session) {
     size_t next = 0;
     std::vector<uint8_t> canon;
+    // [#225] With the FC WH sidecar open, the FC and DENSE_FFN ops bind the
+    // handles the prefill registered from it (HTP_GRAPH_FEED_WH): one copy
+    // of those weights for both. The tied lm_head stays Q4M1.
+    // [#234 P4] Lever L1 (HTP_GRAPH_FEED_NATIVE, NNTR_HTP_PPL_LEVERS=2)
+    // asks for the native Q4 kernels on every Q4M1 kind: the sidecar's
+    // handles then stay out of the decode list.
+    bool native = false;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size()); ++i)
+      native |= (graphOp(i)->feed & HTP_GRAPH_FEED_NATIVE) != 0u;
+    const bool wh = !native && [this] {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      return fcwh_fd_ >= 0;
+    }();
+    uint32_t wh_handles = 0;
     q4m1_left_ = 0; // [#132 Part B E3] what the FC arena chunks are sized for
-    for (const Q4Pending &p : q4_pending_)
-      q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
-    auto take = [&](uint32_t op, uint32_t K, uint32_t N) -> const uint8_t * {
+    if (!wh) {
+      for (const Q4Pending &p : q4_pending_)
+        q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
+    } else { // [#225] the LM_HEAD's slices only
+      for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size());
+           ++i) {
+        const htp_graph_op *op = graphOp(i);
+        if (op->resident && op->kind == HTP_OP_LM_HEAD)
+          q4m1_left_ +=
+            q4m1_bytes(op->K, op->N) +
+            4096u * ((op->N + kLmHeadSliceRows - 1u) / kLmHeadSliceRows);
+      }
+    }
+    auto pending = [&](uint32_t op, uint32_t K,
+                       uint32_t N) -> const Q4Pending & {
       if (next >= q4_pending_.size())
         throw std::runtime_error("set_decode_graph_desc: op " +
                                  std::to_string(op) + " (" +
@@ -1980,6 +2006,10 @@ public:
           std::to_string(K) + " x " + (N ? std::to_string(N) : "*") +
           " Q4_0 weight, the model's next is " + std::to_string(p.K) + " x " +
           std::to_string(p.N));
+      return p;
+    };
+    auto take = [&](uint32_t op, uint32_t K, uint32_t N) -> const uint8_t * {
+      const Q4Pending &p = pending(op, K, N);
       const size_t bytes =
         static_cast<size_t>(p.N) * (p.K / 32u) * Q4_CPU_BLOCK_BYTES;
       if (p.canonical)
@@ -1988,14 +2018,58 @@ public:
       nntrainer::unpack_q4_0(p.data, canon.data(), bytes, p.N, p.K);
       return canon.data();
     };
+    // [#225] the prefill's handles of a pending weight (registered at the
+    // load's warm-ups, or here if its layer was not keyed)
+    auto key = [](const Q4Pending &p) { return const_cast<void *>(p.data); };
     const uint32_t n_ops = static_cast<uint32_t>(stretch_start_.size());
     for (uint32_t i = 0; i < n_ops; ++i) {
       htp_graph_op *op = htp_graph_op_at(graph_words_.data(), i);
       if (!op->resident ||
           (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u)
         continue;
+      op->feed &= ~HTP_GRAPH_FEED_WH; // [#234 P4] a re-bind sets it anew
       uint32_t parts = 0;
-      if (op->kind == HTP_OP_DENSE_FFN) {
+      if (wh && op->kind == HTP_OP_DENSE_FFN) {
+        const Q4Pending &u = pending(i, op->K, op->N);
+        const Q4Pending &g = pending(i, op->K, op->N);
+        const Q4Pending &d = pending(i, op->N, op->N_out);
+        const DenseHandles &dh = get_or_register_dense(
+          key(u), key(g), key(d), session, op->K, op->N, op->N_out);
+        if (dh.h_gu.size() > HTP_GRAPH_WH_DENSE_MAX_CHUNKS)
+          throw std::runtime_error(
+            "set_decode_graph_desc: DENSE_FFN op " + std::to_string(i) +
+            " has " + std::to_string(dh.h_gu.size()) +
+            " chunks, the M=1 kernel takes " +
+            std::to_string(HTP_GRAPH_WH_DENSE_MAX_CHUNKS));
+        for (size_t c = 0; c < dh.h_gu.size(); ++c) {
+          op->h_gu[parts] = dh.h_gu[c];
+          op->h_dn[parts++] = dh.h_dn[c];
+        }
+        op->feed |= HTP_GRAPH_FEED_WH;
+        wh_handles += 2u * parts;
+      } else if (wh && op->kind == HTP_OP_FC) {
+        uint32_t sum = 0;
+        while (sum < op->N) {
+          const Q4Pending &p = pending(i, op->K, 0u);
+          const FcHandles &fh = get_or_register_fc(key(p), session, p.K, p.N);
+          for (uint32_t h : fh.handles) {
+            if (parts == HTP_GRAPH_MAX_PARTS)
+              throw std::runtime_error("set_decode_graph_desc: FC op " +
+                                       std::to_string(i) + " has over " +
+                                       std::to_string(HTP_GRAPH_MAX_PARTS) +
+                                       " WH parts");
+            op->h_gu[parts++] = h;
+          }
+          sum += p.N;
+        }
+        if (sum != op->N)
+          throw std::runtime_error(
+            "set_decode_graph_desc: FC op " + std::to_string(i) +
+            " is N=" + std::to_string(op->N) + ", its weights sum to " +
+            std::to_string(sum));
+        op->feed |= HTP_GRAPH_FEED_WH;
+        wh_handles += parts;
+      } else if (op->kind == HTP_OP_DENSE_FFN) {
         op->h_gu[0] = registerQ4m1(session, take(i, op->K, op->N), op->K, 0u,
                                    op->N); // up
         op->h_gu[1] = registerQ4m1(session, take(i, op->K, op->N), op->K, 0u,
@@ -2029,10 +2103,15 @@ public:
         "set_decode_graph_desc: the model handed " +
         std::to_string(q4_pending_.size()) + " Q4_0 weights, the list's " +
         "FC / DENSE_FFN / LM_HEAD ops took " + std::to_string(next));
-    std::fprintf(stderr, "[HTP] graph: q4m1 weights=%zu handles=%zu feed=%s\n",
+    std::fprintf(stderr, "[HTP] graph: q4m1 weights=%zu handles=%zu feed=%s",
                  q4_pending_.size(),
                  e2e_ ? e2e_st_->q4m1.size() : q4m1_handles_.size(),
                  q4m1FeedName());
+    // [#225] the FC / DENSE_FFN ops on the sidecar's WH handles (absent:
+    // the line as before)
+    if (wh_handles != 0u)
+      std::fprintf(stderr, " wh_handles=%u", wh_handles);
+    std::fputc('\n', stderr);
   }
 
   /** [#130] The op record of @a op in the description (the words are
@@ -2855,6 +2934,7 @@ public:
       ::close(fcwh_fd_);
     fcwh_fd_ = -1;
     fcwh_.clear();
+    fcwh_arena_bytes_ = fcwh_heap_bytes_ = 0; // [#225] fcwhLeft's, the banner's
     const std::string where = std::string("fc_wh_file_name ") + path + ": ";
     const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -4626,6 +4706,13 @@ private:
     return true;
   }
 
+  /** [#234 P4] compute_ops.h: the E2E list's Q4_0 weights are still to
+   *  bind, so the sidecar can serve its FC / DENSE_FFN ops (bindQ4m1). */
+  bool has_decode_graph_q4_0() override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    return e2e_ && !q4_pending_.empty() && !q4m1_bound_;
+  }
+
   /** [#132 Part B E3, #211] Places the Q4M1 set on S1's own new arena
    *  chunks: at load after the MoE arena (the model calls
    *  finish_decode_graph_q4_0 after repack_weight), else at graph init.
@@ -5289,9 +5376,17 @@ private:
       const char *v = std::getenv("NNTR_HTP_FC_WH_HEAP");
       return v != nullptr && std::atoi(v) != 0;
     }();
+    // [#225 PR 2] On the E2E path these images are also the decode FC set,
+    // and the expert pool's chunks leave them no room (plan 225 section
+    // 3.5: pool C=28 3328 + FC WH 216 + lm_head Q4M1 147 = 3691 of the
+    // PD's 3840 MiB), so they map their own chunk, sized for every image
+    // still to come. The hybrid keeps PR 1's rule: mapped room or the heap.
     uint32_t chunk = 0, off = 0;
+    const bool e2e = HtpBackend::e2eRequested();
     if (!heap_only && ensureArena(session) &&
-        placeExisting(static_cast<uint32_t>(len), &chunk, &off)) {
+        (e2e ? place(session, static_cast<uint32_t>(len), fcwhLeft(), &chunk,
+                     &off)
+             : placeExisting(static_cast<uint32_t>(len), &chunk, &off))) {
       uint8_t *dst = arena_chunks_[chunk].buf->data() + off;
       if (host.empty())
         read_tiles(dst);
@@ -6718,6 +6813,16 @@ private:
   std::string fcwh_name_;
   std::unordered_map<uint64_t, FcWhEntry> fcwh_;
   size_t fcwh_arena_bytes_ = 0, fcwh_heap_bytes_ = 0;
+  /** [#225 PR 2] WH bytes of the sidecar's images not registered yet, plus
+   *  placeExistingOn's 4 KiB alignment for four handles an image (its most:
+   *  a dense FFN's chunks). */
+  size_t fcwhLeft() const {
+    size_t all = 0;
+    for (const auto &e : fcwh_)
+      all += whBytes(e.second.K, e.second.N) + 4u * 4096u;
+    const size_t done = fcwh_arena_bytes_ + fcwh_heap_bytes_;
+    return all > done ? all - done : 0u;
+  }
   /** Handles registered from the sidecar: the FC slices plus the dense
    *  chunks' two each. */
   size_t fcwhHandles() const {

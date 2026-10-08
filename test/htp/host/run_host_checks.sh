@@ -44,6 +44,29 @@ cc=${CC:-gcc}
   "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
 
 "$OUT/moe_layer_host_check"
+# [#225] Two mutants of the decode FC on WH weights (hexkl_mm_u8i4_fc_m1_run),
+# each of which must fail FC WH BIT-IDENTICAL: a lane computing a block it
+# never waited for, and the part's column offset dropped from the dequant's
+# column sums.
+for mut in 's/      if (hexkl_dma_lane_wait(\&d\[cur\]) != 0) {/      if (0) {/' \
+  's/        w->colsum_w + c0, w->w_scale + c0,/        w->colsum_w, w->w_scale + c0,/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" > "$OUT/moe_fc_mutant.c"
+  if cmp -s "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c"; then
+    echo "FC WH MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
+    -DMOE_TAIL_MAX_ROWS=16u \
+    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+    -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    -o "$OUT/moe_fc_mutant" \
+    "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
+    "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+    "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
+  if MOE_CHECK_FC_WH_ONLY=1 "$OUT/moe_fc_mutant" > "$OUT/moe_fc_mutant.log"; then
+    echo "FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "FC WH MUTANT CAUGHT: $mut ($(grep -c 'FAIL$' "$OUT/moe_fc_mutant.log") failed cells)"
+done
 
 # The conv block kernel (doc 51 section 2) on the same stand-ins. It is
 # built on the MoE kernel's exported helpers, so that file links in too.
@@ -292,6 +315,21 @@ for mut in 's/    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);
     echo "GRAPH GEMMA MUTANT PASSED (the check is blind): $mut"; exit 1
   fi
   echo "GRAPH GEMMA MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
+done
+# [#225] The WH FC / DENSE_FFN ops, each mutant must fail GRAPH FC WH OK:
+# the dense chunks handed as one expert of the whole width, the op's L2 bit
+# not reaching the FC kernel as feed off.
+for mut in 's/      op->N \/ op->n_experts, op->N_out, op->n_experts,/      op->N, op->N_out, op->n_experts,/' \
+  's/  if ((op->feed \& HTP_GRAPH_FEED_L2) != 0u) {/  if (0) {/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
+  if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
+    echo "GRAPH FC WH MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  graph_check "$OUT/hexkl_graph_mutant.c" "$OUT/graph_mutant"
+  if "$OUT/graph_mutant" > "$OUT/graph_mutant.log"; then
+    echo "GRAPH FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "GRAPH FC WH MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
 
 # [#132 Part B E2, #211] The one-PD token driver (hmx/hexkl_token.c): one

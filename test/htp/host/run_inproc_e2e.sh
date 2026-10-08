@@ -169,6 +169,27 @@
 #                              run's, one image per graph FC -- 7 a layer,
 #                              6 on a full-attention layer with
 #                              attention_k_eq_v, which has no _wv)
+#   E2E fwd lfm25 fcwh kinds=all calls/token=1.00 q4m1_handles=1 wh_handles=28
+#     e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=<n> ok
+#   E2E eval e3fcwh-lfm25-vs-off ... min_snr_db=<x>   (printed, not gated)
+#   E2E tokens e3fcwh==off-lfm25 8/8 expected_mismatch=0
+#   E2E ppl-decode e3fcwh-lfm25 off=<ppl> wh=<ppl> delta=<%> top1=7/7
+#                              (#225 PR 2: the one-PD token's FC and dense
+#                              FFN on the sidecar's WH handles, the lm_head
+#                              alone Q4M1; NNTR_PPL_DECODE forced on the
+#                              hybrid's continuation)
+#   E2E fwd gemma64 fcwh kinds=all calls/token=1.00 attn_caches=2
+#     q4m1_handles=1 wh_handles=17 ok
+#   E2E eval gemma64-fcwh-vs-cpu ... min_snr_db=<x>   (printed, not gated)
+#   E2E tokens gemma64-fcwh==off <n>/8 expected_mismatch=<m>   (the policy)
+#   E2E eval gemma64x-fcwh-vs-q4m1 ... min_snr_db=<x>  (x >= 20 gated)
+#   E2E tokens gemma64x-fcwh==q4m1 8/8 expected_mismatch=0
+#   E2E e3 pool C=2 gemma64-fcwh == e3 bit_identical=1 misses=<n> ...
+#     moe_dumps==sidecar-less files=<n> bit_identical=1
+#                              (#234 P4: the Gemma 4 sidecar model's one-PD
+#                              token, opened for the bind with no keyed FC;
+#                              gemma64x: the same fixture with int4-exact
+#                              FCs, so both sides hold the same weights)
 # and, since #194 S1 (htp_moe_ppl), the same token with lever
 # L1 (NNTR_HTP_PPL_LEVERS=2: the native FC / DENSE_FFN / LM_HEAD kernels,
 # q4_gemv_native_det.h), forced on E1's hd64 path, and on lfm25:
@@ -402,7 +423,7 @@ done
   --embd_dtype Q4_0 > "$OUT/q_g64cpu.log"
 "$Q" "$FIXG" -o "$OUT/g64htp" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
   --embd_dtype Q4_0 > "$OUT/q_g64htp.log"
-# [#234 P3] the same with the FC WH sidecar: checked below, not run
+# [#234 P3] the same with the FC WH sidecar: checked below; run since P4
 "$Q" "$FIXG" -o "$OUT/g64htpw" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
   --embd_dtype Q4_0 --fc_wh_sidecar > "$OUT/q_g64htpw.log"
 run_gemma() { # run_gemma <label> <model> <engine> [env...]: run_e2e on FIXG
@@ -411,7 +432,7 @@ run_gemma() { # run_gemma <label> <model> <engine> [env...]: run_e2e on FIXG
   local rc=0
   env "$@" "$E2E" --model "$OUT/$model" --tokenizer "$FIXG/tokenizer.json" \
     --prompt $PROMPT --steps $STEPS --moe-engine "$engine" \
-    --dump "$OUT/dump_$label" --max-seq 32 > "$OUT/$label.log" 2>&1 || rc=$?
+    --dump "$OUT/dump_$label" --max-seq 32 ${G_ARGS:-} > "$OUT/$label.log" 2>&1 || rc=$?
   if [ $rc != 0 ] || ! grep -q '^E2E gen ' "$OUT/$label.log"; then
     echo "E2E FAIL $label rc=$rc"; tail -3 "$OUT/$label.log"; exit 1
   fi
@@ -420,6 +441,55 @@ run_gemma g64cpu g64cpu cpu
 run_gemma g64off g64htp htp
 run_gemma g64e3 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
 run_gemma g64e3pool2 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# [#234 P4] the sidecar model's one-PD token (FC / DENSE_FFN on its WH
+# handles), all experts resident and a pool of 2, and the sidecar-less
+# token beside them; --repack as the app's main runs it (repack_weight is
+# where the loader hands the sidecar over)
+G_ARGS=--repack run_gemma g64e3r g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+G_ARGS=--repack run_gemma g64e3w g64htpw htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+G_ARGS=--repack run_gemma g64e3wpool2 g64htpw htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2
+# and gemma64x, the bind check's fixture: every FC weight int4-exact (per
+# column q * 2^e, each 32-row block holding a -8 and the column a 7, so
+# Q4_0 and the sidecar's QS4CX_WH hold the same values) and the q / k norm
+# gammas at 0.3. The plain fixture's two quantizations read -4 dB apart
+# (Q4_0 against f32 FCs reads the same), and its peaked sliding softmax
+# turns the WH path's u8 row quantization of q and k into 9.5 dB even on
+# int4-exact weights; at 0.3 the WH token reads 31 dB against the Q4M1 one
+python3 - "$ROOT/tools/htp" "$FIXG" "$OUT/fixg_x" <<'PY'
+import json, math, os, shutil, struct, sys
+tools, src, dst = sys.argv[1:4]
+sys.path.insert(0, tools)
+from fc_wh_sidecar_from_q4 import fcs
+shutil.copytree(src, dst)
+cfg = json.load(open(src + "/config.json"))
+c = cfg.get("text_config", cfg)
+b = dst + "/" + json.load(open(src + "/nntr_config.json"))["model_file_name"]
+rows, size = fcs(cfg, dict.fromkeys(
+    ("fc_layer_dtype", "embedding_dtype", "moe_layer_dtype"), "FP32"))
+if os.path.getsize(b) not in (size, size + 4 * c["vocab_size"] * c["hidden_size"]):
+    sys.exit("gemma64x: the f32 layout walk disagrees with the file size")
+f = open(b, "r+b")
+for name, o, K, N in rows:
+    f.seek(o)
+    w = list(struct.unpack("<%df" % (K * N), f.read(4 * K * N)))
+    for n in range(N):
+        s = 2.0 ** round(math.log2(max(abs(w[k * N + n]) for k in range(K)) / 8))
+        for k in range(K):
+            q = -8 if k % 32 == 0 else 7 if k == 1 else round(w[k * N + n] / s)
+            w[k * N + n] = max(-8, min(7, q)) * s
+    if name.endswith(("_wq", "_wk")):  # q_norm / k_norm follow
+        hd = c["head_dim"] if c["layer_types"][int(name[5:name.index("_")])] \
+            == "sliding_attention" else c["global_head_dim"]
+        w += [0.3] * hd
+    f.seek(o)
+    f.write(struct.pack("<%df" % len(w), *w))
+PY
+"$Q" "$OUT/fixg_x" -o "$OUT/g64x" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64x.log"
+"$Q" "$OUT/fixg_x" -o "$OUT/g64xw" --fc_dtype Q4_0 --moe_dtype QS4CX_WH \
+  --embd_dtype Q4_0 --fc_wh_sidecar > "$OUT/q_g64xw.log"
+G_ARGS=--repack run_gemma g64xe3 g64x htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+G_ARGS=--repack run_gemma g64xe3w g64xw htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
 # [plan 229] QS2CX_WH experts and their 4-bit palette twin (header above)
 "$Q" "$FIX25" -o "$OUT/htp25q2" --fc_dtype Q4_0 --moe_dtype QS2CX_WH \
   --embd_dtype Q4_0 > "$OUT/q_htp25q2.log"
@@ -492,6 +562,19 @@ PROMPT=1024 NNTR_HTP_PROFILE=1 \
   run_e2e q25w-p2x "$OUT/htp25w" htp "$OUT/dump_25wp2x" "$OUT/25wp2x.log" --max-seq 2048 --repack
 PROMPT=1024 NNTR_HTP_PREFILL_ROWS=0 NNTR_HTP_PROFILE=1 \
   run_e2e q25w-p1x "$OUT/htp25w" htp "$OUT/dump_25wp1x" "$OUT/25wp1x.log" --max-seq 2048 --repack
+# [#225 PR 2] the decode FC set on the sidecar's WH handles: the one-session
+# E1 and the pool of 8 against the one-PD run above, then NNTR_PPL_DECODE:
+# the hybrid writes its continuation, the one-PD run is forced on it
+echo "== [#225 PR 2] lfm25 sidecar: KINDS=all, NNTR_HTP_E2E=1 pool C=2, PPL forced"
+PROMPT=512 NNTR_HTP_FORWARD=1 NNTR_HTP_FORWARD_KINDS=$E1_KINDS \
+  run_e2e q25w-e1 "$OUT/htp25w" htp "$OUT/dump_25we1" "$OUT/25we1.log" --max-seq 2048 --repack
+PROMPT=512 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=2 \
+  run_e2e q25w-e3pool2 "$OUT/htp25w" htp "$OUT/dump_25we3pool2" "$OUT/25we3pool2.log" --max-seq 2048 --repack
+rm -f "$OUT/w.ids"
+PROMPT=512 NNTR_PPL_DECODE="$OUT/w.ids" \
+  run_e2e q25w-offppl "$OUT/htp25w" htp "$OUT/dump_25woffppl" "$OUT/25woffppl.log" --max-seq 2048 --repack --run
+PROMPT=512 NNTR_PPL_DECODE="$OUT/w.ids" NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 \
+  run_e2e q25w-e3ppl "$OUT/htp25w" htp "$OUT/dump_25we3ppl" "$OUT/25we3ppl.log" --max-seq 2048 --repack --run
 # [#211] NNTR_HTP_E2E_PDS is a guard: anything but 1 is refused at load
 rc_pds=0
 NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_HTP_E2E_PDS=2 "$E2E" --model "$OUT/htp64q" \
@@ -623,6 +706,52 @@ if grep -q 'bit_identical=1' <<< "$ev" && [ "$calls" = 1.00 ] &&
   echo "E2E e3 pool C=2 gemma64 == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0"
 else
   echo "E2E FAIL e3 pool C=2 gemma64: [$ev] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
+fi
+# [#234 P4] the sidecar model's one-PD token: the bind banner (the tied
+# lm_head the one Q4M1 handle, every FC part and dense chunk pair a WH
+# handle: 2 sliding layers x (q k v o + gate|up, down) + the full layer's
+# k = v (no v) = 6 + 6 + 5), one call a token on both caches. Against the
+# CPU model (SNR printed) and the off run (tokens by the policy) the plain
+# fixture compares two int4 quantizations of its FCs; the gate is
+# gemma64x's, same weights on both sides: the WH token against the Q4M1
+# token, its logits above 20 dB (a wrong part or chunk reads below 0) and
+# its tokens 8/8. Then its prefill MoE dumps are the sidecar-less token's
+# (the experts did not move; a Gemma prefill FC stays on the CPU, no
+# keys) and its pool of 2 bit-identical to it (logits: the pool splits
+# prefill calls)
+for d in g64e3r g64e3w g64e3wpool2 g64xe3 g64xe3w; do logits_only "$OUT/dump_$d" "$OUT/ref_$d"; done
+gq="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/g64e3w.log")"
+read -r g_q4m1 g_wh <<< "${gq:-x x}"
+calls="$(calls_per_token "$OUT/g64e3w.log")"
+caches="$(grep -c '^\[HTP\] attn_m1: registered ' "$OUT/g64e3w.log" || true)"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3w.log")"
+if [ "$g_q4m1" = 1 ] && [ "$g_wh" = 17 ] && [ "$calls" = 1.00 ] &&
+   [ "$caches" = 2 ] && grep -q ' timeouts=0 stale=0 ' <<< "$close" &&
+   grep -q ' wh_handles=17$' "$OUT/g64xe3w.log"; then
+  echo "E2E fwd gemma64 fcwh kinds=all calls/token=1.00 attn_caches=2 q4m1_handles=$g_q4m1 wh_handles=$g_wh ok"
+else
+  echo "E2E FAIL fwd gemma64 fcwh: bind=[${gq:-none}] calls/token=${calls:-none} attn_caches=$caches close=[$close]"; fail=1
+fi
+$EVAL --label gemma64-fcwh-vs-cpu --allow-diff "$OUT/ref_g64cpu" "$OUT/ref_g64e3w" | tail -1 || true
+$EVAL --label 'gemma64-fcwh==off' --tokens-policy "$OUT/ref_g64off" "$OUT/ref_g64e3w" | tail -1 || fail=1
+$EVAL --label gemma64x-fcwh-vs-q4m1 --allow-diff --snr-floor 20 "$OUT/ref_g64xe3" "$OUT/ref_g64xe3w" | tail -1 || fail=1
+$EVAL --label 'gemma64x-fcwh==q4m1' --tokens-policy "$OUT/ref_g64xe3" "$OUT/ref_g64xe3w" | tail -1 || fail=1
+mkdir -p "$OUT/moe_g64e3r" "$OUT/moe_g64e3w"
+for d in g64e3r g64e3w; do
+  find "$OUT/dump_$d" -maxdepth 1 -type f ! -name 'logits_*' -exec cp {} "$OUT/moe_$d/" \;
+done
+em="$($EVAL --label gemma64-fcwh-moe==e3 "$OUT/moe_g64e3r" "$OUT/moe_g64e3w" | tail -1 || true)"
+ev="$($EVAL --label e3pool-gemma64-fcwh-C2 "$OUT/ref_g64e3w" "$OUT/ref_g64e3wpool2" | tail -1 || true)"
+calls="$(calls_per_token "$OUT/g64e3wpool2.log")"
+close="$(grep -o 'token driver: close .*' "$OUT/g64e3wpool2.log")"
+misses="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/g64e3wpool2.log")"
+nm="$(sed -n 's/.* files=\([0-9]*\) .*/\1/p' <<< "$em")"
+if grep -q 'bit_identical=1' <<< "$ev" && grep -q 'bit_identical=1' <<< "$em" &&
+   [ "${nm:-0}" -gt 0 ] && [ "$calls" = 1.00 ] &&
+   grep -q ' timeouts=0 stale=0 ' <<< "$close" && [ "${misses:-0}" -gt 0 ]; then
+  echo "E2E e3 pool C=2 gemma64-fcwh == e3 bit_identical=1 misses=$misses calls/token=1.00 timeouts=0 moe_dumps==sidecar-less files=$nm bit_identical=1"
+else
+  echo "E2E FAIL e3 pool C=2 gemma64-fcwh: pool=[$ev] moe=[$em] calls/token=${calls:-none} misses=${misses:-none} close=[$close]"; fail=1
 fi
 # [plan 229] the 2-bit lines: every dumped file (the prefill MoE calls'
 # inputs and outputs, the logits) of the 2-bit token equals its palette
@@ -778,6 +907,35 @@ cp "$OUT"/dump_25qoff/logits_*.f32 "$OUT/lq/"; cp "$OUT"/dump_25koff/logits_*.f3
 cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lw/"
 $EVAL --label fcwh-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lw" | tail -1 || true
 $EVAL --label requant-lfm25-vs-cpu-fc --allow-diff "$OUT/lq" "$OUT/lk" | tail -1 || true
+# [#225 PR 2] (6) the one-PD token's FC and dense FFN ops on the sidecar's
+# WH handles (HTP_GRAPH_FEED_WH), the lm_head alone Q4M1 (one slice: vocab
+# 32): the bind banner's counts on the one-PD and the one-session run, one
+# call a token, the one-PD token equal to E1's and to the pool C=2 run's,
+# every logit; (7) against the hybrid, whose decode FCs are the CPU's Q4_0:
+# the tokens by the policy, and the decode logits' SNR printed, not gated
+# -- two int4 quantizations of the fixture's random FCs (per column from
+# f32, and Q4_0 blocks with a Q8_0 row; PR 1's prefill line above reads
+# 2.5 dB for the same reason), so it is the size of the format change, and
+# (6) is the wiring check
+wq="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/25we3.log")"
+wq1="$(sed -n 's/^\[HTP\] graph: q4m1 weights=[0-9]* handles=\([0-9]*\) feed=[a-z0-9]* wh_handles=\([0-9]*\)$/\1 \2/p' "$OUT/25we1.log")"
+read -r w_q4m1 w_wh <<< "${wq:-x x}"
+we="$($EVAL --label e3fcwh==e1fcwh-lfm25 "$OUT/dump_25we1" "$OUT/dump_25we3" | tail -1 || true)"
+wp="$($EVAL --label e3fcwh-pool-C2-lfm25 "$OUT/dump_25we3" "$OUT/dump_25we3pool2" | tail -1 || true)"
+echo "$we"; echo "$wp"
+calls_wp="$(calls_per_token "$OUT/25we3pool2.log")"
+misses_w="$(sed -n 's/.*token driver: pool misses=\([0-9]*\) .*/\1/p' "$OUT/25we3pool2.log")"
+if [ "$w_q4m1" = 1 ] && [ "$w_wh" = 28 ] && [ "$wq1" = "$wq" ] &&
+  [ "$calls_w" = 1.00 ] && [ "$calls_wp" = 1.00 ] && [ "${misses_w:-0}" -gt 0 ] &&
+  grep -q 'bit_identical=1' <<< "$we" && grep -q 'bit_identical=1' <<< "$wp"; then
+  echo "E2E fwd lfm25 fcwh kinds=all calls/token=1.00 q4m1_handles=$w_q4m1 wh_handles=$w_wh e3==e1 bit_identical=1 pool C=2 bit_identical=1 misses=$misses_w ok"
+else
+  echo "E2E FAIL fwd lfm25 fcwh: bind=[${wq:-none}] e1=[${wq1:-none}] calls/token=${calls_w:-none}/${calls_wp:-none} misses=${misses_w:-none}"; fail=1
+fi
+mkdir -p "$OUT/lwo" "$OUT/lw3"
+cp "$OUT"/dump_25woff/logits_*.f32 "$OUT/lwo/"; cp "$OUT"/dump_25we3/logits_*.f32 "$OUT/lw3/"
+$EVAL --label e3fcwh-lfm25-vs-off --allow-diff "$OUT/lwo" "$OUT/lw3" | tail -1 || true
+$EVAL --label 'e3fcwh==off-lfm25' --tokens-policy "$OUT/dump_25woff" "$OUT/dump_25we3" | tail -1 || fail=1
 if [ $rc_pds = 1 ] &&
   grep -q '^E2E FAIL .*NNTR_HTP_E2E_PDS=2: the two-PD path was removed (#211)' "$OUT/64pds2.log"; then
   echo "E2E e2e pds=2 refused ok"
@@ -1086,6 +1244,19 @@ if [ "$(dec_field "$OUT/g64fwd.log" source)" = file ] &&
   awk -v a="$off" -v b="$on" 'BEGIN{exit !(a + 0 > 0 && b + 0 > 0 && a + 0 < 1e30 && b + 0 < 1e30)}'; then
   echo "$line delta=$(awk -v a="$off" -v b="$on" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') top1=$top1"
   [ "$top1" = "$((STEPS - 1))/$((STEPS - 1))" ] || fail=1
+else
+  echo "E2E FAIL $line (not finite, or not forced)"; fail=1
+fi
+# [#225 PR 2] (8) the sidecar model's one-PD token (WH FC set) forced on the
+# hybrid's continuation (CPU Q4_0 decode FCs): the host shape of the
+# device's G4 read, on random weights -- printed; gated: forced, finite
+po="$(dec_field "$OUT/25woffppl.log" ppl)"
+pw="$(dec_field "$OUT/25we3ppl.log" ppl)"
+line="E2E ppl-decode e3fcwh-lfm25 off=${po:-none} wh=${pw:-none}"
+if [ "$(dec_field "$OUT/25woffppl.log" source)" = self ] &&
+  [ "$(dec_field "$OUT/25we3ppl.log" source)" = file ] &&
+  awk -v a="$po" -v b="$pw" 'BEGIN{exit !(a + 0 > 0 && b + 0 > 0 && a + 0 < 1e30 && b + 0 < 1e30)}'; then
+  echo "$line delta=$(awk -v a="$po" -v b="$pw" 'BEGIN{printf "%+.3f%%", (b / a - 1) * 100}') top1=$(dec_field "$OUT/25we3ppl.log" top1)"
 else
   echo "E2E FAIL $line (not finite, or not forced)"; fail=1
 fi

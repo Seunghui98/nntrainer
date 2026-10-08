@@ -413,6 +413,10 @@ public:
   // logits. take_decode_token_id: the id of the last decode token whose
   // logits did not come back, once; false when there is none.
   virtual bool finish_decode_graph_q4_0() { return false; }
+  // [#234 P4] True when the one-PD decode list (NNTR_HTP_E2E=1) holds Q4_0
+  // weights it has not bound yet: the loader then hands this backend the
+  // FC WH sidecar (set_fc_wh_file) even when no layer keyed an FC to it.
+  virtual bool has_decode_graph_q4_0() { return false; }
   virtual void set_decode_logits(bool want) { (void)want; }
   // [#132 Part B E3] The ids the caller's greedy pick sets to -inf (its
   // bad words): an id taken with take_decode_token_id skips them too.
