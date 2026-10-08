@@ -372,6 +372,32 @@ public:
   //
   // gelu says the gated activation between gate_up and down is
   // gelu_tanh(g)*u (Gemma-4) rather than silu(g)*u (LFM2).
+  /**
+   * @brief out = scale * (res + rmsnorm(act . W) * gamma): an FC over a
+   *        QS4CX weight (data @a w, scales @a w_scale, K x N) with the
+   *        decoder block's post-attention epilogue on its output, in one
+   *        accelerator call (doc 57 section 9.32). False when not taken:
+   *        the caller then runs the FC and the add itself.
+   */
+  virtual bool gemm_qs4cx_res_add_fp32(void *w, float *w_scale,
+                                       const float *act, unsigned int M,
+                                       unsigned int K, unsigned int N,
+                                       const float *res, const float *gamma,
+                                       float eps, float scale, float *out) {
+    (void)w;
+    (void)w_scale;
+    (void)act;
+    (void)M;
+    (void)K;
+    (void)N;
+    (void)res;
+    (void)gamma;
+    (void)eps;
+    (void)scale;
+    (void)out;
+    return false;
+  }
+
   // add_x2 (doc 57 section 9.30): the block's post-FFN epilogue on the
   // output, out = add_scale * (act + rmsnorm(moe + add_x2) * add_gamma),
   // with act the raw rows (pre_gamma set, K == N_out).

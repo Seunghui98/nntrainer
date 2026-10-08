@@ -1223,4 +1223,15 @@ interface nntr_hvx : remote_handle64 {
                                         in sequence<float> act_f32,
                                         in sequence<float> x2,
                                         rout sequence<float> out_f32);
+
+   // mm_u8i4_layer (one FC weight in its column-slice handles) followed by
+   // the decoder block's post-attention epilogue on its output (doc 57
+   // section 9.32): out = scale * (res + rmsnorm(act . W) * gamma). One
+   // call instead of the o-proj call and rmsnorm_add_f32.
+   AEEResult mm_u8i4_layer_res_add(in uint32 M, in uint32 K, in float eps,
+                                   in float scale, in sequence<float> gamma,
+                                   in sequence<uint32> w_handles,
+                                   in sequence<float> act_f32,
+                                   in sequence<float> res,
+                                   rout sequence<float> out_f32);
 };

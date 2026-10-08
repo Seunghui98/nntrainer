@@ -1629,6 +1629,50 @@ public:
              matBdata, matCdata, M, N, K);
   }
 
+  // The o-proj with the post-attention epilogue (see the base declaration):
+  // the FC's row chunks as invokeFc takes them, each one call that also
+  // norms, adds the residual and scales, so the FC output never comes back.
+  bool gemm_qs4cx_res_add_fp32(void *w, float *w_scale, const float *act,
+                               unsigned int M, unsigned int K, unsigned int N,
+                               const float *res, const float *gamma, float eps,
+                               float scale, float *out) override {
+    if (M <= 1 || w == nullptr || act == nullptr || res == nullptr)
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const FcHandles &fh = get_or_register_fc(w, session, K, N, w_scale);
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      const size_t a_bytes = static_cast<size_t>(m) * K * sizeof(float);
+      const size_t o_bytes = static_cast<size_t>(m) * N * sizeof(float);
+      std::lock_guard<std::mutex> lock(invoke_mutex_);
+      float *act_f32 = reinterpret_cast<float *>(
+        stageInput(act_pool_, act + static_cast<size_t>(m0) * K, a_bytes)
+          .data());
+      float *res_f32 =
+        reinterpret_cast<float *>(stage(x2_pool_, o_bytes).data());
+      float *out_f32 =
+        reinterpret_cast<float *>(stage(out_pool_, o_bytes).data());
+      stagedMemcpy(res_f32, res + static_cast<size_t>(m0) * N, o_bytes);
+      const uint64_t t0 = HtpProfile::nowUs();
+      const int err = nntr_hvx_mm_u8i4_layer_res_add(
+        session, m, K, eps, scale, gamma, gamma ? static_cast<int>(N) : 0,
+        fh.handles.data(), static_cast<int>(fh.handles.size()), act_f32,
+        static_cast<int>(m * K), res_f32, static_cast<int>(m * N), out_f32,
+        static_cast<int>(m * N));
+      const uint64_t elapsed = HtpProfile::nowUs() - t0;
+      if (err != AEE_SUCCESS)
+        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_res_add failed: err=" +
+                                 std::to_string(err));
+      stagedMemcpy(out + static_cast<size_t>(m0) * N, out_f32, o_bytes);
+      HtpProfile &profile = HtpProfile::global();
+      if (profile.level())
+        profile.addInvoke(m, K, N, elapsed, nullptr);
+    }
+    return true;
+  }
+
   // Same grouping as gemm_q4_0_batch_fp32, for QS4CX weights -- see the
   // comment on the base declaration (compute_ops.h). Without this,
   // FloatTensor::dot's vector overload had no accelerated path for QS4CX at
