@@ -1230,6 +1230,9 @@ public:
   // packing of the same bytes. [#260] Except under the one-PD token
   // (NNTR_HTP_E2E=1): a decode row is the token's, and the layers' hooks
   // that hand it over (qkv's input norm first) sit on their row path.
+  // ponytail: process-wide, so a decode row the token does not take (a
+  // moe_htp_layers subset) runs its QS4CX FCs on the CPU kernel; a
+  // per-row answer needs the hook's verdict before qkv's fused call.
   bool accelerates_qs4cx_at_m1() const override {
     return !HtpBackend::e2eRequested();
   }
@@ -2359,9 +2362,16 @@ public:
         continue;
       op->feed &= ~HTP_GRAPH_FEED_WH; // [#234 P4] a re-bind sets it anew
       uint32_t parts = 0;
-      // [#260] a QS4CX weight takes the WH path with or without a sidecar
-      const bool wh_op =
-        wh || (next < q4_pending_.size() && q4_pending_[next].scale != nullptr);
+      // [#260] a QS4CX weight takes the WH path with or without a sidecar;
+      // lever L1 asks for the native Q4 kernels, which QS4CX cannot feed
+      const bool qs4cx_op =
+        next < q4_pending_.size() && q4_pending_[next].scale != nullptr;
+      if (qs4cx_op && native)
+        throw std::runtime_error(
+          "set_decode_graph_desc: lever L1 (NNTR_HTP_PPL_LEVERS=2) takes "
+          "Q4_0 weights, op " +
+          std::to_string(i) + "'s is QS4CX");
+      const bool wh_op = wh || qs4cx_op;
       if (wh_op && op->kind == HTP_OP_DENSE_FFN) {
         const Q4Pending &u = pending(i, op->K, op->N);
         const Q4Pending &g = pending(i, op->K, op->N);

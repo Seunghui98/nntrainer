@@ -251,8 +251,11 @@ if [ ! -f "$FIX64/nntr_lfm2_moe_tiny_fp32.bin" ]; then
   exit 1
 fi
 GENG="test/unittest/models/causallm_reference/generators/generate_gemma4_moe_hd64_reference.py"
-if [ ! -f "$FIXG/nntr_gemma4_moe_tiny_fp32.bin" ]; then
-  echo "E2E FAIL gemma hd64 fixture weights missing: run" >&2
+# [#260] #4415's layout: its converter's .safetensors names _router_norm
+# (an older .bin, #4296's layout, has no such weight and reads wrong)
+if [ ! -f "$FIXG/nntr_gemma4_moe_tiny_fp32.bin" ] ||
+   ! grep -qa '"layer0_router_norm:' "$FIXG/nntr_gemma4_moe_tiny_fp32.safetensors" 2>/dev/null; then
+  echo "E2E FAIL gemma hd64 fixture weights missing or in the pre-#4415 layout: run" >&2
   echo "  python3 $GENG --hidden 128 --inter 64 --heads 2 --kv-heads 1 --head-dim 64 --global-head-dim 128 --global-kv-heads 1 --layer-types sliding_attention,sliding_attention,full_attention --max-pos 32 --sliding-window 8 --experts 8 --top-k 2 --moe-inter 32 --final-softcap 30 --random-layer-scalar --random-norms --router-scale 50 --seed 12 --out $FIXG" >&2
   echo "  git checkout -- $FIXG/" >&2
   exit 1
