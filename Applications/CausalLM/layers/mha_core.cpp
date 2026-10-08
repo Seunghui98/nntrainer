@@ -1021,15 +1021,13 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
     }
     causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, q2_scale_v.data());
   }
+  // Q's per-head range, NEON (min / max are order-free): scalar it was
+  // 11-22 ms a 1024-row layer (doc 59 section 2.2).
   std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
   for (unsigned int r = 0; r < n_q; ++r) {
     const float *qr = q + static_cast<size_t>(r) * q_stride;
-    for (unsigned int h = 0; h < num_heads_Q; ++h) {
-      for (unsigned int d = 0; d < head_dim; ++d) {
-        q_lo[h] = std::min(q_lo[h], qr[h * head_dim + d]);
-        q_hi[h] = std::max(q_hi[h], qr[h * head_dim + d]);
-      }
-    }
+    for (unsigned int h = 0; h < num_heads_Q; ++h)
+      causallm::min_max_f32(qr + h * head_dim, head_dim, q_lo[h], q_hi[h]);
   }
   const unsigned int G = num_heads_Q / num_heads_KV;
   for (unsigned int h = 0; h < num_heads_Q; ++h) {
@@ -1169,21 +1167,20 @@ bool MHACoreLayer::try_quantized_attention(
     const size_t q_elems = static_cast<size_t>(n_q) * q_stride;
     q2_q_u16.resize(q_elems);
     q2_out_u16.resize(q_elems);
+    // Both conversions NEON on this thread: scalar they were 8-13 ms a
+    // 1024-row layer (doc 59 section 2.2); NEON 1.0 / 1.1 ms, and split over
+    // 4 or 8 compute threads slower (doc 57 section 9.23).
+    static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
+    const auto tq0 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q; ++r) {
       const float *qr = io.q + static_cast<size_t>(r) * q_stride;
       uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
-      for (unsigned int h = 0; h < num_heads_Q; ++h) {
-        const float inv = 1.0f / q2_q_enc[2 * h];
-        const float zp = q2_q_enc[2 * h + 1];
-        const float *src = qr + h * head_dim;
-        uint16_t *d = dst + h * head_dim;
-        for (unsigned int i = 0; i < head_dim; ++i) {
-          float v = src[i] * inv + zp + 0.5f;
-          v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
-          d[i] = static_cast<uint16_t>(v);
-        }
-      }
+      for (unsigned int h = 0; h < num_heads_Q; ++h)
+        causallm::quant_u16_f32(qr + h * head_dim, head_dim,
+                                1.0f / q2_q_enc[2 * h], q2_q_enc[2 * h + 1],
+                                dst + h * head_dim);
     }
+    const auto tq1 = std::chrono::steady_clock::now();
     if (!compute_ops_->sdpa_q2_kvcache(
           handle, append_row0, append_rows, width, k_base + off, v_base + off,
           q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q, cache_from, cache_to,
@@ -1191,19 +1188,25 @@ bool MHACoreLayer::try_quantized_attention(
           q2_out_enc.data(), q_stride)) {
       return fail("attention");
     }
+    const auto tq2 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q; ++r) {
       const uint16_t *src =
         q2_out_u16.data() + static_cast<size_t>(r) * q_stride;
       float *dst = io.out + static_cast<size_t>(r) * q_stride;
-      for (unsigned int h = 0; h < num_heads_Q; ++h) {
-        const float scale = q2_out_enc[2 * h];
-        const float zp = q2_out_enc[2 * h + 1];
-        const uint16_t *s = src + h * head_dim;
-        float *d = dst + h * head_dim;
-        for (unsigned int i = 0; i < head_dim; ++i) {
-          d[i] = (static_cast<float>(s[i]) - zp) * scale;
-        }
-      }
+      for (unsigned int h = 0; h < num_heads_Q; ++h)
+        causallm::dequant_u16_f32(src + h * head_dim, head_dim,
+                                  q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
+                                  dst + h * head_dim);
+    }
+    if (conv_trace && n_q > 1) {
+      const auto tq3 = std::chrono::steady_clock::now();
+      auto us = [](auto d) {
+        return static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+      };
+      ml_logi("mha_core trace: q2 convert rows=%u q_us=%lld call_us=%lld "
+              "out_us=%lld",
+              n_q, us(tq1 - tq0), us(tq2 - tq1), us(tq3 - tq2));
     }
   } else if (!compute_ops_->sdpa_q_kvcache(
                handle, append_row0, append_rows, width, k_base + off,
