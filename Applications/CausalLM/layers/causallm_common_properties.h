@@ -228,6 +228,19 @@ public:
   static constexpr const char *key = "router_norm";
 };
 
+/**
+ * @brief out_add: an MoE layer also takes the decoder block's post-FFN
+ *        epilogue: out = scalar * (input + rmsnorm(moe + input 1) * gamma),
+ *        input 1 being the dense branch's output (gamma and the scalar the
+ *        last two weights in the file, as the residual_add they replace).
+ */
+class OutAdd : public nntrainer::Property<bool> {
+public:
+  OutAdd(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "out_add";
+};
+
 }; // namespace props
 
 WIN_EXPORT enum RMSParams { gamma };
