@@ -791,3 +791,8 @@ MoE가 호출당 ≈1 ms만 준 이유: HMX 스레드가 HVX epilogue(dequant·G
 | staging | 7.2 GB, 509 ms | 6.2 GB, 464 ms |
 
 host `unittest_causallm_models` 94 통과(Gemma-4 MoE tiny 모델 HF 기준 일치, weight-bearing 목록에서 `_post_ffn_norm`이 빠진 것은 의도). 이득은 중앙값 ≈ −25~−45 ms(1회 튐 제외)로 산술 기대(−100 ms)보다 작다: MoE 호출이 epilogue(DSP)와 x2 staging을 떠안았다.
+
+### 9.31 staging dedupe, FC quant 한 패스 (2026-10-08, 1c70d1a2 + 다음 커밋, 기기 실측, 직접 실행)
+
+- **staging dedupe**(1c70d1a2): router·dense·MoE가 같은 post-attention 행(11.5 MB)을 같은 act 버퍼에 세 번 복사하던 것을, 버퍼가 그 복사를 아직 들고 있으면(포인터·크기 같고 32개 64 B 창 + 끝이 일치) 건너뛴다. staging 6.2 → 5.56 GB, 464 → 426 ms. prefill 3,938 / 3,857 / 3,946(노이즈 안), nll 3.5045·문장 그대로.
+- **FC quant 한 패스**: 행 params 패스 + k-tile 분할 pack 패스(행을 DDR에서 두 번, pack worker는 모든 행을 stride로)를 4행 묶음 분할로 params 직후 pack. o-proj quant 631 → 304 us/호출(K=8192: 906 → 471), o-proj 행 166 → 141 ms, prefill **3,866 / 3,918 / 3,839**, nll 3.5045 비트 동일. lane 에뮬에 pack 명령이 없어 host 검사 없음(기기 nll로 확인).
