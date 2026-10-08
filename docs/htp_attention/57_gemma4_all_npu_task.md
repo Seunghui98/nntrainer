@@ -762,3 +762,17 @@ MoE가 호출당 ≈1 ms만 준 이유: HMX 스레드가 HVX epilogue(dequant·G
 | router 행 | 267 ms | **213** |
 | prefill | 4,048 / 4,074 / 3,995 | 4,205 / **3,935 / 3,924** |
 | nll | 3.50819 | 3.50819 |
+
+### 9.29 측정: staging 복사 스레드화(기각), MoE·dense의 HMX bound (2026-10-08, 기기 실측, 직접 실행)
+
+**staging memcpy를 ThreadManager로 나누기 — 기각.** 2 MB 이상 복사를 n 스레드로(추론 스레드만):
+
+| n | staging | prefill |
+|---|---|---|
+| 1 | 509 / 512 ms (14.9 GB/s) | 4,029 / 4,024 |
+| 2 | 800 ms (9.4 GB/s) | 4,332 |
+| 4 | 1,025 ms (7.4 GB/s) | 4,596 |
+
+변환(§9.23)과 같은 결과: prefill 중 CPU 0–5는 expert reader 몫이라 깨우는 비용·경합이 대역폭보다 크다. 커밋하지 않음.
+
+**PROFILE=2 분해(inline 후, 호출당).** MoE: DSP 43.3 ms = mm 10.7 + **acc 읽기 17.6**(inline 전 21.1 + 9.6) + requant 대기 6.9 + dequant 대기 3.4 + stage 1.3 + 기타. 누산기 읽기가 HMX 완료를 기다리므로 HMX 실제 시간 ≈ 28 ms로 그대로 — **MoE는 HMX array bound**(64행 블록 padding 포함 196 블록/호출). dense(MoE kernel을 intermediate 3 chunk로 빌려 씀): DSP 10.9 ms = HMX 6.2 + worker 대기 2.4 + stage·quant·gather 2.0, worker 23.7 ms. 3 chunk가 같은 1024행을 각각 pack하고 down을 out에 3번 RMW한다(개선 여지 ≈ 2 ms/호출, 기기 미측정).
