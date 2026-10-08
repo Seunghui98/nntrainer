@@ -741,3 +741,24 @@ MoE에 남은 큰 몫: acc 읽기 9.6 · requant 6.9 ms/call(커널 작업, `hex
 `NNTR_M0_PROFILE=1`(30층): MoE 레이어 2,016 ms = MoE 호출 1,669 + top-k 정리 6 + 기타 341(router FastRPC 274 + CPU in_norm ≈ 67). in_norm을 MoE 호출의 `pre_gamma`(DSP `norm_rows_in`)로 옮긴 시험: nll 3.50819 → 3.5045, 문장 "…harbour town of Ardley…" 유지(첫 토큰 "The" → "<"), prefill 4,133 / 4,066 / 4,152 ms(전 4,087 / 4,147 / 4,165) — 노이즈 안. CPU norm 2.2 ms/층이 DSP 쪽 norm으로 옮겨 갔을 뿐이라 커밋하지 않았다.
 
 expert prefetch(질문 정리): 로드 때 arena 480 slot(층당 16)만 채우고, prefill 중 층 N 계산 동안 층 N+2의 128 expert를 reader 7스레드가 flash에서 읽는다(3,360개/prefill, 노출 대기 0 ms). 30×128×3 MB ≈ 11.5 GB라 미리 다 올릴 수 없다. 지금 prefill은 계산 bound(4.1 s > flash 바닥 3.4 s).
+
+### 9.28 HMX 곱셈 inline(FC·MoE), router top-k 한 번 훑기 (2026-10-08, 3b7295ba + 363c2a80e, 기기 실측, 직접 실행)
+
+**HMX inline.** PR 4343(a63aeac6)은 `hexkl_micro_hmx_mm_*`의 wrapper(호출당 ≈50 사이클, 실제 HMX ≈9)를 자기 attention kernel에서만 없앴다. FC kernel(`layer_run`·`fused_run`·`gate_up_swiglu_run`: qkv·o-proj·dense)과 MoE kernel에도 적용(`hexkl_hmx_mm.h`). 남은 HMX 라이브러리 호출: `acc_read_int32`(wrapper가 작업의 ~5%라 그대로), `acc_clear`(이미 명령 하나), fp16 attention의 `mm_f16`(cfgB 미사용), u8i8(`hexkl_mm_u8i8_dma.c`, 이 모델 미사용).
+
+| cfgB | 전 | inline 후 |
+|---|---|---|
+| nll | 3.50819 | 3.50819(같은 packet) |
+| qkv `N=8192` | 480 ms | 444–460 |
+| MoE 행 | 1,430–1,472 | 1,382–1,435 |
+| prefill | 4,087 / 4,147 / 4,165 | **4,048 / 4,074 / 3,995** |
+
+MoE가 호출당 ≈1 ms만 준 이유: HMX 스레드가 HVX epilogue(dequant·GeGLU·requant·scatter, worker 3개 합 102 ms/호출)를 기다린다 — MoE는 HVX epilogue bound. 호출자 거들기(work-stealing)는 산술상 ≈1 ms/호출이라 보류.
+
+**router 분해**(측정용 임시 스위치, 커밋 안 함, 각 1회): 호출 8.97 ms = softmax+top-k 2.7 + DSP norm 0.8 + logits 행렬곱+전송 5.5. top-k를 n_sel(13)번 최대값 훑기에서 한 번 훑기 + 정렬 삽입으로(동점 = 낮은 index 우선 유지, host check 불일치 0):
+
+| cfgB | inline 후 | + top-k |
+|---|---|---|
+| router 행 | 267 ms | **213** |
+| prefill | 4,048 / 4,074 / 3,995 | 4,205 / **3,935 / 3,924** |
+| nll | 3.50819 | 3.50819 |
