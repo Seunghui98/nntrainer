@@ -27,6 +27,10 @@
 #                                        lock). <bin dir> is the merged
 #                                        build's install dir on the phone and
 #                                        holds unittest_hvx_two_sessions
+#   260-e-run.sh cx <bin dir> <log dir> <C>...
+#                                        E p512 G512 at each C (no ladder;
+#                                        stops at the first C that cannot
+#                                        generate), the miss curve of the pool
 #   260-e-run.sh sum <log dir>           the per-cell table, text, first
 #                                        <turn|> and loop onset (host only)
 # Resumable per cell (<log dir>/done/<cell>). If an E cell cannot load, it is
@@ -125,7 +129,7 @@ cell() { # cell <bin dir> <log dir> <variant> <prompt> <G> [tag] [extra env]
   [ "$v" = Ap ] && cfg="r2_A_p${p}_g${g}"
   n="${v}_p${p}_g${g}${tag:+_$tag}"
   [ -f "$L/done/$n" ] && { echo "$n: done earlier"; return 0; }
-  for c in 16 12 8; do
+  for c in ${CLADDER:-16 12 8}; do
     e="NNTR_MOE_CACHE_EXPERTS=$c $extra"
     [ "$v" = E ] && e="NNTR_HTP_E2E=1 $e"
     read -r soc bat z0 <<<"$(cool)"
@@ -188,6 +192,19 @@ run() {
   echo "=== done $(date '+%F %T %Z')"
 }
 
+cx() { # cx <bin dir> <log dir> <C>... : E p512 G512 per C, lock held
+  local B=${1:?bin dir} L=${2:?log dir} c
+  shift 2
+  mkdir -p "$L/done"
+  exec > >(tee -a "$L/sweep.out") 2>&1
+  (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "260 r2 C sweep" 90) || exit 1
+  trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
+  for c in "$@"; do
+    CLADDER=$c cell "$B" "$L" E 512 512 "c$c" || { echo "stop: C=$c cannot generate"; break; }
+  done
+  echo "=== cx done $(date '+%F %T %Z')"
+}
+
 sum() { # host-only table
   local L=${1:?log dir}
   python3 - "$L" "$TOK" "$HERE" <<'PY'
@@ -237,6 +254,7 @@ PY
 case "${1:-}" in
 stage) stage ;;
 run) shift; run "$@" ;;
+cx) shift; cx "$@" ;;
 sum) shift; sum "$@" ;;
 *) sed -n '2,40p' "$0"; exit 1 ;;
 esac
