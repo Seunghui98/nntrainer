@@ -21,6 +21,7 @@
  *   htp_e2e_test --model <quantized dir> --tokenizer <tokenizer.json>
  *                [--prompt 16] [--steps 8] [--moe-engine htp|cpu]
  *                [--dump <dir>] [--max-seq N] [--run] [--repack]
+ *                [--load-only]
  *
  * The prompt is deterministic, ids[i] = 1 + (7 i mod 30): inside the
  * 32-token vocabulary, never bos (0) or eos (31). Output:
@@ -38,6 +39,10 @@
  * --repack calls repack_weight after the load, as the app's main does
  * (#225): the load-time FC registrations, the FC WH sidecar and the
  * warm-up calls (which the MoE dumps then hold too).
+ * [#260] --load-only stops after the load (and --repack): the backend's
+ * load banners, then `E2E load kv_alloc=<0|1> kv_shared=<0|1>`: whether
+ * the model installed the attention engine's shared KV allocator, and
+ * whether a slab came from it (0 in-process: no rpcmem there).
  * Exit 0, or 1 with `E2E FAIL <reason>` on any exception.
  */
 
@@ -60,7 +65,7 @@ namespace {
 struct Options {
   std::string model, tokenizer, engine = "htp", dump;
   unsigned prompt = 16, steps = 8, max_seq = 0;
-  bool run = false, repack = false;
+  bool run = false, repack = false, load_only = false;
 };
 
 Options parse(int argc, char **argv) {
@@ -88,6 +93,8 @@ Options parse(int argc, char **argv) {
       o.max_seq = static_cast<unsigned>(std::stoul(value()));
     else if (a == "--run")
       o.run = true;
+    else if (a == "--load-only")
+      o.load_only = true;
     else if (a == "--repack")
       o.repack = true;
     else
@@ -173,6 +180,11 @@ int runModel(const Options &o, nlohmann::json &cfg, nlohmann::json &gen,
   model.loadWeight(weights);
   if (o.repack)
     model.repack_weight();
+  if (o.load_only) {
+    const int kv = model.kvCacheShared();
+    std::printf("E2E load kv_alloc=%d kv_shared=%d\n", kv & 1, kv >> 1);
+    return 0;
+  }
 
   std::vector<unsigned int> ids(o.prompt);
   for (unsigned i = 0; i < o.prompt; ++i)

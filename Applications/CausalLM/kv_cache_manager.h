@@ -82,6 +82,12 @@ public:
   bool usesSharedMemory() const { return !shared_blocks_.empty(); }
 
   /**
+   * @brief Whether setSharedAllocator installed an allocator (a backend
+   *        may still hand back nullptr and leave the slabs on the heap).
+   */
+  bool hasSharedAllocator() const { return static_cast<bool>(shared_alloc_); }
+
+  /**
    * @brief Allocate KV cache for all layers
    * @param[in] num_layers number of attention layers
    * @param[in] batch_size batch size
