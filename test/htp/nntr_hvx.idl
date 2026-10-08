@@ -1234,4 +1234,18 @@ interface nntr_hvx : remote_handle64 {
                                    in sequence<float> act_f32,
                                    in sequence<float> res,
                                    rout sequence<float> out_f32);
+
+   // router_logits_f32 with the logits from the u8 x i8 HMX path, over a
+   // gate weight registered by weight_register_u8i8 (K x E int8, a scale per
+   // expert): the HVX f32 logits were ~4 ms of a 7 ms prefill router call
+   // (doc 57 section 9.33). Same norm, softmax and selection.
+   AEEResult router_logits_u8i8_f32(in uint32 M, in uint32 K, in uint32 E,
+                                    in float eps, in sequence<float> gamma,
+                                    in uint32 w_handle,
+                                    in sequence<float> x, in uint32 top_k,
+                                    in uint32 n_sel,
+                                    in sequence<float> scale,
+                                    rout sequence<float> logits,
+                                    rout sequence<uint32> sel,
+                                    rout sequence<float> weight);
 };

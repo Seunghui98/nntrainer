@@ -1445,6 +1445,48 @@ public:
     return reinterpret_cast<const float *>(it->second->data());
   }
 
+  /** @brief The gate weight (K x E f32) as a u8 x i8 HMX weight, built and
+   *  registered on first use and kept by the weight's address: symmetric
+   *  int8 per expert column (scale = max |w| / 127), its column sums, no
+   *  bias. UINT32_MAX when the backend refuses (the f32 kernel then runs). */
+  uint32_t routerWeightU8i8(remote_handle64 session, const float *w,
+                            unsigned int K, unsigned int E) {
+    auto it = router_u8i8_.find(w);
+    if (it != router_u8i8_.end())
+      return it->second;
+    std::vector<int8_t> q(static_cast<size_t>(K) * E);
+    std::vector<float> sc(E), bias(E, 0.0f);
+    std::vector<int32_t> colsum(E, 0);
+    for (unsigned int e = 0; e < E; ++e) {
+      float amax = 0.0f;
+      for (unsigned int k = 0; k < K; ++k)
+        amax = std::max(amax, std::fabs(w[static_cast<size_t>(k) * E + e]));
+      sc[e] = amax > 0.0f ? amax / 127.0f : 1.0f;
+      const float inv = 1.0f / sc[e];
+      for (unsigned int k = 0; k < K; ++k) {
+        const long v = std::lround(w[static_cast<size_t>(k) * E + e] * inv);
+        const int8_t qi =
+          static_cast<int8_t>(std::max(-127L, std::min(127L, v)));
+        q[static_cast<size_t>(k) * E + e] = qi;
+        colsum[e] += qi;
+      }
+    }
+    uint32_t h = UINT32_MAX;
+    const int err = nntr_hvx_weight_register_u8i8(
+      session, K, E, q.data(), static_cast<int>(q.size()), sc.data(),
+      static_cast<int>(E), colsum.data(), static_cast<int>(E), bias.data(),
+      static_cast<int>(E), &h);
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr,
+                   "[HTP] router stays on the f32 kernel: "
+                   "weight_register_u8i8 err=%d\n",
+                   err);
+      h = UINT32_MAX;
+    }
+    router_u8i8_[w] = h;
+    return h;
+  }
+
   void router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
                           const float *x, const float *gamma, float eps,
                           const float *w, float *logits, unsigned int top_k,
@@ -1459,20 +1501,40 @@ public:
       stageInput(act_pool_, x, x_len * sizeof(float)).data());
     float *out = reinterpret_cast<float *>(
       stage(out_pool_, out_len * sizeof(float)).data());
+    // NNTR_HTP_ROUTER_U8I8=1: the logits on the HMX (u8 x i8). Off by
+    // default: on device its logits were up to 0.17-0.39 off the CPU's
+    // (the f32 kernel: 2e-5), the per-row u8 step being coarse beside
+    // Gemma-4's outlier activations, and the routing that noise changes
+    // is not a model's own (doc 57 section 9.33).
+    static const bool router_u8i8 =
+      std::getenv("NNTR_HTP_ROUTER_U8I8") != nullptr;
+    const uint32_t h8 =
+      router_u8i8 ? routerWeightU8i8(session, w, K, E) : UINT32_MAX;
     const float *w_shared =
-      routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
+      h8 != UINT32_MAX
+        ? nullptr
+        : routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
     const uint64_t t0 = HtpProfile::nowUs();
     // the selection is small (M x 13 + M x 8 at the softmax router's
     // width) and goes straight to the caller's arrays
     static_assert(sizeof(unsigned int) == sizeof(uint32_t), "sel is u32");
-    const int err = nntr_hvx_router_logits_f32(
-      session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w_shared,
-      static_cast<int>(static_cast<size_t>(K) * E), act,
-      static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
-      top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
-      reinterpret_cast<uint32_t *>(sel),
-      top_k ? static_cast<int>(M * n_sel) : 0, weight,
-      top_k ? static_cast<int>(M * top_k) : 0);
+    const int err =
+      h8 != UINT32_MAX
+        ? nntr_hvx_router_logits_u8i8_f32(
+            session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, h8,
+            act, static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+            top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
+            reinterpret_cast<uint32_t *>(sel),
+            top_k ? static_cast<int>(M * n_sel) : 0, weight,
+            top_k ? static_cast<int>(M * top_k) : 0)
+        : nntr_hvx_router_logits_f32(
+            session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0,
+            w_shared, static_cast<int>(static_cast<size_t>(K) * E), act,
+            static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+            top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
+            reinterpret_cast<uint32_t *>(sel),
+            top_k ? static_cast<int>(M * n_sel) : 0, weight,
+            top_k ? static_cast<int>(M * top_k) : 0);
     const uint64_t elapsed = HtpProfile::nowUs() - t0;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error(
@@ -6550,6 +6612,7 @@ private:
   StagingPool attn_out_pool_; /**< and its f32 output */
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
+  std::map<const float *, uint32_t> router_u8i8_; /**< gate -> u8i8 handle */
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
       unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
