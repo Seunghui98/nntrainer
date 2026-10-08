@@ -450,3 +450,239 @@ Open, for S7 proper: the real `RSS 766` decomposition on the device (one
 `smaps` read of an LFM run settles the 240), the sliding-cache sizing in
 the attention op, whether the loader can skip the CPU originals when every
 kind is resident, and S5's own routing trace for the hit curve.
+
+## 8. S2 revision 2, 2026-10-08 — the FC / head 2-bit step after #234 P4
+
+Supersedes §4 S2 (the "Gemma at 2 bits on the host" bullet) and the FC
+/ head rows of §3.2 for what comes next; §3.3, §3.4 and §7 stand. Inputs:
+the P4 sitting `docs/measurements/234-p4-fcwh-decode.md` on
+`origin/htp/234-p4-fcwh-decode` @ `a7fe77748` (PR #257, S25 `R3CY205ZMND`,
+dummy weights, prompt 447, C 16), plan 234 §3, LEDGER rules 71 / 72, ㉞ /
+㉟, S5-0. Tags as §0; **[M-P4]** = that sitting's G 512 F16 cells (mean of
+r1–r3). Code references are to the P4 branch unless marked `[htp_decode]`.
+
+### 8.1 Lever ranking from the P4 breakdown
+
+Bytes a token on the DSP today (F16 = one PD, FC / DENSE_FFN on the 4-bit
+sidecar, LM_HEAD Q4M1, experts `QS2CX_WH`), from the config [G] against
+the per-kind ms [M-P4]:
+
+| kind | what is read | MB / token [G] | ms [M-P4] | GB/s [G] |
+|---|---|---:|---:|---:|
+| FC | attention q \| k \| v, o: 1 110 M w × 0.5 B + 8 B × 335 360 cols | 557.8 | 10.65 | **52.4** |
+| DENSE_FFN | up, gate, down: 535 M w × 0.5 B + 8 B × 211 200 cols | 269.3 | 5.33 | 50.5 |
+| LM_HEAD | tied head Q4_0, 262 144 × 2 816 × 18 / 32 | 415.2 | 8.18 | 50.8 |
+| MOE | 240 experts × (5.95 M w / 4 + 8 B × 4 224) | 365.0 | 11.19 (10.4 net of 0.71 miss × 1.1 ms) | 32.6 (35) |
+| ATTN_M1 | KV fp16, 225 KB a context position, mean ctx 703 | ≈ 158 | 13.74 | ≈ 13 (slope 17 µs / position from the G 64 / 512 / 1024 cells: 9.56 / 13.74 / 17.73 ms at mean ctx 479 / 703 / 959) |
+| ROUTER_TOPK | 30 × [2 816 × 128] f32 | 43 | 4.04 | ≈ 11 |
+| RMSNORM + QK_NORM + ROPE + ADD | — | — | 2.9 | — |
+| **DSP wall** | | **≈ 1 810** | **56.45** | |
+
+The token is 62.9 ms (15.89 tok/s), so ≈ 6.5 ms a token is ARM, transport
+and miss wait. **The WH read rate on this path is ≈ 52 GB/s** (attention
+557.8 MB / 10.65 ms; dense agrees at 50.5) — above rule 59's 44, under rule
+44's 70, and the same as the Q4M1 head's 50.8: the P4 move bought bytes
+(0.5625 → 0.5 B/w, −11 %) plus the kernel's rate (E16's FC was 14.33 ms for
+the same bytes at Q4_0 = 44 GB/s), not a new ceiling. Every lever below is
+priced at 52 GB/s.
+
+| lever | bytes before → after (MB) | ms before → after | gain (ms) | note |
+|---|---:|---:|---:|---|
+| **1. FC + dense → 2-bit** (sidecar `bits = 2`, u8i2 column branch) | 827.2 → 415.8 (+ 4 palette B / image) | 15.98 → 8.0 | **−8.0 [G]** | the kernel exists (`hvx_gemm_u8i2_wh_col_nopf`, `hvx_gemm_u8i4_wh.h:100`); the DENSE_FFN WH path already runs the MoE kernel, whose 2-bit feed lands packed rows (`hexkl_mm_u8i4_moe.c:1120`) |
+| 2a. LM_HEAD → WH 4-bit | 415.2 → 371.2 | 8.18 → 7.1 | −1.0 [G] | bind + runner work (§8.4); costs +371 MiB of arena because the ARM keeps its Q4_0 table for the embedding lookup (today the head is *attached*, `attach_mib=396`, no second copy) |
+| 2b. LM_HEAD → WH 2-bit | 415.2 → 186.6 | 8.18 → 3.6 | −4.6 [G] | only if the tied embedding is ternary — **needs-user** (§3.2's caveat stands) |
+| 3. attention window (㉞ a) | KV scan capped at 1 024 positions on the 25 sliding layers | at G 512 (ctx ≤ 959): 0; at G 1024: ≤ 92 MB at the last token | 0 at the headline cell; ≈ −1.7 mean at G 1024 [G] | a memory lever first: KV 800 → 200 MiB at `max_seq` 4096, which is rule 71's C lever. ATTN_M1's real cost is its 13 GB/s (−9 ms if it read at the WH rate [E]) — S6's, not this plan's |
+| 4. MOE 4-slab feed (§3.3) | 365, unchanged | 10.4 → ≥ 7.0 | ≤ −3.4, expect −2 [E] | the only 2-bit kind left with a rate gap (35 vs 52 GB/s); DMA two experts ahead now fits (3.96 MB of 8 MiB) |
+
+If 1 + 2a + 4 land: 56.45 − 8.0 − 1.0 − 2.0 = 45.5 ms DSP + 6.5 → 52 ms
+→ **≈ 19.2 tok/s** [G/E]; with 2b instead of 2a ≈ 20.7. Lever 1 alone:
+54.9 ms → 18.2 tok/s, level with the hybrid A16 (18.37 [M-P4]). **Lever 1
+buys the most**: it is the largest byte stream on the DSP (827 of 1 810 MB,
+46 %), it halves, the GEMV is DDR-bound (§3.1: 25 µs of compute against
+340 µs of DMA per LFM call), and the kernel and the feed-by-`bits`
+plumbing exist — what is missing is a format field and a column branch.
+The 50 bar is out of this plan's reach by arithmetic: ATTN_M1 13.7 +
+ROUTER 4.0 + norms 2.9 + ARM 6.5 = 27 ms of non-weight time a token caps
+the path at 37 tok/s with zero weight bytes; §3.2's floor 61 assumed 4 ms
+of remainder. The bar is S6's (kernel rates), the next 3–4 tok/s are S2's.
+
+### 8.2 The FC source format (needs-user)
+
+What the P4 accuracy flag means. Q4_0's block scale is `d = max / −8`
+(`nntr_ggml_impl_quant.cpp:402`, `fallback_internal.cpp:1245` [C]): a
+32-block holding both +s and −s stores one sign at 7s/8. For a ternary FC
+every block of a column holds both signs, so **Q4_0 is lossy for ternary
+by construction** (12.5 % on half the non-zeros), and P4's tool then
+re-quantizes those values per column — two roundings. The dummy's
++12.6 % ppl is this stack on random weights; on real weights the size is
+unknown but the mechanism is certain.
+
+| option | producer emits | sidecar | exact for ternary | CPU prefill / hybrid A | cost |
+|---|---|---|---|---|---|
+| **A** (recommended) | FCs as **`QS4CX`** in the main file: per-column int4 codes + f32 scale (`quantize_stream.cpp:471`, the `writeFc` dtype list `:386`) | a **repack**: `whPack` (bits 4) or `whPack2` + palette (bits 2 when every code ∈ {−1, 0, +1}); no quantization in the tool | yes: codes {−1, 0, +1} × s_col, identical bytes on both sides | the CPU runs `QS4CX` natively (KleidiAI qsi4cx GEMV / GEMM, `float_tensor.cpp:1136-1140`; `fc_layer.cpp:223`) — one set of values for prefill, the hybrid A and the NPU decode | writer: none (dtype exists); tool: a `QS4CX` reader; loader: the Gemma hand-over accepts a `QS4CX` FC (§8.3 S2.2); **open**: the KleidiAI prefill rate vs Q4_0's (the −5 % rule reads it) |
+| B (P4 today) | Q4_0 | re-quantized per column | no (two roundings) | Q4_0 | none; fails the +2 % ppl rule on the dummy; unbounded on real files |
+| C | Q4_0 | per-32-group scales in the WH image | no (Q4_0's 7/8 stays) | Q4_0 | a new GEMV (per-k-tile accumulator drain — doc 54 rejected `acc_read`; or f32 accumulation off `vrmpyacc`), image +6 % (K/32 × N f16 scales), a new `fc_wh_det.h` spec + mutant, no HMX form for the LFM prefill half (one scale per column in the HMX epilogue); and for ternary it buys nothing a per-column scale does not already hold |
+
+**Recommend A.** Fallback A′ if the KleidiAI prefill fails the −5 % rule:
+Q4_0 main file + the sidecar written **from the source** (P3's
+`--fc_wh_sidecar` path) — one rounding each side, prefill and decode on
+different FC values, the hybrid A lossy at 7/8; still better than B.
+
+**Producer spec to forward (option A).** Either (A1) hand us the source
+tensors (bf16 / f32 of `ternary × scale`, or the ternary codes + per-column
+scale) as safetensors and `nntr_quantize_stream --fc_dtype QS4CX
+--moe_dtype QS2CX_WH --fc_wh_sidecar` writes both files; or (A2) emit the
+`.bin` directly, in `writeGemma4Moe` order (`quantize_stream.cpp:1301-1352`
+[C]): `embedding0`; per layer `layer<i>_attention_norm`, `_wq`, `_q_norm`,
+`_wk`, `_k_norm`, `_wv` (sliding layers only — full layers have
+`attention_k_eq_v`), `_attention_out`, `_post_attention_norm`,
+`_pre_ffn_norm`, `_ffn_gate`, `_ffn_up`, `_ffn_down`, `_post_ffn_norm_1`,
+`_pre_ffn_norm_2`, `_sparse_moe router`, `router_scale`, then the experts
+as today. Each FC `[K × N]` (K = input width) as `QS4CX`: `N` rows of
+`K / 2` bytes of int4 codes (two per byte, low nibble first, value − 8 …
+i.e. the `layer_devel.h` QS4CX save layout), then `N` f32 per-column
+scales; ternary → codes {−1, 0, +1} exactly, scale = the checkpoint's
+column scale. The tied head stays the embedding's dtype (Q4_0 or, if the
+head is ternary, the same `QS4CX` — then lever 2b opens). Experts unchanged
+(`QS2CX_WH`, PR #251's repack). The 2-bit sidecar image is ours to derive;
+the producer never writes 2-bit FCs (no CPU kernel: `float_tensor.cpp:775`).
+
+### 8.3 Steps (option A)
+
+Each ends in a rung of `.claude/skills/hexagon-gates`; the IDL does not
+change (`weight_register_u2i4_arena` exists, `nntr_hvx.idl:1055`
+[htp_decode]), so no stub regeneration; rung 2 for the DSP sources.
+
+* **S2.0 — needs-user.** The §8.2 decision and the producer spec
+  forwarded; whether the tied head is ternary. Gate: the #229 comment;
+  contract §12 row.
+* **S2.1 — sidecar v2 + writers (host, no DSP).** `htp_wh_layout.h`:
+  `FCWH_VERSION 2`, `FCWH_FORMAT "QSxCX_WH/2"`, `FcWhEntry.bits` (the
+  static_assert moves with it; v1 files refused by the version check,
+  `htp_compute_ops.cpp:2951` — one format per tree, rule 3). Image at
+  bits 2 = the `QS2CX_WH` tensor layout `[K·N/4 codes][4 palette][N f32
+  scale][N f32 colsum]` (`qs4cx_tensor.h:325`). `nntr_quantize_stream
+  --fc_wh_sidecar` picks bits 2 per tensor when its per-column codes are
+  all in {−1, 0, +1} (palette {−1, 0, 1, 0}), else 4; LFM's FCs are not
+  ternary, so its sidecar stays bits 4 and its lines read as before.
+  `tools/htp/fc_wh_sidecar_from_q4.py` gains the `QS4CX` main-file reader
+  (repack, same bits rule); its Q4_0 mode stays for the dummy, marked
+  lossy in its banner. Fixtures: `gemma64x` (int4-exact FCs, the FC SNR
+  gate) plus a ternary twin `gemma64t` (codes clamped to {−1, 0, +1} at
+  f32 generation, so Q4_0, `QS4CX` and both sidecar widths hold the same
+  values). Gate rung 1: `FcWhSidecarMatchesWhQuantize` extended (`*Lfm2Moe*`
+  still 7 / 7 + the Gemma count), a host check `whPack2 + expand ==
+  whPack` on every image (`expand_i2i4_host_check` reused), `E2E quant
+  fcwh-gemma64t main=same images=<n> bits2=<n> ok`.
+* **S2.2 — loader (host).** `registerFcWh` (`htp_compute_ops.cpp:5312`)
+  sizes by `bits` (`codeBytes` + `paletteBytes` + 8 N, `:5833-5840`), fills
+  `ArenaEntry.pal`, so the existing register call picks
+  `weight_register_u2i4_arena` (`:6748`); `fcwhLeft` (`:6819`) by bits;
+  the heap overflow path (`NNTR_HTP_FC_WH_HEAP=1`) expands on the host
+  and registers 4-bit (`ponytail:` doubles those bytes; the E2E chunk
+  never takes it). Gemma hand-over: `Q4Pending` (`:7012`) carries a dtype,
+  `gemma4_moe_causallm.cpp:231` admits `QS4CX` FCs, and `bindQ4m1`'s
+  non-WH branch refuses a `QS4CX` FC with no sidecar entry (no Q4M1 /
+  CPU fallback, contract §2). Gate rung 1: `E2E fwd gemma64t fcwh
+  kinds=all calls/token=1.00 attn_caches=2 q4m1_handles=1 wh_handles=<n>
+  bits2=<n>`, `GRAPH FC WH OK` / `MUTANT CAUGHT` unchanged.
+* **S2.3 — the u8i2 FC column branch (DSP).** `hexkl_mm_u8i4_fc_m1_run`
+  (`hexkl_mm_u8i4_moe.c:2792`): drop the `w->bits == 2u` refusal (`:2816`);
+  per part a 128 B LUT from `hvx_expand_i2i4_table(w->pal, …)` in the
+  scratch carve (32 × 128 B); `fc_m1_push` row and source stride halved
+  at bits 2 (the `:1120` pattern — the 2D descriptor lands packed rows);
+  `fc_m1_worker` calls `hvx_gemm_u8i2_wh_col_nopf` (fed) /
+  `hvx_gemm_u8i2_wh_col` (unfed) with the part's LUT; `col_bytes` by bits
+  so `fit` doubles. Per-part bits (q \| k \| v may mix). DENSE_FFN needs
+  no kernel change (`moe_all_2bit`, `:677`). `fc_wh_det.h` gains the 2-bit
+  twin (expand the codes, then the 4-bit spec — same int32 sums) and its
+  mutant; `moe_layer_host_check` FC WH cell at bits 2 `bitwise
+  mismatches=0` against the 4-bit image of the same codes, scoreboard
+  unchanged. Gate rung 1 (`FC WH BIT-IDENTICAL bits=2 …`, `FC WH MUTANT
+  CAUGHT`, `E2E tokens gemma64t-fcwh2==fcwh4 8/8 expected_mismatch=0`,
+  `E2E eval … bit_identical=1` 2-bit token vs 4-bit token, `E2E e3 pool
+  C=2 gemma64t-fcwh == e3 bit_identical=1`), rung 2 (skel v79 + v81,
+  `UNDEFINED SYMBOLS OK`, stub unchanged), rung 3 before the sitting.
+* **S2.4 — deferred: LM_HEAD on WH.** Opens only on a "head is ternary"
+  answer (2b, −4.6 ms); at 4 bits it is −1.0 ms for +371 MiB of arena and
+  the §8.4 bind work. Not in this sitting.
+* **S2.5 — the device sitting (unavoidable; on the real files, S5's).**
+  Handoff `docs/measurements/229-s2-fcwh2.md`, same runner shape as
+  `234-p4-run.sh`; prompt 512 if the config's `sample_input` allows, else
+  447 as P4; G 64 / 512 / 1024, cool start per G, A first, then T and F
+  alternating order across blocks; `.sitting.lock`; S1 ceiling after
+  every run; RSS + arena bytes (㉟).
+
+  | variant | what | reads |
+  |---|---|---|
+  | **A16** | hybrid on the option-A main file (`QS4CX` FCs on the CPU) | reference: tok/s, prefill, text / PPL; its prefill also against P4's A16 (126–134) — the KleidiAI question |
+  | **F16** | one PD, 4-bit sidecar repacked from the same file | P4's cell on exact weights: FC 10.65 / DENSE 5.33 must repeat; PPL vs A now meaningful (cause 1 of P4 gone) |
+  | **T16** | one PD, 2-bit sidecar | the cell |
+  | T-C | T at the largest C that loads (rule 71: start from the KV bytes) | misses a token, ms a miss |
+
+  Gates: T16 tokens == F16 over the whole run and `NNTR_HTP_DUMP` logits
+  rms(T − F) = 0 (same codes, same int32 sums — the plan's bit-identity
+  gate, now between two NPU runs); F16 / T16 vs A16 by the plan 130 §3.5
+  policy **and** decode PPL ≤ 1.02 × A (the per-token-entry rule P4 waived
+  on the dummy, applied here); prefill of F / T ≥ 0.95 × A16 same sitting;
+  speed: **T16 ≥ 17.5 tok/s at G 512** (70 % of lever 1's −8.0 ms on
+  15.89) and FC ≤ 6.0 ms, DENSE_FFN ≤ 3.0 ms with every other kind inside
+  noise (the §5.18 signature); the WH chunk ≈ 420 MiB (`fcwhLeft`). On
+  the dummy only a speed pre-read is possible (a 2-bit sidecar clamped
+  from the 4-bit one's codes; no tokens / PPL column), if the files are
+  late.
+
+### 8.4 Risks
+
+* **VTCM at M = 1, 2-bit FC**: none new. `fc_m1_worker` double-buffers
+  `k_tiles × 256 B` columns per lane (K 2 816: 22.5 KB a column tile,
+  `per_lane` ≈ 0.97 MiB → `fit` 21 instead of 10); the LUT is one HVX
+  register from a 128 B scratch table; nothing is expanded in VTCM. The
+  exposed first block of each lane (`FC_M1_BLOCKS` 4) halves with the bytes.
+* **LM_HEAD at 262 144 rows** (if S2.4 opens): `fcSliceCols(2816)` = 1 472
+  cols → 179 parts against `HTP_GRAPH_MAX_PARTS` / `HEXKL_FC_M1_MAX_PARTS`
+  32 (`htp_graph_desc.h:62`, `hexkl_mm_u8i4_moe.h:269`) — the head needs an
+  8 192-col slice (11.5 MiB a handle, 32 parts exactly) and
+  `graph_op_lm_head` (`hexkl_graph.c:540`) the FC's WH branch (`:468`)
+  before its softcap / ban / argmax; plus the ARM-side Q4_0 copy or a
+  row-from-tiles lookup. Handles: 16 + 435 today; +32 − 16 with the head;
+  the pool adds 2 a slot (C 16 → 960, C 40 → 2 400); the 4 096 table
+  (`hexkl_mm_u8i4_dma.h:38`) binds at C ≈ 60, above rule 71's heap-bound
+  C 40, so not before ㉞ a lands.
+* **Arena sum vs plan 234 §3**: today pool 704 + WH chunk 832 + FC arena
+  448 = 1 984 MiB mapped; after S2 ≈ 704 + 420 + 448 = 1 572 (head still
+  attached Q4M1); with S2.4 at 4 bits ≈ 704 + 420 + 371 = 1 495 but +371
+  of RSS. The ceiling 3 840 is not what binds — rule 71's DSP heap (KV
+  400 + 40 MiB) is, so S2 frees address space it cannot spend on C until
+  ㉞ a.
+* **`FCWH_FORMAT` bump**: every v1 sidecar (the device's
+  `nntr_gemma4_qs2cx_wh_fcwh.bin`, the lfm25 / gemma64 fixtures' files)
+  is refused by `transformer.cpp:591`; the fixtures are regenerated by
+  `run_inproc_e2e.sh` itself, the device file by the handoff's recipe;
+  md5s on both ends, one tree per sitting (rule 3). A skel older than S2.3
+  refuses a 2-bit FC handle with `AEE_EBADITEM` at the first token — the
+  stale-skel symptom to name in the handoff (rule 67).
+* **The CPU `QS4CX` prefill rate** is unmeasured against Q4_0 (rule 46:
+  51–63 GB/s on Q4_0); the −5 % rule in S2.5 is where it shows; fallback
+  A′ (§8.2).
+* **Cause 2 of P4 stays**: the WH GEMV's u8 per-row activation (sliding
+  q / k at 9.5 dB on a peaked softmax, `run_inproc_e2e.sh:451-458`). S2
+  does not touch it; the real-file PPL column is where it is read, and a
+  failure there is its own issue (the FC's own `_det` spec, not a format).
+* **Host vs device**: the host proves bytes and the schedule, the ISS
+  (§4 S3) compute cycles; the 52 GB/s and the −8.0 ms are the sitting's
+  to confirm, same-sitting A / F / T, cool start per G, rule 52's band.
+
+### 8.5 Docs to update
+
+* **BENCHMARK.md** Gemma block: the §8.1 lever table (computed, marked
+  until S2.5), then A16 / F16 / T16 / T-C rows with RSS, arena, WH chunk.
+* **LEDGER.md**: rule candidates — "the one-PD WH FC read rate on the
+  S25 is ≈ 52 GB/s, the Q4M1 head's 50.8: a format move buys bytes, not
+  rate" [M-P4]; "Q4_0 is lossy for ternary by `d = max / −8`; a ternary
+  FC's CPU format is `QS4CX`"; ㉞ a re-pointed as a C lever (rule 71), ≤
+  1.7 ms at G 1024; the S0 answer row; plan 234 §3's arena sum re-stated
+  as §8.4's.
+* **Plan 234**: P4's "S2 lands after P4" bullet → this section; the
+  `registerFcWh` / `fc_m1_run` `ponytail:` lines retire with S2.2 / S2.3.
+* **Contract `0001` §12**: the user's §8.2 answer, dated.
