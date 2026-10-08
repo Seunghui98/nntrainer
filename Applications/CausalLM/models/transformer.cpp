@@ -470,14 +470,13 @@ void Transformer::repack_weight() {
           else if (ends_with(":down"))
             down_p = &w->getVariableRef();
         }
-        // A CPU-engine dense_ffn reads QS4CX through the KleidiAI pack, as
-        // the FC branch below does; on an engine the pack is never read.
-        if (!context.getComputeOps())
-          for (auto *p : {up_p, gate_p, down_p})
-            if (p &&
-                p->getDataType() == ml::train::TensorDim::DataType::QS4CX &&
-                !p->isVirtual())
-              p->pack();
+        // A CPU-engine dense_ffn reads QS4CX through the KleidiAI pack, so
+        // pack as the FC branch below does (a CPU layer has ComputeOps too,
+        // so the engine cannot be told from them here).
+        for (auto *p : {up_p, gate_p, down_p})
+          if (p && p->getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+              !p->isVirtual())
+            p->pack();
         if (up_p && gate_p && down_p && context.getComputeOps()) {
           auto &up = *up_p;
           auto &gate = *gate_p;
