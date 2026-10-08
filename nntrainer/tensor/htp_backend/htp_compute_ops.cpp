@@ -1371,8 +1371,18 @@ public:
       std::vector<OutSlice> rows = slices;
       for (OutSlice &o : rows)
         o.dst += static_cast<size_t>(m0) * o.stride;
-      norms.rope_cs =
-        rope_hd ? rope_cs + static_cast<size_t>(m0) * 2 * rope_hd : nullptr;
+      // The table rows through ION like the activation: a plain host
+      // pointer is pinned and mapped by the driver every call (~155 MB/s,
+      // doc 34 section 4 item F), 1-2 MB a prefill layer here.
+      norms.rope_cs = nullptr;
+      if (rope_hd) {
+        const size_t bytes =
+          static_cast<size_t>(m) * 2 * rope_hd * sizeof(float);
+        float *cs = reinterpret_cast<float *>(stage(rope_pool_, bytes).data());
+        stagedMemcpy(cs, rope_cs + static_cast<size_t>(m0) * 2 * rope_hd,
+                     bytes);
+        norms.rope_cs = cs;
+      }
       invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
                   matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
                   K, nullptr, nullptr, &norms, &rows);
@@ -1417,11 +1427,22 @@ public:
   }
 
   // The router logits (see the base declaration): the rows through the
-  // act pool, the logits through the out pool, gamma and the gate weight
-  // as plain host pointers. ponytail: the K x E f32 weight (1.4 MB at
-  // 2816 x 128) crosses with every call -- one prefill call a layer; a
-  // registered copy is the upgrade if the transport shows in a profile.
+  // act pool, the logits through the out pool, gamma as a plain host
+  // pointer, and the K x E f32 gate weight (1.4 MB at 2816 x 128) from an
+  // ION copy made on its first call and kept by the weight's address --
+  // as a plain pointer it was pinned and mapped every call (doc 57
+  // section 9.10: 9.7 ms a call against the CPU dot's 6).
   bool supports_router_logits_fp32() const override { return true; }
+
+  const float *routerWeightShared(const float *w, size_t bytes) {
+    auto it = router_w_.find(w);
+    if (it == router_w_.end()) {
+      auto buf = std::make_unique<HtpRpcBuffer>(bytes);
+      std::memcpy(buf->data(), w, bytes);
+      it = router_w_.emplace(w, std::move(buf)).first;
+    }
+    return reinterpret_cast<const float *>(it->second->data());
+  }
 
   void router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
                           const float *x, const float *gamma, float eps,
@@ -1438,12 +1459,14 @@ public:
     float *out = reinterpret_cast<float *>(
       stage(out_pool_, out_len * sizeof(float)).data());
     stagedMemcpy(act, x, x_len * sizeof(float));
+    const float *w_shared =
+      routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
     const uint64_t t0 = HtpProfile::nowUs();
     // the selection is small (M x 13 + M x 8 at the softmax router's
     // width) and goes straight to the caller's arrays
     static_assert(sizeof(unsigned int) == sizeof(uint32_t), "sel is u32");
     const int err = nntr_hvx_router_logits_f32(
-      session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w,
+      session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w_shared,
       static_cast<int>(static_cast<size_t>(K) * E), act,
       static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
       top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
@@ -1507,6 +1530,16 @@ public:
     if (profile.level())
       profile.addInvoke(1, K, N, elapsed, nullptr);
     return true;
+  }
+
+  bool lm_head_q4_0_prepare(const void *w, unsigned int K,
+                            unsigned int N) override {
+    if (w == nullptr || K == 0 || K % 64 != 0 || K > 8192 || N == 0 ||
+        N % 32 != 0)
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    return lmHeadHandles(w, session, K, N) != nullptr;
   }
 
   /** @brief The lm_head weight's Q4M1 slice handles, placed on first use;
@@ -6373,6 +6406,9 @@ private:
                                      true answers: CPU FC calls skipped */
   StagingPool act_pool_;
   StagingPool out_pool_;
+  StagingPool rope_pool_; /**< the fused projection call's RoPE rows */
+  /** @brief ION copies of the MoE routers' gate weights, by address. */
+  std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
       unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
