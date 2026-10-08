@@ -16,7 +16,7 @@ OUT=$1; CELL=$2; shift 2
 ENVS="$*"
 TAG=${TAG:-}
 SER=R3CY205ZMND
-D=/data/local/tmp/nntrainer/causallm/s260p
+D=${BIN:-/data/local/tmp/nntrainer/causallm/s260p}
 C=/data/local/tmp/nntrainer/s260cfg/$CELL
 mkdir -p "$OUT"
 LOG="$OUT/$CELL${TAG:+.$TAG}.log"
@@ -43,4 +43,4 @@ done
   echo "== logcat (mha_core / HTP)"
   A logcat -d | grep -aE 'mha_core|HTP|hexkl|nntr_hvx' | tail -200
 } > "$LOG" 2>&1
-grep -aE 'prefill:|generation:|peak memory|Maximum resident|RC=' "$LOG"
+grep -aE "prefill:|generation:|peak memory|nll|ppl|RC=" "$LOG"
