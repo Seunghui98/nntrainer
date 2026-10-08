@@ -609,3 +609,22 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 - `NNTR_HTP_DSPQ=0`은 dspq 큐(decode MoE의 M==1 호출)만 FastRPC로 돌린다. prefill에는 영향 없음.
 
 사다리: `skip_prefill: false`, fp16 attention, seq 2048, 생성 16, MoE htp 고정. acc_0 전부 htp, acc_1 attention cpu, acc_2 +lm_head, acc_3 +dense, acc_4 +attn_proj, acc_5 = acc_0 + `NNTR_HTP_DSPQ=0`. 판정: PPL이 정상이고 첫 토큰이 말이 되는데 이후가 깨지면 decode 경로. 결과는 아래에 이어 적는다.
+
+### 9.20 사다리 결과: decode가 아니라 prefill이 깨져 있다 (2026-10-08, 2e3eadd1 빌드, 사용자 실행)
+
+조건: §9.19 사다리(`skip_prefill: false`, fp16 attention, seq 2048, 1024토큰 Ardley prompt, 생성 16, `NNTR_PPL=1`, MoE htp).
+
+| 실행 | cpu로 둔 엔진 | prompt nll/token | 첫 토큰 | 생성 |
+|---|---|---|---|---|
+| acc_0 | 없음 | 12.33 (ppl 225,406) | `<pad>` | ` a is a a a A A/A Is …` |
+| acc_1 | attention | 12.16 | `<pad>` | ` aI dod yes a is a …` |
+| acc_2 | +lm_head | **nan** | `<unused6226>` | ` США USA.A A A …` |
+| acc_3, acc_4 | +dense | — | — | `FATAL ERROR: pack before run model` |
+
+- nll 12.33은 vocab 262,144의 균등분포(ln = 12.48)에 가깝다 → **prefill 로짓이 이미 무작위다.** §9.19의 decode 가설은 틀렸다.
+- CPU lm_head가 nan → lm_head 앞 hidden에 NaN이 있다. NPU lm_head는 같은 입력에서 유한한 값을 내서 균등분포처럼 보였던 것으로 본다(기기 미측정).
+- attention을 cpu로 두어도 그대로 → attention 아님.
+- 같은 오프라인 QS4CX bin으로 전부-NPU nll 4.510(55 §10.15, 446토큰)이 있었으므로 bin이 아니라 그 뒤 57의 fold 커밋들(norm·epilogue·router·RoPE·lm_head를 호출 안으로, §9.10 수정) 쪽 회귀다. §9.9의 첫 전부-NPU 실행부터 출력이 깨져 있었다.
+- acc_3/4의 죽음: load walk의 `dense_ffn` 분기가 QS4CX pack 없이 return. c9fcb134에서 CPU engine일 때만 pack.
+
+다음(기기 비교만, x86 host 결과는 기기 NEON·KleidiAI 경로와 달라 근거로 쓰지 않는다): `NNTR_ACT_STATS=1`(b62c3ec9)로 acc_0(전부 NPU)과 acc_4(MoE만 NPU, 나머지 기기 CPU NEON)를 같은 prompt로 돌려 노드별 nan·rms를 맞대고, 처음 갈라지는 노드를 찾는다.
