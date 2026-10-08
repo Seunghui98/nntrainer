@@ -26,8 +26,8 @@
 # the index must be byte-identical, and each image's dequantized weight is
 # compared by SNR (two quantizations of one weight, printed). This is the
 # tool's runnable check.
-# Prints the two nntr_config.json keys to add (fc_wh_file_name,
-# fc_wh_format); it does not edit the model's config.
+# The worker prints the two nntr_config.json keys to add (fc_wh_file_name,
+# fc_wh_format, the build's FCWH_FORMAT); the model's config is not edited.
 #
 # ponytail: text-only Gemma 4 MoE (writeGemma4Moe's order, tied head, no
 # per-layer input), ARM Q4_0 FCs, QS4CX_WH / QS2CX_WH experts. Anything else
@@ -132,11 +132,7 @@ def main():
                         "-L", a.lib, "-lnntrainer", "-Wl,-rpath," + os.path.abspath(a.lib)],
                        check=True)
         cmd = [exe, main_bin, tab, a.output] + ([a.check] if a.check else [])
-        rc = subprocess.run(cmd).returncode
-    if rc == 0:
-        print(f'nntr_config.json: "fc_wh_file_name": "{os.path.basename(a.output)}", '
-              f'"fc_wh_format": "QS4CX_WH/1"')
-    return rc
+        return subprocess.run(cmd).returncode
 
 
 if __name__ == "__main__":

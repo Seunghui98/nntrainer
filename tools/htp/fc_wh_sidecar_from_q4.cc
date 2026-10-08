@@ -58,6 +58,10 @@ int main(int argc, char **argv) {
   std::vector<Row> rows;
   for (Row r; tab >> r.name >> r.off >> r.K >> r.N;)
     rows.push_back(r);
+  if (!main_f || rows.empty()) {
+    std::fprintf(stderr, "cannot read %s, or no row in %s\n", argv[1], argv[2]);
+    return 1;
+  }
   const uint32_t count = static_cast<uint32_t>(rows.size());
   std::vector<nntrainer::FcWhEntry> idx(count);
   std::ofstream out(argv[3], std::ios::binary | std::ios::trunc);
@@ -124,8 +128,11 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "cannot write %s\n", argv[3]);
     return 1;
   }
-  std::printf("fc wh sidecar: %s images=%u bytes=%llu keys_unique=1\n", argv[3],
-              count, static_cast<unsigned long long>(at));
+  std::printf("fc wh sidecar: %s images=%u bytes=%llu keys_unique=1\n"
+              "nntr_config.json: \"fc_wh_file_name\": \"<its file name>\", "
+              "\"fc_wh_format\": \"%s\"\n",
+              argv[3], count, static_cast<unsigned long long>(at),
+              nntrainer::FCWH_FORMAT);
   if (argc == 4)
     return 0;
 
