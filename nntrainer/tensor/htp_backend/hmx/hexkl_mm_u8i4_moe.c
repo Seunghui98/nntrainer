@@ -49,6 +49,7 @@
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
 #include "hexkl_dma_trace.h"
+#include "hexkl_hmx_mm.h"
 #include "hexkl_micro.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
@@ -1623,6 +1624,15 @@ int hexkl_mm_u8i4_moe_layer_run(
    * epilogue is submitted. gate_up[e+1] and the next activation block go
    * out as before, once GU(n) has freed their slots, and arrive under
    * DN(n-1). */
+  /* The multiplies inline (hexkl_hmx_mm.h): the library call wraps one
+     packet in ~50 cycles for ~9 of array time, and this loop issues ~760 k
+     of them a 1024-row prefill call. The layout puts every activation tile
+     at a multiple of 2048 and every weight tile at a multiple of 512 from
+     these four region starts, so one check covers them all; a layout that
+     ever misses keeps the library call. */
+  const int hmx_inline =
+    hexkl_hmx_mm_aligned(vtcm_base + L.act_off, vtcm_base + L.w_gu_off) &&
+    hexkl_hmx_mm_aligned(vtcm_base + L.mid_off, vtcm_base + L.w_dn_off);
   moe_blk blk, pblk;
   moe_blk_set(&blk, 0u, 0u, order, row_count, slot_of);
   /* The first expert's first activation block. Queued behind its gate_up
@@ -1716,12 +1726,23 @@ int hexkl_mm_u8i4_moe_layer_run(
           const uint32_t col =
             (j < np) ? (g0 + j) : (inter_ntiles + g0 + (j - np));
           hexkl_micro_hmx_acc_clear_int32();
-          for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-            rc = hexkl_micro_hmx_mm_u8i4(
-              vtcm_base, L.act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
-              L.w_gu_off + (kt * gu_ntiles + col) * WEIGHT_TILE_BYTES_U8I4);
-            if (rc != AEE_SUCCESS) {
-              goto out;
+          if (hmx_inline) {
+            const uint8_t *a = vtcm_base + L.act_off;
+            const uint8_t *w =
+              vtcm_base + L.w_gu_off + (size_t)col * WEIGHT_TILE_BYTES_U8I4;
+            for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+              hexkl_hmx_mm_u8i4(a, w);
+              a += HEXKL_HMX_ACTIVATION_ALIGNMENT;
+              w += (size_t)gu_ntiles * WEIGHT_TILE_BYTES_U8I4;
+            }
+          } else {
+            for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+              rc = hexkl_micro_hmx_mm_u8i4(
+                vtcm_base, L.act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
+                L.w_gu_off + (kt * gu_ntiles + col) * WEIGHT_TILE_BYTES_U8I4);
+              if (rc != AEE_SUCCESS) {
+                goto out;
+              }
             }
           }
           HEXKL_PROBE_T0(p0);
@@ -1856,13 +1877,26 @@ int hexkl_mm_u8i4_moe_layer_run(
         HEXKL_MOE_MM_BEGIN();
         for (uint32_t j = 0; j < nb; ++j) {
           hexkl_micro_hmx_acc_clear_int32();
-          for (uint32_t kt = 0; kt < inter_ktiles; ++kt) {
-            rc = hexkl_micro_hmx_mm_u8i4(
-              vtcm_base,
-              L.mid_off + pp * mid_bytes + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
-              L.w_dn_off + (kt * dn_ntiles + nt0 + j) * WEIGHT_TILE_BYTES_U8I4);
-            if (rc != AEE_SUCCESS) {
-              goto out;
+          if (hmx_inline) {
+            const uint8_t *a = vtcm_base + L.mid_off + pp * mid_bytes;
+            const uint8_t *w = vtcm_base + L.w_dn_off +
+                               (size_t)(nt0 + j) * WEIGHT_TILE_BYTES_U8I4;
+            for (uint32_t kt = 0; kt < inter_ktiles; ++kt) {
+              hexkl_hmx_mm_u8i4(a, w);
+              a += HEXKL_HMX_ACTIVATION_ALIGNMENT;
+              w += (size_t)dn_ntiles * WEIGHT_TILE_BYTES_U8I4;
+            }
+          } else {
+            for (uint32_t kt = 0; kt < inter_ktiles; ++kt) {
+              rc = hexkl_micro_hmx_mm_u8i4(
+                vtcm_base,
+                L.mid_off + pp * mid_bytes +
+                  kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
+                L.w_dn_off +
+                  (kt * dn_ntiles + nt0 + j) * WEIGHT_TILE_BYTES_U8I4);
+              if (rc != AEE_SUCCESS) {
+                goto out;
+              }
             }
           }
           HEXKL_PROBE_T0(p0);

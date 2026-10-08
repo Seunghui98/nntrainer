@@ -20,6 +20,7 @@
 
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
+#include "hexkl_hmx_mm.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_opts.h"
 #include "hvx_dequant_i32.h"
@@ -36,6 +37,21 @@
  *         by inspection. If HexKL ever exposes it from hexkl_micro.h, both
  *         files should switch to that instead of this comment. */
 #define WEIGHT_TILE_BYTES_U8I4 512u
+
+/** @brief One u8 x i4 tile multiply, the packet inline (hexkl_hmx_mm.h):
+ *  the library call wraps it in ~50 cycles for ~9 of array time (PR 4343,
+ *  a63aeac6), and a 1024-row qkv call issues hundreds of thousands. The two
+ *  alignment tests the library makes stay, here as two ANDs; a tile that
+ *  fails them takes the library call and its error code. */
+static inline int mm_u8i4_tile(uint8_t *vtcm_base, uint32_t act_off,
+                               uint32_t w_off) {
+  const uint8_t *a = vtcm_base + act_off, *w = vtcm_base + w_off;
+  if (hexkl_hmx_mm_aligned(a, w)) {
+    hexkl_hmx_mm_u8i4(a, w);
+    return AEE_SUCCESS;
+  }
+  return hexkl_micro_hmx_mm_u8i4(vtcm_base, act_off, w_off);
+}
 /** @brief Bytes in one int32 accumulator tile (64x32 values). */
 #define ACC_TILE_BYTES 8192u
 /** @brief Largest single DMA row HexKL/HVX will move correctly; rows above
@@ -604,7 +620,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               act_off + (rb * k_tiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
             const uint32_t w_tile_off =
               wcur + (kt * nt_n + nt0 + j) * WEIGHT_TILE_BYTES_U8I4;
-            rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+            rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
             if (rc != AEE_SUCCESS) {
               goto out;
             }
@@ -860,7 +876,7 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           act1_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
         const uint32_t w_tile_off =
           w1_off + (kt * n1_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
@@ -920,7 +936,7 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           act2_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
         const uint32_t w_tile_off =
           w2_off + (kt * n2_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
@@ -1108,7 +1124,7 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
           act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
         const uint32_t w_tile_off =
           w_off + (kt * n1_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
