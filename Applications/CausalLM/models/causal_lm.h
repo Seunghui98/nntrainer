@@ -223,6 +223,10 @@ protected:
    */
   virtual void allocateAndBindKVCache();
 
+  /** @brief Points kv_cache at the attention engine's shared memory
+   *  (rpcmem on the HTP); call before kv_cache.allocate(). */
+  void installKVCacheSharedAllocator();
+
   /**
    * @brief Reset all mha_core layers' cache_index to @p pos and the
    *        KVCacheManager's tracked write position.

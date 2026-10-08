@@ -142,6 +142,34 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   global_token_len = 0;
 }
 
+// With the attention layers on an accelerator, put the cache in memory
+// that accelerator reads in place (ComputeOps::alloc_shared; rpcmem on
+// the HTP), so no call copies the used cache range. A backend without
+// shared memory returns nullptr from alloc_shared and the manager
+// keeps the heap; a missing or unusable engine is reported and the
+// model runs as before. Every allocateAndBindKVCache override calls
+// this before kv_cache.allocate(): Gemma4's did not, and FastRPC copied
+// its K/V every attention call (doc 57 section 9.10).
+void CausalLM::installKVCacheSharedAllocator() {
+  if (ATTENTION_ENGINE.empty())
+    return;
+  try {
+    auto *ctx =
+      nntrainer::Engine::Global().getRegisteredContext(ATTENTION_ENGINE);
+    auto data = ctx ? ctx->getContextData() : nullptr;
+    nntrainer::ComputeOps *ops = data ? data->getComputeOps() : nullptr;
+    if (ops) {
+      kv_cache.setSharedAllocator(
+        [ops](size_t bytes) { return ops->alloc_shared(bytes); },
+        [ops](void *block) { ops->free_shared(block); });
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "KV cache stays in host memory: attention_engine '"
+              << ATTENTION_ENGINE << "' unavailable (" << e.what() << ")"
+              << std::endl;
+  }
+}
+
 void CausalLM::allocateAndBindKVCache() {
   if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's cache placeholders so external cache storage
@@ -154,30 +182,7 @@ void CausalLM::allocateAndBindKVCache() {
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
 
-    // With the attention layers on an accelerator, put the cache in memory
-    // that accelerator reads in place (ComputeOps::alloc_shared; rpcmem on
-    // the HTP), so no call copies the used cache range. A backend without
-    // shared memory returns nullptr from alloc_shared and the manager
-    // keeps the heap; a missing or unusable engine is reported and the
-    // model runs as before.
-    if (!ATTENTION_ENGINE.empty()) {
-      try {
-        auto *ctx =
-          nntrainer::Engine::Global().getRegisteredContext(ATTENTION_ENGINE);
-        auto data = ctx ? ctx->getContextData() : nullptr;
-        nntrainer::ComputeOps *ops = data ? data->getComputeOps() : nullptr;
-        if (ops) {
-          kv_cache.setSharedAllocator(
-            [ops](size_t bytes) { return ops->alloc_shared(bytes); },
-            [ops](void *block) { ops->free_shared(block); });
-        }
-      } catch (const std::exception &e) {
-        std::cerr << "KV cache stays in host memory: attention_engine '"
-                  << ATTENTION_ENGINE << "' unavailable (" << e.what() << ")"
-                  << std::endl;
-      }
-    }
-
+    installKVCacheSharedAllocator();
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       max_timestep,
                       static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),

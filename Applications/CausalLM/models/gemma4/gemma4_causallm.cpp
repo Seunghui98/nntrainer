@@ -966,6 +966,7 @@ void Gemma4CausalLM::allocateAndBindKVCache() {
       kv_widths.push_back(getKVCacheWidth(i));
     }
 
+    installKVCacheSharedAllocator();
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
                       cache_dtype);
