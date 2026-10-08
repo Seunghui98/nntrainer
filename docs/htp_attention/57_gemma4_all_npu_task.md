@@ -562,3 +562,120 @@ nntrainer/nntrainer#4343(haehun, `htp/quant-dequant-hvx-opt`)에서 이 브랜�
 - attention 트레이스(한 층, 1023행): `kv_write_us≈500`, `accel_call_us 52–55 ms`, DSP 쪽 `wall_us 41–43 ms`(dsp 33 ms). 즉 **호출 wrapper 안에서 11–13 ms, by-op 노드(§9.13 91 ms)까지 다시 ~36 ms**가 host에 있다. 코드로 원인이 잡혔다: Android fp16 빌드에서 `MHACoreLayer::incremental_forwarding`이 f32 query 스텝을 **fp16 Q/K/V/O 텐서 4개로 새로 할당·변환**한 뒤 `one_batch_incremental_forwarding`에 넘기고, 가속 경로(`AccelF32Io`)는 그 fp16 Q를 **다시 스칼라 루프로 f32**로 풀어 DSP에 보내고, 출력은 f32→fp16(`io.commit`)→f32(`output_step.copyData`)로 두 번 더 변환한다. 1023행이면 Q 4.2M·K/V 2.1M·out 4.2M 원소를 다섯 번 변환하고 25 MB를 매 층 새로 page-fault한다.
 - 고침(커밋 아래): 가속 경로가 켜져 있으면(`compute_ops_ && is_causal && (supports_sdpa_fp16_kvcache || kv_cache_quant 준비)`) fp16 스테이징을 건너뛰고 f32 스텝 텐서를 그대로 넘긴다. KV cache 쓰기는 `HalfTensor::copyData`가 f32→fp16을 NEON으로 하므로 그대로, Q·out은 포인터 직결. 기대: 층당 ~36+11 ms → 수 ms, prefill **−1.0~−1.3 s** (기기 미측정). 가속 호출이 실패하면 non-Android 빌드가 늘 쓰던 f32 query CPU 경로로 떨어진다.
 - 다음 측정: (A) 같은 설정으로 by-op의 attention 노드와 `accel_call_us`가 DSP `wall_us`에 붙는지; (B) §9.15의 `attention_kv_dtype: q8`로 DSP 41 → ~18–25 ms가 되는지와 nll.
+
+### 9.17 int8 row-blocked attention 기기 결과와 주변 비용 제거 (2026-10-08, 1024 token, all-NPU)
+
+PR 4343 커널(`attention_kv_dtype: q8`, §9.15)을 켠 세 번의 실행. 모두 1024 token, 엔진 5개 htp, `max_seq_len 1088`(int8 KV cache가 DSP heap에 들어가도록).
+
+| 실행 | attention 호출(`accel_call_us`, sliding 층) | prefill |
+|---|---|---|
+| fp16 (§9.16 스테이징 우회 후) | 52–55 ms → 노드 56.7 ms | 5,120 ms |
+| int8, PR 그대로 | 40–45 ms → 노드 44.3 ms | 5,605 ms(프로파일 빌드) / 4,967 ms |
+| int8 + 트레이스 분해 (6c559ff7) | 28–36 ms | 4,967 ms |
+| int8 + Q·out ION (0583c9eb) + NEON 보정 (2e3eadd1) | **17–18 ms** (첫 층 28: ION 풀 첫 할당) | **4,864 ms** |
+
+분해(한 sliding 층, 1024행, 마지막 실행): host 보정 0.6 ms(스칼라 때 6.7–7.4) · FastRPC 전송 2.5 ms(`wall 14.0 − total 11.4`; ION 전엔 7–12.6) · DSP append 6.7 ms(quant 5.7 + bake 1.0; K/V 1024행 int8 양자화를 HMX 스레드 혼자) · **DSP 커널 4.65 ms**(qk 1.75, softmax 1.86, pv 1.15, wait 0.1) · Q/out memcpy ≈4 ms(`arm staging memcpy` 458 → 583 ms, +1,155 MB) · kv_write 0.55. PR 실측 18.4 ms/층(v81)과 같은 자리.
+
+- 생성 문장은 fp16·int8 모두 `■s a, a/A/AA/A/A/`로 글자까지 같다 → attention 밖 엔진이 깨뜨린다. 가르기(PPL) 결과 아직 없음.
+- MoE 행 `K=2816 N=2816 M>1`은 §9.13의 41.5 ms/call이 router 블로킹(4e903b97) 이후 네 번 연속 49–51 ms(+290 ms). 원인 미확인(기기 미측정 가설: 열, 또는 router가 빨라져 MoE 호출이 prefetch reader의 flash burst와 더 겹침). 프로파일 2단계가 융합 MoE 호출의 DSP 단계를 못 주니 `mm_u8i4_moe_layer_norm`의 timed 변형이 먼저다.
+- 실행 간 노이즈 ±3–5%(MoE 행 1,526–1,576, FC 행 ±10%) → 100 ms 단위 비교는 냉각 후 3회가 필요.
+
+**남은 prefill 4.86 s의 구성(마지막 실행, 산술)과 다음 항목** — flash 바닥 3.4 s(C=16)까지 1.46 s:
+
+| # | 항목 | 지금 | 기대 | 방법 |
+|---|---|---|---|---|
+| 0 | 출력 깨짐 원인 엔진 | — | 정확도 게이트 | 엔진 하나씩 cpu로 돌려 nll 비교 |
+| 1 | MoE 호출 회귀 | 50.8 ms/층 (1,576) | 41.5 (−0.29 s) | timed 변형으로 DSP 단계(gather·requant·mm·swiglu·scatter) 보기, 4e903b97 전후 비교 |
+| 2 | 노드 간 activation 복사 | staging memcpy 583 ms(7.8 GB, 14 GB/s) | −0.4~0.5 s | 연속 NPU 노드 사이 activation을 ION에 상주(KV cache의 `setSharedAllocator`처럼), 호출 출력 버퍼를 다음 호출 입력으로 |
+| 3 | epilogue `residual_add` 2호출/층 | ≈0.46 s(9.7+5.7 ms/층) | −0.3 s | o-proj·down 호출의 post 단계로 합쳐 round trip 2개 제거 (2와 겹침) |
+| 4 | router | 8.7 ms/층 (262) | 2 ms (−0.2 s) | w(1.4 MB)를 VTCM에, 루프를 행 바깥·k 안쪽으로: 지금은 k-chunk마다 x 11.5 MB를 다시 읽음(127 MB/호출, 메모리 bound) |
+| 5 | attention append | 6.7 ms/층 (0.2 s) | −0.12 s / −0.2 s | K/V 양자화를 worker에 분산; 또는 qkv 호출 post 단계에서 K/V를 int8 마스터로 바로 써 append 자체 제거(skel) |
+| 6 | FC 효율 (qkv·dense·o) | qkv N=8192 17.9 ms/call = 2.6 TOPS | −0.3~0.5 s(불확실) | PROFILE=2 FC 분해로 quant/mm/acc/dequant worker 중 병목 확인 뒤 |
+| 7 | flash 바닥 | 3.4 s | 3.1 s | 1–6 뒤 compute < 3.4 s가 되면 C=24, 그 뒤는 읽기 속도 |
+
+decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽기 141 ms/token, 호출 85회/token.
+
+### 9.18 정확도 사다리 첫 시도와 인수인계 (2026-10-08)
+
+엔진을 하나씩 cpu로 되돌리는 사다리(사용자 실행)는 두 가지로 막혔다. (1) MoE를 CPU로 둔 실행(전부 CPU 포함)마다 기기 연결이 끊겼다(`waiting for device`, 2회). (2) 나머지 실행은 `[PPL] no positions scored`: config의 `skip_prefill: true`면 lm_head가 prefill을 건너뛰어 채점할 행이 없다. 같은 설정에서 생성 토큰은 전부 decode(M==1) 경로에서 나오므로, 출력 깨짐의 유력 가설은 decode 경로다(기기 미측정). 다음 세션용 인수인계와 다음 실험은 `58_gemma4_prefill_handoff.md`.
+
+### 9.19 P0: skip_prefill 가설의 코드 확인과 사다리 (2026-10-08, 기기 미측정)
+
+코드로 확인한 것(기기 미측정):
+
+- `causal_lm.cpp` `SKIP_PREFILL && init_len > 1` 분기: prompt N−1 토큰만 prefill하고, 마지막 prompt 토큰을 `id_list`에 그대로 넣어 생성 루프로 보낸다. 첫 생성 토큰부터 전부 decode(M==1) 호출의 로짓에서 나온다. prefill 로짓으로 고른 토큰은 하나도 없다.
+- `tie_word_embedding.cpp` `incremental_forwarding_lmhead`: `skip_prefill && from == 0`이면 조기 return → `NNTR_PPL` 채점 루프에 닿지 않는다(§9.18의 `no positions scored`). `NNTR_PPL_DECODE`도 `SKIP_PREFILL`이면 꺼진다.
+- Gemma4 lm_head는 norm·softcap이 접혀 있어(`in_norm`, softcap≠0) decode에서도 `htpDecodeLmHead`가 아닌 `head_of` → `lm_head_q4_0_fp32`(HVX Q4M1) 경로다. prefill 마지막 행과 decode 행이 같은 lm_head 함수를 탄다.
+- `NNTR_HTP_DSPQ=0`은 dspq 큐(decode MoE의 M==1 호출)만 FastRPC로 돌린다. prefill에는 영향 없음.
+
+사다리: `skip_prefill: false`, fp16 attention, seq 2048, 생성 16, MoE htp 고정. acc_0 전부 htp, acc_1 attention cpu, acc_2 +lm_head, acc_3 +dense, acc_4 +attn_proj, acc_5 = acc_0 + `NNTR_HTP_DSPQ=0`. 판정: PPL이 정상이고 첫 토큰이 말이 되는데 이후가 깨지면 decode 경로. 결과는 아래에 이어 적는다.
+
+### 9.20 사다리 결과: decode가 아니라 prefill이 깨져 있다 (2026-10-08, 2e3eadd1 빌드, 사용자 실행)
+
+조건: §9.19 사다리(`skip_prefill: false`, fp16 attention, seq 2048, 1024토큰 Ardley prompt, 생성 16, `NNTR_PPL=1`, MoE htp).
+
+| 실행 | cpu로 둔 엔진 | prompt nll/token | 첫 토큰 | 생성 |
+|---|---|---|---|---|
+| acc_0 | 없음 | 12.33 (ppl 225,406) | `<pad>` | ` a is a a a A A/A Is …` |
+| acc_1 | attention | 12.16 | `<pad>` | ` aI dod yes a is a …` |
+| acc_2 | +lm_head | **nan** | `<unused6226>` | ` США USA.A A A …` |
+| acc_3, acc_4 | +dense | — | — | `FATAL ERROR: pack before run model` |
+
+- nll 12.33은 vocab 262,144의 균등분포(ln = 12.48)에 가깝다 → **prefill 로짓이 이미 무작위다.** §9.19의 decode 가설은 틀렸다.
+- CPU lm_head가 nan → lm_head 앞 hidden에 NaN이 있다. NPU lm_head는 같은 입력에서 유한한 값을 내서 균등분포처럼 보였던 것으로 본다(기기 미측정).
+- attention을 cpu로 두어도 그대로 → attention 아님.
+- 같은 오프라인 QS4CX bin으로 전부-NPU nll 4.510(55 §10.15, 446토큰)이 있었으므로 bin이 아니라 그 뒤 57의 fold 커밋들(norm·epilogue·router·RoPE·lm_head를 호출 안으로, §9.10 수정) 쪽 회귀다. §9.9의 첫 전부-NPU 실행부터 출력이 깨져 있었다.
+- acc_3/4의 죽음: load walk의 `dense_ffn` 분기가 QS4CX pack 없이 return. c9fcb134에서 CPU engine일 때만 pack.
+
+다음(기기 비교만, x86 host 결과는 기기 NEON·KleidiAI 경로와 달라 근거로 쓰지 않는다): `NNTR_ACT_STATS=1`(b62c3ec9)로 acc_0(전부 NPU)과 acc_4(MoE만 NPU, 나머지 기기 CPU NEON)를 같은 prompt로 돌려 노드별 nan·rms를 맞대고, 처음 갈라지는 노드를 찾는다.
+
+### 9.21 P0 원인: DSP router의 qf32 누산 (2026-10-08, 기기 실측, 1024토큰, 직접 실행)
+
+- `NNTR_ACT_STATS=1`(b62c3ec9)로 노드별 첫 NaN = `layer0_sparse_moe`(입력 유한, 출력 725행 NaN).
+- MoE 안을 가르니(임시 계측, 커밋 안 함): out_norm·expert kernel 무관. **NPU router가 726행에서 softmax 확률 0 → top-k가 expert 0..7, weight NaN(0×inf).**
+- top-k 없이 받은 raw logits: 4행 블록마다 1행만 CPU와 같고 3행은 1e37·NaN(64행마다 48). 단일 스레드 skel에서도 같음 → 스레드 경합 아님. 256·7행으로 나눠 불러도 같음 → staging 버퍼 아님. 누산 초기값을 바꾸면 살아남는 행이 1→0으로 바뀜. 4e903b97 이전 kernel은 모든 행이 최대 7 차이(§9.13의 "그럴듯하지만 엉뚱한 문장"). 호스트 lane 에뮬은 M=1025에서도 둘 다 통과.
+- 수정 7eeea62e: 누산을 IEEE sf(`Q6_Vsf_vmpy`/`Q6_Vsf_vadd`)로. 기기에서 모든 행이 CPU dot과 2.3e-5 이내.
+- ~~P1(MoE 호출 +290 ms)도 같은 원인~~ → **측정으로 기각**: 수정 후에도 MoE 행 50.5 ms/call(아래).
+
+사다리(fix 후, `skip_prefill: false`, fp16 attention, seq 2048):
+
+| 실행 | cpu로 둔 엔진 | nll/token | 생성 첫 구절 |
+|---|---|---|---|
+| acc_0 | 없음 | 3.536 | "The text provides a detailed description of the small harbour town of Ardless…" |
+| acc_1 | attention | 3.491 | |
+| acc_2 | +lm_head | 3.491 | |
+| acc_3 | +dense | 3.530 | |
+| acc_4 | +attn_proj (MoE만 NPU) | 3.517 | "The text describes a small harbour town called Ardley…" |
+
+- NPU 몫 대부분은 attention(fp16) +0.045. lm_head 0, dense·attn_proj(QS4CX weight)는 NPU가 같거나 낮다 → weight 양자화 경로보다 attention 정밀도가 먼저 볼 곳(실행 간 노이즈 미측정, 1회씩).
+- 남은 주의: CausalLM 앱은 `-ffast-math`라 `std::isfinite`/`isnan` 검사가 접힌다(이번 디버깅에서 확인). 앱 쪽 NaN 검사는 비트로 해야 한다. `NNTR_ACT_STATS`는 libnntrainer(fast-math 아님)라 유효.
+
+수정 후 기기 실측(사용자 실행, e6a2022b, 1회):
+
+- acc_0 재현: nll 3.536, 같은 문장.
+- cfgB(int8 attention, seq 1088, `skip_prefill: true`): prefill **4,486 ms**(이전 4,864), decode 2.87 TPS. 출력 "The text discusses the small harbour town of Ardley, which is located at the confluence of a slow river and a cold northern sea…" → decode 경로도 정상.
+- 행별: MoE 1,567 ms(50.5/call, 이전 1,576) · router 276(9.2/call, 이전 262) · qkv 499(538) · dense 418(444) · o 190(218) · K=5632 111(157) · full qkv 122(135) · staging 541(583). −378 ms는 여러 행에 흩어져 1회로는 노이즈(±3–5%)와 못 가른다.
+
+### 9.22 MoE 회귀 가르기 1차, PR 4343 최신 3커밋 (2026-10-08, 기기 실측, 직접 실행)
+
+**MoE 호출 vs prefetch 경합** (cfgB, 생성 1, 냉각 2분, 번갈아 2회씩):
+
+| `NNTR_MOE_PREFETCH` | prefill | MoE `K=2816 N=2816 M>1` |
+|---|---|---|
+| 1 | 4,428 / 4,531 ms | 48.8 / 49.7 ms/call |
+| 0 | 11,376 / 11,482 ms | 46.2 / 46.4 ms/call |
+
+→ flash 경합 몫 ≈ 3 ms/call(≈ 90 ms/prefill). §9.13의 41.5 대비 +9 ms 중 나머지 ≈ 5–6 ms는 경합이 아니다. 다음은 융합 MoE 호출의 DSP 단계 분해(`mm_u8i4_moe_layer_norm`에 timed 변형 없음).
+
+**PR 4343 최신 3커밋 cherry-pick**: f145d8b6(9005bc9f, 16-bit P 정수 softmax), 48f04ddb(a3b066ab, a16/kv8 row-blocked), 4b08b64b(5a213bfc, u16 Q·출력, IDL 변경). 충돌: `hexkl_attn_q2.c`의 void submit(6a31ba72, PR과 `submit_job`만 다름), `htp_compute_ops.cpp`의 Q/out ION 스테이징(유지, u16으로), `mha_core.cpp`의 Q 보정(PR의 min/max 채택 → 2e3eadd1의 NEON abs-max는 Q에서 빠짐).
+
+| | 이전(e6a2022b) | PR 최신 |
+|---|---|---|
+| nll (q8, `skip_prefill: false`) | — (fp16 3.536) | **3.508** |
+| cfgB prefill | 4,428–4,531 ms | **4,796 / 4,791 ms** |
+| staging memcpy | 541 ms | 470 ms |
+| attention `accel_call` 30층 합 | ≈ 540 ms | **1,080 ms** = 보정 398 + RPC wall 421(DSP 366) + host 나머지 260 |
+| DSP kernel (sliding / full) | 4.65 ms / — | 5.1 / 8.4 ms |
+| 출력 | 정상 | 정상 ("…town of Ardley, which is located at the mouth of a slow river…") |
+
+- +300 ms는 PR이 host에 넣은 스칼라 루프 둘: Q min/max 보정(층당 11–22 ms, 첫 prefill)과 Q·출력 f32↔u16 변환(30층 ≈ 260 ms). 다음 수정 = 둘을 NEON + 스레드로(기대 −0.5 s, 기기 미측정).

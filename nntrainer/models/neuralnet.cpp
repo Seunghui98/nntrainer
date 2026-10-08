@@ -168,6 +168,58 @@ struct OpTimeTable {
 
 OpTimeTable g_op_time;
 
+/**
+ * @brief NNTR_ACT_STATS=1: after every node of the first prefill (from == 0,
+ *        to - from > 1), one stderr line per FP32 output -- NaN and Inf
+ *        counts, max |x| and rms over the rows that call wrote -- so an
+ *        all-NPU run diffed against the device's own CPU (NEON) run names
+ *        the first node whose output leaves it (doc 57 section 9.20).
+ *        Never in a tok/s run: a full read of every output.
+ */
+void actStats(LayerNode &node, unsigned int rows) {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_ACT_STATS");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  if (!on)
+    return;
+  for (unsigned int i = 0; i < node.getNumOutputs(); ++i) {
+    const Tensor &t = node.getOutput(i);
+    if (t.empty() || t.getDataType() != TensorDim::DataType::FP32)
+      continue;
+    const TensorDim &d = t.getDim();
+    const size_t n =
+      std::min<size_t>(rows, d.height()) * d.width() * d.channel();
+    const float *p = t.getData<float>();
+    // rms over the finite values and over the first row alone, so a CPU
+    // run and an accelerator run of the same prompt line up node by node
+    const size_t row = static_cast<size_t>(d.width()) * d.channel();
+    size_t nan = 0, inf = 0;
+    float mx = 0.0f;
+    double ss = 0.0, ss0 = 0.0;
+    for (size_t k = 0; k < n; ++k) {
+      const float v = p[k];
+      if (std::isnan(v)) {
+        ++nan;
+      } else if (std::isinf(v)) {
+        ++inf;
+      } else {
+        mx = std::max(mx, std::fabs(v));
+        ss += static_cast<double>(v) * v;
+        if (k < row)
+          ss0 += static_cast<double>(v) * v;
+      }
+    }
+    const size_t fin = n - nan - inf;
+    std::fprintf(stderr,
+                 "[ACT] %s out%u n=%zu nan=%zu inf=%zu maxabs=%g rms=%g "
+                 "rms_row0=%g\n",
+                 node.getName().c_str(), i, n, nan, inf, mx,
+                 fin ? std::sqrt(ss / fin) : 0.0,
+                 row ? std::sqrt(ss0 / std::min(row, n ? n : 1)) : 0.0);
+  }
+}
+
 } // namespace
 
 NeuralNetwork::NeuralNetwork() :
@@ -612,6 +664,8 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
       } else {
         model_graph.flushCacheExcept(f);
         node->incremental_forwarding(from, to, training);
+        if (from == 0 && to - from > 1)
+          actStats(*node, to - from);
       }
     } else {
       model_graph.checkLoadComplete(f);

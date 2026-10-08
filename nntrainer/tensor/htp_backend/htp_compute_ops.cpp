@@ -7489,6 +7489,8 @@ private:
   StagingPool act_pool_;
   StagingPool out_pool_;
   StagingPool rope_pool_; /**< the fused projection call's RoPE rows */
+  StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
+  StagingPool attn_out_pool_; /**< and its f32 output */
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
@@ -7707,18 +7709,19 @@ public:
   bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
                        unsigned int append_rows, unsigned int kv_stride,
                        const uint16_t *k_rows, const uint16_t *v_rows,
-                       const float *q, const float *q_scale,
+                       const uint16_t *q, const float *q_enc,
                        unsigned int q_stride, unsigned int n_q,
                        unsigned int cache_from, unsigned int cache_to,
                        unsigned int n_head_q, unsigned int n_head_kv,
-                       unsigned int head_dim, unsigned int window, float *out,
+                       unsigned int head_dim, unsigned int window,
+                       uint16_t *out, const float *out_enc,
                        unsigned int out_stride) override {
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
         head_dim > 512 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
         q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
-        !q_scale ||
+        !q || !q_enc || !out || !out_enc ||
         (append_rows != 0 &&
          (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
       return false;
@@ -7726,11 +7729,38 @@ public:
     const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
     const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
     const int rows_len = static_cast<int>(append_rows * kv_stride);
+    const int enc_len = static_cast<int>(2 * n_head_q);
     uint32_t stats[12] = {0};
+    const int64_t t0 = now_us();
+    // Q and the output through ION, as the FC path stages its rows: from
+    // plain heap FastRPC moved 2 x 16.8 MB a 1024-row layer, 7-12 ms of an
+    // 18-24 ms call around 11.5 ms on the DSP (doc 57 section 9.17). A
+    // memcpy each way here is ~1 ms (u16 since PR 4343's a16 path: half).
+    const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
+    uint16_t *q_ion =
+      reinterpret_cast<uint16_t *>(stage(attn_q_pool_, q_bytes).data());
+    uint16_t *out_ion =
+      reinterpret_cast<uint16_t *>(stage(attn_out_pool_, q_bytes).data());
+    stagedMemcpy(q_ion, q, q_bytes);
     const int err = nntr_hvx_attn_q2_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
-      rows_len, n_q, cache_from, cache_to, n_head_q, window, q, q_len, q_scale,
-      static_cast<int>(n_head_q), out, q_len, stats, 12);
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
+      q_enc, enc_len, out_enc, enc_len, out_ion, q_len, stats, 12);
+    if (err == AEE_SUCCESS) {
+      stagedMemcpy(out, out_ion, q_bytes);
+    }
+    if (attn_trace_enabled()) {
+      // stats (nntr_hvx_attn_q2_step): append, kernel, -, total, then the
+      // append's quant/stage/bake, rows appended, the kernel's qk, softmax,
+      // pv and worker wait, in microseconds. wall - total is transport.
+      ml_logi("HTP attn trace q2: n_q=%u cache=%u..%u err=0x%x wall_us=%lld "
+              "dsp_us: append=%u (quant=%u stage=%u bake=%u rows=%u) "
+              "kernel=%u (qk=%u softmax=%u pv=%u wait=%u) total=%u",
+              n_q, cache_from, cache_to, err,
+              static_cast<long long>(now_us() - t0), stats[0], stats[4],
+              stats[5], stats[6], stats[7], stats[1], stats[8], stats[9],
+              stats[10], stats[11], stats[3]);
+    }
     if (err != AEE_SUCCESS) {
       ml_logw("HTP row-blocked attention step failed: 0x%x; CPU fallback", err);
       return false;

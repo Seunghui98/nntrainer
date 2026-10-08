@@ -889,12 +889,13 @@ public:
   virtual bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
                                unsigned int append_rows, unsigned int kv_stride,
                                const uint16_t *k_rows, const uint16_t *v_rows,
-                               const float *q, const float *q_scale,
+                               const uint16_t *q, const float *q_enc,
                                unsigned int q_stride, unsigned int n_q,
                                unsigned int cache_from, unsigned int cache_to,
                                unsigned int n_head_q, unsigned int n_head_kv,
                                unsigned int head_dim, unsigned int window,
-                               float *out, unsigned int out_stride) {
+                               uint16_t *out, const float *out_enc,
+                               unsigned int out_stride) {
     (void)handle;
     (void)append_row0;
     (void)append_rows;
@@ -902,7 +903,7 @@ public:
     (void)k_rows;
     (void)v_rows;
     (void)q;
-    (void)q_scale;
+    (void)q_enc;
     (void)q_stride;
     (void)n_q;
     (void)cache_from;
@@ -912,6 +913,7 @@ public:
     (void)head_dim;
     (void)window;
     (void)out;
+    (void)out_enc;
     (void)out_stride;
     return false;
   }
