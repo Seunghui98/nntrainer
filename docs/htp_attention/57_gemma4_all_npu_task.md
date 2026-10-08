@@ -776,3 +776,18 @@ MoE가 호출당 ≈1 ms만 준 이유: HMX 스레드가 HVX epilogue(dequant·G
 변환(§9.23)과 같은 결과: prefill 중 CPU 0–5는 expert reader 몫이라 깨우는 비용·경합이 대역폭보다 크다. 커밋하지 않음.
 
 **PROFILE=2 분해(inline 후, 호출당).** MoE: DSP 43.3 ms = mm 10.7 + **acc 읽기 17.6**(inline 전 21.1 + 9.6) + requant 대기 6.9 + dequant 대기 3.4 + stage 1.3 + 기타. 누산기 읽기가 HMX 완료를 기다리므로 HMX 실제 시간 ≈ 28 ms로 그대로 — **MoE는 HMX array bound**(64행 블록 padding 포함 196 블록/호출). dense(MoE kernel을 intermediate 3 chunk로 빌려 씀): DSP 10.9 ms = HMX 6.2 + worker 대기 2.4 + stage·quant·gather 2.0, worker 23.7 ms. 3 chunk가 같은 1024행을 각각 pack하고 down을 out에 3번 RMW한다(개선 여지 ≈ 2 ms/호출, 기기 미측정).
+
+### 9.30 post-FFN epilogue를 MoE 호출에 접기 (2026-10-08, 78c77c61 + 766c5fa4, 기기 실측, 직접 실행)
+
+`out_add`: MoE 레이어가 dense 출력을 input 1로, post-FFN `residual_add`의 gamma·scalar를 마지막 두 가중치로 받는다(파일 순서 그대로). prefill은 한 호출(`mm_u8i4_moe_layer_norm_add`, IDL 끝에 추가)에서 입력 norm(pre_gamma; 원본 행이 DSP에서 residual이 됨) → expert → out_norm → epilogue(`hvx_rmsnorm_add_res_f32`, residual을 별도 포인터로). decode·split 호출·MoE diff 계측·CPU 경로는 CPU에서 residual_add와 같은 순서로.
+
+| cfgB | 전(363c2a80) | 후 |
+|---|---|---|
+| nll (cfgB_ppl) | 3.50819 | **3.5045**(입력 norm이 DSP로 — §9.27과 같은 값) |
+| 문장 | "The text provides a detailed description of the small harbour town of Ardley, which is located at the mouth of a slow river…" | "<summary>\nThe text provides a detailed description of the small harbour town of Ardley, which is located at the mouth of a large river…" |
+| prefill | 4,205 / 3,935 / 3,924 | **3,911 / 4,175 / 3,880** |
+| epilogue `K=5632` 행 | 114 ms, 30회 | 없음 |
+| MoE 행 | 1,382–1,435 | 1,510–1,570(epilogue·입력 norm 흡수) |
+| staging | 7.2 GB, 509 ms | 6.2 GB, 464 ms |
+
+host `unittest_causallm_models` 94 통과(Gemma-4 MoE tiny 모델 HF 기준 일치, weight-bearing 목록에서 `_post_ffn_norm`이 빠진 것은 의도). 이득은 중앙값 ≈ −25~−45 ms(1회 튐 제외)로 산술 기대(−100 ms)보다 작다: MoE 호출이 epilogue(DSP)와 x2 staging을 떠안았다.
