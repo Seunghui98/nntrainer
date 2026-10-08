@@ -535,3 +535,30 @@ projection·dense FFN·MoE만 NPU(attention·lm_head CPU), Q4_0 FC bin, C=16, 10
 - router 레지스터 블로킹(E/32·행 수를 컴파일 타임 상수로, w 행을 행 4개에 한 번 로드): host `ROUTER ROWS OK`. 기대 21.6 → 6 ms/호출(산술, 기기 미측정).
 - `mha_core trace:` 로그(`NNTR_HTP_ATTN_TRACE=1`, logcat): K/V cache 쓰기와 accelerator 호출의 호스트 시간을 층마다 찍어 "호출 밖 45 ms"를 가른다.
 - 그다음: attention 호출의 qprep·store(f32 Q/out 16.8 MB ×2 변환, 16 ms) → fp16 입출력; dma·tile(q 블록마다 K/V 재타일) → kv head당 1회; 전송 7 ms → Q/out을 ION으로.
+
+### 9.15 PR 4343의 row-blocked int8 attention 커널 cherry-pick (2026-10-08, 기기 미측정)
+
+nntrainer/nntrainer#4343(haehun, `htp/quant-dequant-hvx-opt`)에서 이 브랜치에 없던 커밋 11개(19387931..a2679616)를 그대로 가져왔다. 핵심은 **int8 KV cache용 row-blocked A8W8 attention**(`hexkl_attn_q2.c`, `hvx_softmax_q.c`, `hexkl_cvt.h`): kv head마다 Kᵀ·V 타일을 VTCM에 한 번 DMA하고, 64행 q 블록마다 QKᵀ(HMX) → int16 점수를 convert unit으로 읽어 정수 softmax(HVX) → P'V(HMX) → f32 epilogue. 점수가 VTCM을 떠나지 않고 재양자화가 없다. 커밋 메시지의 기기 실측(v81, 1 thread): Gemma-4 모양 1024×1024, 16/8, hd 256, W=1024에서 **18.4 ms/층, SNR 40.8 dB**; 그중 12.9 ms가 f32 Q 읽기·f32 출력 쓰기. 044dd36b가 HMX 스레드와 HVX worker로 파이프라인(수치는 메시지에 없음).
+
+- 충돌 3곳: `21_quantized_attention_plan.md`(PR 쪽), `Applications/CausalLM/meson.build`(양쪽 테스트 목록 합침), `test/htp/build.sh`·`hvx_add_f32.c`·`nntr_hvx.idl`(PR이 `session_info(vtcm_size, hmx_fp16_rate)`를 새로 추가했는데 우리 IDL엔 같은 이름의 `session_info(sequence<uint32> res)`가 이미 있음 → 우리 것을 8칸으로 넓혀 `res[7]`에 fp16 HMX rate, PR의 테스트는 그 형태로 고침; skel SRCS에 `hvx_softmax_q.c`·`hexkl_attn_q2.c` 추가).
+- 켜는 법: config에 `"attention_kv_dtype": "q8"` (Gemma4는 `createAttentionCore`를 쓰므로 그대로 전달). 조건: `attention_engine: htp`, attention softcap 0(Gemma-4는 `attn_logit_softcapping` 없음), sink 없음. 첫 prefill에서 K·V·Q 스케일을 보정해 고정하고, 이후 모든 호출이 row-blocked 경로. logcat: `mha_core: attention over the int8 quantized KV cache on the accelerator (row-blocked, fixed scales)`.
+- 기대(산술): attention 호출 40 → 약 18 ms/층(1024토큰), prefill −0.65 s. 정확도는 int8 KV라 nll로 확인해야 한다(§9.11 5번).
+- host: 빌드·`unittest_causallm_models`·`run_host_checks.sh`. 기기 gtest `unittest_hvx_attn_q`(convert·softmax bit-exact·q2 커널)가 PR에 있다.
+
+### 9.16 router 블로킹·attention 트레이스 기기 결과 (2026-10-08, 1023 token, all-NPU)
+
+§9.14의 두 커밋(router register blocking 4e903b97, mha_core trace 798d3032)을 넣고 §9.13과 같은 조건으로 돌린 값.
+
+| 항목 | §9.13 | 이번 | 차이 |
+|---|---|---|---|
+| prefill 1023 tok | 6230 ms | **5971 ms** | −259 ms |
+| router `K=2816 N=128 M>1` | 648 ms (21.6 ms/call) | **248 ms (8.3 ms/call)** | −400 ms (2.6×) |
+| MoE `K=2816 N=2816 M>1` (무표기, blocks=128) | 1276–1288 ms (41.5 ms/call) | 1515 ms (48.9 ms/call) | **+230 ms** |
+| dense `… M>1 dense` | 402 ms | 404 ms | 0 |
+| arm staging memcpy | — | 437 ms (6613 MB, 15.9 GB/s) | |
+| decode | 2.96 TPS | 5.19 TPS (miss 1.13/call, file read 2.2 ms/call) | |
+
+- router는 예측대로 떨어졌다. MoE 행은 커널을 건드리지 않았는데 +18%라 **한 번 더 돌려 재현되는지** 봐야 한다(§9.13의 세 번은 ±1% 안이었음). 재현되면 router가 빨라진 만큼 MoE 호출이 prefetch reader 7스레드의 flash burst와 더 겹치는 것이 유력한 후보이고, 아니면 열 변동.
+- attention 트레이스(한 층, 1023행): `kv_write_us≈500`, `accel_call_us 52–55 ms`, DSP 쪽 `wall_us 41–43 ms`(dsp 33 ms). 즉 **호출 wrapper 안에서 11–13 ms, by-op 노드(§9.13 91 ms)까지 다시 ~36 ms**가 host에 있다. 코드로 원인이 잡혔다: Android fp16 빌드에서 `MHACoreLayer::incremental_forwarding`이 f32 query 스텝을 **fp16 Q/K/V/O 텐서 4개로 새로 할당·변환**한 뒤 `one_batch_incremental_forwarding`에 넘기고, 가속 경로(`AccelF32Io`)는 그 fp16 Q를 **다시 스칼라 루프로 f32**로 풀어 DSP에 보내고, 출력은 f32→fp16(`io.commit`)→f32(`output_step.copyData`)로 두 번 더 변환한다. 1023행이면 Q 4.2M·K/V 2.1M·out 4.2M 원소를 다섯 번 변환하고 25 MB를 매 층 새로 page-fault한다.
+- 고침(커밋 아래): 가속 경로가 켜져 있으면(`compute_ops_ && is_causal && (supports_sdpa_fp16_kvcache || kv_cache_quant 준비)`) fp16 스테이징을 건너뛰고 f32 스텝 텐서를 그대로 넘긴다. KV cache 쓰기는 `HalfTensor::copyData`가 f32→fp16을 NEON으로 하므로 그대로, Q·out은 포인터 직결. 기대: 층당 ~36+11 ms → 수 ms, prefill **−1.0~−1.3 s** (기기 미측정). 가속 호출이 실패하면 non-Android 빌드가 늘 쓰던 f32 query CPU 경로로 떨어진다.
+- 다음 측정: (A) 같은 설정으로 by-op의 attention 노드와 `accel_call_us`가 DSP `wall_us`에 붙는지; (B) §9.15의 `attention_kv_dtype: q8`로 DSP 41 → ~18–25 ms가 되는지와 nll.
