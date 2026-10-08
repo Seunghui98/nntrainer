@@ -135,6 +135,8 @@ MHACoreLayer::MHACoreLayer() :
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
+std::vector<uint16_t> MHACoreLayer::q2_q_u16, MHACoreLayer::q2_out_u16;
+
 MHACoreLayer::~MHACoreLayer() { release_quantized_cache(); }
 
 /************************************************************** */
@@ -1061,10 +1063,14 @@ bool MHACoreLayer::try_quantized_attention(
       !compute_ops_->supports_kv_cache_q() || !is_causal) {
     return false;
   }
+  using clk = std::chrono::steady_clock;
+  const auto ts0 = clk::now();
   AccelF32Io io;
   if (!io.prepare(query_step, attention_output_step, sink)) {
     return false;
   }
+  const auto ts1 = clk::now();
+  clk::time_point ts2 = ts1, ts3 = ts1, ts4 = ts1, ts5 = ts1;
   const uint16_t *k_base = nullptr;
   const uint16_t *v_base = nullptr;
   switch (cache_key.getDataType()) {
@@ -1112,6 +1118,7 @@ bool MHACoreLayer::try_quantized_attention(
     return false;
   }
   if (handle < 0) {
+    ts2 = clk::now();
     handle = compute_ops_->kv_cache_q_register(
       static_cast<unsigned int>(kv_cache_quant_kind), max_rows, num_heads_KV,
       head_dim);
@@ -1120,6 +1127,7 @@ bool MHACoreLayer::try_quantized_attention(
     }
     synced = 0;
     q2_scales_set[batch] = 0;
+    ts3 = clk::now();
   }
   // Rows past cache_from may have been rewritten (a rewound session, a
   // loaded cache); re-append from the first row that could differ.
@@ -1153,6 +1161,7 @@ bool MHACoreLayer::try_quantized_attention(
                     .count()));
       }
     }
+    const auto ts_sc = clk::now();
     if (!q2_scales_set[batch]) {
       if (!compute_ops_->kv_cache_q_set_fixed_scales(
             handle, num_heads_KV, head_dim, q2_scale_k.data(),
@@ -1165,8 +1174,12 @@ bool MHACoreLayer::try_quantized_attention(
     // quantized graph both are the neighbouring layers' formats already;
     // here the f32 layer converts at its edges.
     const size_t q_elems = static_cast<size_t>(n_q) * q_stride;
-    q2_q_u16.resize(q_elems);
-    q2_out_u16.resize(q_elems);
+    ts4 = clk::now();
+    if (q2_q_u16.size() < q_elems) {
+      q2_q_u16.resize(q_elems);
+      q2_out_u16.resize(q_elems);
+    }
+    ts5 = clk::now();
     // Both conversions NEON on this thread: scalar they were 8-13 ms a
     // 1024-row layer (doc 59 section 2.2); NEON 1.0 / 1.1 ms, and split over
     // 4 or 8 compute threads slower (doc 57 section 9.23).
@@ -1204,6 +1217,10 @@ bool MHACoreLayer::try_quantized_attention(
         return static_cast<long long>(
           std::chrono::duration_cast<std::chrono::microseconds>(d).count());
       };
+      ml_logi("mha_core trace: q2 setup rows=%u prepare_us=%lld "
+              "register_us=%lld fixed_scales_us=%lld resize_us=%lld",
+              n_q, us(ts1 - ts0), us(ts3 - ts2), us(ts4 - ts_sc),
+              us(ts5 - ts4));
       ml_logi("mha_core trace: q2 convert rows=%u q_us=%lld call_us=%lld "
               "out_us=%lld",
               n_q, us(tq1 - tq0), us(tq2 - tq1), us(tq3 - tq2));

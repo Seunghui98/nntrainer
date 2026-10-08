@@ -408,7 +408,12 @@ private:
    *        the two staging buffers.
    */
   std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
-  std::vector<uint16_t> q2_q_u16, q2_out_u16;
+  /** The a16 path's u16 Q and output, one pair for every layer: per layer
+   *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
+   *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
+   *  MHACoreLayer instances, so layers must not run concurrently (they run
+   *  in graph order); a per-thread pair is the upgrade if they ever do. */
+  static std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
