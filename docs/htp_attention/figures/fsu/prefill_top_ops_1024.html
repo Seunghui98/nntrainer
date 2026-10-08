@@ -33,70 +33,71 @@ svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
 </defs>
 <rect width="1920" height="1080" fill="var(--surface)"/>
 
-<text x="80" y="88" class="t1" text-anchor="start" >Prefill: 연산별 시간 순위 (1024 token)</text>
+<text x="80" y="88" class="t1" text-anchor="start" >Gemma-4 26B-A4B Prefill: 연산별 시간 순위 (1024 token)</text>
 <text x="80" y="134" class="t2" text-anchor="start" >projection·dense FFN·MoE는 NPU, attention·lm_head는 CPU · 프로파일 빌드, 30 layer 합 7,232 ms</text>
-<text x="80" y="178" class="sm" text-anchor="start" >op (type)</text>
-<text x="560" y="178" class="sm" text-anchor="start" >sum over 30 layers</text>
-<text x="1700" y="178" class="sm" text-anchor="start" >avg / call</text>
-<text x="80" y="234" class="lbl" text-anchor="start" style="font-weight:700">attention</text>
-<text x="80" y="258" class="sm" text-anchor="start" >mha_core · CPU · n=30</text>
-<rect x="560" y="210" width="1100.0" height="50" rx="5" fill="var(--host)" />
-<text x="1646.0" y="242" class="lblw" text-anchor="end" style="font-size:18px">2,991 ms  (41.4%)</text>
-<text x="1700" y="242" class="lbl" text-anchor="start" >99.70 ms</text>
-<path d="M80,278 L1840,278" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="316" class="lbl" text-anchor="start" style="font-weight:700">sparse_moe</text>
-<text x="80" y="340" class="sm" text-anchor="start" >lfm2_moe · NPU · n=30</text>
-<rect x="560" y="292" width="783.2870850188893" height="50" rx="5" fill="var(--npu)" />
-<text x="1329.2870850188892" y="324" class="lblw" text-anchor="end" style="font-size:18px">2,130 ms  (29.5%)</text>
-<text x="1700" y="324" class="lbl" text-anchor="start" >71.00 ms</text>
-<path d="M80,360 L1840,360" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="398" class="lbl" text-anchor="start" style="font-weight:700">qkv</text>
-<text x="80" y="422" class="sm" text-anchor="start" >qkv_layer · NPU · n=30</text>
-<rect x="560" y="374" width="301.74517735949985" height="50" rx="5" fill="var(--npu)" />
-<text x="847.7451773594998" y="406" class="lblw" text-anchor="end" style="font-size:18px">820 ms  (11.3%)</text>
-<text x="1700" y="406" class="lbl" text-anchor="start" >27.35 ms</text>
-<path d="M80,442 L1840,442" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="480" class="lbl" text-anchor="start" style="font-weight:700">ffn</text>
-<text x="80" y="504" class="sm" text-anchor="start" >dense_ffn · NPU · n=30</text>
-<rect x="560" y="456" width="172.3312493731403" height="50" rx="5" fill="var(--npu)" />
-<text x="744.3312493731403" y="488" class="lbl" text-anchor="start" >469 ms  (6.5%)</text>
-<text x="1700" y="488" class="lbl" text-anchor="start" >15.62 ms</text>
-<path d="M80,524 L1840,524" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="562" class="lbl" text-anchor="start" style="font-weight:700">attention_out</text>
-<text x="80" y="586" class="sm" text-anchor="start" >fully_connected · NPU · n=30</text>
-<rect x="560" y="538" width="129.0093945371268" height="50" rx="5" fill="var(--npu)" />
-<text x="701.0093945371268" y="570" class="lbl" text-anchor="start" >351 ms  (4.9%)</text>
-<text x="1700" y="570" class="lbl" text-anchor="start" >11.69 ms</text>
-<path d="M80,606 L1840,606" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="644" class="lbl" text-anchor="start" style="font-weight:700">post_ffn_norm</text>
-<text x="80" y="668" class="sm" text-anchor="start" >residual_add · NPU · n=30</text>
-<rect x="560" y="620" width="107.78977633646485" height="50" rx="5" fill="var(--npu)" />
-<text x="679.7897763364649" y="652" class="lbl" text-anchor="start" >293 ms  (4.1%)</text>
-<text x="1700" y="652" class="lbl" text-anchor="start" >9.77 ms</text>
-<path d="M80,688 L1840,688" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="726" class="lbl" text-anchor="start" style="font-weight:700">post_attention_norm</text>
-<text x="80" y="750" class="sm" text-anchor="start" >residual_add · NPU · n=30</text>
-<rect x="560" y="702" width="58.47347129818461" height="50" rx="5" fill="var(--npu)" />
-<text x="630.4734712981846" y="734" class="lbl" text-anchor="start" >159 ms  (2.2%)</text>
-<text x="1700" y="734" class="lbl" text-anchor="start" >5.30 ms</text>
-<path d="M80,770 L1840,770" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="808" class="lbl" text-anchor="start" style="font-weight:700">output_of_causallm</text>
-<text x="80" y="832" class="sm" text-anchor="start" >tie_word_embedding · CPU · n=1</text>
-<rect x="560" y="784" width="6.509310955835646" height="50" rx="5" fill="var(--host)" />
-<text x="578.5093109558356" y="816" class="lbl" text-anchor="start" >18 ms  (0.2%)</text>
-<text x="1700" y="816" class="lbl" text-anchor="start" >17.71 ms</text>
-<path d="M80,852 L1840,852" stroke="#eeede8" stroke-width="2"/>
-<text x="80" y="890" class="lbl" text-anchor="start" style="font-weight:700">embedding0</text>
-<text x="80" y="914" class="sm" text-anchor="start" >tie_word_embedding · CPU · n=1</text>
-<rect x="560" y="866" width="4" height="50" rx="5" fill="var(--host)" />
-<text x="576" y="898" class="lbl" text-anchor="start" >1 ms  (0.0%)</text>
-<text x="1700" y="898" class="lbl" text-anchor="start" >1.27 ms</text>
-<path d="M80,934 L1840,934" stroke="#eeede8" stroke-width="2"/>
-<rect x="560" y="954" width="22" height="22" rx="4" fill="var(--host)" />
-<text x="592" y="972" class="sm" text-anchor="start" >CPU</text>
-<rect x="680" y="954" width="22" height="22" rx="4" fill="var(--npu)" />
-<text x="712" y="972" class="sm" text-anchor="start" >NPU</text>
-<text x="80" y="972" class="sm" text-anchor="start" >CPU 3,010 ms (42%) · NPU 4,222 ms</text>
-<text x="80" y="1030" class="xs" text-anchor="start" >측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin, 1024-token prompt, 2026-10-08, 브랜치 b0bbd264. 일반 빌드 prefill 타이머 6,452 ms(158.7 TPS); 프로파일 빌드는 노드마다 동기화해 합이 더 큼.</text>
-<text x="80" y="1058" class="xs" text-anchor="start" >노드가 9개뿐인 이유: 이 브랜치에서 norm·RoPE·scalar·add·router·GeLU가 NPU 호출(qkv, ffn, residual_add, sparse_moe) 안으로 들어감. attention_engine: htp와 lm_head NPU는 이 실행에 없음(기기 미측정).</text>
+<text x="80" y="174" class="sm" text-anchor="start" >op (type)</text>
+<text x="560" y="174" class="sm" text-anchor="start" >sum over 30 layers</text>
+<text x="1700" y="174" class="sm" text-anchor="start" >avg / call</text>
+<text x="80" y="230" class="lbl" text-anchor="start" style="font-weight:700">attention</text>
+<text x="80" y="254" class="sm" text-anchor="start" >mha_core · CPU · n=30</text>
+<rect x="560" y="206" width="1100.0" height="50" rx="5" fill="var(--host)" />
+<text x="1646.0" y="238" class="lblw" text-anchor="end" style="font-size:18px">2,991 ms  (41.4%)</text>
+<text x="1700" y="238" class="lbl" text-anchor="start" >99.70 ms</text>
+<path d="M80,270 L1840,270" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="308" class="lbl" text-anchor="start" style="font-weight:700">sparse_moe</text>
+<text x="80" y="332" class="sm" text-anchor="start" >moe (128 expert, top-8) · NPU · n=30</text>
+<rect x="560" y="284" width="783.2870850188893" height="50" rx="5" fill="var(--npu)" />
+<text x="1329.2870850188892" y="316" class="lblw" text-anchor="end" style="font-size:18px">2,130 ms  (29.5%)</text>
+<text x="1700" y="316" class="lbl" text-anchor="start" >71.00 ms</text>
+<path d="M80,348 L1840,348" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="386" class="lbl" text-anchor="start" style="font-weight:700">qkv</text>
+<text x="80" y="410" class="sm" text-anchor="start" >qkv_layer · NPU · n=30</text>
+<rect x="560" y="362" width="301.74517735949985" height="50" rx="5" fill="var(--npu)" />
+<text x="847.7451773594998" y="394" class="lblw" text-anchor="end" style="font-size:18px">820 ms  (11.3%)</text>
+<text x="1700" y="394" class="lbl" text-anchor="start" >27.35 ms</text>
+<path d="M80,426 L1840,426" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="464" class="lbl" text-anchor="start" style="font-weight:700">ffn</text>
+<text x="80" y="488" class="sm" text-anchor="start" >dense_ffn · NPU · n=30</text>
+<rect x="560" y="440" width="172.3312493731403" height="50" rx="5" fill="var(--npu)" />
+<text x="744.3312493731403" y="472" class="lbl" text-anchor="start" >469 ms  (6.5%)</text>
+<text x="1700" y="472" class="lbl" text-anchor="start" >15.62 ms</text>
+<path d="M80,504 L1840,504" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="542" class="lbl" text-anchor="start" style="font-weight:700">attention_out</text>
+<text x="80" y="566" class="sm" text-anchor="start" >fully_connected · NPU · n=30</text>
+<rect x="560" y="518" width="129.0093945371268" height="50" rx="5" fill="var(--npu)" />
+<text x="701.0093945371268" y="550" class="lbl" text-anchor="start" >351 ms  (4.9%)</text>
+<text x="1700" y="550" class="lbl" text-anchor="start" >11.69 ms</text>
+<path d="M80,582 L1840,582" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="620" class="lbl" text-anchor="start" style="font-weight:700">post_ffn_norm</text>
+<text x="80" y="644" class="sm" text-anchor="start" >residual_add · NPU · n=30</text>
+<rect x="560" y="596" width="107.78977633646485" height="50" rx="5" fill="var(--npu)" />
+<text x="679.7897763364649" y="628" class="lbl" text-anchor="start" >293 ms  (4.1%)</text>
+<text x="1700" y="628" class="lbl" text-anchor="start" >9.77 ms</text>
+<path d="M80,660 L1840,660" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="698" class="lbl" text-anchor="start" style="font-weight:700">post_attention_norm</text>
+<text x="80" y="722" class="sm" text-anchor="start" >residual_add · NPU · n=30</text>
+<rect x="560" y="674" width="58.47347129818461" height="50" rx="5" fill="var(--npu)" />
+<text x="630.4734712981846" y="706" class="lbl" text-anchor="start" >159 ms  (2.2%)</text>
+<text x="1700" y="706" class="lbl" text-anchor="start" >5.30 ms</text>
+<path d="M80,738 L1840,738" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="776" class="lbl" text-anchor="start" style="font-weight:700">output_of_causallm</text>
+<text x="80" y="800" class="sm" text-anchor="start" >tie_word_embedding · CPU · n=1</text>
+<rect x="560" y="752" width="6.509310955835646" height="50" rx="5" fill="var(--host)" />
+<text x="578.5093109558356" y="784" class="lbl" text-anchor="start" >18 ms  (0.2%)</text>
+<text x="1700" y="784" class="lbl" text-anchor="start" >17.71 ms</text>
+<path d="M80,816 L1840,816" stroke="#eeede8" stroke-width="2"/>
+<text x="80" y="854" class="lbl" text-anchor="start" style="font-weight:700">embedding0</text>
+<text x="80" y="878" class="sm" text-anchor="start" >tie_word_embedding · CPU · n=1</text>
+<rect x="560" y="830" width="4" height="50" rx="5" fill="var(--host)" />
+<text x="576" y="862" class="lbl" text-anchor="start" >1 ms  (0.0%)</text>
+<text x="1700" y="862" class="lbl" text-anchor="start" >1.27 ms</text>
+<path d="M80,894 L1840,894" stroke="#eeede8" stroke-width="2"/>
+<rect x="560" y="914" width="22" height="22" rx="4" fill="var(--host)" />
+<text x="592" y="932" class="sm" text-anchor="start" >CPU</text>
+<rect x="680" y="914" width="22" height="22" rx="4" fill="var(--npu)" />
+<text x="712" y="932" class="sm" text-anchor="start" >NPU</text>
+<text x="80" y="932" class="sm" text-anchor="start" >CPU 3,010 ms (42%) · NPU 4,222 ms</text>
+<text x="80" y="1000" class="xs" text-anchor="start" >측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin, 1024-token prompt, 2026-10-08, 브랜치 b0bbd264. 일반 빌드 prefill 타이머 6,452 ms(158.7 TPS); 프로파일 빌드는 노드마다 동기화해 합이 더 큼.</text>
+<text x="80" y="1028" class="xs" text-anchor="start" >노드가 9개뿐인 이유: 이 브랜치에서 norm·RoPE·scalar·add·router·GeLU가 NPU 호출(qkv, ffn, residual_add, sparse_moe) 안으로 들어감. attention_engine: htp와 lm_head NPU는 이 실행에 없음(기기 미측정).</text>
+<text x="80" y="1056" class="xs" text-anchor="start" >sparse_moe의 코드상 type은 lfm2_moe(LFM2와 공유하는 MoE 층 구현)이지만 여기서는 Gemma-4의 128 expert MoE(top-8)다.</text>
 </svg></body></html>

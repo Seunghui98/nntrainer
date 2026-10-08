@@ -666,10 +666,10 @@ def figR():
     """prefill_timeline.py --by-op at 1024 tokens on this branch (doc 57
     section 9.12), ranked: one bar per op, CPU/NPU by colour."""
     o = [HEAD.format(title="Top ops by time")]
-    o.append(text(80, 88, "Prefill: 연산별 시간 순위 (1024 token)", "t1"))
+    o.append(text(80, 88, "Gemma-4 26B-A4B Prefill: 연산별 시간 순위 (1024 token)", "t1"))
     o.append(text(80, 134, "projection·dense FFN·MoE는 NPU, attention·lm_head는 CPU · 프로파일 빌드, 30 layer 합 7,232 ms", "t2"))
     rows = [("attention", "mha_core", "CPU", 30, 99.70, 2991.1),
-            ("sparse_moe", "lfm2_moe", "NPU", 30, 71.00, 2129.9),
+            ("sparse_moe", "moe (128 expert, top-8)", "NPU", 30, 71.00, 2129.9),
             ("qkv", "qkv_layer", "NPU", 30, 27.35, 820.5),
             ("ffn", "dense_ffn", "NPU", 30, 15.62, 468.6),
             ("attention_out", "fully_connected", "NPU", 30, 11.69, 350.8),
@@ -679,7 +679,7 @@ def figR():
             ("embedding0", "tie_word_embedding", "CPU", 1, 1.27, 1.3)]
     total = sum(r[5] for r in rows)
     fill = {"CPU": "var(--host)", "NPU": "var(--npu)"}
-    x0, bw, y0, rh = 560, 1100, 200, 82
+    x0, bw, y0, rh = 560, 1100, 196, 78
     o.append(text(80, y0 - 22, "op (type)", "sm"))
     o.append(text(x0, y0 - 22, "sum over 30 layers", "sm"))
     o.append(text(1700, y0 - 22, "avg / call", "sm"))
@@ -702,10 +702,11 @@ def figR():
         o.append(text(x0 + i * 120 + 32, ly + 18, lb, "sm"))
     o.append(text(80, ly + 18, f"CPU {sum(r[5] for r in rows if r[2] == 'CPU'):,.0f} ms ({100 * sum(r[5] for r in rows if r[2] == 'CPU') / total:.0f}%) · "
                               f"NPU {sum(r[5] for r in rows if r[2] == 'NPU'):,.0f} ms", "sm"))
-    o.append(text(80, 1030, "측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin, 1024-token prompt, 2026-10-08, 브랜치 b0bbd264. "
+    o.append(text(80, 1000, "측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin, 1024-token prompt, 2026-10-08, 브랜치 b0bbd264. "
                             "일반 빌드 prefill 타이머 6,452 ms(158.7 TPS); 프로파일 빌드는 노드마다 동기화해 합이 더 큼.", "xs"))
-    o.append(text(80, 1058, "노드가 9개뿐인 이유: 이 브랜치에서 norm·RoPE·scalar·add·router·GeLU가 NPU 호출(qkv, ffn, residual_add, sparse_moe) 안으로 들어감. "
+    o.append(text(80, 1028, "노드가 9개뿐인 이유: 이 브랜치에서 norm·RoPE·scalar·add·router·GeLU가 NPU 호출(qkv, ffn, residual_add, sparse_moe) 안으로 들어감. "
                             "attention_engine: htp와 lm_head NPU는 이 실행에 없음(기기 미측정).", "xs"))
+    o.append(text(80, 1056, "sparse_moe의 코드상 type은 lfm2_moe(LFM2와 공유하는 MoE 층 구현)이지만 여기서는 Gemma-4의 128 expert MoE(top-8)다.", "xs"))
     o.append(TAIL)
     return "\n".join(o)
 
