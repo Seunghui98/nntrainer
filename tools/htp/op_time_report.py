@@ -98,7 +98,7 @@ def parse(path):
             sys.exit(f"{path}: node {n['name']} calls={n['calls']} != "
                      f"step tokens={tokens}")
         us, mn, wb = float(n["sum_us"]), float(n["min_us"]), int(n["wbytes"])
-        if n["type"] == "lfm2_moe":
+        if n["type"] in ("lfm2_moe", "lfm2_moe_pool"):
             rows["MoE CPU part"][0] += us
             rows["MoE CPU part"][1] += ROUTER_BYTES
             continue  # no avg/min: its minimum holds the call

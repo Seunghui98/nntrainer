@@ -245,6 +245,17 @@ public:
   void loadWeight(const std::string &path) override { this->load_weight(path); }
 
   /**
+   * @brief [#260] Allocates and binds the KV cache (idempotent); bit 0: the
+   *        model's allocateAndBindKVCache installed the attention engine's
+   *        shared allocator, bit 1: a slab came from it
+   */
+  int kvCacheShared() {
+    this->allocateAndBindKVCache();
+    return (this->kv_cache.hasSharedAllocator() ? 1 : 0) |
+           (this->kv_cache.usesSharedMemory() ? 2 : 0);
+  }
+
+  /**
    * @brief Run one prompt through the model
    */
   void runPrompt(const std::string &prompt) override {

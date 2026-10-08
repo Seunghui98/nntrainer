@@ -49,6 +49,23 @@ public:
   static constexpr const char *key = "moe_activation";
 };
 /**
+ * @brief MoE router type: how logits become the top-k set and its weights.
+ *  "sigmoid_bias" (default) is LFM2's: sigmoid scores, a per-expert bias
+ *  added for selection only, weights normalised over the top-k.
+ *  "softmax_scale" is Gemma-4's: softmax scores, top-k, weights normalised
+ *  to sum 1, then multiplied by a per-expert scale. The layer's one
+ *  [num_experts] weight is the bias for the first and the scale for the
+ *  second.
+ */
+class RouterType : public nntrainer::Property<std::string> {
+public:
+  RouterType(const std::string &value = "sigmoid_bias") :
+    nntrainer::Property<std::string>(value) {}
+  static constexpr const char *key = "router_type";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
  * @brief [plan 201 S4] The MoE router: "sigmoid" (LFM2: sigmoid scores plus
  *        an expert bias for the selection) or "softmax" (Gemma 4: an
  *        un-normed router input RMS-normed and scaled, softmax, top-k,
@@ -59,6 +76,20 @@ public:
   MoERouter(std::string value = "sigmoid") { set(value); };
   static constexpr const char *key = "moe_router";
   using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
+ * @brief Per-layer expert cache size C for the streamed (virtual) expert
+ *  path, doc 52/55. 0 keeps the experts resident. NNTR_MOE_CACHE_EXPERTS in
+ *  the environment overrides it, so one device can sweep C without a
+ *  config edit.
+ */
+class CacheExperts : public nntrainer::Property<unsigned int> {
+public:
+  CacheExperts(unsigned int value = 0) :
+    nntrainer::Property<unsigned int>(value) {}
+  static constexpr const char *key = "cache_experts";
+  using prop_tag = nntrainer::uint_prop_tag;
 };
 
 /**
@@ -119,6 +150,110 @@ public:
   using prop_tag = nntrainer::enum_class_prop_tag;
   static constexpr const char *key = "gamma_initializer";
 };
+/**
+ * @brief in_norm: the layer owns the RMSNorm gamma of its input (hidden
+ *        wide, FP32, the first weight in the file) and applies that norm
+ *        itself -- on an accelerator inside the same call as its matmuls.
+ */
+class InNorm : public nntrainer::Property<bool> {
+public:
+  InNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "in_norm";
+};
+
+/**
+ * @brief norm_in_call: [#260] qkv_layer's per-head q / k norms
+ *        (feature_size) go into the accelerator's projection call with
+ *        no in_norm too (#4415's default). LFM2 sets it false: its prefill
+ *        keeps the norms on the CPU, as before #4415.
+ */
+class NormInCall : public nntrainer::Property<bool> {
+public:
+  NormInCall(bool val = true) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "norm_in_call";
+};
+
+/**
+ * @brief use_weight: the layer's scalar comes from the weight file (one
+ *        float), not from a property. scalar_multiply's, shared with
+ *        residual_add, which folds the block's scalar into its add.
+ */
+class UseWeight : public nntrainer::Property<bool> {
+public:
+  static constexpr const char *key = "use_weight"; /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag;       /**< property type */
+  UseWeight(bool value = false) { set(value); }
+};
+
+/**
+ * @brief RopeTheta
+ */
+class RopeTheta : public nntrainer::Property<unsigned int> {
+public:
+  RopeTheta(unsigned int value = 500000) { set(value); };
+  static constexpr const char *key = "rope_theta"; /**< unique key to access */
+  using prop_tag = nntrainer::uint_prop_tag;       /**< property type */
+};
+
+/**
+ * @brief RopeScalingType
+ * - default
+ * - yarn
+ */
+class RopeScalingType : public nntrainer::Property<std::string> {
+public:
+  RopeScalingType(std::string value = "default") { set(value); };
+  static constexpr const char *key =
+    "rope_scaling_type";                    /**< unique key to access */
+  using prop_tag = nntrainer::str_prop_tag; /**< property type */
+};
+
+/**
+ * @brief RopePartialRotaryFactor
+ */
+class RopePartialRotaryFactor : public nntrainer::Property<float> {
+public:
+  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
+  static constexpr const char *key =
+    "rope_partial_rotary_factor";             /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief softcap: y = softcap * tanh(y / softcap) on a layer's output (the
+ *        final logit softcap, folded into the tied lm_head); 0 for none.
+ */
+class Softcap : public nntrainer::Property<float> {
+public:
+  Softcap(float val = 0.0f) : nntrainer::Property<float>(val) {}
+  using prop_tag = nntrainer::float_prop_tag;
+  static constexpr const char *key = "softcap";
+};
+
+/**
+ * @brief out_norm: likewise the RMSNorm of the layer's output (its gamma
+ *        is the last weight in the file).
+ */
+class OutNorm : public nntrainer::Property<bool> {
+public:
+  OutNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "out_norm";
+};
+
+/**
+ * @brief router_norm: an MoE layer's router reads its own RMSNorm of the
+ *        layer's input (gamma after in_norm's in the file).
+ */
+class RouterNorm : public nntrainer::Property<bool> {
+public:
+  RouterNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "router_norm";
+};
+
 }; // namespace props
 
 WIN_EXPORT enum RMSParams { gamma };

@@ -9,7 +9,8 @@ lfm2_moe_src = [
 # --- MoE layers (each built as its own shared library) ---
 lfm2_moe_layer = shared_library(
     'lfm2_moe_layer',
-    [meson.current_source_dir() / 'lfm2_moe_layer.cpp'],
+    [meson.current_source_dir() / 'lfm2_moe_layer.cpp',
+     meson.current_source_dir() / 'lfm2_moe_pool_layer.cpp'],
     include_directories: [causallm_layer_inc, lfm2_moe_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,

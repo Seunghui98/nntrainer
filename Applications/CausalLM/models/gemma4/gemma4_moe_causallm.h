@@ -33,7 +33,6 @@ public:
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
-  void registerCustomLayers() override;
 
   /**
    * @brief Gemma4CausalLM::load_weight, then [plan 201 S4] with
@@ -49,22 +48,7 @@ public:
    */
   void repack_weight() override;
 
-protected:
-  Tensor createFeedForwardBlock(const int layer_id, Tensor post_attention,
-                                bool is_kv_shared_layer) override;
-
 private:
-  unsigned int num_experts = 0;
-  unsigned int top_k_experts = 0;
-  unsigned int moe_intermediate_size = 0;
-  unsigned int moe_cache_size = 0;
-  /** [plan 201 S4] the MoE layer's engine (nntr_config moe_engine): "htp"
-   *  builds the lfm2_moe layer with the softmax router (QS4CX_WH experts,
-   *  the expert pool), anything else #4296's gemma4_moe */
-  std::string moe_engine = "cpu";
-  /** [plan 201 S4] the expert dtype (nntr_config moe_layer_dtype), default
-   *  FC_LAYER_DTYPE */
-  std::string moe_layer_dtype;
   /** [plan 201 S4] NNTR_HTP_E2E=1 with moe_engine=htp: the whole decode
    *  token on the HTP */
   bool htp_e2e = false;

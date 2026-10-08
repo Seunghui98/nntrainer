@@ -1,48 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
-
-## @package generate_gemma4_moe_reference
-## @brief Generate Hugging Face reference fixtures for a tiny Gemma4 MoE model.
-## @author Jungwon-Lee <jungone.lee@samsung.com>
-
-"""Generate Hugging Face reference fixtures for a tiny Gemma4 MoE model.
-
-The NNTrainer binary is written through the production Gemma4 MoE converter so
-the fixture also verifies PLE-disabled, K-equals-V, router, norm, and fused
-expert ordering.
-"""
+## @file generate_gemma4_moe_reference.py
+## @brief Golden fixtures for the Gemma-4 MoE (enable_moe_block) differential
+##        test: gemma-4-26B-A4B's text_config shape made tiny.
+##
+## Same recipe as generate_gemma4_reference.py (random tiny HF model, weights
+## saved in nntrainer's load order, HF logits and greedy tokens as JSON), with
+## what the 26B adds (docs/htp_attention/55_gemma4_moe_htp_task.md):
+##   - a router + experts beside the dense MLP in every layer,
+##   - attention_k_eq_v: the full-attention layer has no v_proj (V is K),
+##   - hidden_size_per_layer_input = 0: no per-layer input path,
+##   - use_bidirectional_attention = "vision" (text stays causal).
+##
+## Weight save order per layer (unittest_causallm_gemma4_moe's
+## WeightBearingLayerOrderMatchesConverter holds the same list):
+##   attention_norm, wq, q_norm, wk, k_norm, [wv: sliding only],
+##   attention_out, post_attention_norm, pre_ffn_norm,
+##   ffn_gate, ffn_up, ffn_down,
+##   post_ffn_norm_1, pre_ffn_norm_2, router_norm (= router.scale * H^-0.5),
+##   sparse_moe: router.proj.T, per_expert_scale, per expert gate_up[e].T,
+##               down[e].T,
+##   post_ffn_norm_2, post_ffn_norm, layer_scalar
+##
+## Usage:
+##   python3 generate_gemma4_moe_reference.py [--out <dir>] [--seed <int>]
 
 import argparse
-import importlib.util
 import json
 import pathlib
-import types
 
 import numpy as np
 import torch
-import transformers
 from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
 
-from generate_gemma4_reference import INPUT_IDS, N_GEN, TINY_TOKENIZER
-
-
 THIS_DIR = pathlib.Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parents[4]
 DEFAULT_OUT = THIS_DIR.parent / "gemma4_moe_tiny"
-CONVERTER_PATH = (
-    REPO_ROOT / "Applications/CausalLM/res/gemma4/gemma4_moe_weight_converter.py"
-)
 
-TINY_MOE_TEXT_CONFIG = dict(
-    hidden_size=64,
+HIDDEN = 64
+NUM_LAYERS = 2
+LAYER_TYPES = ["sliding_attention", "full_attention"]
+NUM_EXPERTS = 4
+TOP_K = 2
+MOE_INTER = 64
+
+TINY_TEXT_CONFIG = dict(
+    hidden_size=HIDDEN,
     intermediate_size=64,
-    num_hidden_layers=2,
+    num_hidden_layers=NUM_LAYERS,
     num_attention_heads=8,
     num_key_value_heads=4,
     head_dim=8,
     global_head_dim=8,
-    num_global_key_value_heads=4,
+    num_global_key_value_heads=2,
+    attention_k_eq_v=True,
+    enable_moe_block=True,
+    num_experts=NUM_EXPERTS,
+    top_k_experts=TOP_K,
+    moe_intermediate_size=MOE_INTER,
     hidden_size_per_layer_input=0,
     vocab_size_per_layer_input=32,
     vocab_size=32,
@@ -50,340 +65,226 @@ TINY_MOE_TEXT_CONFIG = dict(
     rms_norm_eps=1e-6,
     rope_theta=1000000,
     sliding_window=4,
-    layer_types=["sliding_attention", "full_attention"],
+    layer_types=LAYER_TYPES,
     tie_word_embeddings=True,
     hidden_activation="gelu_pytorch_tanh",
     attention_dropout=0.0,
     pad_token_id=0,
     num_kv_shared_layers=0,
     use_double_wide_mlp=False,
-    attention_k_eq_v=True,
-    enable_moe_block=True,
-    num_experts=4,
-    top_k_experts=2,
-    moe_intermediate_size=32,
+    use_bidirectional_attention="vision",
 )
 
+K_EQ_V = True
+INPUT_IDS = [1, 4, 2, 3]
+N_GEN = 4
 
-def load_production_converter():
-    """Load the production converter directly from the repository."""
-    spec = importlib.util.spec_from_file_location(
-        "gemma4_moe_weight_converter", CONVERTER_PATH
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def build_model(seed, cfg=None, random_layer_scalar=False, random_norms=False,
-                router_scale=1.0):
-    """Build a deterministic tiny Gemma4 MoE text model.
-
-    The init leaves every norm weight, the router's input scale and its
-    per-expert scale at one and the router near uniform, which a test of
-    who-gets-which-weight cannot see through. random_layer_scalar puts the
-    layer_scalar buffers at seeded values in [0.5, 1.5); random_norms puts
-    every one of those vectors at 1 + 0.25 N(0, 1); router_scale multiplies
-    the router projection so the top-k is not decided by rounding.
-    """
-    torch.manual_seed(seed)
-    config = Gemma4TextConfig(**(cfg or TINY_MOE_TEXT_CONFIG))
-    model = Gemma4TextModel(config)
-    model.eval()
-    with torch.no_grad():
-        if random_layer_scalar:
-            for layer in model.layers:
-                layer.layer_scalar.fill_(0.5 + float(torch.rand(1)))
-        if random_norms:
-            for name, param in model.named_parameters():
-                if param.dim() == 1 and (
-                    "norm" in name or name.endswith("router.scale")
-                    or name.endswith("per_expert_scale")
-                ):
-                    param.copy_(1.0 + 0.25 * torch.randn_like(param))
-        if router_scale != 1.0:
-            for layer in model.layers:
-                layer.router.proj.weight.mul_(router_scale)
-    return model
+TINY_TOKENIZER = {
+    "version": "1.0",
+    "truncation": None,
+    "padding": None,
+    "added_tokens": [
+        {
+            "id": 31,
+            "content": "<eos>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    ],
+    "normalizer": None,
+    "pre_tokenizer": {"type": "Whitespace"},
+    "post_processor": None,
+    "decoder": None,
+    "model": {
+        "type": "WordLevel",
+        "vocab": {
+            "<unk>": 0,
+            "hello": 1,
+            "world": 2,
+            **{f"tok{i}": i for i in range(3, 31)},
+            "<eos>": 31,
+        },
+        "unk_token": "<unk>",
+    },
+}
 
 
-def convert_weights(model, output_path):
-    """Write weights using the same ordered walker as production conversion.
+def convert_weights(model: Gemma4TextModel, bin_path: pathlib.Path) -> None:
+    sd = model.state_dict()
+    total = 0
 
-    The .safetensors beside the .bin is the converter's --safetensors output
-    of the same weights: the quantizer reads either (issue #234 P2), and
-    QuantizeStreamSafetensors* compares the two and permutes the header.
-    """
-    converter = load_production_converter()
-    wrapper_config = types.SimpleNamespace(text_config=model.config)
-    with open(output_path, "wb") as output_file:
-        converter.save_gemma4_moe_bin(
-            model.state_dict(), wrapper_config, "float32", output_file, True
-        )
-    converter.save_gemma4_moe_safetensors(
-        model.state_dict(), wrapper_config, "float32",
-        str(pathlib.Path(output_path).with_suffix(".safetensors")), True
-    )
+    with open(bin_path, "wb") as f:
+
+        def save(tensor: torch.Tensor, name: str) -> None:
+            nonlocal total
+            arr = tensor.float().detach().contiguous().numpy().astype(np.float32)
+            f.write(arr.tobytes())
+            total += arr.nbytes
+            print(f"  {name:40s} shape={list(tensor.shape)}")
+
+        save(sd["embed_tokens.weight"], "embedding0")
+        for i in range(NUM_LAYERS):
+            p = f"layers.{i}."
+            full = LAYER_TYPES[i] == "full_attention"
+            save(sd[f"{p}input_layernorm.weight"], f"layer{i}_attention_norm")
+            save(sd[f"{p}self_attn.q_proj.weight"].T, f"layer{i}_wq")
+            save(sd[f"{p}self_attn.q_norm.weight"], f"layer{i}_q_norm")
+            save(sd[f"{p}self_attn.k_proj.weight"].T, f"layer{i}_wk")
+            save(sd[f"{p}self_attn.k_norm.weight"], f"layer{i}_k_norm")
+            if not (K_EQ_V and full):  # attention_k_eq_v: no v_proj on full
+                save(sd[f"{p}self_attn.v_proj.weight"].T, f"layer{i}_wv")
+            save(sd[f"{p}self_attn.o_proj.weight"].T, f"layer{i}_attention_out")
+            save(sd[f"{p}post_attention_layernorm.weight"],
+                 f"layer{i}_post_attention_norm")
+            save(sd[f"{p}pre_feedforward_layernorm.weight"],
+                 f"layer{i}_pre_ffn_norm")
+            save(sd[f"{p}mlp.gate_proj.weight"].T, f"layer{i}_ffn_gate")
+            save(sd[f"{p}mlp.up_proj.weight"].T, f"layer{i}_ffn_up")
+            save(sd[f"{p}mlp.down_proj.weight"].T, f"layer{i}_ffn_down")
+            # the MoE half, as res/gemma4/weight_converter.py writes it
+            save(sd[f"{p}post_feedforward_layernorm_1.weight"],
+                 f"layer{i}_post_ffn_norm_1")
+            save(sd[f"{p}pre_feedforward_layernorm_2.weight"],
+                 f"layer{i}_pre_ffn_norm_2")
+            save(sd[f"{p}router.scale"] * HIDDEN ** -0.5,
+                 f"layer{i}_router_norm")
+            save(sd[f"{p}router.proj.weight"].T, f"layer{i}_sparse_moe:gate")
+            save(sd[f"{p}router.per_expert_scale"],
+                 f"layer{i}_sparse_moe:expert_bias")
+            gate_up = sd[f"{p}experts.gate_up_proj"]  # [E, 2I, H]
+            down = sd[f"{p}experts.down_proj"]  # [E, H, I]
+            for e in range(NUM_EXPERTS):
+                save(gate_up[e].T, f"layer{i}_sparse_moe:expert_gate_up_{e}")
+                save(down[e].T, f"layer{i}_sparse_moe:expert_down_{e}")
+            save(sd[f"{p}post_feedforward_layernorm_2.weight"],
+                 f"layer{i}_post_ffn_norm_2")
+            save(sd[f"{p}post_feedforward_layernorm.weight"],
+                 f"layer{i}_post_ffn_norm")
+            save(sd[f"{p}layer_scalar"], f"layer{i}_layer_scalar")
+        save(sd["norm.weight"], "output_norm")
+        save(sd["embed_tokens.weight"], "output_of_causallm")
+
+    print(f"[converter] saved {bin_path} ({total} bytes)")
 
 
-def softcap(logits, cap):
-    """Gemma4ForCausalLM's final logit soft-cap (none when cap is None)."""
-    if cap is None:
-        return logits
-    return torch.tanh(logits / cap) * cap
-
-
-def run_forward(model, input_ids, cap=None):
-    """Return tied-embedding logits for the final prompt token."""
+def run_forward(model, input_ids):
     ids = torch.tensor([input_ids], dtype=torch.long)
     with torch.no_grad():
-        hidden = model(ids, use_cache=False).last_hidden_state[0, -1, :]
-        logits = softcap(hidden @ model.embed_tokens.weight.T, cap)
-    return logits.float().tolist()
+        out = model(ids, use_cache=False)
+    hidden = out.last_hidden_state[0, -1, :]
+    return (hidden @ model.embed_tokens.weight.T).float().tolist()
 
 
-def run_greedy_with_margin(model, input_ids, count, cap=None):
-    """Generate greedy tokens and return the minimum top-two logit margin."""
+def run_greedy(model, input_ids, n):
     ids = list(input_ids)
     generated = []
-    minimum_margin = float("inf")
     with torch.no_grad():
-        for _ in range(count):
-            inputs = torch.tensor([ids], dtype=torch.long)
-            hidden = model(inputs, use_cache=False).last_hidden_state[0, -1, :]
-            logits = softcap(hidden @ model.embed_tokens.weight.T, cap)
-            top2 = torch.topk(logits.float(), k=2).values
-            minimum_margin = min(
-                minimum_margin, float((top2[0] - top2[1]).item())
-            )
-            token = int(logits.argmax().item())
-            generated.append(token)
-            ids.append(token)
-    return generated, minimum_margin
+        for _ in range(n):
+            out = model(torch.tensor([ids], dtype=torch.long), use_cache=False)
+            logits = out.last_hidden_state[0, -1, :] @ model.embed_tokens.weight.T
+            tok = int(logits.argmax().item())
+            generated.append(tok)
+            ids.append(tok)
+    return generated
 
 
-def find_stable_seed(count, generated_tokens, cfg=None, cap=None, **knobs):
-    """Select the seed with the largest minimum greedy logit margin."""
-    candidates = []
-    for seed in range(count):
-        model = build_model(seed, cfg, **knobs)
-        _, margin = run_greedy_with_margin(
-            model, INPUT_IDS, generated_tokens, cap
-        )
-        candidates.append((margin, seed))
-    candidates.sort(reverse=True)
-    print(f"[search] best seeds={candidates[:10]}")
-    return candidates[0][1]
-
-
-def write_configs(output_dir, binary_name, tokenizer_path, cfg=None, cap=None):
-    """Write the three configs consumed by the CausalLM differential tests."""
-    c = cfg or TINY_MOE_TEXT_CONFIG
+def write_nntr_configs(out_dir, bin_name, tokenizer_path):
+    text = dict(TINY_TEXT_CONFIG)
+    text.pop("hidden_activation")
+    text.pop("attention_dropout")
+    text.pop("pad_token_id")
+    text["rope_parameters"] = {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000},
+        "full_attention": {"rope_type": "proportional", "rope_theta": 1000000,
+                           "partial_rotary_factor": 0.25},
+    }
     config_json = {
-        "architectures": ["Gemma4ForCausalLM"],
+        "architectures": ["Gemma4ForConditionalGeneration"],
         "bos_token_id": 0,
         "eos_token_id": [31],
-        "num_hidden_layers": c["num_hidden_layers"],
-        "text_config": {
-            "attention_k_eq_v": c["attention_k_eq_v"],
-            "enable_moe_block": True,
-            "global_head_dim": c["global_head_dim"],
-            "head_dim": c["head_dim"],
-            "hidden_activation": "gelu_pytorch_tanh",
-            "hidden_size": c["hidden_size"],
-            "hidden_size_per_layer_input": 0,
-            "intermediate_size": c["intermediate_size"],
-            "layer_types": c["layer_types"],
-            "max_position_embeddings": c["max_position_embeddings"],
-            "moe_intermediate_size": c["moe_intermediate_size"],
-            "num_attention_heads": c["num_attention_heads"],
-            "num_experts": c["num_experts"],
-            "num_global_key_value_heads": c["num_global_key_value_heads"],
-            "num_hidden_layers": c["num_hidden_layers"],
-            "num_key_value_heads": c["num_key_value_heads"],
-            "num_kv_shared_layers": 0,
-            "rms_norm_eps": 1e-6,
-            "rope_parameters": {
-                "sliding_attention": {
-                    "rope_type": "default",
-                    "rope_theta": 10000,
-                },
-                "full_attention": {
-                    "rope_type": "proportional",
-                    "rope_theta": 1000000,
-                    "partial_rotary_factor": 0.25,
-                },
-            },
-            "rope_theta": 1000000,
-            "sliding_window": c["sliding_window"],
-            "tie_word_embeddings": True,
-            "top_k_experts": c["top_k_experts"],
-            "use_double_wide_mlp": False,
-            "vocab_size": 32,
-            "vocab_size_per_layer_input": 32,
-        },
+        "text_config": text,
     }
-    if cap is not None:
-        config_json["text_config"]["final_logit_softcapping"] = cap
-    generation_json = {
-        "bos_token_id": 0,
-        "eos_token_id": 31,
-        "do_sample": False,
-        "top_k": 1,
-        "top_p": 1.0,
-        "temperature": 1.0,
+    generation_config_json = {
+        "bos_token_id": 0, "eos_token_id": 31, "do_sample": False,
+        "top_k": 1, "top_p": 1.0, "temperature": 1.0,
     }
-    nntrainer_json = {
-        "bad_word_ids": [],
-        "batch_size": 1,
-        "embedding_dtype": "FP32",
-        "fc_layer_dtype": "FP32",
-        "init_seq_len": 4,
-        "lmhead_dtype": "FP32",
-        "max_seq_len": c["max_position_embeddings"],
-        "model_file_name": binary_name,
-        "model_tensor_type": "FP32-FP32",
-        "model_type": "CausalLM",
-        "num_to_generate": 1,
-        "tokenizer_file": pathlib.Path(tokenizer_path).name,
+    nntr_config_json = {
+        "bad_word_ids": [], "batch_size": 1,
+        "embedding_dtype": "FP32", "fc_layer_dtype": "FP32",
+        # max_seq_len 16, not 8 like gemma4_tiny: the x86 AVX2 rotary kernel's
+        # fp16 tail store writes 8 lanes for a 4-pair half (head_dim 8), so the
+        # last cache row of the 2-head (16-wide) full layer overshoots its
+        # tensor by 8 fp16 and corrupts the heap. Real head dims are
+        # multiples of 16 and never take that tail; the slack keeps the tiny
+        # fixture clear of it.
+        "init_seq_len": 4, "lmhead_dtype": "FP32", "max_seq_len": 16,
+        "model_file_name": bin_name, "model_tensor_type": "FP32-FP32",
+        "model_type": "CausalLM", "num_to_generate": 1,
+        "tokenizer_file": tokenizer_path,
     }
-    for filename, payload in (
-        ("config.json", config_json),
-        ("generation_config.json", generation_json),
-        ("nntr_config.json", nntrainer_json),
-    ):
-        with open(output_dir / filename, "w") as output_file:
-            json.dump(payload, output_file, indent=2)
+    json.dump(config_json, open(out_dir / "config.json", "w"), indent=2)
+    json.dump(generation_config_json,
+              open(out_dir / "generation_config.json", "w"), indent=2)
+    json.dump(nntr_config_json, open(out_dir / "nntr_config.json", "w"),
+              indent=2)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generate tiny Gemma4 MoE Hugging Face fixtures"
-    )
-    parser.add_argument("--out", type=pathlib.Path, default=DEFAULT_OUT)
-    # Seed 17 was selected from [0, 100) for a 0.102 minimum greedy margin.
-    parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--n", type=int, default=N_GEN)
-    parser.add_argument(
-        "--search-seeds",
-        type=int,
-        default=0,
-        help="Search seeds [0, N) and use the one with the widest greedy margin",
-    )
-    parser.add_argument("--transformers-commit", default="unknown")
-    # [plan 201 S4] the HTP decode fixture's shape (head_dim >= 64: the
-    # NPU's attention kinds take multiples of 64); unset = the hd8 fixture
-    for flag, key in (
-        ("--hidden", "hidden_size"),
-        ("--inter", "intermediate_size"),
-        ("--heads", "num_attention_heads"),
-        ("--kv-heads", "num_key_value_heads"),
-        ("--head-dim", "head_dim"),
-        ("--global-head-dim", "global_head_dim"),
-        ("--global-kv-heads", "num_global_key_value_heads"),
-        ("--max-pos", "max_position_embeddings"),
-        ("--sliding-window", "sliding_window"),
-        ("--experts", "num_experts"),
-        ("--top-k", "top_k_experts"),
-        ("--moe-inter", "moe_intermediate_size"),
-    ):
-        parser.add_argument(flag, dest=key, type=int, default=None)
-    parser.add_argument(
-        "--layer-types",
-        default=None,
-        help="comma-separated sliding_attention / full_attention",
-    )
-    parser.add_argument(
-        "--final-softcap",
-        type=float,
-        default=None,
-        help="final_logit_softcapping, applied to the reference logits too",
-    )
-    parser.add_argument(
-        "--random-layer-scalar",
-        action="store_true",
-        help="seeded layer_scalar values in [0.5, 1.5) instead of ones",
-    )
-    parser.add_argument(
-        "--random-norms",
-        action="store_true",
-        help="norm weights, router scale and per-expert scale at 1 + 0.25 N",
-    )
-    parser.add_argument(
-        "--router-scale",
-        type=float,
-        default=1.0,
-        help="multiply the router projection (a decisive top-k)",
-    )
-    args = parser.parse_args()
-    knobs = dict(
-        random_layer_scalar=args.random_layer_scalar,
-        random_norms=args.random_norms,
-        router_scale=args.router_scale,
-    )
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", type=pathlib.Path, default=DEFAULT_OUT)
+    ap.add_argument("--seed", type=int, default=18)
+    ap.add_argument("--n", type=int, default=N_GEN)
+    ap.add_argument("--global-kv", type=int, default=2,
+                    help="debug variant: num_global_key_value_heads")
+    ap.add_argument("--no-k-eq-v", action="store_true",
+                    help="debug variant: v_proj on every layer, 4 global kv heads")
+    args = ap.parse_args()
+    TINY_TEXT_CONFIG["num_global_key_value_heads"] = args.global_kv
+    if args.no_k_eq_v:
+        TINY_TEXT_CONFIG["attention_k_eq_v"] = False
+        TINY_TEXT_CONFIG["num_global_key_value_heads"] = 4
+        global K_EQ_V
+        K_EQ_V = False
+    out_dir = args.out.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = dict(TINY_MOE_TEXT_CONFIG)
-    for key in list(cfg):
-        if getattr(args, key, None) is not None:
-            cfg[key] = getattr(args, key)
-    if args.layer_types:
-        cfg["layer_types"] = args.layer_types.split(",")
-        cfg["num_hidden_layers"] = len(cfg["layer_types"])
-    cap = args.final_softcap
+    config = Gemma4TextConfig(**TINY_TEXT_CONFIG)
+    torch.manual_seed(args.seed)
+    model = Gemma4TextModel(config)
+    # Random experts and router: Gemma4's init leaves per_expert_scale and
+    # router.scale at ones and layer_scalar at one; the experts get the
+    # module's normal init. Spread the scales so a wrong wiring shows.
+    with torch.no_grad():
+        for layer in model.layers:
+            layer.router.per_expert_scale.copy_(
+                0.5 + torch.rand(NUM_EXPERTS))
+            layer.router.scale.copy_(0.5 + torch.rand(HIDDEN))
+    model.eval()
+    print(f"[generate] params: {sum(p.numel() for p in model.parameters()):,}")
 
-    if args.search_seeds > 0:
-        args.seed = find_stable_seed(args.search_seeds, args.n, cfg, cap,
-                                     **knobs)
+    bin_name = "nntr_gemma4_moe_tiny_fp32.bin"
+    convert_weights(model, out_dir / bin_name)
+    tok_path = out_dir / "tokenizer.json"
+    json.dump(TINY_TOKENIZER, open(tok_path, "w"), indent=2)
+    write_nntr_configs(out_dir, bin_name, "tokenizer.json")
 
-    output_dir = args.out.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model = build_model(args.seed, cfg, **knobs)
-    print(f"[generate] parameters={sum(p.numel() for p in model.parameters()):,}")
-
-    binary_name = "nntr_gemma4_moe_tiny_fp32.bin"
-    convert_weights(model, output_dir / binary_name)
-
-    tokenizer_path = output_dir / "tokenizer.json"
-    with open(tokenizer_path, "w") as output_file:
-        json.dump(TINY_TOKENIZER, output_file, indent=2)
-    write_configs(output_dir, binary_name, tokenizer_path, cfg, cap)
-
-    logits = run_forward(model, INPUT_IDS, cap)
-    tokens, greedy_margin = run_greedy_with_margin(
-        model, INPUT_IDS, args.n, cap
-    )
-    for filename, payload in (
-        ("input_ids.json", INPUT_IDS),
-        ("reference_logits.json", logits),
-        ("reference_tokens.json", tokens),
-    ):
-        with open(output_dir / filename, "w") as output_file:
-            json.dump(payload, output_file)
-
-    sorted_logits = np.sort(np.asarray(logits, dtype=np.float32))
-    top2_margin = float(sorted_logits[-1] - sorted_logits[-2])
-    meta = {
-        "seed": args.seed,
-        "n_gen": args.n,
-        "input_ids": INPUT_IDS,
-        "logits_atol_fp32": 1e-2,
-        "logits_atol_q40": 5.0,
+    ref_logits = run_forward(model, INPUT_IDS)
+    json.dump(ref_logits, open(out_dir / "reference_logits.json", "w"))
+    ref_tokens = run_greedy(model, INPUT_IDS, args.n)
+    json.dump(ref_tokens, open(out_dir / "reference_tokens.json", "w"))
+    json.dump(INPUT_IDS, open(out_dir / "input_ids.json", "w"))
+    import transformers
+    json.dump({
+        "seed": args.seed, "n_gen": args.n, "input_ids": INPUT_IDS,
+        "logits_atol_fp32": 1e-2, "logits_atol_q40": 5.0,
         "prefix_match_min": 2,
-        "top2_logit_margin": top2_margin,
-        "minimum_greedy_margin": greedy_margin,
         "transformers_version": transformers.__version__,
-        "transformers_commit": args.transformers_commit,
         "torch_version": torch.__version__,
-    }
-    with open(output_dir / "meta.json", "w") as output_file:
-        json.dump(meta, output_file, indent=2)
-
-    print(
-        f"[generate] seed={args.seed}, argmax={int(np.argmax(logits))}, "
-        f"margin={top2_margin}, greedy_margin={greedy_margin}"
-    )
-    print(f"[generate] tokens={tokens}")
-    print(f"[generate] output={output_dir}")
+    }, open(out_dir / "meta.json", "w"), indent=2)
+    print(f"[generate] argmax={int(np.argmax(ref_logits))} tokens={ref_tokens}")
 
 
 if __name__ == "__main__":

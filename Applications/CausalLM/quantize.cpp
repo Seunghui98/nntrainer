@@ -566,6 +566,8 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       // FFN FC layers - version3 (Qwen/Gemma LLMs)
       dtype_map[prefix + "_ffn_gate"] = fc_dtype;
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
+      // the same three fused (dense_ffn); its weights follow this dtype
+      dtype_map[prefix + "_ffn"] = fc_dtype;
 
       // LFM2 MoE experts (see the moe_dtype note in this function's
       // docstring); dense FFN layers keep following fc_dtype.

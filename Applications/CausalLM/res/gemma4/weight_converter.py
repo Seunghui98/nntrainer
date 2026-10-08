@@ -15,12 +15,22 @@
 ## nntrainer safetensors loader matches tensors back to layers.
 ##
 ## Gemma4 specifics handled here:
-## - Interleaved sliding / full attention and optional K-equals-V projection
-## - Optional KV sharing and double-wide dense MLPs
-## - Optional per-layer input embedding / projection / norm
+## - 35 text layers with interleaved sliding / full attention
+## - KV sharing for the last 20 layers (layer >= 15): wk / wv / k_norm are not
+##   emitted, matching nntrainer's createSharedAttention()
+## - Double-wide MLP for KV-shared layers (shape is taken from the source tensor)
+## - Per-layer input embedding / projection / norm (global, emitted with layer 0)
 ## - Tied word embeddings: the lm head shares embedding0, so the safetensors
 ##   path emits no separate output_of_causallm entry, while the .bin path keeps
 ##   the trailing duplicate that nntrainer's binary lm-head save expects.
+## - MoE checkpoints (enable_moe_block, e.g. gemma-4-26B-A4B): the router and
+##   the experts follow the dense MLP of every layer in the LFM2 expert file
+##   order nntrainer's lfm2_moe layer requests (router gate, the [E] scale,
+##   then per expert the fused gate|up and the down projection); the
+##   router's scale and hidden^-0.5 are folded into one rms_norm gamma
+##   (docs/htp_attention/55_gemma4_moe_htp_task.md section 6.2). With
+##   hidden_size_per_layer_input == 0 the per-layer input path is absent.
+## - attention_k_eq_v: full-attention layers have no v_proj (V is K).
 
 import argparse
 import glob
@@ -118,18 +128,28 @@ class LazyTensor:
 
     Exposes the shape without reading the payload (so the safetensors header
     can be built cheaply) and loads the actual data only on materialize().
+    Indexing ([e]) narrows it to one leading slice, read alone on
+    materialize(): one expert of a [E, ...] stack, not the whole stack.
     """
 
-    def __init__(self, handle, key):
+    def __init__(self, handle, key, index=None):
         self._handle = handle
         self._key = key
+        self._index = index
 
     @property
     def shape(self):
-        return tuple(self._handle.get_slice(self._key).get_shape())
+        shape = tuple(self._handle.get_slice(self._key).get_shape())
+        return shape[1:] if self._index is not None else shape
+
+    def __getitem__(self, index):
+        return LazyTensor(self._handle, self._key, index)
 
     def materialize(self):
+        if self._index is not None:
+            return self._handle.get_slice(self._key)[self._index]
         return self._handle.get_tensor(self._key)
+
 
 class SafetensorsState:
     """A lazy, dict-like view over one or more safetensors files.
@@ -188,7 +208,7 @@ def load_model_state(model_path):
     return model.state_dict(), "HuggingFace model state_dict"
 
 
-def iter_gemma4_weight_specs(params, config, additional_ffn_specs=None):
+def iter_gemma4_weight_specs(params, config):
     """Yield (nntr_name, suffix, torch_tensor, transpose) in nntrainer order.
 
     The ordering matches nntrainer's binary save/load order. The names and
@@ -202,11 +222,15 @@ def iter_gemma4_weight_specs(params, config, additional_ffn_specs=None):
     """
     text_config = config.text_config
     n_layers = text_config.num_hidden_layers
-    num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
+    num_kv_shared_layers = text_config.num_kv_shared_layers
     first_kv_shared_layer_idx = n_layers - num_kv_shared_layers
-    layer_types = text_config.layer_types
-    attention_k_eq_v = bool(getattr(text_config, "attention_k_eq_v", False))
-    ple_size = int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0)
+    layer_types = getattr(text_config, "layer_types", None) or (
+        ["sliding_attention"] * n_layers)
+    k_eq_v = bool(getattr(text_config, "attention_k_eq_v", False))
+    per_layer_input = getattr(text_config, "hidden_size_per_layer_input", 0)
+    moe = bool(getattr(text_config, "enable_moe_block", False))
+    num_experts = text_config.num_experts if moe else 0
+
     resolve = make_param_resolver(params)
 
     def is_kv_shared_layer(layer_idx):
@@ -235,10 +259,8 @@ def iter_gemma4_weight_specs(params, config, additional_ffn_specs=None):
                    resolve(f"{lp}self_attn.k_proj.weight"), True)
             yield (f"layer{layer_idx}_k_norm", SUFFIX_GAMMA,
                    resolve(f"{lp}self_attn.k_norm.weight"), False)
-            use_alternative_attention = (
-                attention_k_eq_v and layer_types[layer_idx] == "full_attention"
-            )
-            if not use_alternative_attention:
+            # attention_k_eq_v: a full-attention layer has no v_proj.
+            if not (k_eq_v and layer_types[layer_idx] == "full_attention"):
                 yield (f"layer{layer_idx}_wv", SUFFIX_WEIGHT,
                        resolve(f"{lp}self_attn.v_proj.weight"), True)
 
@@ -257,13 +279,38 @@ def iter_gemma4_weight_specs(params, config, additional_ffn_specs=None):
         yield (f"layer{layer_idx}_ffn_down", SUFFIX_WEIGHT,
                resolve(f"{lp}mlp.down_proj.weight"), True)
 
-        if additional_ffn_specs:
-            yield from additional_ffn_specs(layer_idx, lp, resolve)
+        if moe:
+            # Graph order (unittest_causallm_gemma4_moe checks it): the two
+            # norms of the residual come experts' first, router's second.
+            yield (f"layer{layer_idx}_post_ffn_norm_1", SUFFIX_GAMMA,
+                   resolve(f"{lp}post_feedforward_layernorm_1.weight"), False)
+            yield (f"layer{layer_idx}_pre_ffn_norm_2", SUFFIX_GAMMA,
+                   resolve(f"{lp}pre_feedforward_layernorm_2.weight"), False)
+            # Gemma4TextRouter: norm(x) * scale * hidden^-0.5, one rms_norm
+            # whose gamma carries both factors.
+            router_scale = resolve(f"{lp}router.scale")
+            if hasattr(router_scale, "materialize"):
+                router_scale = router_scale.materialize()
+            yield (f"layer{layer_idx}_router_norm", SUFFIX_GAMMA,
+                   router_scale.float() * text_config.hidden_size ** -0.5,
+                   False)
+            # The lfm2_moe layer's weights, in its request order.
+            moe_name = f"layer{layer_idx}_sparse_moe"
+            yield (moe_name, "gate", resolve(f"{lp}router.proj.weight"), True)
+            yield (moe_name, "expert_bias",
+                   resolve(f"{lp}router.per_expert_scale"), False)
+            gate_up = resolve(f"{lp}experts.gate_up_proj")  # [E, 2I, H]
+            down = resolve(f"{lp}experts.down_proj")  # [E, H, I]
+            for e in range(num_experts):
+                yield (moe_name, f"expert_gate_up_{e}", gate_up[e], True)
+                yield (moe_name, f"expert_down_{e}", down[e], True)
+            yield (f"layer{layer_idx}_post_ffn_norm_2", SUFFIX_GAMMA,
+                   resolve(f"{lp}post_feedforward_layernorm_2.weight"), False)
 
         yield (f"layer{layer_idx}_post_ffn_norm", SUFFIX_GAMMA,
                resolve(f"{lp}post_feedforward_layernorm.weight"), False)
 
-        if ple_size > 0:
+        if per_layer_input:
             yield (f"layer{layer_idx}_per_layer_input_gate", SUFFIX_WEIGHT,
                    resolve(f"{lp}per_layer_input_gate.weight"), True)
 
@@ -310,8 +357,7 @@ def _transposed_shape(tensor, transpose):
     return shape
 
 
-def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings,
-                    weight_specs=iter_gemma4_weight_specs):
+def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings):
     """Write Gemma4 weights as the nntrainer binary (.bin) layout.
 
     Streams one tensor at a time: each weight is converted to numpy, written,
@@ -319,7 +365,8 @@ def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings,
     """
     total_bytes = 0
     count = 0
-    for _name, _suffix, tensor, transpose in weight_specs(params, config):
+    for _name, _suffix, tensor, transpose in iter_gemma4_weight_specs(
+            params, config):
         arr = tensor_to_numpy(tensor, dtype, transpose)
         arr.tofile(file)
         total_bytes += arr.nbytes
@@ -342,8 +389,7 @@ def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings,
 
 
 def save_gemma4_safetensors(params, config, dtype, output_path,
-                            tie_word_embeddings,
-                            weight_specs=iter_gemma4_weight_specs):
+                            tie_word_embeddings):
     """Write Gemma4 weights as a safetensors file keyed by nntrainer names.
 
     The safetensors layout is [8-byte header length][header JSON][raw data].
@@ -358,7 +404,7 @@ def save_gemma4_safetensors(params, config, dtype, output_path,
     safetensors_dtype = SAFETENSORS_DTYPE_MAP[dtype]
     itemsize = np.dtype(dtype).itemsize
 
-    specs = list(weight_specs(params, config))
+    specs = list(iter_gemma4_weight_specs(params, config))
 
     # With tied embeddings the lm head shares embedding0's tensor, so nntrainer
     # stores a single deduped entry and no separate output_of_causallm is added.
@@ -454,6 +500,10 @@ def main():
 
     print("\nModel configuration:")
     print(f"  Text layers: {text_config.num_hidden_layers}")
+    print(f"  MoE: {getattr(text_config, 'enable_moe_block', False)} "
+          f"(experts {getattr(text_config, 'num_experts', None)}, "
+          f"moe_intermediate_size "
+          f"{getattr(text_config, 'moe_intermediate_size', None)})")
     print(f"  Hidden size: {text_config.hidden_size}")
     print(f"  Vocab size: {text_config.vocab_size}")
     print(f"  KV shared layers: {text_config.num_kv_shared_layers}")

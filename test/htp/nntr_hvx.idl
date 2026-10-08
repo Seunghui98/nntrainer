@@ -99,6 +99,29 @@ interface nntr_hvx : remote_handle64 {
                                  rout sequence<float> out_cat,
                                  rout sequence<uint32> stage_us);
 
+   // mm_u8i4_layer with the RMSNorms a block runs around its projections
+   // folded into the call (doc 57 section 5 step 4), so the rows do not
+   // round-trip for them. pre_gamma (K floats, or empty for none): every
+   // activation row is normed over its K floats, times gamma, before the
+   // quantizer. post_chunk (one per handle, or empty for none; 0 = that
+   // handle untouched) and post_gamma (the chunks of every normed handle
+   // in call order, concatenated): handle i's output rows are normed per
+   // post_chunk[i]-wide piece (N_i for a whole-row norm, the head dim for
+   // a per-head one), times its gamma, in place. eps for both.
+   // After the norms, RoPE (hvx_rope_rows_f32) on the first rope_handles
+   // handles' output rows, per head of rope_hd (0 = none): rope_cs is M
+   // rows of 2*rope_hd floats, the CPU table's cos row then sin row for
+   // each row's position. The q and k projections thus leave rotated.
+   AEEResult mm_u8i4_layer_norm(in uint32 M, in uint32 K, in float eps,
+                                in sequence<float> pre_gamma,
+                                in sequence<uint32> post_chunk,
+                                in sequence<float> post_gamma,
+                                in uint32 rope_hd, in uint32 rope_handles,
+                                in sequence<float> rope_cs,
+                                in sequence<uint32> w_handles,
+                                in sequence<float> act_f32,
+                                rout sequence<float> out_cat);
+
    // Same as mm_u8i4_layer, but the caller has already quantized AND
    // AH-tile-packed the activation on the ARM side (htp_act_quant.h's
    // htp_quant_pack_u8_ah, bit-for-bit matching hvx_quant_rows_u8_params +
@@ -223,9 +246,11 @@ interface nntr_hvx : remote_handle64 {
    // separate "the two arithmetics differ" from "they agree and something
    // downstream does not" -- the whole point is bit identity against a
    // scalar reference, so a failure has to say WHERE.
-   // Every length must match and be a multiple of 32.
-   AEEResult swiglu_det_f32(in sequence<float> gate, in sequence<float> up,
-                            rout sequence<float> res,
+   // Every length must match and be a multiple of 32. act 0 is SwiGLU,
+   // 1 the GeGLU twin (hvx_geglu_det_sf; exp_out and recip_out are then
+   // of t = g (C0 + C1 g^2), doc 55).
+   AEEResult swiglu_det_f32(in uint32 act, in sequence<float> gate,
+                            in sequence<float> up, rout sequence<float> res,
                             rout sequence<float> exp_out,
                             rout sequence<float> recip_out);
 
@@ -315,8 +340,12 @@ interface nntr_hvx : remote_handle64 {
    // hands over. The kernel underneath takes plain pointers, so the Phase D
    // entry point that leaves the residual stream on the DSP is a second
    // wrapper over the same code, not a rewrite (doc 45 section 3.1).
+   //
+   // act is the gated activation between gate_up and down: 0 silu(g)*u
+   // (LFM2), 1 gelu_tanh(g)*u (Gemma-4; doc 55). HVX_GLU_* in
+   // hvx_dequant_i32.h.
    AEEResult mm_u8i4_moe_layer(in uint32 M, in uint32 K, in uint32 inter,
-                               in uint32 N_out,
+                               in uint32 N_out, in uint32 act,
                                in sequence<uint32> h_gate_up,
                                in sequence<uint32> h_down,
                                in sequence<uint32> row_index,
@@ -329,7 +358,7 @@ interface nntr_hvx : remote_handle64 {
    // [total, quant, swiglu, dequant, acc_read, drain, scatter, acc_stride].
    // DEBUG ONLY.
    AEEResult mm_u8i4_moe_layer_timed(in uint32 M, in uint32 K, in uint32 inter,
-                                     in uint32 N_out,
+                                     in uint32 N_out, in uint32 act,
                                      in sequence<uint32> h_gate_up,
                                      in sequence<uint32> h_down,
                                      in sequence<uint32> row_index,
@@ -338,6 +367,42 @@ interface nntr_hvx : remote_handle64 {
                                      in sequence<float> act_f32,
                                      rout sequence<float> out_f32,
                                      rout sequence<uint32> stage_us);
+
+   // [57 section 5 step 5] The MoE router's logits at prefill shapes:
+   // logits[M][E] = rmsnorm(x)[M][K] . w[K][E] in f32 (hvx_router_rows_f32),
+   // gamma K floats for the router's own norm or empty for none. E a
+   // multiple of 32 up to 128. The call removes the M x K x E CPU matmul
+   // and the norm before it. top_k 0: logits only, sel and weight empty.
+   // top_k > 0 (the softmax router): logits returns the softmax
+   // probabilities, sel the n_sel largest per row (descending, an exact
+   // tie to the lower index -- the CPU layer's comparator) and weight the
+   // first top_k's p * (1 / their sum) * scale[e] (hvx_router_topk_rows_f32);
+   // scale is E floats. n_sel past top_k is the caller's prefetch hint.
+   AEEResult router_logits_f32(in uint32 M, in uint32 K, in uint32 E,
+                               in float eps, in sequence<float> gamma,
+                               in sequence<float> w, in sequence<float> x,
+                               in uint32 top_k, in uint32 n_sel,
+                               in sequence<float> scale,
+                               rout sequence<float> logits,
+                               rout sequence<uint32> sel,
+                               rout sequence<float> weight);
+
+   // mm_u8i4_moe_layer with the block's norms folded in, as
+   // mm_u8i4_layer_norm does for the FC call: pre_gamma (K floats, or
+   // empty) norms every activation row before the call, post_gamma (N_out
+   // floats, or empty) norms every output row after it, in place.
+   AEEResult mm_u8i4_moe_layer_norm(in uint32 M, in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 act,
+                                    in float eps,
+                                    in sequence<float> pre_gamma,
+                                    in sequence<float> post_gamma,
+                                    in sequence<uint32> h_gate_up,
+                                    in sequence<uint32> h_down,
+                                    in sequence<uint32> row_index,
+                                    in sequence<uint32> row_count,
+                                    in sequence<float> row_weight,
+                                    in sequence<float> act_f32,
+                                    rout sequence<float> out_f32);
 
    // [doc 51 section 2] An LFM2 conv block -- in_proj, a*c, causal conv1d,
    // *b, out_proj -- in one call, so its four M x C f32 intermediates never
@@ -538,6 +603,18 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<float> y,
                              rout sequence<float> row_scale);
 
+   // [57 section 5 step 4] The decoder block's epilogue at prefill shapes:
+   // res = scale * (res + rmsnorm(x [+ x2]) * gamma) over M rows of n
+   // floats (n a multiple of 32), the whole-row norm of the summed addend.
+   // res carries the residual in; x is M*n floats, or 2*M*n with the
+   // second addend (the MoE output beside the dense one) behind the first.
+   // gamma is n floats or empty for 1. Lives on the hvx_rmsnorm_rows_f32
+   // kernel, so the rows split across the session's worker pool.
+   AEEResult rmsnorm_add_f32(in uint32 M, in uint32 n, in float eps,
+                             in float scale, in sequence<float> gamma,
+                             in sequence<float> x,
+                             inrout sequence<float> res);
+
    // RoPE at head_dim 64: qk is n_q q heads then (qkLen / 64 - n_q) k
    // heads of 64 contiguous floats, cs the 64-float cos[32] | sin[32] row
    // of one position; y receives the rotated copy.
@@ -698,6 +775,18 @@ interface nntr_hvx : remote_handle64 {
                          rout sequence<float> y,
                          rout sequence<uint32> stats);
 
+   // [57 section 9.7] The lm_head of one row as one call: x (K floats)
+   // normed by gamma (K floats, or empty for none) with eps, quantized
+   // once in the CPU's Q4_0 FC order (hvx_q4m1_prep), then every slice h[p]
+   // (registered or attached Q4M1 weights of K columns, in vocab order)
+   // into its rows of y, and y capped by softcap * tanh(y / softcap)
+   // (hvx_softcap_f32; 0 for none). y is the slices' rows summed. A model
+   // path, unlike fc_q4m1_f32: AEE_EINVALIDFORMAT for a bad shape,
+   // AEE_EBADITEM for a bad handle.
+   AEEResult lm_head_q4m1_f32(in float eps, in sequence<float> gamma,
+                              in float softcap, in sequence<uint32> h,
+                              in sequence<float> x, rout sequence<float> y);
+
    // The FC's vector quantizer (hvx_q4m1_prep, = q8_0_quant_cpu_det, the
    // CPU's nntr_quantize_row_q8_0): xLen % 64 == 0, <= 8192 floats into
    // xLen int8 and xLen/32 f16 scales.
@@ -719,7 +808,9 @@ interface nntr_hvx : remote_handle64 {
    // res (7): [hmx_locked, vtcm_size bytes, vtcm_avail_kib, vtcm_max_page_kib
    // (HAP_query_avail_VTCM now), heap_used_kib ([#132 Part B E5g] the PD's
    // heap in use, HAP_mem_get_stats; 0 without it), open_path (0 full, 1
-   // lite: no HMX lock, VTCM from HAP_compute_res), hvx_units].
+   // lite: no HMX lock, VTCM from HAP_compute_res), hvx_units]; with 8
+   // slots, res[7] is the fp16 HMX rate hexkl_micro_hw_init reported (0:
+   // none), which bounds every fp16 / quantized attention plan.
    AEEResult session_info(rout sequence<uint32> res);
 
    // One side of a DSP-to-DSP hop through a shared page (nntr_hvx_mailbox.c):
@@ -965,6 +1056,11 @@ interface nntr_hvx : remote_handle64 {
 
    AEEResult kv_release_q(in uint32 kv_handle);
 
+   // Fixed quantization scales for a registered cache: s_k [n_head_kv],
+   // s_v [n_head_kv][head_dim]. See hexkl_kv_q_set_fixed_scales.
+   AEEResult kv_set_fixed_scales_q(in uint32 kv_handle, in sequence<float> s_k,
+                                   in sequence<float> s_v);
+
    AEEResult kv_append_q(in uint32 kv_handle, in uint32 row0,
                          in sequence<uint16> k_rows,
                          in sequence<uint16> v_rows);
@@ -1032,6 +1128,85 @@ interface nntr_hvx : remote_handle64 {
                          in sequence<float> q_f32, in sequence<float> sinks,
                          rout sequence<float> out_f32,
                          rout sequence<uint32> stats_us);
+
+   // The convert unit on a real accumulator: act_s (64 x head_dim u8) times
+   // the K^T tiles of (head n, column tile c), then two convert passes with
+   // the fp16 scales scale0_hf / scale1_hf (bias field bias_q on both) into
+   // plane0 / plane1 (2048 u8 each, activation tile layout), their HVX zip
+   // s16 (2048 int16, same layout), and the same accumulator through the
+   // library's int32 drain as the reference.
+   // stats = { cycles per convert pass over n_rep passes, cycles per
+   // library drain }.
+   AEEResult probe_cvt(in uint32 kv_handle, in uint32 n, in uint32 c,
+                       in sequence<uint8> act_s, in uint32 scale0_hf,
+                       in uint32 scale1_hf, in uint32 bias_q, in uint32 n_rep,
+                       rout sequence<uint8> plane0, rout sequence<uint8> plane1,
+                       rout sequence<int16> s16, rout sequence<int32> acc_i32,
+                       rout sequence<uint32> stats);
+
+   // The row-blocked a16/kv8 kernel (hexkl_attn_q2) over a fixed-scale
+   // cache. Same operands as attn_q_prefill without br/bc, softcap or
+   // sinks; Q is the model's u16 tensor with q_enc = n_head_q (scale, zero
+   // point) pairs, the output is u16 with out_enc likewise.
+   // stats_us = { qprep, dma, qk, softmax, pv, epilogue, total, n_blocks,
+   // kcycles, hmx wait, head setup, submit }.
+   AEEResult attn_q2_prefill(in uint32 kv_handle, in uint32 n_q,
+                             in uint32 cache_from, in uint32 cache_to,
+                             in uint32 n_head_q, in uint32 window,
+                             in sequence<uint16> q_u16,
+                             in sequence<float> q_enc,
+                             in sequence<float> out_enc,
+                             rout sequence<uint16> out_u16,
+                             rout sequence<uint32> stats_us);
+
+   // HVX issue-rate probe, n iterations each: stats = { cycles per vadd
+   // (8 independent chains), per Q15 vmpy (8 chains), per exp2 chain of the
+   // softmax (4 chains), per VTCM vector load (8 streams) }.
+   AEEResult probe_hvx_rate(in uint32 n, rout sequence<uint32> stats);
+
+   // attn_q_step's counterpart for the row-blocked kernel over a cache in
+   // fixed-scale mode: appends rows [row0, row0 + n) from k_rows / v_rows
+   // (empty = nothing to append), then hexkl_attn_q2_prefill with the u16
+   // Q / output and their per-head encodings. stats_us = { append us,
+   // attention us, 0, total us, append quantize us, append stage us,
+   // append bake us, rows appended, kernel: qk, softmax, pv, hmx wait }.
+   AEEResult attn_q2_step(in uint32 kv_handle, in uint32 row0,
+                          in sequence<uint16> k_rows, in sequence<uint16> v_rows,
+                          in uint32 n_q, in uint32 cache_from, in uint32 cache_to,
+                          in uint32 n_head_q, in uint32 window,
+                          in sequence<uint16> q_u16, in sequence<float> q_enc,
+                          in sequence<float> out_enc,
+                          rout sequence<uint16> out_u16,
+                          rout sequence<uint32> stats_us);
+
+   // The int8 WH tile permutation (hexkl_kv_q_wh_i8_pos), 1024 entries.
+   AEEResult probe_wh_i8_pos(rout sequence<uint16> pos);
+
+   // The HVX integer softmax of one 64-row block over int16 score tiles
+   // (hvx_softmax_q), for the bit-exact check against the scalar
+   // definition the host runs. corr has (n_col_tiles + 1) * 32 entries.
+   // stats = { cycles of the HVX call }.
+   AEEResult probe_softmax_q(in uint32 n_col_tiles, in uint32 col0,
+                             in uint32 n_cols, in uint32 row0, in uint32 n_rows,
+                             in uint32 window, in uint32 rho_q15,
+                             in uint32 frac_bits, in sequence<int16> s_tiles,
+                             in sequence<int16> corr,
+                             rout sequence<uint8> p_tiles,
+                             rout sequence<int32> rowsum,
+                             rout sequence<uint32> stats);
+
+   // The same for the 16-bit P of the a16 contract (hvx_softmax_q16):
+   // P16 leaves as its low and high byte tiles, rowsum holds the P' sums.
+   AEEResult probe_softmax_q16(in uint32 n_col_tiles, in uint32 col0,
+                               in uint32 n_cols, in uint32 row0,
+                               in uint32 n_rows, in uint32 window,
+                               in uint32 rho_q15, in uint32 frac_bits,
+                               in sequence<int16> s_tiles,
+                               in sequence<int16> corr,
+                               rout sequence<uint8> p_lo,
+                               rout sequence<uint8> p_hi,
+                               rout sequence<int32> rowsum,
+                               rout sequence<uint32> stats);
 
    // [doc 54] The 2-bit expert expansion (hvx_expand_i2i4.h). Same reason
    // swiglu_det_f32 exists: the HVX form rests on an unverified reading of

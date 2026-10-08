@@ -515,7 +515,8 @@ static void softcap_lane(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
-void hvx_softcap_f32(float *x, uint32_t n, float cap, hvx_worker_pool *pool) {
+void hvx_softcap_m1_f32(float *x, uint32_t n, float cap,
+                        hvx_worker_pool *pool) {
   /* one IEEE RN divide, cpu_det_div_rn's result (hvx_swiglu_cpu_f32) */
   volatile float inv = 1.0f / cap;
   softcap_ctx c = {x, n, inv, cap};

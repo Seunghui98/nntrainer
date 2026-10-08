@@ -80,7 +80,7 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (resLen != 7) {
+  if (resLen != 7 && resLen != 8) {
     return AEE_EINVALIDFORMAT;
   }
   if (HAP_query_avail_VTCM) {
@@ -100,6 +100,9 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
   }
   res[5] = s->open_path;
   res[6] = (uint32)((qurt_hvx_get_units() >> 8) & 0xFF);
+  if (resLen == 8) {
+    res[7] = s->hmx_fp16_rate;
+  }
   return AEE_SUCCESS;
 }
 
@@ -311,6 +314,7 @@ int nntr_hvx_close(remote_handle64 handle) {
   }
   hvx_worker_pool_destroy(s->quant_pool);
   free(s->fc_l2);
+  free(s->norm_rows);
   if (s->vtcm_ctx) {
     HAP_compute_res_release(s->vtcm_ctx);
   }

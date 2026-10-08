@@ -5,7 +5,7 @@
   "fc_layer_dtype": "FP32",
   "init_seq_len": 4,
   "lmhead_dtype": "FP32",
-  "max_seq_len": 8,
+  "max_seq_len": 16,
   "model_file_name": "nntr_gemma4_moe_tiny_fp32.bin",
   "model_tensor_type": "FP32-FP32",
   "model_type": "CausalLM",

@@ -1,0 +1,12 @@
+# e6a2022b, cfgB with num_to_generate 1, cool 2 min between, NNTR_MOE_PREFETCH alternated
+## moe_pf1.log
+prefill: 1024 tokens, 4531 ms, 225.999 TPS
+[HTP-PROFILE]   K=2816  N=2816  M>1        calls=31      rows=31232    host=   1540.8 ms (49704.5 us/call)
+[HTP-PROFILE] expert cache misses: 224, file read 561.4 ms (2.51 ms/miss), swap rpc 3.5 ms (0.02 ms/miss)
+[HTP-PROFILE] expert prefetch: 3360 experts read under the layer calls, exposed wait 0.0 ms (0.00 ms/expert), register rpc 28.2 ms (0.01 ms/expert)
+[HTP-PROFILE] expert prefetch progress: 3360 of 3360 read when their layer asked (100%), caller cpus {6}, reader cpus {0,1,2,3,4,5,7}
+[HTP-PROFILE] expert prefetch readers: 3.94 ms/expert on a reader, 3360 experts
+## moe_pf0.log
+prefill: 1024 tokens, 11482 ms, 89.1831 TPS
+[HTP-PROFILE]   K=2816  N=2816  M>1        calls=31      rows=31232    host=   1439.1 ms (46421.0 us/call)
+[HTP-PROFILE] expert cache misses: 3033, file read 7890.5 ms (2.60 ms/miss), swap rpc 29.3 ms (0.01 ms/miss)

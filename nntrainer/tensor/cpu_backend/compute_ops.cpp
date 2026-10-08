@@ -215,8 +215,28 @@ void ComputeOps::gemm_qs4cx_moe_layer_fp32(
   const std::vector<void *> &, const std::vector<float *> &,
   const std::vector<unsigned int> &, const std::vector<unsigned int> &,
   const std::vector<float> &, const float *, float *, unsigned int,
-  unsigned int, unsigned int, unsigned int, unsigned int) {
+  unsigned int, unsigned int, unsigned int, unsigned int, bool, const float *,
+  const float *, float) {
   NI(gemm_qs4cx_moe_layer_fp32);
+}
+void ComputeOps::gemm_q4_0_batch_norm_fp32(
+  std::vector<void *>, std::vector<float *>, float *, std::vector<float *>,
+  unsigned int, std::vector<unsigned int>, unsigned int, const float *,
+  const std::vector<unsigned int> &, const float *, float, const float *,
+  unsigned int, unsigned int) {
+  NI(gemm_q4_0_batch_norm_fp32);
+}
+void ComputeOps::rmsnorm_add_fp32(unsigned int, unsigned int, const float *,
+                                  const float *, const float *, const float *,
+                                  float, float, float *) {
+  NI(rmsnorm_add_fp32);
+}
+void ComputeOps::router_logits_fp32(unsigned int, unsigned int, unsigned int,
+                                    const float *, const float *, float,
+                                    const float *, float *, unsigned int,
+                                    unsigned int, const float *, unsigned int *,
+                                    float *) {
+  NI(router_logits_fp32);
 }
 void ComputeOps::gemm_q4_K_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,

@@ -145,9 +145,9 @@ per-token decode. Branch:
 
 - Q6 (model-level timing, long context): Qwen3-0.6B, a 3083-token prompt
   plus 32 greedy tokens, `init_seq_len` 4096, NNTR_NUM_THREADS=4, the same
-  device. Per-call numbers come from `NNTR_HTP_ATTN_TRACE=1`, which logs
-  every attention call's host wall time and the skel's stats to logcat
-  (`HtpComputeOps`).
+  device. Per-call numbers were taken with a temporary trace of every
+  attention call (host wall time plus the skel's stats) that is not part
+  of the tree.
 
   | path | prefill (3083 tok) | generation (32 tok) | attention per layer: prefill / decode (host wall) |
   |---|---|---|---|
@@ -158,7 +158,7 @@ per-token decode. Branch:
   Both DSP paths reproduce the CPU's text; int8 agrees for 27 of the 32
   tokens and then continues with a different, plausible clause, the same
   in every run (the scheme's ~40 dB at 3k rows, deterministic). What the
-  trace says:
+  per-call numbers say:
   - **fp16 prefill is tile-conversion-bound.** Of a layer's 3.68 s, 3.59 s
     is the kernel's tile phase: the raw path converts every K/V block to
     the HMX layout again for each of the 97 query blocks (5096 block
@@ -418,7 +418,7 @@ CPU path over the fp16 cache, exactly as today. Batch > 1: one handle per
 | Q4 | `hvx_attn_decode_q`: both kinds from the same offset-binary masters, Q and P' as 4 uint8 in a scalar register against `vrmpy(Vub, Rub)`, f32 softmax with all-lanes-equal running state, nothing touches VTCM | done: DSP vs model 69-137 dB; 5.0x / 4.05x faster than the fp16 decode at 1x1024 / 1x4096 |
 | Q5 | `ComputeOps::kv_cache_q_{register,append,release}` + `sdpa_q_kvcache`, `HtpComputeOps` forwarding, `MHACoreLayer` `kv_cache_quant` property with a per-batch mirror that re-appends from the first row that may differ (rewind, cache load), `attention_kv_dtype` in nntr_config.json, `Transformer::createAttentionCore` | done: Qwen3-0.6B on device, identical greedy tokens for CPU / HTP fp16 / HTP int8 |
 | Q5b | One FastRPC call per layer per step for the quantized path (append + attend), direct WH-tile writes for int8 from a probed layout, HVX quantizer for appended rows | done: int8 append 1.45 ms -> 30 us per row; model-level generation 3181 -> 1136 ms, at parity with the fp16 path (1164) |
-| Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4 -- kernel numbers are in the Q2b / Q4 notes; model-level table at 3083 + 32 tokens in the Q6 note, with `NNTR_HTP_ATTN_TRACE` per-call tracing | done: int8 prefill 31.8 s vs CPU 34.6 s vs fp16 125 s; decode 135 / 74 / 275 ms per token |
+| Q6 | Device timing table (prefill 128x1024, 32x4096; decode 1x1024, 1x4096) for f16 / q8 / q4 -- kernel numbers are in the Q2b / Q4 notes; model-level table at 3083 + 32 tokens in the Q6 note | done: int8 prefill 31.8 s vs CPU 34.6 s vs fp16 125 s; decode 135 / 74 / 275 ms per token |
 
 ## 5. Risks
 - **Accumulator layout**: the probe may find a non-affine layout on v81;

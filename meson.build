@@ -95,9 +95,12 @@ warning_cxx_flags = [
   '-Wdefaulted-function-deleted'
 ]
 
+# No -Wmissing-include-dirs for C: a cmake subproject's include dirs (e.g.
+# iniparser's __CMake_build) are absent on builds that take the system
+# package, and with -Werror the first C source in libnntrainer
+# (hexkl_kv_q.c, #4415) stopped the build there.
 warning_c_flags = [
   '-Wmissing-declarations',
-  '-Wmissing-include-dirs',
   '-Wmissing-prototypes',
   '-Wnested-externs',
   '-Wold-style-definition'

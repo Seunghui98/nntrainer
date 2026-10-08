@@ -138,6 +138,7 @@ LOCAL_SRC_FILES := \
     ../models/lfm2_moe/lfm2_slim_moe_causallm.cpp \
     ../models/lfm2_moe/lfm2_cached_slim_moe_causallm.cpp \
     ../models/lfm2_moe/lfm2_moe_layer.cpp \
+    ../models/lfm2_moe/lfm2_moe_pool_layer.cpp \
     ../models/lfm2_moe/lfm2_moe_layer_fsu.cpp \
     ../models/lfm2_moe/lfm2_moe_layer_cached.cpp \
     ../models/gemma3/function.cpp \
@@ -184,6 +185,22 @@ LOCAL_MODULE := nntrainer_causallm
 LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := ../main.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
+
+include $(BUILD_EXECUTABLE)
+
+# Build gemma4_attn_bench executable (one Gemma-4 attention layer, timed)
+include $(CLEAR_VARS)
+
+LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_MODULE := gemma4_attn_bench
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := ../bench/gemma4_attn_bench.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -266,6 +283,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/lfm2_moe/lfm2_slim_moe_causallm.cpp \
     ../models/lfm2_moe/lfm2_cached_slim_moe_causallm.cpp \
     ../models/lfm2_moe/lfm2_moe_layer.cpp \
+    ../models/lfm2_moe/lfm2_moe_pool_layer.cpp \
     ../models/lfm2_moe/lfm2_moe_layer_fsu.cpp \
     ../models/lfm2_moe/lfm2_moe_layer_cached.cpp \
     ../models/gemma3/function.cpp \

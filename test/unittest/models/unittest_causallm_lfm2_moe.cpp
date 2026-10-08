@@ -47,7 +47,7 @@ void setupLfm2MoeDeterministicWeights(TinyLfm2MoeCausalLM &model) {
       if (layer.getName() == "output_of_causallm")
         return;
 
-      if (layer.getType() == "lfm2_moe") {
+      if (layer.getType() == "lfm2_moe_pool") {
         // Zero every FP32 weight (gate, expert_bias, expert projections) so the
         // MoE branch contributes zero to the residual stream.
         for (unsigned int i = 0; i < context.getNumWeights(); ++i) {

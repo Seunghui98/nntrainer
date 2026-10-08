@@ -222,6 +222,79 @@ public:
   // CPU subclasses leave both the impl (default-throw) and predicate
   // (default false) untouched. Accelerator subclasses override both.
   // ===========================================================================
+  // gemm_q4_0_batch_fp32 with the RMSNorms a block runs around its
+  // projections folded into the same accelerator call (doc 57 section 5
+  // step 4), so the rows do not leave the accelerator for them: pre_gamma
+  // (K floats, or nullptr) norms every activation row before the
+  // quantizer; post_chunk[i] (one per weight; 0 = none) and post_gamma
+  // (the chunks of every normed weight in call order, concatenated) norm
+  // weight i's output rows per post_chunk[i]-wide piece, in place. eps
+  // for both. A backend without it says so and the layer norms itself.
+  // matAscale: empty for Q4_0 weights, else one QS4CX per-channel scale
+  // region per weight (gemm_qs4cx_accel_fp32's form: quantized offline,
+  // no Q4_0 detour). rope_cs / rope_hd / rope_weights: after the norms,
+  // RoPE per head of rope_hd on the outputs of the first rope_weights
+  // weights (q and k), rope_cs being M rows of 2*rope_hd floats -- the
+  // CPU table's cos row then sin row for each row's position; rope_hd 0
+  // for none.
+  virtual bool supports_gemm_q4_0_batch_norm_fp32() const { return false; }
+  virtual void gemm_q4_0_batch_norm_fp32(
+    std::vector<void *> matAdata, std::vector<float *> matAscale,
+    float *matBdata, std::vector<float *> matCdata, unsigned int M,
+    std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
+    const std::vector<unsigned int> &post_chunk, const float *post_gamma,
+    float eps, const float *rope_cs = nullptr, unsigned int rope_hd = 0,
+    unsigned int rope_weights = 0);
+
+  // The decoder block's epilogue as one accelerator call (doc 57 section
+  // 5 step 4): out = scale * (resid + rmsnorm(x [+ x2]) * gamma) over M
+  // rows of N floats, the whole-row norm of the summed addend. x2 nullptr
+  // for one addend, gamma nullptr for 1. A backend without it says so and
+  // the layer runs the three ops itself.
+  virtual bool supports_rmsnorm_add_fp32() const { return false; }
+  virtual void rmsnorm_add_fp32(unsigned int M, unsigned int N,
+                                const float *resid, const float *x,
+                                const float *x2, const float *gamma, float eps,
+                                float scale, float *out);
+
+  // The MoE router's logits at prefill shapes (doc 57 section 5 step 5):
+  // logits[M][E] = rmsnorm(x)[M][K] . w[K][E] in f32, gamma (K floats)
+  // for the router's own norm or nullptr for none. E a multiple of 32 up
+  // to 128. top_k > 0 (the softmax router) adds the selection: logits
+  // then holds the softmax probabilities, sel the n_sel largest per row
+  // (descending, an exact tie to the lower index, the layer's own rule)
+  // and weight the first top_k's p * (1 / their sum) * scale[e].
+  virtual bool supports_router_logits_fp32() const { return false; }
+  virtual void
+  router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
+                     const float *x, const float *gamma, float eps,
+                     const float *w, float *logits, unsigned int top_k = 0,
+                     unsigned int n_sel = 0, const float *scale = nullptr,
+                     unsigned int *sel = nullptr, float *weight = nullptr);
+
+  // The lm_head of one row (doc 57 section 9.7): y (N floats) = the Q4_0
+  // weight w (N rows of K, canonical block_q4_0 -- a tied embedding's own
+  // bytes) times rmsnorm(x) * gamma (gamma nullptr: x as it is), then
+  // softcap * tanh(y / softcap) (softcap 0: none). False when the backend
+  // cannot run it (no such call, a shape it does not take, or a weight it
+  // could not place); the caller then runs the same three on the CPU.
+  virtual bool lm_head_q4_0_fp32(const void *w, unsigned int K, unsigned int N,
+                                 const float *x, const float *gamma, float eps,
+                                 float softcap, float *y) {
+    (void)w, (void)K, (void)N, (void)x, (void)gamma, (void)eps, (void)softcap,
+      (void)y;
+    return false;
+  }
+  /** @brief Places the lm_head weight for lm_head_q4_0_fp32 ahead of the
+   *  first call (at load, after every other weight: the arena order), so
+   *  the first prefill does not pay for it. True when the calls will run
+   *  here; false leaves the caller on its own path. */
+  virtual bool lm_head_q4_0_prepare(const void *w, unsigned int K,
+                                    unsigned int N) {
+    (void)w, (void)K, (void)N;
+    return false;
+  }
+
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,
@@ -237,6 +310,10 @@ public:
   // touching CPU/GPU's existing M > 1 behavior, which is intentional and
   // must not change.
   virtual bool accelerates_q4_0_at_m1() const { return false; }
+  // The same question for QS4CX weights, answered separately: a backend
+  // that holds them in its own format may prefer every row, decode's one
+  // included, over a CPU path in another format (doc 57 section 5).
+  virtual bool accelerates_qs4cx_at_m1() const { return false; }
 
   // QS4CX weights reach an accelerator without the Q4_0 detour: a model
   // quantized straight from FP32 into QS4CX carries the same int4 values
@@ -301,23 +378,27 @@ public:
   //
   // w_bits says how the nibbles are stored: 0 = plain QS4CX (the backend
   // converts), 4 = QS4CX_WH (already in the HMX weight-tile layout),
-  // 2 = QS2CX_WH (half that, expanded on the DSP -- doc 54)
+  // 2 = QS2CX_WH (half that, expanded on the DSP -- doc 54); 1 reads as 4
+  // (#4415's lfm2_moe passes its bool weights_wh here)
   // (htp_wh_layout.h) with a per-output-channel column sum after the scales,
   // so the implementation registers them as they are instead of converting
   // and baking. It is a flag rather than a colsum pointer because the sums
   // sit immediately after the scales and the callee already knows N.
+  //
+  // gelu says the gated activation between gate_up and down is
+  // gelu_tanh(g)*u (Gemma-4) rather than silu(g)*u (LFM2).
   virtual bool supports_gemm_qs4cx_moe_layer_fp32() const { return false; }
-  virtual void
-  gemm_qs4cx_moe_layer_fp32(const std::vector<void *> &gate_up_data,
-                            const std::vector<float *> &gate_up_scale,
-                            const std::vector<void *> &down_data,
-                            const std::vector<float *> &down_scale,
-                            const std::vector<unsigned int> &row_index,
-                            const std::vector<unsigned int> &row_count,
-                            const std::vector<float> &row_weight,
-                            const float *act, float *out, unsigned int M,
-                            unsigned int K, unsigned int inter,
-                            unsigned int N_out, unsigned int w_bits);
+  virtual void gemm_qs4cx_moe_layer_fp32(
+    const std::vector<void *> &gate_up_data,
+    const std::vector<float *> &gate_up_scale,
+    const std::vector<void *> &down_data,
+    const std::vector<float *> &down_scale,
+    const std::vector<unsigned int> &row_index,
+    const std::vector<unsigned int> &row_count,
+    const std::vector<float> &row_weight, const float *act, float *out,
+    unsigned int M, unsigned int K, unsigned int inter, unsigned int N_out,
+    unsigned int w_bits, bool gelu = false, const float *pre_gamma = nullptr,
+    const float *post_gamma = nullptr, float eps = 0.0f);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate
@@ -340,6 +421,20 @@ public:
     (void)K;
     (void)N;
     (void)canonical;
+    return false;
+  }
+
+  // [#260] add_decode_graph_q4_0 for a QS4CX FC or dense FFN weight (K x N
+  // codes, @a scale its N per-column f32 scales), in the same list order.
+  // The backend binds the handles its prefill registers from the same bytes
+  // (one image set); no Q4M1 or CPU fallback. Returns false when it takes
+  // none.
+  virtual bool add_decode_graph_qs4cx(const void *data, const float *scale,
+                                      unsigned K, unsigned N) {
+    (void)data;
+    (void)scale;
+    (void)K;
+    (void)N;
     return false;
   }
 
@@ -565,15 +660,31 @@ public:
 
   // The dense SwiGLU FFN as ONE accelerator call (doc 51): up and gate
   // [K x I] and down [I x N], all Q4_0x4 as loaded; act [M x K] f32 ->
-  // out [M x N] f32 = (silu(act . gate) * (act . up)) . down. The HTP
-  // answers it with its MoE layer kernel over column chunks of I, each
-  // chunk a whole "expert" whose down output is summed into out.
+  // out [M x N] f32 = (silu(act . gate) * (act . up)) . down, or with
+  // gelu, (gelu_tanh(act . gate) * (act . up)) . down. The HTP answers it
+  // with its MoE layer kernel over column chunks of I, each chunk a whole
+  // "expert" whose down output is summed into out.
   // register_q4_0_dense_ffn is the load-time twin, like the two above.
   virtual bool supports_gemm_q4_0_dense_ffn_fp32() const { return false; }
-  virtual void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
-                                        const float *act, float *out,
-                                        unsigned int M, unsigned int K,
-                                        unsigned int I, unsigned int N) {
+  // pre_gamma (K floats) / post_gamma (N floats), nullptr for none, and
+  // eps: the RMSNorms before and after the block, folded into the call as
+  // gemm_q4_0_batch_norm_fp32 folds them. up_scale / gate_scale /
+  // down_scale: non-null when the three weights are QS4CX (their
+  // per-channel scales), null for Q4_0.
+  virtual void gemm_q4_0_dense_ffn_fp32(
+    void *up, void *gate, void *down, const float *act, float *out,
+    unsigned int M, unsigned int K, unsigned int I, unsigned int N,
+    bool gelu = false, const float *pre_gamma = nullptr,
+    const float *post_gamma = nullptr, float eps = 0.0f,
+    const float *up_scale = nullptr, const float *gate_scale = nullptr,
+    const float *down_scale = nullptr) {
+    (void)gelu;
+    (void)pre_gamma;
+    (void)post_gamma;
+    (void)eps;
+    (void)up_scale;
+    (void)gate_scale;
+    (void)down_scale;
     (void)up;
     (void)gate;
     (void)down;
@@ -588,7 +699,13 @@ public:
   }
   virtual bool register_q4_0_dense_ffn(void *up, void *gate, void *down,
                                        unsigned int K, unsigned int I,
-                                       unsigned int N) {
+                                       unsigned int N,
+                                       const float *up_scale = nullptr,
+                                       const float *gate_scale = nullptr,
+                                       const float *down_scale = nullptr) {
+    (void)up_scale;
+    (void)gate_scale;
+    (void)down_scale;
     (void)up;
     (void)gate;
     (void)down;
@@ -746,6 +863,60 @@ public:
   }
 
   virtual void kv_cache_q_release(int handle) { (void)handle; }
+
+  /**
+   * @brief The row-blocked int8 attention (hexkl_attn_q2) over a cache in
+   *        fixed-scale mode: K one scale per KV head, V one per (KV head,
+   *        dim), Q one per query head, all given by the caller as a
+   *        quantized model's encodings give them. kv_cache_q_set_fixed_scales
+   *        must be called once after kv_cache_q_register and before the
+   *        first append; sdpa_q2_kvcache then has sdpa_q_kvcache's contract
+   *        with the per-head Q scales added and softcap / sinks removed
+   *        (neither exists in the models this path serves). head_dim up to
+   *        512.
+   */
+  virtual bool supports_kv_cache_q2() const { return false; }
+  virtual bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
+                                           unsigned int head_dim,
+                                           const float *s_k, const float *s_v) {
+    (void)handle;
+    (void)n_head_kv;
+    (void)head_dim;
+    (void)s_k;
+    (void)s_v;
+    return false;
+  }
+  virtual bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
+                               unsigned int append_rows, unsigned int kv_stride,
+                               const uint16_t *k_rows, const uint16_t *v_rows,
+                               const uint16_t *q, const float *q_enc,
+                               unsigned int q_stride, unsigned int n_q,
+                               unsigned int cache_from, unsigned int cache_to,
+                               unsigned int n_head_q, unsigned int n_head_kv,
+                               unsigned int head_dim, unsigned int window,
+                               uint16_t *out, const float *out_enc,
+                               unsigned int out_stride) {
+    (void)handle;
+    (void)append_row0;
+    (void)append_rows;
+    (void)kv_stride;
+    (void)k_rows;
+    (void)v_rows;
+    (void)q;
+    (void)q_enc;
+    (void)q_stride;
+    (void)n_q;
+    (void)cache_from;
+    (void)cache_to;
+    (void)n_head_q;
+    (void)n_head_kv;
+    (void)head_dim;
+    (void)window;
+    (void)out;
+    (void)out_enc;
+    (void)out_stride;
+    return false;
+  }
 
   /**
    * @brief sdpa_fp16_kvcache() over a registered quantized cache, with the

@@ -26,6 +26,7 @@
 #include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
+#include <memory>
 
 namespace causallm {
 
@@ -49,6 +50,49 @@ public:
   using prop_tag = nntrainer::uint_prop_tag;
 };
 
+/** v_norm: a gamma-less per-head RMS norm on v (feature_size wide, the
+ *  same kernel as q and k without the multiply) */
+class VNorm : public nntrainer::Property<bool> {
+public:
+  VNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "v_norm";
+};
+
+/** v_from_k: no v weight; v is the raw k projection, before k_norm (a
+ *  model whose attention has K == V). Needs feature_size. */
+class VFromK : public nntrainer::Property<bool> {
+public:
+  VFromK(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "v_from_k";
+};
+
+/** q_scale: multiplied into q after its norm (folded into the gamma
+ *  multiply), e.g. sqrt(head_dim) for a model whose attention scaling is
+ *  1.0 against a core that divides by sqrt(head_dim) */
+class QScale : public nntrainer::Property<float> {
+public:
+  QScale(float val = 1.0f) : nntrainer::Property<float>(val) {}
+  using prop_tag = nntrainer::float_prop_tag;
+  static constexpr const char *key = "q_scale";
+};
+
+/**
+ * @brief rope: RoPE on q and k after their norms, with rope_theta,
+ *        rope_scaling_type (default or proportional),
+ * rope_partial_rotary_factor and max_timestep (the table's rows) as the
+ * attention core takes them -- whose use_rope is then off. The head dim is
+ * feature_size. On the accelerator it rides the projection call; on the CPU it
+ * is the attention core's own kernel over the same table.
+ */
+class Rope : public nntrainer::Property<bool> {
+public:
+  Rope(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "rope";
+};
+
 } // namespace props
 
 /**
@@ -65,6 +109,13 @@ public:
  * order, q, q_norm's gamma, k, k_norm's gamma, v, and applies the same
  * rms_norm_wrt_width + gamma multiply ReshapedRMSNormLayer would; the
  * outputs are q_normed, k_normed, v. Without it: q, k, v as they are.
+ * v_norm adds the gamma-less norm on v, q_scale a factor on q after its
+ * norm, and v_from_k drops the v weight and takes v from the raw k
+ * projection -- the three things one model's attention does around the
+ * projections, folded in so one call still covers the block. in_norm
+ * folds the block's input RMSNorm in too (its gamma leads the weights).
+ * On an accelerator with gemm_q4_0_batch_norm_fp32 every norm here rides
+ * the projection call; on the CPU they are the same kernels in sequence.
  */
 WIN_EXPORT class QKVLayer : public nntrainer::LayerImpl {
 public:
@@ -157,11 +208,26 @@ public:
 private:
   /** feature_size: the head dim q and k are normed over; unset = no norm */
   std::tuple<props::QUnit, props::KUnit, props::VUnit, props::FeatureSize,
-             nntrainer::props::Epsilon>
+             nntrainer::props::Epsilon, props::VNorm, props::VFromK,
+             props::QScale, props::InNorm, props::Rope, props::RopeTheta,
+             props::RopeScalingType, props::RopePartialRotaryFactor,
+             nntrainer::props::MaxTimestep, props::NormInCall>
     qkv_props;
-  std::array<unsigned int, 5> weight_idx; /**< q, [q_gamma,] k, [k_gamma,] v */
-  std::array<unsigned int, 2> tensor_idx; /**< q and k before the norm */
+  std::array<unsigned int, 6>
+    weight_idx; /**< [in_gamma,] q, [q_gamma,] k, [k_gamma,] v */
+  std::array<unsigned int, 4>
+    tensor_idx; /**< q, k (and v) before the norm; the normed input */
+  bool in_norm = false;
+  bool norm_in_call = true; /**< props::NormInCall */
   unsigned int feature_size = 0;
+  bool v_norm = false;
+  bool v_from_k = false;
+  float q_scale = 1.0f;
+  bool rope = false;
+  unsigned int rope_rows = 0; /**< positions the table holds */
+  /** [pos][cos row (feature_size, halves duplicated) | sin row], shared by
+   *  every layer of the same shape */
+  std::shared_ptr<const std::vector<float>> rope_table;
 };
 
 } // namespace causallm

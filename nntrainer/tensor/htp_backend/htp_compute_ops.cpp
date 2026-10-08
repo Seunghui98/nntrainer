@@ -43,6 +43,7 @@
 #ifdef ENABLE_HEXKL
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <cpu_ops_table.h>
 #include <htp_act_quant.h>
 #include <htp_backend.h>
@@ -1223,6 +1224,19 @@ public:
   // dot(), not a MoE stack) and saves the one MoE FFN caller from a
   // documented loss.
   bool accelerates_q4_0_at_m1() const override { return false; }
+  // QS4CX weights live on the DSP in their own format and nowhere else
+  // once the FCs are quantized to it offline (doc 57 section 5): decode's
+  // row goes to the same kernel as prefill, 64-row pad tax and all (one
+  // call per FC, a few ms a token), rather than to a CPU kernel on another
+  // packing of the same bytes. [#260] Except under the one-PD token
+  // (NNTR_HTP_E2E=1): a decode row is the token's, and the layers' hooks
+  // that hand it over (qkv's input norm first) sit on their row path.
+  // ponytail: process-wide, so a decode row the token does not take (a
+  // moe_htp_layers subset) runs its QS4CX FCs on the CPU kernel; a
+  // per-row answer needs the hook's verdict before qkv's fused call.
+  bool accelerates_qs4cx_at_m1() const override {
+    return !HtpBackend::e2eRequested();
+  }
 
   /** @brief The handles one conv block is registered as: in_proj's column
    *  thirds a, b, c (get_or_register_fc's slices at this model's K) and
@@ -1262,19 +1276,12 @@ public:
     // stay in the tree, unused, in case a caller that is not this one
     // ever legitimately arrives with pre-quantized bytes already in hand.
     //
-    // In row chunks of fcRowStep: the VTCM cap (fcMaxRows) -- the dense
-    // FFN's down projection is K = 7168, 3.1 MiB of u8 rows at M = 444 and
-    // 7 at M = 1024 -- and prefillRows(), so the hybrid's qkv / o_proj at
-    // P1024 stage 512-row buffers like every other prefill call (#236).
-    // Each chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms.
-    const unsigned int step = fcRowStep(K);
-    for (unsigned int m0 = 0; m0 < M; m0 += step) {
-      const unsigned int m = std::min(step, M - m0);
-      invokeLayer(session, fh.handles.data(),
-                  static_cast<int>(fh.handles.size()),
-                  matBdata + static_cast<size_t>(m0) * K,
-                  matCdata + static_cast<size_t>(m0) * N, m, N, K, &fh.cols);
-    }
+    // In row chunks when the activation would not fit VTCM beside the
+    // slice double buffer (fcMaxRows): the dense FFN's down projection is
+    // K = 7168, 3.1 MiB of u8 rows at M = 444 and 7 at M = 1024. Each
+    // chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms;
+    // one call covers every K = 2048 weight up to 1,920 rows.
+    invokeFc(session, fh, matBdata, matCdata, M, N, K);
   }
 
   /** @brief Rows one layer call may carry at this K.
@@ -1294,16 +1301,6 @@ public:
       static_cast<unsigned int>((kVtcmBudget - kSliceDouble) / K);
     rows -= rows % 64u;
     return rows < 64u ? 64u : rows;
-  }
-
-  /** @brief [#236] Rows per FC call: fcMaxRows(K), capped at prefillRows()
-   *  when that is set, so no M > 1 FC asks FastRPC for staging classes the
-   *  other prefill entries never use (#225's P1024 qkv died at M = 1024 with
-   *  AEE_ERPC). Rows are independent in the layer kernel, so the chunks'
-   *  bytes are the whole call's (fc_layer_host_check). */
-  static unsigned int fcRowStep(unsigned int K) {
-    const unsigned int cap = fcMaxRows(K);
-    return prefillRows() != 0 ? std::min(cap, prefillRows()) : cap;
   }
 
   // Several Q4_0 weights that share ONE activation -- LFM2-MoE decode's
@@ -1349,8 +1346,8 @@ public:
     // M == 1, and the attention q/k/v projections at prefill (qkv_layer,
     // doc 51 section 2.21) -- 444 rows, where a heap copy in between
     // would be 5 MB a call. Row chunks as gemm_q4_0_accel_fp32 makes them,
-    // for the same reasons.
-    const unsigned int step = fcRowStep(K);
+    // for the same VTCM reason.
+    const unsigned int step = fcMaxRows(K);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       std::vector<float *> dsts(n);
@@ -1360,6 +1357,316 @@ public:
                   matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
                   K, &N, &dsts);
     }
+  }
+
+  bool supports_gemm_q4_0_batch_norm_fp32() const override { return true; }
+
+  void gemm_q4_0_batch_norm_fp32(std::vector<void *> matAdata,
+                                 std::vector<float *> matAscale,
+                                 float *matBdata, std::vector<float *> matCdata,
+                                 unsigned int M, std::vector<unsigned int> N,
+                                 unsigned int K, const float *pre_gamma,
+                                 const std::vector<unsigned int> &post_chunk,
+                                 const float *post_gamma, float eps,
+                                 const float *rope_cs, unsigned int rope_hd,
+                                 unsigned int rope_weights) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t n = matAdata.size();
+    if ((!post_chunk.empty() && post_chunk.size() != n) ||
+        (!matAscale.empty() && matAscale.size() != n) ||
+        (rope_hd != 0 && (rope_weights > n || rope_cs == nullptr))) {
+      throw std::invalid_argument(
+        "gemm_q4_0_batch_norm_fp32: one post_chunk / scale per weight, "
+        "rope on a prefix of them");
+    }
+    // Every weight as the column slices gemm_q4_0_accel_fp32 would make
+    // of it (a 2816 x 4096 weight does not fit the VTCM double buffer
+    // whole), all of them one call: handle by handle, the slice's chunk
+    // and its weight's gamma again, and where the slice's rows land.
+    std::vector<uint32_t> handles;
+    std::vector<unsigned int> chunks;
+    std::vector<float> gammas;
+    std::vector<OutSlice> slices;
+    unsigned int n_total = 0;
+    unsigned int rope_slices = 0;
+    const float *g = post_gamma;
+    for (size_t i = 0; i < n; ++i) {
+      const FcHandles &fh =
+        get_or_register_fc(matAdata[i], session, K, N[i],
+                           matAscale.empty() ? nullptr : matAscale[i]);
+      const unsigned int chunk = post_chunk.empty() ? 0u : post_chunk[i];
+      unsigned int c0 = 0;
+      for (size_t j = 0; j < fh.handles.size(); ++j) {
+        const unsigned int cols = fh.cols[j];
+        if ((chunk != 0u && cols % chunk != 0u) ||
+            (rope_hd != 0u && i < rope_weights && cols % rope_hd != 0u)) {
+          throw std::invalid_argument(
+            "gemm_q4_0_batch_norm_fp32: a slice of " + std::to_string(cols) +
+            " columns does not hold whole chunks of " + std::to_string(chunk) +
+            " / heads of " + std::to_string(rope_hd));
+        }
+        if (rope_hd != 0u && i < rope_weights)
+          ++rope_slices;
+        handles.push_back(fh.handles[j]);
+        chunks.push_back(chunk);
+        if (chunk != 0u)
+          gammas.insert(gammas.end(), g, g + chunk);
+        slices.push_back({matCdata[i], N[i], c0, cols});
+        c0 += cols;
+        n_total += cols;
+      }
+      if (chunk != 0u)
+        g += chunk;
+    }
+    FusedNorms norms;
+    norms.pre_gamma = pre_gamma;
+    norms.post_chunk = post_chunk.empty() ? nullptr : &chunks;
+    norms.post_gamma = gammas.data();
+    norms.eps = eps;
+    norms.rope_hd = rope_hd;
+    norms.rope_handles = rope_slices;
+    // Both norms and the RoPE are per row, so the row chunks
+    // gemm_q4_0_batch_fp32 makes for VTCM carry them unchanged (the table
+    // rows advance with the activation rows).
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      std::vector<OutSlice> rows = slices;
+      for (OutSlice &o : rows)
+        o.dst += static_cast<size_t>(m0) * o.stride;
+      // The table rows through ION like the activation: a plain host
+      // pointer is pinned and mapped by the driver every call (~155 MB/s,
+      // doc 34 section 4 item F), 1-2 MB a prefill layer here.
+      norms.rope_cs = nullptr;
+      if (rope_hd) {
+        const size_t bytes =
+          static_cast<size_t>(m) * 2 * rope_hd * sizeof(float);
+        float *cs = reinterpret_cast<float *>(stage(rope_pool_, bytes).data());
+        stagedMemcpy(cs, rope_cs + static_cast<size_t>(m0) * 2 * rope_hd,
+                     bytes);
+        norms.rope_cs = cs;
+      }
+      invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
+                  matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
+                  K, nullptr, nullptr, &norms, &rows);
+    }
+  }
+
+  // The block epilogue (see the base declaration): the residual rides the
+  // out staging buffer in and the result out, the addends the act buffer
+  // (x then x2), gamma as a plain host pointer like the fused norms'.
+  bool supports_rmsnorm_add_fp32() const override { return true; }
+
+  void rmsnorm_add_fp32(unsigned int M, unsigned int N, const float *resid,
+                        const float *x, const float *x2, const float *gamma,
+                        float eps, float scale, float *out) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t rows = static_cast<size_t>(M) * N;
+    const size_t x_len = x2 ? 2 * rows : rows;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, x_len * sizeof(float)).data());
+    float *res =
+      reinterpret_cast<float *>(stage(out_pool_, rows * sizeof(float)).data());
+    stagedMemcpy(act, x, rows * sizeof(float));
+    if (x2)
+      stagedMemcpy(act + rows, x2, rows * sizeof(float));
+    stagedMemcpy(res, resid, rows * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_rmsnorm_add_f32(
+      session, M, N, eps, scale, gamma, gamma ? static_cast<int>(N) : 0, act,
+      static_cast<int>(x_len), res, static_cast<int>(rows));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_rmsnorm_add_f32 failed: err=" + std::to_string(err) +
+        " (M=" + std::to_string(M) + " N=" + std::to_string(N) + ")");
+    }
+    stagedMemcpy(out, res, rows * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(M, x2 ? 2 * N : N, N, elapsed, nullptr);
+  }
+
+  // The router logits (see the base declaration): the rows through the
+  // act pool, the logits through the out pool, gamma as a plain host
+  // pointer, and the K x E f32 gate weight (1.4 MB at 2816 x 128) from an
+  // ION copy made on its first call and kept by the weight's address --
+  // as a plain pointer it was pinned and mapped every call (doc 57
+  // section 9.10: 9.7 ms a call against the CPU dot's 6).
+  bool supports_router_logits_fp32() const override { return true; }
+
+  const float *routerWeightShared(const float *w, size_t bytes) {
+    auto it = router_w_.find(w);
+    if (it == router_w_.end()) {
+      auto buf = std::make_unique<HtpRpcBuffer>(bytes);
+      std::memcpy(buf->data(), w, bytes);
+      it = router_w_.emplace(w, std::move(buf)).first;
+    }
+    return reinterpret_cast<const float *>(it->second->data());
+  }
+
+  void router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
+                          const float *x, const float *gamma, float eps,
+                          const float *w, float *logits, unsigned int top_k,
+                          unsigned int n_sel, const float *scale,
+                          unsigned int *sel, float *weight) override {
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const size_t x_len = static_cast<size_t>(M) * K;
+    const size_t out_len = static_cast<size_t>(M) * E;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, x_len * sizeof(float)).data());
+    float *out = reinterpret_cast<float *>(
+      stage(out_pool_, out_len * sizeof(float)).data());
+    stagedMemcpy(act, x, x_len * sizeof(float));
+    const float *w_shared =
+      routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    // the selection is small (M x 13 + M x 8 at the softmax router's
+    // width) and goes straight to the caller's arrays
+    static_assert(sizeof(unsigned int) == sizeof(uint32_t), "sel is u32");
+    const int err = nntr_hvx_router_logits_f32(
+      session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w_shared,
+      static_cast<int>(static_cast<size_t>(K) * E), act,
+      static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+      top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
+      reinterpret_cast<uint32_t *>(sel),
+      top_k ? static_cast<int>(M * n_sel) : 0, weight,
+      top_k ? static_cast<int>(M * top_k) : 0);
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_router_logits_f32 failed: err=" + std::to_string(err) +
+        " (M=" + std::to_string(M) + " K=" + std::to_string(K) +
+        " E=" + std::to_string(E) + ")");
+    }
+    stagedMemcpy(logits, out, out_len * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(M, K, E, elapsed, nullptr);
+  }
+
+  // The lm_head (see the base declaration): the canonical Q4_0 rows as
+  // Q4M1 slices of kLmHeadSliceRows -- the same nibbles and scales,
+  // reordered (q4m1_from_q4_0), no requantization -- placed in the arena
+  // on the first call and attached by offset, then one call per row runs
+  // the norm, every slice's GEMV and the softcap. A tied weight is ~415 MB
+  // at a 262144 vocabulary: past the DSP heap (it refused at ~100 MiB), so
+  // the arena or nothing. A placement or attach refused leaves the
+  // lm_head on the CPU for the run, said once on stderr.
+  // ponytail: it is placed after every other weight, in the address space
+  // they leave; a second session's arena (the decode graph's S2) is the
+  // upgrade if the first one has no room on a device.
+  bool lm_head_q4_0_fp32(const void *w, unsigned int K, unsigned int N,
+                         const float *x, const float *gamma, float eps,
+                         float softcap, float *y) override {
+    if (w == nullptr || K == 0 || K % 64 != 0 || K > 8192 || N == 0 ||
+        N % 32 != 0)
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const std::vector<uint32_t> *h = lmHeadHandles(w, session, K, N);
+    if (h == nullptr)
+      return false;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, K * sizeof(float)).data());
+    float *out = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(N) * sizeof(float)).data());
+    stagedMemcpy(act, x, K * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_lm_head_q4m1_f32(
+      session, eps, gamma, gamma ? static_cast<int>(K) : 0, softcap, h->data(),
+      static_cast<int>(h->size()), act, static_cast<int>(K), out,
+      static_cast<int>(N));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_lm_head_q4m1_f32 failed: err=" + std::to_string(err) +
+        " (K=" + std::to_string(K) + " N=" + std::to_string(N) + ")");
+    }
+    stagedMemcpy(y, out, static_cast<size_t>(N) * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(1, K, N, elapsed, nullptr);
+    return true;
+  }
+
+  bool lm_head_q4_0_prepare(const void *w, unsigned int K,
+                            unsigned int N) override {
+    if (w == nullptr || K == 0 || K % 64 != 0 || K > 8192 || N == 0 ||
+        N % 32 != 0)
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    return lmHeadHandles(w, session, K, N) != nullptr;
+  }
+
+  /** @brief The lm_head weight's Q4M1 slice handles, placed on first use;
+   *  nullptr when they could not be (then for good, said once). */
+  const std::vector<uint32_t> *lmHeadHandles(const void *w,
+                                             remote_handle64 session,
+                                             unsigned int K, unsigned int N) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    auto it = lm_head_.find(w);
+    if (it != lm_head_.end())
+      return it->second.ok ? &it->second.h : nullptr;
+    LmHeadSlices lh;
+    const uint8_t *canonical = static_cast<const uint8_t *>(w);
+    const size_t row_bytes = static_cast<size_t>(K / 32u) * Q4_CPU_BLOCK_BYTES;
+    size_t left = 0;
+    for (uint32_t r0 = 0; r0 < N; r0 += kLmHeadSliceRows)
+      left +=
+        q4m1_bytes(K, std::min<uint32_t>(kLmHeadSliceRows, N - r0)) + 4096u;
+    const size_t total = left;
+    const uint64_t t0 = HtpProfile::nowUs();
+    std::string why;
+    for (uint32_t r0 = 0; r0 < N; r0 += kLmHeadSliceRows) {
+      const uint32_t rows = std::min<uint32_t>(kLmHeadSliceRows, N - r0);
+      const uint32_t bytes = static_cast<uint32_t>(q4m1_bytes(K, rows));
+      std::vector<uint8_t> q4m1(bytes);
+      q4m1_from_q4_0(canonical + r0 * row_bytes, K, rows, q4m1.data());
+      uint32_t handle = 0, chunk = 0, off = 0;
+      int err;
+      if (ensureArena(session) && place(session, bytes, left, &chunk, &off)) {
+        std::memcpy(arena_chunks_[chunk].buf->data() + off, q4m1.data(), bytes);
+        err = nntr_hvx_q4m1_attach(session, arena_chunks_[chunk].dsp_id, off, K,
+                                   rows, &handle);
+        if (err != AEE_SUCCESS)
+          why = "q4m1_attach err=" + std::to_string(err);
+      } else {
+        err = nntr_hvx_q4m1_register(session, K, rows, q4m1.data(),
+                                     static_cast<int>(bytes), &handle);
+        if (err != AEE_SUCCESS)
+          why = "no arena room (" + arena_fail_ +
+                "), q4m1_register err=" + std::to_string(err);
+      }
+      if (err != AEE_SUCCESS)
+        break;
+      lh.h.push_back(handle);
+      left = left > bytes + 4096u ? left - bytes - 4096u : 0u;
+    }
+    if (!why.empty()) {
+      for (uint32_t handle : lh.h)
+        nntr_hvx_q4m1_release(session, handle);
+      std::fprintf(stderr,
+                   "[HTP] lm_head stays on the CPU: slice %zu of %u rows "
+                   "refused (%s)\n",
+                   lh.h.size(), N, why.c_str());
+      lm_head_[w] = LmHeadSlices{};
+      return nullptr;
+    }
+    lh.ok = true;
+    std::fprintf(stderr,
+                 "[HTP] lm_head on the NPU: %u x %u Q4_0 as %zu Q4M1 slices, "
+                 "%.1f MiB, placed in %.0f ms\n",
+                 N, K, lh.h.size(), static_cast<double>(total) / (1u << 20),
+                 static_cast<double>(HtpProfile::nowUs() - t0) / 1000.0);
+    return &(lm_head_[w] = std::move(lh)).h;
   }
 
   // A QS4CX weight was quantized once, straight from FP32, and already
@@ -1377,16 +1684,13 @@ public:
                              unsigned int K) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const uint32_t handle =
-      get_or_register_qs4cx(matAdata, matAscale, session, K, N);
-
-    // ponytail: see gemm_q4_0_accel_fp32's identical comment -- reverted
-    // from invokeLayerU8In for the same reason. Row chunks as there.
-    const unsigned int step = fcRowStep(K);
-    for (unsigned int m0 = 0; m0 < M; m0 += step)
-      invokeLayer(session, &handle, 1, matBdata + static_cast<size_t>(m0) * K,
-                  matCdata + static_cast<size_t>(m0) * N,
-                  std::min(step, M - m0), N, K);
+    // Column slices and row chunks as gemm_q4_0_accel_fp32 takes them: one
+    // handle over the whole weight overflows VTCM once it is wider than
+    // fcSliceCols (2816 x 4096 at M = 512 answered AEE_ENOMEMORY). A weight
+    // that fits one slice keeps its handle_cache_ entry, so an expert that
+    // register_qs4cx_weight registered is not registered twice.
+    invokeFc(session, get_or_register_fc(matAdata, session, K, N, matAscale),
+             matBdata, matCdata, M, N, K);
   }
 
   // Same grouping as gemm_q4_0_batch_fp32, for QS4CX weights -- see the
@@ -1413,17 +1717,18 @@ public:
       n_total += N[i];
     }
 
-    // Same row chunks and per-handle blocks as gemm_q4_0_batch_fp32 -- see
-    // that function's comment: mm_u8i4_layer returns one contiguous block
-    // per handle, copyOut hands each weight its block.
-    const unsigned int step = fcRowStep(K);
-    for (unsigned int m0 = 0; m0 < M; m0 += step) {
-      std::vector<float *> dsts(n);
-      for (size_t i = 0; i < n; ++i)
-        dsts[i] = matCdata[i] + static_cast<size_t>(m0) * N[i];
-      invokeLayer(session, handles.data(), static_cast<int>(n),
-                  matBdata + static_cast<size_t>(m0) * K, nullptr,
-                  std::min(step, M - m0), n_total, K, &N, &dsts);
+    // Same stage-then-hand-out shape as gemm_q4_0_batch_fp32 -- see that
+    // function's comment for why: mm_u8i4_layer returns one contiguous
+    // block per handle, matCdata is one pointer per weight.
+    std::vector<float> out_cat(static_cast<size_t>(M) * n_total);
+    invokeLayer(session, handles.data(), static_cast<int>(n), matBdata,
+                out_cat.data(), M, n_total, K);
+
+    size_t off = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const size_t block = static_cast<size_t>(M) * N[i];
+      std::memcpy(matCdata[i], out_cat.data() + off, block * sizeof(float));
+      off += block;
     }
   }
 
@@ -1446,8 +1751,12 @@ public:
                                  const std::vector<float> &row_weight,
                                  const float *act, float *out, unsigned int M,
                                  unsigned int K, unsigned int inter,
-                                 unsigned int N_out,
-                                 unsigned int w_bits) override {
+                                 unsigned int N_out, unsigned int w_bits,
+                                 bool gelu, const float *pre_gamma,
+                                 const float *post_gamma, float eps) override {
+    // #4415's lfm2_moe passes its bool weights_wh: true reads as 4 bits
+    if (w_bits == 1u)
+      w_bits = 4u;
     const size_t n_experts = gate_up_data.size();
     if (n_experts == 0 || gate_up_scale.size() != n_experts ||
         down_data.size() != n_experts || down_scale.size() != n_experts ||
@@ -1501,8 +1810,10 @@ public:
             moe_bound_ = moe_ops_.size();
           pool_dirty_ = true;
         }
+        // [#260] with #4415's epilogue (GeGLU, the folded norms), as below
         invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight,
-                       act, out, M, K, inter, N_out);
+                       act, out, M, K, inter, N_out, 0, gelu ? 1u : 0u,
+                       pre_gamma, post_gamma, eps);
         return;
       }
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
@@ -1536,7 +1847,8 @@ public:
       }
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
-                   out, M, K, inter, N_out);
+                   out, M, K, inter, N_out, 0, gelu ? 1u : 0u, pre_gamma,
+                   post_gamma, eps);
   }
 
   /** [#85] NNTR_HTP_FORWARD=1 routes decode's MoE calls through the
@@ -1827,6 +2139,23 @@ public:
     return true;
   }
 
+  /** [#260] compute_ops.h: a QS4CX FC / DENSE_FFN weight of the decode
+   *  list, bound (bindQ4m1) to the WH handles get_or_register_fc /
+   *  get_or_register_dense make from its codes and scales -- the ones the
+   *  fused prefill calls use. */
+  bool add_decode_graph_qs4cx(const void *data, const float *scale, unsigned K,
+                              unsigned N) override {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    if (graph_words_.empty() || (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) == 0u)
+      return false;
+    if (graph_inited_) {
+      throw std::runtime_error(
+        "add_decode_graph_qs4cx: the graph is already initialised");
+    }
+    q4_pending_.push_back({data, K, N, false, scale});
+    return true;
+  }
+
   /** [plan 201 S4] compute_ops.h: one f32 parameter of op @a op handed at
    *  load by the weight's name. The length is checked against the record
    *  now (hexkl_graph.c's graph_param_len), the pointer kept and bound
@@ -1979,7 +2308,8 @@ public:
     q4m1_left_ = 0; // [#132 Part B E3] what the FC arena chunks are sized for
     if (!wh) {
       for (const Q4Pending &p : q4_pending_)
-        q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
+        if (p.scale == nullptr) // [#260] a QS4CX weight binds WH handles
+          q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
     } else { // [#225] the LM_HEAD's slices only
       for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size());
            ++i) {
@@ -2010,6 +2340,10 @@ public:
     };
     auto take = [&](uint32_t op, uint32_t K, uint32_t N) -> const uint8_t * {
       const Q4Pending &p = pending(op, K, N);
+      if (p.scale != nullptr) // [#260] no Q4M1 from QS4CX (contract s. 2)
+        throw std::runtime_error("set_decode_graph_desc: op " +
+                                 std::to_string(op) +
+                                 " takes Q4M1, its weight is QS4CX");
       const size_t bytes =
         static_cast<size_t>(p.N) * (p.K / 32u) * Q4_CPU_BLOCK_BYTES;
       if (p.canonical)
@@ -2029,12 +2363,23 @@ public:
         continue;
       op->feed &= ~HTP_GRAPH_FEED_WH; // [#234 P4] a re-bind sets it anew
       uint32_t parts = 0;
-      if (wh && op->kind == HTP_OP_DENSE_FFN) {
+      // [#260] a QS4CX weight takes the WH path with or without a sidecar;
+      // lever L1 asks for the native Q4 kernels, which QS4CX cannot feed
+      const bool qs4cx_op =
+        next < q4_pending_.size() && q4_pending_[next].scale != nullptr;
+      if (qs4cx_op && native)
+        throw std::runtime_error(
+          "set_decode_graph_desc: lever L1 (NNTR_HTP_PPL_LEVERS=2) takes "
+          "Q4_0 weights, op " +
+          std::to_string(i) + "'s is QS4CX");
+      const bool wh_op = wh || qs4cx_op;
+      if (wh_op && op->kind == HTP_OP_DENSE_FFN) {
         const Q4Pending &u = pending(i, op->K, op->N);
         const Q4Pending &g = pending(i, op->K, op->N);
         const Q4Pending &d = pending(i, op->N, op->N_out);
-        const DenseHandles &dh = get_or_register_dense(
-          key(u), key(g), key(d), session, op->K, op->N, op->N_out);
+        const DenseHandles &dh =
+          get_or_register_dense(key(u), key(g), key(d), session, op->K, op->N,
+                                op->N_out, u.scale, g.scale, d.scale);
         if (dh.h_gu.size() > HTP_GRAPH_WH_DENSE_MAX_CHUNKS)
           throw std::runtime_error(
             "set_decode_graph_desc: DENSE_FFN op " + std::to_string(i) +
@@ -2047,11 +2392,12 @@ public:
         }
         op->feed |= HTP_GRAPH_FEED_WH;
         wh_handles += 2u * parts;
-      } else if (wh && op->kind == HTP_OP_FC) {
+      } else if (wh_op && op->kind == HTP_OP_FC) {
         uint32_t sum = 0;
         while (sum < op->N) {
           const Q4Pending &p = pending(i, op->K, 0u);
-          const FcHandles &fh = get_or_register_fc(key(p), session, p.K, p.N);
+          const FcHandles &fh =
+            get_or_register_fc(key(p), session, p.K, p.N, p.scale);
           for (uint32_t h : fh.handles) {
             if (parts == HTP_GRAPH_MAX_PARTS)
               throw std::runtime_error("set_decode_graph_desc: FC op " +
@@ -3570,11 +3916,33 @@ private:
    *  slices of one weight and matCdata is its whole [M x N], or separate
    *  weights whose [M x N_i] blocks go to @a dsts[i]; NULL when each
    *  handle's output stays a block of its own (or there is only one). */
+  /** @brief Where one handle's [M x cols] output block lands: columns
+   *  [c0, c0 + cols) of a [M x stride] destination. */
+  struct OutSlice {
+    float *dst;
+    unsigned int stride, c0, cols;
+  };
+
+  /** @brief The RMSNorms folded into one layer call (mm_u8i4_layer_norm):
+   *  nothing set = the plain call. */
+  struct FusedNorms {
+    const float *pre_gamma = nullptr;                      /**< K floats */
+    const std::vector<unsigned int> *post_chunk = nullptr; /**< per handle */
+    const float *post_gamma = nullptr; /**< the chunks, concatenated */
+    float eps = 0.0f;
+    const float *rope_cs = nullptr; /**< M rows of 2*rope_hd, or nullptr */
+    unsigned int rope_hd = 0;       /**< 0: no RoPE */
+    unsigned int rope_handles = 0;  /**< the handles rotated, a prefix */
+    bool any() const { return pre_gamma || post_chunk || rope_hd; }
+  };
+
   void invokeLayer(remote_handle64 session, const uint32_t *handles,
                    int num_handles, float *matBdata, float *matCdata,
                    unsigned int M, unsigned int N, unsigned int K,
                    const std::vector<unsigned int> *blocks = nullptr,
-                   const std::vector<float *> *dsts = nullptr) {
+                   const std::vector<float *> *dsts = nullptr,
+                   const FusedNorms *norms = nullptr,
+                   const std::vector<OutSlice> *slices = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
     const auto shape = [&]() {
@@ -3592,6 +3960,46 @@ private:
                  static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
+    if (norms && norms->any()) {
+      // The norms ride the same call; the timed twin has no norm variant,
+      // so this path counts as an untimed call in the profile.
+      int post_gamma_len = 0;
+      if (norms->post_chunk) {
+        for (unsigned int c : *norms->post_chunk)
+          post_gamma_len += static_cast<int>(c);
+      }
+      const uint64_t t0 = HtpProfile::nowUs();
+      const int err = nntr_hvx_mm_u8i4_layer_norm(
+        session, M, K, norms->eps, norms->pre_gamma,
+        norms->pre_gamma ? static_cast<int>(K) : 0,
+        norms->post_chunk ? norms->post_chunk->data() : nullptr,
+        norms->post_chunk ? static_cast<int>(norms->post_chunk->size()) : 0,
+        norms->post_gamma, post_gamma_len, norms->rope_hd, norms->rope_handles,
+        norms->rope_cs,
+        norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0, handles,
+        num_handles, act_f32, act_len, out_cat, out_len);
+      const uint64_t elapsed = HtpProfile::nowUs() - t0;
+      if (err != AEE_SUCCESS) {
+        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_norm failed: err=" +
+                                 std::to_string(err) + shape());
+      }
+      if (slices) {
+        size_t off = 0;
+        for (const OutSlice &o : *slices) {
+          for (unsigned int r = 0; r < M; ++r) {
+            stagedMemcpy(o.dst + static_cast<size_t>(r) * o.stride + o.c0,
+                         out_cat + off + static_cast<size_t>(r) * o.cols,
+                         static_cast<size_t>(o.cols) * sizeof(float));
+          }
+          off += static_cast<size_t>(M) * o.cols;
+        }
+      } else {
+        copyOut(matCdata, out_cat, M, N, blocks, dsts);
+      }
+      if (profile.level())
+        profile.addInvoke(M, K, N, elapsed, nullptr);
+      return;
+    }
     if (profile.level() == 0) {
       const int err =
         nntr_hvx_mm_u8i4_layer(session, M, K, handles, num_handles, act_f32,
@@ -4195,7 +4603,7 @@ private:
                const std::vector<unsigned int> &row_index,
                const std::vector<unsigned int> &row_count,
                const std::vector<float> &row_weight, size_t act_bytes,
-               size_t out_bytes, uint32_t *stage_us) {
+               size_t out_bytes, uint32_t glu, uint32_t *stage_us) {
     static_assert(HTP_MOE_N_STAGES == HTP_DSPQ_STAGES,
                   "htp_dspq_wire.h's stage count is the timed call's");
     DspqMoe &st = *dspq_;
@@ -4204,7 +4612,8 @@ private:
     const uint32_t seq = ++st.seq;
     const htp_dspq_req_hdr hdr = {HTP_DSPQ_OP_MOE,
                                   seq,
-                                  stage_us ? HTP_DSPQ_FLAG_TIMED : 0u,
+                                  (stage_us ? HTP_DSPQ_FLAG_TIMED : 0u) |
+                                    (glu ? HTP_DSPQ_FLAG_GELU : 0u),
                                   M,
                                   K,
                                   inter,
@@ -4772,36 +5181,12 @@ private:
                       const std::vector<unsigned int> &row_count,
                       const std::vector<float> &row_weight, const float *act,
                       float *out, unsigned int M, unsigned int K,
-                      unsigned int inter, unsigned int N_out, int kind = 0) {
-    // [#225] A long prefill in row chunks, each with its rows' share of the
-    // routing: the session scratch grows with M (the cached activation and
-    // its AH tiles), and at P1024 it no longer fits beside the weights.
-    // Every row's result is its own -- per-row quantization, experts added
-    // in index order -- so the chunks give the whole call's bytes.
-    const unsigned int step = prefillRows();
-    if (step != 0 && M > step) {
-      for (unsigned int m0 = 0; m0 < M; m0 += step) {
-        const unsigned int m = std::min(step, M - m0);
-        std::vector<unsigned int> ri, rc(row_count.size(), 0);
-        std::vector<float> rw;
-        for (size_t e = 0, at = 0; e < row_count.size(); at += row_count[e++]) {
-          for (unsigned int j = 0; j < row_count[e]; ++j) {
-            const unsigned int r = row_index[at + j];
-            if (r >= m0 && r < m0 + m) {
-              ri.push_back(r - m0);
-              rw.push_back(row_weight[at + j]);
-              ++rc[e];
-            }
-          }
-        }
-        invokeMoeLayer(
-          session, h_gu, h_dn, ri, rc, rw, act + static_cast<size_t>(m0) * K,
-          out + static_cast<size_t>(m0) * N_out, m, K, inter, N_out, kind);
-      }
-      return;
-    }
+                      unsigned int inter, unsigned int N_out, int kind = 0,
+                      uint32_t glu = 0, const float *pre_gamma = nullptr,
+                      const float *post_gamma = nullptr, float eps = 0.0f) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
+    const bool with_norms = pre_gamma != nullptr || post_gamma != nullptr;
 
     const size_t act_bytes = static_cast<size_t>(act_len) * sizeof(float);
     const size_t out_bytes = static_cast<size_t>(out_len) * sizeof(float);
@@ -4814,7 +5199,8 @@ private:
     // sitting; NNTR_HTP_DSPQ=0 keeps FastRPC): the same DSP function, the same
     // argument bytes, only the transport differs. Anything the packet cannot
     // carry stays on FastRPC.
-    const bool via_dspq = M == 1 && kind == 0 && h_dn.size() == h_gu.size() &&
+    const bool via_dspq = M == 1 && kind == 0 && !with_norms &&
+                          h_dn.size() == h_gu.size() &&
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
@@ -4835,6 +5221,14 @@ private:
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
     const bool timed = profile.level() >= 2;
+    // NNTR_HTP_PROFILE>=2 on a call whose only fold is the output norm: the
+    // timed entry (stage breakdown) and the norm on the host after it, so
+    // the prefill MoE call, which always carries that norm, has stages too
+    // (doc 57 section 9.26). Measurement only; the norm's time is then
+    // outside the call.
+    const bool host_post_norm =
+      timed && pre_gamma == nullptr && post_gamma != nullptr && !via_dspq;
+    const bool norm_entry = with_norms && !host_post_norm;
     // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
     // keeps the fastest. Two runs with no functional change between them
     // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
@@ -4852,17 +5246,28 @@ private:
       const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
-                                timed ? rep_stage : nullptr)
-            : timed  ? nntr_hvx_mm_u8i4_moe_layer_timed(
-                         session, M, K, inter, N_out, h_gu.data(),
-                         static_cast<int>(h_gu.size()), h_dn.data(),
-                         static_cast<int>(h_dn.size()), row_index.data(),
-                         static_cast<int>(row_index.size()), row_count.data(),
-                         static_cast<int>(row_count.size()), row_weight.data(),
-                         static_cast<int>(row_weight.size()), act_f32, act_len,
-                         out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
+                                glu, timed ? rep_stage : nullptr)
+            : norm_entry
+              ? nntr_hvx_mm_u8i4_moe_layer_norm(
+                  session, M, K, inter, N_out, glu, eps, pre_gamma,
+                  pre_gamma ? static_cast<int>(K) : 0, post_gamma,
+                  post_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+                  static_cast<int>(h_gu.size()), h_dn.data(),
+                  static_cast<int>(h_dn.size()), row_index.data(),
+                  static_cast<int>(row_index.size()), row_count.data(),
+                  static_cast<int>(row_count.size()), row_weight.data(),
+                  static_cast<int>(row_weight.size()), act_f32, act_len,
+                  out_f32, out_len)
+            : timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
+                        session, M, K, inter, N_out, glu, h_gu.data(),
+                        static_cast<int>(h_gu.size()), h_dn.data(),
+                        static_cast<int>(h_dn.size()), row_index.data(),
+                        static_cast<int>(row_index.size()), row_count.data(),
+                        static_cast<int>(row_count.size()), row_weight.data(),
+                        static_cast<int>(row_weight.size()), act_f32, act_len,
+                        out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
                     : nntr_hvx_mm_u8i4_moe_layer(
-                        session, M, K, inter, N_out, h_gu.data(),
+                        session, M, K, inter, N_out, glu, h_gu.data(),
                         static_cast<int>(h_gu.size()), h_dn.data(),
                         static_cast<int>(h_dn.size()), row_index.data(),
                         static_cast<int>(row_index.size()), row_count.data(),
@@ -4902,6 +5307,14 @@ private:
         (via_dspq ? " (via dspq)" : ""));
     }
     stagedMemcpy(out, out_f32, out_bytes);
+    if (host_post_norm) {
+      std::vector<float> raw(out, out + static_cast<size_t>(out_len));
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(raw.data(), out, M, N_out,
+                                                   eps);
+      for (unsigned int r = 0; r < M; ++r)
+        for (unsigned int n = 0; n < N_out; ++n)
+          out[static_cast<size_t>(r) * N_out + n] *= post_gamma[n];
+    }
     dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
                 static_cast<size_t>(out_len), M, K, inter, N_out, kind,
                 row_count);
@@ -5192,6 +5605,20 @@ private:
     std::vector<unsigned int> cols; /**< N of each handle */
   };
 
+  /** @brief One FC weight's layer calls, in fcMaxRows row chunks. */
+  void invokeFc(remote_handle64 session, const FcHandles &fh, float *matBdata,
+                float *matCdata, unsigned int M, unsigned int N,
+                unsigned int K) {
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      invokeLayer(session, fh.handles.data(),
+                  static_cast<int>(fh.handles.size()),
+                  matBdata + static_cast<size_t>(m0) * K,
+                  matCdata + static_cast<size_t>(m0) * N, m, N, K, &fh.cols);
+    }
+  }
+
   /** @brief Columns of a K-deep weight per registered handle.
    *
    * hexkl_mm_u8i4_layer_run lays VTCM out as the whole activation
@@ -5208,16 +5635,26 @@ private:
     const unsigned int k_tiles = K / 32u;
     const unsigned int n_tiles =
       k_tiles == 0 ? 0 : (kSliceBytes / 512u) / k_tiles;
-    return n_tiles < 1u ? 32u : n_tiles * 32u;
+    const unsigned int cols = n_tiles < 1u ? 32u : n_tiles * 32u;
+    // A slice holds whole heads, so a per-head norm folded into the call
+    // (mm_u8i4_layer_norm's post chunks) never straddles two handles: 512
+    // columns is the widest head dim here and divides every smaller one.
+    // ponytail: a head dim that does not divide 512 needs its own
+    // alignment passed down, not this constant.
+    return cols >= 512u ? (cols / 512u) * 512u : cols;
   }
 
   /** @brief get_or_register for an FC weight of any width: one handle when
    *  it fits fcSliceCols, else one per column slice, converted once and
    *  registered slice by slice under keys inside the weight (its data
    *  pointer plus the slice's first column -- distinct, and valid as long
-   *  as the weight is). Cached by the weight pointer like every handle. */
+   *  as the weight is). Cached by the weight pointer like every handle.
+   *  @param qs4cx_scale non-null: @a matAdata is a QS4CX weight with these
+   *         per-channel scales (quantized offline, no Q4_0 detour); null:
+   *         Q4_0x4 bytes. */
   const FcHandles &get_or_register_fc(void *matAdata, remote_handle64 session,
-                                      uint32_t K, uint32_t N) {
+                                      uint32_t K, uint32_t N,
+                                      const float *qs4cx_scale = nullptr) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = fc_cache_.find(matAdata);
     if (it != fc_cache_.end())
@@ -5226,6 +5663,8 @@ private:
     FcHandles fh;
     const unsigned int cap = fcSliceCols(K);
     if (const FcWhEntry *w = fcwhFind(matAdata, K, N)) {
+      // [#225] LFM's FC WH sidecar ahead of #4415's order; no-op without
+      // fc_wh_file_name (Gemma sets none)
       for (uint32_t c0 = 0; c0 < N; c0 += cap) {
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
         fh.handles.push_back(registerFcWh(static_cast<char *>(matAdata) + c0,
@@ -5233,7 +5672,10 @@ private:
         fh.cols.push_back(n);
       }
     } else if (N <= cap) {
-      fh.handles.push_back(get_or_register_unlocked(matAdata, session, K, N));
+      fh.handles.push_back(
+        qs4cx_scale
+          ? get_or_register_qs4cx_unlocked(matAdata, qs4cx_scale, session, K, N)
+          : get_or_register_unlocked(matAdata, session, K, N));
       fh.cols.push_back(N);
     } else {
       std::vector<int8_t> full(static_cast<size_t>(K) * N);
@@ -5242,8 +5684,12 @@ private:
       // The first slice's profile entry carries the conversion, so its
       // clock starts before it; the later slices' start with their copy.
       uint64_t t_begin = HtpProfile::nowUs();
-      qs4cxFromModelQ4_0(matAdata, K, N, full.data(), w_scale.data(),
-                         colsum_w.data());
+      if (qs4cx_scale)
+        htp_qs4cx_from_packed(matAdata, qs4cx_scale, K, N, full.data(),
+                              w_scale.data(), colsum_w.data());
+      else
+        qs4cxFromModelQ4_0(matAdata, K, N, full.data(), w_scale.data(),
+                           colsum_w.data());
       uint64_t convert_us = HtpProfile::nowUs() - t_begin;
       for (uint32_t c0 = 0; c0 < N; c0 += cap) {
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
@@ -5491,7 +5937,10 @@ private:
    *  weight's pointer. */
   const DenseHandles &get_or_register_dense(void *up, void *gate, void *down,
                                             remote_handle64 session, uint32_t K,
-                                            uint32_t I, uint32_t N) {
+                                            uint32_t I, uint32_t N,
+                                            const float *up_s = nullptr,
+                                            const float *gate_s = nullptr,
+                                            const float *down_s = nullptr) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     auto it = dense_cache_.find(up);
     if (it != dense_cache_.end())
@@ -5520,13 +5969,24 @@ private:
     uint64_t t_begin = HtpProfile::nowUs();
     std::vector<int8_t> up_rm(static_cast<size_t>(K) * I),
       gate_rm(static_cast<size_t>(K) * I), down_rm(static_cast<size_t>(I) * N);
-    std::vector<float> up_s(I), gate_s(I), down_s(N);
+    std::vector<float> up_s_v(I), gate_s_v(I), down_s_v(N);
     std::vector<int32_t> up_c(I), gate_c(I), down_c(N);
-    qs4cxFromModelQ4_0(up, K, I, up_rm.data(), up_s.data(), up_c.data());
-    qs4cxFromModelQ4_0(gate, K, I, gate_rm.data(), gate_s.data(),
-                       gate_c.data());
-    qs4cxFromModelQ4_0(down, I, N, down_rm.data(), down_s.data(),
-                       down_c.data());
+    // QS4CX weights (scales given) are a bit rearrangement, as the FC
+    // path's; Q4_0 ones a requantization.
+    if (up_s) {
+      htp_qs4cx_from_packed(up, up_s, K, I, up_rm.data(), up_s_v.data(),
+                            up_c.data());
+      htp_qs4cx_from_packed(gate, gate_s, K, I, gate_rm.data(), gate_s_v.data(),
+                            gate_c.data());
+      htp_qs4cx_from_packed(down, down_s, I, N, down_rm.data(), down_s_v.data(),
+                            down_c.data());
+    } else {
+      qs4cxFromModelQ4_0(up, K, I, up_rm.data(), up_s_v.data(), up_c.data());
+      qs4cxFromModelQ4_0(gate, K, I, gate_rm.data(), gate_s_v.data(),
+                         gate_c.data());
+      qs4cxFromModelQ4_0(down, I, N, down_rm.data(), down_s_v.data(),
+                         down_c.data());
+    }
     uint64_t convert_us = HtpProfile::nowUs() - t_begin;
 
     for (uint32_t c0 = 0; c0 < I; c0 += w) {
@@ -5539,8 +5999,8 @@ private:
         std::memcpy(gu.data() + static_cast<size_t>(k) * 2 * w + w,
                     up_rm.data() + static_cast<size_t>(k) * I + c0, w);
       }
-      std::vector<float> gus(gate_s.begin() + c0, gate_s.begin() + c0 + w);
-      gus.insert(gus.end(), up_s.begin() + c0, up_s.begin() + c0 + w);
+      std::vector<float> gus(gate_s_v.begin() + c0, gate_s_v.begin() + c0 + w);
+      gus.insert(gus.end(), up_s_v.begin() + c0, up_s_v.begin() + c0 + w);
       std::vector<int32_t> guc(gate_c.begin() + c0, gate_c.begin() + c0 + w);
       guc.insert(guc.end(), up_c.begin() + c0, up_c.begin() + c0 + w);
       if (c0 != 0)
@@ -5557,7 +6017,7 @@ private:
         for (uint32_t n = 0; n < N; ++n)
           dnc[n] += dn[static_cast<size_t>(r) * N + n];
       }
-      std::vector<float> dns(down_s);
+      std::vector<float> dns(down_s_v);
       dh.h_dn.push_back(registerRm(static_cast<char *>(down) + c0, session, dn,
                                    w, N, dns, dnc, HtpProfile::nowUs(), 0));
     }
@@ -5568,12 +6028,15 @@ private:
 
   void gemm_q4_0_dense_ffn_fp32(void *up, void *gate, void *down,
                                 const float *act, float *out, unsigned int M,
-                                unsigned int K, unsigned int I,
-                                unsigned int N) override {
+                                unsigned int K, unsigned int I, unsigned int N,
+                                bool gelu, const float *pre_gamma,
+                                const float *post_gamma, float eps,
+                                const float *up_scale, const float *gate_scale,
+                                const float *down_scale) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    const DenseHandles &dh =
-      get_or_register_dense(up, gate, down, session, K, I, N);
+    const DenseHandles &dh = get_or_register_dense(
+      up, gate, down, session, K, I, N, up_scale, gate_scale, down_scale);
     // Every chunk is an "expert" that takes every row with weight 1: the
     // kernel zero-fills out and scatter-adds each chunk's down result into
     // it, which is exactly the sum over the intermediate dimension.
@@ -5585,14 +6048,18 @@ private:
         row_index[c * M + r] = r;
     }
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
-                   act, out, M, K, dh.w, N, /*kind=*/1);
+                   act, out, M, K, dh.w, N, /*kind=*/1, gelu ? 1u : 0u,
+                   pre_gamma, post_gamma, eps);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
-                               unsigned int I, unsigned int N) override {
+                               unsigned int I, unsigned int N,
+                               const float *up_scale, const float *gate_scale,
+                               const float *down_scale) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    get_or_register_dense(up, gate, down, session, K, I, N);
+    get_or_register_dense(up, gate, down, session, K, I, N, up_scale,
+                          gate_scale, down_scale);
     return true;
   }
 
@@ -5652,8 +6119,9 @@ private:
     }
   }
 
-  /** @brief [#225] Rows per call of the prefill kernels whose session
-   *  scratch grows with M (conv block, dense FFN, MoE layer): 512, the
+  /** @brief [#225] Rows per call of the conv block's prefill, whose session
+   *  scratch grows with M (LFM2 only; since #260 #4415's MoE layer, FC and
+   *  dense FFN calls take the whole prefill in one call): 512, the
    *  prefill the DSP heap held beside the FC weights in #222's sitting
    *  where 1024 failed with AEE_ENOMEMORY. NNTR_HTP_PREFILL_ROWS=<n> sets
    *  another, 0 one call per prefill (the host check of the chunking). */
@@ -6382,6 +6850,14 @@ private:
                                  remote_handle64 session, uint32_t K,
                                  uint32_t N) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
+    return get_or_register_qs4cx_unlocked(matAdata, matAscale, session, K, N);
+  }
+
+  /** @note Call with handle_mutex_ already held. */
+  uint32_t get_or_register_qs4cx_unlocked(void *matAdata,
+                                          const float *matAscale,
+                                          remote_handle64 session, uint32_t K,
+                                          uint32_t N) {
     auto it = handle_cache_.find(matAdata);
     if (it != handle_cache_.end())
       return it->second;
@@ -7013,9 +7489,17 @@ private:
     const void *data;
     uint32_t K, N;
     bool canonical;
+    const float *scale = nullptr; /**< [#260] QS4CX: N scales; Q4_0: null */
   };
   std::vector<Q4Pending> q4_pending_;
   std::vector<uint32_t> q4m1_handles_;
+  /** @brief The lm_head's slices by weight (lmHeadHandles); ok false: it
+   *  could not be placed and stays on the CPU. */
+  struct LmHeadSlices {
+    bool ok = false;
+    std::vector<uint32_t> h;
+  };
+  std::map<const void *, LmHeadSlices> lm_head_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */
@@ -7023,6 +7507,11 @@ private:
                                      true answers: CPU FC calls skipped */
   StagingPool act_pool_;
   StagingPool out_pool_;
+  StagingPool rope_pool_;     /**< the fused projection call's RoPE rows */
+  StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
+  StagingPool attn_out_pool_; /**< and its f32 output */
+  /** @brief ION copies of the MoE routers' gate weights, by address. */
+  std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
       unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
@@ -7124,9 +7613,11 @@ public:
                           unsigned int n_head_kv,
                           unsigned int head_dim) override {
     HtpBackend &hb = HtpBackend::global();
+    // head_dim up to 512 is the registry's limit; the column-blocked
+    // kernel below checks its own 256 at call time.
     if (!hb.enabled() || kind > 1 || max_rows == 0 || max_rows > 0xFFFFu ||
         n_head_kv == 0 || head_dim == 0 || (head_dim % 32) != 0 ||
-        head_dim > 256) {
+        head_dim > 512) {
       return -1;
     }
     uint32_t h = 0;
@@ -7209,6 +7700,93 @@ public:
     return true;
   }
 
+  // --- the row-blocked kernel over a fixed-scale int8 cache ---
+
+  bool supports_kv_cache_q2() const override {
+    return HtpBackend::global().enabled();
+  }
+
+  bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
+                                   unsigned int head_dim, const float *s_k,
+                                   const float *s_v) override {
+    HtpBackend &hb = HtpBackend::global();
+    if (!hb.enabled() || handle < 0 || !s_k || !s_v || n_head_kv == 0 ||
+        head_dim == 0) {
+      return false;
+    }
+    const int err = nntr_hvx_kv_set_fixed_scales_q(
+      static_cast<remote_handle64>(hb.handle()), static_cast<uint32_t>(handle),
+      s_k, static_cast<int>(n_head_kv), s_v,
+      static_cast<int>(n_head_kv * head_dim));
+    if (err != AEE_SUCCESS) {
+      ml_logw("HTP quantized KV cache: fixed scales failed: 0x%x", err);
+      return false;
+    }
+    return true;
+  }
+
+  bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
+                       unsigned int append_rows, unsigned int kv_stride,
+                       const uint16_t *k_rows, const uint16_t *v_rows,
+                       const uint16_t *q, const float *q_enc,
+                       unsigned int q_stride, unsigned int n_q,
+                       unsigned int cache_from, unsigned int cache_to,
+                       unsigned int n_head_q, unsigned int n_head_kv,
+                       unsigned int head_dim, unsigned int window,
+                       uint16_t *out, const float *out_enc,
+                       unsigned int out_stride) override {
+    HtpBackend &hb = HtpBackend::global();
+    if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
+        (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
+        head_dim > 512 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
+        q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
+        !q || !q_enc || !out || !out_enc ||
+        (append_rows != 0 &&
+         (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
+      return false;
+    }
+    const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
+    const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
+    const int rows_len = static_cast<int>(append_rows * kv_stride);
+    const int enc_len = static_cast<int>(2 * n_head_q);
+    uint32_t stats[12] = {0};
+    const int64_t t0 = now_us();
+    // Q and the output through ION, as the FC path stages its rows: from
+    // plain heap FastRPC moved 2 x 16.8 MB a 1024-row layer, 7-12 ms of an
+    // 18-24 ms call around 11.5 ms on the DSP (doc 57 section 9.17). A
+    // memcpy each way here is ~1 ms (u16 since PR 4343's a16 path: half).
+    const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
+    uint16_t *q_ion =
+      reinterpret_cast<uint16_t *>(stage(attn_q_pool_, q_bytes).data());
+    uint16_t *out_ion =
+      reinterpret_cast<uint16_t *>(stage(attn_out_pool_, q_bytes).data());
+    stagedMemcpy(q_ion, q, q_bytes);
+    const int err = nntr_hvx_attn_q2_step(
+      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
+      q_enc, enc_len, out_enc, enc_len, out_ion, q_len, stats, 12);
+    if (err == AEE_SUCCESS) {
+      stagedMemcpy(out, out_ion, q_bytes);
+    }
+    if (attn_trace_enabled()) {
+      // stats (nntr_hvx_attn_q2_step): append, kernel, -, total, then the
+      // append's quant/stage/bake, rows appended, the kernel's qk, softmax,
+      // pv and worker wait, in microseconds. wall - total is transport.
+      ml_logi("HTP attn trace q2: n_q=%u cache=%u..%u err=0x%x wall_us=%lld "
+              "dsp_us: append=%u (quant=%u stage=%u bake=%u rows=%u) "
+              "kernel=%u (qk=%u softmax=%u pv=%u wait=%u) total=%u",
+              n_q, cache_from, cache_to, err,
+              static_cast<long long>(now_us() - t0), stats[0], stats[4],
+              stats[5], stats[6], stats[7], stats[1], stats[8], stats[9],
+              stats[10], stats[11], stats[3]);
+    }
+    if (err != AEE_SUCCESS) {
+      ml_logw("HTP row-blocked attention step failed: 0x%x; CPU fallback", err);
+      return false;
+    }
+    return true;
+  }
+
   bool sdpa_fp16_kvcache(const float *q, unsigned int q_stride,
                          const uint16_t *k_cache, const uint16_t *v_cache,
                          unsigned int kv_stride, unsigned int n_q,
@@ -7220,7 +7798,7 @@ public:
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
-        head_dim > 256 || cache_to < cache_from + n_q || cache_to > 0xFFFFu) {
+        head_dim > 512 || cache_to < cache_from + n_q || cache_to > 0xFFFFu) {
       return false;
     }
     // The IDL takes dense [n_q][n_head_q*head_dim] and

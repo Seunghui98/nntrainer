@@ -1,0 +1,104 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>expert 스트리밍 한눈에</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="expert 스트리밍 한눈에">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="92" class="t1" text-anchor="start" >11.6 GB짜리 expert를 1.4 GB 작업대로 돌린다</text>
+<text x="80" y="140" class="t2" text-anchor="start" >전부 메모리에 올릴 수 없으니 창고(flash)에 두고, 지금·곧 쓸 것만 작업대(DRAM)에 올려 NPU가 계산한다</text>
+<text x="80" y="214" class="h3" text-anchor="start" >expert 전체 3,840개 = 11.6 GB (flash)</text>
+<rect x="80.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="138.66666666666666" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="197.33333333333331" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="256.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="314.66666666666663" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="373.3333333333333" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="432.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="490.6666666666667" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="549.3333333333333" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="608.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="666.6666666666666" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="725.3333333333334" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="784.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="842.6666666666666" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="901.3333333333334" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="960.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1018.6666666666666" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1077.3333333333335" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1136.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1194.6666666666667" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1253.3333333333333" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1312.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1370.6666666666667" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1429.3333333333333" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1488.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1546.6666666666667" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1605.3333333333333" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1664.0" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1722.6666666666667" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<rect x="1781.3333333333333" y="230" width="55.666666666666664" height="54" rx="3" fill="var(--read)" opacity="0.75"/>
+<text x="80" y="318" class="h3" text-anchor="start" >작업대에 올라가는 양 = 480칸 ≈ 1.4 GB (12%)</text>
+<rect x="80" y="334" width="212.41379310344828" height="54" rx="4" fill="var(--npu)" />
+<text x="308.41379310344826" y="370" class="lbl" text-anchor="start" >← 나머지 88%는 필요할 때 창고에서 가져온다</text>
+<rect x="80" y="440" width="520" height="250" rx="14" fill="var(--read-t)" />
+<text x="112" y="500" class="big" text-anchor="start" style="font-size:40px">창고</text>
+<text x="210" y="498" class="lane2" text-anchor="start" style="font-size:20px">Flash (UFS)</text>
+<text x="112" y="560" class="lbl" text-anchor="start" style="font-size:24px">모든 expert가 있다</text>
+<text x="112" y="600" class="lbl" text-anchor="start" style="font-size:24px">크지만 느리다: 3.0 GB/s</text>
+<rect x="700" y="440" width="520" height="250" rx="14" fill="#e6eef9" />
+<text x="732" y="500" class="big" text-anchor="start" style="font-size:40px">작업대</text>
+<text x="870" y="498" class="lane2" text-anchor="start" style="font-size:20px">DRAM 칸 480개</text>
+<text x="732" y="560" class="lbl" text-anchor="start" style="font-size:24px">지금 쓰는 것 + 곧 쓸 것</text>
+<text x="732" y="600" class="lbl" text-anchor="start" style="font-size:24px">빈 칸은 다 쓴 것부터 비운다</text>
+<rect x="1320" y="440" width="520" height="250" rx="14" fill="var(--npu-t)" />
+<text x="1352" y="500" class="big" text-anchor="start" style="font-size:40px">작업자</text>
+<text x="1490" y="498" class="lane2" text-anchor="start" style="font-size:20px">NPU (Hexagon)</text>
+<text x="1352" y="560" class="lbl" text-anchor="start" style="font-size:24px">작업대 위의 expert만</text>
+<text x="1352" y="600" class="lbl" text-anchor="start" style="font-size:24px">가지고 계산한다</text>
+<path d="M604,565 L692,565" stroke="#eb6834" stroke-width="5" marker-end="url(#ahr)"/>
+<text x="650" y="540" class="sm" text-anchor="middle" >가져오기</text>
+<path d="M1224,565 L1312,565" stroke="#52514e" stroke-width="5" marker-end="url(#ah)"/>
+<text x="1270" y="540" class="sm" text-anchor="middle" >계산</text>
+<rect x="80" y="740" width="860" height="250" rx="14" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="80" y="740" width="10" height="250" rx="4" fill="var(--npu)" />
+<text x="118" y="792" class="h3" text-anchor="start" style="font-size:26px">prefill (프롬프트 읽기)</text>
+<text x="118" y="842" class="lbl" text-anchor="start" style="font-size:22px">무엇이 필요한지 미리 안다 (층마다 거의 전부)</text>
+<text x="118" y="882" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">→ 계산하는 동안 다음 층 것을 미리 가져온다</text>
+<text x="118" y="930" class="sm" text-anchor="start" >기다림 7.10 s → 0.01 s (실측, 칸 5 → 16개/층)</text>
+<rect x="980" y="740" width="860" height="250" rx="14" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="980" y="740" width="10" height="250" rx="4" fill="var(--read)" />
+<text x="1018" y="792" class="h3" text-anchor="start" style="font-size:26px">decode (한 토큰씩 생성)</text>
+<text x="1018" y="842" class="lbl" text-anchor="start" style="font-size:22px">라우터가 고르기 전에는 모른다 (128개 중 8개)</text>
+<text x="1018" y="882" class="lbl" text-anchor="start" style="font-size:22px;font-weight:700">→ 쓴 것을 작업대에 남겨 두고, 없으면 그때 가져온다</text>
+<text x="1018" y="930" class="sm" text-anchor="start" >작업대에 있을 확률(히트율)이 속도를 정한다</text>
+<text x="80" y="1040" class="xs" text-anchor="start" >nntrainer의 일반 FSU(층 단위 swap)가 아니라 MoE 층이 expert 단위로 관리하는 경로. 크기는 문서 55 §3.2 산술, 기다림은 55 §10.11 실측(MoE만 NPU 구성, 2026-10-02).</text>
+</svg></body></html>

@@ -1,0 +1,151 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>Expert memory and prefetch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="Expert memory and prefetch">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="88" class="t1" text-anchor="start" >Gemma-4 26B-A4B: Expert 메모리와 Prefetch (512-token)</text>
+<text x="80" y="134" class="t2" text-anchor="start" >Expert weight는 Flash에 두고, DRAM의 Expert cache(30 layer 공유)에는 일부만 올린다. 1 slot = expert 1개(3.01 MB)</text>
+<text x="80" y="200" class="h3" text-anchor="start" >Expert 크기</text>
+<rect x="80" y="218" width="660" height="44" rx="6" fill="var(--idle)" />
+<text x="94" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">항목</text>
+<text x="454" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">크기</text>
+<text x="94" y="291" class="sm" text-anchor="start" >MoE layer × expert</text>
+<text x="454" y="291" class="lbl" text-anchor="start" >30 × 128 = 3,840개</text>
+<path d="M80,304 L740,304" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="333" class="sm" text-anchor="start" >Expert 1개 (int4 + scale)</text>
+<text x="454" y="333" class="lbl" text-anchor="start" >3.01 MB (2.87 MiB)</text>
+<path d="M80,346 L740,346" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="375" class="sm" text-anchor="start" >Layer 1개 (128 expert)</text>
+<text x="454" y="375" class="lbl" text-anchor="start" >385 MB</text>
+<path d="M80,388 L740,388" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="417" class="sm" text-anchor="start" >Token 1개 (30 layer × top-8)</text>
+<text x="454" y="417" class="lbl" text-anchor="start" >240개 = 722 MB</text>
+<path d="M80,430 L740,430" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="459" class="sm" text-anchor="start" >Expert 전체</text>
+<text x="454" y="459" class="lbl" text-anchor="start" style="font-weight:700">11.56 GB</text>
+<path d="M80,472 L740,472" stroke="#e1e0d9" stroke-width="2"/>
+<text x="80" y="528" class="h3" text-anchor="start" >모델 파일 (Flash)</text>
+<rect x="80" y="546" width="660" height="44" rx="6" fill="var(--idle)" />
+<text x="94" y="576" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">구성</text>
+<text x="454" y="576" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">크기</text>
+<text x="94" y="619" class="sm" text-anchor="start" >Expert (QS4CX_WH)</text>
+<text x="454" y="619" class="lbl" text-anchor="start" >11.55 GB</text>
+<path d="M80,632 L740,632" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="661" class="sm" text-anchor="start" >Attention · dense FFN (QS4CX)</text>
+<text x="454" y="661" class="lbl" text-anchor="start" >0.82 GB</text>
+<path d="M80,674 L740,674" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="703" class="sm" text-anchor="start" >Embedding = lm_head (Q4_0)</text>
+<text x="454" y="703" class="lbl" text-anchor="start" >0.42 GB</text>
+<path d="M80,716 L740,716" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="745" class="sm" text-anchor="start" >Router 등 FP32</text>
+<text x="454" y="745" class="lbl" text-anchor="start" >0.04 GB</text>
+<path d="M80,758 L740,758" stroke="#e1e0d9" stroke-width="2"/>
+<text x="94" y="787" class="sm" text-anchor="start" >합계 (실측 12,240 MiB)</text>
+<text x="454" y="787" class="lbl" text-anchor="start" style="font-weight:700">12.83 GB</text>
+<path d="M80,800 L740,800" stroke="#e1e0d9" stroke-width="2"/>
+<text x="780" y="200" class="h3" text-anchor="start" >Prefill (512-token prompt)</text>
+<rect x="780" y="218" width="1060" height="44" rx="6" fill="var(--idle)" />
+<text x="794" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">항목</text>
+<text x="1124" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">240 slot</text>
+<text x="1339" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">480 slot (기본)</text>
+<text x="1639" y="248" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">720 slot</text>
+<text x="794" y="291" class="sm" text-anchor="start" >설정값 moe_cache_experts (×30)</text>
+<text x="1124" y="291" class="lbl" text-anchor="start" >8</text>
+<text x="1339" y="291" class="lbl" text-anchor="start" style="font-weight:700">16</text>
+<text x="1639" y="291" class="lbl" text-anchor="start" >24</text>
+<path d="M780,304 L1840,304" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="333" class="sm" text-anchor="start" >Cache 크기 (DRAM)</text>
+<text x="1124" y="333" class="lbl" text-anchor="start" >0.72 GB</text>
+<text x="1339" y="333" class="lbl" text-anchor="start" style="font-weight:700">1.45 GB</text>
+<text x="1639" y="333" class="lbl" text-anchor="start" >2.17 GB</text>
+<path d="M780,346 L1840,346" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="375" class="sm" text-anchor="start" >미리 올려 두는 양 (산술)</text>
+<text x="1124" y="375" class="lbl" text-anchor="start" >0 (112 < 128)</text>
+<text x="1339" y="375" class="lbl" text-anchor="start" style="font-weight:700">256개 ≈ 0.77 GB</text>
+<text x="1639" y="375" class="lbl" text-anchor="start" >512개 ≈ 1.54 GB</text>
+<path d="M780,388 L1840,388" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="417" class="sm" text-anchor="start" >Flash read / prefill (상한)</text>
+<text x="1124" y="417" class="lbl" text-anchor="start" >10.84 GB</text>
+<text x="1339" y="417" class="lbl" text-anchor="start" style="font-weight:700">10.12 GB</text>
+<text x="1639" y="417" class="lbl" text-anchor="start" >9.39 GB</text>
+<path d="M780,430 L1840,430" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="459" class="sm" text-anchor="start" >Flash 하한 (÷ 3.0 GB/s)</text>
+<text x="1124" y="459" class="lbl" text-anchor="start" >3.61 s</text>
+<text x="1339" y="459" class="lbl" text-anchor="start" style="font-weight:700">3.37 s</text>
+<text x="1639" y="459" class="lbl" text-anchor="start" >3.13 s</text>
+<path d="M780,472 L1840,472" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="501" class="sm" text-anchor="start" >Prefetch (실측)</text>
+<text x="1124" y="501" class="lbl" text-anchor="start" >—</text>
+<text x="1339" y="501" class="lbl" text-anchor="start" style="font-weight:700">3,360개 · 대기 0 ms</text>
+<text x="1639" y="501" class="lbl" text-anchor="start" >—</text>
+<path d="M780,514 L1840,514" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="543" class="sm" text-anchor="start" >Prefill latency (실측)</text>
+<text x="1124" y="543" class="lbl" text-anchor="start" >4.85 s</text>
+<text x="1339" y="543" class="lbl" text-anchor="start" style="font-weight:700">4.27 s</text>
+<text x="1639" y="543" class="lbl" text-anchor="start" >4.15 s</text>
+<path d="M780,556 L1840,556" stroke="#e1e0d9" stroke-width="2"/>
+<text x="780" y="612" class="h3" text-anchor="start" >Decode (512 token 생성)</text>
+<rect x="780" y="630" width="1060" height="44" rx="6" fill="var(--idle)" />
+<text x="794" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">항목</text>
+<text x="1124" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">240 slot</text>
+<text x="1339" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">480 slot (기본)</text>
+<text x="1639" y="660" class="sm" text-anchor="start" style="font-weight:700;fill:#0b0b0b">720 slot</text>
+<text x="794" y="703" class="sm" text-anchor="start" >Decode 속도 (실측)</text>
+<text x="1124" y="703" class="lbl" text-anchor="start" >4.51 TPS</text>
+<text x="1339" y="703" class="lbl" text-anchor="start" style="font-weight:700">3.39 TPS</text>
+<text x="1639" y="703" class="lbl" text-anchor="start" >3.47 TPS</text>
+<path d="M780,716 L1840,716" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="745" class="sm" text-anchor="start" >Cache miss (실측)</text>
+<text x="1124" y="745" class="lbl" text-anchor="start" >81,348</text>
+<text x="1339" y="745" class="lbl" text-anchor="start" style="font-weight:700">62,198</text>
+<text x="1639" y="745" class="lbl" text-anchor="start" >41,955</text>
+<path d="M780,758 L1840,758" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="787" class="sm" text-anchor="start" >Hit rate (계산)</text>
+<text x="1124" y="787" class="lbl" text-anchor="start" >34%</text>
+<text x="1339" y="787" class="lbl" text-anchor="start" style="font-weight:700">49%</text>
+<text x="1639" y="787" class="lbl" text-anchor="start" >66%</text>
+<path d="M780,800 L1840,800" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="829" class="sm" text-anchor="start" >Flash read / token</text>
+<text x="1124" y="829" class="lbl" text-anchor="start" >478 MB</text>
+<text x="1339" y="829" class="lbl" text-anchor="start" style="font-weight:700">366 MB</text>
+<text x="1639" y="829" class="lbl" text-anchor="start" >247 MB</text>
+<path d="M780,842 L1840,842" stroke="#e1e0d9" stroke-width="2"/>
+<text x="794" y="871" class="sm" text-anchor="start" >Read 시간 / miss (실측)</text>
+<text x="1124" y="871" class="lbl" text-anchor="start" >0.76 ms</text>
+<text x="1339" y="871" class="lbl" text-anchor="start" style="font-weight:700">1.58 ms</text>
+<text x="1639" y="871" class="lbl" text-anchor="start" >2.27 ms</text>
+<path d="M780,884 L1840,884" stroke="#e1e0d9" stroke-width="2"/>
+<text x="80" y="990" class="xs" text-anchor="start" >미리 올려 두는 양: 다음 layer(128개) 단위로만 queue → (slot − 현재 layer 128) ÷ 128 layer. Hit rate = 1 − miss ÷ (512 token × 240). Flash read / token = miss ÷ 512 × 3.01 MB.</text>
+<text x="80" y="1018" class="xs" text-anchor="start" >Cache가 커지면 hit는 오르지만 miss당 read가 느려진다(ION arena가 커질수록 OS page cache가 줄어드는 것으로 추정, 미측정).</text>
+<text x="80" y="1046" class="xs" text-anchor="start" >실측: Galaxy S25 Ultra (Hexagon V79), FC·MoE NPU 구성, 2026-10-02 (문서 55 §10.14·10.15, 57 §3). 이번 브랜치(전 연산 NPU)는 기기 미측정.</text>
+</svg></body></html>

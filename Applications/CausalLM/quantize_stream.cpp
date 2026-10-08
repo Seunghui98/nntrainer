@@ -1344,14 +1344,21 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
     writer.writeFc(model.intermediate_size, model.hidden_size, quant.fc_dtype,
                    prefix + "_ffn_down", true);
 
+    // The MoE half of the block, in the compiled graph's order (checked by
+    // unittest_causallm_gemma4_moe) that res/gemma4/weight_converter.py
+    // writes too: three norms (the router's scale and
+    // hidden^-0.5 folded into _router_norm), then the lfm2_moe layer's
+    // weights as writeLfm2Moe has them -- router gate and the [E] vector
+    // FP32 (Lfm2MoELayer::save never quantizes them), then per expert the
+    // fused gate|up and the down projection in the MoE dtype, which is what
+    // lets --moe_dtype QS4CX_WH stream them onto the HTP (doc 55).
     writer.copyFp32(model.hidden_size, prefix + "_post_ffn_norm_1");
     writer.copyFp32(model.hidden_size, prefix + "_pre_ffn_norm_2");
-    writer.copyFp32(tensorElements(model.hidden_size, model.num_experts,
-                                   prefix + "_sparse_moe router"),
-                    prefix + "_sparse_moe router");
-    writer.copyFp32(model.hidden_size, prefix + "_sparse_moe router_scale");
-    writer.copyFp32(model.num_experts,
-                    prefix + "_sparse_moe router_per_expert_scale");
+    writer.copyFp32(model.hidden_size, prefix + "_router_norm");
+    writer.copyFp32(
+      tensorElements(model.hidden_size, model.num_experts, prefix + "_router"),
+      prefix + "_router");
+    writer.copyFp32(model.num_experts, prefix + "_per_expert_scale");
 
     // The experts in --moe_dtype (the fc dtype unless set). [plan 201 S4]
     // QS4CX_WH (and QS2CX_WH, its 2-bit form) is the HTP MoE layer's
@@ -1360,17 +1367,10 @@ void writeGemma4Moe(TensorWriter &writer, const Gemma4MoePlan &model,
     for (size_t expert = 0; expert < model.num_experts; ++expert) {
       const std::string expert_prefix =
         prefix + "_expert" + std::to_string(expert);
-      if (quant.moe_dtype == DType::QS4CX_WH ||
-          quant.moe_dtype == DType::QS2CX_WH) {
-        writer.writeFcConcat(model.hidden_size, model.moe_intermediate_size,
-                             model.moe_intermediate_size, quant.moe_dtype,
-                             expert_prefix + "_gate_up");
-      } else {
-        writer.writeFc(model.hidden_size, model.moe_intermediate_size,
-                       quant.moe_dtype, expert_prefix + "_gate");
-        writer.writeFc(model.hidden_size, model.moe_intermediate_size,
-                       quant.moe_dtype, expert_prefix + "_up");
-      }
+      writer.writeFc(
+        model.hidden_size,
+        checkedMultiply(2, model.moe_intermediate_size, expert_prefix),
+        quant.moe_dtype, expert_prefix + "_gate_up");
       writer.writeFc(model.moe_intermediate_size, model.hidden_size,
                      quant.moe_dtype, expert_prefix + "_down");
     }
@@ -1703,7 +1703,9 @@ void printUsage(const char *program) {
        "kernel can\n"
     << "read it, so a model using it runs its MoE experts on the HTP or "
        "not at all.\n"
-    << "Gemma4 MoE FC/expert weights currently support FP32 or Q4_0.\n";
+    << "Gemma4 MoE FC weights currently support FP32 or Q4_0; the experts "
+       "take\n"
+    << "--moe_dtype like LFM2 (QS4CX_WH for the HTP expert streaming).\n";
 }
 
 int run(int argc, char **argv) {
@@ -1855,10 +1857,12 @@ int run(int argc, char **argv) {
     throw std::invalid_argument(
       "A tied model requires matching embedding and LM head dtypes");
   }
+  // The experts take --moe_dtype; the FCs are plain fully_connected layers,
+  // whose QS4CX weight the HTP registers without a Q4_0 detour.
   if (is_gemma4_moe && quant.fc_dtype != DType::FP32 &&
-      quant.fc_dtype != DType::Q4_0) {
+      quant.fc_dtype != DType::Q4_0 && quant.fc_dtype != DType::QS4CX) {
     throw std::invalid_argument(
-      "Gemma4 MoE FC/expert dtype must be FP32 or Q4_0");
+      "Gemma4 MoE FC dtype must be FP32, Q4_0 or QS4CX");
   }
   // [#225] The sidecar is the HTP prefill's copy of the CPU's Q4_0 FCs: it
   // is keyed by those Q4_0 bytes, and only the LFM2 and Gemma4 MoE walks

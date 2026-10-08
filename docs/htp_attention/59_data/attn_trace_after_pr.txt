@@ -1,0 +1,91 @@
+# 6a31ba72, cfgB run 2, logcat: mha_core trace (host) + HTP attn trace q2 (DSP), 1024-row prefill, layer order 0..29 (full layers 5,11,17,23,29)
+mha_core trace: q2 calibration rows=1024 us=10690
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14556 dsp_us: append=6836 (quant=5840 stage=0 bake=965 rows=1024) kernel=5065 (qk=2534 softmax=2228 pv=1779 wait=43) total=11901
+mha_core trace: rows=1024 kv_write_us=607 accel_call_us=37443
+mha_core trace: q2 calibration rows=1024 us=10611
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13218 dsp_us: append=6787 (quant=5840 stage=0 bake=938 rows=1024) kernel=5092 (qk=2543 softmax=2197 pv=1766 wait=44) total=11879
+mha_core trace: rows=1024 kv_write_us=545 accel_call_us=30076
+mha_core trace: q2 calibration rows=1024 us=13245
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13329 dsp_us: append=6833 (quant=5874 stage=0 bake=949 rows=1024) kernel=5104 (qk=2547 softmax=2216 pv=1786 wait=28) total=11937
+mha_core trace: rows=1024 kv_write_us=666 accel_call_us=33342
+mha_core trace: q2 calibration rows=1024 us=11812
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13514 dsp_us: append=6944 (quant=5946 stage=0 bake=987 rows=1024) kernel=5098 (qk=2544 softmax=2216 pv=1783 wait=37) total=12042
+mha_core trace: rows=1024 kv_write_us=798 accel_call_us=32807
+mha_core trace: q2 calibration rows=1024 us=10649
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14341 dsp_us: append=7509 (quant=6364 stage=0 bake=1136 rows=1024) kernel=5115 (qk=2552 softmax=2213 pv=1775 wait=39) total=12624
+mha_core trace: rows=1024 kv_write_us=801 accel_call_us=32278
+mha_core trace: q2 calibration rows=1024 us=20916
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=15688 dsp_us: append=2864 (quant=2377 stage=0 bake=482 rows=1024) kernel=8347 (qk=3635 softmax=2310 pv=3540 wait=29) total=11211
+mha_core trace: rows=1024 kv_write_us=375 accel_call_us=46143
+mha_core trace: q2 calibration rows=1024 us=10611
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14318 dsp_us: append=7464 (quant=6387 stage=0 bake=1066 rows=1024) kernel=5118 (qk=2540 softmax=2201 pv=1777 wait=33) total=12582
+mha_core trace: rows=1024 kv_write_us=784 accel_call_us=31400
+mha_core trace: q2 calibration rows=1024 us=11291
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14301 dsp_us: append=7494 (quant=6347 stage=0 bake=1135 rows=1024) kernel=5121 (qk=2533 softmax=2191 pv=1778 wait=38) total=12615
+mha_core trace: rows=1024 kv_write_us=774 accel_call_us=32841
+mha_core trace: q2 calibration rows=1024 us=12518
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14051 dsp_us: append=7408 (quant=6253 stage=0 bake=1142 rows=1024) kernel=5133 (qk=2539 softmax=2195 pv=1769 wait=43) total=12541
+mha_core trace: rows=1024 kv_write_us=871 accel_call_us=34015
+mha_core trace: q2 calibration rows=1024 us=10666
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13656 dsp_us: append=7075 (quant=6094 stage=0 bake=969 rows=1024) kernel=5063 (qk=2537 softmax=2215 pv=1775 wait=42) total=12138
+mha_core trace: rows=1024 kv_write_us=655 accel_call_us=32674
+mha_core trace: q2 calibration rows=1024 us=12630
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14030 dsp_us: append=7304 (quant=6178 stage=0 bake=1114 rows=1024) kernel=5119 (qk=2556 softmax=2193 pv=1781 wait=42) total=12423
+mha_core trace: rows=1024 kv_write_us=666 accel_call_us=34688
+mha_core trace: q2 calibration rows=1024 us=20844
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13422 dsp_us: append=2867 (quant=2387 stage=0 bake=474 rows=1024) kernel=8358 (qk=3649 softmax=2303 pv=3533 wait=24) total=11225
+mha_core trace: rows=1024 kv_write_us=474 accel_call_us=44669
+mha_core trace: q2 calibration rows=1024 us=11615
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14089 dsp_us: append=7416 (quant=6261 stage=0 bake=1142 rows=1024) kernel=5083 (qk=2529 softmax=2202 pv=1783 wait=48) total=12499
+mha_core trace: rows=1024 kv_write_us=719 accel_call_us=32370
+mha_core trace: q2 calibration rows=1024 us=11806
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14343 dsp_us: append=7622 (quant=6444 stage=0 bake=1171 rows=1024) kernel=5088 (qk=2537 softmax=2204 pv=1775 wait=43) total=12710
+mha_core trace: rows=1024 kv_write_us=727 accel_call_us=33545
+mha_core trace: q2 calibration rows=1024 us=12389
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14075 dsp_us: append=7465 (quant=6335 stage=0 bake=1122 rows=1024) kernel=5108 (qk=2548 softmax=2214 pv=1793 wait=33) total=12573
+mha_core trace: rows=1024 kv_write_us=786 accel_call_us=34302
+mha_core trace: q2 calibration rows=1024 us=11677
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13959 dsp_us: append=7122 (quant=5993 stage=0 bake=1116 rows=1024) kernel=5116 (qk=2548 softmax=2198 pv=1787 wait=42) total=12238
+mha_core trace: rows=1024 kv_write_us=921 accel_call_us=34494
+mha_core trace: q2 calibration rows=1024 us=11601
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14020 dsp_us: append=7265 (quant=6158 stage=0 bake=1101 rows=1024) kernel=5075 (qk=2523 softmax=2216 pv=1781 wait=52) total=12340
+mha_core trace: rows=1024 kv_write_us=756 accel_call_us=33937
+mha_core trace: q2 calibration rows=1024 us=24505
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14585 dsp_us: append=3156 (quant=2612 stage=0 bake=540 rows=1024) kernel=8373 (qk=3645 softmax=2280 pv=3543 wait=22) total=11529
+mha_core trace: rows=1024 kv_write_us=492 accel_call_us=61810
+mha_core trace: q2 calibration rows=1024 us=13816
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13218 dsp_us: append=6848 (quant=5864 stage=0 bake=976 rows=1024) kernel=5070 (qk=2548 softmax=2215 pv=1792 wait=39) total=11918
+mha_core trace: rows=1024 kv_write_us=658 accel_call_us=33217
+mha_core trace: q2 calibration rows=1024 us=10640
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14234 dsp_us: append=7387 (quant=6307 stage=0 bake=1072 rows=1024) kernel=5133 (qk=2550 softmax=2200 pv=1780 wait=49) total=12520
+mha_core trace: rows=1024 kv_write_us=916 accel_call_us=33306
+mha_core trace: q2 calibration rows=1024 us=11806
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14464 dsp_us: append=7477 (quant=6281 stage=0 bake=1185 rows=1024) kernel=5118 (qk=2538 softmax=2201 pv=1785 wait=40) total=12595
+mha_core trace: rows=1024 kv_write_us=687 accel_call_us=33756
+mha_core trace: q2 calibration rows=1024 us=10774
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14105 dsp_us: append=7348 (quant=6236 stage=0 bake=1101 rows=1024) kernel=5116 (qk=2560 softmax=2200 pv=1784 wait=42) total=12464
+mha_core trace: rows=1024 kv_write_us=861 accel_call_us=32918
+mha_core trace: q2 calibration rows=1024 us=10628
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14151 dsp_us: append=7469 (quant=6302 stage=0 bake=1155 rows=1024) kernel=5089 (qk=2553 softmax=2216 pv=1791 wait=41) total=12558
+mha_core trace: rows=1024 kv_write_us=823 accel_call_us=33741
+mha_core trace: q2 calibration rows=1024 us=21513
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14097 dsp_us: append=3034 (quant=2531 stage=0 bake=497 rows=1024) kernel=8367 (qk=3640 softmax=2286 pv=3543 wait=24) total=11401
+mha_core trace: rows=1024 kv_write_us=438 accel_call_us=47354
+mha_core trace: q2 calibration rows=1024 us=12235
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14372 dsp_us: append=7467 (quant=6365 stage=0 bake=1091 rows=1024) kernel=5106 (qk=2546 softmax=2182 pv=1780 wait=37) total=12573
+mha_core trace: rows=1024 kv_write_us=720 accel_call_us=32694
+mha_core trace: q2 calibration rows=1024 us=10769
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14431 dsp_us: append=7575 (quant=6464 stage=0 bake=1103 rows=1024) kernel=5120 (qk=2541 softmax=2182 pv=1774 wait=47) total=12695
+mha_core trace: rows=1024 kv_write_us=936 accel_call_us=33259
+mha_core trace: q2 calibration rows=1024 us=10625
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13407 dsp_us: append=6936 (quant=5957 stage=0 bake=968 rows=1024) kernel=5107 (qk=2555 softmax=2201 pv=1777 wait=36) total=12043
+mha_core trace: rows=1024 kv_write_us=564 accel_call_us=32059
+mha_core trace: q2 calibration rows=1024 us=11446
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=14061 dsp_us: append=7291 (quant=6150 stage=0 bake=1133 rows=1024) kernel=5114 (qk=2555 softmax=2184 pv=1775 wait=31) total=12405
+mha_core trace: rows=1024 kv_write_us=759 accel_call_us=34765
+mha_core trace: q2 calibration rows=1024 us=10810
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13991 dsp_us: append=7216 (quant=6083 stage=0 bake=1128 rows=1024) kernel=5117 (qk=2537 softmax=2217 pv=1770 wait=33) total=12333
+mha_core trace: rows=1024 kv_write_us=668 accel_call_us=33608
+mha_core trace: q2 calibration rows=1024 us=22487
+HTP attn trace q2: n_q=1024 cache=0..1024 err=0x0 wall_us=13466 dsp_us: append=2842 (quant=2357 stage=0 bake=479 rows=1024) kernel=8372 (qk=3640 softmax=2269 pv=3539 wait=36) total=11214
+mha_core trace: rows=1024 kv_write_us=326 accel_call_us=46038

@@ -1,0 +1,153 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>Prefill time by op</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="Prefill time by op">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="88" class="t1" text-anchor="start" >Prefill 연산별 시간: 512 vs 1024 token</text>
+<text x="80" y="134" class="t2" text-anchor="start" >projection·dense FFN·MoE는 NPU, attention·lm_head는 CPU (프로파일 빌드, 노드 시간 합)</text>
+<text x="80" y="244" class="h3" text-anchor="start" >512 token</text>
+<text x="80" y="270" class="sm" text-anchor="start" >4.82 s · 브랜치 전</text>
+<rect x="360" y="210" width="408.47123893805303" height="70" rx="4" fill="var(--host)" />
+<text x="565.7356194690265" y="240" class="lblw" text-anchor="middle" style="font-size:17px">attention</text>
+<text x="565.7356194690265" y="266" class="lblw" text-anchor="middle" style="font-size:16px">2.07 s</text>
+<rect x="771.471238938053" y="210" width="251.11061946902652" height="70" rx="4" fill="var(--npu)" />
+<text x="898.5265486725663" y="240" class="lblw" text-anchor="middle" style="font-size:17px">sparse_moe</text>
+<text x="898.5265486725663" y="266" class="lblw" text-anchor="middle" style="font-size:16px">1.28 s</text>
+<rect x="1025.5818584070796" y="210" width="112.56637168141592" height="70" rx="4" fill="var(--npu)" />
+<rect x="1141.1482300884954" y="210" width="84.29203539823007" height="70" rx="4" fill="var(--npu)" />
+<rect x="1228.4402654867256" y="210" width="36.98230088495575" height="70" rx="4" fill="var(--npu)" />
+<rect x="1268.4225663716813" y="210" width="29.873893805309727" height="70" rx="4" fill="var(--npu)" />
+<rect x="1301.296460176991" y="210" width="10.48008849557522" height="70" rx="4" fill="var(--npu)" />
+<rect x="1314.7765486725664" y="210" width="2.0176991150442474" height="70" rx="4" fill="var(--host)" />
+<text x="1333.7942477876106" y="254" class="lbl" text-anchor="start" style="font-weight:700">4.82 s</text>
+<text x="80" y="354" class="h3" text-anchor="start" >1024 token</text>
+<text x="80" y="380" class="sm" text-anchor="start" >7.23 s · 지금 브랜치</text>
+<rect x="360" y="320" width="592.5730088495575" height="70" rx="4" fill="var(--host)" />
+<text x="657.7865044247787" y="350" class="lblw" text-anchor="middle" style="font-size:17px">attention</text>
+<text x="657.7865044247787" y="376" class="lblw" text-anchor="middle" style="font-size:16px">2.99 s</text>
+<rect x="955.5730088495575" y="320" width="421.0951327433628" height="70" rx="4" fill="var(--npu)" />
+<text x="1167.6205752212388" y="350" class="lblw" text-anchor="middle" style="font-size:17px">sparse_moe</text>
+<text x="1167.6205752212388" y="376" class="lblw" text-anchor="middle" style="font-size:16px">2.13 s</text>
+<rect x="1379.6681415929202" y="320" width="160.3738938053097" height="70" rx="4" fill="var(--npu)" />
+<text x="1461.355088495575" y="350" class="lblw" text-anchor="middle" style="font-size:17px">qkv</text>
+<text x="1461.355088495575" y="376" class="lblw" text-anchor="middle" style="font-size:16px">0.82 s</text>
+<rect x="1543.04203539823" y="320" width="90.30530973451327" height="70" rx="4" fill="var(--npu)" />
+<rect x="1636.3473451327432" y="320" width="66.84955752212389" height="70" rx="4" fill="var(--npu)" />
+<rect x="1706.196902654867" y="320" width="55.360619469026545" height="70" rx="4" fill="var(--npu)" />
+<rect x="1764.5575221238935" y="320" width="28.659292035398227" height="70" rx="4" fill="var(--npu)" />
+<rect x="1796.2168141592917" y="320" width="1" height="70" rx="4" fill="var(--host)" />
+<text x="1813.9999999999998" y="364" class="lbl" text-anchor="start" style="font-weight:700">7.23 s</text>
+<rect x="360" y="426" width="22" height="22" rx="4" fill="var(--host)" />
+<text x="392" y="444" class="sm" text-anchor="start" >CPU</text>
+<rect x="480" y="426" width="22" height="22" rx="4" fill="var(--npu)" />
+<text x="512" y="444" class="sm" text-anchor="start" >NPU</text>
+<rect x="80" y="500" width="1760" height="50" rx="6" fill="var(--idle)" />
+<text x="96" y="533" class="lbl" text-anchor="start" style="font-weight:700">연산 (지금 브랜치의 노드)</text>
+<text x="636" y="533" class="lbl" text-anchor="start" style="font-weight:700">어디서</text>
+<text x="806" y="533" class="lbl" text-anchor="start" style="font-weight:700">512 token</text>
+<text x="1016" y="533" class="lbl" text-anchor="start" style="font-weight:700">1024 token</text>
+<text x="1236" y="533" class="lbl" text-anchor="start" style="font-weight:700">배율</text>
+<text x="1396" y="533" class="lbl" text-anchor="start" style="font-weight:700">비고</text>
+<path d="M80,594 L1840,594" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="580" class="lbl" text-anchor="start" >attention (CPU fp16)</text>
+<rect x="636" y="561" width="54" height="24" rx="4" fill="var(--host)" />
+<text x="663" y="579" class="lblw" text-anchor="middle" style="font-size:14px">CPU</text>
+<text x="806" y="580" class="lbl" text-anchor="start" >2,066 ms</text>
+<text x="1016" y="580" class="lbl" text-anchor="start" style="font-weight:700">2,991 ms</text>
+<text x="1236" y="580" class="lbl" text-anchor="start" >×1.45</text>
+<text x="1396" y="580" class="sm" text-anchor="start" >O(n²). RoPE 표 1 s가 512 쪽 L0/L5에 섞여 있음</text>
+<path d="M80,638 L1840,638" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="624" class="lbl" text-anchor="start" >sparse_moe (router·128 expert)</text>
+<rect x="636" y="605" width="54" height="24" rx="4" fill="var(--npu)" />
+<text x="663" y="623" class="lblw" text-anchor="middle" style="font-size:14px">NPU</text>
+<text x="806" y="624" class="lbl" text-anchor="start" >1,276 ms</text>
+<text x="1016" y="624" class="lbl" text-anchor="start" style="font-weight:700">2,130 ms</text>
+<text x="1236" y="624" class="lbl" text-anchor="start" >×1.67</text>
+<text x="1396" y="624" class="sm" text-anchor="start" >weight DMA는 token 무관 → 계산 몫이 늘어남</text>
+<path d="M80,682 L1840,682" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="668" class="lbl" text-anchor="start" >qkv (norm·q/k/v·RoPE)</text>
+<rect x="636" y="649" width="54" height="24" rx="4" fill="var(--npu)" />
+<text x="663" y="667" class="lblw" text-anchor="middle" style="font-size:14px">NPU</text>
+<text x="806" y="668" class="lbl" text-anchor="start" >580 ms</text>
+<text x="1016" y="668" class="lbl" text-anchor="start" style="font-weight:700">820 ms</text>
+<text x="1236" y="668" class="lbl" text-anchor="start" >×1.41</text>
+<text x="1396" y="668" class="sm" text-anchor="start" >full 층(hd 512) L5 56 ms</text>
+<path d="M80,726 L1840,726" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="712" class="lbl" text-anchor="start" >ffn (dense gate/up/down)</text>
+<rect x="636" y="693" width="54" height="24" rx="4" fill="var(--npu)" />
+<text x="663" y="711" class="lblw" text-anchor="middle" style="font-size:14px">NPU</text>
+<text x="806" y="712" class="lbl" text-anchor="start" >438 ms</text>
+<text x="1016" y="712" class="lbl" text-anchor="start" style="font-weight:700">469 ms</text>
+<text x="1236" y="712" class="lbl" text-anchor="start" >×1.07</text>
+<text x="1396" y="712" class="sm" text-anchor="start" >token당 1.1배: DMA·고정비 큼</text>
+<path d="M80,770 L1840,770" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="756" class="lbl" text-anchor="start" >attention_out (o proj)</text>
+<rect x="636" y="737" width="54" height="24" rx="4" fill="var(--npu)" />
+<text x="663" y="755" class="lblw" text-anchor="middle" style="font-size:14px">NPU</text>
+<text x="806" y="756" class="lbl" text-anchor="start" >201 ms</text>
+<text x="1016" y="756" class="lbl" text-anchor="start" style="font-weight:700">351 ms</text>
+<text x="1236" y="756" class="lbl" text-anchor="start" >×1.75</text>
+<text x="1396" y="756" class="sm" text-anchor="start" ></text>
+<path d="M80,814 L1840,814" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="800" class="lbl" text-anchor="start" >post_ffn_norm (epilogue)</text>
+<rect x="636" y="781" width="54" height="24" rx="4" fill="var(--npu)" />
+<text x="663" y="799" class="lblw" text-anchor="middle" style="font-size:14px">NPU</text>
+<text x="806" y="800" class="lbl" text-anchor="start" >165 ms</text>
+<text x="1016" y="800" class="lbl" text-anchor="start" style="font-weight:700">293 ms</text>
+<text x="1236" y="800" class="lbl" text-anchor="start" >×1.78</text>
+<text x="1396" y="800" class="sm" text-anchor="start" >1024행×2 addend staging</text>
+<path d="M80,858 L1840,858" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="844" class="lbl" text-anchor="start" >post_attention_norm (epilogue)</text>
+<rect x="636" y="825" width="54" height="24" rx="4" fill="var(--npu)" />
+<text x="663" y="843" class="lblw" text-anchor="middle" style="font-size:14px">NPU</text>
+<text x="806" y="844" class="lbl" text-anchor="start" >68 ms</text>
+<text x="1016" y="844" class="lbl" text-anchor="start" style="font-weight:700">159 ms</text>
+<text x="1236" y="844" class="lbl" text-anchor="start" >×2.35</text>
+<text x="1396" y="844" class="sm" text-anchor="start" ></text>
+<path d="M80,902 L1840,902" stroke="#e1e0d9" stroke-width="2"/>
+<text x="96" y="888" class="lbl" text-anchor="start" >lm_head·embedding (CPU)</text>
+<rect x="636" y="869" width="54" height="24" rx="4" fill="var(--host)" />
+<text x="663" y="887" class="lblw" text-anchor="middle" style="font-size:14px">CPU</text>
+<text x="806" y="888" class="lbl" text-anchor="start" >25 ms</text>
+<text x="1016" y="888" class="lbl" text-anchor="start" style="font-weight:700">19 ms</text>
+<text x="1236" y="888" class="lbl" text-anchor="start" >×0.75</text>
+<text x="1396" y="888" class="sm" text-anchor="start" >마지막 행만</text>
+<rect x="80" y="902" width="1760" height="46" rx="6" fill="var(--idle)" />
+<text x="96" y="932" class="lbl" text-anchor="start" style="font-weight:700">합계 (노드 시간 합)</text>
+<text x="806" y="932" class="lbl" text-anchor="start" style="font-weight:700">4,820 ms</text>
+<text x="1016" y="932" class="lbl" text-anchor="start" style="font-weight:700">7,232 ms</text>
+<text x="1236" y="932" class="lbl" text-anchor="start" style="font-weight:700">×1.50</text>
+<text x="1396" y="932" class="sm" text-anchor="start" >일반 빌드 prefill 타이머: 3.99 s / 6.45 s</text>
+<text x="80" y="1000" class="xs" text-anchor="start" >512: 브랜치 전 그래프(문서 57 §3, 2026-10-06)의 31개 노드를 지금 브랜치의 융합 노드로 합산. 1024: 지금 브랜치(b0bbd264) 프로파일 빌드, 2026-10-08. 두 실행의 코드가 다르므로 배율은 참고값.</text>
+<text x="80" y="1028" class="xs" text-anchor="start" >CPU attention이 1024에서 41%. attention_engine: htp(HMX)와 lm_head NPU는 이 그림에 없음(기기 미측정). 측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin.</text>
+</svg></body></html>

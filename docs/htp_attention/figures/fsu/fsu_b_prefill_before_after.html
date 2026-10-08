@@ -1,0 +1,117 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>prefill 선읽기 전후</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=block" rel="stylesheet">
+<style>
+:root {
+  --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.10);
+  --npu:#2a78d6; --npu-t:#cde2fb; --read:#eb6834; --read-t:#fbe0d4;
+  --host:#1baf7a; --host-t:#d3f1e6; --crit:#d03b3b; --crit-t:#f7dcdc;
+  --idle:#e9e8e3;
+}
+html,body { margin:0; background:var(--surface); }
+svg { display:block; font-family:"Noto Sans KR",system-ui,sans-serif; }
+.t1 { font-size:44px; font-weight:700; fill:var(--ink); }
+.t2 { font-size:24px; fill:var(--ink2); }
+.lane { font-size:22px; font-weight:700; fill:var(--ink); }
+.lane2 { font-size:17px; fill:var(--ink2); }
+.lbl { font-size:19px; fill:var(--ink); }
+.lblw { font-size:19px; font-weight:700; fill:#fff; }
+.sm { font-size:16px; fill:var(--ink2); }
+.xs { font-size:15px; fill:var(--muted); }
+.big { font-size:46px; font-weight:700; fill:var(--ink); }
+.h3 { font-size:22px; font-weight:700; fill:var(--ink); }
+</style></head><body>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-label="prefill 선읽기 전후">
+<defs>
+ <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+ <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="18" markerHeight="18" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+  <path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<rect width="1920" height="1080" fill="var(--surface)"/>
+
+<text x="80" y="92" class="t1" text-anchor="start" >prefill: 계산하는 동안 다음 층을 미리 가져오면 기다림이 사라진다</text>
+<text x="80" y="140" class="t2" text-anchor="start" >같은 프롬프트(446토큰), 같은 모델. 달라진 것은 작업대 크기(층당 칸 수) 하나다</text>
+<text x="80" y="222" class="lane" text-anchor="start" style="font-size:26px">칸 5개/층</text>
+<text x="80" y="256" class="h3" text-anchor="start" fill="#d03b3b">prefill 10.94 s</text>
+<rect x="330" y="200" width="197.21756487025948" height="72" rx="8" fill="var(--crit)" />
+<text x="428.60878243512974" y="232.0" class="lblw" text-anchor="middle" >⚠ 기다림</text>
+<text x="428.60878243512974" y="258.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">flash에서 읽기</text>
+<rect x="531.2175648702595" y="200" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="614.2175648702595" y="243.0" class="lblw" text-anchor="middle" >층 1 계산</text>
+<rect x="701.2175648702595" y="200" width="197.21756487025948" height="72" rx="8" fill="var(--crit)" />
+<text x="799.8263473053892" y="232.0" class="lblw" text-anchor="middle" >⚠ 기다림</text>
+<text x="799.8263473053892" y="258.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">flash에서 읽기</text>
+<rect x="902.435129740519" y="200" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="985.435129740519" y="243.0" class="lblw" text-anchor="middle" >층 2 계산</text>
+<rect x="1072.435129740519" y="200" width="197.21756487025948" height="72" rx="8" fill="var(--crit)" />
+<text x="1171.0439121756488" y="232.0" class="lblw" text-anchor="middle" >⚠ 기다림</text>
+<text x="1171.0439121756488" y="258.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">flash에서 읽기</text>
+<rect x="1273.6526946107783" y="200" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="1356.6526946107783" y="243.0" class="lblw" text-anchor="middle" >층 3 계산</text>
+<rect x="1443.6526946107783" y="200" width="197.21756487025948" height="72" rx="8" fill="var(--crit)" />
+<text x="1542.2614770459081" y="232.0" class="lblw" text-anchor="middle" >⚠ 기다림</text>
+<text x="1542.2614770459081" y="258.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">flash에서 읽기</text>
+<rect x="1644.870259481038" y="200" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="1727.870259481038" y="243.0" class="lblw" text-anchor="middle" >층 4 계산</text>
+<text x="330" y="300" class="sm" text-anchor="start" >읽기와 계산이 번갈아: 층마다 expert를 다 읽을 때까지 NPU가 논다</text>
+<text x="80" y="392" class="lane" text-anchor="start" style="font-size:26px">칸 16개/층</text>
+<text x="80" y="426" class="h3" text-anchor="start" fill="#2a78d6">prefill 5.01 s</text>
+<rect x="338" y="346" width="150" height="64" rx="8" fill="var(--read)" />
+<text x="413.0" y="374.0" class="lblw" text-anchor="middle" >층 2</text>
+<text x="413.0" y="400.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">가져오기</text>
+<rect x="330" y="418" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="413.0" y="461.0" class="lblw" text-anchor="middle" >층 1 계산</text>
+<rect x="508" y="346" width="150" height="64" rx="8" fill="var(--read)" />
+<text x="583.0" y="374.0" class="lblw" text-anchor="middle" >층 3</text>
+<text x="583.0" y="400.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">가져오기</text>
+<rect x="500" y="418" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="583.0" y="461.0" class="lblw" text-anchor="middle" >층 2 계산</text>
+<rect x="678" y="346" width="150" height="64" rx="8" fill="var(--read)" />
+<text x="753.0" y="374.0" class="lblw" text-anchor="middle" >층 4</text>
+<text x="753.0" y="400.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">가져오기</text>
+<rect x="670" y="418" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="753.0" y="461.0" class="lblw" text-anchor="middle" >층 3 계산</text>
+<rect x="848" y="346" width="150" height="64" rx="8" fill="var(--read)" />
+<text x="923.0" y="374.0" class="lblw" text-anchor="middle" >층 5</text>
+<text x="923.0" y="400.0" class="lblw" text-anchor="middle" style="font-weight:400;font-size:16px">가져오기</text>
+<rect x="840" y="418" width="166" height="72" rx="8" fill="var(--npu)" />
+<text x="923.0" y="461.0" class="lblw" text-anchor="middle" >층 4 계산</text>
+<text x="1030" y="384" class="sm" text-anchor="start" >← flash: 다음 층 것</text>
+<text x="1030" y="462" class="sm" text-anchor="start" >← NPU: 쉬지 않고 계산</text>
+<text x="330" y="530" class="lbl" text-anchor="start" style="font-weight:700">기다림 칸이 없다: 층 N을 계산하는 동안 층 N+1이 이미 작업대에 올라온다</text>
+<text x="80" y="610" class="h3" text-anchor="start" style="font-size:26px">왜 작업대 크기가 결정적인가</text>
+<text x="80" y="664" class="lbl" text-anchor="start" style="font-weight:700">칸 5개/층 = 150칸</text>
+<rect x="330" y="630" width="397.0" height="50" rx="4" fill="var(--npu)" />
+<text x="530.0" y="662" class="lblw" text-anchor="middle" >지금 층 128</text>
+<rect x="730.0" y="630" width="65.75" height="50" rx="4" fill="var(--idle)" />
+<text x="812.75" y="662" class="sm" text-anchor="start" >남는 22칸 → 다음 층(128)이 안 들어간다</text>
+<text x="80" y="744" class="lbl" text-anchor="start" style="font-weight:700">칸 16개/층 = 480칸</text>
+<rect x="330" y="710" width="397.0" height="50" rx="4" fill="var(--npu)" />
+<text x="530.0" y="742" class="lblw" text-anchor="middle" >지금 층 128</text>
+<rect x="730.0" y="710" width="397.0" height="50" rx="4" fill="var(--npu-t)" />
+<rect x="1130.0" y="710" width="397.0" height="50" rx="4" fill="var(--read)" />
+<text x="1330.0" y="742" class="lblw" text-anchor="middle" >그다음 층 가져오는 중</text>
+<rect x="1530.0" y="710" width="297.0" height="50" rx="4" fill="var(--idle)" />
+<text x="1844.0" y="742" class="sm" text-anchor="start" ></text>
+<text x="930.0" y="742" class="lbl" text-anchor="middle" >다음 층 128 (준비됨)</text>
+<rect x="80" y="800" width="560" height="200" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="80" y="800" width="8" height="200" rx="4" fill="var(--crit)" />
+<text x="110" y="844" class="h3" text-anchor="start" >⚠ 칸 5개/층</text>
+<text x="110" y="908" class="big" text-anchor="start" >기다림 7.10 s</text>
+<text x="110" y="950" class="sm" text-anchor="start" >flash에서 기다리며 읽은 expert 2,893개</text>
+<rect x="680" y="800" width="560" height="200" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="680" y="800" width="8" height="200" rx="4" fill="var(--npu)" />
+<text x="710" y="844" class="h3" text-anchor="start" >칸 16개/층 (기본)</text>
+<text x="710" y="908" class="big" text-anchor="start" >기다림 0.01 s</text>
+<text x="710" y="950" class="sm" text-anchor="start" >미리 가져온 expert 3,360개</text>
+<rect x="1280" y="800" width="560" height="200" rx="10" fill="#fff" style="stroke:var(--ring);stroke-width:2"/>
+<rect x="1280" y="800" width="8" height="200" rx="4" fill="var(--muted)" />
+<text x="1310" y="844" class="h3" text-anchor="start" >그래도 남는 바닥</text>
+<text x="1310" y="908" class="big" text-anchor="start" >≈ 3.3 s</text>
+<text x="1310" y="950" class="sm" text-anchor="start" >prefill마다 약 10 GB를 3.0 GB/s로 읽는다 (산술)</text>
+<text x="80" y="1050" class="xs" text-anchor="start" >실측: Galaxy S25 Ultra, MoE만 NPU 구성, 2026-10-02 (문서 55 §10.11). 막대는 개념도이고 두 줄의 길이 비만 실측(10.94 : 5.01)에 맞췄다. 모든 연산 NPU 구성은 기기 미측정.</text>
+</svg></body></html>

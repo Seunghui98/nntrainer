@@ -22,6 +22,7 @@
 #define WIN_EXPORT
 #endif
 
+#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_devel.h>
 #include <layer_impl.h>
@@ -168,6 +169,13 @@ public:
   WIN_EXPORT void prepareLmhead(nntrainer::RunLayerContext &context);
 
   /**
+   * @brief Places the lm_head weight on the layer's accelerator ahead of
+   *        the first call (ComputeOps::lm_head_q4_0_prepare); true when
+   *        it is there, and then prepareLmhead builds no CPU twin.
+   */
+  WIN_EXPORT bool placeLmheadOnAccelerator(nntrainer::RunLayerContext &context);
+
+  /**
    * @brief NNTR_PPL (doc 51 section 2.14): the prompt's teacher-forced
    *        negative log-likelihood at prefill, the accuracy gate that
    *        replaces reading the generated text.
@@ -190,11 +198,17 @@ private:
   static double ppl_nll_;
   static unsigned int ppl_count_;
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
-             nntrainer::props::Unit, nntrainer::props::Scale>
+             nntrainer::props::Unit, nntrainer::props::Scale, props::InNorm,
+             nntrainer::props::Epsilon, props::Softcap>
     tieword_embedding_props;
   enum mode { embedding, lm_head };
   enum mode mode_;
-  std::array<unsigned int, 4> weight_idx; /**< indices of the weights */
+  std::array<unsigned int, 5> weight_idx; /**< indices of the weights */
+  /** @brief lm_head only: the model's final norm (in_norm, its gamma read
+   *  where the output_norm layer's was) and logit softcap, folded in so
+   *  an accelerator runs the three as one call. */
+  bool in_norm = false;
+  float softcap = 0.0f;
   bool skip_prefill = false;
 
   /**

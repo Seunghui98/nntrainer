@@ -9,9 +9,7 @@
 #include <app_context.h>
 #include <engine.h>
 #include <gemma4_moe_causallm.h>
-#include <gemma4_moe_layer.h>
 #include <layer_context.h>
-#include <lfm2_moe_layer.h>
 #include <llm_util.hpp>
 #include <model.h>
 
@@ -30,55 +28,18 @@ namespace causallm {
 void Gemma4MoECausalLM::setupParameters(json &cfg, json &generation_cfg,
                                         json &nntr_cfg) {
   Gemma4CausalLM::setupParameters(cfg, generation_cfg, nntr_cfg);
-
-  NNTR_THROW_IF(!cfg.contains("num_experts") || cfg["num_experts"].is_null() ||
-                  !cfg.contains("top_k_experts") ||
-                  cfg["top_k_experts"].is_null() ||
-                  !cfg.contains("moe_intermediate_size") ||
-                  cfg["moe_intermediate_size"].is_null(),
-                std::invalid_argument)
-    << "[Gemma4MoE] num_experts, top_k_experts, and moe_intermediate_size "
-       "must be provided";
-
-  num_experts = cfg["num_experts"].get<unsigned int>();
-  top_k_experts = cfg["top_k_experts"].get<unsigned int>();
-  moe_intermediate_size = cfg["moe_intermediate_size"].get<unsigned int>();
-  moe_cache_size =
-    nntr_cfg.contains("moe_cache_size") && !nntr_cfg["moe_cache_size"].is_null()
-      ? nntr_cfg["moe_cache_size"].get<unsigned int>()
-      : 0;
-
-  NNTR_THROW_IF(num_experts == 0 || top_k_experts == 0 ||
-                  top_k_experts > num_experts || moe_intermediate_size == 0,
-                std::invalid_argument)
-    << "[Gemma4MoE] invalid expert configuration";
-  NNTR_THROW_IF(NUM_KV_SHARED_LAYERS > 0, std::invalid_argument)
-    << "[Gemma4MoE] shared KV layers are not supported";
-
-  // [plan 201 S4] moe_engine=htp: the lfm2_moe layer with the softmax
-  // router, QS4CX_WH experts and the expert pool; its experts and the
-  // dense FFN are GeGLU on the HTP (the session's MoE flag, sent with the
-  // first MoE call)
-  moe_engine = nntr_cfg.value("moe_engine", std::string("cpu"));
-  moe_layer_dtype = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
-  // The two expert layouts: nntr_quantize_stream fuses gate | up for
-  // QS4CX_WH and QS2CX_WH (the HTP layer's), every other dtype keeps them
-  // apart (gemma4_moe's)
-  NNTR_THROW_IF((moe_engine == "htp") != (moe_layer_dtype == "QS4CX_WH" ||
-                                          moe_layer_dtype == "QS2CX_WH"),
-                std::invalid_argument)
-    << "[Gemma4MoE] moe_engine=htp takes QS4CX_WH or QS2CX_WH experts and "
-       "only they do "
-       "(moe_engine="
-    << moe_engine << ", moe_layer_dtype=" << moe_layer_dtype << ")";
 #ifdef ENABLE_HEXKL
-  if (moe_engine == "htp")
+  // [plan 201 S4, #260] moe_engine=htp: #4415's lfm2_moe layer runs the
+  // experts; their GeGLU goes into the session's MoE word too, which the
+  // one-PD token's MOE and DENSE_FFN ops read (#4415's prefill call ORs it
+  // in per call anyway)
+  if (MOE_ENGINE == "htp")
     nntrainer::get_htp_ops()->set_moe_geglu(true);
   // [plan 201 S4] NNTR_HTP_E2E=1: the whole decode token on the HTP, one
   // call a token; the list is built after load (load_weight)
   const char *e2e_env = std::getenv("NNTR_HTP_E2E");
   htp_e2e =
-    e2e_env != nullptr && std::atoi(e2e_env) != 0 && moe_engine == "htp";
+    e2e_env != nullptr && std::atoi(e2e_env) != 0 && MOE_ENGINE == "htp";
   NNTR_THROW_IF(htp_e2e && (HIDDEN_SIZE_PER_LAYER_INPUT > 0 ||
                             ATTN_LOGIT_SOFTCAPPING > 0.0f),
                 std::invalid_argument)
@@ -92,30 +53,35 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
 #ifdef ENABLE_HEXKL
   if (!htp_e2e)
     return;
-  // The weights by layer name (the names the graph builders give).
-  std::map<std::string, std::vector<nntrainer::Tensor *>> w;
+  // The weights by name, "<layer>:<weight>" (#4415's fused layers hold
+  // several each: qkv's gammas and projections, dense_ffn's gate / up /
+  // down and its two gammas, residual_add's gamma and the block's scalar),
+  // never by index. Keyed under the owning layer too: a shared_from layer
+  // (the tied head) names its own weights after the layer it shares with.
+  std::map<std::string, nntrainer::Tensor *> w;
   model->forEachLayer(
     [&w](ml::train::Layer &l, nntrainer::RunLayerContext &rc, void *) {
-      for (auto *t : rc.getWeights())
-        w[l.getName()].push_back(&t->getVariableRef());
+      for (auto *t : rc.getWeights()) {
+        const std::string &n = t->getName();
+        w[n] = &t->getVariableRef();
+        const size_t colon = n.rfind(':');
+        if (colon != std::string::npos)
+          w.emplace(l.getName() + n.substr(colon), &t->getVariableRef());
+      }
     },
     nullptr);
-  auto weight = [&w](const std::string &layer,
-                     size_t i) -> nntrainer::Tensor & {
-    auto it = w.find(layer);
-    if (it == w.end() || it->second.size() <= i)
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " + layer +
-                               " has no weight " + std::to_string(i));
-    return *it->second[i];
+  auto weight = [&w](const std::string &name) -> nntrainer::Tensor & {
+    auto it = w.find(name);
+    if (it == w.end())
+      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: no weight " + name);
+    return *it->second;
   };
-  auto f32 = [&weight](const std::string &layer, size_t i,
-                       size_t n) -> const float * {
-    nntrainer::Tensor &t = weight(layer, i);
+  auto f32 = [&weight](const std::string &name, size_t n) -> const float * {
+    nntrainer::Tensor &t = weight(name);
     if (t.getDataType() != ml::train::TensorDim::DataType::FP32 ||
         t.size() != n)
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: " + layer +
-                               " weight " + std::to_string(i) + " is not " +
-                               std::to_string(n) + " FP32 values");
+      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: " + name +
+                               " is not " + std::to_string(n) + " FP32 values");
     return t.getData<float>();
   };
 
@@ -125,7 +91,8 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
   std::vector<float> scalar(n_layers);
   for (uint32_t l = 0; l < n_layers; ++l) {
     is_full[l] = !isSlidingAttentionLayer(static_cast<int>(l));
-    scalar[l] = f32("layer" + std::to_string(l) + "_layer_scalar", 0, 1)[0];
+    scalar[l] = f32(
+      "layer" + std::to_string(l) + "_post_ffn_norm:scalar_multiplier", 1)[0];
     // the list's ADD stores 0.0f as "no multiplier" (#221)
     if (scalar[l] == 0.0f)
       throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " +
@@ -137,9 +104,9 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
   shape.n_layers = n_layers;
   shape.hidden = static_cast<uint32_t>(DIM);
   shape.inter_dense = static_cast<uint32_t>(INTERMEDIATE_SIZE);
-  shape.inter_moe = moe_intermediate_size;
-  shape.n_experts = num_experts;
-  shape.top_k = top_k_experts;
+  shape.inter_moe = MOE_INTERMEDIATE_SIZE;
+  shape.n_experts = NUM_EXPERTS;
+  shape.top_k = NUM_EXPERTS_PER_TOK;
   shape.n_heads = static_cast<uint32_t>(NUM_HEADS);
   shape.n_kv = static_cast<uint32_t>(NUM_KEY_VALUE_HEADS);
   shape.head_dim = static_cast<uint32_t>(HEAD_DIM);
@@ -152,11 +119,10 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
   shape.vocab = NUM_VOCAB;
   shape.max_seq = MAX_SEQ_LEN;
   shape.eps = NORM_EPS;
-  // ponytail: the CPU's logit_softcapping layer after the head caps the
-  // logits the HTP hands back, so the list's LM_HEAD caps nothing (the
-  // DSP's argmax on raw logits picks the same id: tanh is monotonic). The
-  // upgrade: skip that layer at a resident row and cap on the DSP.
-  shape.softcap = 0.0f;
+  // a tied head folds the final norm and the softcap (#4415's
+  // FOLD_OUTPUT_NORM), so the DSP caps; an untied one keeps the CPU's
+  // logit_softcapping layer after the head, which caps the logits
+  shape.softcap = TIE_WORD_EMBEDDINGS ? FINAL_LOGIT_SOFTCAPPING : 0.0f;
   std::vector<uint32_t> words(htp_graph_words_for(n_layers, HTP_GRAPH_MAX_OPS));
   const uint32_t n_words = htp_graph_gemma_build(
     words.data(), static_cast<uint32_t>(words.size()), &shape, is_full.data(),
@@ -173,11 +139,16 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
   // The f32 parameters by name. The RMSNORMs of a layer in the builder's
   // order (htp_graph_gemma_build): input, post-attention, the MoE branch's
   // pre / post, the dense branch's pre / post, post-FFN; the tail's final.
+  // #4415's graph holds all of them in fused layers: the input norm in
+  // qkv, the MoE branch's two in the MoE layer (in_norm / out_norm), the
+  // dense branch's two in dense_ffn, post-attention and post-FFN in the
+  // residual_adds.
   static const char *const kNorms[7] = {
-    "_attention_norm",  "_post_attention_norm", "_pre_ffn_norm_2",
-    "_post_ffn_norm_2", "_pre_ffn_norm",        "_post_ffn_norm_1",
-    "_post_ffn_norm"};
-  const uint32_t n_ops = words[3], H = shape.hidden, E = num_experts;
+    "_qkv:in_norm_gamma",        "_post_attention_norm:gamma",
+    "_sparse_moe:in_norm_gamma", "_sparse_moe:out_norm_gamma",
+    "_ffn:in_norm_gamma",        "_ffn:out_norm_gamma",
+    "_post_ffn_norm:gamma"};
+  const uint32_t n_ops = words[3], H = shape.hidden, E = NUM_EXPERTS;
   auto hand = [ops](uint32_t op, uint32_t which, const float *d, size_t n) {
     if (!ops->set_decode_graph_param(op, which, d, static_cast<unsigned>(n)))
       throw std::runtime_error(
@@ -196,29 +167,29 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
       if (layer < n_layers && norm == 7u)
         throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " + p +
                                  " has more RMSNORM ops than names");
-      const std::string name =
-        layer == n_layers ? std::string("output_norm") : p + kNorms[norm++];
-      hand(i, HTP_GRAPH_PARAM_GAMMA, f32(name, 0, H), H);
+      const std::string name = layer < n_layers ? p + kNorms[norm++]
+                               : TIE_WORD_EMBEDDINGS
+                                 ? std::string("output_of_causallm:gamma")
+                                 : std::string("output_norm:gamma");
+      hand(i, HTP_GRAPH_PARAM_GAMMA, f32(name, H), H);
     } else if (op->kind == HTP_OP_QK_NORM) {
       const uint32_t hd = op->head_dim;
       std::vector<float> g(2u * hd);
-      std::copy_n(f32(p + "_q_norm", 0, hd), hd, g.begin());
-      std::copy_n(f32(p + "_k_norm", 0, hd), hd, g.begin() + hd);
+      std::copy_n(f32(p + "_qkv:q_norm_gamma", hd), hd, g.begin());
+      std::copy_n(f32(p + "_qkv:k_norm_gamma", hd), hd, g.begin() + hd);
       htp_params.push_back(std::move(g));
       hand(i, HTP_GRAPH_PARAM_GAMMA, htp_params.back().data(), 2u * hd);
     } else if (op->kind == HTP_OP_ROUTER_TOPK) {
-      // lfm2_moe (softmax): router [H][E], router_scale [H], per-expert
-      // scale [E]; ROUTER_BIAS is g | per-expert scale with g the layer's
-      // own router_scale / sqrt(H) (Lfm2MoELayer::route)
-      const std::string m = p + "_sparse_moe";
-      hand(i, HTP_GRAPH_PARAM_ROUTER_W, f32(m, 0, size_t(H) * E),
+      // #4415's lfm2_moe (router_type softmax_scale): router [H][E], its
+      // norm's gamma [H] with router.scale * H^-0.5 already folded in the
+      // file, the per-expert scale [E]; ROUTER_BIAS is gamma | scale, as
+      // the file has them
+      const std::string m = p + "_sparse_moe:";
+      hand(i, HTP_GRAPH_PARAM_ROUTER_W, f32(m + "gate", size_t(H) * E),
            size_t(H) * E);
-      const float *rs = f32(m, 1, H), *pes = f32(m, 2, E);
-      const float hs = 1.0f / std::sqrt(static_cast<float>(H));
       std::vector<float> b(H + E);
-      for (uint32_t f = 0; f < H; ++f)
-        b[f] = rs[f] * hs;
-      std::copy_n(pes, E, b.begin() + H);
+      std::copy_n(f32(m + "router_norm_gamma", H), H, b.begin());
+      std::copy_n(f32(m + "expert_bias", E), E, b.begin() + H);
       htp_params.push_back(std::move(b));
       hand(i, HTP_GRAPH_PARAM_ROUTER_BIAS, htp_params.back().data(), H + E);
     }
@@ -226,16 +197,25 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
 
   // The Q4_0 weights of the FC / DENSE_FFN / LM_HEAD ops, in list order:
   // q | k (| v), o; up, gate, down; the tied table.
-  auto q4 = [&weight, ops](const std::string &layer, bool tied) {
-    nntrainer::Tensor &t = weight(layer, 0);
-    if (t.getDataType() != ml::train::TensorDim::DataType::Q4_0)
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: " + layer +
-                               " is not Q4_0 (the resident FC kinds' type)");
+  // [#260] an FC / dense weight may be QS4CX (fc_layer_dtype QS4CX): it
+  // binds the WH handles the prefill registers from the same bytes
+  // The LM_HEAD is Q4M1, so Q4_0 only (tied: the embedding's own bytes).
+  auto q4 = [&weight, ops](const std::string &name, bool tied,
+                           bool lm_head = false) {
+    nntrainer::Tensor &t = weight(name);
+    const auto dt = t.getDataType();
+    const bool qs4cx = !lm_head && dt == ml::train::TensorDim::DataType::QS4CX;
+    if (dt != ml::train::TensorDim::DataType::Q4_0 && !qs4cx)
+      throw std::runtime_error(
+        "[Gemma4MoE] NNTR_HTP_E2E: " + name + " is not " +
+        (lm_head ? "Q4_0, the LM_HEAD's type" : "Q4_0 or QS4CX, the FC types"));
     const unsigned K = tied ? t.width() : t.height();
     const unsigned N = tied ? t.height() : t.width();
-    if (!ops->add_decode_graph_q4_0(t.getData<char>(), K, N, tied))
+    if (qs4cx ? !ops->add_decode_graph_qs4cx(t.getData<char>(),
+                                             t.getScale<float>(), K, N)
+              : !ops->add_decode_graph_q4_0(t.getData<char>(), K, N, tied))
       throw std::runtime_error(
-        "[Gemma4MoE] NNTR_HTP_E2E: the backend took no Q4_0 weight");
+        "[Gemma4MoE] NNTR_HTP_E2E: the backend took no weight " + name);
   };
   layer = HTP_GRAPH_NO_OP;
   uint32_t fc = 0;
@@ -247,19 +227,21 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
     }
     const std::string p = "layer" + std::to_string(layer);
     if (op->kind == HTP_OP_FC && fc++ == 0) {
-      q4(p + "_wq", false);
-      q4(p + "_wk", false);
-      if (w.count(p + "_wv"))
-        q4(p + "_wv", false);
+      q4(p + "_qkv:qweight", false);
+      q4(p + "_qkv:kweight", false);
+      if (w.count(p + "_qkv:vweight")) // absent under k = v
+        q4(p + "_qkv:vweight", false);
     } else if (op->kind == HTP_OP_FC) {
-      q4(p + "_attention_out", false);
+      q4(p + "_attention_out:weight", false);
     } else if (op->kind == HTP_OP_DENSE_FFN) {
-      q4(p + "_ffn_up", false);
-      q4(p + "_ffn_gate", false);
-      q4(p + "_ffn_down", false);
+      // the list's order up, gate, down; the file's is gate-first
+      q4(p + "_ffn:up", false);
+      q4(p + "_ffn:gate", false);
+      q4(p + "_ffn:down", false);
     } else if (op->kind == HTP_OP_LM_HEAD) {
-      q4(TIE_WORD_EMBEDDINGS ? "embedding0" : "output_of_causallm",
-         TIE_WORD_EMBEDDINGS);
+      q4(TIE_WORD_EMBEDDINGS ? "embedding0:Embedding"
+                             : "output_of_causallm:weight",
+         TIE_WORD_EMBEDDINGS, true);
     }
   }
   std::fprintf(stderr,
@@ -275,99 +257,6 @@ void Gemma4MoECausalLM::repack_weight() {
   if (htp_e2e)
     nntrainer::get_htp_ops()->finish_decode_graph_q4_0();
 #endif
-}
-
-Tensor Gemma4MoECausalLM::createFeedForwardBlock(const int layer_id,
-                                                 Tensor post_attention,
-                                                 bool is_kv_shared_layer) {
-  std::vector<std::string> pre_ffn_norm_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_pre_ffn_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(pre_ffn_norm_props, is_kv_shared_layer);
-  LayerHandle pre_ffn_norm(createLayer("rms_norm", pre_ffn_norm_props));
-  Tensor dense_input = pre_ffn_norm(post_attention);
-  Tensor dense_output =
-    createMlp(layer_id, DIM, INTERMEDIATE_SIZE, dense_input);
-
-  LayerHandle post_dense_norm(createLayer(
-    "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm_1"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
-  Tensor post_dense = post_dense_norm(dense_output);
-
-  LayerHandle pre_sparse_norm(createLayer(
-    "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_pre_ffn_norm_2"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
-  Tensor sparse_input = pre_sparse_norm(post_attention);
-  // [plan 201 S4] moe_engine=htp: lfm2_moe with the softmax router (the
-  // experts' file layout is the fused gate | up of nntr_quantize_stream's
-  // QS4CX_WH writer); else #4296's gemma4_moe
-  const std::string moe_name =
-    "layer" + std::to_string(layer_id) + "_sparse_moe";
-  LayerHandle sparse_moe(
-    moe_engine == "htp"
-      ? createLayer(
-          "lfm2_moe",
-          {withKey("name", moe_name),
-           withKey("unit", std::to_string(moe_intermediate_size)),
-           withKey("num_experts", std::to_string(num_experts)),
-           withKey("num_experts_per_token", std::to_string(top_k_experts)),
-           withKey("moe_activation", "tanh_gelu"),
-           withKey("moe_router", "softmax"),
-           withKey("epsilon", std::to_string(NORM_EPS)),
-           withKey("weight_dtype", moe_layer_dtype),
-           withKey("engine", moe_engine)})
-      : createLayer(
-          "gemma4_moe",
-          {withKey("name", moe_name),
-           withKey("unit", std::to_string(moe_intermediate_size)),
-           withKey("num_experts", std::to_string(num_experts)),
-           withKey("num_experts_per_token", std::to_string(top_k_experts)),
-           withKey("moe_cache_size", std::to_string(moe_cache_size)),
-           withKey("moe_activation", "tanh_gelu"),
-           withKey("epsilon", std::to_string(NORM_EPS)),
-           withKey("weight_dtype", moe_layer_dtype)}));
-  Tensor sparse_output = sparse_moe({sparse_input, post_attention});
-
-  LayerHandle post_sparse_norm(createLayer(
-    "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm_2"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
-  Tensor post_sparse = post_sparse_norm(sparse_output);
-  LayerHandle combine_ffn(createLayer(
-    "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_combine_ffn")}));
-  Tensor combined_ffn = combine_ffn({post_dense, post_sparse});
-
-  LayerHandle post_combined_norm(createLayer(
-    "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
-  return post_combined_norm(combined_ffn);
-}
-
-void Gemma4MoECausalLM::registerCustomLayers() {
-  Gemma4CausalLM::registerCustomLayers();
-  auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
-  try {
-    app_context->registerFactory(nntrainer::createLayer<Gemma4MoELayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
-  // [plan 201 S4] the HTP MoE layer (moe_engine=htp)
-  try {
-    app_context->registerFactory(nntrainer::createLayer<Lfm2MoELayer>);
-  } catch (std::invalid_argument &e) {
-    (void)e; // already registered by another model of this process
-  }
 }
 
 } // namespace causallm

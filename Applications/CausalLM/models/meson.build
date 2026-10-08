@@ -13,10 +13,11 @@ subdir('qwen3')
 subdir('qwen3_moe')
 subdir('qwen3_slim_moe')
 subdir('gemma3')
-subdir('gemma4')
 subdir('timm_vit')
 subdir('lfm2')
 subdir('lfm2_moe')
+# after lfm2_moe: the Gemma-4 MoE block links its layer
+subdir('gemma4')
 if get_option('platform') != 'windows'
     subdir('bert')
     subdir('xlm_roberta')

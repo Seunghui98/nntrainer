@@ -361,6 +361,8 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_moe_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe_reference.cpp',
@@ -385,6 +387,7 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_slim_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_cached_slim_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_mha_core_dispatch.cpp',
       ],
       dependencies: [
         nntrainer_dep,
