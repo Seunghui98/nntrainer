@@ -6407,6 +6407,8 @@ private:
   StagingPool act_pool_;
   StagingPool out_pool_;
   StagingPool rope_pool_; /**< the fused projection call's RoPE rows */
+  StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
+  StagingPool attn_out_pool_; /**< and its f32 output */
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
@@ -6629,10 +6631,23 @@ public:
     const int rows_len = static_cast<int>(append_rows * kv_stride);
     uint32_t stats[12] = {0};
     const int64_t t0 = now_us();
+    // Q and the output through ION, as the FC path stages its rows: from
+    // plain heap FastRPC moved 2 x 16.8 MB a 1024-row layer, 7-12 ms of an
+    // 18-24 ms call around 11.5 ms on the DSP (doc 57 section 9.17). A
+    // memcpy each way here is ~1 ms.
+    const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
+    float *q_ion =
+      reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
+    float *out_ion =
+      reinterpret_cast<float *>(stage(attn_out_pool_, q_bytes).data());
+    stagedMemcpy(q_ion, q, q_bytes);
     const int err = nntr_hvx_attn_q2_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
-      rows_len, n_q, cache_from, cache_to, n_head_q, window, q, q_len, q_scale,
-      static_cast<int>(n_head_q), out, q_len, stats, 12);
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
+      q_scale, static_cast<int>(n_head_q), out_ion, q_len, stats, 12);
+    if (err == AEE_SUCCESS) {
+      stagedMemcpy(out, out_ion, q_bytes);
+    }
     if (attn_trace_enabled()) {
       // stats (nntr_hvx_attn_q2_step): append, kernel, -, total, then the
       // append's quant/stage/bake, rows appended, the kernel's qk, softmax,
