@@ -1248,4 +1248,21 @@ interface nntr_hvx : remote_handle64 {
                                     rout sequence<float> logits,
                                     rout sequence<uint32> sel,
                                     rout sequence<float> weight);
+
+   // mm_u8i4_layer_norm with handle i's output rows at out_cat + out_off[i],
+   // out_ld[i] floats apart, instead of packed [M x N_i] blocks: the column
+   // slices of one weight then land as its row-major [M x N], which the
+   // host copies out whole instead of one slice-row at a time (132.8 ms of
+   // 4 KB copies a 1024-token prefill, doc 57 section 9.34).
+   AEEResult mm_u8i4_layer_norm_ld(in uint32 M, in uint32 K, in float eps,
+                                   in sequence<float> pre_gamma,
+                                   in sequence<uint32> post_chunk,
+                                   in sequence<float> post_gamma,
+                                   in uint32 rope_hd, in uint32 rope_handles,
+                                   in sequence<float> rope_cs,
+                                   in sequence<uint32> w_handles,
+                                   in sequence<uint32> out_off,
+                                   in sequence<uint32> out_ld,
+                                   in sequence<float> act_f32,
+                                   rout sequence<float> out_cat);
 };

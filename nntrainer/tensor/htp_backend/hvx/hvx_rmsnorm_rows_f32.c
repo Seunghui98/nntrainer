@@ -27,7 +27,7 @@ typedef struct {
   const float *x;
   float *y;
   const float *gamma;
-  uint32_t M, n, chunk;
+  uint32_t M, n, ld, chunk;
   float eps;
 } rows_ctx;
 
@@ -83,8 +83,8 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
   const uint32_t n_chunks = c->n / c->chunk;
   for (uint32_t r = lo; r < hi; ++r) {
-    const float *x = c->x + (size_t)r * c->n;
-    float *y = c->y + (size_t)r * c->n;
+    const float *x = c->x + (size_t)r * c->ld;
+    float *y = c->y + (size_t)r * c->ld;
     for (uint32_t k = 0; k < n_chunks; ++k) {
       norm_chunk(x + (size_t)k * c->chunk, y + (size_t)k * c->chunk, c->gamma,
                  c->chunk, c->eps);
@@ -95,11 +95,17 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
 int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
                          uint32_t chunk, const float *gamma, float eps,
                          hvx_worker_pool *pool) {
+  return hvx_rmsnorm_rows_ld_f32(x, y, M, n, n, chunk, gamma, eps, pool);
+}
+
+int hvx_rmsnorm_rows_ld_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                            uint32_t ld, uint32_t chunk, const float *gamma,
+                            float eps, hvx_worker_pool *pool) {
   if (!x || !y || M == 0u || chunk == 0u || chunk % LANES != 0u ||
-      n % chunk != 0u) {
+      n % chunk != 0u || ld < n) {
     return -1;
   }
-  rows_ctx c = {x, y, gamma, M, n, chunk, eps};
+  rows_ctx c = {x, y, gamma, M, n, ld, chunk, eps};
   hvx_worker_pool_run(pool, rows_worker, &c, M);
   return 0;
 }

@@ -60,6 +60,7 @@
 #include <thread_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -508,10 +509,14 @@ public:
    *  stays a FastRPC number), which meant it was invisible -- and at this
    *  model's shapes it is ~0.9 MB per expert, 64 times per layer. Counted
    *  here so "HTP host time" stops understating what the path costs. */
-  void addStaging(uint64_t us, uint64_t bytes) {
+  void addStaging(uint64_t us, uint64_t bytes, int line) {
     std::lock_guard<std::mutex> lock(mutex_);
     staging_us_ += us;
     staging_bytes_ += bytes;
+    auto &l = staging_by_line_[line];
+    l[0] += us;
+    l[1] += bytes;
+    l[2] += 1;
   }
 
   ~HtpProfile() {
@@ -895,6 +900,14 @@ private:
       staging_us_ ? static_cast<double>(staging_bytes_) / staging_us_ / 1000.0
                   : 0.0,
       ms(reg_total_us_ + invoke_us + staging_us_));
+    for (const auto &l : staging_by_line_)
+      if (l.second[0] >= 1000)
+        std::fprintf(stderr,
+                     "[HTP-PROFILE]   staging at htp_compute_ops.cpp:%d: "
+                     "%8.1f ms  %8.1f MB  %llu copies\n",
+                     l.first, ms(l.second[0]),
+                     static_cast<double>(l.second[1]) / (1024.0 * 1024.0),
+                     (unsigned long long)l.second[2]);
     if (miss_total_ != 0) {
       std::fprintf(stderr,
                    "[HTP-PROFILE] expert cache misses: %llu, file read "
@@ -953,6 +966,8 @@ private:
   uint64_t reg_total_us_ = 0;
   uint64_t staging_us_ = 0;
   uint64_t staging_bytes_ = 0;
+  /** us, bytes, copies by the caller's line of stagedMemcpy. */
+  std::map<int, std::array<uint64_t, 3>> staging_by_line_;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
   uint64_t graph_calls_ = 0; /**< [#85] addInvokeForward */
@@ -1066,7 +1081,8 @@ inline void l2CheckFinite(const char *what, const float *v, size_t n,
   }
 }
 
-inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
+inline void stagedMemcpy(void *dst, const void *src, size_t bytes,
+                         int line = __builtin_LINE()) {
   HtpProfile &p = HtpProfile::global();
   if (p.level() == 0) {
     std::memcpy(dst, src, bytes);
@@ -1074,7 +1090,7 @@ inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
   }
   const uint64_t t0 = HtpProfile::nowUs();
   std::memcpy(dst, src, bytes);
-  p.addStaging(HtpProfile::nowUs() - t0, bytes);
+  p.addStaging(HtpProfile::nowUs() - t0, bytes, line);
 }
 
 } // namespace
@@ -3298,7 +3314,7 @@ private:
    *  copied again. ponytail: a rewrite that keeps every sampled window is
    *  missed; a full compare costs about what the copy does. */
   static HtpRpcBuffer &stageInput(StagingPool &pool, const void *src,
-                                  size_t bytes) {
+                                  size_t bytes, int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     if (!slot)
@@ -3317,7 +3333,7 @@ private:
       if (same)
         return *slot;
     }
-    stagedMemcpy(slot->data(), src, bytes);
+    stagedMemcpy(slot->data(), src, bytes, line);
     pool.holds[cls] = {src, bytes};
     return *slot;
   }
@@ -3347,18 +3363,20 @@ private:
    * weights (@a dsts, the batch call) each get their block whole. */
   static void copyOut(float *dst, const float *out_cat, unsigned int M,
                       unsigned int N, const std::vector<unsigned int> *blocks,
-                      const std::vector<float *> *dsts = nullptr) {
+                      const std::vector<float *> *dsts = nullptr,
+                      int line = __builtin_LINE()) {
     if (dsts) {
       size_t off = 0;
       for (size_t i = 0; i < dsts->size(); ++i) {
         const size_t block = static_cast<size_t>(M) * (*blocks)[i];
-        stagedMemcpy((*dsts)[i], out_cat + off, block * sizeof(float));
+        stagedMemcpy((*dsts)[i], out_cat + off, block * sizeof(float), line);
         off += block;
       }
       return;
     }
     if (!blocks || blocks->size() < 2) {
-      stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float));
+      stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float),
+                   line);
       return;
     }
     size_t off = 0;
@@ -3367,7 +3385,7 @@ private:
       for (unsigned int r = 0; r < M; ++r) {
         stagedMemcpy(dst + static_cast<size_t>(r) * N + c0,
                      out_cat + off + static_cast<size_t>(r) * n,
-                     static_cast<size_t>(n) * sizeof(float));
+                     static_cast<size_t>(n) * sizeof(float), line);
       }
       off += static_cast<size_t>(M) * n;
       c0 += n;
@@ -3430,30 +3448,54 @@ private:
         for (unsigned int c : *norms->post_chunk)
           post_gamma_len += static_cast<int>(c);
       }
+      // With slices, each lands in its weight's row-major [M x N] on the
+      // DSP (out_off / out_ld), so a weight comes out as one copy; the
+      // slice-row copies this replaces were 132.8 ms of 4 KB memcpys a
+      // 1024-token prefill (doc 57 section 9.34). A weight's slices come
+      // in column order from c0 = 0 (gemm_q4_0_batch_norm_fp32).
+      std::vector<uint32_t> out_off, out_ld;
+      if (slices) {
+        size_t base = 0, next = 0;
+        for (const OutSlice &o : *slices) {
+          if (o.c0 == 0) {
+            base = next;
+            next += static_cast<size_t>(M) * o.stride;
+          }
+          out_off.push_back(static_cast<uint32_t>(base + o.c0));
+          out_ld.push_back(o.stride);
+        }
+      }
       const uint64_t t0 = HtpProfile::nowUs();
-      const int err = nntr_hvx_mm_u8i4_layer_norm(
-        session, M, K, norms->eps, norms->pre_gamma,
-        norms->pre_gamma ? static_cast<int>(K) : 0,
-        norms->post_chunk ? norms->post_chunk->data() : nullptr,
-        norms->post_chunk ? static_cast<int>(norms->post_chunk->size()) : 0,
-        norms->post_gamma, post_gamma_len, norms->rope_hd, norms->rope_handles,
-        norms->rope_cs,
-        norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0, handles,
-        num_handles, act_f32, act_len, out_cat, out_len);
+      const int pre_len = norms->pre_gamma ? static_cast<int>(K) : 0;
+      const uint32_t *chunk =
+        norms->post_chunk ? norms->post_chunk->data() : nullptr;
+      const int chunk_len =
+        norms->post_chunk ? static_cast<int>(norms->post_chunk->size()) : 0;
+      const int cs_len =
+        norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0;
+      const int err =
+        slices ? nntr_hvx_mm_u8i4_layer_norm_ld(
+                   session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+                   chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+                   norms->rope_handles, norms->rope_cs, cs_len, handles,
+                   num_handles, out_off.data(), num_handles, out_ld.data(),
+                   num_handles, act_f32, act_len, out_cat, out_len)
+               : nntr_hvx_mm_u8i4_layer_norm(
+                   session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+                   chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+                   norms->rope_handles, norms->rope_cs, cs_len, handles,
+                   num_handles, act_f32, act_len, out_cat, out_len);
       const uint64_t elapsed = HtpProfile::nowUs() - t0;
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_norm failed: err=" +
                                  std::to_string(err) + shape());
       }
       if (slices) {
-        size_t off = 0;
-        for (const OutSlice &o : *slices) {
-          for (unsigned int r = 0; r < M; ++r) {
-            stagedMemcpy(o.dst + static_cast<size_t>(r) * o.stride + o.c0,
-                         out_cat + off + static_cast<size_t>(r) * o.cols,
-                         static_cast<size_t>(o.cols) * sizeof(float));
-          }
-          off += static_cast<size_t>(M) * o.cols;
+        for (size_t i = 0; i < slices->size(); ++i) {
+          const OutSlice &o = (*slices)[i];
+          if (o.c0 == 0)
+            stagedMemcpy(o.dst, out_cat + out_off[i],
+                         static_cast<size_t>(M) * o.stride * sizeof(float));
         }
       } else {
         copyOut(matCdata, out_cat, M, N, blocks, dsts);

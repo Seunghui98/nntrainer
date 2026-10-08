@@ -66,6 +66,15 @@ typedef struct {
   float *pre_scratch;
   const float *pre_gamma;
   float pre_eps;
+
+  /** Both NULL, or both n_handles entries: handle i's row m goes to
+      out_cat + out_off[i] + m * out_ld[i] instead of the packed [M x N_i]
+      blocks, so the column slices of one weight land as its row-major
+      [M x N] and the host copies it out whole. Needs the in-place
+      accumulator layout (AEE_EUNSUPPORTED otherwise); the caller keeps the
+      handles' rectangles inside out_cat and apart. */
+  const uint32_t *out_off;
+  const uint32_t *out_ld;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

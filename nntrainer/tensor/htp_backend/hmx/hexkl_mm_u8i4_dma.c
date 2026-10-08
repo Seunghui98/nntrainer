@@ -410,6 +410,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   if (o->pre_scratch != NULL && o->act_scale != NULL) {
     return AEE_EBADPARM; // the pre norm rides on the params scan
   }
+  if ((o->out_off == NULL) != (o->out_ld == NULL)) {
+    return AEE_EBADPARM;
+  }
 
   const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
   const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
@@ -485,6 +488,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     hexkl_acc_layout_get(vtcm_base, result_off);
   hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE] =
     acc_layout->usable ? acc_layout->row_stride : 0u;
+  if (o->out_off && !acc_layout->usable) {
+    return AEE_EUNSUPPORTED; // the fallback dequant writes packed blocks
+  }
 
   /** Caller-supplied params (o->act_scale) skip the min/max scan; loc_* are
    * only allocated for the dynamic path. */
@@ -586,6 +592,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     const hexkl_weight_u8i4 *h = &tbl->slots[handles[i]];
     const uint32_t nt_n = h->N / HEXKL_HMX_INT8_BLOCK_N_COL;
     const uint32_t wcur = wbuf[i & 1u];
+    float *const out_h =
+      o->out_off ? out_cat + o->out_off[i] : out_cat + out_off;
+    const uint32_t ld_h = o->out_ld ? o->out_ld[i] : h->N;
 
     if (i + 1 < n_handles) {
       // Cross-matmul prefetch (doc13 §3a): while handle i computes below,
@@ -659,10 +668,10 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             jb->colsum_w = h->colsum_w;
             jb->w_scale = h->w_scale;
             jb->bias = h->bias;
-            jb->dst_a = out_cat + out_off + (size_t)m0 * h->N;
+            jb->dst_a = out_h + (size_t)m0 * ld_h;
             jb->dst_b = NULL;
             jb->split = h->N;
-            jb->dst_stride = h->N;
+            jb->dst_stride = ld_h;
             jb->n_tiles = nb;
             hvx_worker_pool_submit(o->pool, hvx_dq_tiles_worker, jb, nb);
           }
@@ -677,7 +686,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             hvx_dequant_acc_tile_to_f32(
               tile, acc_layout->row_stride, cnt, act_scale + m0, act_zp + m0,
               h->colsum_w + c0, h->w_scale + c0, h->bias + c0,
-              out_cat + out_off + (size_t)m0 * h->N + c0, h->N, o->accumulate);
+              out_h + (size_t)m0 * ld_h + c0, ld_h, o->accumulate);
             HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
           }
         } else {
