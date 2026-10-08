@@ -635,7 +635,7 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 - MoE 안을 가르니(임시 계측, 커밋 안 함): out_norm·expert kernel 무관. **NPU router가 726행에서 softmax 확률 0 → top-k가 expert 0..7, weight NaN(0×inf).**
 - top-k 없이 받은 raw logits: 4행 블록마다 1행만 CPU와 같고 3행은 1e37·NaN(64행마다 48). 단일 스레드 skel에서도 같음 → 스레드 경합 아님. 256·7행으로 나눠 불러도 같음 → staging 버퍼 아님. 누산 초기값을 바꾸면 살아남는 행이 1→0으로 바뀜. 4e903b97 이전 kernel은 모든 행이 최대 7 차이(§9.13의 "그럴듯하지만 엉뚱한 문장"). 호스트 lane 에뮬은 M=1025에서도 둘 다 통과.
 - 수정 7eeea62e: 누산을 IEEE sf(`Q6_Vsf_vmpy`/`Q6_Vsf_vadd`)로. 기기에서 모든 행이 CPU dot과 2.3e-5 이내.
-- P1(MoE 호출 +290 ms, 4e903b97 이후)도 같은 원인으로 본다: 726행이 expert 0..7로 몰려 호출이 무거워짐(기기 미측정, 다음 프로파일에서 확인).
+- ~~P1(MoE 호출 +290 ms)도 같은 원인~~ → **측정으로 기각**: 수정 후에도 MoE 행 50.5 ms/call(아래).
 
 사다리(fix 후, `skip_prefill: false`, fp16 attention, seq 2048):
 
@@ -649,3 +649,9 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 
 - NPU 몫 대부분은 attention(fp16) +0.045. lm_head 0, dense·attn_proj(QS4CX weight)는 NPU가 같거나 낮다 → weight 양자화 경로보다 attention 정밀도가 먼저 볼 곳(실행 간 노이즈 미측정, 1회씩).
 - 남은 주의: CausalLM 앱은 `-ffast-math`라 `std::isfinite`/`isnan` 검사가 접힌다(이번 디버깅에서 확인). 앱 쪽 NaN 검사는 비트로 해야 한다. `NNTR_ACT_STATS`는 libnntrainer(fast-math 아님)라 유효.
+
+수정 후 기기 실측(사용자 실행, e6a2022b, 1회):
+
+- acc_0 재현: nll 3.536, 같은 문장.
+- cfgB(int8 attention, seq 1088, `skip_prefill: true`): prefill **4,486 ms**(이전 4,864), decode 2.87 TPS. 출력 "The text discusses the small harbour town of Ardley, which is located at the confluence of a slow river and a cold northern sea…" → decode 경로도 정상.
+- 행별: MoE 1,567 ms(50.5/call, 이전 1,576) · router 276(9.2/call, 이전 262) · qkv 499(538) · dense 418(444) · o 190(218) · K=5632 111(157) · full qkv 122(135) · staging 541(583). −378 ms는 여러 행에 흩어져 1회로는 노이즈(±3–5%)와 못 가른다.
