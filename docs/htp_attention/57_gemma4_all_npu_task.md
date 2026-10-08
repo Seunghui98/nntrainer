@@ -796,3 +796,19 @@ host `unittest_causallm_models` 94 통과(Gemma-4 MoE tiny 모델 HF 기준 일�
 
 - **staging dedupe**(1c70d1a2): router·dense·MoE가 같은 post-attention 행(11.5 MB)을 같은 act 버퍼에 세 번 복사하던 것을, 버퍼가 그 복사를 아직 들고 있으면(포인터·크기 같고 32개 64 B 창 + 끝이 일치) 건너뛴다. staging 6.2 → 5.56 GB, 464 → 426 ms. prefill 3,938 / 3,857 / 3,946(노이즈 안), nll 3.5045·문장 그대로.
 - **FC quant 한 패스**: 행 params 패스 + k-tile 분할 pack 패스(행을 DDR에서 두 번, pack worker는 모든 행을 stride로)를 4행 묶음 분할로 params 직후 pack. o-proj quant 631 → 304 us/호출(K=8192: 906 → 471), o-proj 행 166 → 141 ms, prefill **3,866 / 3,918 / 3,839**, nll 3.5045 비트 동일. lane 에뮬에 pack 명령이 없어 host 검사 없음(기기 nll로 확인).
+
+### 9.32 post-attention epilogue를 o-proj 호출에 접기 (2026-10-08, 25682ec7 + 23565235 + 6d653744, 기기 실측, 직접 실행)
+
+`residual_add`의 `proj`: o-proj 가중치를 먼저 요청(파일 순서 그대로, FC처럼 ones 초기화)하고 attention core 출력을 input 1로 받는다. prefill은 FC 행 chunk마다 한 호출(`mm_u8i4_layer_res_add`, IDL 끝에 추가): `layer_run` → `hvx_rmsnorm_add_blocks_f32`(handle별 열 블록을 그대로 읽어 재배치 없음, 제곱합 순서가 `hvx_rmsnorm_add_f32`와 같음). decode·CPU는 `dot()`(engine의 FC, decode 행 포함) 뒤 같은 add. load walk가 이 QS4CX 가중치도 FC처럼 pack·등록. `nntr_quantize`·tiny 테스트의 레이어별 dtype 맵에 `_post_attention_norm` 추가, core `Layer::save`의 QS4CX 분기도 높이 1 텐서는 그대로 둔다(Q4_0 분기와 같게).
+
+| cfgB | 전(577c48af) | 후 |
+|---|---|---|
+| nll / 문장 | 3.5045 / "…harbour town of Ardley…" | 같음 |
+| prefill | 3,866 / 3,918 / 3,839 | **3,808 / 3,822 / 3,813** |
+| post-attn epilogue `K=2816 N=2816 FC` 행 | 62–75 ms, 30회 | 없음 |
+| o-proj 행(K=4096) | 141 ms | 202(epilogue 흡수) |
+| staging | 5.56 GB, 426 ms | 4.9 GB, 368 ms |
+
+host `unittest_causallm_models` 94 통과(처음 Q4_0 tiny 모델이 실패: proj 가중치가 NONE 초기화 + dtype 맵 누락 → ones 초기화와 맵 추가로 해결).
+
+오늘 누적(cfgB, 1024토큰 prefill): 4.79 s(PR 4343 a16 직후) → **3.81 s**, nll 3.508 → 3.5045.
