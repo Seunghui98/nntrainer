@@ -583,9 +583,87 @@ def figT():
     return "\n".join(o)
 
 
+
+# --------------------------------------------- prefill time by op, 512 vs 1024
+def figO():
+    """prefill_timeline.py --by-op, projection / dense FFN / MoE on the NPU,
+    attention and lm_head on the CPU. 512 is the pre-branch graph (doc 57
+    section 3) summed into this branch's fused nodes; 1024 is this branch
+    (section 9.12). Both profile builds."""
+    o = [HEAD.format(title="Prefill time by op")]
+    o.append(text(80, 88, "Prefill 연산별 시간: 512 vs 1024 token", "t1"))
+    o.append(text(80, 134, "projection·dense FFN·MoE는 NPU, attention·lm_head는 CPU (프로파일 빌드, 노드 시간 합)", "t2"))
+    # (name, unit, 512 ms, 1024 ms)
+    rows = [("attention (CPU fp16)", "CPU", 2066.5, 2991.1),
+            ("sparse_moe (router·128 expert)", "NPU", 1276.2, 2129.9),
+            ("qkv (norm·q/k/v·RoPE)", "NPU", 580.4, 820.5),
+            ("ffn (dense gate/up/down)", "NPU", 438.4, 468.6),
+            ("attention_out (o proj)", "NPU", 200.8, 350.8),
+            ("post_ffn_norm (epilogue)", "NPU", 165.1, 293.1),
+            ("post_attention_norm (epilogue)", "NPU", 67.7, 159.0),
+            ("lm_head·embedding (CPU)", "CPU", 25.2, 19.0)]
+    t512 = sum(r[2] for r in rows)
+    t1024 = sum(r[3] for r in rows)
+    fill = {"CPU": "var(--host)", "NPU": "var(--npu)"}
+    # stacked bars
+    x0, bw = 360, 1440
+    sc = bw / t1024
+    for y, lab, sub, idx, tot in [(210, "512 token", "4.82 s · 브랜치 전", 2, t512),
+                                  (320, "1024 token", "7.23 s · 지금 브랜치", 3, t1024)]:
+        o.append(text(80, y + 34, lab, "h3"))
+        o.append(text(80, y + 60, sub, "sm"))
+        x = x0
+        for r in rows:
+            w = r[idx] * sc
+            o.append(rect(x, y, max(w - 3, 1), 70, fill[r[1]], 4))
+            if w > 150:
+                o.append(text(x + w / 2, y + 30, r[0].split(" (")[0], "lblw", "middle", 'style="font-size:17px"'))
+                o.append(text(x + w / 2, y + 56, f"{r[idx] / 1000:.2f} s", "lblw", "middle", 'style="font-size:16px"'))
+            x += w
+        o.append(text(x + 14, y + 44, f"{tot / 1000:.2f} s", "lbl", extra='style="font-weight:700"'))
+    for i, (f, lb) in enumerate([("var(--host)", "CPU"), ("var(--npu)", "NPU")]):
+        o.append(rect(x0 + i * 120, 426, 22, 22, f, 4))
+        o.append(text(x0 + i * 120 + 32, 444, lb, "sm"))
+    # table
+    ty = 500
+    cols = [(80, "연산 (지금 브랜치의 노드)"), (620, "어디서"), (790, "512 token"), (1000, "1024 token"),
+            (1220, "배율"), (1380, "비고")]
+    o.append(rect(80, ty, 1760, 50, "var(--idle)", 6))
+    for x, h in cols:
+        o.append(text(x + 16, ty + 33, h, "lbl", extra='style="font-weight:700"'))
+    notes = ["O(n²). RoPE 표 1 s가 512 쪽 L0/L5에 섞여 있음",
+             "weight DMA는 token 무관 → 계산 몫이 늘어남",
+             "full 층(hd 512) L5 56 ms",
+             "token당 1.1배: DMA·고정비 큼",
+             "", "1024행×2 addend staging", "", "마지막 행만"]
+    for k, (r, n) in enumerate(zip(rows, notes)):
+        y = ty + 50 + k * 44
+        o.append(f'<path d="M80,{y + 44} L1840,{y + 44}" stroke="#e1e0d9" stroke-width="2"/>')
+        o.append(text(96, y + 30, r[0], "lbl"))
+        o.append(rect(636, y + 11, 54, 24, fill[r[1]], 4))
+        o.append(text(663, y + 29, r[1], "lblw", "middle", 'style="font-size:14px"'))
+        o.append(text(806, y + 30, f"{r[2]:,.0f} ms", "lbl"))
+        o.append(text(1016, y + 30, f"{r[3]:,.0f} ms", "lbl", extra='style="font-weight:700"'))
+        o.append(text(1236, y + 30, f"×{r[3] / r[2]:.2f}", "lbl"))
+        o.append(text(1396, y + 30, n, "sm"))
+    y = ty + 50 + len(rows) * 44
+    o.append(rect(80, y, 1760, 46, "var(--idle)", 6))
+    o.append(text(96, y + 30, "합계 (노드 시간 합)", "lbl", extra='style="font-weight:700"'))
+    o.append(text(806, y + 30, f"{t512:,.0f} ms", "lbl", extra='style="font-weight:700"'))
+    o.append(text(1016, y + 30, f"{t1024:,.0f} ms", "lbl", extra='style="font-weight:700"'))
+    o.append(text(1236, y + 30, f"×{t1024 / t512:.2f}", "lbl", extra='style="font-weight:700"'))
+    o.append(text(1396, y + 30, "일반 빌드 prefill 타이머: 3.99 s / 6.45 s", "sm"))
+    o.append(text(80, 1000, "512: 브랜치 전 그래프(문서 57 §3, 2026-10-06)의 31개 노드를 지금 브랜치의 융합 노드로 합산. "
+                            "1024: 지금 브랜치(b0bbd264) 프로파일 빌드, 2026-10-08. 두 실행의 코드가 다르므로 배율은 참고값.", "xs"))
+    o.append(text(80, 1028, "CPU attention이 1024에서 41%. attention_engine: htp(HMX)와 lm_head NPU는 이 그림에 없음(기기 미측정). "
+                            "측정: Galaxy S25 Ultra (Hexagon V79), Gemma-4 26B-A4B, C=16, Q4_0 FC bin.", "xs"))
+    o.append(TAIL)
+    return "\n".join(o)
+
 for name, fn in [("fsu_1_placement", fig1), ("fsu_2_prefill_prefetch", fig2),
                  ("fsu_3_decode_cache", fig3), ("fsu_a_overview", figA),
                  ("fsu_b_prefill_before_after", figB), ("fsu_c_decode_hits", figC),
-                 ("fsu_prefill_prefetch", figP), ("fsu_expert_memory_table", figT)]:
+                 ("fsu_prefill_prefetch", figP), ("fsu_expert_memory_table", figT),
+                 ("prefill_by_op_512_1024", figO)]:
     open(f"{name}.html", "w").write(fn())
 print("ok")

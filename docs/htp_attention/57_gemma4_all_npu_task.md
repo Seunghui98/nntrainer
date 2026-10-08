@@ -501,3 +501,12 @@ T=$(ls test/jni/libs/arm64-v8a/unittest_hvx_attn_f16 2>/dev/null || ls test/jni/
 4. **attention 분해**: `adb logcat -c; NNTR_HTP_ATTN_TRACE=1 ...` 로 실행 뒤 `adb logcat -d -s nntrainer | grep 'attn trace f16'` → 층마다 qprep/dma/tile/qk/softmax/pv/store µs. `mha_core: attention over the fp16 KV cache on the accelerator`도 같은 logcat에.
 5. **정확도**: 446토큰 `NNTR_PPL=1`, nll 4.51±0.02(§2). `lmhead_engine` cpu/htp 둘 다 같아야 lm_head DSP 산술이 무죄.
 6. 2가 정상이고 nll이 맞으면 **512토큰 생성 512** 본 측정, 그리고 `NNTR_MOE_PREFETCH=0` 짝(그림용).
+
+### 9.12 1024토큰 prefill 분해 (2026-10-08, b0bbd264, 프로파일 빌드, 사용자 실행)
+
+projection·dense FFN·MoE만 NPU(attention·lm_head CPU), Q4_0 FC bin, C=16, 1024토큰 prompt, 생성 8. 일반 빌드 prefill **6452 ms (158.7 TPS)**; §2의 같은 구성 기준선 7506 ms(136.4 TPS)보다 1.05 s 빠름(§9.10 #1 dense 등록 수정의 몫).
+
+`prefill_timeline.py --by-op`(노드 합 7232 ms): attention(CPU) 2991 · sparse_moe 2130 · qkv 821 · ffn 469 · attention_out 351 · post_ffn_norm 293 · post_attention_norm 159 · lm_head 18 ms. 그림 `figures/fsu/prefill_by_op_512_1024.png`(512는 §3의 브랜치 전 표를 융합 노드로 합산).
+- CPU attention 41%, 512(2.07 s, RoPE 표 1 s 포함) 대비 1.45배. `attention_engine: htp`가 다음 측정.
+- MoE 1.67배: weight DMA는 token 무관이라 1024에서는 계산 몫이 커짐.
+- epilogue 2개 0.45 s, post_ffn_norm 9.8 ms/호출: staging(1024행×2 addend) 몫으로 추정, `NNTR_HTP_PROFILE=2`로 확인.
