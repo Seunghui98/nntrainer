@@ -1965,7 +1965,13 @@ public:
     // [#225] With the FC WH sidecar open, the FC and DENSE_FFN ops bind the
     // handles the prefill registered from it (HTP_GRAPH_FEED_WH): one copy
     // of those weights for both. The tied lm_head stays Q4M1.
-    const bool wh = [this] {
+    // [#234 P4] Lever L1 (HTP_GRAPH_FEED_NATIVE, NNTR_HTP_PPL_LEVERS=2)
+    // asks for the native Q4 kernels on every Q4M1 kind: the sidecar's
+    // handles then stay out of the decode list.
+    bool native = false;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size()); ++i)
+      native |= (graphOp(i)->feed & HTP_GRAPH_FEED_NATIVE) != 0u;
+    const bool wh = !native && [this] {
       std::lock_guard<std::mutex> lock(handle_mutex_);
       return fcwh_fd_ >= 0;
     }();
@@ -2021,6 +2027,7 @@ public:
       if (!op->resident ||
           (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u)
         continue;
+      op->feed &= ~HTP_GRAPH_FEED_WH; // [#234 P4] a re-bind sets it anew
       uint32_t parts = 0;
       if (wh && op->kind == HTP_OP_DENSE_FFN) {
         const Q4Pending &u = pending(i, op->K, op->N);

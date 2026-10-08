@@ -1851,7 +1851,7 @@ static void check_wh(void) {
   err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
   op->feed = 0u;
   /* init: a part of another K, parts short of N, a down of another shape,
-     no chunk, a free part handle */
+     no chunk, a free part handle, a 2-bit part */
   op = htp_graph_op_at(w, fc_qkv);
   register_weight(op->h_gu[1], 64u, 64u);
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
@@ -1873,8 +1873,17 @@ static void check_wh(void) {
   g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]].in_use = 0;
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
   err |= rc != HTP_GRAPH_E_INVHANDLE || g != NULL;
-  CHECK(err == 0, "WH init refusals");
   g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]].in_use = 1;
+  /* [#234 P4] a 2-bit FC part: the kernel refuses it, so init does */
+  {
+    hexkl_weight_u8i4 *s2 = &g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]];
+    const uint32_t bits = s2->bits;
+    s2->bits = 2u;
+    rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+    err |= rc != HTP_GRAPH_E_INVHANDLE || g != NULL;
+    s2->bits = bits;
+  }
+  CHECK(err == 0, "WH init refusals");
   htp_graph_op_at(w, fc_qkv)->feed |= HTP_GRAPH_FEED_L2; /* arena read */
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
   CHECK(rc == 0u && g != NULL, "WH init: %s", htp_graph_err_name(rc));
@@ -1939,7 +1948,8 @@ static void check_wh(void) {
            "read) and DENSE_FFN (2 chunks as experts of weight 1, M = 1) hand "
            "the kernels the prefill's handles; WH LM_HEAD refused; init "
            "refuses another K / short parts / a bad down / no chunk / a free "
-           "handle; uses_handle sees WH ops, uses_q4m1 skips them\n");
+           "handle / a 2-bit part; uses_handle sees WH ops, uses_q4m1 skips "
+           "them\n");
 }
 
 /* ---- [plan 201 S4] Gemma 4's attention shapes -------------------------- */

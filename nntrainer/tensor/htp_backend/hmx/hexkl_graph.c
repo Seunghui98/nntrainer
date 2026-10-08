@@ -485,7 +485,7 @@ static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
    gemma4_causallm.cpp:760-806: separate gate and up, tanh_gelu, multiply). */
 static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
                               graph_call *call, const float *in, float *out) {
-  float *up = g->ffn, *gate = g->ffn + op->N, *act = g->ffn + 2u * op->N;
+  float *up, *gate, *act;
   int rc;
   if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
     /* [#225] the n_experts chunks as experts of weight 1, the token's one
@@ -510,6 +510,11 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
   }
+  /* g->ffn is NULL when every DENSE_FFN is WH (graph_init sizes it by the
+     Q4M1 ones): set only on this path */
+  up = g->ffn;
+  gate = g->ffn + op->N;
+  act = g->ffn + 2u * op->N;
   graph_prep(op, in, op->K, &g->act);
   rc = call->env->fc(call->env->fc_ctx, op->h_gu[0], op->feed, &g->act, up);
   if (rc == AEE_SUCCESS) {
@@ -651,8 +656,11 @@ static int graph_check_wh(const htp_graph_op *op,
   }
   for (p = 0; p < op->n_experts; ++p) {
     const uint32_t h = op->h_gu[p];
+    /* [#234 P4] 4-bit only: hexkl_mm_u8i4_fc_m1_run refuses a 2-bit
+       handle on every token, so it is refused here, once */
     if (h >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[h].in_use ||
-        tbl->slots[h].K != op->K || tbl->slots[h].N % 32u != 0u) {
+        tbl->slots[h].K != op->K || tbl->slots[h].N % 32u != 0u ||
+        tbl->slots[h].bits == 2u) {
       return AEE_EINVHANDLE;
     }
     sum += tbl->slots[h].N;
