@@ -3290,6 +3290,9 @@ private:
     /** What stageInput last copied into a class's buffer, cleared by any
      *  other stage() of it (doc 57 section 9.31). */
     std::map<size_t, std::pair<const void *, size_t>> holds;
+    /** The host tensor a class's buffer was last copied out to, whole
+     *  (copyOutOf), cleared by any other stage() of it. */
+    std::map<size_t, std::pair<const void *, size_t>> copied_out;
   };
   static size_t stageClass(size_t bytes) {
     size_t cls = size_t(64) << 10;
@@ -3300,42 +3303,75 @@ private:
   static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
     const size_t cls = stageClass(bytes);
     pool.holds.erase(cls);
+    pool.copied_out.erase(cls);
     auto &slot = pool.by_class[cls];
     if (!slot)
       slot = std::make_unique<HtpRpcBuffer>(cls);
     return *slot;
   }
+  /** @brief Whether @a b still holds the copy of @a a: 32 spread 64-byte
+   *  windows and the tail compared. ponytail: a rewrite that keeps every
+   *  sampled window is missed; a full compare costs about what the copy
+   *  does. */
+  static bool sampledSame(const void *a_, const void *b_, size_t bytes) {
+    const uint8_t *a = static_cast<const uint8_t *>(a_);
+    const uint8_t *b = static_cast<const uint8_t *>(b_);
+    bool same =
+      bytes < 64 || std::memcmp(a + bytes - 64, b + bytes - 64, 64) == 0;
+    for (size_t i = 0; same && i < 32 && bytes >= 64; ++i) {
+      const size_t off = (bytes - 64) / 32 * i;
+      same = std::memcmp(a + off, b + off, 64) == 0;
+    }
+    return same;
+  }
   /** @brief stage() plus the copy of @a bytes from @a src, skipped when the
    *  buffer still holds exactly that copy: the router, dense and MoE calls
    *  of a Gemma-4 layer each stage the same 11.5 MB post-attention rows.
    *  Any other stage() of the buffer forgets the copy, and before skipping
-   *  32 spread 64-byte windows and the tail are compared with @a src, so a
-   *  host tensor rewritten (or another one placed at the same address) is
-   *  copied again. ponytail: a rewrite that keeps every sampled window is
-   *  missed; a full compare costs about what the copy does. */
+   *  the copy is compared (sampledSame) with @a src, so a host tensor
+   *  rewritten (or another one placed at the same address) is copied again.
+   *
+   *  With @a from, a buffer of that pool that @a src was copied out of
+   *  whole (copyOutOf) and still matches is swapped in instead of copied:
+   *  the dense output is the MoE call's x2 and the MoE output the next
+   *  qkv call's input (doc 57 section 9.34). Stage this before the call's
+   *  own output buffer, which may be the one swapped in. */
   static HtpRpcBuffer &stageInput(StagingPool &pool, const void *src,
-                                  size_t bytes, int line = __builtin_LINE()) {
+                                  size_t bytes, StagingPool *from = nullptr,
+                                  int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     if (!slot)
       slot = std::make_unique<HtpRpcBuffer>(cls);
     auto it = pool.holds.find(cls);
     if (it != pool.holds.end() && it->second.first == src &&
-        it->second.second == bytes) {
-      const uint8_t *a = static_cast<const uint8_t *>(src);
-      const uint8_t *b = slot->data();
-      bool same =
-        bytes < 64 || std::memcmp(a + bytes - 64, b + bytes - 64, 64) == 0;
-      for (size_t i = 0; same && i < 32 && bytes >= 64; ++i) {
-        const size_t off = (bytes - 64) / 32 * i;
-        same = std::memcmp(a + off, b + off, 64) == 0;
-      }
-      if (same)
+        it->second.second == bytes && sampledSame(src, slot->data(), bytes))
+      return *slot;
+    if (from) {
+      auto c = from->copied_out.find(cls);
+      auto &fslot = from->by_class[cls];
+      if (c != from->copied_out.end() && c->second.first == src &&
+          c->second.second == bytes && fslot &&
+          sampledSame(src, fslot->data(), bytes)) {
+        std::swap(slot, fslot);
+        from->holds.erase(cls);
+        from->copied_out.erase(cls);
+        pool.copied_out.erase(cls);
+        pool.holds[cls] = {src, bytes};
         return *slot;
+      }
     }
     stagedMemcpy(slot->data(), src, bytes, line);
     pool.holds[cls] = {src, bytes};
     return *slot;
+  }
+  /** @brief The copy of a call's whole output out of @a pool's buffer for
+   *  @a bytes, remembered for stageInput's @a from. */
+  static void copyOutOf(StagingPool &pool, void *dst, size_t bytes,
+                        int line = __builtin_LINE()) {
+    const size_t cls = stageClass(bytes);
+    stagedMemcpy(dst, pool.by_class[cls]->data(), bytes, line);
+    pool.copied_out[cls] = {dst, bytes};
   }
 
   /** @brief The one FastRPC layer call both accelerated entries make.
@@ -3433,11 +3469,11 @@ private:
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     float *act_f32 = reinterpret_cast<float *>(
-      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
+      stageInput(act_pool_, matBdata,
+                 static_cast<size_t>(act_len) * sizeof(float), &out_pool_)
+        .data());
     float *out_cat = reinterpret_cast<float *>(
       stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
-    stagedMemcpy(act_f32, matBdata,
-                 static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
     if (norms && norms->any()) {
@@ -4736,12 +4772,22 @@ private:
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
     const bool host_prenorm = HtpProfile::global().level() >= 2 && with_norms &&
-                              !via_dspq && add_x2 == nullptr &&
-                              pre_gamma != nullptr;
+                              !via_dspq && pre_gamma != nullptr;
     HtpRpcBuffer &act_stage = via_dspq ? *dspq_->act
                               : host_prenorm
                                 ? stage(act_pool_, act_bytes)
                                 : stageInput(act_pool_, act, act_bytes);
+    // The post-FFN epilogue's second addend rides its own staging buffer,
+    // staged before out_stage: it may be swapped in from out_pool_.
+    float *x2_f32 = nullptr;
+    if (add_x2 != nullptr) {
+      if (pre_gamma == nullptr || K != N_out || via_dspq)
+        throw std::invalid_argument(
+          "gemm_qs4cx_moe_layer_fp32: the epilogue needs the raw rows "
+          "(pre_gamma) and K == N_out");
+      x2_f32 = reinterpret_cast<float *>(
+        stageInput(x2_pool_, add_x2, out_bytes, &out_pool_).data());
+    }
     HtpRpcBuffer &out_stage =
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
@@ -4749,19 +4795,10 @@ private:
     // NNTR_HTP_PROFILE>=2 on a call with folded norms: the timed entry
     // (stage breakdown) and the norms on the host around it, so the prefill
     // MoE and dense calls, which always carry them, have stages too (doc 57
-    // section 9.26). Measurement only; the norms' time is outside the call.
-    const bool host_norms = HtpProfile::global().level() >= 2 && with_norms &&
-                            !via_dspq && add_x2 == nullptr;
-    // The post-FFN epilogue's second addend rides its own staging buffer.
-    float *x2_f32 = nullptr;
-    if (add_x2 != nullptr) {
-      if (pre_gamma == nullptr || K != N_out || via_dspq)
-        throw std::invalid_argument(
-          "gemm_qs4cx_moe_layer_fp32: the epilogue needs the raw rows "
-          "(pre_gamma) and K == N_out");
-      x2_f32 = reinterpret_cast<float *>(stage(x2_pool_, out_bytes).data());
-      stagedMemcpy(x2_f32, add_x2, out_bytes);
-    }
+    // section 9.26), the post-FFN epilogue too (section 9.34). Measurement
+    // only; the norms' and the epilogue's time is outside the call.
+    const bool host_norms =
+      HtpProfile::global().level() >= 2 && with_norms && !via_dspq;
     if (host_prenorm) {
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
       for (unsigned int r = 0; r < M; ++r)
@@ -4800,7 +4837,7 @@ private:
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
                                 glu, timed ? rep_stage : nullptr)
-            : add_x2 != nullptr
+            : add_x2 != nullptr && !host_norms
               ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
                   session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
                   static_cast<int>(K), post_gamma,
@@ -4871,7 +4908,10 @@ private:
         " failed: err=" + std::to_string(err) + hint +
         (via_dspq ? " (via dspq)" : ""));
     }
-    stagedMemcpy(out, out_f32, out_bytes);
+    if (via_dspq)
+      stagedMemcpy(out, out_f32, out_bytes);
+    else
+      copyOutOf(out_pool_, out, out_bytes);
     if (host_post_norm) {
       std::vector<float> raw(out, out + static_cast<size_t>(out_len));
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(raw.data(), out, M, N_out,
@@ -4879,6 +4919,21 @@ private:
       for (unsigned int r = 0; r < M; ++r)
         for (unsigned int n = 0; n < N_out; ++n)
           out[static_cast<size_t>(r) * N_out + n] *= post_gamma[n];
+    }
+    if (host_norms && add_x2) {
+      // out = scale * (act + rmsnorm(out + x2) * gamma), as the epilogue.
+      for (unsigned int r = 0; r < M; ++r) {
+        float *o = out + static_cast<size_t>(r) * N_out;
+        const float *x2 = add_x2 + static_cast<size_t>(r) * N_out;
+        const float *res = act + static_cast<size_t>(r) * K;
+        float ss = 0.0f;
+        for (unsigned int n = 0; n < N_out; ++n)
+          ss += (o[n] + x2[n]) * (o[n] + x2[n]);
+        const float rs = 1.0f / std::sqrt(ss / N_out + eps);
+        for (unsigned int n = 0; n < N_out; ++n)
+          o[n] = add_scale * (res[n] + (o[n] + x2[n]) * rs *
+                                         (add_gamma ? add_gamma[n] : 1.0f));
+      }
     }
     dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
                 static_cast<size_t>(out_len), M, K, inter, N_out, kind,
