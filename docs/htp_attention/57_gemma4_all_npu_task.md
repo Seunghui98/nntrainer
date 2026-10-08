@@ -594,3 +594,7 @@ PR 4343 커널(`attention_kv_dtype: q8`, §9.15)을 켠 세 번의 실행. 모�
 | 7 | flash 바닥 | 3.4 s | 3.1 s | 1–6 뒤 compute < 3.4 s가 되면 C=24, 그 뒤는 읽기 속도 |
 
 decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽기 141 ms/token, 호출 85회/token.
+
+### 9.18 정확도 사다리 첫 시도와 인수인계 (2026-10-08)
+
+엔진을 하나씩 cpu로 되돌리는 사다리(사용자 실행)는 두 가지로 막혔다. (1) MoE를 CPU로 둔 실행(전부 CPU 포함)마다 기기 연결이 끊겼다(`waiting for device`, 2회). (2) 나머지 실행은 `[PPL] no positions scored`: config의 `skip_prefill: true`면 lm_head가 prefill을 건너뛰어 채점할 행이 없다. 같은 설정에서 생성 토큰은 전부 decode(M==1) 경로에서 나오므로, 출력 깨짐의 유력 가설은 decode 경로다(기기 미측정). 다음 세션용 인수인계와 다음 실험은 `58_gemma4_prefill_handoff.md`.
