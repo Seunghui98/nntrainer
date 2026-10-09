@@ -417,12 +417,19 @@ static void graph_predict(hexkl_graph *g, const htp_graph_op *op,
       nx = &g->ops[j];
     }
   }
+  /* in != out: the guess must not clobber this router's input (the
+     validator allows it for the sigmoid router); the same kind and width,
+     so the guess writes no more of the slot than this router does */
   if (nx != NULL && g->param[nx - g->ops] != NULL &&
-      g->state[nx - g->ops] != NULL && nx->K == op->K &&
+      g->state[nx - g->ops] != NULL && in != out &&
+      nx->n_experts == op->n_experts &&
+      (nx->eps_bits != 0u) == (op->eps_bits != 0u) &&
       nx->top_k <= HEXKL_GRAPH_MISS_MAX) {
     graph_router(g, nx, call, in, out, sel, w);
     n = nx->top_k;
   }
+  /* ponytail: an entry that does not fit is dropped, as route_log does
+     (Gemma's 29 x 9 + 1 B fit); a model past 320 B needs a bigger log */
   if (g->pred_log_n + 1u + n <= HEXKL_GRAPH_ROUTE_LOG) {
     g->pred_log[g->pred_log_n++] = (uint8_t)n;
     for (r = 0; r < n; ++r) {

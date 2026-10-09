@@ -3156,7 +3156,10 @@ public:
       // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
       // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
       if (const char *v = std::getenv("NNTR_HTP_PREDICT")) {
-        const uint32_t on = std::strtoul(v, nullptr, 10);
+        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0)
+          throw std::runtime_error(std::string("NNTR_HTP_PREDICT=") + v +
+                                   ": want 0 or 1");
+        const uint32_t on = v[0] == '1' ? 1u : 0u;
         float word;
         std::memcpy(&word, &on, sizeof(word));
         setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT, &word, 1u,
