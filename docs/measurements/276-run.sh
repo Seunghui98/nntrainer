@@ -35,17 +35,17 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=260-e-run.sh
 source "$HERE/260-e-run.sh"
 DM=${DM276:-/data/local/tmp/nntrainer/gemma4_26b_ternary_fcqs4cx}
-DC=/data/local/tmp/nntrainer/s276cfg
-B6=/data/local/tmp/nntrainer/causallm/s276
+DC=${DC276:-/data/local/tmp/nntrainer/s276cfg}
+B6=${B276:-/data/local/tmp/nntrainer/causallm/s276}
 BIN=${BIN276:-nntr_gemma4_26b_a4b_qs2cx_fcqs4cx.bin}
 FC=${FC276:-QS4CX}
 
 stage276() {
   local base=${1:?the user nntr_config.json, pulled from $DM} out d n
   out=$(mktemp -d)
-  python3 - "$base" "$HERE" "$out" "$DM" "$BIN" <<'PY'
+  python3 - "$base" "$HERE" "$out" "$DM" "$BIN" "${P276:-512 1024}" "${G276:-64 512}" <<'PY'
 import copy, json, os, sys
-base_f, here, out, dm, binf = sys.argv[1:]
+base_f, here, out, dm, binf, ps, gs = sys.argv[1:]
 base = json.load(open(base_f))
 base.update(skip_prefill=False, model_file_name=dm + "/" + binf,
             tokenizer_file=dm + "/tokenizer.json",
@@ -57,12 +57,14 @@ for k, v in (("bad_word_ids", []), ("lora_alpha", 0), ("lora_rank", 0),
              ("lora_target", [])):
     base.setdefault(k, v)
 base.pop("attention_kv_dtype", None)
+if os.environ.get("KV276"):  # q8: the user's config of record (2026-10-09)
+    base["attention_kv_dtype"] = os.environ["KV276"]
 assert base["moe_layer_dtype"] == "QS2CX_WH", base["moe_layer_dtype"]
-P = (512, 1024)
+P = [int(x) for x in ps.split()]
 prompts = {p: open(os.path.join(here, "260-prompt%d.txt" % p)).read() for p in P}
 for v in ("E", "A"):
     for p in P:
-        for g in (64, 512):
+        for g in [int(x) for x in gs.split()]:
             d = copy.deepcopy(base)
             d["sample_input"] = prompts[p]
             d["num_to_generate"] = g
@@ -126,10 +128,31 @@ run276() {
   echo "=== done $(date '+%F %T %Z')"
 }
 
+grid() { # the 2-bit best-version grid (#276, 2026-10-09): E at every prompt x G,
+  # then A p1024 G512 as the one reference. Configs: DC276=<dir> P276="1024
+  # 2048 4096" G276="64 512 1024" 276-run.sh stage <base>
+  local L=${1:?log dir} p g
+  mkdir -p "$L/done"
+  exec > >(tee -a "$L/sweep.out") 2>&1
+  export COOL_QUICK=1 CLADDER=16
+  echo "=== 276 grid $(date '+%F %T %Z') bin=$B6 cfg=$DC"
+  # TAG276=q8 names the cells <cell>_q8; SKIP4096=1 after a p4096 cell
+  # took the phone down (fp16 KV at 8192 rebooted it three times)
+  for p in 1024 2048 4096; do
+    for g in 64 512 1024; do
+      cell $B6 "$L" E "$p" "$g" "${TAG276:-}" ||
+        { [ "$p" = 4096 ] && [ "${SKIP4096:-0}" = 1 ] && break; }
+    done
+  done
+  cell $B6 "$L" A 1024 512 "${TAG276:-}"
+  echo "=== done $(date '+%F %T %Z')"
+}
+
 case "${1:-}" in
 stage) shift; stage276 "$@" ;;
 sanity) shift; sanity "$@" ;;
 run) shift; run276 "$@" ;;
+grid) shift; grid "$@" ;;
 sum) shift; TOK=${1:?log dir}/model/tokenizer.json; sum "$@" ;;
 *) sed -n 2,28p "$0"; exit 1 ;;
 esac
