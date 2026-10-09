@@ -72,7 +72,7 @@ Each cell reads mean GiB/s over the requested bytes (rep 0 / rep 1) · ms per ro
 | malloc | bounce | slices | | | 1.76 (1.58 / 1.94) · 0.80 ms · 2.90 | 1.83 (1.99 / 1.68) · 0.77 ms · 2.93 |
 | malloc | bounce | expert | | | 3.02 (3.02 / 3.03) · 2.70 ms · 2.88 | 3.00 (3.10 / 2.91) · 2.71 ms · 2.88 |
 
-\* rep 1 only. Rep 0 of these three cells read stripes 0–2, which a warm-up run had just read, and shows pgpgin ≈ 0. Slices "ms" is per weight, not per round of 3. PSI io `some avg10` was 0.1–17.9 over the run. The stripes cycle every 64 cells and the run had 57 cells per rep, so from its 8th cell on rep 1 re-reads the stripes that rep 0's cells read about 50 cells (≈ 10 GB of reads) earlier. Rep 0 and rep 1 agree within 0–12 % in every cell except the starred ones (the decision cells: 3.16 / 3.14, 1.81 / 1.82).
+\* rep 1 only. Rep 0 of these three cells read stripes 0–2, which a warm-up run had just read, and shows pgpgin ≈ 0. Slices "ms" is per weight, not per round of 3. PSI io `some avg10` was 0.1–17.9 over the run. The stripes cycle every 64 cells and the run had 57 cells per rep, so from its 8th cell on rep 1 re-reads the stripes that rep 0's cells read about 50 cells (≈ 10 GB of reads) earlier. Rep 0 against rep 1, outside the starred cells: median difference 3.9 %, at most 18 % (the slices rows, malloc bounce slices T=4 1.58 / 1.94); the decision cells agree to 1 % (weight T=4 3.16 / 3.14, slices T=8 1.81 / 1.82).
 
 **Anomaly, not resolved.**
 - Buffered cells show 1.7–2.1 MiB of pgpgin per 2.87 MiB expert. `mincore` reports 0 pages of the file resident after `DONTNEED`.
