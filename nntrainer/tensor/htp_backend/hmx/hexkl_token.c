@@ -47,6 +47,15 @@ static uint64_t tk_now_us(void) {
 #endif
 }
 
+/** @brief [#267 L0] The core's pcycles; 0 on the host. */
+static uint64_t tk_pcyc(void) {
+#if defined(__hexagon__)
+  return HAP_perf_get_pcycles();
+#else
+  return 0u;
+#endif
+}
+
 /** @brief Our stores reach DDR, where the ARM reads them. */
 static void tk_clean(void *p, uint32_t n) {
 #if defined(__hexagon__)
@@ -95,6 +104,7 @@ static void tk_pcycles(const hexkl_graph *g, uint32_t s, uint32_t e,
     st->pcycles += g->op_pcycles[s];
     if (g->ops[s].kind < HTP_OP_KIND_N) {
       st->kind_pcycles[g->ops[s].kind] += g->op_pcycles[s];
+      st->kind_qt[g->ops[s].kind] += g->op_qt[s];
     }
   }
 }
@@ -146,6 +156,7 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   const uint32_t seq = hexkl_token_seq(m->tok, m->k++);
   const htp_graph_op *o = &g->ops[op];
   const uint64_t t0 = tk_now_us();
+  const uint64_t pc0 = tk_pcyc();
   uint32_t i;
   int rc = AEE_SUCCESS;
   for (;;) {
@@ -157,6 +168,7 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
     dt = tk_now_us() - t0;
     if (dt >= (uint64_t)m->spin_us + HEXKL_TOKEN_TIMEOUT_US) {
       m->st->miss_us += (uint32_t)dt;
+      m->st->miss_pcyc += tk_pcyc() - pc0;
       ++m->st->timeouts;
       return AEE_EEXPIRED;
     }
@@ -167,6 +179,7 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
     }
   }
   m->st->miss_us += (uint32_t)(tk_now_us() - t0);
+  m->st->miss_pcyc += tk_pcyc() - pc0;
   tk_refresh(a, sizeof(*a));
   if (a->seq2 != seq || a->n_evict > HEXKL_GRAPH_MISS_MAX ||
       a->n_load > HEXKL_GRAPH_MISS_MAX) {

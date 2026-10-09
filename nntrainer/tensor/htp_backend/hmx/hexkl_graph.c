@@ -45,6 +45,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <AEEStdErr.h>
 #include <HAP_perf.h>
@@ -69,6 +70,18 @@
   HTP_GRAPH_E_NOTALLOWED != AEE_ENOTALLOWED
 #error "htp_graph_desc.h's error codes drifted from AEEStdErr.h"
 #endif
+
+/** @brief [#267 L0] Wall time in QTimer ticks on the DSP; in ns on the host
+ *  (whose HAP_perf stub's QTimer reads 0). */
+static uint64_t graph_now_qt(void) {
+#if defined(__hexagon__)
+  return HAP_perf_get_qtimer_count();
+#else
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+#endif
+}
 
 /** @brief What one forward call carries to the kernels. */
 typedef struct {
@@ -1106,6 +1119,7 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     return AEE_EBADSTATE;
   }
   memset(g->op_pcycles, 0, sizeof(g->op_pcycles));
+  memset(g->op_qt, 0, sizeof(g->op_qt));
   if (start_op >= g->n_ops || pos >= g->max_seq) {
     return AEE_EBADITEM;
   }
@@ -1136,7 +1150,7 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     const htp_graph_op *op = &g->ops[i];
     const graph_kernel k = kernels[op->kind];
     float *in, *out;
-    uint64_t t0;
+    uint64_t t0, n0;
     int rc;
     if (!op->resident) {
       break;
@@ -1149,9 +1163,11 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     if (n_run == 0u) {
       memcpy(in, act_in, (size_t)act_in_len * sizeof(float));
     }
+    n0 = graph_now_qt();
     t0 = HAP_perf_get_pcycles();
     rc = k(g, op, &call, in, out);
     g->op_pcycles[i] = HAP_perf_get_pcycles() - t0;
+    g->op_qt[i] = (uint32_t)(graph_now_qt() - n0);
     if (rc != AEE_SUCCESS) {
       return rc;
     }

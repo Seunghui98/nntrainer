@@ -58,6 +58,7 @@
 #define SPIN_US 20000u
 
 static int g_fail;
+
 #define CHECK(cond, ...)                                                       \
   do {                                                                         \
     if (!(cond)) {                                                             \
@@ -67,6 +68,33 @@ static int g_fail;
       ++g_fail;                                                                \
     }                                                                          \
   } while (0)
+
+/** @brief [#267 L0] the monotonic clock hexkl_graph's op_qt reads on the
+ *  host (its ticks are ns here) */
+static uint64_t now_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+
+/** @brief [#267 L0] The stats' per-kind wall: every kind the list runs
+ *  counted, their sum inside the tokens' own wall @a wall_ns (the op
+ *  brackets nest in it) and most of it (the glue between ops is small). */
+static double check_kind_ns(const hexkl_token_stats *st, uint64_t wall_ns,
+                            const char *what) {
+  static const uint32_t kinds[] = {HTP_OP_RMSNORM, HTP_OP_FC, HTP_OP_ATTN_M1,
+                                   HTP_OP_MOE, HTP_OP_LM_HEAD};
+  uint64_t sum = 0;
+  uint32_t k;
+  for (k = 0; k < HTP_OP_KIND_N; ++k)
+    sum += st->kind_qt[k];
+  for (k = 0; k < sizeof(kinds) / sizeof(kinds[0]); ++k)
+    CHECK(st->kind_qt[kinds[k]] > 0u, "%s kind %u: 0 ns", what, kinds[k]);
+  CHECK(sum <= wall_ns && sum >= wall_ns / 2u,
+        "%s: kinds %llu ns of the tokens' %llu", what, (unsigned long long)sum,
+        (unsigned long long)wall_ns);
+  return wall_ns ? (double)sum / (double)wall_ns : 0.0;
+}
 
 /* ---- the MoE stand-in: deterministic, routing-dependent, recorded ---- */
 static uint64_t *g_moe_log; /* in hash, out hash per call */
@@ -356,6 +384,8 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
   hexkl_token_stats st;
   uint32_t t, id, same_logits = 0, same_id = 0, same_moe = 0;
   uint32_t distinct = 0, seen[VOCAB] = {0};
+  uint64_t wall_ns = 0;
+  double cover;
   int rc;
 
   g_moe_cap = TOKENS * moe_per_token;
@@ -375,9 +405,12 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
   memset(&st, 0, sizeof(st));
   g_moe_calls = 0;
   for (t = 0; t < TOKENS; ++t) {
+    uint64_t t0;
     emb_row(t, x);
+    t0 = now_ns();
     rc = hexkl_token_main(s.g, &s.env, page, t, t % s.g->max_seq, x, HID,
                           t % 2u ? logits : NULL, VOCAB, SPIN_US, &st, &id);
+    wall_ns += now_ns() - t0;
     if (rc != AEE_SUCCESS) {
       CHECK(0, "token %u: 0x%x", t, (unsigned)rc);
       break;
@@ -397,12 +430,14 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
         "MoE calls %u, %u equal of %u", g_moe_calls, same_moe, g_moe_cap);
   CHECK(st.timeouts + st.stale + st.misses == 0u,
         "timeouts %u stale %u misses %u", st.timeouts, st.stale, st.misses);
+  cover = check_kind_ns(&st, wall_ns, "resident");
   if (g_fail == 0)
     printf("TOKEN DRIVER BIT-IDENTICAL: tokens %u/%u (%u distinct ids) "
            "logits bit_identical=1 "
            "moe_calls %u/%u in+out bit_identical=1 timeouts=0 stale=0 "
+           "kind_ns/wall=%.3f "
            "(hd64 C A C, one session, vs the one-session forward)\n",
-           same_id, TOKENS, distinct, same_moe, g_moe_cap);
+           same_id, TOKENS, distinct, same_moe, g_moe_cap, cover);
   close_session(&s);
   free(page);
   free(ref_log);
@@ -543,6 +578,8 @@ static void check_pool(const uint32_t *words, uint32_t n) {
   pthread_t tho;
   hexkl_token_stats st;
   uint32_t t, id, same_logits = 0, same_id = 0;
+  uint64_t wall_ns = 0;
+  double cover;
   int rc;
 
   reference(words, n, ref_logits, ref_id);
@@ -553,9 +590,12 @@ static void check_pool(const uint32_t *words, uint32_t n) {
   memset(&st, 0, sizeof(st));
   pthread_create(&tho, NULL, owner_thread, &o);
   for (t = 0; t < TOKENS; ++t) {
+    uint64_t t0;
     emb_row(t, x);
+    t0 = now_ns();
     rc = hexkl_token_main(s.g, &s.env, o.page, t, t % s.g->max_seq, x, HID,
                           NULL, VOCAB, SPIN_US, &st, &id);
+    wall_ns += now_ns() - t0;
     if (rc != AEE_SUCCESS) {
       CHECK(0, "pool token %u: 0x%x", t, (unsigned)rc);
       break;
@@ -575,13 +615,20 @@ static void check_pool(const uint32_t *words, uint32_t n) {
         st.stale);
   CHECK(s.g->route_log_n == POOL_OPS * 3u, "route log %u bytes",
         s.g->route_log_n);
+  cover = check_kind_ns(&st, wall_ns, "pool");
+  /* the waits run inside the MOE ops' brackets */
+  CHECK(st.kind_qt[HTP_OP_MOE] >= (uint64_t)st.miss_us * 1000u,
+        "pool MOE %llu ns < its waits %u us",
+        (unsigned long long)st.kind_qt[HTP_OP_MOE], st.miss_us);
   if (g_fail == 0)
     printf("TOKEN POOL BIT-IDENTICAL: tokens %u/%u logits bit_identical=1, a "
            "pool of %u of %u experts a layer, misses=%u (%.2f/token) in %u "
-           "rounds, timeouts=0 stale=0 (the miss rounds against an owner "
-           "pthread; vs the one-session forward)\n",
+           "rounds, timeouts=0 stale=0 kind_ns/wall=%.3f MOE net of miss "
+           "wait %.1f us/token (the miss rounds against an owner pthread; vs "
+           "the one-session forward)\n",
            same_id, TOKENS, 2u, POOL_E, o.loads, (double)o.loads / TOKENS,
-           o.served);
+           o.served, cover,
+           ((double)st.kind_qt[HTP_OP_MOE] / 1000.0 - st.miss_us) / TOKENS);
   close_session(&s);
   free(o.page);
 }

@@ -79,6 +79,10 @@ typedef struct {
   uint64_t kind_pcycles[HTP_OP_KIND_N]; /**< the same, per op kind */
   uint32_t misses;  /**< [plan 201 S1] experts loaded by miss rounds */
   uint32_t miss_us; /**< the waits for their answers */
+  /** [#267 L0] the ops' wall QTimer ticks per kind (hexkl_graph op_qt);
+   *  MOE's hold its miss waits */
+  uint64_t kind_qt[HTP_OP_KIND_N];
+  uint64_t miss_pcyc; /**< [#267 L0] the pcycles over those waits */
 } hexkl_token_stats;
 
 /** @brief The sequence value of round @a round of token @a tok. */
