@@ -251,6 +251,8 @@ for f in sorted(glob.glob(os.path.join(L, "*.log"))):
 PY
 }
 
+# sourced (266-run.sh): the functions only
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 case "${1:-}" in
 stage) stage ;;
 run) shift; run "$@" ;;
