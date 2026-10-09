@@ -12,7 +12,7 @@ Neither lever was built. In both cases the measured breakdown contradicts the pl
   - The real checkpoint has `tie_word_embeddings: true`. A tied head folds the final norm
     and the softcap into itself (`FOLD_OUTPUT_NORM`, `496a04979`, from the #4415 port).
   - `Gemma4CausalLM::constructModel` adds the `logit_softcapping` layer only for an untied
-    head (`gemma4_causallm.cpp:942-951`).
+    head (`gemma4_causallm.cpp:942-951` at `4c3953bb1`, `:965-974` at `19dbf3a78`; the fold is unchanged by #275).
   - At a resident row the tied head's hook returns 1 and `continue`s
     (`tie_word_embedding.cpp:609-617`), so the ARM computes no `tanh`. The DSP's LM_HEAD caps
     the logits before its argmax (`hexkl_graph.c:563` at `4c3953bb1`).

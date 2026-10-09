@@ -10,12 +10,13 @@
 # 266 / 267 sittings) from R260 (PR #265's branch, default ~/nntrainer-260doc).
 #
 # usage:
-#   261-softcap-attn-run.sh wait <stage dir>   poll until the sitting lock
-#                                  is ours, then push the stage dir (jni/...
+#   261-softcap-attn-run.sh push <stage dir>   push the stage dir (jni/...
 #                                  + libnntr_hvx_skel.so) to s261p/
 #   261-softcap-attn-run.sh one <log dir> <prompt> <G> [suffix] [extra env]
-#                                  one P cell (lock held)
-#   261-softcap-attn-run.sh release
+#                                  one P cell
+# Device access only on the coordinator's go. The sitting lock
+# (tools/htp/sitting_lock.sh) is retired (user, 2026-10-09). The 2026-10-09
+# sittings ran under it, through a `wait` command that this revision removed.
 set -u -o pipefail
 R260=${R260:-$HOME/nntrainer-260doc/docs/measurements}
 # shellcheck disable=SC1090
@@ -50,13 +51,6 @@ cool() { # relaxed (user, 2026-10-09): no other run, then battery <= 32.0 C
   echo "$soc $bat $z0"
 }
 
-wait_lock() {
-  until (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "261 attn phase words" 60); do
-    sleep 60
-  done
-  push_stage "${1:?stage dir}"
-}
-
 one() { # one <log dir> <prompt> <G> [suffix] [extra env]
   L=${1:?log dir}
   mkdir -p "$L/done"
@@ -64,8 +58,7 @@ one() { # one <log dir> <prompt> <G> [suffix] [extra env]
 }
 
 case "${1:-}" in
-wait) shift; wait_lock "$@" ;;
+push) shift; push_stage "$@" ;;
 one) shift; one "$@" ;;
-release) (cd "$ROOT" && tools/htp/sitting_lock.sh release $SER) ;;
 *) sed -n '2,20p' "$0"; exit 1 ;;
 esac
