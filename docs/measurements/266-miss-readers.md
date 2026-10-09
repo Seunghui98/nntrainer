@@ -160,7 +160,8 @@ Columns:
   - `E2E e3 pool C=3 gemma64 … bit_identical=1 misses=19`;
   - `2bit pool C=1 / C=2 … misses=56 / 13`;
   - keys `pool C=2 … misses=15`.
-- With `NNTR_MOE_MISS_READERS=1`: see the PR.
+- With `NNTR_MOE_MISS_READERS=1`: `INPROC E2E PASS`. Every pool line is `bit_identical=1` with the same `misses=` (5 / 56 / 14 / 19 / 56 / 13 / 15). The fcwh line is also `misses=11`.
+- The review fix `9c34d6780` (route log only on a whole response, comments) came after the sitting. `ninja -C build` rebuilt and the sim selftest passes. The device numbers are on `275cfc06e`; the fix changes only the failure path.
 
 ## Rerun
 
