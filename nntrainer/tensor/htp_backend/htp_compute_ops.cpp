@@ -3054,7 +3054,10 @@ public:
   }
   /** [#266] NNTR_HTP_ROUTE_LOG=<path>: each token's routed sets, one line
    *  per MoE op in NNTR_MOE_TRACE's format ("<op> 1 | <ids> |"), so
-   *  tools/moe_expert_cache_sim.py replays the one-PD token's routing. */
+   *  tools/moe_expert_cache_sim.py replays the one-PD token's routing.
+   *  [#266 S2] Under NNTR_HTP_PREDICT=1 the third field is the previous
+   *  router op's guess at this op's ids, best first (the sim's --predict
+   *  trace). */
   static void routeLog(const htp_dspq_token_resp &s1r) {
     static std::FILE *f = [] {
       const char *path = std::getenv("NNTR_HTP_ROUTE_LOG");
@@ -3062,12 +3065,23 @@ public:
     }();
     if (f == nullptr)
       return;
+    const uint32_t pred_n =
+      std::min<uint32_t>(s1r.pred_n, HTP_DSPQ_TOKEN_ROUTE);
+    // prev: the previous router op's entry (its guess at this op)
+    uint32_t p_at = 0, prev = pred_n;
     for (uint32_t m = 0, at = 0; at < s1r.route_n; ++m) {
       const uint32_t n = s1r.route[at++];
       std::fprintf(f, "%u 1 |", m);
       for (uint32_t i = 0; i < n && at < s1r.route_n; ++i)
         std::fprintf(f, " %u", s1r.route[at++]);
-      std::fputs(" |\n", f);
+      std::fputs(" |", f);
+      for (uint32_t i = 1;
+           prev < pred_n && i <= s1r.pred[prev] && prev + i < pred_n; ++i)
+        std::fprintf(f, " %u", s1r.pred[prev + i]);
+      std::fputc('\n', f);
+      prev = p_at;
+      if (p_at < pred_n)
+        p_at += 1u + s1r.pred[p_at];
     }
     std::fflush(f);
   }
@@ -3139,6 +3153,15 @@ public:
       // [plan 201 S4] the parameters the model handed at load, by name
       for (const LoadParam &p : load_params_)
         setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
+      // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
+      // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
+      if (const char *v = std::getenv("NNTR_HTP_PREDICT")) {
+        const uint32_t on = std::strtoul(v, nullptr, 10);
+        float word;
+        std::memcpy(&word, &on, sizeof(word));
+        setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT, &word, 1u,
+                 1u, "PREDICT");
+      }
     } catch (...) {
       nntr_hvx_graph_release(session);
       if (!e2e_)
