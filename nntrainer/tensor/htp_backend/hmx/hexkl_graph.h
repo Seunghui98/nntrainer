@@ -64,6 +64,10 @@
 #include "hvx_attn_m1_f32.h"
 #include "hvx_q4_gemv_f32.h"
 
+/** @brief [#261] attn_m1_det.h's ATTN_M1_PROF_WORDS (hexkl_graph.c asserts
+ *  they agree): the size of hexkl_graph.attn_prof's rows. */
+#define HEXKL_GRAPH_ATTN_PROF_WORDS 14u
+
 /** @brief Largest K a Q4M1 op quantizes (the validator's rule; the model's
  *  widest is 7168, the dense down). */
 #define HEXKL_GRAPH_Q4M1_MAX_K 8192u
@@ -221,6 +225,13 @@ typedef struct hexkl_graph_s {
                        LM_BAN ids skipped */
   uint32_t ban[HTP_GRAPH_MAX_BAN]; /**< [#132 Part B E3] LM_BAN's ids */
   uint32_t n_ban;
+  /** [#261] While attn_prof_on (the token driver sets it per token), each
+   *  ATTN_M1 op runs the kernel's _prof entry and adds its phase words
+   *  (attn_m1_det.h ATTN_M1_PROF_*) here: [0] env->attn_m1's calls,
+   *  [1] env->attn_m1_b's (Gemma's full layers). Off: no timestamp. */
+  uint32_t attn_prof_on;
+  uint32_t attn_prof_calls[2];
+  uint64_t attn_prof[2][HEXKL_GRAPH_ATTN_PROF_WORDS];
 } hexkl_graph;
 
 /** @brief HTP_GRAPH_KIND_BIT mask of the kinds whose table slot is

@@ -43,6 +43,8 @@
 
 #include "hexkl_graph.h"
 
+#include "../../attn_m1_det.h" /* nntrainer/tensor/ */
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -350,6 +352,10 @@ static hvx_attn_m1_ctx *graph_attn_cache(const hexkl_graph_env *env,
   return NULL;
 }
 
+typedef char
+  graph_attn_prof_fits[HEXKL_GRAPH_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS ? 1
+                                                                         : -1];
+
 /* [plan 201 S4] top_k is the sliding window (0: full causal, LFM2 and
    Gemma's full layers), eps_bits the scale (graph_attn_scale) */
 static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
@@ -357,12 +363,22 @@ static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
   const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
                  n_k = op->n_kv * hd;
   hvx_attn_m1_ctx *c = graph_attn_cache(call->env, op);
+  uint32_t w[ATTN_M1_PROF_WORDS], i;
+  int rc;
   if (c == NULL) {
     return AEE_EBADSTATE;
   }
-  return hvx_attn_m1_forward(c, g->ordinal[op - g->ops], call->pos, op->top_k,
-                             graph_attn_scale(op), in, in + n_q, in + n_q + n_k,
-                             out, NULL);
+  rc = hvx_attn_m1_forward_prof(
+    c, g->ordinal[op - g->ops], call->pos, op->top_k, graph_attn_scale(op), in,
+    in + n_q, in + n_q + n_k, out, NULL, g->attn_prof_on ? w : NULL);
+  if (rc == AEE_SUCCESS && g->attn_prof_on) { /* [#261] */
+    const uint32_t b = c == call->env->attn_m1_b ? 1u : 0u;
+    ++g->attn_prof_calls[b];
+    for (i = 0; i < ATTN_M1_PROF_WORDS; ++i) {
+      g->attn_prof[b][i] += w[i];
+    }
+  }
+  return rc;
 }
 
 /* ---- #132: the residual add and the router ------------------------------ */

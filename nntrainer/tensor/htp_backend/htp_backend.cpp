@@ -47,6 +47,20 @@ bool HtpBackend::e2eRequested() {
 }
 
 HtpBackend::HtpBackend() {
+  // [#260 r3] The FastRPC thread runs every call that does not ride the
+  // dspqueue, the load-time MoE warm-up included. Its default stack is the
+  // 16 KiB minimum; hexkl_mm_u8i4_moe_layer_run's frame alone is 14.6 KiB
+  // since #4415's down ring joined ours, and the first scratch malloc that
+  // grows the heap then overflowed it (DSP crash in apps_mem_request_map64,
+  // 0x8000040d). 64 KiB as the dspqueue thread (nntr_hvx_dspq.c). Must
+  // precede every other RPC of the process; not fatal if refused.
+  remote_rpc_thread_params thread_params = {CDSP_DOMAIN_ID, -1, 64 * 1024};
+  int tp_err = remote_session_control(FASTRPC_THREAD_PARAMS, &thread_params,
+                                      sizeof(thread_params));
+  if (tp_err != AEE_SUCCESS)
+    ml_logw("remote_session_control(thread stack 64 KiB) failed (err=%d)",
+            tp_err);
+
   // Enables the unsigned-PD CDSP session the dev/bring-up skel needs.
   // Not fatal if it fails -- a signed production skel does not need it,
   // and nntr_hvx_open below is the real pass/fail signal either way.
