@@ -2929,6 +2929,7 @@ public:
     if (!pool_dirty_)
       return;
     pinExperts();
+    dropHostFc();
     E2eState &e = *e2e_st_;
     if (pool_descs_.size() != moe_ops_.size())
       throw std::runtime_error(
@@ -7222,6 +7223,42 @@ private:
     return v;
   }
 
+  /** @brief [#282 B] NNTR_HTP_DROP_HOST_FC=1: at the first decode token,
+   *  hand the OS back the CPU copies of the decode list's FC / DENSE_FFN /
+   *  LM_HEAD weights (q4_pending_). The one-PD token reads its own arena
+   *  copies (bindQ4m1, lmHeadHandles) and the prefill FCs their WH handles,
+   *  registered by then; the CPU layers skip their GEMVs on a resident row.
+   *  ponytail: a second prefill that fell back to a CPU FC would read
+   *  zeros (madvise DONTNEED on anonymous pages) -- single-prompt runs
+   *  only; the upgrade is a re-read from the model file on that path. */
+  void dropHostFc() {
+    static const bool on = std::getenv("NNTR_HTP_DROP_HOST_FC") != nullptr;
+    if (!on || host_fc_dropped_ || !e2e_)
+      return;
+    host_fc_dropped_ = true;
+    const size_t before = memAvailableMib();
+    size_t bytes = 0;
+    for (const Q4Pending &p : q4_pending_) {
+      if (p.canonical) // a tied head is the embedding table: still read
+        continue;
+      const size_t codes =
+        p.scale != nullptr
+          ? static_cast<size_t>(p.K) * p.N / 2
+          : static_cast<size_t>(p.K) / 32 * p.N * Q4_CPU_BLOCK_BYTES;
+      releaseArmSource(const_cast<void *>(p.data), codes);
+      bytes += codes;
+      if (p.scale != nullptr) {
+        releaseArmSource(const_cast<float *>(p.scale), sizeof(float) * p.N);
+        bytes += sizeof(float) * p.N;
+      }
+    }
+    std::fprintf(stderr,
+                 "[HTP] drop host fc: weights=%zu mib=%zu mem_avail_mib "
+                 "%zu -> %zu rss_mib=%zu\n",
+                 q4_pending_.size(), bytes >> 20, before, memAvailableMib(),
+                 static_cast<size_t>(rssKb() >> 10));
+  }
+
   /** @brief [#282] The pinned bytes of file range [off, off + len), or
    *  nullptr when they are not pinned. */
   const uint8_t *pinnedAt(int fd, uint64_t off, uint64_t len) const {
@@ -8051,6 +8088,7 @@ private:
   std::vector<std::vector<ExpertFileDesc>> pool_descs_;
   std::vector<PinRange> pin_ranges_; /**< [#282] NNTR_MOE_PIN */
   bool pinned_ = false;
+  bool host_fc_dropped_ = false; /**< [#282 B] NNTR_HTP_DROP_HOST_FC */
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
   bool pool_dirty_ = true;
