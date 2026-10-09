@@ -4807,6 +4807,34 @@ private:
                    "[HTP] graph per-kind pcyc/token:%s | wall_ms/token=%.3f "
                    "mhz=%.0f spin_us=%u\n",
                    line.c_str(), wus / n / 1000.0, mhz, e.spin_us);
+      // [#267 L0] the same kinds in wall us at whatever clock each ran, the
+      // MOE net of its miss waits, and the clock outside the waits
+      line.clear();
+      uint64_t sum_us = 0;
+      for (uint32_t kd = 0; kd < HTP_OP_KIND_N; ++kd) {
+        sum_us += e.kind_us[kd];
+        if (e.kind_us[kd] == 0)
+          continue;
+        std::snprintf(buf, sizeof(buf), " %s=%.0f", htp_graph_kind_name(kd),
+                      static_cast<double>(e.kind_us[kd]) / n);
+        line += buf;
+        if (kd == HTP_OP_MOE) {
+          std::snprintf(buf, sizeof(buf), "(net of miss wait %.0f)",
+                        (static_cast<double>(e.kind_us[kd]) -
+                         static_cast<double>(e.miss_us)) /
+                          n);
+          line += buf;
+        }
+      }
+      const double cus = wus - static_cast<double>(e.miss_us);
+      std::fprintf(
+        stderr,
+        "[HTP] graph per-kind us/token:%s | ops/wall=%.4f compute_mhz=%.0f\n",
+        line.c_str(), wus > 0 ? static_cast<double>(sum_us) / wus : 0.0,
+        cus > 0 ? (static_cast<double>(e.wall_pcyc) -
+                   static_cast<double>(e.miss_pcyc)) /
+                    cus
+                : 0.0);
       if (e.moe_ops != 0 && e.kind[HTP_OP_MOE] != 0) {
         const double moe = static_cast<double>(e.kind[HTP_OP_MOE]) / n /
                            static_cast<double>(e.moe_ops);
@@ -5073,8 +5101,11 @@ private:
     e.pcyc += r.pcycles;
     e.wall_us += r.wall_us;
     e.wall_pcyc += r.wall_pcyc;
-    for (uint32_t k = 0; k < HTP_OP_KIND_N; ++k)
+    for (uint32_t k = 0; k < HTP_OP_KIND_N; ++k) {
       e.kind[k] += r.kind_pcyc[k];
+      e.kind_us[k] += r.kind_us[k];
+    }
+    e.miss_pcyc += r.miss_pcyc;
     e.token_us += us;
     e.hop_us += r.hop_us;
     e.disp_us += static_cast<int32_t>(r.t_in_us - c0);
@@ -7609,6 +7640,8 @@ private:
      *  packet handling around its token (out - in) */
     int64_t disp_us = 0, ret_us = 0, inout_us = 0;
     uint64_t kind[HTP_OP_KIND_N] = {0};
+    /** [#267 L0] the ops' wall us per kind, the pcycles over the waits */
+    uint64_t kind_us[HTP_OP_KIND_N] = {0}, miss_pcyc = 0;
     uint32_t moe_ops = 0, spin_us = 0;
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */

@@ -95,6 +95,11 @@ typedef struct htp_dspq_token_resp_s {
   uint32_t route_n;           /**< [plan 201 S1] S1: bytes of route */
   uint8_t route[HTP_DSPQ_TOKEN_ROUTE]; /**< per MOE op in list order: its
                                             routed count, then the ids */
+  /** [#267 L0] the ops' wall us per kind (QTimer; MOE holds the waits) */
+  uint32_t kind_us[HTP_DSPQ_TOKEN_KINDS];
+  /** [#267 L0] the pcycles over the miss waits: the clock while computing
+   *  is (wall_pcyc - miss_pcyc) / (wall_us - miss_us) */
+  uint32_t miss_pcyc;
 } htp_dspq_token_resp;
 
 /** @brief [plan 201 S1] The token driver's mailbox page (hexkl_token.h):

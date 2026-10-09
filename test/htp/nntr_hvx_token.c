@@ -151,12 +151,15 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   r->pcycles = (uint32_t)(t->st.pcycles - before.pcycles);
   r->misses = t->st.misses - before.misses;
   r->miss_us = t->st.miss_us - before.miss_us;
+  r->miss_pcyc = (uint32_t)(t->st.miss_pcyc - before.miss_pcyc);
   /* [plan 201 S1] the routed sets, for the pool */
   r->route_n = s->graph->route_log_n;
   memcpy(r->route, s->graph->route_log, r->route_n);
   for (k = 0; k < HTP_DSPQ_TOKEN_KINDS && k < HTP_OP_KIND_N; ++k) {
     r->kind_pcyc[k] =
       (uint32_t)(t->st.kind_pcycles[k] - before.kind_pcycles[k]);
+    r->kind_us[k] = (uint32_t)HAP_perf_qtimer_count_to_us(t->st.kind_qt[k] -
+                                                          before.kind_qt[k]);
   }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "[token] tok=%u pos=%u: 0x%08x (timeouts %u stale %u)",

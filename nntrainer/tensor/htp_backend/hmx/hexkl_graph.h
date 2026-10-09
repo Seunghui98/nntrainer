@@ -173,6 +173,9 @@ typedef struct hexkl_graph_s {
                             (param[op], max_seq x head_dim) reads that */
   htp_graph_op ops[HTP_GRAPH_MAX_OPS];
   uint64_t op_pcycles[HTP_GRAPH_MAX_OPS]; /**< of the last forward */
+  uint32_t op_qt[HTP_GRAPH_MAX_OPS];   /**< [#267 L0] the same brackets in wall
+                                            QTimer ticks (ns on the host): the
+                                            op's time at whatever clock it ran */
   float *param[HTP_GRAPH_MAX_OPS];     /**< gamma or conv_w, NULL until bound */
   float *state[HTP_GRAPH_MAX_OPS];     /**< CONV1D_GATE: 3 x N (rows 0-1 the
                                             conv state, row 2 scratch) */
