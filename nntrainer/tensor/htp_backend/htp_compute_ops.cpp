@@ -5023,6 +5023,8 @@ private:
   static void e2eTeardown(E2eState &e) {
     static_assert(HTP_OP_KIND_N == HTP_DSPQ_TOKEN_KINDS,
                   "htp_dspq_wire.h's kind count is the graph's");
+    static_assert(HTP_DSPQ_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS,
+                  "htp_dspq_wire.h's phase words are attn_m1_det.h's");
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
     // [#132 Part B E5g] every DSP thread stopped before any munmap: the
     // queue (QUIT, joined), then the token driver (its HAP_mmap_put); then
