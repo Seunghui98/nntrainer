@@ -228,10 +228,33 @@ def simulate_pred(calls, capacity, mode, src, seed=0):
     return t
 
 
+def pred_accuracy(calls):
+    """Plan 266 S2: per layer, the mean share of a decode call's routed
+    experts that the previous layer's logged guess (the third field) named.
+    -> {layer: (p, calls scored)}; layers whose lines carry no guess are
+    left out."""
+    hit, n = {}, {}
+    for layer, tokens, routed, ext in calls:
+        if tokens != 1 or not ext or not routed:
+            continue
+        hit[layer] = hit.get(layer, 0.0) + len(set(routed) & set(ext)) / len(
+            routed)
+        n[layer] = n.get(layer, 0) + 1
+    return {m: (hit[m] / n[m], n[m]) for m in sorted(n)}
+
+
 def report_pred(calls, caches, srcs):
     """Plan 266 lever 3's table: hit % (DSP-posted misses) and the waited
     misses per call for plain LRU, protect and prefetch."""
     layers = len({c[0] for c in calls})
+    acc = pred_accuracy(calls)
+    if acc:
+        ps = [v[0] for v in acc.values()]
+        print(f"guess accuracy p per layer (plan 266 S2; {len(acc)} layers, "
+              f"mean {100.0 * sum(ps) / len(ps):.1f}%, "
+              f"{sum(1 for v in ps if v >= 0.7)} at p >= 0.7):")
+        print("  " + " ".join(f"{m}:{100.0 * v[0]:.0f}" for m, v in
+                              acc.items()))
     print("next-layer prediction (plan 266 lever 3): misses/call = what the "
           "DSP posts, waited = demand reads, extra = prefetch reads/call")
     print(f"{'C':>3} {'mode':>13} {'src':>7} {'misses/call':>11} {'hit %':>6} "
@@ -422,6 +445,8 @@ def selftest():
         {5, 6}
     assert next_sets([(0, 1, [0], []), (1, 1, [1], [5, 6])], "trace:1")[0] \
         == {5}
+    assert pred_accuracy([(0, 1, [1, 2], []), (1, 1, [3, 4], [3, 5])]) == \
+        {1: (0.5, 1)}
     # Parsing.
     assert parse(["3 1 | 4 7 | 7 4 9\n", "\n"]) == [(3, 1, [4, 7], [7, 4, 9])]
     print("selftest OK")
