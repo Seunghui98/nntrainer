@@ -3458,8 +3458,18 @@ public:
       if (rec == nullptr)
         continue;
       const uint32_t max_seq = graph_words_[6];
+      // [#282 D] NNTR_HTP_ATTN_M1_Q8: the int8 cache (half the bytes;
+      // fixed scales from the prefill seed), HVX_ATTN_M1_Q8 in max_seq;
+      // 1 = the first cache only (Gemma's sliding layers, 400 of its 440
+      // MiB at max_seq 2048), 2 = both (the full layers too)
+      static const int q8_knob = [] {
+        const char *v = std::getenv("NNTR_HTP_ATTN_M1_Q8");
+        return v != nullptr ? std::atoi(v) : 0;
+      }();
+      const bool q8 = q8_knob >= 2 || (q8_knob == 1 && c == 0u);
       const int rc = nntr_hvx_attn_m1_register(
-        session, n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq);
+        session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
+        max_seq | (q8 ? 0x80000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
@@ -3467,11 +3477,12 @@ public:
       attn_registered_ = true;
       std::fprintf(stderr,
                    "[HTP] attn_m1: registered layers=%u kv=%u gqa=%u "
-                   "head_dim=%u max_seq=%u cache=%llu KiB\n",
+                   "head_dim=%u max_seq=%u cache=%llu KiB%s\n",
                    n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq,
                    (unsigned long long)n_attn * rec->n_kv * rec->head_dim *
-                     ((max_seq + 63u) / 64u * 64u) * 2u * sizeof(uint16_t) /
-                     1024u);
+                     ((max_seq + 63u) / 64u * 64u) * 2u *
+                     (q8 ? 1u : sizeof(uint16_t)) / 1024u,
+                   q8 ? " int8" : "");
     }
     if (e2e_)
       e2eStart();
