@@ -8,7 +8,7 @@ next sitting (512 retired once #266 / #267 finish). This note adds the 2048 and
 |---|---|---|---|
 | `260-prompt512.txt` | 512 | `c31a365fbaecd148602c09c8a2523a1d` | Thyme abstract (research register) — in use |
 | `260-prompt1024.txt` | 1024 | `93bd76497aeb9c9d9ea7074d93e2bff8` | Ardley harbour town — in use |
-| `260-prompt2048.txt` | 2048 | `193cd0918df99aa2a9e06794b4847e30` | municipal water-network leak study (research report register, 1760 words) — **not yet device-validated** |
+| `260-prompt2048.txt` | 2048 | `193cd0918df99aa2a9e06794b4847e30` | municipal water-network leak study (research report register, 1760 words) — **not yet device-validated** (checklist below) |
 | `260-prompt4096.txt` | 4096 | `a157af12c759e5ca00056d0d40dd38e7` | Halstrand, a mountain mining / observatory town (3520 words) — **not yet device-validated** |
 
 All four share the same wrapper byte for byte: `<bos><|turn>user\n` + the
@@ -41,14 +41,47 @@ lines of the r2 sitting (`260-step2-r2-3897963d8.md`). With
 app does. The new files count 2048 / 4096 exactly under the same call; the last
 sentence of each body was adjusted (reworded, not padded) until the count landed.
 
-## What remains before adoption
+## Runner
 
-- **Device validation, G 64, not done** (the phone is held by the #266 / #267
-  sittings; no adb from this task): one run per file to confirm the log reads
-  `prefill: 2048 tokens` / `prefill: 4096 tokens`, and the user's read of the
-  text (a coherent summary up to the first `<turn|>`) plus a prompt nll for the
-  record, as for 512 / 1024.
-- `260-e-run.sh stage` hard-codes `prompts = {512, 1024}` and
-  `init_seq_len = 2048 if p == 1024 else 1024`; the next sitting's runner must
-  add the two files and keep the doc 57 §7.5 rule (init_seq_len strictly
-  above the prompt length, so 4096 → 8192).
+`260-e-run.sh` (2026-10-09) stages all four prompts and runs `PROMPTS`
+(default `1024 2048 4096`; `PROMPTS="512 1024"` for before/after lever
+comparisons). Per prompt, doc 57 §7.5 rule (init_seq_len strictly above the
+prompt) and `max_seq_len ≥ init_seq_len` so p + G always fits (the base config's
+`max_seq_len` 2048 would truncate a 2048 prompt's tail):
+
+| prompt | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|
+| `init_seq_len` | 1024 | 2048 | 4096 | 8192 |
+| `max_seq_len` | 2048 | 2048 | 4096 | 8192 |
+
+The 512 / 1024 configs are byte-identical to the r2 sitting's (checked on the
+host against the old `stage`). p4096 sizes the KV cache and the RoPE table at
+8192 positions and the prefill graph at 8192 rows; it may not fit the one-PD
+3840 MiB ceiling, at G1024 least of all. Such a cell keeps
+`<cell>.C<c>.fail.log`, the first failure line goes to the sweep output and
+to `sum`'s `FAIL` list, and the runner continues.
+
+## First device run (validation before adoption)
+
+The phone is held by the #266 / #267 sittings; nothing below has run yet.
+
+```bash
+cd docs/measurements
+./260-e-run.sh stage                               # under the lock if a sitting may run
+PPL=1 ./260-e-run.sh prefill <bin dir> <log dir>   # E and A, p1024 / 2048 / 4096 x G64, + nll cells
+```
+
+Check per prompt, for E and A:
+
+- [ ] `prefill: N tokens` reads exactly 1024 / 2048 / 4096 (`sum` marks a
+      mismatch `**!= p<N>**`); no `[CausalLM] WARNING: prompt (…) exceeds`
+      line in the log.
+- [ ] Prefill tok/s and ms recorded, E / A ratio (prefill gate E ≥ 0.95 × A).
+- [ ] G64 text judged up to the first `<turn|>`: a coherent summary of that
+      prompt's body (water-network leak study for 2048, Halstrand for 4096),
+      not a continuation of the prose.
+- [ ] nll/token from the `_ppl` cell recorded beside the p512 / p1024 `_ppl`
+      cells of the r2 sitting (`260-step2-r2-3897963d8.md`, fp16 KV).
+- [ ] Peak RSS and S1 ceiling recorded; any `FAIL` line (expected candidate:
+      p4096) copied verbatim into the doc with the C it ran at.
+- [ ] Then mark the 2048 / 4096 rows above as validated.

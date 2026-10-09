@@ -2,8 +2,9 @@
 ##
 # @file    260-e-run.sh
 # @brief   #260 revision 2 sitting: E (#4415 prefill + our one-PD decode) and
-#          A (#4415's hybrid on the same build) on the standard 512 / 1024
-#          prompts, Gemma-4 26B QS4CX file, S25 R3CY205ZMND
+#          A (#4415's hybrid on the same build) on the standard prompts
+#          (1024 / 2048 / 4096 since 2026-10-09; 512 on request), Gemma-4 26B
+#          QS4CX file, S25 R3CY205ZMND
 #
 # Plan: docs/plans/260-4415-prefill-port.md section 7 (7.2, 7.3, 7.5).
 #   E    NNTR_HTP_E2E=1, lmhead_engine cpu (the head placed once, as Q4M1 for
@@ -13,22 +14,44 @@
 #        decode, lmhead_engine htp, attention_kv_dtype unset.
 #   Aq8  A with attention_kv_dtype q8, G 64 only (KV-format control).
 #   Ap   A on the pure #4415 @ 41bd65e04 install (s260p3), one cell
-#        (p512 G512), to show the merged build's A path is #4415's own:
+#        (first prompt, G512), to show the merged build's A path is #4415's own:
 #        same text and nll, prefill within 5 %. If it is not, the A rows of
 #        the sitting are read from Ap and the doc says so.
 #
+# Prompts (contract section 1 Speed row, section 12 2026-10-09): the grid runs
+# PROMPTS, default "1024 2048 4096". 512 is retired for tables of record and
+# kept for before/after lever comparisons: PROMPTS="512 1024" <mode> ...
+# Every cell's config sets init_seq_len above its prompt (doc 57 7.5: a
+# prompt as long as init_seq_len takes another branch) and max_seq_len
+# >= init_seq_len (p + G must fit, or the app truncates the prompt's tail):
+#   prompt        512   1024   2048   4096
+#   init_seq_len  1024  2048   4096   8192
+#   max_seq_len   2048  2048   4096   8192   (512 / 1024 = the r2 configs)
+# Memory: the KV cache and the RoPE table are sized by max_seq_len and the
+# prefill graph by init_seq_len, so p4096 (8192) may not fit the one-PD
+# 3840 MiB ceiling, at G1024 least of all. A cell that cannot generate keeps
+# its log as <cell>.C<c>.fail.log with the first failure line printed, and
+# the runner goes on to the next cell; `sum` lists those lines.
+#
 # usage:
-#   260-e-run.sh stage                   build the cell configs from the
-#                                        delivered nntr_config.json and the
-#                                        standard prompts, push them to
+#   260-e-run.sh stage                   build the cell configs for all four
+#                                        prompts from the delivered
+#                                        nntr_config.json, push them to
 #                                        /data/local/tmp/nntrainer/s260cfg/r2_*
-#                                        (no model run; no lock needed)
+#                                        (no model run; take the lock if a
+#                                        sitting may be running, the r2_*
+#                                        configs it reads are rewritten)
 #   260-e-run.sh run <bin dir> <log dir> the sitting (takes and releases the
 #                                        lock). <bin dir> is the merged
 #                                        build's install dir on the phone and
 #                                        holds unittest_hvx_two_sessions
+#   260-e-run.sh prefill <bin dir> <log dir>
+#                                        prefill only: each prompt x G64 for
+#                                        E and A, then `sum` (prefill tok/s,
+#                                        N tokens, text); PPL=1 adds the
+#                                        prompt-nll cells
 #   260-e-run.sh cx <bin dir> <log dir> <C>...
-#                                        E p512 G512 at each C (no ladder;
+#                                        E <first prompt> G512 at each C (no ladder;
 #                                        stops at the first C that cannot
 #                                        generate), the miss curve of the pool
 #   260-e-run.sh sum <log dir>           the per-cell table, text, first
@@ -40,6 +63,7 @@ set -u -o pipefail
 SER=R3CY205ZMND
 AD="adb -s $SER"
 HERE=$(cd "$(dirname "$0")" && pwd)
+PROMPTS=${PROMPTS:-1024 2048 4096}
 ROOT=$(cd "$HERE/../.." && pwd)
 MODEL=/local/mnt/workspace/models/gemma4_26b_qs4cx
 DM=/data/local/tmp/nntrainer/gemma4_26b_qs4cx
@@ -50,28 +74,27 @@ TOK=$MODEL/tokenizer.json
 stage() {
   local out
   out=$(mktemp -d)
-  python3 - "$MODEL/nntr_config.json" "$HERE/260-prompt512.txt" \
-    "$HERE/260-prompt1024.txt" "$out" "$DM" <<'PY'
+  python3 - "$MODEL/nntr_config.json" "$HERE" "$out" "$DM" <<'PY'
 import copy, json, os, sys
-base_f, p512, p1024, out, dm = sys.argv[1:]
+base_f, here, out, dm = sys.argv[1:]
 base = json.load(open(base_f))
 base.update(skip_prefill=False,
             model_file_name=dm + "/nntr_gemma4_qs4cx_fc_arm.bin",
             tokenizer_file=dm + "/tokenizer.json")
 base.pop("attention_kv_dtype", None)  # plan 7.3: unset in the main grid
-prompts = {512: open(p512).read(), 1024: open(p1024).read()}
-cells = []
-for v in ("E", "A"):
-    for p in (512, 1024):
-        for g in (64, 512, 1024):
-            cells.append((v, p, g))
-cells += [("Aq8", 512, 64), ("Aq8", 1024, 64)]
+P = (512, 1024, 2048, 4096)
+prompts = {p: open(os.path.join(here, "260-prompt%d.txt" % p)).read() for p in P}
+cells = [(v, p, g) for v in ("E", "A") for p in P for g in (64, 512, 1024)]
+cells += [("Aq8", p, 64) for p in P]
 for v, p, g in cells:
     d = copy.deepcopy(base)
     d["sample_input"] = prompts[p]
     d["num_to_generate"] = g
     # doc 57 7.5: a prompt as long as init_seq_len takes another branch
-    d["init_seq_len"] = 2048 if p == 1024 else 1024
+    d["init_seq_len"] = 2 * p
+    # p + G <= max_seq_len, else the app drops the prompt's tail
+    d["max_seq_len"] = max(base["max_seq_len"], d["init_seq_len"])
+    assert p + g <= d["max_seq_len"]
     d["lmhead_engine"] = "cpu" if v == "E" else "htp"
     if v == "Aq8":
         d["attention_kv_dtype"] = "q8"
@@ -155,7 +178,7 @@ cell() { # cell <bin dir> <log dir> <variant> <prompt> <G> [tag] [extra env]
       echo "$n (C=$c): $(grep -h -E '^(prefill|generation):' "$L/$n.log" | grep -o '[0-9.]* TPS' | tr '\n' ' ')$(grep -aho 'calls/token=[0-9.]*' "$L/$n.log" | tail -1) $(grep -aho 'nll/token=[0-9.]*' "$L/$n.log") $(grep -ao 'Max RSS (KiB): [0-9]*' "$L/$n.log")"
       return 0
     fi
-    echo "$n cannot generate at C=$c: $(grep -m1 -aE 'FATAL|Abort|ERROR|AEE_|what\(\)' "$L/$n.log" | cut -c1-200)"
+    echo "$n cannot generate at C=$c: $(grep -m1 -aE 'FATAL|Abort|ERROR|AEE_|what\(\)|ENOMEM|bad_alloc|out of memory|Killed|Segmentation|RC=[1-9]' "$L/$n.log" | cut -c1-200)"
     mv "$L/$n.log" "$L/$n.C$c.fail.log"
     [ "$v" = E ] || break # the C ladder is E's (plan 7.5)
   done
@@ -170,41 +193,64 @@ run() {
   (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "260 r2 E/A grid" 180) || exit 1
   trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
   echo "=== 260 r2 sitting $(date '+%F %T %Z') bin=$B uptime=$($AD shell cat /proc/uptime | tr -d '\r')"
-  # first deliverable first (plan 7.6 step 3): E p512 G512, then A
-  cell "$B" "$L" E 512 512
-  cell "$B" "$L" A 512 512
-  cell "$PURE" "$L" Ap 512 512 # A on the pure #4415 install
-  for p in 512 1024; do
+  local p0=${PROMPTS%% *}
+  echo "prompts: $PROMPTS"
+  # first deliverable first (plan 7.6 step 3): E G512, then A
+  cell "$B" "$L" E "$p0" 512
+  cell "$B" "$L" A "$p0" 512
+  cell "$PURE" "$L" Ap "$p0" 512 # A on the pure #4415 install
+  for p in $PROMPTS; do
     for g in 64 512 1024; do
-      cell "$B" "$L" E $p $g
-      cell "$B" "$L" A $p $g
+      cell "$B" "$L" E "$p" "$g"
+      cell "$B" "$L" A "$p" "$g"
     done
   done
-  cell "$B" "$L" Aq8 512 64
-  cell "$B" "$L" Aq8 1024 64
-  for p in 512 1024; do # per-kind lines, one G512 run per prompt
-    cell "$B" "$L" E $p 512 optime NNTR_OP_TIME=1
-    cell "$B" "$L" A $p 512 optime NNTR_OP_TIME=1
+  for p in $PROMPTS; do cell "$B" "$L" Aq8 "$p" 64; done
+  for p in $PROMPTS; do # per-kind lines, one G512 run per prompt
+    cell "$B" "$L" E "$p" 512 optime NNTR_OP_TIME=1
+    cell "$B" "$L" A "$p" 512 optime NNTR_OP_TIME=1
   done
-  for p in 512 1024; do # prompt nll (lm_head scores every prefill row)
-    cell "$B" "$L" E $p 64 ppl NNTR_PPL=1
-    cell "$B" "$L" A $p 64 ppl NNTR_PPL=1
+  for p in $PROMPTS; do # prompt nll (lm_head scores every prefill row)
+    cell "$B" "$L" E "$p" 64 ppl NNTR_PPL=1
+    cell "$B" "$L" A "$p" 64 ppl NNTR_PPL=1
   done
-  cell "$B" "$L" A 512 64 last # A first and last (drift)
+  cell "$B" "$L" A "$p0" 64 last # A first and last (drift)
   echo "=== done $(date '+%F %T %Z')"
 }
 
-cx() { # cx <bin dir> <log dir> <C>... : E p512 G512 per C, lock held
-  local B=${1:?bin dir} L=${2:?log dir} c
+cx() { # cx <bin dir> <log dir> <C>... : E <first prompt> G512 per C
+  local B=${1:?bin dir} L=${2:?log dir} c p0=${PROMPTS%% *}
   shift 2
   mkdir -p "$L/done"
   exec > >(tee -a "$L/sweep.out") 2>&1
   (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "260 r2 C sweep" 90) || exit 1
   trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
   for c in "$@"; do
-    CLADDER=$c cell "$B" "$L" E 512 512 "c$c" || { echo "stop: C=$c cannot generate"; break; }
+    CLADDER=$c cell "$B" "$L" E "$p0" 512 "c$c" || { echo "stop: C=$c cannot generate"; break; }
   done
   echo "=== cx done $(date '+%F %T %Z')"
+}
+
+prefill() { # prefill <bin dir> <log dir>: the "prefill tok/s at 1024 / 2048 /
+  # 4096" answer after a merge; each prompt x G64, E and A, then the table
+  local B=${1:?bin dir} L=${2:?log dir} p
+  mkdir -p "$L/done"
+  exec > >(tee -a "$L/sweep.out") 2>&1
+  (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "260 prefill $PROMPTS" 60) || exit 1
+  trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
+  echo "=== 260 prefill $(date '+%F %T %Z') bin=$B prompts: $PROMPTS"
+  for p in $PROMPTS; do
+    cell "$B" "$L" E "$p" 64
+    cell "$B" "$L" A "$p" 64
+  done
+  if [ "${PPL:-0}" = 1 ]; then
+    for p in $PROMPTS; do
+      cell "$B" "$L" E "$p" 64 ppl NNTR_PPL=1
+      cell "$B" "$L" A "$p" 64 ppl NNTR_PPL=1
+    done
+  fi
+  echo "=== done $(date '+%F %T %Z')"
+  sum "$L"
 }
 
 sum() { # host-only table
@@ -215,15 +261,20 @@ L, tok, here = sys.argv[1:]
 def g(rx, s, k=1):
     m = re.findall(rx, s)
     return m[-1] if m else "-"
+def key(f):  # E_p512 before E_p1024 before E_p2048 ...
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", os.path.basename(f))]
+logs = sorted(glob.glob(os.path.join(L, "*.log")), key=key)
 print("| cell | C | prefill | prefill tok/s | decode tok/s | calls/token | router pcyc/op | mhz | id_checked | token_ms | mapped | heap_used_kib | arena MiB | peak RSS KiB | S1 ceiling | pgpgin / refault (delta) | nll | zone0 start | first <turn\\|> | loop onset |")
 print("|" + "---|" * 20)
-for f in sorted(glob.glob(os.path.join(L, "*.log"))):
+for f in logs:
     b = os.path.basename(f)
     if b.startswith("ceil_") or b.endswith("fail.log"):
         continue
     s = open(f, errors="replace").read()
     pf = re.search(r"prefill: (\d+) tokens, (\d+) ms, ([\d.]+) TPS", s)
     ge = re.search(r"generation: (\d+) tokens, (\d+) ms, ([\d.]+) TPS", s)
+    want = re.search(r"_p(\d+)_", b)
+    bad = " **!= p%s**" % want.group(1) if pf and want and pf.group(1) != want.group(1) else ""
     vb = dict(re.findall(r"(\w+)=(\d+)", g(r"vm_before (.*)", s)))
     va = dict(re.findall(r"(\w+)=(\d+)", g(r"vm_after (.*)", s)))
     dv = lambda k: str(int(va.get(k, 0)) - int(vb.get(k, 0))) if k in va and k in vb else "-"
@@ -233,7 +284,7 @@ for f in sorted(glob.glob(os.path.join(L, "*.log"))):
                         capture_output=True, text=True).stdout
     print("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s / %s | %s | %s | %s | %s |" % (
         b[:-4], g(r"NNTR_MOE_CACHE_EXPERTS=(\d+)", s),
-        "%s tok, %s ms" % (pf.group(1), pf.group(2)) if pf else "-",
+        "%s tok, %s ms%s" % (pf.group(1), pf.group(2), bad) if pf else "-",
         pf.group(3) if pf else "-", ge.group(3) if ge else "-",
         g(r"calls/token=([\d.]+)", s), g(r"pcyc/op=([\d.]+)", s), g(r"mhz=([\d.]+)", s),
         g(r"id_checked=(\d+)", s), g(r"token_ms=([\d.]+)", s),
@@ -245,7 +296,13 @@ for f in sorted(glob.glob(os.path.join(L, "*.log"))):
         g(r"first_turn_end_at=(\S+)", t106).replace("None", "none"),
         g(r"third10_at=(\S+)", lp).replace("None", "none")))
 print()
-for f in sorted(glob.glob(os.path.join(L, "*.log"))):
+for f in logs:  # cells that could not generate: the first failure line
+    if f.endswith("fail.log"):
+        s = open(f, errors="replace").read()
+        m = re.search(r"(?m)^.*(FATAL|Abort|ERROR|AEE_|what\(\)|ENOMEM|bad_alloc|out of memory|Killed|Segmentation|RC=[1-9]).*$", s)
+        print("FAIL %s: %s" % (os.path.basename(f)[:-4], m.group(0)[:200] if m else "(no failure line)"))
+print()
+for f in logs:
     if os.path.basename(f).startswith("ceil_") or f.endswith("fail.log"):
         continue
     print(subprocess.run(["python3", os.path.join(here, "260-turn106.py"), tok, f],
@@ -259,6 +316,7 @@ case "${1:-}" in
 stage) stage ;;
 run) shift; run "$@" ;;
 cx) shift; cx "$@" ;;
+prefill) shift; prefill "$@" ;;
 sum) shift; sum "$@" ;;
-*) sed -n '2,40p' "$0"; exit 1 ;;
+*) sed -n '2,61p' "$0"; exit 1 ;;
 esac
