@@ -82,6 +82,7 @@
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__linux__)
@@ -3062,6 +3063,9 @@ public:
         for (uint32_t i = 0; i < r.n_miss; ++i)
           p.pending.push_back(stageExpert(session, d[r.miss[i]]));
       }
+      for (uint32_t i = 0; i < r.n_miss; ++i) // [#282 B]
+        if (pf_issued_keys_.erase(d[r.miss[i]].key_gu) != 0)
+          ++pf_useful_;
       readMisses(p.pending);
       std::lock_guard<std::mutex> lock(handle_mutex_);
       for (uint32_t i = 0; i < r.n_miss; ++i) {
@@ -3106,6 +3110,95 @@ public:
     p.advice.clear();
   }
 
+  /** @brief [#282 B] NNTR_MOE_PREFETCH=<threads> (0 / unset: off; needs
+   *  NNTR_HTP_PREDICT=1 for S1 to post hints): the reader threads that
+   *  pull a hinted expert the pool lacks into the page cache, so its miss
+   *  a layer later preads DDR, not flash. The slots and S1's tables are
+   *  untouched -- the ids cannot move. */
+  static size_t prefetchThreads() {
+    static const size_t n = [] {
+      const char *v = std::getenv("NNTR_MOE_PREFETCH");
+      return v != nullptr ? std::strtoul(v, nullptr, 10) : size_t(0);
+    }();
+    return n;
+  }
+
+  /** @brief [#282 B] The hint slot, if S1 posted a newer one this token
+   *  (one slot: older hints the poll did not see are gone): the guessed
+   *  experts of the next MoE layer the pool does not hold go to the
+   *  prefetch readers. @return the seq taken. */
+  uint32_t takeHint(uint8_t *page, uint32_t tok, uint32_t last) {
+    const volatile htp_pred_hint *hv =
+      reinterpret_cast<const volatile htp_pred_hint *>(page + HTP_MBOX_HINT);
+    const uint32_t seq = hv->seq;
+    if (seq <= last || seq > tok * 256u + 255u)
+      return last;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    htp_pred_hint h;
+    std::memcpy(&h, const_cast<const htp_pred_hint *>(hv), sizeof(h));
+    if (h.seq2 != seq || h.n > HTP_MBOX_MISS_MAX)
+      return last;
+    ++pf_hints_;
+    const auto it = std::upper_bound(moe_ops_.begin(), moe_ops_.end(), h.op);
+    if (it == moe_ops_.end())
+      return seq;
+    const std::vector<ExpertFileDesc> &d = pool_descs_[it - moe_ops_.begin()];
+    std::vector<ExpertFileDesc> jobs;
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      // NNTR_MOE_PREFETCH_TOP: only the guess's best n (best first)
+      static const uint32_t top = [] {
+        const char *v = std::getenv("NNTR_MOE_PREFETCH_TOP");
+        return v != nullptr ? static_cast<uint32_t>(std::atoi(v)) : 16u;
+      }();
+      for (uint32_t i = 0; i < std::min(h.n, top); ++i)
+        if (h.ids[i] < d.size() && experts_.count(d[h.ids[i]].key_gu) == 0 &&
+            pf_issued_keys_.insert(d[h.ids[i]].key_gu).second)
+          jobs.push_back(d[h.ids[i]]);
+    }
+    if (!jobs.empty())
+      prefetchQueue(std::move(jobs));
+    return seq;
+  }
+
+  /** @brief [#282 B] Hands @a jobs to the prefetch readers (started on
+   *  first use, left running at exit like the advice worker): each preads
+   *  both weights into a scratch buffer, which leaves them in the page
+   *  cache. */
+  void prefetchQueue(std::vector<ExpertFileDesc> jobs) {
+    std::lock_guard<std::mutex> lock(pf_mu_);
+    if (pf_threads_.empty()) {
+      for (size_t t = 0; t < prefetchThreads(); ++t)
+        pf_threads_.emplace_back([this] {
+          std::vector<uint8_t> buf;
+          for (;;) {
+            ExpertFileDesc d;
+            {
+              std::unique_lock<std::mutex> l(pf_mu_);
+              pf_cv_.wait(l, [this] { return !pf_q_.empty(); });
+              d = pf_q_.front();
+              pf_q_.pop_front();
+            }
+            const uint64_t pal = paletteBytes(d.w_bits);
+            const size_t gu =
+              codeBytes(d.K, 2 * d.inter, d.w_bits) + pal + 8ull * 2 * d.inter;
+            const size_t dn =
+              codeBytes(d.inter, d.N_out, d.w_bits) + pal + 8ull * d.N_out;
+            buf.resize(std::max(gu, dn));
+            (void)preadAll(d.fd, buf.data(), gu, d.off_gu);
+            (void)preadAll(d.fd, buf.data(), dn, d.off_dn);
+            ++pf_done_;
+          }
+        });
+      for (std::thread &t : pf_threads_)
+        t.detach();
+    }
+    pf_issued_ += jobs.size();
+    for (ExpertFileDesc &j : jobs)
+      pf_q_.push_back(j);
+    pf_cv_.notify_all();
+  }
+
   /** [plan 201 S1] The pool server: a thread that, while a token is in
    *  flight, polls the page's request word and answers each miss round.
    *  ponytail: it spins (with a yield) on one ARM core for the whole token,
@@ -3128,7 +3221,10 @@ public:
         p.idle = false;
         tok = p.tok;
       }
+      uint32_t hint_seq = tok * 256u; // [#282 B] the last hint taken
       for (uint32_t k = 0; k < 255u;) {
+        if (prefetchThreads() != 0)
+          hint_seq = takeHint(page, tok, hint_seq);
         const uint32_t seq = tok * 256u + k + 1u; // hexkl_token_seq
         if (q->seq == seq) {
           std::atomic_thread_fence(std::memory_order_acquire);
@@ -3156,6 +3252,7 @@ public:
       pool_srv_->th = std::thread([this] { poolServe(); });
     }
     std::lock_guard<std::mutex> lock(pool_srv_->mu);
+    pf_issued_keys_.clear(); // [#282 B] per token: the server is idle here
     pool_srv_->tok = tok;
     pool_srv_->active = true;
     pool_srv_->cv.notify_all();
@@ -5175,6 +5272,14 @@ private:
             ? static_cast<double>(e.pool_read_us) / 1000.0 / e.pool_rounds
             : 0.0,
           static_cast<double>(vmstatPgpginKib() - e.pgpgin0) / 1024.0);
+      if (prefetchThreads() != 0)
+        std::fprintf(stderr,
+                     "[HTP] token driver: prefetch hints/token=%.2f "
+                     "issued/token=%.2f done=%llu useful/token=%.2f\n",
+                     static_cast<double>(pf_hints_) / n,
+                     static_cast<double>(pf_issued_) / n,
+                     (unsigned long long)pf_done_.load(),
+                     static_cast<double>(pf_useful_) / n);
       if (e.moe_calls != 0)
         std::fprintf(stderr,
                      "[HTP] token driver: moe calls/token=%.2f "
@@ -8089,6 +8194,17 @@ private:
   std::vector<PinRange> pin_ranges_; /**< [#282] NNTR_MOE_PIN */
   bool pinned_ = false;
   bool host_fc_dropped_ = false; /**< [#282 B] NNTR_HTP_DROP_HOST_FC */
+  /** [#282 B] the prefetch readers (NNTR_MOE_PREFETCH): their queue, and
+   *  the counts the close line prints. The issued keys are the pool
+   *  server's alone: a later miss of one counts as useful. */
+  std::mutex pf_mu_;
+  std::condition_variable pf_cv_;
+  std::deque<ExpertFileDesc> pf_q_;
+  std::vector<std::thread> pf_threads_;
+  std::unordered_set<const void *> pf_issued_keys_;
+  // static: e2eTeardown (static) prints them; one backend per process
+  static inline uint64_t pf_hints_ = 0, pf_issued_ = 0, pf_useful_ = 0;
+  static inline std::atomic<uint64_t> pf_done_{0};
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
   bool pool_dirty_ = true;
