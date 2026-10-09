@@ -26,7 +26,7 @@ CR=/data/local/tmp/nntrainer/causallm
 P=$CR/s261p
 export SITTING_OWNER=${SITTING_OWNER:-r261b@$(hostname)}
 
-install() {
+push_stage() {
   local st=${1:?stage dir} f
   $AD shell "mkdir -p $P && cd $P && cp $CR/s260r2/libc++_shared.so $CR/s260r2/libsdkl.so $CR/s260r2/unittest_hvx_two_sessions ."
   for f in jni/libs/arm64-v8a/nntrainer_causallm jni/libs/arm64-v8a/libcausallm_core.so \
@@ -54,7 +54,7 @@ wait_lock() {
   until (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "261 attn phase words" 60); do
     sleep 60
   done
-  install "${1:?stage dir}"
+  push_stage "${1:?stage dir}"
 }
 
 one() { # one <log dir> <prompt> <G> [suffix] [extra env]

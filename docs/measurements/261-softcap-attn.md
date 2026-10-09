@@ -24,20 +24,21 @@ Neither lever was built. In both cases the measured breakdown contradicts the pl
   - **PV is 66–70 %** of the lane time. It runs at 64–71 lane pcycles per 64-lane FMA, where
     the v79 ISS reads 11.4. The cost is in memory, not arithmetic.
   - The plan's −4…−6 ms at G 512 cannot come from the softmax.
-- What was built is the measurement channel: `7a2902817`, the ATTN_M1 phase words per KV cache
-  in the one-PD token under `NNTR_HTP_PROFILE`. This is plan §4 S0's missing read, i.e.
+- What was built is the measurement channel: `7a2902817` plus the review fixes `4e29c867c`,
+  the ATTN_M1 phase words per KV cache in the one-PD token under `NNTR_HTP_PROFILE`. This is plan §4 S0's missing read, i.e.
   S3's first commit.
 
 ## Artifacts
 
 | item | value |
 |---|---|
-| P (this sitting) | `7a2902817`; skel v79 `38820e8d83bef55419ce5f5ea20addb5`, v81 `458818b2d83617ea6ed6c42265a97608` (both `UNDEFINED SYMBOLS OK (68 runtime imports)`, `ARCH OK`) |
-| app (P) | `nntrainer_causallm` `55c918f99d1976ecabf4dd61686c7932`, `libcausallm_core.so` `499776637b556ce2553b91bcfff6a745`, `libnntrainer.so` `2adf91641b2e20da2387c015459159a2`, `libccapi-nntrainer.so` `f7ac413f8b16be9cf9db14958a2e7201` (`jni/obj/local`; NEEDED `libsdkl.so`, `libcdsprpc.so`; `NNTR_HTP_FORWARD_KINDS` strings = 2) |
+| P (cells 1–2) | `7a2902817`; skel v79 `38820e8d83bef55419ce5f5ea20addb5`, v81 `458818b2d83617ea6ed6c42265a97608` (both `UNDEFINED SYMBOLS OK (68 runtime imports)`, `ARCH OK`) |
+| Q (cells 3–4, after code review) | `4e29c867c`; skel v79 `b6940582ce4ce7ae6084cfde8bd6d6c5`, v81 `e8611a81a538bb069a1c8439fca2522a` (both `UNDEFINED SYMBOLS OK (68 runtime imports)`, `ARCH OK`); the app is byte-identical to P's (the ARM change is a `static_assert`) |
+| app (P and Q) | `nntrainer_causallm` `55c918f99d1976ecabf4dd61686c7932`, `libcausallm_core.so` `499776637b556ce2553b91bcfff6a745`, `libnntrainer.so` `2adf91641b2e20da2387c015459159a2`, `libccapi-nntrainer.so` `f7ac413f8b16be9cf9db14958a2e7201` (`jni/obj/local`; NEEDED `libsdkl.so`, `libcdsprpc.so`; `NNTR_HTP_FORWARD_KINDS` strings = 2) |
 | device dir | `/data/local/tmp/nntrainer/causallm/s261p/`, device `md5sum` == local for all 5 files; `libc++_shared.so`, `libsdkl.so`, `unittest_hvx_two_sessions` copied from `s260r2/` |
 | reference | 267 sitting D (`docs/measurements/267-dma-bypass.md`): its ids equal the 260 r2 E |
 | configs | the 260 r2 `s260cfg/r2_E_p{512,1024}_g512` (C 16, fp16 KV, `lmhead_engine cpu`). Prompts are 512 / 1024, as in the 266 / 267 sittings, so the numbers compare before / after. The 1024 / 2048 / 4096 standard applies to new sittings |
-| device | S25 Ultra `R3CY205ZMND` (v79), lock `r261b@…` 14:48:42–14:52:11 KST (free when polled) |
+| device | S25 Ultra `R3CY205ZMND` (v79), lock `r261b@…` 14:48:42–14:52:11 KST (P) and 15:11:53–15:13:48 KST (Q); free both times it was polled |
 | runner | `docs/measurements/261-softcap-attn-run.sh` (`wait <stage>`, `one <log> <p> <G> prof NNTR_HTP_PROFILE=1`) |
 
 Cool start: relaxed rule (battery ≤ 32.0 °C or a 5 min cap).
@@ -46,11 +47,13 @@ Cool start: relaxed rule (battery ≤ 32.0 °C or a 5 min cap).
 |---|---|---|
 | p512 | 31.8 / 24.4 / 27.1 | 51.2 / 25.6 / 43.4 |
 | p1024 | 55.0 / 25.6 / 41.1 | 61.6 / 27.9 / 49.2 |
+| Q p512 off | 31.4 / 24.7 / 27.1 | 56.6 / 25.7 / 44.2 |
+| Q p512 prof | 57.0 / 26.0 / 41.8 | 54.0 / 26.9 / 46.5 |
 
 The p1024 cell started right after the p512 one, because the battery was under 32 °C. Its SoC
 start was hot. compute_mhz read 2112 in both cells.
 
-## Host / build rungs (on `7a2902817`)
+## Host / build rungs (on `7a2902817`; `4e29c867c` re-ran 1 and 2)
 
 | rung | result |
 |---|---|
@@ -67,9 +70,13 @@ start was hot. compute_mhz read 2112 in both cells.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | P p512 G512 | 147.1 | **5.01** (5.50) | 169, `<eos>` | **identical** | 94.96 | 117.8 | **12.12** (12.09) | 12.26 / 6.27 / 8.30 / 3.15 | 24.06 | 1456.7 | 1395573 | 2,899,184 |
 | P p1024 G512 | 183.8 | **4.10** (3.99) | 512 | **identical** | 120.81 | 155.6 | **22.22** (22.14) | 12.36 / 6.43 / 8.29 / 3.16 | 24.29 | 1544.5 | 1424757 | 2,948,528 |
+| Q p512 G512, channel **off** (control) | 158.0 | 5.04 (5.63) | 169, `<eos>` | **identical** | 94.96 | 116.1 | **12.15** | 12.34 / 6.39 / 8.30 / 3.18 | 24.13 | 1565.3 | 1395573 | 2,900,040 |
+| Q p512 G512, channel on | 157.3 | 4.93 (5.47) | 169, `<eos>` | **identical** | 94.96 | 120.8 | **12.19** | 12.23 / 6.25 / 8.27 / 3.18 | 23.99 | 1446.9 | 1395573 | 2,901,904 |
 
-- With the phase words on, ATTN_M1 reads within 0.4 % of 267 D, so the channel costs nothing
-  measurable.
+- **The channel's cost, isolated** (Q, same binary, back to back): ATTN_M1 12.15 ms off and
+  12.19 ms on (+0.36 %). Every other kind is within ±2 %. The decode tok/s gap (5.04 / 4.93)
+  is the miss wait (116.1 / 120.8 ms), not the channel. Q's words repeat P's within 1.3 %:
+  sliding scores / softmax / pv 28 234 / 7 647 / 61 258 k, full 7 015 / 1 288 / 27 416 k.
 - Decode tok/s is above 267 D's (3.36 / 2.65) because this base carries #271's miss readers:
   the miss wait drops 215 → 118 and 289 → 156 ms. These are not lever numbers.
 - `heap_used_kib` equals 267 D's at both prompts.
@@ -138,14 +145,13 @@ The ISS already put the softmax at 13 % or less. The silicon split above confirm
 |---|---|
 | ids identical with the channel on | **pass**: p512 169 tokens `<eos>`, p1024 512 tokens, generated text byte-equal to 267 D (= 260 r2 E) |
 | misses/token unchanged | **pass**: 94.96 / 120.81 |
-| ATTN_M1 wall with the channel on | 12.12 / 22.22 ms vs 12.09 / 22.14 (+0.3 %) |
+| ATTN_M1 wall with the channel on | Q: 12.19 vs 12.15 ms off, same binary (+0.36 %); P vs 267 D: 12.12 / 22.22 vs 12.09 / 22.14 |
 | memory | **pass**: `mapped_mib` 449.12, `heap_used_kib` equal to 267 D |
 | D2 PPL / lever-3a gates | **not run**: lever 3a was not built (see Summary) |
 
 ## Not run
 
 - Lever 2 and lever 3a cells and the PPL cell: there is no code for either lever.
-- No A control: the channel changes no value, and the ids equal 267 D.
 - No G64 / G1024 cells.
 - The ARM-side `NNTR_OP_TIME` breakdown of `arm_us`: not needed once the layer was shown absent.
 
