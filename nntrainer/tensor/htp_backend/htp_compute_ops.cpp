@@ -3008,8 +3008,26 @@ public:
    *  policy picks the victims (never a routed expert) and names the loads,
    *  each load is read into a free slot -- the victim's, with its pair --
    *  and the answer names both; S1 rebinds the pairs and fills them in. */
+  /** @brief [#282 C] The ARM's view of the DSP's QTimer: cntvct_el0, the
+   *  same 19.2 MHz system counter on these SoCs (0 elsewhere). */
+  static uint64_t qtNow() {
+#if defined(__aarch64__)
+    uint64_t v;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+#else
+    return 0;
+#endif
+  }
+
   void poolAnswer(uint8_t *page, const htp_miss_req &r) {
     PoolServer &p = *pool_srv_;
+    { // [#282 C] post -> noticed here
+      const uint64_t tp = uint64_t(r.t_post[0]) | (uint64_t(r.t_post[1]) << 32),
+                     tn = qtNow();
+      if (tp != 0 && tn >= tp)
+        e2e_st_->rt_notice_us += (tn - tp) * 10 / 192;
+    }
     htp_miss_ans a;
     std::memset(&a, 0, sizeof(a));
     a.rc = AEE_SUCCESS;
@@ -3066,7 +3084,10 @@ public:
       for (uint32_t i = 0; i < r.n_miss; ++i) // [#282 B]
         if (pf_issued_keys_.erase(d[r.miss[i]].key_gu) != 0)
           ++pf_useful_;
+      const uint64_t t_r0 = HtpProfile::nowUs(); // [#282 C]
+      e2e_st_->rt_pre_us += t_r0 - t0;
       readMisses(p.pending);
+      e2e_st_->rt_read_us += HtpProfile::nowUs() - t_r0;
       std::lock_guard<std::mutex> lock(handle_mutex_);
       for (uint32_t i = 0; i < r.n_miss; ++i) {
         const ExpertFileDesc &x = d[r.miss[i]];
@@ -3100,6 +3121,11 @@ public:
       HtpProfile::global().addExpertLoad(read_us, 0, a.n_load);
     // the body, then seq last: S1 reads seq, then the rest
     a.seq2 = r.seq;
+    { // [#282 C] the answer's write time, for S1's answer latency
+      const uint64_t ta = qtNow();
+      a.t_ans[0] = static_cast<uint32_t>(ta);
+      a.t_ans[1] = static_cast<uint32_t>(ta >> 32);
+    }
     uint8_t *dst = page + HTP_MBOX_MISS_ANS;
     std::memcpy(dst + 4, reinterpret_cast<const uint8_t *>(&a) + 4,
                 sizeof(a) - 4);
@@ -5272,6 +5298,17 @@ private:
             ? static_cast<double>(e.pool_read_us) / 1000.0 / e.pool_rounds
             : 0.0,
           static_cast<double>(vmstatPgpginKib() - e.pgpgin0) / 1024.0);
+      if (e.pool_rounds != 0) {
+        const double rr = static_cast<double>(e.pool_rounds);
+        std::fprintf(stderr,
+                     "[HTP] token driver: round us: notice=%.0f pre=%.0f "
+                     "read=%.0f answer=%.0f (arm total) | dsp overlap=%.0f "
+                     "wait=%.0f anslat=%.0f rebind=%.0f\n",
+                     e.rt_notice_us / rr, e.rt_pre_us / rr, e.rt_read_us / rr,
+                     static_cast<double>(e.pool_read_us) / rr,
+                     e.rt_overlap_us / rr, static_cast<double>(e.miss_us) / rr,
+                     e.rt_anslat_us / rr, e.rt_rebind_us / rr);
+      }
       if (prefetchThreads() != 0)
         std::fprintf(stderr,
                      "[HTP] token driver: prefetch hints/token=%.2f "
@@ -5490,6 +5527,9 @@ private:
     ++e.tokens;
     e.misses += r.misses;
     e.miss_us += r.miss_us;
+    e.rt_overlap_us += r.miss_overlap_us; // [#282 C]
+    e.rt_anslat_us += r.miss_anslat_us;
+    e.rt_rebind_us += r.miss_rebind_us;
     if (!pool_descs_.empty())
       poolRefresh(r);
     e.hops += r.hops;
@@ -8318,6 +8358,12 @@ private:
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */
     uint64_t misses = 0, miss_us = 0, pool_rounds = 0, pool_read_us = 0;
+    /** [#282 C] a miss round's parts, us summed: post -> the server
+     *  noticed it, its work before the reads, the reads, S1's present
+     *  experts computed meanwhile, the answer written -> S1 saw it, S1's
+     *  rebinds */
+    uint64_t rt_notice_us = 0, rt_pre_us = 0, rt_read_us = 0, rt_overlap_us = 0,
+             rt_anslat_us = 0, rt_rebind_us = 0;
     uint64_t pgpgin0 = 0; /**< [#216] vmstatPgpginKib() at driver on */
   };
   /** @brief The mailbox page: HEXKL_MBOX_BYTES (18 432) rounded to the
