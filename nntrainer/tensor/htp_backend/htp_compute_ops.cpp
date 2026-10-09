@@ -42,6 +42,7 @@
 
 #ifdef ENABLE_HEXKL
 
+#include <attn_m1_det.h>
 #include <compute_ops.h>
 #include <cpu_backend.h>
 #include <cpu_ops_table.h>
@@ -5087,6 +5088,31 @@ private:
                    static_cast<double>(e.miss_pcyc)) /
                     cus
                 : 0.0);
+      // [#261] ATTN_M1's phase words per token and KV cache (attn_m1_det.h:
+      // the lane-summed pieces, the pool's span and busiest lane in k
+      // pcycles; call_us the calls' wall)
+      for (uint32_t c = 0; c < 2u && e.attn_tokens != 0; ++c) {
+        if (e.attn_calls[c] == 0)
+          continue;
+        const double t = static_cast<double>(e.attn_tokens);
+        auto k = [&](uint32_t w) {
+          return static_cast<double>(e.attn_prof[c][w]) / t / 1000.0;
+        };
+        std::fprintf(
+          stderr,
+          "[HTP] graph attn_m1 cache=%u calls/token=%.2f kpcyc/token: "
+          "append=%.1f scores=%.1f softmax=%.1f (exp=%.1f et=%.1f max=%.1f "
+          "sum=%.1f div=%.1f) pv=%.1f pool=%.1f busy_max=%.1f lanes=%.2f "
+          "call_us/token=%.1f\n",
+          c, static_cast<double>(e.attn_calls[c]) / t, k(ATTN_M1_PROF_APPEND),
+          k(ATTN_M1_PROF_SCORES), k(ATTN_M1_PROF_SOFTMAX), k(ATTN_M1_PROF_EXP),
+          k(ATTN_M1_PROF_ET), k(ATTN_M1_PROF_MAX), k(ATTN_M1_PROF_SUM),
+          k(ATTN_M1_PROF_DIV), k(ATTN_M1_PROF_PV), k(ATTN_M1_PROF_POOL),
+          k(ATTN_M1_PROF_BUSY_MAX),
+          static_cast<double>(e.attn_prof[c][ATTN_M1_PROF_LANES]) /
+            static_cast<double>(e.attn_calls[c]),
+          static_cast<double>(e.attn_prof[c][ATTN_M1_PROF_CALL_QT]) / t / 19.2);
+      }
       if (e.moe_ops != 0 && e.kind[HTP_OP_MOE] != 0) {
         const double moe = static_cast<double>(e.kind[HTP_OP_MOE]) / n /
                            static_cast<double>(e.moe_ops);
@@ -5261,8 +5287,11 @@ private:
     const uint32_t tok = e.tok++;
     if (!pool_descs_.empty())
       poolArm(tok);
-    const htp_dspq_token_req req = {HTP_DSPQ_OP_TOKEN, tok,
-                                    logits ? HTP_DSPQ_TOKEN_LOGITS : 0u, pos};
+    const uint32_t attn_prof =
+      HtpProfile::global().level() ? HTP_DSPQ_TOKEN_ATTN_PROF : 0u; // [#261]
+    const htp_dspq_token_req req = {
+      HTP_DSPQ_OP_TOKEN, tok, (logits ? HTP_DSPQ_TOKEN_LOGITS : 0u) | attn_prof,
+      pos};
     struct dspqueue_buffer b[2] = {};
     b[0].fd = static_cast<uint32_t>(q.act->fd());
     b[0].size = static_cast<uint32_t>(act_bytes);
@@ -5358,6 +5387,14 @@ private:
       e.kind_us[k] += r.kind_us[k];
     }
     e.miss_pcyc += r.miss_pcyc;
+    if (attn_prof) {
+      ++e.attn_tokens;
+      for (uint32_t c = 0; c < 2u; ++c) {
+        e.attn_calls[c] += r.attn_calls[c];
+        for (uint32_t w = 0; w < HTP_DSPQ_ATTN_PROF_WORDS; ++w)
+          e.attn_prof[c][w] += r.attn_prof[c][w];
+      }
+    }
     e.token_us += us;
     e.hop_us += r.hop_us;
     e.disp_us += static_cast<int32_t>(r.t_in_us - c0);
@@ -7952,6 +7989,10 @@ private:
     uint64_t kind[HTP_OP_KIND_N] = {0};
     /** [#267 L0] the ops' wall us per kind, the pcycles over the waits */
     uint64_t kind_us[HTP_OP_KIND_N] = {0}, miss_pcyc = 0;
+    /** [#261] NNTR_HTP_PROFILE: the ATTN_M1 phase words per KV cache,
+     *  summed over attn_tokens tokens */
+    uint64_t attn_calls[2] = {0, 0}, attn_tokens = 0;
+    uint64_t attn_prof[2][HTP_DSPQ_ATTN_PROF_WORDS] = {};
     uint32_t moe_ops = 0, spin_us = 0;
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */
