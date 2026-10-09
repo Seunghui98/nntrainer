@@ -76,3 +76,30 @@ The whole text is identical between base and both in each prompt.
   differently there.
 - The first token costs 3.1 s at p1024 and 5.7 s at p2048. Of that, the KV seed is 2.0 / 4.0 s.
   These are 6–11 % of the 512-token time.
+
+## First token: the KV seed over the pools (`attn_m1` + `mha_core`)
+
+The seed's DSP amax and append now run over the session's worker pool. The ARM's fp16 → f32
+rows run over ThreadManager. The per-element code is unchanged.
+
+Install `causallm/s289s`:
+
+- skel `86f18820`
+- `libcausallm_core.so` `76cc54fc`
+
+The cells are the same 512-token EOS-off cells, both levers on, C 24. Host:
+`ATTN M1 BIT-IDENTICAL` and `ATTN M1 GEMMA BIT-IDENTICAL`, workers {0, 3, 7}.
+
+| prompt | build | **decode avg tok/s** | first token ms | kv seed rpc ms | ARM convert ms | rest avg ms | text md5 |
+|---|---|---|---|---|---|---|---|
+| 1024 | before | 11.81 | 3 287 | 2 038 | ≈ 510 | 78.4 | `4257c8ec` |
+| 1024 | **pool seed** | **12.04** | **1 529** | **659** | **160** | 80.3 | `4257c8ec` |
+| 2048 | before | 10.50 | 5 659 | 4 041 | ≈ 1 000 | 84.4 | `b667afcb` |
+| 2048 | **pool seed** | **10.83** | **2 689** | **1 558** | **294** | 87.2 | `b667afcb` |
+
+- The first token is 1.8 s shorter at p1024 and 3.0 s shorter at p2048. The text is identical.
+- The rest-of-tokens average moved by +1.9 / +2.8 ms between sittings. That is
+  run-to-run noise: the seed does not touch the per-token path.
+- What is left of the seed (0.66 / 1.56 s) is the f32 transfer, about 16 MiB a sliding layer at
+  p1024, plus the DSP's strided tile writes. The next step there is an fp16 seed: half the bytes,
+  no ARM conversion, an IDL change.
