@@ -16,8 +16,8 @@
  * like the real ones they are not 4 KiB-aligned -- after dropping the
  * file's pages (POSIX_FADV_DONTNEED, as page_cache_evict does), under an
  * optional anon pressure. A round is `round` experts read together, then
- * a barrier (the pool's miss round: 3.32 misses on E p512 G512); 0 = all
- * at once.
+ * a barrier (the pool's miss round: 3.32 misses on E p512 G512); at most
+ * 16, the destination ring's slots.
  *
  *   dest   malloc | ion (rpcmem_alloc heap 25, uncached, as the arena)
  *   mode   pread | random (pread on an fd with POSIX_FADV_RANDOM) |
@@ -35,7 +35,7 @@
  * Build: aarch64-linux-android26-clang -O2 -o pread_probe <this file> -ldl
  *        -lpthread (the NDK's toolchains/llvm/prebuilt/linux-x86_64/bin)
  * Usage: pread_probe <file> [--pressure MiB] [--n experts] [--reps r]
- *        [--round R] [--cells all|<dest>,<mode>,<T>,<req>[;...]]
+ *        [--round 1..16] [--cells all|<dest>,<mode>,<T>,<req>[;...]]
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -151,7 +151,7 @@ static void *worker(void *arg) {
   uint8_t *bounce = NULL;
   (void)arg;
   if (posix_memalign((void **)&bounce, 4096, (2u << 20) + 8192))
-    return NULL;
+    abort(); /* a missing worker would hang the barriers */
   memset(bounce, 0, (2u << 20) + 8192);
   for (;;) {
     pthread_barrier_wait(&G.start);
@@ -230,14 +230,14 @@ static void cell(const char *file, cell_t c, int n, int round, int rep,
 
   /* each cell reads its own stripe of the expert region: on the S25 a
    * range re-read after POSIX_FADV_DONTNEED shows less pgpgin than its
-   * first read (not resident by mincore; source not found), so no cell
-   * re-reads the previous ones' ranges */
+   * first read (not resident by mincore; source not found). The stripes
+   * cycle every 64 cells, so cell k re-reads cell k - 64's stripe */
   static unsigned stripe_next;
   const unsigned stripe = stripe_next++ % STRIPES;
   uint64_t seed = 0x266u + (uint64_t)stripe * 7919u + (uint64_t)rep;
   const uint64_t span = (fsize - fsize / 16 - (64ull << 20)) / STRIPES;
   const uint64_t lo = fsize / 16 + stripe * span;
-  const int R = round > 0 ? round : n;
+  const int R = round;
   int rounds = 0;
   const long pg0 = vm_pgpgin_kib();
   const double t0 = now_s();
@@ -330,10 +330,11 @@ int main(int argc, char **argv) {
   }
   struct stat st;
   int fd0 = file ? open(file, O_RDONLY) : -1;
-  if (fd0 < 0 || fstat(fd0, &st) != 0 || n < 1 || n * 4 > MAXJ) {
+  if (fd0 < 0 || fstat(fd0, &st) != 0 || n < 1 || n * 4 > MAXJ || round < 1 ||
+      round > (int)RING) {
     fprintf(stderr,
             "usage: %s <file> [--pressure MiB] [--n experts<=1024] "
-            "[--reps r] [--round R] [--cells all|d,m,T,r;...]\n",
+            "[--reps r] [--round 1..16] [--cells all|d,m,T,r;...]\n",
             argv[0]);
     return 2;
   }

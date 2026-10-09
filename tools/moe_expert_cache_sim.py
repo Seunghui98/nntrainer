@@ -170,7 +170,10 @@ def report(calls, caches, base_ms, miss_ms, policies):
         print("  " + " ".join(f"d={d}:{100.0 * v:5.1f}%"
                               for d, v in curve.items()))
         for c in caches:
-            hits = layer_hits(calls, c * layers)
+            try:
+                hits = layer_hits(calls, c * layers)
+            except ValueError:
+                continue
             print(f"  lru per-layer hit % at C={c}: " +
                   " ".join(f"{h:.0f}" for h in hits))
     spec = speculation(calls)
@@ -227,6 +230,8 @@ def layer_hits(calls, capacity):
     order, need, miss = OrderedDict(), {}, {}
     for layer, tokens, routed, _ in calls:
         keys = [(layer, e) for e in routed]
+        if len(keys) > capacity:
+            raise ValueError(f"a call needs {len(keys)} experts")
         pinned = set(keys)
         misses = [k for k in keys if k not in order]
         for k in keys:
