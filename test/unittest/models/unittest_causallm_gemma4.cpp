@@ -142,6 +142,9 @@ makeGemma4LayerDtypeMap(const causallm_test::TinyCausalLMDataType &data_type) {
       // the fused q/k/v (its norm gammas stay FP32) and dense FFN layers
       dtype_map[prefix + "_qkv"] = dtype;
       dtype_map[prefix + "_attention_out"] = dtype;
+      // the post-attention residual_add holds the o-proj (proj); its gamma
+      // is height 1 and stays FP32
+      dtype_map[prefix + "_post_attention_norm"] = dtype;
       dtype_map[prefix + "_ffn"] = dtype;
       // Gemma4-specific per-layer FC weights
       // hidden_size_per_layer_input=32 ensures width is divisible by 32

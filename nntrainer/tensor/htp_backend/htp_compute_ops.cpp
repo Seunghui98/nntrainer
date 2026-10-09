@@ -61,6 +61,7 @@
 #include <thread_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -539,10 +540,14 @@ public:
    *  stays a FastRPC number), which meant it was invisible -- and at this
    *  model's shapes it is ~0.9 MB per expert, 64 times per layer. Counted
    *  here so "HTP host time" stops understating what the path costs. */
-  void addStaging(uint64_t us, uint64_t bytes) {
+  void addStaging(uint64_t us, uint64_t bytes, int line) {
     std::lock_guard<std::mutex> lock(mutex_);
     staging_us_ += us;
     staging_bytes_ += bytes;
+    auto &l = staging_by_line_[line];
+    l[0] += us;
+    l[1] += bytes;
+    l[2] += 1;
   }
 
   ~HtpProfile() {
@@ -932,6 +937,14 @@ private:
       staging_us_ ? static_cast<double>(staging_bytes_) / staging_us_ / 1000.0
                   : 0.0,
       ms(reg_total_us_ + invoke_us + staging_us_));
+    for (const auto &l : staging_by_line_)
+      if (l.second[0] >= 1000)
+        std::fprintf(stderr,
+                     "[HTP-PROFILE]   staging at htp_compute_ops.cpp:%d: "
+                     "%8.1f ms  %8.1f MB  %llu copies\n",
+                     l.first, ms(l.second[0]),
+                     static_cast<double>(l.second[1]) / (1024.0 * 1024.0),
+                     (unsigned long long)l.second[2]);
     if (miss_total_ != 0) {
       std::fprintf(stderr,
                    "[HTP-PROFILE] expert cache misses: %llu, file read "
@@ -990,6 +1003,8 @@ private:
   uint64_t reg_total_us_ = 0;
   uint64_t staging_us_ = 0;
   uint64_t staging_bytes_ = 0;
+  /** us, bytes, copies by the caller's line of stagedMemcpy. */
+  std::map<int, std::array<uint64_t, 3>> staging_by_line_;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
   uint64_t graph_calls_ = 0; /**< [#85] addInvokeForward */
@@ -1103,7 +1118,8 @@ inline void l2CheckFinite(const char *what, const float *v, size_t n,
   }
 }
 
-inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
+inline void stagedMemcpy(void *dst, const void *src, size_t bytes,
+                         int line = __builtin_LINE()) {
   HtpProfile &p = HtpProfile::global();
   if (p.level() == 0) {
     std::memcpy(dst, src, bytes);
@@ -1111,7 +1127,7 @@ inline void stagedMemcpy(void *dst, const void *src, size_t bytes) {
   }
   const uint64_t t0 = HtpProfile::nowUs();
   std::memcpy(dst, src, bytes);
-  p.addStaging(HtpProfile::nowUs() - t0, bytes);
+  p.addStaging(HtpProfile::nowUs() - t0, bytes, line);
 }
 
 } // namespace
@@ -1508,6 +1524,48 @@ public:
     return reinterpret_cast<const float *>(it->second->data());
   }
 
+  /** @brief The gate weight (K x E f32) as a u8 x i8 HMX weight, built and
+   *  registered on first use and kept by the weight's address: symmetric
+   *  int8 per expert column (scale = max |w| / 127), its column sums, no
+   *  bias. UINT32_MAX when the backend refuses (the f32 kernel then runs). */
+  uint32_t routerWeightU8i8(remote_handle64 session, const float *w,
+                            unsigned int K, unsigned int E) {
+    auto it = router_u8i8_.find(w);
+    if (it != router_u8i8_.end())
+      return it->second;
+    std::vector<int8_t> q(static_cast<size_t>(K) * E);
+    std::vector<float> sc(E), bias(E, 0.0f);
+    std::vector<int32_t> colsum(E, 0);
+    for (unsigned int e = 0; e < E; ++e) {
+      float amax = 0.0f;
+      for (unsigned int k = 0; k < K; ++k)
+        amax = std::max(amax, std::fabs(w[static_cast<size_t>(k) * E + e]));
+      sc[e] = amax > 0.0f ? amax / 127.0f : 1.0f;
+      const float inv = 1.0f / sc[e];
+      for (unsigned int k = 0; k < K; ++k) {
+        const long v = std::lround(w[static_cast<size_t>(k) * E + e] * inv);
+        const int8_t qi =
+          static_cast<int8_t>(std::max(-127L, std::min(127L, v)));
+        q[static_cast<size_t>(k) * E + e] = qi;
+        colsum[e] += qi;
+      }
+    }
+    uint32_t h = UINT32_MAX;
+    const int err = nntr_hvx_weight_register_u8i8(
+      session, K, E, q.data(), static_cast<int>(q.size()), sc.data(),
+      static_cast<int>(E), colsum.data(), static_cast<int>(E), bias.data(),
+      static_cast<int>(E), &h);
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr,
+                   "[HTP] router stays on the f32 kernel: "
+                   "weight_register_u8i8 err=%d\n",
+                   err);
+      h = UINT32_MAX;
+    }
+    router_u8i8_[w] = h;
+    return h;
+  }
+
   void router_logits_fp32(unsigned int M, unsigned int K, unsigned int E,
                           const float *x, const float *gamma, float eps,
                           const float *w, float *logits, unsigned int top_k,
@@ -1518,25 +1576,44 @@ public:
     const size_t x_len = static_cast<size_t>(M) * K;
     const size_t out_len = static_cast<size_t>(M) * E;
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    float *act =
-      reinterpret_cast<float *>(stage(act_pool_, x_len * sizeof(float)).data());
+    float *act = reinterpret_cast<float *>(
+      stageInput(act_pool_, x, x_len * sizeof(float)).data());
     float *out = reinterpret_cast<float *>(
       stage(out_pool_, out_len * sizeof(float)).data());
-    stagedMemcpy(act, x, x_len * sizeof(float));
+    // NNTR_HTP_ROUTER_U8I8=1: the logits on the HMX (u8 x i8). Off by
+    // default: on device its logits were up to 0.17-0.39 off the CPU's
+    // (the f32 kernel: 2e-5), the per-row u8 step being coarse beside
+    // Gemma-4's outlier activations, and the routing that noise changes
+    // is not a model's own (doc 57 section 9.33).
+    static const bool router_u8i8 =
+      std::getenv("NNTR_HTP_ROUTER_U8I8") != nullptr;
+    const uint32_t h8 =
+      router_u8i8 ? routerWeightU8i8(session, w, K, E) : UINT32_MAX;
     const float *w_shared =
-      routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
+      h8 != UINT32_MAX
+        ? nullptr
+        : routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
     const uint64_t t0 = HtpProfile::nowUs();
     // the selection is small (M x 13 + M x 8 at the softmax router's
     // width) and goes straight to the caller's arrays
     static_assert(sizeof(unsigned int) == sizeof(uint32_t), "sel is u32");
-    const int err = nntr_hvx_router_logits_f32(
-      session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, w_shared,
-      static_cast<int>(static_cast<size_t>(K) * E), act,
-      static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
-      top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
-      reinterpret_cast<uint32_t *>(sel),
-      top_k ? static_cast<int>(M * n_sel) : 0, weight,
-      top_k ? static_cast<int>(M * top_k) : 0);
+    const int err =
+      h8 != UINT32_MAX
+        ? nntr_hvx_router_logits_u8i8_f32(
+            session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, h8,
+            act, static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+            top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
+            reinterpret_cast<uint32_t *>(sel),
+            top_k ? static_cast<int>(M * n_sel) : 0, weight,
+            top_k ? static_cast<int>(M * top_k) : 0)
+        : nntr_hvx_router_logits_f32(
+            session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0,
+            w_shared, static_cast<int>(static_cast<size_t>(K) * E), act,
+            static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+            top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
+            reinterpret_cast<uint32_t *>(sel),
+            top_k ? static_cast<int>(M * n_sel) : 0, weight,
+            top_k ? static_cast<int>(M * top_k) : 0);
     const uint64_t elapsed = HtpProfile::nowUs() - t0;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error(
@@ -1693,6 +1770,50 @@ public:
              matBdata, matCdata, M, N, K);
   }
 
+  // The o-proj with the post-attention epilogue (see the base declaration):
+  // the FC's row chunks as invokeFc takes them, each one call that also
+  // norms, adds the residual and scales, so the FC output never comes back.
+  bool gemm_qs4cx_res_add_fp32(void *w, float *w_scale, const float *act,
+                               unsigned int M, unsigned int K, unsigned int N,
+                               const float *res, const float *gamma, float eps,
+                               float scale, float *out) override {
+    if (M <= 1 || w == nullptr || act == nullptr || res == nullptr)
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const FcHandles &fh = get_or_register_fc(w, session, K, N, w_scale);
+    const unsigned int step = fcMaxRows(K);
+    for (unsigned int m0 = 0; m0 < M; m0 += step) {
+      const unsigned int m = std::min(step, M - m0);
+      const size_t a_bytes = static_cast<size_t>(m) * K * sizeof(float);
+      const size_t o_bytes = static_cast<size_t>(m) * N * sizeof(float);
+      std::lock_guard<std::mutex> lock(invoke_mutex_);
+      float *act_f32 = reinterpret_cast<float *>(
+        stageInput(act_pool_, act + static_cast<size_t>(m0) * K, a_bytes)
+          .data());
+      float *res_f32 =
+        reinterpret_cast<float *>(stage(x2_pool_, o_bytes).data());
+      float *out_f32 =
+        reinterpret_cast<float *>(stage(out_pool_, o_bytes).data());
+      stagedMemcpy(res_f32, res + static_cast<size_t>(m0) * N, o_bytes);
+      const uint64_t t0 = HtpProfile::nowUs();
+      const int err = nntr_hvx_mm_u8i4_layer_res_add(
+        session, m, K, eps, scale, gamma, gamma ? static_cast<int>(N) : 0,
+        fh.handles.data(), static_cast<int>(fh.handles.size()), act_f32,
+        static_cast<int>(m * K), res_f32, static_cast<int>(m * N), out_f32,
+        static_cast<int>(m * N));
+      const uint64_t elapsed = HtpProfile::nowUs() - t0;
+      if (err != AEE_SUCCESS)
+        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_res_add failed: err=" +
+                                 std::to_string(err));
+      stagedMemcpy(out + static_cast<size_t>(m0) * N, out_f32, o_bytes);
+      HtpProfile &profile = HtpProfile::global();
+      if (profile.level())
+        profile.addInvoke(m, K, N, elapsed, nullptr);
+    }
+    return true;
+  }
+
   // Same grouping as gemm_q4_0_batch_fp32, for QS4CX weights -- see the
   // comment on the base declaration (compute_ops.h). Without this,
   // FloatTensor::dot's vector overload had no accelerated path for QS4CX at
@@ -1753,7 +1874,9 @@ public:
                                  unsigned int K, unsigned int inter,
                                  unsigned int N_out, unsigned int w_bits,
                                  bool gelu, const float *pre_gamma,
-                                 const float *post_gamma, float eps) override {
+                                 const float *post_gamma, float eps,
+                                 const float *add_x2, const float *add_gamma,
+                                 float add_scale) override {
     // #4415's lfm2_moe passes its bool weights_wh: true reads as 4 bits
     if (w_bits == 1u)
       w_bits = 4u;
@@ -1813,7 +1936,8 @@ public:
         // [#260] with #4415's epilogue (GeGLU, the folded norms), as below
         invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight,
                        act, out, M, K, inter, N_out, 0, gelu ? 1u : 0u,
-                       pre_gamma, post_gamma, eps);
+                       pre_gamma, post_gamma, eps, add_x2, add_gamma,
+                       add_scale);
         return;
       }
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
@@ -1848,7 +1972,7 @@ public:
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
                    out, M, K, inter, N_out, 0, gelu ? 1u : 0u, pre_gamma,
-                   post_gamma, eps);
+                   post_gamma, eps, add_x2, add_gamma, add_scale);
   }
 
   /** [#85] NNTR_HTP_FORWARD=1 routes decode's MoE calls through the
@@ -3872,15 +3996,91 @@ private:
    * same. With classes, decode stays on the 64 KiB pair. */
   struct StagingPool {
     std::map<size_t, std::unique_ptr<HtpRpcBuffer>> by_class;
+    /** What stageInput last copied into a class's buffer, cleared by any
+     *  other stage() of it (doc 57 section 9.31). */
+    std::map<size_t, std::pair<const void *, size_t>> holds;
+    /** The host tensor a class's buffer was last copied out to, whole
+     *  (copyOutOf), cleared by any other stage() of it. */
+    std::map<size_t, std::pair<const void *, size_t>> copied_out;
   };
-  static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+  static size_t stageClass(size_t bytes) {
     size_t cls = size_t(64) << 10;
     while (cls < bytes)
       cls <<= 1;
+    return cls;
+  }
+  static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+    const size_t cls = stageClass(bytes);
+    pool.holds.erase(cls);
+    pool.copied_out.erase(cls);
     auto &slot = pool.by_class[cls];
     if (!slot)
       slot = std::make_unique<HtpRpcBuffer>(cls);
     return *slot;
+  }
+  /** @brief Whether @a b still holds the copy of @a a: 32 spread 64-byte
+   *  windows and the tail compared. ponytail: a rewrite that keeps every
+   *  sampled window is missed; a full compare costs about what the copy
+   *  does. */
+  static bool sampledSame(const void *a_, const void *b_, size_t bytes) {
+    const uint8_t *a = static_cast<const uint8_t *>(a_);
+    const uint8_t *b = static_cast<const uint8_t *>(b_);
+    bool same =
+      bytes < 64 || std::memcmp(a + bytes - 64, b + bytes - 64, 64) == 0;
+    for (size_t i = 0; same && i < 32 && bytes >= 64; ++i) {
+      const size_t off = (bytes - 64) / 32 * i;
+      same = std::memcmp(a + off, b + off, 64) == 0;
+    }
+    return same;
+  }
+  /** @brief stage() plus the copy of @a bytes from @a src, skipped when the
+   *  buffer still holds exactly that copy: the router, dense and MoE calls
+   *  of a Gemma-4 layer each stage the same 11.5 MB post-attention rows.
+   *  Any other stage() of the buffer forgets the copy, and before skipping
+   *  the copy is compared (sampledSame) with @a src, so a host tensor
+   *  rewritten (or another one placed at the same address) is copied again.
+   *
+   *  With @a from, a buffer of that pool that @a src was copied out of
+   *  whole (copyOutOf) and still matches is swapped in instead of copied:
+   *  the dense output is the MoE call's x2 and the MoE output the next
+   *  qkv call's input (doc 57 section 9.34). Stage this before the call's
+   *  own output buffer, which may be the one swapped in. */
+  static HtpRpcBuffer &stageInput(StagingPool &pool, const void *src,
+                                  size_t bytes, StagingPool *from = nullptr,
+                                  int line = __builtin_LINE()) {
+    const size_t cls = stageClass(bytes);
+    auto &slot = pool.by_class[cls];
+    if (!slot)
+      slot = std::make_unique<HtpRpcBuffer>(cls);
+    auto it = pool.holds.find(cls);
+    if (it != pool.holds.end() && it->second.first == src &&
+        it->second.second == bytes && sampledSame(src, slot->data(), bytes))
+      return *slot;
+    if (from) {
+      auto c = from->copied_out.find(cls);
+      auto &fslot = from->by_class[cls];
+      if (c != from->copied_out.end() && c->second.first == src &&
+          c->second.second == bytes && fslot &&
+          sampledSame(src, fslot->data(), bytes)) {
+        std::swap(slot, fslot);
+        from->holds.erase(cls);
+        from->copied_out.erase(cls);
+        pool.copied_out.erase(cls);
+        pool.holds[cls] = {src, bytes};
+        return *slot;
+      }
+    }
+    stagedMemcpy(slot->data(), src, bytes, line);
+    pool.holds[cls] = {src, bytes};
+    return *slot;
+  }
+  /** @brief The copy of a call's whole output out of @a pool's buffer for
+   *  @a bytes, remembered for stageInput's @a from. */
+  static void copyOutOf(StagingPool &pool, void *dst, size_t bytes,
+                        int line = __builtin_LINE()) {
+    const size_t cls = stageClass(bytes);
+    stagedMemcpy(dst, pool.by_class[cls]->data(), bytes, line);
+    pool.copied_out[cls] = {dst, bytes};
   }
 
   /** @brief The one FastRPC layer call both accelerated entries make.
@@ -3908,18 +4108,20 @@ private:
    * weights (@a dsts, the batch call) each get their block whole. */
   static void copyOut(float *dst, const float *out_cat, unsigned int M,
                       unsigned int N, const std::vector<unsigned int> *blocks,
-                      const std::vector<float *> *dsts = nullptr) {
+                      const std::vector<float *> *dsts = nullptr,
+                      int line = __builtin_LINE()) {
     if (dsts) {
       size_t off = 0;
       for (size_t i = 0; i < dsts->size(); ++i) {
         const size_t block = static_cast<size_t>(M) * (*blocks)[i];
-        stagedMemcpy((*dsts)[i], out_cat + off, block * sizeof(float));
+        stagedMemcpy((*dsts)[i], out_cat + off, block * sizeof(float), line);
         off += block;
       }
       return;
     }
     if (!blocks || blocks->size() < 2) {
-      stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float));
+      stagedMemcpy(dst, out_cat, static_cast<size_t>(M) * N * sizeof(float),
+                   line);
       return;
     }
     size_t off = 0;
@@ -3928,7 +4130,7 @@ private:
       for (unsigned int r = 0; r < M; ++r) {
         stagedMemcpy(dst + static_cast<size_t>(r) * N + c0,
                      out_cat + off + static_cast<size_t>(r) * n,
-                     static_cast<size_t>(n) * sizeof(float));
+                     static_cast<size_t>(n) * sizeof(float), line);
       }
       off += static_cast<size_t>(M) * n;
       c0 += n;
@@ -3976,11 +4178,11 @@ private:
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     float *act_f32 = reinterpret_cast<float *>(
-      stage(act_pool_, static_cast<size_t>(act_len) * sizeof(float)).data());
+      stageInput(act_pool_, matBdata,
+                 static_cast<size_t>(act_len) * sizeof(float), &out_pool_)
+        .data());
     float *out_cat = reinterpret_cast<float *>(
       stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
-    stagedMemcpy(act_f32, matBdata,
-                 static_cast<size_t>(act_len) * sizeof(float));
 
     HtpProfile &profile = HtpProfile::global();
     if (norms && norms->any()) {
@@ -3991,30 +4193,54 @@ private:
         for (unsigned int c : *norms->post_chunk)
           post_gamma_len += static_cast<int>(c);
       }
+      // With slices, each lands in its weight's row-major [M x N] on the
+      // DSP (out_off / out_ld), so a weight comes out as one copy; the
+      // slice-row copies this replaces were 132.8 ms of 4 KB memcpys a
+      // 1024-token prefill (doc 57 section 9.34). A weight's slices come
+      // in column order from c0 = 0 (gemm_q4_0_batch_norm_fp32).
+      std::vector<uint32_t> out_off, out_ld;
+      if (slices) {
+        size_t base = 0, next = 0;
+        for (const OutSlice &o : *slices) {
+          if (o.c0 == 0) {
+            base = next;
+            next += static_cast<size_t>(M) * o.stride;
+          }
+          out_off.push_back(static_cast<uint32_t>(base + o.c0));
+          out_ld.push_back(o.stride);
+        }
+      }
       const uint64_t t0 = HtpProfile::nowUs();
-      const int err = nntr_hvx_mm_u8i4_layer_norm(
-        session, M, K, norms->eps, norms->pre_gamma,
-        norms->pre_gamma ? static_cast<int>(K) : 0,
-        norms->post_chunk ? norms->post_chunk->data() : nullptr,
-        norms->post_chunk ? static_cast<int>(norms->post_chunk->size()) : 0,
-        norms->post_gamma, post_gamma_len, norms->rope_hd, norms->rope_handles,
-        norms->rope_cs,
-        norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0, handles,
-        num_handles, act_f32, act_len, out_cat, out_len);
+      const int pre_len = norms->pre_gamma ? static_cast<int>(K) : 0;
+      const uint32_t *chunk =
+        norms->post_chunk ? norms->post_chunk->data() : nullptr;
+      const int chunk_len =
+        norms->post_chunk ? static_cast<int>(norms->post_chunk->size()) : 0;
+      const int cs_len =
+        norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0;
+      const int err =
+        slices ? nntr_hvx_mm_u8i4_layer_norm_ld(
+                   session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+                   chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+                   norms->rope_handles, norms->rope_cs, cs_len, handles,
+                   num_handles, out_off.data(), num_handles, out_ld.data(),
+                   num_handles, act_f32, act_len, out_cat, out_len)
+               : nntr_hvx_mm_u8i4_layer_norm(
+                   session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+                   chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+                   norms->rope_handles, norms->rope_cs, cs_len, handles,
+                   num_handles, act_f32, act_len, out_cat, out_len);
       const uint64_t elapsed = HtpProfile::nowUs() - t0;
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_norm failed: err=" +
                                  std::to_string(err) + shape());
       }
       if (slices) {
-        size_t off = 0;
-        for (const OutSlice &o : *slices) {
-          for (unsigned int r = 0; r < M; ++r) {
-            stagedMemcpy(o.dst + static_cast<size_t>(r) * o.stride + o.c0,
-                         out_cat + off + static_cast<size_t>(r) * o.cols,
-                         static_cast<size_t>(o.cols) * sizeof(float));
-          }
-          off += static_cast<size_t>(M) * o.cols;
+        for (size_t i = 0; i < slices->size(); ++i) {
+          const OutSlice &o = (*slices)[i];
+          if (o.c0 == 0)
+            stagedMemcpy(o.dst, out_cat + out_off[i],
+                         static_cast<size_t>(M) * o.stride * sizeof(float));
         }
       } else {
         copyOut(matCdata, out_cat, M, N, blocks, dsts);
@@ -5239,7 +5465,10 @@ private:
                       float *out, unsigned int M, unsigned int K,
                       unsigned int inter, unsigned int N_out, int kind = 0,
                       uint32_t glu = 0, const float *pre_gamma = nullptr,
-                      const float *post_gamma = nullptr, float eps = 0.0f) {
+                      const float *post_gamma = nullptr, float eps = 0.0f,
+                      const float *add_x2 = nullptr,
+                      const float *add_gamma = nullptr,
+                      float add_scale = 1.0f) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
     const bool with_norms = pre_gamma != nullptr || post_gamma != nullptr;
@@ -5260,13 +5489,42 @@ private:
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
-    HtpRpcBuffer &act_stage =
-      via_dspq ? *dspq_->act : stage(act_pool_, act_bytes);
+    const bool host_prenorm = HtpProfile::global().level() >= 2 && with_norms &&
+                              !via_dspq && pre_gamma != nullptr;
+    HtpRpcBuffer &act_stage = via_dspq ? *dspq_->act
+                              : host_prenorm
+                                ? stage(act_pool_, act_bytes)
+                                : stageInput(act_pool_, act, act_bytes);
+    // The post-FFN epilogue's second addend rides its own staging buffer,
+    // staged before out_stage: it may be swapped in from out_pool_.
+    float *x2_f32 = nullptr;
+    if (add_x2 != nullptr) {
+      if (pre_gamma == nullptr || K != N_out || via_dspq)
+        throw std::invalid_argument(
+          "gemm_qs4cx_moe_layer_fp32: the epilogue needs the raw rows "
+          "(pre_gamma) and K == N_out");
+      x2_f32 = reinterpret_cast<float *>(
+        stageInput(x2_pool_, add_x2, out_bytes, &out_pool_).data());
+    }
     HtpRpcBuffer &out_stage =
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
-    stagedMemcpy(act_f32, act, act_bytes);
+    // NNTR_HTP_PROFILE>=2 on a call with folded norms: the timed entry
+    // (stage breakdown) and the norms on the host around it, so the prefill
+    // MoE and dense calls, which always carry them, have stages too (doc 57
+    // section 9.26), the post-FFN epilogue too (section 9.34). Measurement
+    // only; the norms' and the epilogue's time is outside the call.
+    const bool host_norms =
+      HtpProfile::global().level() >= 2 && with_norms && !via_dspq;
+    if (host_prenorm) {
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
+      for (unsigned int r = 0; r < M; ++r)
+        for (unsigned int k = 0; k < K; ++k)
+          act_f32[static_cast<size_t>(r) * K + k] *= pre_gamma[k];
+    } else if (via_dspq) {
+      stagedMemcpy(act_f32, act, act_bytes);
+    }
 
     // The five small sequences (handles, routing) go from the heap. Tried
     // from one rpcmem buffer (doc 51 section 2.26): transport 627 -> 605
@@ -5277,14 +5535,8 @@ private:
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
     const bool timed = profile.level() >= 2;
-    // NNTR_HTP_PROFILE>=2 on a call whose only fold is the output norm: the
-    // timed entry (stage breakdown) and the norm on the host after it, so
-    // the prefill MoE call, which always carries that norm, has stages too
-    // (doc 57 section 9.26). Measurement only; the norm's time is then
-    // outside the call.
-    const bool host_post_norm =
-      timed && pre_gamma == nullptr && post_gamma != nullptr && !via_dspq;
-    const bool norm_entry = with_norms && !host_post_norm;
+    const bool host_post_norm = host_norms && post_gamma != nullptr;
+    const bool norm_entry = with_norms && !host_norms;
     // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
     // keeps the fastest. Two runs with no functional change between them
     // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
@@ -5303,6 +5555,18 @@ private:
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
                                 glu, timed ? rep_stage : nullptr)
+            : add_x2 != nullptr && !host_norms
+              ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
+                  session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
+                  static_cast<int>(K), post_gamma,
+                  post_gamma ? static_cast<int>(N_out) : 0, add_gamma,
+                  add_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+                  static_cast<int>(h_gu.size()), h_dn.data(),
+                  static_cast<int>(h_dn.size()), row_index.data(),
+                  static_cast<int>(row_index.size()), row_count.data(),
+                  static_cast<int>(row_count.size()), row_weight.data(),
+                  static_cast<int>(row_weight.size()), act_f32, act_len, x2_f32,
+                  out_len, out_f32, out_len)
             : norm_entry
               ? nntr_hvx_mm_u8i4_moe_layer_norm(
                   session, M, K, inter, N_out, glu, eps, pre_gamma,
@@ -5362,7 +5626,10 @@ private:
         " failed: err=" + std::to_string(err) + hint +
         (via_dspq ? " (via dspq)" : ""));
     }
-    stagedMemcpy(out, out_f32, out_bytes);
+    if (via_dspq)
+      stagedMemcpy(out, out_f32, out_bytes);
+    else
+      copyOutOf(out_pool_, out, out_bytes);
     if (host_post_norm) {
       std::vector<float> raw(out, out + static_cast<size_t>(out_len));
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(raw.data(), out, M, N_out,
@@ -5370,6 +5637,21 @@ private:
       for (unsigned int r = 0; r < M; ++r)
         for (unsigned int n = 0; n < N_out; ++n)
           out[static_cast<size_t>(r) * N_out + n] *= post_gamma[n];
+    }
+    if (host_norms && add_x2) {
+      // out = scale * (act + rmsnorm(out + x2) * gamma), as the epilogue.
+      for (unsigned int r = 0; r < M; ++r) {
+        float *o = out + static_cast<size_t>(r) * N_out;
+        const float *x2 = add_x2 + static_cast<size_t>(r) * N_out;
+        const float *res = act + static_cast<size_t>(r) * K;
+        float ss = 0.0f;
+        for (unsigned int n = 0; n < N_out; ++n)
+          ss += (o[n] + x2[n]) * (o[n] + x2[n]);
+        const float rs = 1.0f / std::sqrt(ss / N_out + eps);
+        for (unsigned int n = 0; n < N_out; ++n)
+          o[n] = add_scale * (res[n] + (o[n] + x2[n]) * rs *
+                                         (add_gamma ? add_gamma[n] : 1.0f));
+      }
     }
     dumpMoeCall("moe_layer", act, static_cast<size_t>(act_len), out,
                 static_cast<size_t>(out_len), M, K, inter, N_out, kind,
@@ -7607,10 +7889,12 @@ private:
   StagingPool act_pool_;
   StagingPool out_pool_;
   StagingPool rope_pool_;     /**< the fused projection call's RoPE rows */
+  StagingPool x2_pool_;       /**< the MoE call's post-FFN second addend */
   StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
   StagingPool attn_out_pool_; /**< and its f32 output */
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
+  std::map<const float *, uint32_t> router_u8i8_; /**< gate -> u8i8 handle */
   /** [#141] The M==1 MoE call's dspqueue; null until the first such call
       unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
