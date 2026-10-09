@@ -94,7 +94,7 @@ for f in sorted(glob.glob(os.path.join(L, "E_*.log"))):
     if b.startswith("ceil_") or b.endswith("fail"):
         continue
     s = open(f, errors="replace").read()
-    base = re.sub(r"_(A|B|D)(_last|_ppl)?$", "", b) + ("_ppl" if b.endswith("_ppl") else "")
+    base = re.sub(r"_(A|B|D|S2|C)(_last|_ppl)?$", "", b) + ("_ppl" if b.endswith("_ppl") else "")
     rf = os.path.join(ref, base + ".log")
     r = open(rf, errors="replace").read() if os.path.exists(rf) else ""
     ge = re.search(r"generation: (\d+) tokens, (\d+) ms, ([\d.]+) TPS", s)
