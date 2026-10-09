@@ -2927,16 +2927,20 @@ public:
           " experts, the pool loads " + std::to_string(loads.size()));
       const remote_handle64 session =
         static_cast<remote_handle64>(HtpBackend::global().handle());
+      // [#266] stage every miss, then read them together outside the
+      // lock; a staged slot is in p.pending at once, so a failed read
+      // gives it back in poolDisarm like any failed round
+      {
+        std::lock_guard<std::mutex> lock(handle_mutex_);
+        for (uint32_t i = 0; i < r.n_miss; ++i)
+          p.pending.push_back(stageExpert(session, d[r.miss[i]]));
+      }
+      readMisses(p.pending);
       std::lock_guard<std::mutex> lock(handle_mutex_);
       for (uint32_t i = 0; i < r.n_miss; ++i) {
         const ExpertFileDesc &x = d[r.miss[i]];
-        StagedExpert st = stageExpert(session, x);
-        // [#216] dropped at the next poolSync, not beside the miss reads
-        st.rc = readExpert(st, /*use_pool=*/true, /*advise=*/false);
-        if (st.rc != 0) {
-          free_expert_slots_.push_back(st.slot);
-          throwPread(st.rc, "expert weight (miss)");
-        }
+        const StagedExpert &st = p.pending[i];
+        throwPread(st.rc, "expert weight (miss)");
         htp_miss_load &l = a.load[a.n_load++];
         l.e = r.miss[i];
         l.old_gu = st.slot.h_gu;
@@ -2951,7 +2955,6 @@ public:
         std::copy(st.gu.pal.begin(), st.gu.pal.end(), l.pal_gu);
         std::copy(st.dn.pal.begin(), st.dn.pal.end(), l.pal_dn);
         l.h_gu = l.h_dn = kNoHandle;
-        p.pending.push_back(st);
       }
     } catch (...) {
       if (!p.err)
@@ -3049,6 +3052,26 @@ public:
     }
     poolHarvest(e2e_st_->mbox->data());
   }
+  /** [#266] NNTR_HTP_ROUTE_LOG=<path>: each token's routed sets, one line
+   *  per MoE op in NNTR_MOE_TRACE's format ("<op> 1 | <ids> |"), so
+   *  tools/moe_expert_cache_sim.py replays the one-PD token's routing. */
+  static void routeLog(const htp_dspq_token_resp &s1r) {
+    static std::FILE *f = [] {
+      const char *path = std::getenv("NNTR_HTP_ROUTE_LOG");
+      return path != nullptr && *path != '\0' ? std::fopen(path, "w") : nullptr;
+    }();
+    if (f == nullptr)
+      return;
+    for (uint32_t m = 0, at = 0; at < s1r.route_n; ++m) {
+      const uint32_t n = s1r.route[at++];
+      std::fprintf(f, "%u 1 |", m);
+      for (uint32_t i = 0; i < n && at < s1r.route_n; ++i)
+        std::fprintf(f, " %u", s1r.route[at++]);
+      std::fputs(" |\n", f);
+    }
+    std::fflush(f);
+  }
+
   void poolRefresh(const htp_dspq_token_resp &s1r) {
     size_t at = 0;
     for (size_t m = 0; m < pool_descs_.size() && at < s1r.route_n; ++m) {
@@ -4985,6 +5008,7 @@ private:
       err = q.api->read(q.q, &flags, 2, &rnb, rb, sizeof(r), &len,
                         reinterpret_cast<uint8_t *>(&r), kDspqTimeoutUs);
       r.route_n = std::min<uint32_t>(r.route_n, HTP_DSPQ_TOKEN_ROUTE);
+      routeLog(r);
     }
     const uint64_t us = HtpProfile::nowUs() - t0;
     const uint32_t c2 = sysCounterUs();
@@ -6312,20 +6336,59 @@ private:
    *  throw -- the slot is this expert's alone until registerStaged -- so a
    *  background thread can run it. @return 0, errno, or -1 at EOF. */
   int readExpert(StagedExpert &st, bool use_pool, bool advise = true) {
-    const ExpertFileDesc &d = st.d;
-    uint8_t *base = st.base;
-    const uint32_t gu_stride = expertStride(d.K, 2 * d.inter, d.w_bits);
-    st.gu.chunk = st.dn.chunk = st.slot.chunk;
-    st.gu.off = st.slot.off;
-    st.dn.off = st.slot.off + gu_stride;
-    int rc = readWeight(d.fd, d.off_gu, d.K, 2 * d.inter, d.w_bits, base, st.gu,
-                        use_pool);
+    int rc = readExpertWeight(st, false, use_pool);
     if (rc == 0)
-      rc = readWeight(d.fd, d.off_dn, d.inter, d.N_out, d.w_bits,
-                      base + gu_stride, st.dn, use_pool);
+      rc = readExpertWeight(st, true, use_pool);
     if (rc == 0 && advise && fadviseKnob() != 0) // [#216] the slot holds it
-      adviseLater({{d, false}});
+      adviseLater({{st.d, false}});
     return rc;
+  }
+
+  /** @brief readExpert's half: gate_up, or down when @a dn. Touches only
+   *  that half's ArenaEntry, so the two can run on two threads. */
+  int readExpertWeight(StagedExpert &st, bool dn, bool use_pool) {
+    const ExpertFileDesc &d = st.d;
+    const uint32_t gu_stride = expertStride(d.K, 2 * d.inter, d.w_bits);
+    ArenaEntry &e = dn ? st.dn : st.gu;
+    e.chunk = st.slot.chunk;
+    e.off = st.slot.off + (dn ? gu_stride : 0u);
+    return dn ? readWeight(d.fd, d.off_dn, d.inter, d.N_out, d.w_bits,
+                           st.base + gu_stride, e, use_pool)
+              : readWeight(d.fd, d.off_gu, d.K, 2 * d.inter, d.w_bits, st.base,
+                           e, use_pool);
+  }
+
+  /** @brief [#266] A miss round's reads, all at once: one job per weight
+   *  (two per expert), NNTR_MOE_MISS_READERS threads of the ThreadManager
+   *  taking them in turn, each job one whole-range pread plus its tail.
+   *  The S25 probe (docs/measurements/266-miss-readers.md): rounds of 3
+   *  experts into ION read 3.1 GiB/s this way at 4 readers, 1.8 GiB/s as
+   *  each weight split in 8 slices read one expert after the other (the
+   *  old miss path: the slices share one readahead window). Each
+   *  StagedExpert's rc is set; no lock, no throw. */
+  void readMisses(std::vector<StagedExpert> &st) {
+    const size_t n_jobs = 2 * st.size();
+    std::vector<int> rc(n_jobs, 0);
+    std::atomic<size_t> next{0};
+    ThreadManager::Global().parallel_for(
+      0, std::min(missReaders(), n_jobs), [&](size_t) {
+        for (size_t j; (j = next.fetch_add(1)) < n_jobs;)
+          rc[j] = readExpertWeight(st[j / 2], j % 2 != 0, /*use_pool=*/false);
+      });
+    for (size_t i = 0; i < st.size(); ++i)
+      st[i].rc = rc[2 * i] != 0 ? rc[2 * i] : rc[2 * i + 1];
+  }
+
+  /** @brief [#266] NNTR_MOE_MISS_READERS: the miss round's reader count
+   *  (4, the S25 probe's best for whole-weight reads; 1 reads the round's
+   *  weights one after another on the pool server). */
+  static size_t missReaders() {
+    static const size_t n = [] {
+      const char *v = std::getenv("NNTR_MOE_MISS_READERS");
+      return v != nullptr ? std::max<size_t>(1, std::strtoul(v, nullptr, 10))
+                          : size_t(4);
+    }();
+    return n;
   }
 
   /** @brief [#216] NNTR_MOE_FADVISE: unset / 0 = no advice (the bytes and
