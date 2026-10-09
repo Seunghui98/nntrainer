@@ -15,9 +15,12 @@
 #   267-run.sh install <B app dir> <B skel> <D skel>
 #                         push B's app + skel to s267b/, D's skel beside
 #                         the same app to s267d/ (lock held by the caller)
-#   267-run.sh run <log dir>   wait for the sitting lock (polling), take
-#                              it, install if INSTALL="<app> <skelB> <skelD>"
-#                              is set, run the grid, release
+#   267-run.sh wait            poll until the sitting lock is ours, then
+#                              install if INSTALL="<app> <skelB> <skelD>"
+#   267-run.sh one <log dir> <variant> <prompt> <G> [suffix] [extra env]
+#                              one cell (lock held; C 16 only)
+#   267-run.sh dumps <dir>...  md5 of each prefill MoE dump directory
+#   267-run.sh release
 #   267-run.sh sum <log dir>   the per-cell table (host only)
 set -u -o pipefail
 R260=${R260:-$HOME/nntrainer-260doc/docs/measurements}
@@ -55,52 +58,38 @@ v() { # v <variant> <prompt> <G> [suffix] [extra env]
   cell "${BIN[$1]}" "$L" E "$2" "$3" "$1${4:+_$4}" "${XENV[$1]} ${5:-}"
 }
 
-dumps() { # prefill MoE dumps of A / B / D (p512 PPL cells) == bit for bit
-  local x
-  for x in A B D; do
-    $AD shell "cd $DD/$x && ls moe_*.f32 | wc -l && md5sum manifest.txt moe_*.f32 | md5sum" | tr -d '\r' | tr '\n' ' '
-    echo " $x"
-  done >"$L/dumps.txt"
-  cat "$L/dumps.txt"
-  [ "$(awk '{print $2}' "$L/dumps.txt" | sort -u | wc -l)" = 1 ] &&
-    echo "PREFILL MOE DUMPS A==B==D bit_identical=1 ($(awk 'NR==1{print $1}' "$L/dumps.txt") calls)" | tee -a "$L/dumps.txt" ||
-    echo "PREFILL MOE DUMPS DIFFER bit_identical=0" | tee -a "$L/dumps.txt"
-  $AD shell "rm -rf $DD"
+cool() { # relaxed (coordinator, 2026-10-09): no other run, then battery
+  # <= 32.0 C or a 5 minute cap; the start temperatures are logged
+  local i soc bat z0
+  while $AD shell 'ps -A' | grep -q 'nntrainer_causall[m]'; do sleep 10; done
+  for i in $(seq 30); do
+    read -r soc bat z0 <<<"$(temps)"
+    [ "$bat" -le 320 ] && break
+    sleep 10
+  done
+  echo "$soc $bat $z0"
 }
 
-run() {
-  L=${1:?log dir}
-  DD=/data/local/tmp/nntrainer/s267dump
-  mkdir -p "$L/done"
-  exec > >(tee -a "$L/sweep.out") 2>&1
-  until (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "267 S0 A/B/C/D grid" 300); do
-    sleep 120
+wait_lock() { # poll until the sitting lock is ours, install once
+  until (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "267 S0 D/B/C" 120); do
+    sleep 60
   done
-  trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
-  echo "=== 267 sitting 1 $(date '+%F %T %Z') uptime=$($AD shell cat /proc/uptime | tr -d '\r')"
   # shellcheck disable=SC2086
   [ -n "${INSTALL:-}" ] && install $INSTALL
-  for f in unittest_hvx_mm_u8i4 unittest_hvx_fc; do # rung 3 on D's skel
-    [ -f "$L/gtest_$f.log" ] && continue
-    $AD shell "cd $CR/s267d && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ./$f" >"$L/gtest_$f.log" 2>&1
-    echo "$f: $(grep -aE '^\[  (PASSED|FAILED)  \]' "$L/gtest_$f.log" | tr '\n' ' ')"
+}
+
+one() { # one <log dir> <variant> <prompt> <G> [suffix] [extra env]
+  L=${1:?log dir}
+  mkdir -p "$L/done"
+  CLADDER=16 v "$2" "$3" "$4" "${5:-}" "${6:-}"
+}
+
+dumps() { # dumps <dir x> <dir y>: the prefill MoE dumps equal bit for bit
+  local x
+  for x in "$@"; do
+    $AD shell "cd $x && ls moe_*.f32 | wc -l && md5sum manifest.txt moe_*.f32 | md5sum" | tr -d '\r' | tr '\n' ' '
+    echo " $x"
   done
-  for p in 512 1024; do
-    for g in 64 512; do
-      v A $p $g
-      v B $p $g
-      [ $g = 512 ] && v C $p $g
-      v D $p $g
-    done
-  done
-  for x in A B D; do # prompt nll; the p512 one dumps the prefill MoE calls
-    $AD shell "rm -rf $DD/$x && mkdir -p $DD/$x"
-    v $x 512 64 ppl "NNTR_PPL=1 NNTR_HTP_DUMP=$DD/$x"
-    v $x 1024 64 ppl "NNTR_PPL=1"
-  done
-  dumps
-  v A 512 64 last # A first and last (drift)
-  echo "=== done $(date '+%F %T %Z')"
 }
 
 sum() { # host-only table; text compared to the 260 r2 sitting's E
@@ -153,7 +142,10 @@ PY
 
 case "${1:-}" in
 install) shift; install "$@" ;;
-run) shift; run "$@" ;;
+wait) wait_lock ;;
+one) shift; one "$@" ;;
+dumps) shift; dumps "$@" ;;
+release) (cd "$ROOT" && tools/htp/sitting_lock.sh release $SER) ;;
 sum) shift; sum "$@" ;;
 *) sed -n '2,25p' "$0"; exit 1 ;;
 esac
