@@ -735,3 +735,140 @@ decode(3.84 TPS, 260 ms/token)는 별개: expert miss 2.23/call → 파일 읽�
 | e2e(로드 포함) | 31.8 s | 30.9 s |
 
 MoE에 남은 큰 몫: acc 읽기 9.6 · requant 6.9 ms/call(커널 작업, `hexkl_mm_u8i4_moe.c`).
+
+### 9.27 F1a: MoE 입력 norm을 DSP 호출로 — 이득 없음, 되돌림 (2026-10-08, 기기 실측)
+
+`NNTR_M0_PROFILE=1`(30층): MoE 레이어 2,016 ms = MoE 호출 1,669 + top-k 정리 6 + 기타 341(router FastRPC 274 + CPU in_norm ≈ 67). in_norm을 MoE 호출의 `pre_gamma`(DSP `norm_rows_in`)로 옮긴 시험: nll 3.50819 → 3.5045, 문장 "…harbour town of Ardley…" 유지(첫 토큰 "The" → "<"), prefill 4,133 / 4,066 / 4,152 ms(전 4,087 / 4,147 / 4,165) — 노이즈 안. CPU norm 2.2 ms/층이 DSP 쪽 norm으로 옮겨 갔을 뿐이라 커밋하지 않았다.
+
+expert prefetch(질문 정리): 로드 때 arena 480 slot(층당 16)만 채우고, prefill 중 층 N 계산 동안 층 N+2의 128 expert를 reader 7스레드가 flash에서 읽는다(3,360개/prefill, 노출 대기 0 ms). 30×128×3 MB ≈ 11.5 GB라 미리 다 올릴 수 없다. 지금 prefill은 계산 bound(4.1 s > flash 바닥 3.4 s).
+
+### 9.28 HMX 곱셈 inline(FC·MoE), router top-k 한 번 훑기 (2026-10-08, 3b7295ba + 363c2a80e, 기기 실측, 직접 실행)
+
+**HMX inline.** PR 4343(a63aeac6)은 `hexkl_micro_hmx_mm_*`의 wrapper(호출당 ≈50 사이클, 실제 HMX ≈9)를 자기 attention kernel에서만 없앴다. FC kernel(`layer_run`·`fused_run`·`gate_up_swiglu_run`: qkv·o-proj·dense)과 MoE kernel에도 적용(`hexkl_hmx_mm.h`). 남은 HMX 라이브러리 호출: `acc_read_int32`(wrapper가 작업의 ~5%라 그대로), `acc_clear`(이미 명령 하나), fp16 attention의 `mm_f16`(cfgB 미사용), u8i8(`hexkl_mm_u8i8_dma.c`, 이 모델 미사용).
+
+| cfgB | 전 | inline 후 |
+|---|---|---|
+| nll | 3.50819 | 3.50819(같은 packet) |
+| qkv `N=8192` | 480 ms | 444–460 |
+| MoE 행 | 1,430–1,472 | 1,382–1,435 |
+| prefill | 4,087 / 4,147 / 4,165 | **4,048 / 4,074 / 3,995** |
+
+MoE가 호출당 ≈1 ms만 준 이유: HMX 스레드가 HVX epilogue(dequant·GeGLU·requant·scatter, worker 3개 합 102 ms/호출)를 기다린다 — MoE는 HVX epilogue bound. 호출자 거들기(work-stealing)는 산술상 ≈1 ms/호출이라 보류.
+
+**router 분해**(측정용 임시 스위치, 커밋 안 함, 각 1회): 호출 8.97 ms = softmax+top-k 2.7 + DSP norm 0.8 + logits 행렬곱+전송 5.5. top-k를 n_sel(13)번 최대값 훑기에서 한 번 훑기 + 정렬 삽입으로(동점 = 낮은 index 우선 유지, host check 불일치 0):
+
+| cfgB | inline 후 | + top-k |
+|---|---|---|
+| router 행 | 267 ms | **213** |
+| prefill | 4,048 / 4,074 / 3,995 | 4,205 / **3,935 / 3,924** |
+| nll | 3.50819 | 3.50819 |
+
+### 9.29 측정: staging 복사 스레드화(기각), MoE·dense의 HMX bound (2026-10-08, 기기 실측, 직접 실행)
+
+**staging memcpy를 ThreadManager로 나누기 — 기각.** 2 MB 이상 복사를 n 스레드로(추론 스레드만):
+
+| n | staging | prefill |
+|---|---|---|
+| 1 | 509 / 512 ms (14.9 GB/s) | 4,029 / 4,024 |
+| 2 | 800 ms (9.4 GB/s) | 4,332 |
+| 4 | 1,025 ms (7.4 GB/s) | 4,596 |
+
+변환(§9.23)과 같은 결과: prefill 중 CPU 0–5는 expert reader 몫이라 깨우는 비용·경합이 대역폭보다 크다. 커밋하지 않음.
+
+**PROFILE=2 분해(inline 후, 호출당).** MoE: DSP 43.3 ms = mm 10.7 + **acc 읽기 17.6**(inline 전 21.1 + 9.6) + requant 대기 6.9 + dequant 대기 3.4 + stage 1.3 + 기타. 누산기 읽기가 HMX 완료를 기다리므로 HMX 실제 시간 ≈ 28 ms로 그대로 — **MoE는 HMX array bound**(64행 블록 padding 포함 196 블록/호출). dense(MoE kernel을 intermediate 3 chunk로 빌려 씀): DSP 10.9 ms = HMX 6.2 + worker 대기 2.4 + stage·quant·gather 2.0, worker 23.7 ms. 3 chunk가 같은 1024행을 각각 pack하고 down을 out에 3번 RMW한다(개선 여지 ≈ 2 ms/호출, 기기 미측정).
+
+### 9.30 post-FFN epilogue를 MoE 호출에 접기 (2026-10-08, 78c77c61 + 766c5fa4, 기기 실측, 직접 실행)
+
+`out_add`: MoE 레이어가 dense 출력을 input 1로, post-FFN `residual_add`의 gamma·scalar를 마지막 두 가중치로 받는다(파일 순서 그대로). prefill은 한 호출(`mm_u8i4_moe_layer_norm_add`, IDL 끝에 추가)에서 입력 norm(pre_gamma; 원본 행이 DSP에서 residual이 됨) → expert → out_norm → epilogue(`hvx_rmsnorm_add_res_f32`, residual을 별도 포인터로). decode·split 호출·MoE diff 계측·CPU 경로는 CPU에서 residual_add와 같은 순서로.
+
+| cfgB | 전(363c2a80) | 후 |
+|---|---|---|
+| nll (cfgB_ppl) | 3.50819 | **3.5045**(입력 norm이 DSP로 — §9.27과 같은 값) |
+| 문장 | "The text provides a detailed description of the small harbour town of Ardley, which is located at the mouth of a slow river…" | "<summary>\nThe text provides a detailed description of the small harbour town of Ardley, which is located at the mouth of a large river…" |
+| prefill | 4,205 / 3,935 / 3,924 | **3,911 / 4,175 / 3,880** |
+| epilogue `K=5632` 행 | 114 ms, 30회 | 없음 |
+| MoE 행 | 1,382–1,435 | 1,510–1,570(epilogue·입력 norm 흡수) |
+| staging | 7.2 GB, 509 ms | 6.2 GB, 464 ms |
+
+host `unittest_causallm_models` 94 통과(Gemma-4 MoE tiny 모델 HF 기준 일치, weight-bearing 목록에서 `_post_ffn_norm`이 빠진 것은 의도). 이득은 중앙값 ≈ −25~−45 ms(1회 튐 제외)로 산술 기대(−100 ms)보다 작다: MoE 호출이 epilogue(DSP)와 x2 staging을 떠안았다.
+
+### 9.31 staging dedupe, FC quant 한 패스 (2026-10-08, 1c70d1a2 + 다음 커밋, 기기 실측, 직접 실행)
+
+- **staging dedupe**(1c70d1a2): router·dense·MoE가 같은 post-attention 행(11.5 MB)을 같은 act 버퍼에 세 번 복사하던 것을, 버퍼가 그 복사를 아직 들고 있으면(포인터·크기 같고 32개 64 B 창 + 끝이 일치) 건너뛴다. staging 6.2 → 5.56 GB, 464 → 426 ms. prefill 3,938 / 3,857 / 3,946(노이즈 안), nll 3.5045·문장 그대로.
+- **FC quant 한 패스**: 행 params 패스 + k-tile 분할 pack 패스(행을 DDR에서 두 번, pack worker는 모든 행을 stride로)를 4행 묶음 분할로 params 직후 pack. o-proj quant 631 → 304 us/호출(K=8192: 906 → 471), o-proj 행 166 → 141 ms, prefill **3,866 / 3,918 / 3,839**, nll 3.5045 비트 동일. lane 에뮬에 pack 명령이 없어 host 검사 없음(기기 nll로 확인).
+
+### 9.32 post-attention epilogue를 o-proj 호출에 접기 (2026-10-08, 25682ec7 + 23565235 + 6d653744, 기기 실측, 직접 실행)
+
+`residual_add`의 `proj`: o-proj 가중치를 먼저 요청(파일 순서 그대로, FC처럼 ones 초기화)하고 attention core 출력을 input 1로 받는다. prefill은 FC 행 chunk마다 한 호출(`mm_u8i4_layer_res_add`, IDL 끝에 추가): `layer_run` → `hvx_rmsnorm_add_blocks_f32`(handle별 열 블록을 그대로 읽어 재배치 없음, 제곱합 순서가 `hvx_rmsnorm_add_f32`와 같음). decode·CPU는 `dot()`(engine의 FC, decode 행 포함) 뒤 같은 add. load walk가 이 QS4CX 가중치도 FC처럼 pack·등록. `nntr_quantize`·tiny 테스트의 레이어별 dtype 맵에 `_post_attention_norm` 추가, core `Layer::save`의 QS4CX 분기도 높이 1 텐서는 그대로 둔다(Q4_0 분기와 같게).
+
+| cfgB | 전(577c48af) | 후 |
+|---|---|---|
+| nll / 문장 | 3.5045 / "…harbour town of Ardley…" | 같음 |
+| prefill | 3,866 / 3,918 / 3,839 | **3,808 / 3,822 / 3,813** |
+| post-attn epilogue `K=2816 N=2816 FC` 행 | 62–75 ms, 30회 | 없음 |
+| o-proj 행(K=4096) | 141 ms | 202(epilogue 흡수) |
+| staging | 5.56 GB, 426 ms | 4.9 GB, 368 ms |
+
+host `unittest_causallm_models` 94 통과(처음 Q4_0 tiny 모델이 실패: proj 가중치가 NONE 초기화 + dtype 맵 누락 → ones 초기화와 맵 추가로 해결).
+
+오늘 누적(cfgB, 1024토큰 prefill): 4.79 s(PR 4343 a16 직후) → **3.81 s**, nll 3.508 → 3.5045.
+
+### 9.33 router u8×i8(opt-in), dense pack dedupe, qkv 입력 norm을 quant 패스로 (2026-10-08, 929c3b31 + 7567197b + 1d082884, 기기 실측, 직접 실행)
+
+- **router 로짓을 HMX u8×i8로**(929c3b31, `NNTR_HTP_ROUTER_U8I8=1`일 때만): gate 가중치를 expert 열별 대칭 int8 + 열 합으로 한 번 등록, 새 skel 진입점이 norm → `hexkl_mm_u8i8_layer_run` → softmax·top-k. router 행 214 → 99 ms, prefill 약 −45 ms. 하지만 로짓이 CPU와 최대 0.17–0.39 다르다(f32 커널은 2e-5; 비율 0.998–1.0002라 scale 오류는 아님). Gemma-4의 outlier 활성값 옆에서 행별 u8 계단이 거칠고, 그 잡음이 뒤집는 expert 선택은 모델의 선택이 아니다. nll 3.5045 → 3.42045는 더 정확해서가 아니라 다른 routing이라서다. **기본값은 f32 유지.**
+- **dense pack dedupe**(7567197b): dense는 MoE kernel을 intermediate 3 chunk의 "expert"로 빌려 쓰는데, 세 chunk가 같은 1024행을 각각 pack했다. 직전 expert와 행 목록이 같으면 그 slot을 공유한다(M=1 경로 제외). dense host 403 → **390.3 / 389.6 / 388.2 ms**, nll 3.5045 비트 동일.
+- **qkv 입력 norm을 quant 패스 안으로**(1d082884): `mm_u8i4_layer_norm`이 M행 전체를 `norm_rows` 힙에 norm해 쓰고 quant 패스가 DDR에서 두 번 다시 읽던 것을, quant 패스가 4행씩 worker 자기 몫의 scratch에 norm(`hvx_rmsnorm_row_f32` = 같은 `norm_chunk`)한 뒤 cache에 있을 때 params·pack한다(`hexkl_mm_opts.pre_scratch/pre_gamma/pre_eps`). qkv `N=8192` 행 443.6 / 433.1 / 459.2 → **420.6 / 413.7 / 426.6 ms**(`N=10240` 그대로), nll 3.5045 비트 동일, 문장 "…harbour town of Ardley…".
+
+prefill(cfgB, 3회): dedupe 후 4,032 / 3,752 / 4,020, norm 융합 후 3,775 / 3,741 / 3,991 ms. 회당 ±130 ms가 흔들려 −14·−23 ms 이득은 prefill 숫자로는 구분되지 않는다. 행별 host 시간으로 판단했다.
+
+### 9.34 staging 분해와 두 수정: qkv slice 행 우선 배치, 출력 버퍼 대여 (2026-10-09, 782026d2 + bdc40c2a, 기기 실측, 직접 실행)
+
+**측정 먼저.** `NNTR_HTP_PROFILE`에 staging memcpy의 호출 위치별 시간(`stagedMemcpy` 호출자의 `__builtin_LINE`)을 더했다. 1024토큰 prefill 370.6 ms 중 가장 큰 몫은 qkv 출력 복사 **132.8 ms**(1,031 MB, 264,000번, 7.8 GB/s): q/k/v 가중치는 VTCM 크기 열 slice로 DSP에 가고, slice마다 자기 [M × cols] 블록으로 돌아온 것을 host가 행마다 ~4 KB씩 이어 붙였다.
+
+- **qkv slice 행 우선 배치**(782026d2): `hexkl_mm_opts.out_off/out_ld`(handle별 출력 위치 — dequant job은 이미 stride를 받는다), post norm·RoPE의 행 stride 변형(`hvx_rmsnorm_rows_ld_f32`, `hvx_rope_rows_ld_f32`), 새 skel 진입점 `mm_u8i4_layer_norm_ld`(IDL 끝에 추가). DSP가 slice를 가중치의 [M × N] 안 제자리에 쓰고 host는 가중치 하나를 한 번에 복사한다. qkv 출력 복사 132.8 → 97.5 ms(2,970번), staging 370.6 → **338.0 / 343.0 / 338.9 ms**, prefill **3,737 / 3,756 / 3,753 ms**, nll 3.5045 비트 동일. host lane 검사 RMSNORM ROWS OK, ROPE ROWS OK.
+- **출력 버퍼 대여**(bdc40c2a): dense 출력은 MoE 호출의 x2로, MoE 출력은 다음 층 qkv의 입력으로 ION 버퍼에서 나갔다가 다시 들어갔다. `StagingPool`이 class 버퍼를 통째로 복사해 준 host tensor를 기억하고(`copyOutOf`), `stageInput(..., from)`이 그 tensor가 아직 같으면(입력 dedupe와 같은 표본 비교) 복사 대신 버퍼를 맞바꾼다. o-proj는 행 chunk가 2개(fcMaxRows(4096) = 960)라 해당 없음. staging 4,899 → 4,202 MB, 338–343 → 296–332 ms, prefill 3,940 / 3,705 / 3,934 / 3,730 / 3,718 ms(중앙값 3,730; 1·3회는 router·o-proj 등 대여와 무관한 행까지 같이 느려진 기기 상태), nll 3.5045 비트 동일.
+
+남은 staging(호출 위치별, 대여 후): qkv 출력 107 ms(1,031 MB) · o-proj 입력/residual/출력 40 + 25 + 25 · attention q/out u16 22 + 20(PR 4343 쪽 변환 경로) · router 입력 23 · dense·MoE 출력 43.
+
+**MoE 분해 복구**: PROFILE=2에서 post-FFN epilogue가 붙은 MoE 호출도 timed 진입점(+ host norm·epilogue, 측정 전용)으로. 호출당 DSP 43.6 ms = HMX(mm 10.7 + acc 읽기 17.5) **28.1** + HVX worker 대기 **10.6**(DN epilogue 대기 = REQUANT 열 7.1, GU epilogue 대기 = DEQUANT 열 3.5) + 나머지. worker 5개(n_hvx 6) 합 100 ms = 각 20 ms로 46%만 바쁘다: 처리량이 아니라 batch 하나의 epilogue가 그 batch의 HMX issue보다 긴 임계 경로 문제.
+
+### 9.35 MoE epilogue, HMX 클럭 vote, DN epilogue를 background lane으로 — 이제 flash가 상한 (2026-10-09, f1bbdb7a + f80643893 + dc54536d, 기기 실측, 직접 실행)
+
+PROFILE=2 MoE 분해(§9.34)에서 출발. 같은 세션 안에서 skel만 바꿔 C(기준)·A·B를 두 번씩 번갈아 돌렸다(호출당 DSP, cfgB_g1):
+
+| | C 기준 | A: DN dequant+scatter 융합 | B: A + GLU 4행 unroll |
+|---|---|---|---|
+| MoE 호출 | 43.75 / 43.75 ms | 43.49 / 43.37 | **41.81 / 42.00** |
+| worker 합 | 100.8 | 100.4 / 99.8 | **85.9 / 86.2** |
+| GU epilogue 대기 | 3.45 | 3.38 | **1.8** |
+| dense 호출 | 10.74 / 10.80 | 10.55 / 10.57 | **10.03 / 9.92** |
+
+- **GLU 4행 unroll**: GeGLU는 행마다 의존 HVX 연산 ~50개(exp Horner, Newton 3회)라 한 행씩이면 latency에 묶인다(DQ_TILE_ROW와 같은 이유). 4행의 독립 사슬을 한 블록에. 행별 연산은 그대로.
+- **DN dequant+scatter 융합**(`hvx_dequant_acc_tile_scatter_f32`): VTCM f32 블록 왕복과 타일당 64번의 한-벡터 호출을 레지스터 한 패스로, 4행의 출력 load를 첫 store 앞에(한 expert의 토큰이라 행이 겹치지 않음). 첫 시도(행마다 load→store)는 오히려 느렸다(REQUANT 7.1 → 8.9 ms): 컴파일러가 alias를 몰라 DDR RMW 4개를 직렬화.
+- B: cfgB nll 3.5045 비트 동일, prefill 3,862 / 3,639 / 3,612 ms.
+
+**HMX 클럭 vote**(f80643893). 세션은 Q6 코어(DCVS TURBO)와 버스만 vote하고 HMX 클럭은 안 했다. `HAP_power_set_HMX_v2`는 클럭 vote가 없으면 최저 HMX 주파수다. 최대 corner·HIGH로 vote:
+
+| cfgB, 3회 | B | B + HMX vote |
+|---|---|---|
+| MoE 행 | 1,471–1,533 ms | **1,163–1,182** |
+| dense | 369–380 | **285–289** |
+| qkv `N=8192` / `N=10240` | 408 / 104 | **290–296 / 69–70** |
+| o-proj K=4096 / K=8192 | 202 / 64 | **140–141 / 41** |
+| prefill | 3,862 / 3,639 / 3,612 | 3,593 / 3,574 / 3,614 |
+| expert prefetch 노출 대기 | 43 ms | **710–730 ms** |
+
+PROFILE=2: MoE 호출 42.0 → 32.2 ms, HMX(mm + acc 읽기) 28.1 → **9.7 ms**(2.9배). 계산이 ≈620 ms 줄었는데 prefill은 40 ms만 줄었다: **expert를 flash에서 읽는 것이 상한이 됐다.** C=16이면 prefill 한 번에 3,360 expert × 2.97 MB ≈ 10.0 GB를 읽고, 이 기기 UFS는 3.0 GB/s(doc 52 §10.32, 스트림 수 무관, O_DIRECT·압축은 거기서 기각) → 바닥 3.33 s. 측정 3.57–3.61 s = 바닥 + 시작(preload가 pool을 채워 layer 0이 끝나야 읽기 시작)·끝(마지막 층 계산) ≈ 0.25 s.
+
+**DN epilogue를 background lane으로**(dc54536d). 전경 lane은 job 하나라 DN batch(32 tile, k = 22라 HMX ≈20 us)의 epilogue(≈38 us)가 다음 batch 밑에 숨지 못했다. DN batch를 자기 staging ring(옛 f32 scatter 영역, 최대 4개)에 쌓고 epilogue를 tile 단위 bg job으로: bg job은 큐 순서로 끝나므로 출력 행의 expert 기여 순서는 그대로. HMX 스레드는 ring slot 재사용 때만 기다리고 기다리는 동안 unit을 직접 처리한다. rq는 별도 전경 job, DN job은 자기 블록의 행 params 사본을 가진다(다음 rq가 같은 parity를 덮어씀). HMX vote 위에서 MoE 호출 32.2 → **30.8 ms**, scatter 대기 2.8 → 0.3, dense 7.29 → 7.04 ms. nll 3.5045 비트 동일, host MoE 검사 통과. ring 대기 14.2 ms(HMX 스레드가 unit을 처리하며)는 **MoE가 이제 HVX epilogue 작업량 bound**라는 뜻이다(worker 합 94 ms/호출).
+
+| cfgB, dc54536d, 3회 | C=16 (`moe_cache_experts`) | C=24 |
+|---|---|---|
+| prefill | **3,399 / 3,457 / 3,466 ms** | **3,284 / 3,257** / 3,725 |
+| expert prefetch 노출 대기 | 598 / 592 / 633 ms | 416 / 397 / 842 |
+| decode(32토큰) | 3.03–3.05 TPS | 3.16–3.28 TPS |
+| MoE 행 | 1,122–1,184 ms | 1,139–1,181 |
+
+C=32는 DSP 등록이 실패한다(`weight_register_u8i4` 0x80000402). C=24의 3회차는 노출 대기가 2배로 튄 flash 쪽 변동. **오늘 누적(cfgB, 1024토큰 prefill, C=16): 3.81 s(§9.32) → 3.40–3.47 s**, nll 3.5045 그대로. C=24(arena +0.72 GB)면 3.26–3.28 s.
+
+**지금 상한과 다음 지렛대.** C=16의 prefill은 flash 바닥(3.33 s)에 붙었다. 계산(≈2.8 s)을 더 줄여도 C를 늘리지 않는 한 prefill에는 거의 안 보인다. 남은 계산 쪽 큰 몫은 MoE의 HVX epilogue(worker 94 ms/호출: pack·GU dequant+GeGLU·DN dequant+scatter·requant). 남은 staging은 qkv 출력 107 ms·o-proj 90 ms.

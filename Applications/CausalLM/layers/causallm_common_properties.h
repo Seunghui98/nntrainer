@@ -254,6 +254,32 @@ public:
   static constexpr const char *key = "router_norm";
 };
 
+/**
+ * @brief proj: a residual_add also holds the projection before it (the
+ *        attention's o-proj): input 1 is the projection's input and the
+ *        weight is requested first, as that layer's was (doc 57 section
+ *        9.32).
+ */
+class Proj : public nntrainer::Property<bool> {
+public:
+  Proj(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "proj";
+};
+
+/**
+ * @brief out_add: an MoE layer also takes the decoder block's post-FFN
+ *        epilogue: out = scalar * (input + rmsnorm(moe + input 1) * gamma),
+ *        input 1 being the dense branch's output (gamma and the scalar the
+ *        last two weights in the file, as the residual_add they replace).
+ */
+class OutAdd : public nntrainer::Property<bool> {
+public:
+  OutAdd(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "out_add";
+};
+
 }; // namespace props
 
 WIN_EXPORT enum RMSParams { gamma };

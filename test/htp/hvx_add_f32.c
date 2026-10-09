@@ -227,6 +227,24 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
       FARF(HIGH, "nntr_hvx_open: DCVS vote rejected (continuing)");
     }
+#if defined(HAP_POWER_SET_HMX_V2_DEFINED) && !defined(NNTR_HVX_NO_HMX_VOTE)
+    /* The HMX clock, separately from the core's: with no clock vote the
+       HMX_v2 default is its lowest frequency, and the prefill MoE call is
+       HMX-bound (28 of 43.6 ms, doc 57 section 9.35). The maximum corner at
+       its highest frequency, the same best-effort policy as above.
+       -DNNTR_HVX_NO_HMX_VOTE builds the skel without it. */
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_HMX_v2;
+    req.hmx_v2.set_power = 0;
+    req.hmx_v2.set_clock = 1;
+    req.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
+    req.hmx_v2.min_corner = HAP_DCVS_EXP_VCORNER_DISABLE;
+    req.hmx_v2.max_corner = HAP_DCVS_EXP_VCORNER_MAX;
+    req.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
+    if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
+      FARF(HIGH, "nntr_hvx_open: HMX clock vote rejected (continuing)");
+    }
+#endif
     /* The bus, separately from the core. The DCVS vote above raises the
        DSP clock, and mm at 17.5 ns a tile says it holds; it says nothing
        about DDR. The MoE layer's weight DMA measured 16-18 GB/s in situ
@@ -315,6 +333,7 @@ int nntr_hvx_close(remote_handle64 handle) {
   hvx_worker_pool_destroy(s->quant_pool);
   free(s->fc_l2);
   free(s->norm_rows);
+  free(s->moe_res);
   if (s->vtcm_ctx) {
     HAP_compute_res_release(s->vtcm_ctx);
   }

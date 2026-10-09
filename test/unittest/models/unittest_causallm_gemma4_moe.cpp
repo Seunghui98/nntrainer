@@ -209,13 +209,14 @@ TEST_P(Gemma4MoeTinyModelTest, WeightBearingLayerOrderMatchesConverter) {
     // _qkv holds attention_norm, q, q_norm, k, k_norm (and v on a sliding
     // layer; layer 1 is full_attention: K == V); _ffn holds pre_ffn_norm,
     // gate, up, down, post_ffn_norm_1; _sparse_moe holds pre_ffn_norm_2,
-    // router_norm, the router and the experts, post_ffn_norm_2 -- each in
-    // the file's order, so the tensor order is unchanged by the fusion.
-    // _post_attention_norm and _post_ffn_norm are the residual adds that
-    // hold those norms' gammas, the latter the layer scalar too.
+    // router_norm, the router and the experts, post_ffn_norm_2, then
+    // post_ffn_norm's gamma and the layer scalar (out_add: the layer takes
+    // the post-FFN epilogue, doc 57 section 9.30) -- each in the file's
+    // order, so the tensor order is unchanged by the fusion.
+    // _post_attention_norm is the residual add that holds the o-proj
+    // weight and that norm's gamma (proj, doc 57 section 9.32).
     std::vector<std::string> block = {p + "_qkv"};
-    for (const char *n : {"_attention_out", "_post_attention_norm", "_ffn",
-                          "_sparse_moe", "_post_ffn_norm"})
+    for (const char *n : {"_post_attention_norm", "_ffn", "_sparse_moe"})
       block.push_back(p + n);
     expected.insert(expected.end(), block.begin(), block.end());
   }

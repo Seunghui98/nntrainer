@@ -76,6 +76,13 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
       throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: no weight " + name);
     return *it->second;
   };
+  // [#260 r3] #4415 @ 2db6cad59 folds the o-proj into the post-attention
+  // residual_add (proj) and the post-FFN residual_add into the MoE layer
+  // (out_add): the same weights under the folding layer's name; a layer
+  // that does not fold (KV-shared) keeps the old one.
+  auto named = [&w](const std::string &folded, const std::string &own) {
+    return w.count(folded) ? folded : own;
+  };
   auto f32 = [&weight](const std::string &name, size_t n) -> const float * {
     nntrainer::Tensor &t = weight(name);
     if (t.getDataType() != ml::train::TensorDim::DataType::FP32 ||
@@ -91,8 +98,10 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
   std::vector<float> scalar(n_layers);
   for (uint32_t l = 0; l < n_layers; ++l) {
     is_full[l] = !isSlidingAttentionLayer(static_cast<int>(l));
-    scalar[l] = f32(
-      "layer" + std::to_string(l) + "_post_ffn_norm:scalar_multiplier", 1)[0];
+    const std::string p = "layer" + std::to_string(l);
+    scalar[l] = f32(named(p + "_sparse_moe:add_scalar",
+                          p + "_post_ffn_norm:scalar_multiplier"),
+                    1)[0];
     // the list's ADD stores 0.0f as "no multiplier" (#221)
     if (scalar[l] == 0.0f)
       throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " +
@@ -167,10 +176,12 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
       if (layer < n_layers && norm == 7u)
         throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " + p +
                                  " has more RMSNORM ops than names");
-      const std::string name = layer < n_layers ? p + kNorms[norm++]
-                               : TIE_WORD_EMBEDDINGS
-                                 ? std::string("output_of_causallm:gamma")
-                                 : std::string("output_norm:gamma");
+      const std::string name =
+        layer < n_layers
+          ? (norm == 6u ? named(p + "_sparse_moe:add_gamma", p + kNorms[norm++])
+                        : p + kNorms[norm++])
+        : TIE_WORD_EMBEDDINGS ? std::string("output_of_causallm:gamma")
+                              : std::string("output_norm:gamma");
       hand(i, HTP_GRAPH_PARAM_GAMMA, f32(name, H), H);
     } else if (op->kind == HTP_OP_QK_NORM) {
       const uint32_t hd = op->head_dim;
@@ -232,7 +243,8 @@ void Gemma4MoECausalLM::load_weight(const std::string &weight_path) {
       if (w.count(p + "_qkv:vweight")) // absent under k = v
         q4(p + "_qkv:vweight", false);
     } else if (op->kind == HTP_OP_FC) {
-      q4(p + "_attention_out:weight", false);
+      q4(named(p + "_post_attention_norm:weight", p + "_attention_out:weight"),
+         false);
     } else if (op->kind == HTP_OP_DENSE_FFN) {
       // the list's order up, gate, down; the file's is gate-first
       q4(p + "_ffn:up", false);
