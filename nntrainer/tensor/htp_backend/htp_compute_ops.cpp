@@ -5008,7 +5008,8 @@ private:
       err = q.api->read(q.q, &flags, 2, &rnb, rb, sizeof(r), &len,
                         reinterpret_cast<uint8_t *>(&r), kDspqTimeoutUs);
       r.route_n = std::min<uint32_t>(r.route_n, HTP_DSPQ_TOKEN_ROUTE);
-      routeLog(r);
+      if (err == AEE_SUCCESS && len == sizeof(r))
+        routeLog(r);
     }
     const uint64_t us = HtpProfile::nowUs() - t0;
     const uint32_t c2 = sysCounterUs();
@@ -6365,7 +6366,9 @@ private:
    *  experts into ION read 3.1 GiB/s this way at 4 readers, 1.8 GiB/s as
    *  each weight split in 8 slices read one expert after the other (the
    *  old miss path: the slices share one readahead window). Each
-   *  StagedExpert's rc is set; no lock, no throw. */
+   *  StagedExpert's rc is set; no lock, no throw. The readers are the
+   *  pool server and ThreadManager's workers, so at most
+   *  getComputeThreadCount() (NNTR_NUM_THREADS) run at once. */
   void readMisses(std::vector<StagedExpert> &st) {
     const size_t n_jobs = 2 * st.size();
     std::vector<int> rc(n_jobs, 0);
@@ -6711,8 +6714,10 @@ private:
     const size_t nib = codeBytes(K, N, w_bits);
     // [doc 52 sections 10.7, 10.9] The nibble read is 82% of a miss and
     // capped near 4.9 GB/s by the uncached mapping whatever the thread
-    // count: 8 slices bought 18%. Kept for the synchronous miss; the
-    // prefetch readers are already one thread per expert. Page-sized
+    // count: 8 slices bought 18% warm. Kept for the load and prefill
+    // registration; the miss round (readMisses, #266: slices of one weight
+    // share its readahead window cold) and the prefetch readers read
+    // whole weights. Page-sized
     // slices, so no two threads write the same page; a worker cannot throw
     // across parallel_for, so each slice keeps its result.
     std::atomic<int> first_rc{0};
