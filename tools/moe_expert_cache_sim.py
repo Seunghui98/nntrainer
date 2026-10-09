@@ -24,6 +24,8 @@ every C and every policy:
 Usage:
   NNTR_MOE_TRACE=/data/local/tmp/moe_trace.txt ./nntrainer_causallm <model>
   python3 tools/moe_expert_cache_sim.py moe_trace.txt --cache 2 4 8 16
+  python3 tools/moe_expert_cache_sim.py route.txt --cache 16 --predict \
+      oracle trace p0.7          # plan 266 lever 3: protect / prefetch
   python3 tools/moe_expert_cache_sim.py --selftest
 
 The TPS column is arithmetic, not a measurement: 1000 / (base_ms + layers x
@@ -135,6 +137,117 @@ def simulate(calls, capacity, policy, seed=0, layers=1):
         else:
             pre_miss += len(misses)
     return dec_miss, dec_calls, pre_miss
+
+
+def next_sets(calls, src, seed=0):
+    """Plan 266 lever 3: per call i, the set predicted for call i + 1 when
+    that call is the next layer of the same decode token, else None.
+    src: "oracle" (call i + 1's real set), "trace" (call i + 1's third
+    field: the ids NNTR_HTP_PREDICT logged, layer i's guess at i + 1, best
+    score first; "trace:j" keeps the first j of them), or
+    "p<x>" (the real set with each id kept with probability x, else
+    replaced by an expert outside it: a guess of accuracy x)."""
+    n_exp = 1 + max((e for c in calls for e in c[2] + c[3]), default=0)
+    rng = _random.Random(seed)
+    out = []
+    for i, (layer, tokens, _, _) in enumerate(calls):
+        nxt = calls[i + 1] if i + 1 < len(calls) else None
+        if tokens != 1 or nxt is None or nxt[1] != 1 or nxt[0] != layer + 1:
+            out.append(None)
+            continue
+        if src == "oracle":
+            out.append(set(nxt[2]))
+        elif src.startswith("trace"):  # trace:j = the first j logged
+            j = int(src[6:]) if src[5:6] == ":" else len(nxt[3])
+            out.append(set(nxt[3][:j]))
+        else:
+            keep = float(src[1:])
+            real = set(nxt[2])
+            guess = {e for e in real if rng.random() < keep}
+            others = [e for e in range(n_exp) if e not in real]
+            rng.shuffle(others)
+            guess.update(others[:len(real) - len(guess)])
+            out.append(guess)
+    return out
+
+
+def simulate_pred(calls, capacity, mode, src, seed=0):
+    """LRU with the next layer's predicted set (plan 266 lever 3).
+    mode "lru": plain LRU (the prediction unused).
+    mode "protect": an eviction skips the predicted set (no extra reads).
+    mode "prefetch": after call i its predicted non-resident experts are
+    read and entered most recent (the predicted set is pinned meanwhile);
+    a routed expert that came that way is a hidden miss. mode
+    "prefetch-tail": the same, entered least recent, so a wrong guess is
+    the next eviction instead of pushing a resident expert out. -> dict of decode
+    totals: calls, routed, misses (what the DSP would post: demand +
+    hidden), demand (waited for), hidden, prefetched (extra reads)."""
+    pred = next_sets(calls, src, seed)
+    order = OrderedDict()
+    fresh = set()  # prefetched, not yet routed
+    t = dict(calls=0, routed=0, misses=0, demand=0, hidden=0, prefetched=0)
+
+    def make_room(n, pinned):
+        for _ in range(len(order) + n - capacity):
+            cand = [k for k in order if k not in pinned]
+            if mode == "protect" and guard:
+                cand = [k for k in cand if k not in guard] or cand
+            del order[cand[0]]
+            fresh.discard(cand[0])
+
+    for i, (layer, tokens, routed, _) in enumerate(calls):
+        need = [(layer, e) for e in routed]
+        if len(need) > capacity:
+            raise ValueError(f"call {i} needs {len(need)} experts")
+        guard = ({(layer + 1, e) for e in pred[i]} if pred[i] is not None
+                 else set())
+        demand = [k for k in need if k not in order]
+        hidden = [k for k in need if k in fresh]
+        for k in need:
+            fresh.discard(k)
+            if k in order:
+                order.move_to_end(k)
+        make_room(len(demand), set(need))
+        for k in demand:
+            order[k] = None
+        if tokens == 1:
+            t["calls"] += 1
+            t["routed"] += len(need)
+            t["demand"] += len(demand)
+            t["hidden"] += len(hidden)
+            t["misses"] += len(demand) + len(hidden)
+        if mode.startswith("prefetch") and guard:
+            load = [k for k in guard if k not in order]
+            make_room(len(load), guard)
+            for k in load:
+                order[k] = None
+                if mode == "prefetch-tail":  # least recent: a wrong guess
+                    order.move_to_end(k, last=False)  # is the next victim
+                fresh.add(k)
+            t["prefetched"] += len(load)
+    return t
+
+
+def report_pred(calls, caches, srcs):
+    """Plan 266 lever 3's table: hit % (DSP-posted misses) and the waited
+    misses per call for plain LRU, protect and prefetch."""
+    layers = len({c[0] for c in calls})
+    print("next-layer prediction (plan 266 lever 3): misses/call = what the "
+          "DSP posts, waited = demand reads, extra = prefetch reads/call")
+    print(f"{'C':>3} {'mode':>13} {'src':>7} {'misses/call':>11} {'hit %':>6} "
+          f"{'waited/call':>11} {'reads/call':>10} {'extra/call':>10}")
+    for c in caches:
+        cap = c * layers
+        rows = [("lru", "oracle")] + [(m, s) for m in ("protect", "prefetch", "prefetch-tail")
+                                      for s in srcs]
+        for mode, src in rows:
+            t = simulate_pred(calls, cap, mode, src)
+            n = t["calls"] or 1
+            reads = t["demand"] + t["prefetched"]
+            print(f"{c:>3} {mode:>13} {src:>7} {t['misses'] / n:>11.2f} "
+                  f"{100.0 * (1 - t['misses'] / max(t['routed'], 1)):>6.1f} "
+                  f"{t['demand'] / n:>11.2f} {reads / n:>10.2f} "
+                  f"{t['prefetched'] / n:>10.2f}")
 
 
 POLICIES = ["ours", "lru", "lfu", "random", "belady"]
@@ -291,6 +404,24 @@ def selftest():
     # Reuse: layer 0 routes [1, 2] then [2, 3]: d=1 covers 2 of the 4.
     assert reuse([(0, 1, [1, 2], []), (0, 1, [2, 3], [])])[1] == 0.25
     assert layer_hits([(0, 1, [1], []), (0, 1, [1], [])], 1) == [50.0]
+    # Lever 3: plain LRU here is simulate's; protect keeps the next
+    # layer's expert; prefetch hides the miss at the cost of a read.
+    calls = [(1, 1, [1], []), (0, 1, [0], []), (0, 1, [2], []),
+             (1, 1, [1], [])]
+    assert simulate_pred(calls, 2, "lru", "oracle")["misses"] == \
+        simulate(calls, 2, "lru")[0] == 4
+    assert simulate_pred(calls, 2, "protect", "oracle")["misses"] == 3
+    t = simulate_pred([(0, 1, [0], []), (1, 1, [1], [])], 2, "prefetch",
+                      "oracle")
+    assert (t["misses"], t["demand"], t["hidden"], t["prefetched"]) == \
+        (2, 1, 1, 1)
+    t = simulate_pred([(0, 1, [0], []), (1, 1, [1], [])], 2,
+                      "prefetch-tail", "oracle")
+    assert (t["demand"], t["hidden"]) == (1, 1)
+    assert next_sets([(0, 1, [0], []), (1, 1, [1], [5, 6])], "trace")[0] == \
+        {5, 6}
+    assert next_sets([(0, 1, [0], []), (1, 1, [1], [5, 6])], "trace:1")[0] \
+        == {5}
     # Parsing.
     assert parse(["3 1 | 4 7 | 7 4 9\n", "\n"]) == [(3, 1, [4, 7], [7, 4, 9])]
     print("selftest OK")
@@ -312,6 +443,10 @@ def main():
                                         for h in HALF_LIVES],
                     help="policies to replay; lrfu:H and lrfu+:H take a "
                          "half-life H in tokens")
+    ap.add_argument("--predict", nargs="+", metavar="SRC",
+                    help="plan 266 lever 3: replay LRU with the next "
+                         "layer's predicted set protected / prefetched; SRC "
+                         "oracle, trace (the NNTR_HTP_PREDICT log) or p<x>")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -320,7 +455,11 @@ def main():
     if not a.trace:
         ap.error("a trace file, or --selftest")
     with open(a.trace) as f:
-        report(parse(f), a.cache, a.base_ms, a.miss_ms, a.policies)
+        calls = parse(f)
+    if a.predict:
+        report_pred(calls, a.cache, a.predict)
+    else:
+        report(calls, a.cache, a.base_ms, a.miss_ms, a.policies)
 
 
 if __name__ == "__main__":
