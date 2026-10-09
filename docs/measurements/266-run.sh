@@ -38,6 +38,7 @@ run266() {
   trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
   echo "=== 266 S1 sitting $(date '+%F %T %Z') uptime=$($AD shell cat /proc/uptime | tr -d '\r')"
   export CLADDER=16 # C stays 16 (user 2026-10-09): no ladder
+  $AD shell mkdir -p $RL
   for pg in "512 512" "1024 512" "512 64" "1024 64" "512 1024" "1024 1024"; do
     read -r p g <<<"$pg"
     cell $BA "$L" E "$p" "$g" A
@@ -65,6 +66,7 @@ quick() { # user 2026-10-09: the minimum, in order; the 260 r2 sitting's E
   (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "266 S1 quick" 30) || exit 1
   trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
   export CLADDER=16 COOL_QUICK=1
+  $AD shell mkdir -p $RL
   echo "=== 266 S1 quick $(date '+%F %T %Z')"
   cell $BS "$L" E 1024 512 B "NNTR_HTP_ROUTE_LOG=$RL/route_p1024_g512.txt"
   cell $BS "$L" E 512 64 B_ppl NNTR_PPL=1
