@@ -53,3 +53,26 @@ Generation stops at `<turn|>`: 107 tokens at p1024, 102 at p2048.
   - LRFU at a longer generation (G ≥ 512 real tokens), where the replay's gap should show.
   - Repeats for noise.
   - LRFU alone at p2048.
+
+## 512 real tokens (EOS off)
+
+These cells use a staged copy of the configs, `s289cfg/r2_E_p*_g512`. Its
+`generation_config.json` has `eos_token_id: [999999]`, so generation runs to G = 512. The user's
+files are not edited.
+
+After `<turn|>` at ≈ 107 the model writes a second `<turn|>` and then copies the source text
+back. That tail is not judged as text (the text gate's window); it is there for speed only.
+The whole text is identical between base and both in each prompt.
+
+| prompt | cell | **decode avg tok/s** | first token ms | rest avg ms | last 64 tok/s | misses/token | miss wait ms | text md5 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | base | 10.48 | 3 082 | 89.6 | 11.42 | 85.83 | 26.8 | `4257c8ec` |
+| 1024 | both | **11.81 (+12.7 %)** | 3 287 | **78.4** | 13.10 | **73.62 (−14 %)** | **15.4** | `4257c8ec` |
+| 2048 | base | 9.59 | 5 691 | 93.3 | 10.07 | 77.71 | 26.7 | `b667afcb` |
+| 2048 | both | **10.50 (+9.5 %)** | 5 659 | **84.4** | 10.86 | 75.29 (−3 %) | **17.6** | `b667afcb` |
+
+- Over 512 tokens, LRFU lowers misses by 14 % at p1024, against 6.8 % over 107 tokens. That is
+  closer to the replay's −20 %. At p2048 the gain is −3 %; the copied source text reuses experts
+  differently there.
+- The first token costs 3.1 s at p1024 and 5.7 s at p2048. Of that, the KV seed is 2.0 / 4.0 s.
+  These are 6–11 % of the 512-token time.
