@@ -143,10 +143,14 @@ def next_sets(calls, src, seed=0):
     """Plan 266 lever 3: per call i, the set predicted for call i + 1 when
     that call is the next layer of the same decode token, else None.
     src: "oracle" (call i + 1's real set), "trace" (call i + 1's third
-    field: the ids NNTR_HTP_PREDICT logged, layer i's guess at i + 1, best
-    score first; "trace:j" keeps the first j of them), or
+    field in an NNTR_HTP_ROUTE_LOG written under NNTR_HTP_PREDICT=1: layer
+    i's guess at i + 1, best first; "trace:j" keeps the first j), or
     "p<x>" (the real set with each id kept with probability x, else
-    replaced by an expert outside it: a guess of accuracy x)."""
+    replaced by an expert outside it: a guess of accuracy x).
+    In an NNTR_MOE_TRACE file the third field is the layer's own
+    top-(k+5), which "trace" would score as a perfect guess; in a route
+    log the "ours" / "lrfu+" policies would read the guess as their
+    top-(k+5). Use each kind of file only for its own report."""
     n_exp = 1 + max((e for c in calls for e in c[2] + c[3]), default=0)
     rng = _random.Random(seed)
     out = []
