@@ -76,6 +76,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -3427,6 +3428,20 @@ public:
                  n_ops,
                  htp_graph_kinds_str(resident_mask_, names, sizeof(names)),
                  moe_ops_.size());
+    // [#282 D] NNTR_HTP_E2E_FREE_KVQ=1: the prefill's quantized KV caches
+    // (kv_cache_q, the int8 masters and WH tiles, as large as the fp16
+    // attn_m1 cache below) go before that cache is registered: the one-PD
+    // token never reads them. ponytail: a later prefill on a layer whose
+    // handle is gone fails its append and takes mha_core's CPU attention
+    // -- single-prompt runs; the upgrade is mha_core re-registering.
+    if (e2e_ && std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr) {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      for (uint32_t h : kvq_handles_)
+        nntr_hvx_kv_release_q(session, h);
+      std::fprintf(stderr, "[HTP] e2e: freed %zu quantized KV caches\n",
+                   kvq_handles_.size());
+      kvq_handles_.clear();
+    }
     // [#130] the session's KV cache for the resident ATTN_M1 ops: one
     // ordinal per attention layer, the shape from the first record;
     // [plan 201 S4] a second cache for a second shape (Gemma 4's full
@@ -3443,8 +3458,18 @@ public:
       if (rec == nullptr)
         continue;
       const uint32_t max_seq = graph_words_[6];
+      // [#282 D] NNTR_HTP_ATTN_M1_Q8: the int8 cache (half the bytes;
+      // fixed scales from the prefill seed), HVX_ATTN_M1_Q8 in max_seq;
+      // 1 = the first cache only (Gemma's sliding layers, 400 of its 440
+      // MiB at max_seq 2048), 2 = both (the full layers too)
+      static const int q8_knob = [] {
+        const char *v = std::getenv("NNTR_HTP_ATTN_M1_Q8");
+        return v != nullptr ? std::atoi(v) : 0;
+      }();
+      const bool q8 = q8_knob >= 2 || (q8_knob == 1 && c == 0u);
       const int rc = nntr_hvx_attn_m1_register(
-        session, n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq);
+        session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
+        max_seq | (q8 ? 0x80000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
@@ -3452,11 +3477,12 @@ public:
       attn_registered_ = true;
       std::fprintf(stderr,
                    "[HTP] attn_m1: registered layers=%u kv=%u gqa=%u "
-                   "head_dim=%u max_seq=%u cache=%llu KiB\n",
+                   "head_dim=%u max_seq=%u cache=%llu KiB%s\n",
                    n_attn, rec->n_kv, rec->gqa, rec->head_dim, max_seq,
                    (unsigned long long)n_attn * rec->n_kv * rec->head_dim *
-                     ((max_seq + 63u) / 64u * 64u) * 2u * sizeof(uint16_t) /
-                     1024u);
+                     ((max_seq + 63u) / 64u * 64u) * 2u *
+                     (q8 ? 1u : sizeof(uint16_t)) / 1024u,
+                   q8 ? " int8" : "");
     }
     if (e2e_)
       e2eStart();
@@ -8234,6 +8260,9 @@ private:
   std::vector<PinRange> pin_ranges_; /**< [#282] NNTR_MOE_PIN */
   bool pinned_ = false;
   bool host_fc_dropped_ = false; /**< [#282 B] NNTR_HTP_DROP_HOST_FC */
+  /** [#282 D] the kv_cache_q handles registered and not released */
+  std::mutex kvq_mutex_;
+  std::set<uint32_t> kvq_handles_;
   /** [#282 B] the prefetch readers (NNTR_MOE_PREFETCH): their queue, and
    *  the counts the close line prints. The issued keys are the pool
    *  server's alone: a later miss of one counts as useful. */
@@ -8447,6 +8476,10 @@ public:
       ml_logw("HTP quantized KV cache: register failed: 0x%x", err);
       return -1;
     }
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      kvq_handles_.insert(h); // [#282 D]
+    }
     return static_cast<int>(h);
   }
 
@@ -8470,6 +8503,11 @@ public:
 
   void kv_cache_q_release(int handle) override {
     HtpBackend &hb = HtpBackend::global();
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      if (handle < 0 || kvq_handles_.erase(static_cast<uint32_t>(handle)) == 0)
+        return; // [#282 D] released already (NNTR_HTP_E2E_FREE_KVQ)
+    }
     if (hb.enabled() && handle >= 0) {
       nntr_hvx_kv_release_q(static_cast<remote_handle64>(hb.handle()),
                             static_cast<uint32_t>(handle));
