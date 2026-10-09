@@ -2928,6 +2928,7 @@ public:
   void poolSync() {
     if (!pool_dirty_)
       return;
+    pinExperts();
     E2eState &e = *e2e_st_;
     if (pool_descs_.size() != moe_ops_.size())
       throw std::runtime_error(
@@ -5173,6 +5174,12 @@ private:
             ? static_cast<double>(e.pool_read_us) / 1000.0 / e.pool_rounds
             : 0.0,
           static_cast<double>(vmstatPgpginKib() - e.pgpgin0) / 1024.0);
+      if (e.moe_calls != 0)
+        std::fprintf(stderr,
+                     "[HTP] token driver: moe calls/token=%.2f "
+                     "(one-at-a-time %.2f)\n",
+                     static_cast<double>(e.moe_calls) / n,
+                     static_cast<double>(e.moe_calls_1x) / n);
       std::fprintf(
         stderr,
         "[HTP] token driver: close tokens=%llu hops/token=%.2f "
@@ -5397,6 +5404,8 @@ private:
           e.attn_prof[c][w] += r.attn_prof[c][w];
       }
     }
+    e.moe_calls += r.moe_calls;
+    e.moe_calls_1x += r.moe_calls_1x;
     e.token_us += us;
     e.hop_us += r.hop_us;
     e.disp_us += static_cast<int32_t>(r.t_in_us - c0);
@@ -7087,9 +7096,161 @@ private:
    *  scales: those go to @a e.pal, not to the arena, which keeps the
    *  slot's [codes][scales][sums] shape. @return 0, errno, or -1 at end
    *  of file. */
+  /** @brief [#282] One layer's expert bytes held in RAM: file range
+   *  [off, off + len) at @a p. */
+  struct PinRange {
+    int fd;
+    uint64_t off, len;
+    const uint8_t *p;
+  };
+
+  /** @brief [#282] NNTR_MOE_PIN: 0 / unset = misses pread the file (as
+   *  before); 1 = each MoE layer's expert range is mmapped MAP_POPULATE
+   *  (+ mlock, logged, not required) and a miss copies from that mapping;
+   *  2 = the range is read into anonymous memory (not evictable as page
+   *  cache is; swap aside). Once, at the first token's poolSync, so the
+   *  cost lands in the first decode token and is logged as "pin:". */
+  static int pinKnob() {
+    static const int k = [] {
+      const char *v = std::getenv("NNTR_MOE_PIN");
+      return v != nullptr ? std::atoi(v) : 0;
+    }();
+    return k;
+  }
+
+  void pinExperts() {
+    if (pinKnob() == 0 || pinned_)
+      return;
+    pinned_ = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t total = 0;
+    int lock_fail = 0;
+    for (const std::vector<ExpertFileDesc> &d : pool_descs_) {
+      if (d.empty())
+        continue;
+      uint64_t lo = ~uint64_t(0), hi = 0;
+      for (const ExpertFileDesc &x : d) {
+        const uint64_t pal = paletteBytes(x.w_bits);
+        lo = std::min<uint64_t>(lo, std::min(x.off_gu, x.off_dn));
+        hi = std::max<uint64_t>(
+          hi,
+          std::max<uint64_t>(x.off_gu + codeBytes(x.K, 2 * x.inter, x.w_bits) +
+                               pal + 8ull * 2 * x.inter,
+                             x.off_dn + codeBytes(x.inter, x.N_out, x.w_bits) +
+                               pal + 8ull * x.N_out));
+      }
+      const uint64_t page = 4096, a = lo & ~(page - 1), len = hi - a;
+      // Mode 2 on the S25 with all 30 layers (5.6 GB anonymous beside the
+      // app's 3.3 GB) rebooted the phone: stop while MemAvailable keeps
+      // NNTR_MOE_PIN_FLOOR_MIB (default 2048) above this layer's bytes.
+      if (pinKnob() == 2 && memAvailableMib() < pinFloorMib() + (len >> 20)) {
+        std::fprintf(stderr,
+                     "[HTP] pin: stop at layer %zu: MemAvailable %zu MiB < "
+                     "floor %zu + %llu\n",
+                     pin_ranges_.size(), memAvailableMib(), pinFloorMib(),
+                     (unsigned long long)(len >> 20));
+        break;
+      }
+      void *m = MAP_FAILED;
+      if (pinKnob() == 1) {
+        m = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE | MAP_POPULATE, d[0].fd,
+                   static_cast<off_t>(a));
+        if (m != MAP_FAILED && ::mlock(m, len) != 0)
+          ++lock_fail;
+      } else {
+        m = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (m != MAP_FAILED) {
+          // four readers, 64 MiB pieces
+          const uint64_t piece = uint64_t(64) << 20;
+          std::atomic<uint64_t> next{0};
+          std::atomic<int> bad{0};
+          ThreadManager::Global().parallel_for(0, 4, [&](size_t) {
+            for (uint64_t at; (at = next.fetch_add(piece)) < len;)
+              if (preadAll(d[0].fd, static_cast<uint8_t *>(m) + at,
+                           std::min(piece, len - at), a + at) != 0)
+                bad = 1;
+          });
+          if (bad.load() != 0) {
+            ::munmap(m, len);
+            m = MAP_FAILED;
+          }
+        }
+      }
+      if (m == MAP_FAILED) {
+        std::fprintf(stderr,
+                     "[HTP] pin: layer range of %llu MiB failed (errno %d); "
+                     "%zu layers pinned, the rest read the file\n",
+                     (unsigned long long)(len >> 20), errno,
+                     pin_ranges_.size());
+        break;
+      }
+      pin_ranges_.push_back({d[0].fd, a, len, static_cast<const uint8_t *>(m)});
+      total += len;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    std::fprintf(stderr,
+                 "[HTP] pin: mode=%d layers=%zu mib=%llu ms=%.0f mlock_fail=%d "
+                 "rss_mib=%zu mem_avail_mib=%zu\n",
+                 pinKnob(), pin_ranges_.size(),
+                 (unsigned long long)(total >> 20), ms, lock_fail,
+                 static_cast<size_t>(rssKb() >> 10), memAvailableMib());
+  }
+
+  /** @brief [#282] /proc/meminfo's MemAvailable, MiB (0 if unreadable). */
+  static size_t memAvailableMib() {
+    FILE *f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr)
+      return 0;
+    char line[128];
+    size_t kb = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr)
+      if (std::sscanf(line, "MemAvailable: %zu kB", &kb) == 1)
+        break;
+    std::fclose(f);
+    return kb >> 10;
+  }
+
+  /** @brief [#282] NNTR_MOE_PIN_FLOOR_MIB (default 2048). */
+  static size_t pinFloorMib() {
+    static const size_t v = [] {
+      const char *e = std::getenv("NNTR_MOE_PIN_FLOOR_MIB");
+      return e != nullptr ? std::strtoul(e, nullptr, 10) : size_t(2048);
+    }();
+    return v;
+  }
+
+  /** @brief [#282] The pinned bytes of file range [off, off + len), or
+   *  nullptr when they are not pinned. */
+  const uint8_t *pinnedAt(int fd, uint64_t off, uint64_t len) const {
+    for (const PinRange &r : pin_ranges_)
+      if (r.fd == fd && off >= r.off && off + len <= r.off + r.len)
+        return r.p + (off - r.off);
+    return nullptr;
+  }
+
   int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N, uint32_t w_bits,
                  uint8_t *arena_dst, ArenaEntry &e, bool use_pool) {
     const size_t nib = codeBytes(K, N, w_bits);
+    // [#282] a pinned expert is a DDR copy, never a file read
+    const size_t pal0 = paletteBytes(w_bits);
+    if (const uint8_t *pin =
+          pinnedAt(fd, off, nib + pal0 + 2 * sizeof(float) * N)) {
+      std::memcpy(arena_dst, pin, nib);
+      e.pal.assign(pin + nib, pin + nib + pal0);
+      const float *tail = reinterpret_cast<const float *>(pin + nib + pal0);
+      std::vector<int32_t> colsum(N);
+      for (uint32_t i = 0; i < N; ++i)
+        colsum[i] = static_cast<int32_t>(tail[N + i]);
+      std::memcpy(arena_dst + nib, tail, sizeof(float) * N);
+      std::memcpy(arena_dst + nib + sizeof(float) * N, colsum.data(),
+                  sizeof(int32_t) * N);
+      e.K = K;
+      e.N = N;
+      return 0;
+    }
     // [doc 52 sections 10.7, 10.9] The nibble read is 82% of a miss and
     // capped near 4.9 GB/s by the uncached mapping whatever the thread
     // count: 8 slices bought 18% warm. Kept for the load and prefill
@@ -7888,6 +8049,8 @@ private:
    *  gate_up key sits (layer, expert), the layer's policy, and whether a
    *  prefill touched the pool since the last token (poolSync). */
   std::vector<std::vector<ExpertFileDesc>> pool_descs_;
+  std::vector<PinRange> pin_ranges_; /**< [#282] NNTR_MOE_PIN */
+  bool pinned_ = false;
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
   bool pool_dirty_ = true;
@@ -7995,6 +8158,8 @@ private:
      *  summed over attn_tokens tokens */
     uint64_t attn_calls[2] = {0, 0}, attn_tokens = 0;
     uint64_t attn_prof[2][HTP_DSPQ_ATTN_PROF_WORDS] = {};
+    /** [#267 L3] MOE kernel calls, and the one-at-a-time form's count */
+    uint64_t moe_calls = 0, moe_calls_1x = 0;
     uint32_t moe_ops = 0, spin_us = 0;
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */

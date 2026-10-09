@@ -68,7 +68,9 @@ for v in ("E", "A"):
             d = copy.deepcopy(base)
             d["sample_input"] = prompts[p]
             d["num_to_generate"] = g
-            d["init_seq_len"] = 2 * p
+            # INIT276=sum (#282): prompt + G; the 2 x prompt rule's q8 KV
+            # buffers pushed the FC set out of the one-PD address space
+            d["init_seq_len"] = p + g if os.environ.get("INIT276") == "sum" else 2 * p
             d["max_seq_len"] = max(base["max_seq_len"], d["init_seq_len"])
             assert p + g <= d["max_seq_len"]
             d["lmhead_engine"] = "cpu" if v == "E" else "htp"
