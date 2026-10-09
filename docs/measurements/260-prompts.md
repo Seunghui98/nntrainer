@@ -8,8 +8,8 @@ next sitting (512 retired once #266 / #267 finish). This note adds the 2048 and
 |---|---|---|---|
 | `260-prompt512.txt` | 512 | `c31a365fbaecd148602c09c8a2523a1d` | Thyme abstract (research register) — in use |
 | `260-prompt1024.txt` | 1024 | `93bd76497aeb9c9d9ea7074d93e2bff8` | Ardley harbour town — in use |
-| `260-prompt2048.txt` | 2048 | `193cd0918df99aa2a9e06794b4847e30` | municipal water-network leak study (research report register, 1760 words) — **not yet device-validated** (checklist below) |
-| `260-prompt4096.txt` | 4096 | `a157af12c759e5ca00056d0d40dd38e7` | Halstrand, a mountain mining / observatory town (3520 words) — **not yet device-validated** |
+| `260-prompt2048.txt` | 2048 | `193cd0918df99aa2a9e06794b4847e30` | municipal water-network leak study (research report register, 1760 words) — **device-validated except nll** (`260-step3-r3-19dbf3a78.md`: `prefill: 2048 tokens` for E and A, no `exceeds` line, both G64 texts summarise the leak study; the `_ppl` cell has not run) |
+| `260-prompt4096.txt` | 4096 | `a157af12c759e5ca00056d0d40dd38e7` | Halstrand, a mountain mining / observatory town (3520 words) — **not yet device-validated** (step 3: E loaded and prefilled, printed its first token, then was stopped; no prefill line, text or nll) |
 
 All four share the same wrapper byte for byte: `<bos><|turn>user\n` + the
 3-sentence summarisation instruction + `<Text>\n` … `\n</Text><turn|>\n<|turn>model\n`.
