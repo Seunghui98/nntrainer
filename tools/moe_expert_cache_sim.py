@@ -163,6 +163,16 @@ def report(calls, caches, base_ms, miss_ms, policies):
             tps = 1000.0 / (base_ms + layers * mpc * miss_ms)
             print(f"{c:>3} {cap:>5} {p:>9} {mpc:>17.2f} {hit:>6.1f} "
                   f"{pm:>15} {tps:>12.1f}")
+    curve = reuse(calls)
+    if curve:
+        print("token-to-token reuse (plan 266): share of a decode call's "
+              "experts the same layer routed in its previous d decode tokens")
+        print("  " + " ".join(f"d={d}:{100.0 * v:5.1f}%"
+                              for d, v in curve.items()))
+        for c in caches:
+            hits = layer_hits(calls, c * layers)
+            print(f"  lru per-layer hit % at C={c}: " +
+                  " ".join(f"{h:.0f}" for h in hits))
     spec = speculation(calls)
     if spec[0][1]:
         print("decode read-ahead ceiling: share of a token's experts in the "
@@ -193,6 +203,43 @@ def speculation(calls):
                 out[m][2] += len(window)
         prev[layer] = ext
     return {m: tuple(v) for m, v in out.items()}
+
+
+def reuse(calls, depth=8):
+    """Plan 266's hit-rate curve: {d: share of decode-routed experts that
+    the same layer routed in one of its previous d decode tokens}."""
+    hist, hit, n = {}, [0] * (depth + 1), 0
+    for layer, tokens, routed, _ in calls:
+        if tokens != 1:
+            continue
+        h = hist.setdefault(layer, [])
+        for e in routed:
+            for d in range(1, depth + 1):
+                if any(e in prev for prev in h[-d:]):
+                    hit[d] += 1
+        n += len(routed)
+        h.append(set(routed))
+    return {d: hit[d] / n for d in range(1, depth + 1)} if n else {}
+
+
+def layer_hits(calls, capacity):
+    """LRU decode hit % per layer at capacity slots (plan 266)."""
+    order, need, miss = OrderedDict(), {}, {}
+    for layer, tokens, routed, _ in calls:
+        keys = [(layer, e) for e in routed]
+        pinned = set(keys)
+        misses = [k for k in keys if k not in order]
+        for k in keys:
+            if k in order:
+                order.move_to_end(k)
+        for _ in range(len(order) + len(misses) - capacity):
+            del order[next(k for k in order if k not in pinned)]
+        for k in misses:
+            order[k] = None
+        if tokens == 1:
+            need[layer] = need.get(layer, 0) + len(keys)
+            miss[layer] = miss.get(layer, 0) + len(misses)
+    return [100.0 * (1 - miss[m] / need[m]) for m in sorted(need)]
 
 
 def selftest():
@@ -236,6 +283,9 @@ def selftest():
              (0, 1, [9], [])]
     assert simulate(calls, 2, "lrfu:100")[0] == 4   # 9 went, missed again
     assert simulate(calls, 2, "lrfu+:100")[0] == 3  # 4 went, 9 hits
+    # Reuse: layer 0 routes [1, 2] then [2, 3]: d=1 covers 2 of the 4.
+    assert reuse([(0, 1, [1, 2], []), (0, 1, [2, 3], [])])[1] == 0.25
+    assert layer_hits([(0, 1, [1], []), (0, 1, [1], [])], 1) == [50.0]
     # Parsing.
     assert parse(["3 1 | 4 7 | 7 4 9\n", "\n"]) == [(3, 1, [4, 7], [7, 4, 9])]
     print("selftest OK")
