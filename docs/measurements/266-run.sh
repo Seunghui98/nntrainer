@@ -17,6 +17,8 @@
 #
 # usage:
 #   266-run.sh run <log dir>   the sitting (takes and releases the lock)
+#   266-run.sh quick <log dir> B p1024 G512, then B p512 G64 PPL (the cut
+#                              plan, user 2026-10-09; COOL_QUICK)
 #   266-run.sh gate <log dir>  per cell: decode tok/s, the pool line, text
 #                              and nll against the 260 r2 sitting's E cell
 #                              of the same prompt and G (REF=<its log dir>)
@@ -50,6 +52,22 @@ run266() {
     cell $BS "$L" E "$p" 64 B_ppl NNTR_PPL=1
   done
   cell $BA "$L" E 512 512 A_last # A first and last (drift)
+  $AD shell "ls -la $RL/route_*" | tr -d '\r'
+  echo "=== done $(date '+%F %T %Z')"
+}
+
+quick() { # user 2026-10-09: the minimum, in order; the 260 r2 sitting's E
+  # rows stand for A. B p1024 G512, then (if B's text == E) the PPL cell;
+  # B / D p512 G512 ran in the first (stopped) grid. Cool: COOL_QUICK.
+  local L=${1:?log dir}
+  mkdir -p "$L/done"
+  exec > >(tee -a "$L/sweep.out") 2>&1
+  (cd "$ROOT" && tools/htp/sitting_lock.sh take $SER "266 S1 quick" 30) || exit 1
+  trap '(cd "$ROOT" && tools/htp/sitting_lock.sh release $SER)' EXIT
+  export CLADDER=16 COOL_QUICK=1
+  echo "=== 266 S1 quick $(date '+%F %T %Z')"
+  cell $BS "$L" E 1024 512 B "NNTR_HTP_ROUTE_LOG=$RL/route_p1024_g512.txt"
+  cell $BS "$L" E 512 64 B_ppl NNTR_PPL=1
   $AD shell "ls -la $RL/route_*" | tr -d '\r'
   echo "=== done $(date '+%F %T %Z')"
 }
@@ -95,6 +113,7 @@ PY
 
 case "${1:-}" in
 run) shift; run266 "$@" ;;
+quick) shift; quick "$@" ;;
 gate) shift; gate "$@" ;;
 *) sed -n '2,24p' "$0"; exit 1 ;;
 esac

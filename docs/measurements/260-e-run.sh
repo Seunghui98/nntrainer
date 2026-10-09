@@ -102,10 +102,12 @@ cool() { # doc 57 7.5 + #234: no other run, 180 s, then cpu/nsp <= 38 C,
   # battery <= 30.0 C, zone0 <= 35 C (20 min cap; the temps are logged)
   local i soc bat z0
   while $AD shell 'ps -A' | grep -q 'nntrainer_causall[m]'; do sleep 10; done
-  sleep "${COOL_S:-180}"
-  for i in $(seq 120); do
+  # COOL_QUICK=1 (#266, user 2026-10-09): battery <= 32.0 C only, 5 min cap
+  [ "${COOL_QUICK:-0}" = 1 ] || sleep "${COOL_S:-180}"
+  for i in $(seq "$([ "${COOL_QUICK:-0}" = 1 ] && echo 30 || echo 120)"); do
     read -r soc bat z0 <<<"$(temps)"
-    [ "$soc" -le 38000 ] && [ "$bat" -le 300 ] && [ "$z0" -le 35000 ] && break
+    if [ "${COOL_QUICK:-0}" = 1 ]; then [ "$bat" -le 320 ] && break
+    elif [ "$soc" -le 38000 ] && [ "$bat" -le 300 ] && [ "$z0" -le 35000 ]; then break; fi
     sleep 10
   done
   echo "$soc $bat $z0"
