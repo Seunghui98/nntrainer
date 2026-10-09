@@ -20,6 +20,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/260-e-run.sh"
 DM=/data/local/tmp/nntrainer/gemma4_26b_ternary_fcqs4cx
 export COOL_QUICK=1
+# NOWAIT=1 (user, 2026-10-09 ladder): no cool-start wait, no S1-ceiling
+# gtest; the temperatures are still read at the start and the end
+if [ "${NOCEIL:-0}" = 1 ]; then # the cool start stays, the gtest goes
+  ceil() { :; }
+fi
+if [ "${NOWAIT:-0}" = 1 ]; then
+  cool() { temps; }
+  ceil() { :; }
+fi
 
 case "${1:-}" in
 one)

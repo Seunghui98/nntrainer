@@ -38,10 +38,10 @@
 #include <vector>
 
 #include <common.h>
-#include <htp_decode_hook.h>
 #include <compute_ops.h>
 #include <context.h>
 #include <context_data.h>
+#include <htp_decode_hook.h>
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
@@ -955,6 +955,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       auto last64_duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(
           token_done_ts[n_done] - token_done_ts[n_done - window]);
+      { // [#282 F] the first token against the rest
+        using msd = std::chrono::duration<double, std::milli>;
+        const size_t nt = token_done_ts.size() - 1;
+        const double first = msd(token_done_ts[1] - token_done_ts[0]).count();
+        const double rest =
+          nt > 1 ? msd(token_done_ts[nt] - token_done_ts[1]).count() / (nt - 1)
+                 : 0.0;
+        std::cerr << "[TIMING] first_token_ms=" << first
+                  << " rest_avg_ms=" << rest << std::endl;
+      }
       std::cout << "generation(last 64): " << window << " tokens, "
                 << last64_duration.count() << " ms, "
                 << ((double)window / last64_duration.count() * 1000) << " TPS";

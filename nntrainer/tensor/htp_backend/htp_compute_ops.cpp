@@ -2856,8 +2856,11 @@ public:
     const uint32_t layer =
       attn_cache_ord_[seed_ordinal_] |
       (attn_cache_[seed_ordinal_] ? HTP_ATTN_KV_CACHE_B : 0u);
+    const uint64_t t_seed = HtpProfile::nowUs(); // [#282 F]
     const int err = nntr_hvx_attn_m1_kv_append(session, layer, 0u, n_rows,
                                                k_rows, n, v_rows, n);
+    seed_rpc_us_ += HtpProfile::nowUs() - t_seed;
+    ++seed_calls_;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error("nntr_hvx_attn_m1_kv_append failed at layer " +
                                std::to_string(seed_ordinal_) + ", " +
@@ -2930,8 +2933,10 @@ public:
   void poolSync() {
     if (!pool_dirty_)
       return;
+    const uint64_t t_ps = HtpProfile::nowUs(); // [#282 F]
     pinExperts();
     dropHostFc();
+    const uint64_t t_drop = HtpProfile::nowUs();
     E2eState &e = *e2e_st_;
     if (pool_descs_.size() != moe_ops_.size())
       throw std::runtime_error(
@@ -2974,6 +2979,15 @@ public:
                static_cast<unsigned>(tabs[m].size()),
                static_cast<unsigned>(tabs[m].size()), "EXPERTS");
     pool_dirty_ = false;
+    if (!t1_printed_) { // [#282 F]
+      t1_printed_ = true;
+      std::fprintf(stderr,
+                   "[HTP] t1: pool_sync_ms=%.1f (drop_host_fc+pin %.1f) "
+                   "kv_seed_rpc_ms=%.1f seeds=%u\n",
+                   (HtpProfile::nowUs() - t_ps) / 1000.0,
+                   (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0,
+                   seed_calls_);
+    }
     // ponytail: a generation's decode loads stay cached until the next
     // prefill (<= misses x 5.3 MiB: 0.7 GiB at G = 1024); a drop per N
     // tokens off the miss path is the upgrade for long generations
@@ -3368,6 +3382,15 @@ public:
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (graph_inited_)
       return;
+    // [#282 F] the first token's setup, timed (one line at the end)
+    const uint64_t t_init = HtpProfile::nowUs();
+    struct InitLine {
+      uint64_t t0;
+      ~InitLine() {
+        std::fprintf(stderr, "[HTP] t1: graph_init_ms=%.1f\n",
+                     (HtpProfile::nowUs() - t0) / 1000.0);
+      }
+    } init_line{t_init};
     if (e2e_ && !q4m1_bound_)
       e2ePlaceFc(); // a caller that never ran finish_decode_graph_q4_0
     if ((resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u && !q4m1_bound_) {
@@ -8260,6 +8283,10 @@ private:
   std::vector<PinRange> pin_ranges_; /**< [#282] NNTR_MOE_PIN */
   bool pinned_ = false;
   bool host_fc_dropped_ = false; /**< [#282 B] NNTR_HTP_DROP_HOST_FC */
+  /** [#282 F] the first token's setup timers */
+  uint64_t seed_rpc_us_ = 0;
+  unsigned seed_calls_ = 0;
+  bool t1_printed_ = false;
   /** [#282 D] the kv_cache_q handles registered and not released */
   std::mutex kvq_mutex_;
   std::set<uint32_t> kvq_handles_;
