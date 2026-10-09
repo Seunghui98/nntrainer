@@ -159,9 +159,21 @@ The ISS already put the softmax at 13 % or less. The silicon split above confirm
 
 Plan 261's lever 3 should be re-derived from this split. The candidates:
 
-1. **PV in one walk** (bit-identical, no IDL change; `pv_group`'s ponytail). The expected gain
-   is not modelled: it depends on how much of the 64 pcycles per FMA is the 4–8× re-walk and
-   how much is DDR.
+1. **PV in one walk** (bit-identical, no IDL change; `pv_group`'s ponytail). Each (head, d)
+   chain keeps its p order, so the bits do not change. The gain is bounded below at 0 and
+   above as follows:
+   - Today PV costs (sliding + full lane pcycles) / 6 lanes / 2112 MHz = **6.96 ms at p512**
+     and **13.9 ms at p1024**.
+   - It cannot go below its V bytes at the FC path's ≈ 40 GB/s:
+     - p512: 25 × 8 × 597 × 512 B + 5 × 2 × 597 × 1 KiB ≈ 67 MB → 1.7 ms.
+     - p1024: ≈ 118 MB → 3.0 ms.
+   - It also cannot go below its compute at the ISS's 11.4 pcycles per FMA: 1.2 / 2.2 ms.
+   - **Ceiling: about −5.3 ms at p512 and −10.9 ms at p1024**, if the re-walk is the whole
+     stall.
+   - Floor: 0, if it is the DDR stream itself. The phase words in this PR read which of the two
+     it is on the first build.
+   - Register budget: 2 heads × 4 chunks = 8 accumulators for the sliding shape. The full shape
+     (8 chunks) needs 1 head × 8 or 2 × 4 chunk halves.
 2. More q heads per V load on the full layers (gqa 8 in groups of 4 today).
 3. Plan §2.3's 3b (int8 KV): this halves exactly the bytes the split shows PV waiting on.
 
