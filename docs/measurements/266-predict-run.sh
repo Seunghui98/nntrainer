@@ -14,6 +14,7 @@
 #   266-predict-run.sh <cell> <log dir>   one cell, takes and releases the
 #                                         lock (SITTING_OWNER r266p@host)
 #     s2      E p512 G512, NNTR_HTP_PREDICT=1, route log with the guesses
+#     s2_1024 the same at p1024 G512
 #   266-predict-run.sh gate <log dir>     266-run.sh's table (REF=<260 r2
 #                                         log dir>)
 set -u -o pipefail
@@ -37,6 +38,9 @@ one() {
   s2) cell $BP "$L" E 512 512 S2 \
     "NNTR_HTP_PREDICT=1 NNTR_HTP_ROUTE_LOG=$RL/pred_p512_g512.txt"
     $AD pull $RL/pred_p512_g512.txt "$L/" ;;
+  s2_1024) cell $BP "$L" E 1024 512 S2 \
+    "NNTR_HTP_PREDICT=1 NNTR_HTP_ROUTE_LOG=$RL/pred_p1024_g512.txt"
+    $AD pull $RL/pred_p1024_g512.txt "$L/" ;;
   *) echo "unknown cell $what"; exit 1 ;;
   esac
   echo "=== done $(date '+%F %T %Z')"
@@ -44,6 +48,6 @@ one() {
 
 case "${1:-}" in
 gate) shift; "$HERE/266-run.sh" gate "$@" ;;
-s2) one "$@" ;;
+s2 | s2_1024) one "$@" ;;
 *) sed -n '2,20p' "$0"; exit 1 ;;
 esac
