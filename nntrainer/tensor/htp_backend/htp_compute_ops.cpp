@@ -3055,6 +3055,11 @@ public:
         throw std::runtime_error("token driver: a miss request for op " +
                                  std::to_string(r.op) + " is malformed");
       const std::vector<ExpertFileDesc> &d = pool_descs_[it - moe_ops_.begin()];
+      {
+        std::lock_guard<std::mutex> lock(handle_mutex_);
+        pool_answered_.resize(pool_descs_.size());
+        pool_answered_[it - moe_ops_.begin()] = 1;
+      }
       std::vector<const void *> need, loads;
       for (uint32_t i = 0; i < r.n_routed; ++i) {
         if (r.routed[i] >= d.size())
@@ -3352,6 +3357,15 @@ public:
   }
 
   void poolRefresh(const htp_dspq_token_resp &s1r) {
+    // [#289] under LRFU a layer's routed set counts once a token: a layer
+    // whose miss round already handed it to the pool is not handed again
+    std::vector<uint8_t> answered;
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      answered.swap(pool_answered_);
+    }
+    if (!lrfuOn())
+      answered.clear();
     size_t at = 0;
     for (size_t m = 0; m < pool_descs_.size() && at < s1r.route_n; ++m) {
       const uint32_t n = s1r.route[at++];
@@ -3366,6 +3380,8 @@ public:
             need.push_back(k);
         }
       }
+      if (m < answered.size() && answered[m] != 0)
+        continue;
       pool_fn_(
         need,
         [](const void *) {
@@ -6982,6 +6998,16 @@ private:
    *  back when it leaves the arena, so the cache holds about the arena's
    *  complement instead of the whole file; 2 = the drop only (diagnostic:
    *  every miss then reads storage). */
+  /** @brief [#289] NNTR_MOE_LRFU set to a half-life other than 0: the
+   *  pool's policy (causallm::ExpertLru) is LRFU, which parses the value. */
+  static bool lrfuOn() {
+    static const bool on = [] {
+      const char *v = std::getenv("NNTR_MOE_LRFU");
+      return v != nullptr && *v != '\0' && std::strtod(v, nullptr) > 0.0;
+    }();
+    return on;
+  }
+
   static int fadviseKnob() {
     static const int k = [] {
       const char *v = std::getenv("NNTR_MOE_FADVISE");
@@ -8303,6 +8329,8 @@ private:
   static inline std::atomic<uint64_t> pf_done_{0};
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
+  std::vector<uint8_t> pool_answered_; /**< [#289] layers a miss round served
+                                          this token (handle_mutex_) */
   bool pool_dirty_ = true;
   bool graph_inited_ = false;
   bool graph_short_warned_ = false;
