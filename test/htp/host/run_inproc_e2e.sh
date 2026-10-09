@@ -155,6 +155,13 @@
 #   E2E 2bit lfm25 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
 #   E2E tokens 2bit==twin-lfm25 8/8 expected_mismatch=0
 #   E2E 2bit pool C=1 / C=2 lfm25 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
+# and, since #276 S1 (#4415's lfm2_moe admits QS2CX_WH), the gemma64
+# fixture with QS4CX FCs and 2-bit experts: the hybrid (their layer at
+# M = 1, all-resident and through their LRU at C=3) and the one-PD token
+#   E2E 2bit gemma64 off == palette-twin bit_identical=1 pool C=3 bit_identical=1
+#   E2E 2bit gemma64 e3 == palette-twin bit_identical=1 calls/token=1.00 timeouts=0
+#   E2E tokens 2bit==twin-gemma64 8/8 expected_mismatch=0
+#   E2E 2bit pool C=3 gemma64 == 2bit e3 bit_identical=1 misses=<n> calls/token=1.00 timeouts=0
 #   E2E keys lfm25 prefill-moved=1 htp_fc_rows=<n> e3==e1 bit_identical=1 pool C=2
 #     bit_identical=1 misses=<n> calls/token=1.00 q4m1_handles=23
 #     cpu-fc-skipped=<n> per_token=10 ok
@@ -430,6 +437,17 @@ run_gemma g64cpu g64cpu cpu
 run_gemma g64off g64htp htp
 run_gemma g64e3 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
 run_gemma g64e3pool3 g64htp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=3
+# [#276] the same fixture with QS2CX_WH experts and their palette twin
+"$Q" "$FIXG" -o "$OUT/g64htp2" --fc_dtype QS4CX --moe_dtype QS2CX_WH \
+  --embd_dtype Q4_0 > "$OUT/q_g64htp2.log"
+"$Q" "$FIXG" -o "$OUT/g64htpp" --fc_dtype QS4CX --moe_dtype QS4CX_WH \
+  --moe_palette_g max --embd_dtype Q4_0 > "$OUT/q_g64htpp.log"
+run_gemma g64offp g64htpp htp
+run_gemma g64offq2 g64htp2 htp
+run_gemma g64offq2pool3 g64htp2 htp NNTR_MOE_CACHE_EXPERTS=3
+run_gemma g64e3p g64htpp htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3q2 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1
+run_gemma g64e3q2pool3 g64htp2 htp NNTR_HTP_DSPQ=1 NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=3
 # [plan 229] QS2CX_WH experts and their 4-bit palette twin (header above)
 "$Q" "$FIX25" -o "$OUT/htp25q2" --fc_dtype Q4_0 --moe_dtype QS2CX_WH \
   --embd_dtype Q4_0 > "$OUT/q_htp25q2.log"
@@ -695,6 +713,15 @@ two_bit() { # two_bit <label> <ref run> <2-bit run> <pool runs...>
   done
 }
 two_bit lfm25 25e3p 25e3q2 25e3q2pool1 25e3q2pool2
+two_bit gemma64 g64e3p g64e3q2 g64e3q2pool3
+for d in g64offq2 g64offq2pool3; do logits_only "$OUT/dump_$d" "$OUT/ref_$d"; done
+ev="$($EVAL --label 2bit-gemma64-off "$OUT/dump_g64offp" "$OUT/dump_g64offq2" | tail -1 || true)"
+evp="$($EVAL --label 2bit-gemma64-off-C3 "$OUT/ref_g64offq2" "$OUT/ref_g64offq2pool3" | tail -1 || true)"
+if grep -q 'bit_identical=1' <<< "$ev" && grep -q 'bit_identical=1' <<< "$evp"; then
+  echo "E2E 2bit gemma64 off == palette-twin bit_identical=1 pool C=3 bit_identical=1"
+else
+  echo "E2E FAIL 2bit gemma64 off: [$ev] pool C=3 [$evp]"; fail=1
+fi
 # [#222] with the keys: the prefill moved (step 0's logits differ from the
 # keyless run's), and the decode paths hold as without them -- the one-PD
 # token equal to E1's of the same model, one call per token, the pool
