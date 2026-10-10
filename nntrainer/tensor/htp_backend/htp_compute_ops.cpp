@@ -1381,15 +1381,13 @@ public:
 
   bool supports_gemm_q4_0_batch_norm_fp32() const override { return true; }
 
-  void gemm_q4_0_batch_norm_fp32(std::vector<void *> matAdata,
-                                 std::vector<float *> matAscale,
-                                 float *matBdata, std::vector<float *> matCdata,
-                                 unsigned int M, std::vector<unsigned int> N,
-                                 unsigned int K, const float *pre_gamma,
-                                 const std::vector<unsigned int> &post_chunk,
-                                 const float *post_gamma, float eps,
-                                 const float *rope_cs, unsigned int rope_hd,
-                                 unsigned int rope_weights) override {
+  void gemm_q4_0_batch_norm_fp32(
+    std::vector<void *> matAdata, std::vector<float *> matAscale,
+    float *matBdata, std::vector<float *> matCdata, unsigned int M,
+    std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
+    const std::vector<unsigned int> &post_chunk, const float *post_gamma,
+    float eps, const float *rope_cs, unsigned int rope_hd,
+    unsigned int rope_weights, bool out_to_host) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const size_t n = matAdata.size();
@@ -1450,6 +1448,12 @@ public:
     // gemm_q4_0_batch_fp32 makes for VTCM carry them unchanged (the table
     // rows advance with the activation rows).
     const unsigned int step = fcMaxRows(K);
+    // The activation and the outputs are staged whole and the row chunks
+    // address them by offset (FusedNorms::rows_total), so the outputs may
+    // stay in that one buffer (the reader takes them by host_view).
+    norms.to_host = out_to_host || HtpProfile::global().level() >= 2;
+    norms.rows_total = M;
+    norms.act_whole = matBdata;
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       std::vector<OutSlice> rows = slices;
@@ -1467,6 +1471,7 @@ public:
                      bytes);
         norms.rope_cs = cs;
       }
+      norms.row0 = m0;
       invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
                   matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
                   K, nullptr, nullptr, &norms, &rows);
@@ -1777,10 +1782,25 @@ public:
   // The o-proj with the post-attention epilogue (see the base declaration):
   // the FC's row chunks as invokeFc takes them, each one call that also
   // norms, adds the residual and scales, so the FC output never comes back.
+  const void *host_view(const void *host, size_t bytes) override {
+    const void *ion = ionAlias(host, bytes);
+    return ion ? ion : host;
+  }
+
+  void sync_to_host(void *host, size_t bytes) override {
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    const void *ion = ionAlias(host, bytes);
+    if (!ion)
+      ion = trueSource(host, bytes);
+    if (ion && ion != host)
+      stagedMemcpy(host, ion, bytes);
+  }
+
   bool gemm_qs4cx_res_add_fp32(void *w, float *w_scale, const float *act,
                                unsigned int M, unsigned int K, unsigned int N,
                                const float *res, const float *gamma, float eps,
-                               float scale, float *out) override {
+                               float scale, float *out,
+                               bool out_to_host) override {
     if (M <= 1 || w == nullptr || act == nullptr || res == nullptr)
       return false;
     const remote_handle64 session =
@@ -1790,25 +1810,29 @@ public:
     // dequantizes it inside the quant pass, nothing is copied or converted
     const bool u16_in = attn_out16_.host == act && attn_out16_.rows == M &&
                         attn_out16_.width == K;
+    // The residual, the output (and an f32 activation) staged whole, once;
+    // the row chunks VTCM asks for address them by offset, so each is one
+    // buffer for the calls that follow, however many calls this one takes.
     const unsigned int step = fcMaxRows(K);
+    const size_t o_all = static_cast<size_t>(M) * N * sizeof(float);
+    const size_t a_all = static_cast<size_t>(M) * K * sizeof(float);
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    // the residual is the rows the qkv call staged as its activation:
+    // swapped in from act_pool_ when it still holds them
+    const float *res_all = reinterpret_cast<const float *>(
+      stageInput(x2_pool_, res, o_all, &act_pool_).data());
+    const float *act_all = nullptr;
+    if (!u16_in) {
+      act_all = static_cast<const float *>(ionAlias(act, a_all));
+      if (!act_all)
+        act_all = reinterpret_cast<const float *>(
+          stageInput(act_pool_, act, a_all).data());
+    }
+    float *out_all = reinterpret_cast<float *>(stage(out_pool_, o_all).data());
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
-      const size_t a_bytes = static_cast<size_t>(m) * K * sizeof(float);
-      const size_t o_bytes = static_cast<size_t>(m) * N * sizeof(float);
-      std::lock_guard<std::mutex> lock(invoke_mutex_);
-      const float *act_f32 = nullptr;
-      if (!u16_in) {
-        const float *a_host = act + static_cast<size_t>(m0) * K;
-        act_f32 = static_cast<const float *>(ionAlias(a_host, a_bytes));
-        if (!act_f32)
-          act_f32 = reinterpret_cast<float *>(
-            stageInput(act_pool_, a_host, a_bytes).data());
-      }
-      float *res_f32 =
-        reinterpret_cast<float *>(stage(x2_pool_, o_bytes).data());
-      float *out_f32 =
-        reinterpret_cast<float *>(stage(out_pool_, o_bytes).data());
-      stagedMemcpy(res_f32, res + static_cast<size_t>(m0) * N, o_bytes);
+      const float *res_f32 = res_all + static_cast<size_t>(m0) * N;
+      float *out_f32 = out_all + static_cast<size_t>(m0) * N;
       const uint64_t t0 = HtpProfile::nowUs();
       const int err =
         u16_in
@@ -1822,18 +1846,21 @@ public:
               static_cast<int>(m * N))
           : nntr_hvx_mm_u8i4_layer_res_add(
               session, m, K, eps, scale, gamma, gamma ? static_cast<int>(N) : 0,
-              fh.handles.data(), static_cast<int>(fh.handles.size()), act_f32,
-              static_cast<int>(m * K), res_f32, static_cast<int>(m * N),
-              out_f32, static_cast<int>(m * N));
+              fh.handles.data(), static_cast<int>(fh.handles.size()),
+              act_all + static_cast<size_t>(m0) * K, static_cast<int>(m * K),
+              res_f32, static_cast<int>(m * N), out_f32,
+              static_cast<int>(m * N));
       const uint64_t elapsed = HtpProfile::nowUs() - t0;
       if (err != AEE_SUCCESS)
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_res_add failed: err=" +
                                  std::to_string(err));
-      stagedMemcpy(out + static_cast<size_t>(m0) * N, out_f32, o_bytes);
       HtpProfile &profile = HtpProfile::global();
       if (profile.level())
         profile.addInvoke(m, K, N, elapsed, nullptr);
     }
+    // remembered for the dense call's stageInput (its from): the
+    // post-attention rows swap in instead of being copied again
+    copyOutOf(out_pool_, out, o_all, out_to_host);
     if (u16_in)
       attn_out16_.host = nullptr;
     return true;
@@ -1901,7 +1928,7 @@ public:
                                  bool gelu, const float *pre_gamma,
                                  const float *post_gamma, float eps,
                                  const float *add_x2, const float *add_gamma,
-                                 float add_scale) override {
+                                 float add_scale, bool out_to_host) override {
     // #4415's lfm2_moe passes its bool weights_wh: true reads as 4 bits
     if (w_bits == 1u)
       w_bits = 4u;
@@ -1961,8 +1988,8 @@ public:
         // [#260] with #4415's epilogue (GeGLU, the folded norms), as below
         invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight,
                        act, out, M, K, inter, N_out, 0, gelu ? 1u : 0u,
-                       pre_gamma, post_gamma, eps, add_x2, add_gamma,
-                       add_scale);
+                       pre_gamma, post_gamma, eps, add_x2, add_gamma, add_scale,
+                       out_to_host);
         return;
       }
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
@@ -1997,7 +2024,7 @@ public:
     }
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
                    out, M, K, inter, N_out, 0, gelu ? 1u : 0u, pre_gamma,
-                   post_gamma, eps, add_x2, add_gamma, add_scale);
+                   post_gamma, eps, add_x2, add_gamma, add_scale, out_to_host);
   }
 
   /** [#85] NNTR_HTP_FORWARD=1 routes decode's MoE calls through the
@@ -4309,14 +4336,23 @@ private:
    * 10.9 MB out buffer at 814 and a 12.7 MB pair at 1633 (doc 50 section
    * 3.6: 36-59 us/MB, cache-flush speed), and prefill's calls paid the
    * same. With classes, decode stays on the 64 KiB pair. */
+  /** @brief The host range a staging buffer stands for. kept: its call
+   *  left only sampledSame's windows on the host (copyOutOf's to_host
+   *  false), so a copy of any part of it must come from the buffer
+   *  (trueSource); a model tensor, alive as long as the model. */
+  struct Held {
+    const void *first;
+    size_t second;
+    bool kept = false;
+  };
   struct StagingPool {
     std::map<size_t, std::unique_ptr<HtpRpcBuffer>> by_class;
     /** What stageInput last copied into a class's buffer, cleared by any
      *  other stage() of it (doc 57 section 9.31). */
-    std::map<size_t, std::pair<const void *, size_t>> holds;
+    std::map<size_t, Held> holds;
     /** The host tensor a class's buffer was last copied out to, whole
      *  (copyOutOf), cleared by any other stage() of it. */
-    std::map<size_t, std::pair<const void *, size_t>> copied_out;
+    std::map<size_t, Held> copied_out;
   };
   static size_t stageClass(size_t bytes) {
     size_t cls = size_t(64) << 10;
@@ -4360,9 +4396,9 @@ private:
    *  the dense output is the MoE call's x2 and the MoE output the next
    *  qkv call's input (doc 57 section 9.34). Stage this before the call's
    *  own output buffer, which may be the one swapped in. */
-  static HtpRpcBuffer &stageInput(StagingPool &pool, const void *src,
-                                  size_t bytes, StagingPool *from = nullptr,
-                                  int line = __builtin_LINE()) {
+  HtpRpcBuffer &stageInput(StagingPool &pool, const void *src, size_t bytes,
+                           StagingPool *from = nullptr,
+                           int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     if (!slot)
@@ -4372,30 +4408,99 @@ private:
         it->second.second == bytes && sampledSame(src, slot->data(), bytes))
       return *slot;
     if (from) {
+      // what from's buffer of this size is: a call's output (copied_out),
+      // or an input staged there (holds: the qkv call's activation rows are
+      // the o-proj call's residual)
       auto c = from->copied_out.find(cls);
+      const Held *was = c != from->copied_out.end() ? &c->second : nullptr;
+      if (!was) {
+        auto h = from->holds.find(cls);
+        was = h != from->holds.end() ? &h->second : nullptr;
+      }
       auto &fslot = from->by_class[cls];
-      if (c != from->copied_out.end() && c->second.first == src &&
-          c->second.second == bytes && fslot &&
+      if (was && was->first == src && was->second == bytes && fslot &&
           sampledSame(src, fslot->data(), bytes)) {
+        const bool kept = was->kept;
         std::swap(slot, fslot);
         from->holds.erase(cls);
         from->copied_out.erase(cls);
         pool.copied_out.erase(cls);
-        pool.holds[cls] = {src, bytes};
+        pool.holds[cls] = {src, bytes, kept};
         return *slot;
       }
     }
-    stagedMemcpy(slot->data(), src, bytes, line);
-    pool.holds[cls] = {src, bytes};
+    // A copy after all (a row chunk of a tensor, a size the pools hold no
+    // buffer of): from where the bytes really are -- a tensor a call kept
+    // (copyOutOf's to_host false) has only its windows on the host.
+    const void *from_buf = trueSource(src, bytes);
+    if (from_buf != slot->data())
+      stagedMemcpy(slot->data(), from_buf, bytes, line);
+    pool.holds[cls] = {src, bytes, false};
     return *slot;
   }
+  /** @brief Where [src, src + bytes) really is: inside a staging buffer
+   *  that holds (by sampledSame over its whole tensor) a kept host tensor
+   *  containing the range, else @a src itself. Only kept ones: any other
+   *  record's host range may be memory freed since. */
+  const void *trueSource(const void *src, size_t bytes) {
+    const char *s = static_cast<const char *>(src);
+    for (StagingPool *pool : {&out_pool_, &act_pool_, &x2_pool_}) {
+      for (auto *m : {&pool->copied_out, &pool->holds}) {
+        for (const auto &rec : *m) {
+          const char *h = static_cast<const char *>(rec.second.first);
+          const size_t hb = rec.second.second;
+          auto slot = pool->by_class.find(rec.first);
+          if (!rec.second.kept || !h || s < h || s + bytes > h + hb ||
+              slot == pool->by_class.end() || !slot->second)
+            continue;
+          if (sampledSame(h, slot->second->data(), hb))
+            return slot->second->data() + (s - h);
+        }
+      }
+    }
+    return src;
+  }
+  /** @brief The windows sampledSame compares, copied: what makes a host
+   *  tensor that was NOT copied out still recognizable as this buffer's. */
+  static void sampledCopy(void *dst_, const void *src_, size_t bytes) {
+    uint8_t *d = static_cast<uint8_t *>(dst_);
+    const uint8_t *s = static_cast<const uint8_t *>(src_);
+    if (bytes < 64) {
+      std::memcpy(d, s, bytes);
+      return;
+    }
+    std::memcpy(d + bytes - 64, s + bytes - 64, 64);
+    for (size_t i = 0; i < 32; ++i) {
+      const size_t off = (bytes - 64) / 32 * i;
+      std::memcpy(d + off, s + off, 64);
+    }
+  }
   /** @brief The copy of a call's whole output out of @a pool's buffer for
-   *  @a bytes, remembered for stageInput's @a from. */
+   *  @a bytes, remembered for stageInput's @a from.
+   *
+   *  @a to_host false: the layer says only accelerator calls read this
+   *  output at prefill, so only sampledSame's windows go to the host (2 KB
+   *  of an 11.5 MB tensor): the calls that take it find the buffer by the
+   *  same content check as ever and swap it in, and a different tensor a
+   *  CPU layer writes at that address still fails the check and is copied.
+   *  A host READER of this tensor sees stale bytes between the windows: the
+   *  builder sets the flag only where every consumer runs here, the layers'
+   *  CPU fallbacks call sync_to_host first, and NNTR_HTP_PROFILE >= 2 (its
+   *  host norms read these tensors) copies in full. */
   static void copyOutOf(StagingPool &pool, void *dst, size_t bytes,
-                        int line = __builtin_LINE()) {
+                        bool to_host = true, int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
-    stagedMemcpy(dst, pool.by_class[cls]->data(), bytes, line);
-    pool.copied_out[cls] = {dst, bytes};
+    const void *buf = pool.by_class[cls]->data();
+    bool kept = !to_host && HtpProfile::global().level() < 2;
+    if (kept) {
+      sampledCopy(dst, buf, bytes);
+      // the windows must be what sampledSame compares, or the readers
+      // would take the stale host tensor: checked, the full copy otherwise
+      kept = sampledSame(dst, buf, bytes);
+    }
+    if (!kept)
+      stagedMemcpy(dst, buf, bytes, line);
+    pool.copied_out[cls] = {dst, bytes, kept};
   }
 
   /** @brief A host range last copied out of a staging buffer, so a later
@@ -4517,6 +4622,16 @@ private:
     const float *rope_cs = nullptr; /**< M rows of 2*rope_hd, or nullptr */
     unsigned int rope_hd = 0;       /**< 0: no RoPE */
     unsigned int rope_handles = 0;  /**< the handles rotated, a prefix */
+    /** false: only sampledSame's windows of each weight's rows go to the
+     *  host tensors (copyOutOf's to_host); host_view finds the rest */
+    bool to_host = true;
+    /** rows_total != 0 (with slices): this call is rows [row0, row0 + M)
+     *  of a rows_total-row call whose activation (act_whole, the host
+     *  tensor) and outputs are staged whole, once: the chunks address them
+     *  by offset, so a tensor is one buffer however many calls VTCM makes
+     *  of it, and the last chunk copies out. */
+    unsigned int rows_total = 0, row0 = 0;
+    const float *act_whole = nullptr;
     bool any() const { return pre_gamma || post_chunk || rope_hd; }
   };
 
@@ -4536,12 +4651,20 @@ private:
     };
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    float *act_f32 = reinterpret_cast<float *>(
-      stageInput(act_pool_, matBdata,
-                 static_cast<size_t>(act_len) * sizeof(float), &out_pool_)
-        .data());
+    const bool chunk = norms && slices && norms->rows_total != 0;
+    const unsigned int m_all = chunk ? norms->rows_total : M;
+    const unsigned int row0 = chunk ? norms->row0 : 0u;
+    float *act_f32 =
+      reinterpret_cast<float *>(
+        stageInput(act_pool_, chunk ? norms->act_whole : matBdata,
+                   static_cast<size_t>(m_all) * K * sizeof(float), &out_pool_)
+          .data()) +
+      static_cast<size_t>(row0) * K;
+    // (stage() of the same size returns the same buffer: a later chunk
+    // finds the earlier ones' rows in it)
+    const int out_all = static_cast<int>(m_all) * static_cast<int>(N);
     float *out_cat = reinterpret_cast<float *>(
-      stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
+      stage(out_pool_, static_cast<size_t>(out_all) * sizeof(float)).data());
 
     HtpProfile &profile = HtpProfile::global();
     if (norms && norms->any()) {
@@ -4563,9 +4686,10 @@ private:
         for (const OutSlice &o : *slices) {
           if (o.c0 == 0) {
             base = next;
-            next += static_cast<size_t>(M) * o.stride;
+            next += static_cast<size_t>(m_all) * o.stride;
           }
-          out_off.push_back(static_cast<uint32_t>(base + o.c0));
+          out_off.push_back(static_cast<uint32_t>(
+            base + o.c0 + static_cast<size_t>(row0) * o.stride));
           out_ld.push_back(o.stride);
         }
       }
@@ -4583,7 +4707,7 @@ private:
                    chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
                    norms->rope_handles, norms->rope_cs, cs_len, handles,
                    num_handles, out_off.data(), num_handles, out_ld.data(),
-                   num_handles, act_f32, act_len, out_cat, out_len)
+                   num_handles, act_f32, act_len, out_cat, out_all)
                : nntr_hvx_mm_u8i4_layer_norm(
                    session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
                    chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
@@ -4595,12 +4719,20 @@ private:
                                  std::to_string(err) + shape());
       }
       if (slices) {
-        for (size_t i = 0; i < slices->size(); ++i) {
+        // whole tensors, once every row is in the buffer
+        for (size_t i = 0; row0 + M == m_all && i < slices->size(); ++i) {
           const OutSlice &o = (*slices)[i];
           if (o.c0 == 0) {
-            const size_t b = static_cast<size_t>(M) * o.stride * sizeof(float);
-            stagedMemcpy(o.dst, out_cat + out_off[i], b);
-            noteIonAlias(o.dst, out_cat + out_off[i], b);
+            const size_t skip = static_cast<size_t>(row0) * o.stride;
+            const size_t b =
+              static_cast<size_t>(m_all) * o.stride * sizeof(float);
+            float *dst = o.dst - skip;
+            const float *src = out_cat + out_off[i] - skip;
+            if (!norms->to_host)
+              sampledCopy(dst, src, b);
+            if (norms->to_host || !sampledSame(dst, src, b))
+              stagedMemcpy(dst, src, b);
+            noteIonAlias(dst, src, b);
           }
         }
       } else {
@@ -5897,8 +6029,8 @@ private:
                       uint32_t glu = 0, const float *pre_gamma = nullptr,
                       const float *post_gamma = nullptr, float eps = 0.0f,
                       const float *add_x2 = nullptr,
-                      const float *add_gamma = nullptr,
-                      float add_scale = 1.0f) {
+                      const float *add_gamma = nullptr, float add_scale = 1.0f,
+                      bool out_to_host = true) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
     const bool with_norms = pre_gamma != nullptr || post_gamma != nullptr;
@@ -5921,10 +6053,12 @@ private:
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
     const bool host_prenorm = HtpProfile::global().level() >= 2 && with_norms &&
                               !via_dspq && pre_gamma != nullptr;
-    HtpRpcBuffer &act_stage = via_dspq ? *dspq_->act
-                              : host_prenorm
-                                ? stage(act_pool_, act_bytes)
-                                : stageInput(act_pool_, act, act_bytes);
+    // from out_pool_: the post-attention rows the res_add call left there
+    // (the dense call), or the dense output the MoE call takes as act
+    HtpRpcBuffer &act_stage =
+      via_dspq       ? *dspq_->act
+      : host_prenorm ? stage(act_pool_, act_bytes)
+                     : stageInput(act_pool_, act, act_bytes, &out_pool_);
     // The post-FFN epilogue's second addend rides its own staging buffer,
     // staged before out_stage: it may be swapped in from out_pool_.
     float *x2_f32 = nullptr;
@@ -6059,7 +6193,7 @@ private:
     if (via_dspq)
       stagedMemcpy(out, out_f32, out_bytes);
     else
-      copyOutOf(out_pool_, out, out_bytes);
+      copyOutOf(out_pool_, out, out_bytes, out_to_host);
     if (host_post_norm) {
       std::vector<float> raw(out, out + static_cast<size_t>(out_len));
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(raw.data(), out, M, N_out,
@@ -6816,7 +6950,8 @@ private:
                                 bool gelu, const float *pre_gamma,
                                 const float *post_gamma, float eps,
                                 const float *up_scale, const float *gate_scale,
-                                const float *down_scale) override {
+                                const float *down_scale,
+                                bool out_to_host) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const DenseHandles &dh = get_or_register_dense(
@@ -6833,7 +6968,8 @@ private:
     }
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
                    act, out, M, K, dh.w, N, /*kind=*/1, gelu ? 1u : 0u,
-                   pre_gamma, post_gamma, eps);
+                   pre_gamma, post_gamma, eps, nullptr, nullptr, 1.0f,
+                   out_to_host);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,

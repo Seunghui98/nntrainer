@@ -57,7 +57,7 @@ QKVLayer::QKVLayer() :
             props::VFromK(), props::QScale(), props::InNorm(), props::Rope(),
             props::RopeTheta(), props::RopeScalingType(),
             props::RopePartialRotaryFactor(), nntrainer::props::MaxTimestep(),
-            props::NormInCall()) {
+            props::NormInCall(), props::OutToHost()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -134,6 +134,7 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
   q_scale = std::get<props::QScale>(qkv_props).get();
   in_norm = std::get<props::InNorm>(qkv_props).get();
   norm_in_call = std::get<props::NormInCall>(qkv_props).get();
+  out_to_host = std::get<props::OutToHost>(qkv_props).get();
   rope = std::get<props::Rope>(qkv_props).get();
   // v from the raw k projection: v's width is k's, and the raw k lands in
   // the norm scratch below, so the norm (feature_size) must be on.
@@ -444,7 +445,7 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       chunks, gammas.data(), epsilon,
       rope ? rope_table->data() + static_cast<size_t>(from) * 2 * feature_size
            : nullptr,
-      rope ? feature_size : 0u, 2u);
+      rope ? feature_size : 0u, 2u, out_to_host || rows == 1);
     return;
   }
 

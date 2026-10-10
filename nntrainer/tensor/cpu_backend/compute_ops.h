@@ -244,7 +244,7 @@ public:
     std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
     const std::vector<unsigned int> &post_chunk, const float *post_gamma,
     float eps, const float *rope_cs = nullptr, unsigned int rope_hd = 0,
-    unsigned int rope_weights = 0);
+    unsigned int rope_weights = 0, bool out_to_host = true);
 
   // The decoder block's epilogue as one accelerator call (doc 57 section
   // 5 step 4): out = scale * (resid + rmsnorm(x [+ x2]) * gamma) over M
@@ -394,12 +394,32 @@ public:
    *        accelerator call (doc 57 section 9.32). False when not taken:
    *        the caller then runs the FC and the add itself.
    */
+  /**
+   * @brief out_to_host false on gemm_qs4cx_res_add_fp32, the dense FFN, the
+   *        MoE layer call and gemm_q4_0_batch_norm_fp32 (whose reader takes
+   *        host_view): the layer says only this engine's calls read
+   *        that output at prefill, so the engine may keep it and leave the
+   *        host tensor (mostly) unwritten. A caller about to read such a
+   *        tensor on the host -- a CPU fallback -- calls sync_to_host on it
+   *        first; a no-op where the host already has it.
+   */
+  virtual void sync_to_host(void *host, size_t bytes) {
+    (void)host, (void)bytes;
+  }
+  /** @brief Where a tensor's bytes are for a host reader: the engine's own
+   *  (host-mapped) buffer when it kept them (gemm_q4_0_batch_norm_fp32 with
+   *  out_to_host false), else @a host. Valid until the engine's next call. */
+  virtual const void *host_view(const void *host, size_t bytes) {
+    (void)bytes;
+    return host;
+  }
   virtual bool gemm_qs4cx_res_add_fp32(void *w, float *w_scale,
                                        const float *act, unsigned int M,
                                        unsigned int K, unsigned int N,
                                        const float *res, const float *gamma,
-                                       float eps, float scale, float *out) {
-    (void)w;
+                                       float eps, float scale, float *out,
+                                       bool out_to_host = true) {
+    (void)w, (void)out_to_host;
     (void)w_scale;
     (void)act;
     (void)M;
@@ -429,7 +449,7 @@ public:
     unsigned int w_bits, bool gelu = false, const float *pre_gamma = nullptr,
     const float *post_gamma = nullptr, float eps = 0.0f,
     const float *add_x2 = nullptr, const float *add_gamma = nullptr,
-    float add_scale = 1.0f);
+    float add_scale = 1.0f, bool out_to_host = true);
 
   // [#85] Hands the accelerator the decode step's op list (the words of
   // htp_backend/htp_graph_desc.h, built by the model) so it can validate
@@ -719,8 +739,8 @@ public:
     bool gelu = false, const float *pre_gamma = nullptr,
     const float *post_gamma = nullptr, float eps = 0.0f,
     const float *up_scale = nullptr, const float *gate_scale = nullptr,
-    const float *down_scale = nullptr) {
-    (void)gelu;
+    const float *down_scale = nullptr, bool out_to_host = true) {
+    (void)gelu, (void)out_to_host;
     (void)pre_gamma;
     (void)post_gamma;
     (void)eps;

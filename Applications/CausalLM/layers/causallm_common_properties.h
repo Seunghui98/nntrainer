@@ -267,6 +267,18 @@ public:
   static constexpr const char *key = "proj";
 };
 
+/** out_to_host: false when every consumer of this layer's prefill output
+ *  runs on the same accelerator, so the layer's call may keep the output
+ *  there instead of copying it to the host tensor (ComputeOps's
+ *  out_to_host; residual_add with proj, dense_ffn, lfm2_moe). The model
+ *  builder decides; a decode row is always written. */
+class OutToHost : public nntrainer::Property<bool> {
+public:
+  OutToHost(bool val = true) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "out_to_host";
+};
+
 /**
  * @brief out_add: an MoE layer also takes the decoder block's post-FFN
  *        epilogue: out = scalar * (input + rmsnorm(moe + input 1) * gamma),
