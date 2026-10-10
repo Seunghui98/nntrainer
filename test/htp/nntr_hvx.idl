@@ -1326,4 +1326,16 @@ interface nntr_hvx : remote_handle64 {
    // V from the masters.
    AEEResult attn_m1_seed_kvq(in uint32 layer, in uint32 kv_handle,
                               in uint32 n_rows, in sequence<float> k_rows);
+
+   // mm_u8i4_layer_res_add over the attention's u16 output: act_u16 is
+   // M x K with a (scale, zero point) per head of act_hd columns in act_enc
+   // (the attention's out_enc), dequantized inside the quant pass (the
+   // CPU's dequant_u16_f32), so the f32 context never exists.
+   AEEResult mm_u8i4_layer_res_add_u16(in uint32 M, in uint32 K, in float eps,
+                                       in float scale, in sequence<float> gamma,
+                                       in sequence<uint32> w_handles,
+                                       in sequence<uint16> act_u16,
+                                       in sequence<float> act_enc,
+                                       in uint32 act_hd, in sequence<float> res,
+                                       rout sequence<float> out_f32);
 };
