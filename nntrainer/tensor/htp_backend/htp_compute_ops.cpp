@@ -1315,9 +1315,10 @@ public:
    * that walked 64-row blocks like hexkl_mm_u8i4_moe.c would need no cap. */
   static unsigned int fcMaxRows(unsigned int K) {
     constexpr size_t kVtcmBudget = (size_t(8) << 20) - (size_t(256) << 10);
-    constexpr size_t kSliceDouble = size_t(2) * (size_t(2) << 20);
+    // the widest handle's double buffer: fcSliceCols's slice, int4
+    const size_t slice_double = size_t(2) * fcSliceCols(K) * K / 2;
     unsigned int rows =
-      static_cast<unsigned int>((kVtcmBudget - kSliceDouble) / K);
+      static_cast<unsigned int>((kVtcmBudget - slice_double) / K);
     rows -= rows % 64u;
     return rows < 64u ? 64u : rows;
   }
@@ -6398,7 +6399,16 @@ private:
    * prompt past it needs the kernel to walk 64-row blocks the way
    * hexkl_mm_u8i4_moe.c does. */
   static unsigned int fcSliceCols(unsigned int K) {
-    constexpr unsigned int kSliceBytes = 2u << 20;
+    // 2 MiB slices, 1 MiB from K = 4096 up. The slice's double buffer is
+    // what the activation rows share VTCM with (fcMaxRows): at 2 MiB the
+    // o-proj's 4096-deep weight left 896 rows a call, two calls for a
+    // 1024-row prefill; at 1 MiB it is 1,472 and one call (the same bytes
+    // stream through VTCM in narrower slices).
+    // ponytail: K = 2816 at 1 MiB would make the qkv call one for 2048
+    // rows too (2,368 a call), but the MoE call after it then fails with
+    // AEE_ENOMEMORY on the S26 Ultra at C = 32 (DSP memory, not yet found
+    // which); the qkv call stays two calls there.
+    const unsigned int kSliceBytes = K >= 4096u ? 1u << 20 : 2u << 20;
     const unsigned int k_tiles = K / 32u;
     const unsigned int n_tiles =
       k_tiles == 0 ? 0 : (kSliceBytes / 512u) / k_tiles;
