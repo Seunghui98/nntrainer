@@ -1,4 +1,4 @@
-# S26 Ultra Gemma-4 2-bit prefill 최적화 — 인수인계 (2026-10-10)
+# S26 Ultra Gemma-4 2-bit prefill 최적화 — 인수인계 (2026-10-10, 밤 갱신)
 
 다른 Claude 세션이 이 문서만 보고 이어서 작업할 수 있도록 환경, 빌드, 설치, 실행, 측정 규칙,
 지금까지의 결과, 남은 작업을 모두 적는다. 숫자는 모두 기기 실측이다 (S26 Ultra, 2분 cool-down).
@@ -43,32 +43,38 @@ PR 4412가 업데이트되면 `git fetch upstream pull/4412/head` 후 rebase 여
 
 ## 0. 한 줄 요약
 
-- 브랜치 `htp/s26-prefill-opt` (origin = `git@github.com:Seunghui98/nntrainer.git`)에 커밋 8개.
-  base는 PR 4412 head (`nntrainer/nntrainer` pull/4412, `b398e078c`, dlwlzzero `htp_decode`).
-- 진행 중인 작업: attention의 f32↔u16 변환을 **CPU(NEON) 없이 전부 HVX(DSP)** 로 옮기기("B").
-  작업 중 코드는 커밋하지 않았고 `~/workspace/s26u_B_wip.patch`에 있다(§7).
-- 그 다음: 남은 prefill 최적화(§8), 그 다음 decode(§9).
+- 브랜치 `htp/s26-prefill-opt`에 커밋 11개 (§10). base는 PR 4412 head (`b398e078c`).
+  마지막 3개(2026-10-10 밤)가 attention 가장자리 작업의 확정분: FC 호출 u16 입력, attention f32 Q·u16
+  context를 DSP에서, NEON quant contraction off. **push는 아직 안 됨** (이 워크스테이션에 GitHub 자격증명
+  없음: `gh auth login` 또는 SSH 키 뒤 `git push origin htp/s26-prefill-opt htp/s26-prefill-handoff --force-with-lease`).
+- `htp/s26-prefill-handoff` = opt + 이 문서 + WIP 커밋 1개(qkv 패스에서 Q를 정적 scale로 u16 출력, 정확도
+  미확정, §7).
+- 그 다음: §7의 열린 질문(정확도 게이트), 남은 prefill 최적화(§8), decode(§9).
 
 ## 1. 작업 환경 (이 워크스테이션)
 
 | 항목 | 경로 / 값 |
 |---|---|
-| 저장소 | `~/workspace/nntrainer` (브랜치 `htp/s26-prefill-opt`) |
-| Hexagon SDK | `~/workspace/Hexagon_SDK/6.4.0.2` (`setup_sdk_env.source`) |
-| HexKL | `~/workspace/hxkl-beta2/hexkl_addon` (lib `6.6.0.0/armv8_android26`, DSP `hexagon_toolv19_v81`) |
-| Android NDK | `~/workspace/android-ndk-r26d` |
-| meson / python | meson 1.3.2, python 3.13 |
-| clang-format | `/usr/bin/clang-format-diff-14` (바뀐 줄만) |
-| 셸 | zsh: `$VAR`가 단어로 안 쪼개진다. 루프 인자는 `${=VAR}`나 배열, 함수 인자를 쓴다 |
+| 저장소 | `~/workspace/nntrainer` |
+| Hexagon SDK | 공용 `/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1` (이 머신엔 6.4.0.2 없음. 원래 머신은 `~/workspace/Hexagon_SDK/6.4.0.2`) |
+| HexKL | `~/workspace/hxkl-beta2/hexkl_addon` (1.0-beta.2; `qpm-cli --download-only hexagon_kl -v 1.0.0-beta2`로 받음, lib `6.6.0.0/armv8_android26`, DSP `hexagon_toolv19_v81`) |
+| Android NDK | `~/workspace/android-ndk-r26d` (dl.google.com에서 받아 풂) |
+| meson / python | meson 1.3.2, python 3.12 (pip 없음) |
+| clang-format | `~/.local/bin/clang-format-diff-14` → `~/.venv/cf`의 pip wheel 14.0.6 (sudo 없음) |
+| 셸 | bash. `setup_sdk_env.source`는 0이 아닌 값을 돌려주므로 `&&`가 아니라 `;`로 이어야 한다 |
 
 `tools/htp/env.sh`는 다른 머신 경로라 쓰지 않는다. 새 셸마다 아래를 export 한다.
 
 ```bash
 export ANDROID_NDK=$HOME/workspace/android-ndk-r26d
-export PATH=$ANDROID_NDK:$PATH
-export HEXAGON_SDK_ROOT=$HOME/workspace/Hexagon_SDK/6.4.0.2
+export PATH=$ANDROID_NDK:$HOME/.local/bin:$PATH
+export HEXAGON_SDK_ROOT=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1
 export HEXKL_ROOT=$HOME/workspace/hxkl-beta2/hexkl_addon
 ```
+`ninja -C builddir install`은 이 머신에서 gmock을 `/usr/local`에 넣으려다 실패한다:
+`ninja -C builddir && meson install -C builddir --no-rebuild --skip-subprojects`.
+**세션 하나만**: `claude --resume`으로 같은 세션이 둘 떠서 같은 트리·기기를 동시에 쓴 적이 있다(측정 오염).
+시작 전 `ps -eo pid,etime,cmd | grep -E 'claude|adb shell|run.sh'`.
 
 환경이 없는 머신이면: 위 네 디렉터리가 있는지 `ls`로 먼저 확인하고, 없으면 사용자에게 받아야 한다
 (SDK/HexKL은 Qualcomm 배포물이라 받을 수 없음). `builddir`이 없으면 §3.2로 만든다.
@@ -200,45 +206,48 @@ adb shell "cd $D/pr4412 && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH='$D/pr4412' $ENV 
 - 기기 실측 아닌 것은 "기기 미측정"이라고 쓴다. qf32 누적은 쓰지 않는다. 비교는 기기 대 기기.
 - 기기 재부팅 위험: `init_seq_len` 8192 (p4096에 2×규칙), `NNTR_MOE_PIN=2`. 하지 말 것.
 
-## 7. 지금 하던 작업: attention 변환을 전부 HVX로 (B)
+## 7. attention 가장자리 (B) — 확정분과 열린 질문
 
-**목표** (사용자 요구): attention core의 Q f32→u16, 출력 u16→f32 변환을 CPU NEON이 아니라 NPU HVX에서.
-CPU 연산 금지. 느려지면 안 됨.
+**확정 (opt 브랜치 커밋 3개, 2026-10-10 밤, 기기 실측)**
+- `7d9490881` FC 호출이 u16 activation을 받음: `hexkl_mm_opts.act_u16`, quant 패스의 pre-norm scratch에서
+  head별 `(u − zp)·scale`로 역양자화, `mm_u8i4_layer_res_add_u16`. host check 비트 동일.
+- `f5a70c4d5` attention: `attn_q2_step_fq`가 f32 Q(qkv 호출의 staging 버퍼, `ionAlias`로 복사 없이)를 받아
+  pool에서 u16로(row-major + l2fetch, 층당 1.0 ms), u16 context는 `attn_out_pool_`에 남기고 o-proj
+  (`gemm_qs4cx_res_add_fp32`)가 `attn_out16_` 레코드로 찾아 그대로 읽음. 커널·인코딩·수식 동일.
+  mha_core는 빌더가 준 `attn_out_u16`(접힌 o-proj가 HTP일 때)에서만 이 경로. `NNTR_HTP_ATTN_F32=0` 기준선,
+  `NNTR_HTP_ATTN_F32_CHECK=1` 두 경로 context 원소 비교, `=2` DSP 경로 2회(결정성).
+- `66e023786` `quant_u16_f32`(NEON)에 `#pragma clang fp contract(off)`: 두 경로 context 차이 최대 125 → 8 step.
 
-**현재 상태**: 브랜치 `htp/s26-prefill-handoff`의 WIP 커밋 (같은 내용의 패치: `~/workspace/s26u_B_wip.patch`).
-- 새 IDL 진입점 `attn_q2_step_f32` (IDL 맨 끝), skel `test/htp/nntr_hvx_attn_q.c`의 `q16_worker`
-  (pool로 Q를 u16로 미리 변환, `-DNNTR_Q16_DIAG`면 스칼라 IEEE와 비교), 커널 `hexkl_attn_q2.c`의
-  `out_f32` epilogue (worker 단계에서 역양자화), host `sdpa_q2_kvcache_f32` + `ionAlias` 레지스트리
-  (qkv 출력/attention 출력의 staging 버퍼를 다음 호출에 복사 없이 넘김), `mha_core`가 f32 경로 우선
-  (`NNTR_HTP_ATTN_F32=0`이면 기존).
-- 적용 후 IDL이 바뀌므로 stub 재생성 필수 (§3.1 (1)).
-
-**알아낸 것** (p1024, 층당):
-| 항목 | 기존 NEON | B |
+| p1024 30층 합 | NEON 기준선 | 확정분 |
 |---|---|---|
-| Q 변환 | 0.46 ms (ARM, 캐시 hot) | 1.7 ms (DSP가 f32 Q 16.8 MB를 DDR에서 다시 읽음, ~10 GB/s) |
-| 출력 변환 | 2.74 ms | epilogue +0.7 ms (worker) |
-| prefill p1024 | 2,395 ms | 2,421 ms (동률) |
-- 첫 시도(커널 qprep 안에서 Q 변환)는 qprep이 **HMX 스레드**에서 돌아 +77 ms였다 → 사전 변환으로 바꿈.
-- 정확도: B는 IEEE 정확(스칼라와 0 불일치). 기존 NEON은 앱이 `-O3 -ffast-math`(Android.mk)라
-  `x*inv + (zp+0.5)`가 FMA로 합쳐져 Q의 ~0.01%가 1단계 다르다. 그래서 B와 기존의 출력이 0.05% 다르고
-  p2048 문장 md5가 바뀐다 (`aff26409`). B가 맞는 쪽이다. 사용자는 CPU 금지이므로 B 결과를 새 기준으로 삼는다.
+| attention 호출 wall | 202 ms | 226 (DSP +40: Q 패스 30) |
+| host 변환·복사(Q 20.7, 출력 29.1, Q·출력·o-proj 입력 staging 56) | 106 | 0 |
+| mha_core accel 합 | 294 | 268 |
+| arm staging memcpy 전체 | 192 | 142 |
+| prefill p1024 | 2,514 / 2,254 | 2,201 / 2,188 |
+| prefill p2048 | 4,466 / 4,530 | 4,194 / 4,527 |
+결정성 0 불일치/146,800,640. 문장 md5 p1024 `1fd0625a`→`2ec61a41`, p2048 `bfc92564`→`aff26409`(둘 다 일관된
+요약, near-tie 토큰에서 갈림). decode TPS 변화 없음(p1024 마지막 64: 12.1–14.3).
 
-**인수인계 시점 상태 (2026-10-10 저녁)**:
-- B는 `htp/s26-prefill-handoff`의 WIP 커밋. 깨끗한 상태는 `htp/s26-prefill-opt`.
-- S26U `$D/pr4412/`에는 **커밋 상태 + B** 빌드가 설치돼 있다 (B 기본 켜짐; 끄려면 `NNTR_HTP_ATTN_F32=0`).
-  커밋 상태로 되돌리려면 B를 뺀 트리로 §3.1 빌드 후 §4 설치.
-- 마지막 A/B(p2048, 커밋 상태 + B): 끔 4,614 ms (443.9 TPS, `bfc92564`), 켬 r1은 **측정 중 S26U가 adb에서
-  사라져** 결과 없음. 다시 재야 한다 (p2048·p1024, 켬/끔 번갈아 2회).
-- 그 직전 같은 B 빌드의 p1024: 끔 2,395 / 켬 2,421 ms (PROFILE=1, 1회).
+**WIP (handoff 브랜치 `78c2ad6a1`, PR 제외): qkv 패스에서 Q를 u16로, 정적 scale**
+- `hvx_norm_rope_rows_ld_q16_f32` / `mm_u8i4_layer_norm_ld_q16`: norm+RoPE 행이 캐시에 있을 때 u16도 씀. 인코딩은
+  head 공통 정적 상한 B = √(2·hd)·max|q gamma·q_scale| (norm 뒤 원소 ≤ √hd·|gamma|, RoPE 쌍은 그 √2배).
+  mha_core는 `ComputeOps::attn_q16_enc`의 인코딩을 쓰고 Q 보정을 안 함. `QKVLayer attn_q16`(빌더가 q8+HTP일 때),
+  `NNTR_HTP_ATTN_Q16=0`이면 동적 인코딩.
+- 기기 실측: 상한/실제 범위 1.6–4.9배(Q ≥ 13비트 유지), 커널 k9 ≤ 2(창 −6..7). attention host 294→217 ms.
+  prefill p1024 2,308/2,298 → 2,228/2,368, p2048 4,515/5,066 → 4,325/4,394.
+- **정확도 미확정**이라 PR 제외. 문장이 바뀜(p2048 둘째 토큰 " l's a summary" 같은 어색한 run 있음).
+  decode teacher-forced NLL(`NNTR_PPL_DECODE`)로는 못 가름: 수치가 같은 두 동적 경로(DSP/NEON 변환)끼리도 교차 nll
+  초과가 +0.04~0.07인데 정적은 +0.03~0.09. 자기 경로 nll은 정적이 더 높음(p1024 0.419 vs 0.375, p2048 0.273 vs 0.195).
+- **열린 질문: 프롬프트 NLL 게이트.** `NNTR_PPL`은 `TieWordEmbedding` 전용. untied `lm_head`에 같은 채점을
+  붙여 봤더니(마지막 행 빼고 모든 prefill 행을 lm_head로) nll/token ≈ 13 (거의 uniform). 마지막 행은 맞다
+  (argmax = 첫 생성 토큰 "thought"), 다른 행들은 결정적이고 경로에 따라 달라지지만 다음 토큰을 못 맞춘다.
+  `skip_prefill` false, E2E 0/1 무관. 왜 마지막 행만 유효한지(어느 층이 prefill에서 마지막 행만 쓰는지)가
+  밝혀져야 정적 scale을 판정할 수 있다. 그 코드는 커밋하지 않았다(채점 루프는 `tie_word_embedding.cpp`의 것을
+  `lm_head.cpp` incremental_forwarding 끝에 그대로 옮기면 된다; 디버그 출력 `[PPL] diag …`로 행별 argmax 확인).
 
-**다음 단계 (합의됨)**: Q를 다시 읽지 않도록 **qkv FC 후처리(norm+RoPE 한 번에, `layer_norm_impl`
-→ `hvx_norm_rope_rows_ld_f32`)에서 u16 양자화**. 문제는 Q scale: `mha_core::calibrate_q2_scales`가
-첫 chunk Q의 head별 min/max(CPU)로 정한다(`q2_q_enc[2h] = range/65535`, zp = round(-lo/scale)).
-min/max도 같은 HVX 패스에서 구해야 하고(CPU 금지), 첫 chunk는 min/max가 끝나야 양자화할 수 있다.
-방안을 정해서 구현 → 결정성(F32_CHECK=2) → 기존과 번갈아 측정 → 빨라질 때만 커밋.
-출력 쪽은 o-proj 입력 양자화 단계(`res_add` → `hexkl_mm_u8i4_layer_run`의 quant)에서 u16을 바로 읽게
-하면 f32 왕복이 없어진다 (3단계).
+**다음 (B 이후 남은 CPU 연산)**: 첫 chunk의 K/V abs-max 보정(`calibrate_q2_scales`, NEON, 층당 0.4–0.8 ms)과
+qkv 출력 Q f32의 host 복사(doc 60 §3.8). 정적 scale이 채택되면 Q f32 복사는 바로 뺄 수 있다.
 
 ## 8. 남은 prefill 최적화 (S26U p1024 ≈ 2.4 s 기준, 기대 효과는 기기 미측정)
 | # | 항목 | 근거 |
@@ -269,7 +278,10 @@ D(+`NNTR_MOE_MISS_READERS=8`), miss 감시 스레드 prime 코어 고정(notice 
 | 904cc7ff3 | router norm 커널 안으로 + VTCM | router 195→156 ms |
 | 72f80829c | qkv post norm + RoPE 한 번에 | 148→97 ms |
 | 7280511bb | router VTCM 복사를 HVX 파일로 (host 빌드 수정) | router 150.6 ms |
-현재 p1024 ≈ 2.4 s (≈420 TPS), p2048 4.45–4.52 s (≈450 TPS), p4096 C24 ≈ 10.6 s.
+| 7d9490881 | FC 호출 u16 activation (quant 패스 안 역양자화) | §7 |
+| f5a70c4d5 | attention f32 Q를 DSP에서 u16로, u16 context를 o-proj에 | p1024 2,514/2,254→2,201/2,188, p2048 4,466/4,530→4,194/4,527 |
+| 66e023786 | NEON quant_u16_f32 contraction off | 두 경로 차이 125→8 step |
+현재 p1024 ≈ 2.2 s (≈465 TPS), p2048 4.2–4.5 s (≈450–490 TPS), p4096 미측정(이 작업 후). decode p1024 마지막 64 ≈ 12–14 TPS(C32).
 
 ## 11. 커밋 규칙
 
@@ -283,7 +295,8 @@ D(+`NNTR_MOE_MISS_READERS=8`), miss 감시 스레드 prime 코어 고정(notice 
 
 Co-authored-by: Claude <noreply@anthropic.com>
 Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_...
 ```
 명령:
 ```bash
