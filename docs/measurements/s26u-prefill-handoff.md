@@ -277,28 +277,65 @@ qkv 출력 Q f32의 host 복사(doc 60 §3.8). 정적 scale이 채택되면 Q f3
 - 분석해서 뺀 것: MoE 층 host "other" 169 ms는 거의 전부 router RPC(157 ms)였다. dense+router, attention+o-proj
   호출 융합은 RPC 60회 ≈ 20 ms라 보류.
 
-## 8-1. 다음: DSP 쪽 (PROFILE=2, p1024, MoE 호출 하나 25.8 ms)
-| 구간 | ms/call |
-|---|---|
-| acc read | 5.2 |
-| drain (expert weight DMA 대기, 0.9 + down 3.5) | 4.4 |
-| mm | 3.6 |
-| stage 1.25 · scatter 0.8 · quant 0.6 · dequant 0.5 · push/alloc 0.5 | 3.7 |
-| **타이머 밖** (`rest<=8791.5`) | **8.8** |
-먼저 그 8.8 ms(30층 ≈ 260 ms)가 어디인지 계측. dense 호출 5.6 ms: swiglu(hidden)·stage 1.1·mm 0.8·requant 0.8.
-router 5.2 ms/call(HVX f32, 157 ms/prefill)은 dense의 HMX 아래로 숨길 후보(풀을 같이 써서 간단하지 않음).
+## 8-1. 지금 시간이 어디 가는지 (2026-10-11, pr4412_b15, 같은 실행에서 노드·RPC 동시 측정)
 
-## 8. 남은 prefill 최적화 (S26U p1024 ≈ 2.4 s 기준, 기대 효과는 기기 미측정)
-| # | 항목 | 근거 |
+p2048 4,604 ms(프로파일 켠 실행; 평소 4,180–4,440) 기준. 노드 시간은 `NNTR_LAYER_PROFILE=1`, RPC host 시간은 `NNTR_HTP_PROFILE=1`, 같은 실행.
+
+| 노드 | p2048 ms | 안의 RPC host | 노드 − RPC (CPU 몫) |
+|---|---|---|---|
+| sparse_moe | 2,313 | MoE 1,828 + router 328 | 157 (top-k·배정표·호출 준비) |
+| attention | 724 | ≈450 (wall 15–20 ms/층 × 30) | ≈270 (CPU KV 쓰기 + Q view + transport) |
+| qkv | 643 | 484 + 117 | 42 |
+| ffn (dense) | 459 | 461 | 0 |
+| post_attention_norm (o-proj) | 372 | 295 + 87 | 0 |
+| staging memcpy | 44 | — | — |
+
+p1024(2,321 ms): moe 1,234(RPC 976+164 → CPU 94) / attention 339 / qkv 282(267) / ffn 254(256) / o-proj 163(173).
+
+**MoE 호출 하나의 DSP 분해 (PROFILE=2, ms/call)** — p1024 → p2048. M에 비례해 커지는 것은 weight DMA가 아니다.
+
+| 구간 | p1024 | p2048 |
 |---|---|---|
-| 7 | MoE 남은 대기 + HVX 8개 맞춤 (acc_tiles, DN ring, 2-bit expand) | drain_dn 3.5 ms/call, worker 40%만 사용 |
-| 4 | attention 주변 (Q·출력 변환은 §7, KV 쓰기 28 ms, 버퍼 재할당 11 ms) | ATTN_TRACE |
-| 5 | attention softmax 64 ms | ATTN_TRACE |
-| 6′ | staging 복사 제거 (qkv 출력 1.0 GB 56 ms, o-proj residual/out 27 ms, attention out 28 ms) | PROFILE staging at |
-| 9 | p4096을 chunk 1개(init 4096)로 | chunk마다 expert 재읽기 |
-| 15 | 첫 토큰 KV seed(p4096 2.0 s)를 prefill 뒤로 숨기기 | t1 kv_seed_rpc_ms |
-| — | router fp16 HMX (정확도 trade-off, 사용자 결정 필요) | logits 4.07 ms/call, IEEE sf 처리량이 한계 |
-해 봤는데 효과 없음: staging memcpy를 4스레드로 (느려짐), router 행 블록 4→6, DCVS MAX corner(2112 MHz 그대로).
+| **타이머 밖** (`rest<=`) | **9.2** | **16.5** |
+| acc read (HMX 완료 대기 포함; HexKL micro는 int32 누산기 1개) | 5.3 | 8.5 |
+| drain_dn (down 2-bit 확장 job 대기) | 3.75 | 7.5 |
+| drain (gate_up) | 0.93 | 0.95 |
+| mm (HMX issue) | 3.65 | 5.9 |
+| stage (act 복사 + out memset + out 복사) | 1.25 | 2.5 |
+| scatter / quant / dequant | 0.9 / 0.64 / 0.57 | 2.1 / 1.06 / 1.05 |
+| alloc (scratch 재확보) | 0.19 | 1.8 |
+| DSP 합계 / host / transport(host−dsp) | 26.75 / 28.1 / 1.3 | 48.3 / 51.6 / **3.2** |
+| 64행 블록 수 → 채움률 | 198 → 65 % | 320 → 80 % |
+
+dense 호출(p2048) 10.2 ms: mm 1.6, stage 2.2, acc 2.0, requant 1.5, dequant 1.06, quant 0.76, scatter 0.39; transport 1.8.
+attention 호출(p2048 sliding 층, window 1024) DSP 12.3 ms: append(KV quant 1.96 + bake 1.8) 3.8, q16 1.45, kernel 8.5(qk 3.2, **softmax 5.5**, pv 1.4, wait 1.0); wall 15.1 → transport 2.8. full 층(hd 512) 15–20 ms. 0층·5층 노드는 +25/+42 ms(첫 호출 calibration·할당).
+t1(첫 토큰) KV seed: p2048 1,055 ms, p4096 2,137 ms — 30층 K/V f32(1 GB)를 non-ION `std::vector`로 보낸다. `NNTR_HTP_KV_SEED_Q=1`은 773 ms지만 **문장이 깨진다**(p2048 빈 출력, p1024 반복) — 쓰지 말 것.
+
+## 8. 남은 prefill 최적화 후보 (2026-10-11 재분석; 기대 효과는 모두 기기 미측정, p2048 ≈ 4,400 ms 기준)
+
+비트 동일 조건을 만족하는 것만 opt에 들어간다(§7-1). 순서 = 기대 효과 × 확실성 ÷ 노력.
+
+| # | 항목 | 근거 (p2048) | 기대 | 첫 걸음 |
+|---|---|---|---|---|
+| 1 | **MoE 타이머 밖 16.5 ms/call** | rest 500 ms(11 %), M에 비례 | 모름(가장 큰 미설명 덩어리) | fg 스레드 타임라인 프로브(블록 루프 밖·pool submit/wait·pack 대기) |
+| 2 | **MoE drain_dn 7.5 ms/call** | 225 ms(5 %), M에 비례 → DMA가 아니라 **background lane FIFO에서 2-bit 확장 job이 pack 유닛 뒤에 선다** | −150~−225 | 확장 전용 lane 또는 pack을 fg worker로; 겸해서 "행을 한 번만 양자화 + u8 gather"(pack 바이트 4분의 1, 비트 동일) |
+| 3 | **FastRPC 캐시 유지보수 (transport)** | staging pool은 cached ION(`HTP_RPC_FLAGS_DEFAULT`) → 호출마다 in/out 46 MB flush/invalidate: MoE 3.2 + dense 1.8 ms/call = 155 ms; attention wall−dsp 2.8 ms/call = 84 ms; qkv·o-proj·router 미계측 | −250~−400 | pool을 weight arena처럼 `fastrpc_mmap` 1회 매핑·uncached로, host가 읽는 창(sampled 2 KB, K/V view)만 DMA_BUF sync. env 플래그로 한 shape 먼저 |
+| 4 | **t1 KV seed 1.06 s (p4096 2.1 s)** — TTFT | f32 K/V 1 GB를 non-ION vector로 전송 | TTFT −0.8~−1.0 s(p2048), −2 s(p4096); prefill TPS 무관 | (a) seed 행을 ION staging으로(비트 동일, 반나절) (b) prefill attention 호출 안에서 DSP가 가진 f32 K/V로 decode 캐시를 바로 채우기(CPU 캐시는 UINT16 저장이라 f32→f16→f32 RNE를 똑같이 — `compute_fp32_to_fp16`과 비트 비교 필요); (b)면 #6도 같이 사라짐 |
+| 5 | **attention softmax 5.5 ms/call + append 3.8** | softmax 168 ms(4 %; 25M 점수를 4.6 G/s), KV quant+bake 114 ms | −150~−250 | softmax 커널 pcycle 프로파일(이론 5× 여유); KV int8 타일을 qkv 호출 epilogue에서 바로 내기(같은 양자화기 → 비트 동일) |
+| 6 | **CPU KV 캐시 쓰기** | attention 노드 host 몫 ≈ 5 ms/층 = 150 ms(3.5 %); t1 seed와 NEON fallback만 읽음 | −150 | #4(b) 뒤에 `NNTR_HTP_KV_DROP_CPU`에서 쓰기 자체를 생략 |
+| 7 | **MoE 노드 CPU 157 ms** | router softmax·top-k·배정표가 CPU | −100 | `buildExpertAssignments` 스레딩 확인; router RPC가 top-k 결과(2048×8)만 돌려주기 — 선택 규칙이 CPU와 비트 동일한지(`m1_ops_det.h`) md5로 확인 |
+| 8 | **router 328 ms** | 138 GFLOP/s ≈ HVX f32 추정 피크의 26 %; 이론 ~3 ms vs 10.9 ms/call | −100~−150 | 커널 stall 프로파일(행당 scalar splat 의심). dense 호출에 넣어 숨기기는 dense가 이미 HVX 80 %라 RPC 1회·23 MB 읽기 1회(≈60 ms)만 남음. fp16 HMX router = 정확도 변경, 사용자 결정 |
+| 9 | **dense 461 ms** | mm 1.6 of 10.2; 3조각(704×3) pseudo-expert로 돌아 out에 3번 scatter RMW(23 MB씩) + memset | −60~−100 | 첫 조각은 memset 없이 바로 쓰기; stage 복사(#10)와 함께 |
+| 10 | **MoE stage 2.5 + alloc 1.8 ms/call** | 78 + 56 ms(3 %); alloc은 p1024 0.19 → p2048 1.8: `n_slots_cap` 상한이 호출마다 넘어 재확보 | −80~−130 | reserve를 M·top_k 최대로 1회; act_f32를 scan이 ION에서 직접 읽고 out을 바로 쓰는지 검토(`moe_dma_copy` 이유 확인 먼저) |
+| 11 | **FC(qkv/o-proj) HMX 효율** | qkv 2.5, o-proj 2.1 TMAC/s vs MoE ≈ 4.4; qkv f32 출력 67 MB/층을 DDR에 쓰고 attention이 다시 읽음 | −150~−300 | PROFILE=2에서 `_timed` FC 엔트리 쓰게 해 분해부터; Q u16(enc는 calibration 뒤 고정)·K/V int8을 qkv epilogue에서 바로 내기 |
+| 12 | p4096 chunk 1개 | expert 스트리밍·확장 2회, seed 2.1 s | −150~−300 of 9,246 | config `init_seq_len` 4096 + DSP scratch 확인 |
+| 13 | 첫 층 calibration·할당 | 0층 +25, 5층 +42 ms | −65 | prefill 사이에 재사용 |
+| 14 | RPC 횟수(6/층) | 고정비 ≈ 0.2 ms × 180 = 40 ms | −20 | #3 뒤에만 의미 |
+| — | MoE acc read 8.5 ms/call | HexKL micro int32 누산기 1개 → tile마다 issue→read 직렬; down은 read당 MAC 22개 | 라이브러리 한계 | 보류 |
+| — | HMX 64행 패딩(p1024 35 %, p2048 20 %) | HVX tail은 패딩된 HMX 블록보다 느림 | 구조적 | 보류 |
+
+해 봤는데 효과 없음(이전): staging memcpy 4스레드, router 행 블록 4→6, DCVS MAX corner. 쓰면 안 됨: `NNTR_HTP_KV_SEED_Q=1`(문장 깨짐), `NNTR_MOE_SPLIT`(기준에서도 깨짐).
+전부 들어가면 p2048 ≈ 1.0–1.5 s 감소(≈ 570–700 TPS)가 상한 추정이고, 절반이 현실적이다 — 기기 미측정.
 
 ## 9. decode (prefill 다음)
 p1024 C32 토큰당 ~70 ms. miss 대기가 최대. env 조합 측정 일부: A 기준 13.01 TPS(마지막 64) /
