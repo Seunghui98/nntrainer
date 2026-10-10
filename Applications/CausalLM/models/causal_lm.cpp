@@ -332,7 +332,11 @@ void CausalLM::registerOutputs(
   for (size_t b = 0; b < ids.size(); ++b) {
     if (!eos_list[b]) {
       pending_ids_.push_back(static_cast<int>(ids[b]));
-      ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
+      // prompt + num_to_generate == max_seq_len puts the last token at
+      // pos == MAX_SEQ_LEN, one past the row; it is never fed back, so it
+      // stays out of the history instead of writing into the next block
+      if (pos < MAX_SEQ_LEN)
+        ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
       std::string decoded_str = tokenizer->Decode(pending_ids_);
 
       if (decoded_str.empty()) {
