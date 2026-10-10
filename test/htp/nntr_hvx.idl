@@ -1317,4 +1317,13 @@ interface nntr_hvx : remote_handle64 {
                                           rout sequence<uint32> h_gu,
                                           rout sequence<uint32> h_dn,
                                           rout uint32 n_done, rout int32 err);
+
+   // [#289] Seeds attn_m1's int8 cache layer (HTP_ATTN_KV_CACHE_B names
+   // the second cache) with rows [0, n_rows) of the prefill's fixed-scale
+   // int8 cache kv_handle (attn_q2's masters, moved as they are, and its
+   // scales), then releases kv_handle. k_rows non-empty ([n_rows][n_kv]
+   // [head_dim] f32): K comes from them at attn_m1's per-dim scales, only
+   // V from the masters.
+   AEEResult attn_m1_seed_kvq(in uint32 layer, in uint32 kv_handle,
+                              in uint32 n_rows, in sequence<float> k_rows);
 };

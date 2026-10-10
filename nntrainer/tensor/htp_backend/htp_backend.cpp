@@ -155,14 +155,33 @@ void *HtpBackend::alloc_shared(size_t bytes) {
     ml_logw("rpcmem_alloc(%zu bytes) failed; this buffer stays on the heap "
             "and FastRPC copies it per call",
             bytes);
+  } else {
+    std::lock_guard<std::mutex> lock(shared_mu_);
+    shared_.insert(block);
   }
   return block;
 }
 
 void HtpBackend::free_shared(void *block) {
-  if (block) {
-    HtpRpcMemApi::get().free_(block);
+  if (!block)
+    return;
+  {
+    std::lock_guard<std::mutex> lock(shared_mu_);
+    if (dropped_.erase(block) != 0)
+      return; // [#289] drop_shared freed it
+    shared_.erase(block);
   }
+  HtpRpcMemApi::get().free_(block);
+}
+
+void HtpBackend::drop_shared(void *block) {
+  {
+    std::lock_guard<std::mutex> lock(shared_mu_);
+    if (!block || shared_.erase(block) == 0)
+      return;
+    dropped_.insert(block);
+  }
+  HtpRpcMemApi::get().free_(block);
 }
 
 HtpBackend::~HtpBackend() {
