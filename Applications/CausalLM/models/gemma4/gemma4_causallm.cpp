@@ -768,6 +768,11 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   if (ATTENTION_K_EQ_V && !is_sliding)
     qkv_params.push_back(withKey("v_from_k", "true"));
+  // q left as u16 on the accelerator for the attention core's q8 step,
+  // when the two run there together (see attn_out_u16 below)
+  if (ATTENTION_KV_DTYPE == "q8" && ATTENTION_ENGINE == "htp" &&
+      engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp")
+    qkv_params.push_back(withKey("attn_q16", "true"));
   appendSkipPrefillIfNeeded(qkv_params, is_kv_shared_layer);
   LayerHandle qkv(createLayer("qkv_layer", qkv_params));
   Tensor qkv_out = qkv(query);

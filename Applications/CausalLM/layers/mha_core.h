@@ -464,10 +464,12 @@ private:
   void release_quantized_cache();
 
   /** @brief Fills q2_scale_* from the first rows (see the members). */
+  /** @param q_enc_fixed non-null: Q's (scale, zp) per head as given (the
+   *  accelerator's u16 Q, ComputeOps::attn_q16_enc) instead of measured */
   void calibrate_q2_scales(const uint16_t *k_rows, const uint16_t *v_rows,
                            unsigned int n_rows, unsigned int kv_stride,
                            const float *q, unsigned int q_stride,
-                           unsigned int n_q);
+                           unsigned int n_q, const float *q_enc_fixed);
 
   /**
    * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the

@@ -1380,15 +1380,13 @@ public:
 
   bool supports_gemm_q4_0_batch_norm_fp32() const override { return true; }
 
-  void gemm_q4_0_batch_norm_fp32(std::vector<void *> matAdata,
-                                 std::vector<float *> matAscale,
-                                 float *matBdata, std::vector<float *> matCdata,
-                                 unsigned int M, std::vector<unsigned int> N,
-                                 unsigned int K, const float *pre_gamma,
-                                 const std::vector<unsigned int> &post_chunk,
-                                 const float *post_gamma, float eps,
-                                 const float *rope_cs, unsigned int rope_hd,
-                                 unsigned int rope_weights) override {
+  void gemm_q4_0_batch_norm_fp32(
+    std::vector<void *> matAdata, std::vector<float *> matAscale,
+    float *matBdata, std::vector<float *> matCdata, unsigned int M,
+    std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
+    const std::vector<unsigned int> &post_chunk, const float *post_gamma,
+    float eps, const float *rope_cs, unsigned int rope_hd,
+    unsigned int rope_weights, float q16_bound) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const size_t n = matAdata.size();
@@ -1399,6 +1397,13 @@ public:
         "gemm_q4_0_batch_norm_fp32: one post_chunk / scale per weight, "
         "rope on a prefix of them");
     }
+    // The u16 Q: weight 0 normed and rotated, M > 1 (decode's row takes
+    // another path), one encoding from the caller's bound.
+    const bool q16 = q16_bound > 0.0f && M > 1 && rope_hd != 0 &&
+                     rope_weights >= 1 && !post_chunk.empty() &&
+                     post_chunk[0] != 0 && N[0] % rope_hd == 0 &&
+                     rope_hd % 64 == 0;
+    attn_q16_.host = nullptr;
     // Every weight as the column slices gemm_q4_0_accel_fp32 would make
     // of it (a 2816 x 4096 weight does not fit the VTCM double buffer
     // whole), all of them one call: handle by handle, the slice's chunk
@@ -1445,6 +1450,24 @@ public:
     norms.eps = eps;
     norms.rope_hd = rope_hd;
     norms.rope_handles = rope_slices;
+    uint16_t *q16_buf = nullptr;
+    if (q16) {
+      const size_t q16_bytes = static_cast<size_t>(M) * N[0] * sizeof(uint16_t);
+      q16_buf =
+        reinterpret_cast<uint16_t *>(stage(attn_q_pool_, q16_bytes).data());
+      norms.q16_slices = static_cast<unsigned int>(
+        get_or_register_fc(matAdata[0], session, K, N[0],
+                           matAscale.empty() ? nullptr : matAscale[0])
+          .handles.size());
+      const float scale = 2.0f * q16_bound / 65535.0f;
+      norms.q_inv = 1.0f / scale;
+      norms.q_zp = 32768.0f;
+      attn_q16_.enc.assign(2 * static_cast<size_t>(N[0] / rope_hd), 0.0f);
+      for (size_t h = 0; h < attn_q16_.enc.size() / 2; ++h) {
+        attn_q16_.enc[2 * h] = scale;
+        attn_q16_.enc[2 * h + 1] = 32768.0f;
+      }
+    }
     // Both norms and the RoPE are per row, so the row chunks
     // gemm_q4_0_batch_fp32 makes for VTCM carry them unchanged (the table
     // rows advance with the activation rows).
@@ -1466,10 +1489,28 @@ public:
                      bytes);
         norms.rope_cs = cs;
       }
+      if (q16) {
+        norms.q_u16 = q16_buf + static_cast<size_t>(m0) * N[0];
+        norms.q_u16_len = static_cast<int>(m * N[0]);
+      }
       invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
                   matBdata + static_cast<size_t>(m0) * K, nullptr, m, n_total,
                   K, nullptr, nullptr, &norms, &rows);
     }
+    if (q16) {
+      attn_q16_.host = matCdata[0];
+      attn_q16_.ion = q16_buf;
+      attn_q16_.rows = M;
+      attn_q16_.width = N[0];
+    }
+  }
+
+  const float *attn_q16_enc(const float *q, unsigned int rows,
+                            unsigned int stride) override {
+    return attn_q16_.host == q && attn_q16_.rows == rows &&
+               attn_q16_.width == stride
+             ? attn_q16_.enc.data()
+             : nullptr;
   }
 
   // The block epilogue (see the base declaration): the residual rides the
@@ -4441,6 +4482,17 @@ private:
     std::vector<float> enc;
   } attn_out16_;
 
+  /** @brief Its twin on the way in: the u16 Q the fused projection call
+   *  left in attn_q_pool_ for the attention step (gemm_q4_0_batch_norm_fp32
+   *  -> attn_q16_enc / sdpa_q2_kvcache_f32), with the one encoding every
+   *  head shares. */
+  struct AttnQ16 {
+    const float *host = nullptr;
+    const uint16_t *ion = nullptr;
+    unsigned int rows = 0, width = 0;
+    std::vector<float> enc;
+  } attn_q16_;
+
   /** @brief The one FastRPC layer call both accelerated entries make.
    *
    *  Under NNTR_HTP_PROFILE >= 2 it goes through mm_u8i4_layer_timed so the
@@ -4516,6 +4568,12 @@ private:
     const float *rope_cs = nullptr; /**< M rows of 2*rope_hd, or nullptr */
     unsigned int rope_hd = 0;       /**< 0: no RoPE */
     unsigned int rope_handles = 0;  /**< the handles rotated, a prefix */
+    /** q16_slices > 0: the first q16_slices handles' rows also as u16
+     *  into q_u16 (M x their ld), x * q_inv + (q_zp + 0.5) truncated. */
+    unsigned int q16_slices = 0;
+    float q_inv = 0.0f, q_zp = 0.0f;
+    uint16_t *q_u16 = nullptr;
+    int q_u16_len = 0;
     bool any() const { return pre_gamma || post_chunk || rope_hd; }
   };
 
@@ -4577,17 +4635,26 @@ private:
       const int cs_len =
         norms->rope_hd ? static_cast<int>(M * 2 * norms->rope_hd) : 0;
       const int err =
-        slices ? nntr_hvx_mm_u8i4_layer_norm_ld(
-                   session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
-                   chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
-                   norms->rope_handles, norms->rope_cs, cs_len, handles,
-                   num_handles, out_off.data(), num_handles, out_ld.data(),
-                   num_handles, act_f32, act_len, out_cat, out_len)
-               : nntr_hvx_mm_u8i4_layer_norm(
-                   session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
-                   chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
-                   norms->rope_handles, norms->rope_cs, cs_len, handles,
-                   num_handles, act_f32, act_len, out_cat, out_len);
+        slices && norms->q16_slices
+          ? nntr_hvx_mm_u8i4_layer_norm_ld_q16(
+              session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+              chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+              norms->rope_handles, norms->rope_cs, cs_len, handles, num_handles,
+              out_off.data(), num_handles, out_ld.data(), num_handles, act_f32,
+              act_len, out_cat, out_len, norms->q16_slices, norms->q_inv,
+              norms->q_zp, norms->q_u16, norms->q_u16_len)
+        : slices
+          ? nntr_hvx_mm_u8i4_layer_norm_ld(
+              session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+              chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+              norms->rope_handles, norms->rope_cs, cs_len, handles, num_handles,
+              out_off.data(), num_handles, out_ld.data(), num_handles, act_f32,
+              act_len, out_cat, out_len)
+          : nntr_hvx_mm_u8i4_layer_norm(
+              session, M, K, norms->eps, norms->pre_gamma, pre_len, chunk,
+              chunk_len, norms->post_gamma, post_gamma_len, norms->rope_hd,
+              norms->rope_handles, norms->rope_cs, cs_len, handles, num_handles,
+              act_f32, act_len, out_cat, out_len);
       const uint64_t elapsed = HtpProfile::nowUs() - t0;
       if (err != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_norm failed: err=" +
@@ -8917,12 +8984,22 @@ public:
     // Q as the qkv call left it (f32, straight from that call's staging
     // buffer when it still holds it; the DSP's pool quantizes), the u16
     // context left in its buffer for the o-proj: no ARM pass either way.
-    const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
-    const float *q_ion = static_cast<const float *>(ionAlias(q, q_bytes));
-    if (!q_ion) {
-      float *b = reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
-      stagedMemcpy(b, q, q_bytes);
-      q_ion = b;
+    // Or already u16: the qkv call quantized it into attn_q_pool_ with the
+    // encoding the caller took from attn_q16_enc.
+    const uint16_t *q16 = attn_q16_.host == q && attn_q16_.rows == n_q &&
+                              attn_q16_.width == q_stride
+                            ? attn_q16_.ion
+                            : nullptr;
+    const float *q_ion = nullptr;
+    if (!q16) {
+      const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
+      q_ion = static_cast<const float *>(ionAlias(q, q_bytes));
+      if (!q_ion) {
+        float *b =
+          reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
+        stagedMemcpy(b, q, q_bytes);
+        q_ion = b;
+      }
     }
     const size_t out_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
     uint16_t *out_ion =
@@ -8936,11 +9013,19 @@ public:
                 "written); check attn_out_u16 against the o-proj's engine");
       }
     }
-    const int err = nntr_hvx_attn_q2_step_fq(
-      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
-      rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
-      q_inv, static_cast<int>(n_head_q), q_enc, enc_len, out_enc, enc_len,
-      out_ion, q_len, stats, 12);
+    const int err =
+      q16 ? nntr_hvx_attn_q2_step(h, static_cast<uint32_t>(handle), append_row0,
+                                  k_rows, rows_len, v_rows, rows_len, n_q,
+                                  cache_from, cache_to, n_head_q, window, q16,
+                                  q_len, q_enc, enc_len, out_enc, enc_len,
+                                  out_ion, q_len, stats, 12)
+          : nntr_hvx_attn_q2_step_fq(
+              h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len,
+              v_rows, rows_len, n_q, cache_from, cache_to, n_head_q, window,
+              q_ion, q_len, q_inv, static_cast<int>(n_head_q), q_enc, enc_len,
+              out_enc, enc_len, out_ion, q_len, stats, 12);
+    if (q16)
+      attn_q16_.host = nullptr;
     if (err == AEE_SUCCESS) {
       attn_out16_.host = out;
       attn_out16_.ion = out_ion;

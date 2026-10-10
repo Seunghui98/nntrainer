@@ -1343,6 +1343,28 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<uint16> out_u16,
                              rout sequence<uint32> stats_us);
 
+   // mm_u8i4_layer_norm_ld, and the first q16_slices handles' rows (the Q
+   // projection's column slices, normed and rotated) also written as u16
+   // into q_u16 (M x out_ld[0], the slices at their column offsets) with
+   // one encoding, x * q_inv + (q_zp + 0.5) truncated (quant_u16_f32): the
+   // attention step's Q, made while the row is in cache. The encoding is
+   // the caller's static bound (sqrt(2 hd) max |q gamma|), no pass over Q
+   // precedes it.
+   AEEResult mm_u8i4_layer_norm_ld_q16(in uint32 M, in uint32 K, in float eps,
+                                       in sequence<float> pre_gamma,
+                                       in sequence<uint32> post_chunk,
+                                       in sequence<float> post_gamma,
+                                       in uint32 rope_hd, in uint32 rope_handles,
+                                       in sequence<float> rope_cs,
+                                       in sequence<uint32> w_handles,
+                                       in sequence<uint32> out_off,
+                                       in sequence<uint32> out_ld,
+                                       in sequence<float> act_f32,
+                                       rout sequence<float> out_cat,
+                                       in uint32 q16_slices, in float q_inv,
+                                       in float q_zp,
+                                       rout sequence<uint16> q_u16);
+
    // mm_u8i4_layer_res_add over the attention's u16 output: act_u16 is
    // M x K with a (scale, zero point) per head of act_hd columns in act_enc
    // (the attention's out_enc), dequantized inside the quant pass (the

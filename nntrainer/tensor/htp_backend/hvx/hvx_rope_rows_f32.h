@@ -55,4 +55,19 @@ int hvx_norm_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
                               uint32_t hd, const float *cs,
                               hvx_worker_pool *pool);
 
+/**
+ * @brief hvx_norm_rope_rows_ld_f32, and each row also written as u16 to
+ *        y16 (ld16 elements a row): x * q_inv + (q_zp + 0.5), clamped to
+ *        [0, 65535], truncated -- the CPU's quant_u16_f32 and the attention
+ *        kernel's Q -- while the row is still in cache. One encoding for
+ *        every head: the caller's static bound on the normed, rotated row
+ *        (sqrt(2 hd) * max |gamma|), so no pass over the rows precedes it.
+ * @param n   a multiple of 64 (two u16 vectors a pair of f32 vectors)
+ */
+int hvx_norm_rope_rows_ld_q16_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                                  uint32_t chunk, const float *gamma, float eps,
+                                  uint32_t hd, const float *cs, uint16_t *y16,
+                                  uint32_t ld16, float q_inv, float q_zp,
+                                  hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_ROPE_ROWS_F32_H__ */

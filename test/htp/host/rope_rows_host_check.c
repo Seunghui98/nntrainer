@@ -122,8 +122,58 @@ static int run_fused(uint32_t M, uint32_t n, uint32_t ld, uint32_t chunk,
   return !same;
 }
 
+/* The q16 variant: the f32 rows as the fused pass leaves them, and the u16
+   rows as quant_u16_f32 (x * inv + (zp + 0.5), clamp, truncate) of those,
+   lane for lane. A mutant inv must differ. */
+static int run_q16(uint32_t M, uint32_t n, uint32_t ld, uint32_t chunk,
+                   uint32_t hd) {
+  const size_t len = (size_t)M * ld;
+  float *a = malloc(sizeof(float) * len), *b = malloc(sizeof(float) * len);
+  float *g = malloc(sizeof(float) * chunk),
+        *cs = malloc(sizeof(float) * M * 2u * hd);
+  uint16_t *y = malloc(sizeof(uint16_t) * M * n);
+  unsigned s = 11u + M + n;
+  for (size_t i = 0; i < len; ++i) {
+    s = s * 1664525u + 1013904223u;
+    a[i] = b[i] = ((float)((s >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 8.0f;
+  }
+  for (uint32_t i = 0; i < chunk; ++i)
+    g[i] = 1.0f + (float)(i % 7u) * 0.01f;
+  for (uint32_t i = 0; i < M * 2u * hd; ++i)
+    cs[i] = cosf(0.37f * (float)i);
+  const float inv = 65535.0f / (2.0f * 24.0f), zp = 32768.0f;
+  const int r0 =
+    hvx_norm_rope_rows_ld_f32(a, M, n, ld, chunk, g, 1e-6f, hd, cs, NULL);
+  const int r1 = hvx_norm_rope_rows_ld_q16_f32(b, M, n, ld, chunk, g, 1e-6f, hd,
+                                               cs, y, n, inv, zp, NULL);
+  int same = r0 == 0 && r1 == 0 && memcmp(a, b, sizeof(float) * len) == 0;
+  size_t bad = 0;
+  for (uint32_t r = 0; r < M; ++r)
+    for (uint32_t j = 0; j < n; ++j) {
+      float v = a[(size_t)r * ld + j] * inv + (zp + 0.5f);
+      v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+      bad += (uint16_t)v != y[(size_t)r * n + j];
+    }
+  same = same && bad == 0;
+  const int r2 = hvx_norm_rope_rows_ld_q16_f32(b, M, n, ld, chunk, g, 1e-6f, hd,
+                                               cs, y, n, inv * 1.5f, zp, NULL);
+  size_t mut = 0;
+  for (uint32_t r = 0; r < M && r2 == 0; ++r)
+    for (uint32_t j = 0; j < n; ++j) {
+      float v = a[(size_t)r * ld + j] * inv + (zp + 0.5f);
+      v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+      mut += (uint16_t)v != y[(size_t)r * n + j];
+    }
+  printf("norm+rope+q16 M=%u n=%u hd=%u: %s (u16 mismatches %zu, mutant %zu)\n",
+         M, n, hd, same ? "bit-identical" : "DIFFERENT", bad, mut);
+  free(a), free(b), free(g), free(cs), free(y);
+  return !same || mut == 0;
+}
+
 int main(void) {
   int fail = 0;
+  fail |= run_q16(7, 4096, 8192, 256, 256); /* sliding q, the qkv rows */
+  fail |= run_q16(4, 1024, 1024, 512, 512); /* full */
   fail |= run(7, 4096, 256, 256, 0);   /* sliding: 16 heads of 256 */
   fail |= run(5, 2048, 256, 256, 500); /* k: 8 heads, later positions */
   fail |= run(4, 1024, 512, 128, 3);   /* full: hd 512, partial 0.25 */

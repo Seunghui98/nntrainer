@@ -68,6 +68,19 @@ public:
   static constexpr const char *key = "v_from_k";
 };
 
+/** attn_q16: the accelerator's fused projection call also leaves q as u16
+ *  for the attention core's quantized-cache step, encoded with the bound
+ *  sqrt(2 feature_size) * max |q gamma * q_scale| (a normed row's element
+ *  cannot exceed sqrt(feature_size) * gamma, RoPE's pair at most sqrt 2 of
+ *  that). The model builder sets it when the attention core runs its q8
+ *  cache on the same accelerator. */
+class AttnQ16 : public nntrainer::Property<bool> {
+public:
+  AttnQ16(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "attn_q16";
+};
+
 /** q_scale: multiplied into q after its norm (folded into the gamma
  *  multiply), e.g. sqrt(head_dim) for a model whose attention scaling is
  *  1.0 against a core that divides by sqrt(head_dim) */
@@ -211,7 +224,7 @@ private:
              nntrainer::props::Epsilon, props::VNorm, props::VFromK,
              props::QScale, props::InNorm, props::Rope, props::RopeTheta,
              props::RopeScalingType, props::RopePartialRotaryFactor,
-             nntrainer::props::MaxTimestep, props::NormInCall>
+             nntrainer::props::MaxTimestep, props::NormInCall, props::AttnQ16>
     qkv_props;
   std::array<unsigned int, 6>
     weight_idx; /**< [in_gamma,] q, [q_gamma,] k, [k_gamma,] v */
@@ -219,6 +232,7 @@ private:
     tensor_idx; /**< q, k (and v) before the norm; the normed input */
   bool in_norm = false;
   bool norm_in_call = true; /**< props::NormInCall */
+  bool attn_q16 = false;    /**< props::AttnQ16 */
   unsigned int feature_size = 0;
   bool v_norm = false;
   bool v_from_k = false;

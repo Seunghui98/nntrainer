@@ -445,6 +445,24 @@ int hvx_norm_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
   return hvx_rope_rows_ld_f32(x, M, n, ld, hd, cs, pool);
 }
 
+int hvx_norm_rope_rows_ld_q16_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                                  uint32_t chunk, const float *gamma, float eps,
+                                  uint32_t hd, const float *cs, uint16_t *y16,
+                                  uint32_t ld16, float q_inv, float q_zp,
+                                  hvx_worker_pool *pool) {
+  if (!y16 || ld16 < n || n % 64u != 0u || !(q_inv > 0.0f) ||
+      hvx_norm_rope_rows_ld_f32(x, M, n, ld, chunk, gamma, eps, hd, cs, pool))
+    return -1;
+  /* quant_u16_f32: x * inv + (zp + 0.5), clamped, truncated */
+  for (uint32_t r = 0; r < M; ++r)
+    for (uint32_t j = 0; j < n; ++j) {
+      float v = x[(size_t)r * ld + j] * q_inv + (q_zp + 0.5f);
+      v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+      y16[(size_t)r * ld16 + j] = (uint16_t)v;
+    }
+  return 0;
+}
+
 /* out = scale * (res + rmsnorm(x [+ x2]) * gamma), one row at a time */
 static void norm_add_row(float *out, const float *res, const float *x,
                          const float *x2, uint32_t n, const float *gamma,

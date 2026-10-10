@@ -57,7 +57,7 @@ QKVLayer::QKVLayer() :
             props::VFromK(), props::QScale(), props::InNorm(), props::Rope(),
             props::RopeTheta(), props::RopeScalingType(),
             props::RopePartialRotaryFactor(), nntrainer::props::MaxTimestep(),
-            props::NormInCall()) {
+            props::NormInCall(), props::AttnQ16()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -134,6 +134,7 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
   q_scale = std::get<props::QScale>(qkv_props).get();
   in_norm = std::get<props::InNorm>(qkv_props).get();
   norm_in_call = std::get<props::NormInCall>(qkv_props).get();
+  attn_q16 = std::get<props::AttnQ16>(qkv_props).get();
   rope = std::get<props::Rope>(qkv_props).get();
   // v from the raw k projection: v's width is k's, and the raw k lands in
   // the norm scratch below, so the norm (feature_size) must be on.
@@ -436,6 +437,26 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     NNTR_THROW_IF(rope && from + rows > rope_rows, std::runtime_error)
       << "qkv_layer: rows " << from << ".." << from + rows
       << " past the RoPE table's " << rope_rows;
+    // The u16 q's bound (props::AttnQ16): |q_d| <= sqrt(hd) |gamma_d| after
+    // the norm, a rotated pair at most sqrt 2 of the larger. Measured on
+    // Gemma-4 26B-A4B it is 1.6-4.9x the rows' actual range, so the u16
+    // keeps >= 13 bits against the cache's 8.
+    // NNTR_HTP_ATTN_F32=0 keeps the attention core's own (measured)
+    // encoding and ARM conversions, the A/B baseline, and NNTR_HTP_ATTN_Q16=0
+    // only the measured encoding (the core converts on the DSP): no u16 q
+    // from here either way.
+    static const bool q16_off = [] {
+      const char *v = std::getenv("NNTR_HTP_ATTN_F32");
+      const char *w = std::getenv("NNTR_HTP_ATTN_Q16");
+      return (v != nullptr && std::strcmp(v, "0") == 0) ||
+             (w != nullptr && std::strcmp(w, "0") == 0);
+    }();
+    float q16_bound = 0.0f;
+    if (attn_q16 && !q16_off && feature_size && rope && rows > 1) {
+      for (unsigned int j = 0; j < feature_size; ++j)
+        q16_bound = std::max(q16_bound, std::fabs(gammas[j]));
+      q16_bound *= std::sqrt(2.0f * static_cast<float>(feature_size));
+    }
     ops->gemm_q4_0_batch_norm_fp32(
       wdata, wscale, input_step.getData<float>(), dsts, rows, widths,
       input_step_dim.width(),
@@ -444,7 +465,7 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       chunks, gammas.data(), epsilon,
       rope ? rope_table->data() + static_cast<size_t>(from) * 2 * feature_size
            : nullptr,
-      rope ? feature_size : 0u, 2u);
+      rope ? feature_size : 0u, 2u, q16_bound);
     return;
   }
 

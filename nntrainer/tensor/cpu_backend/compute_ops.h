@@ -238,13 +238,29 @@ public:
   // CPU table's cos row then sin row for each row's position; rope_hd 0
   // for none.
   virtual bool supports_gemm_q4_0_batch_norm_fp32() const { return false; }
+  // q16_bound > 0: weight 0's rows (q, normed and rotated) are also left
+  // on the accelerator as u16 with one encoding, scale = 2 bound / 65535,
+  // zero point 32768 -- bound being the caller's limit on |q| -- for the
+  // attention step that follows (attn_q16_enc, sdpa_q2_kvcache_f32).
   virtual void gemm_q4_0_batch_norm_fp32(
     std::vector<void *> matAdata, std::vector<float *> matAscale,
     float *matBdata, std::vector<float *> matCdata, unsigned int M,
     std::vector<unsigned int> N, unsigned int K, const float *pre_gamma,
     const std::vector<unsigned int> &post_chunk, const float *post_gamma,
     float eps, const float *rope_cs = nullptr, unsigned int rope_hd = 0,
-    unsigned int rope_weights = 0);
+    unsigned int rope_weights = 0, float q16_bound = 0.0f);
+
+  /**
+   * @brief The per-head (scale, zero point) of the u16 Q the last fused
+   *        projection call left on the accelerator for the tensor @a q (rows
+   *        x stride floats), or nullptr: the attention core then takes
+   *        these as its Q encoding instead of measuring the rows.
+   */
+  virtual const float *attn_q16_enc(const float *q, unsigned int rows,
+                                    unsigned int stride) {
+    (void)q, (void)rows, (void)stride;
+    return nullptr;
+  }
 
   // The decoder block's epilogue as one accelerator call (doc 57 section
   // 5 step 4): out = scale * (resid + rmsnorm(x [+ x2]) * gamma) over M

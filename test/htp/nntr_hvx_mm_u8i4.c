@@ -1013,7 +1013,8 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
                            const uint32 *w_handles, int w_handlesLen,
                            const float *act_f32, int act_f32Len, float *out_cat,
                            int out_catLen, const uint32 *out_off,
-                           const uint32 *out_ld) {
+                           const uint32 *out_ld, uint32 q16_slices, float q_inv,
+                           float q_zp, uint16 *q_u16) {
   int rc =
     check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_catLen);
   if (rc != AEE_SUCCESS) {
@@ -1090,7 +1091,16 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
     const int rope = rope_hd != 0u && i < (int)rope_handles;
     float *o_i = out_off ? out_cat + out_off[i] : out_cat + off;
     const uint32_t ld_i = out_ld ? out_ld[i] : n_i;
-    if (c != 0u && rope) {
+    if (c != 0u && rope && (uint32_t)i < q16_slices) {
+      /* a Q slice: its u16 copy at the slice's columns of the Q block */
+      if (hvx_norm_rope_rows_ld_q16_f32(
+            o_i, M, n_i, ld_i, c, g, eps, rope_hd, rope_cs,
+            q_u16 + (out_off[i] - out_off[0]), out_ld[0], q_inv, q_zp,
+            s->quant_pool) != 0) {
+        FARF(ERROR, "mm_u8i4_layer_norm_ld_q16: slice %d shape", i);
+        return AEE_EBADPARM;
+      }
+    } else if (c != 0u && rope) {
       hvx_norm_rope_rows_ld_f32(o_i, M, n_i, ld_i, c, g, eps, rope_hd, rope_cs,
                                 s->quant_pool);
     } else if (c != 0u) {
@@ -1111,21 +1121,23 @@ int nntr_hvx_mm_u8i4_layer_norm(
   uint32 rope_handles, const float *rope_cs, int rope_csLen,
   const uint32 *w_handles, int w_handlesLen, const float *act_f32,
   int act_f32Len, float *out_cat, int out_catLen) {
-  return layer_norm_impl((nntr_hvx_session *)handle, M, K, eps, pre_gamma,
-                         pre_gammaLen, post_chunk, post_chunkLen, post_gamma,
-                         post_gammaLen, rope_hd, rope_handles, rope_cs,
-                         rope_csLen, w_handles, w_handlesLen, act_f32,
-                         act_f32Len, out_cat, out_catLen, NULL, NULL);
+  return layer_norm_impl(
+    (nntr_hvx_session *)handle, M, K, eps, pre_gamma, pre_gammaLen, post_chunk,
+    post_chunkLen, post_gamma, post_gammaLen, rope_hd, rope_handles, rope_cs,
+    rope_csLen, w_handles, w_handlesLen, act_f32, act_f32Len, out_cat,
+    out_catLen, NULL, NULL, 0u, 0.0f, 0.0f, NULL);
 }
 
-int nntr_hvx_mm_u8i4_layer_norm_ld(
+/* Both _ld entries; q16_slices 0 = no u16 Q. */
+static int layer_norm_ld_impl(
   remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
   int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
   const float *post_gamma, int post_gammaLen, uint32 rope_hd,
   uint32 rope_handles, const float *rope_cs, int rope_csLen,
   const uint32 *w_handles, int w_handlesLen, const uint32 *out_off,
   int out_offLen, const uint32 *out_ld, int out_ldLen, const float *act_f32,
-  int act_f32Len, float *out_cat, int out_catLen) {
+  int act_f32Len, float *out_cat, int out_catLen, uint32 q16_slices,
+  float q_inv, float q_zp, uint16 *q_u16, int q_u16Len) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s || w_handlesLen <= 0 || out_offLen != w_handlesLen ||
       out_ldLen != w_handlesLen || M == 0u) {
@@ -1147,11 +1159,64 @@ int nntr_hvx_mm_u8i4_layer_norm_ld(
       return AEE_EBADPARM;
     }
   }
+  /* The Q slices: the leading rotated handles, one weight's row-major
+     block (the same ld, column offsets inside it), q_u16 that block. */
+  if (q16_slices != 0u) {
+    if (q16_slices > rope_handles || q16_slices > (uint32_t)w_handlesLen ||
+        !q_u16 || (uint64_t)q_u16Len != (uint64_t)M * out_ld[0]) {
+      FARF(ERROR, "mm_u8i4_layer_norm_ld_q16: %u slices, q_u16 %d",
+           (unsigned)q16_slices, q_u16Len);
+      return AEE_EBADPARM;
+    }
+    for (uint32_t i = 0; i < q16_slices; ++i) {
+      const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+      if (out_ld[i] != out_ld[0] || out_off[i] < out_off[0] ||
+          out_off[i] - out_off[0] + n_i > out_ld[0]) {
+        FARF(ERROR, "mm_u8i4_layer_norm_ld_q16: slice %u outside the Q block",
+             (unsigned)i);
+        return AEE_EBADPARM;
+      }
+    }
+  }
   return layer_norm_impl(s, M, K, eps, pre_gamma, pre_gammaLen, post_chunk,
                          post_chunkLen, post_gamma, post_gammaLen, rope_hd,
                          rope_handles, rope_cs, rope_csLen, w_handles,
                          w_handlesLen, act_f32, act_f32Len, out_cat, out_catLen,
-                         out_off, out_ld);
+                         out_off, out_ld, q16_slices, q_inv, q_zp, q_u16);
+}
+
+int nntr_hvx_mm_u8i4_layer_norm_ld(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const uint32 *out_off,
+  int out_offLen, const uint32 *out_ld, int out_ldLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen) {
+  return layer_norm_ld_impl(
+    handle, M, K, eps, pre_gamma, pre_gammaLen, post_chunk, post_chunkLen,
+    post_gamma, post_gammaLen, rope_hd, rope_handles, rope_cs, rope_csLen,
+    w_handles, w_handlesLen, out_off, out_offLen, out_ld, out_ldLen, act_f32,
+    act_f32Len, out_cat, out_catLen, 0u, 0.0f, 0.0f, NULL, 0);
+}
+
+int nntr_hvx_mm_u8i4_layer_norm_ld_q16(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const uint32 *out_off,
+  int out_offLen, const uint32 *out_ld, int out_ldLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen, uint32 q16_slices,
+  float q_inv, float q_zp, uint16 *q_u16, int q_u16Len) {
+  if (q16_slices == 0u) {
+    return AEE_EBADPARM;
+  }
+  return layer_norm_ld_impl(
+    handle, M, K, eps, pre_gamma, pre_gammaLen, post_chunk, post_chunkLen,
+    post_gamma, post_gammaLen, rope_hd, rope_handles, rope_cs, rope_csLen,
+    w_handles, w_handlesLen, out_off, out_offLen, out_ld, out_ldLen, act_f32,
+    act_f32Len, out_cat, out_catLen, q16_slices, q_inv, q_zp, q_u16, q_u16Len);
 }
 
 int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,

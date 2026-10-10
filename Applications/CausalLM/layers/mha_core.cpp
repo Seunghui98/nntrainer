@@ -1130,8 +1130,8 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
                                        const uint16_t *v_rows,
                                        unsigned int n_rows,
                                        unsigned int kv_stride, const float *q,
-                                       unsigned int q_stride,
-                                       unsigned int n_q) {
+                                       unsigned int q_stride, unsigned int n_q,
+                                       const float *q_enc_fixed) {
   q2_scale_k.assign(num_heads_KV, 0.0f);
   q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
   q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
@@ -1148,16 +1148,21 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
   // Q's per-head range, NEON (min / max are order-free): scalar it was
   // 11-22 ms a 1024-row layer (doc 59 section 2.2).
   std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
-  for (unsigned int r = 0; r < n_q; ++r) {
+  for (unsigned int r = 0; r < n_q && !q_enc_fixed; ++r) {
     const float *qr = q + static_cast<size_t>(r) * q_stride;
     for (unsigned int h = 0; h < num_heads_Q; ++h)
       causallm::min_max_f32(qr + h * head_dim, head_dim, q_lo[h], q_hi[h]);
   }
   const unsigned int G = num_heads_Q / num_heads_KV;
   for (unsigned int h = 0; h < num_heads_Q; ++h) {
-    const float range = std::max(q_hi[h] - q_lo[h], 1e-6f);
-    q2_q_enc[2 * h] = range / 65535.0f;
-    q2_q_enc[2 * h + 1] = std::round(-q_lo[h] / q2_q_enc[2 * h]);
+    if (q_enc_fixed) {
+      q2_q_enc[2 * h] = q_enc_fixed[2 * h];
+      q2_q_enc[2 * h + 1] = q_enc_fixed[2 * h + 1];
+    } else {
+      const float range = std::max(q_hi[h] - q_lo[h], 1e-6f);
+      q2_q_enc[2 * h] = range / 65535.0f;
+      q2_q_enc[2 * h + 1] = std::round(-q_lo[h] / q2_q_enc[2 * h]);
+    }
     float vmax = 0.0f;
     for (unsigned int d = 0; d < head_dim; ++d) {
       vmax = std::max(vmax, q2_scale_v[(h / G) * head_dim + d]);
@@ -1270,18 +1275,27 @@ bool MHACoreLayer::try_quantized_attention(
       ? 0u
       : static_cast<unsigned int>(local_window_size);
   if (use_q2) {
+    // The qkv call may have left Q as u16 on the accelerator already, with
+    // its own (fixed) encoding: that is the encoding, every chunk.
+    const float *q16_enc =
+      attn_out_u16 ? compute_ops_->attn_q16_enc(io.q, n_q, q_stride) : nullptr;
     if (!q2_calibrated) {
       // The rows about to be appended are the first this layer sees.
       const auto t0 = std::chrono::steady_clock::now();
       calibrate_q2_scales(k_base + off, v_base + off, append_rows, width, io.q,
-                          q_stride, n_q);
+                          q_stride, n_q, q16_enc);
       if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
-        ml_logi("mha_core trace: q2 calibration rows=%u us=%lld", append_rows,
+        ml_logi("mha_core trace: q2 calibration rows=%u us=%lld q16=%d",
+                append_rows,
                 static_cast<long long>(
                   std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - t0)
-                    .count()));
+                    .count()),
+                q16_enc != nullptr);
       }
+    } else if (q16_enc) {
+      for (unsigned int h = 0; h < 2 * num_heads_Q; ++h)
+        q2_q_enc[h] = q16_enc[h];
     }
     const auto ts_sc = clk::now();
     if (!q2_scales_set[batch]) {

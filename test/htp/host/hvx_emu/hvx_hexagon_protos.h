@@ -118,6 +118,19 @@ static inline HVX_Vector Q6_Vsf_equals_Vw(HVX_Vector a) {
   return r;
 }
 
+/* f32 -> int32, numeric, round toward zero, saturated (the PRM's convert;
+   the quantizers clamp to [0, 65535] before it, so saturation is moot). */
+static inline HVX_Vector Q6_Vw_equals_Vsf(HVX_Vector a) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const float x = hvx_emu_f(a.w[i]);
+    r.w[i] = x >= 2147483648.0f    ? INT32_MAX
+             : x <= -2147483648.0f ? INT32_MIN
+                                   : (int32_t)x;
+  }
+  return r;
+}
+
 #define HVX_EMU_W_BINOP(name, op)                                              \
   static inline HVX_Vector name(HVX_Vector a, HVX_Vector b) {                  \
     HVX_Vector r;                                                              \
@@ -517,6 +530,21 @@ static inline HVX_Vector Q6_Vh_vpacke_VwVw(HVX_Vector u, HVX_Vector v) {
   for (int i = 0; i < HVX_EMU_LANES; ++i) {
     hvx_emu_set_h(&r, i, (uint16_t)v.w[i]);
     hvx_emu_set_h(&r, i + HVX_EMU_LANES, (uint16_t)u.w[i]);
+  }
+  return r;
+}
+
+/* Two word vectors to one of u16, saturated: v's lanes first, then u's
+   (the operand order of Vuh_vpack(Vu, Vv):sat), as the Q quantizers use it. */
+static inline HVX_Vector Q6_Vuh_vpack_VwVw_sat(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const int32_t a = v.w[i], b = u.w[i];
+    hvx_emu_set_h(&r, i, (uint16_t)(a < 0 ? 0 : a > 65535 ? 65535 : a));
+    hvx_emu_set_h(&r, i + HVX_EMU_LANES,
+                  (uint16_t)(b < 0       ? 0
+                             : b > 65535 ? 65535
+                                         : b));
   }
   return r;
 }
