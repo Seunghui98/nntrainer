@@ -103,3 +103,64 @@ The cells are the same 512-token EOS-off cells, both levers on, C 24. Host:
 - What is left of the seed (0.66 / 1.56 s) is the f32 transfer, about 16 MiB a sliding layer at
   p1024, plus the DSP's strided tile writes. The next step there is an fp16 seed: half the bytes,
   no ARM conversion, an IDL change.
+
+## KV cache: the CPU copy freed, and the prefill's int8 cache as the seed (`1b2a3a866`)
+
+Install `causallm/s289m`:
+
+- skel `fbaff5d9`
+- `libnntrainer.so` `82389925`
+- `libcausallm_core.so` `f0b77648`
+
+Both levers are on in every cell (LRFU 32, DENSE_EARLY), C 24. There are three KV copies
+after the prefill:
+
+- ① the CPU fp16 cache: an rpcmem block per layer.
+- ② #4415's fixed-scale int8 cache on the DSP. Its K scale is one per head, its V scale one per
+  (head, dim).
+- ③ attn_m1's int8 decode cache.
+
+Two knobs act on them:
+
+- `NNTR_HTP_KV_DROP_CPU=1`: ① is freed per layer once ③ holds it. The decode row never reads it.
+- `NNTR_HTP_KV_SEED_Q=1`: ③ is seeded on the DSP from ②, and ② is freed layer by layer
+  (attn_m1 registers lazily).
+  - First version, K and V both from ②: decode nll **0.2491** (+9.4 %). The head-wide K scale is
+    too coarse. Dropped.
+  - Committed version: K from ① at attn_m1's per-dim scales, V from ②.
+
+### Accuracy (p1024 G64, forced on the fp16 path, `s282ppl`)
+
+| cell | nll/token | top-1 | kv seed rpc ms | first token ms |
+|---|---|---|---|---|
+| int8 seed from ① (current) | 0.227798 | 62 / 64 | 780 | 1 677 |
+| SEED_Q (V from ②) | **0.234381** (fp16 0.233149: 1.005 ×, gate ≤ 1.02 × passes) | 61 / 64 | **413** | **1 130** |
+| SEED_Q + DROP_CPU | 0.234381 | 61 / 64 | 419 | 1 157 |
+
+### Speed and memory (512 tokens, EOS off, `s289cfg`)
+
+`MemAvailable` is read after the seeds. ① and the arena are dma-buf, so the RSS does not show them.
+
+| prompt | cell | **decode avg tok/s** | MemAvailable MiB | miss wait ms | pgpgin GiB | text md5 |
+|---|---|---|---|---|---|---|
+| 1024 | base | 11.97 | 3 638 | 15.4 | 7.06 | `4257c8ec` |
+| 1024 | **DROP_CPU** | **12.27 (+2.5 %)** | **4 137 (+499)** | **13.0** | 5.37 | `4257c8ec` (same) |
+| 1024 | SEED_Q + DROP_CPU | 12.71 (text differs, see below) | 4 007 | 11.0 | 4.76 | `c2c86a57` |
+| 2048 | base | 10.34 | 3 032 | 23.1 | 11.51 | `b667afcb` |
+| 2048 | **DROP_CPU** | **11.21 (+8.5 %)** | **3 548 (+516)** | **15.9** | 6.86 | `b667afcb` (same) |
+| 2048 | SEED_Q + DROP_CPU | 11.13 | 3 594 | 17.1 | 7.38 | **format broken** |
+
+- **DROP_CPU is the lever.** The text is identical. It frees about 0.5 GiB, which goes to the
+  page cache that serves the expert misses. Flash reads fall by 24 % at p1024 and 40 % at p2048,
+  and the miss wait by 2.4 / 7.2 ms a token.
+- **SEED_Q is not recommended.** It is off by default.
+  - The seed itself is 0.37 / 0.68 s shorter.
+  - At p2048 the 512-token text loses its format: no `<channel|>`, no `<turn|>`, and the summary
+    runs into a loop ("The instructions were to …").
+  - The p1024 text is a sane summary, but a different one.
+  - The one-run PPL cell passes, but it is a p1024 G64 cell. That is not enough to accept a
+    changed V.
+  - The p1024 speed of SEED_Q cells is not comparable either: a different text routes to
+    different experts (63 misses/token against 74).
+- Host: `ATTN M1 SEED Q8 OK`. The masters move byte for byte, the scales are copied, and K from the
+  rows equals kv_append's K. `ATTN M1 BIT-IDENTICAL` holds.
