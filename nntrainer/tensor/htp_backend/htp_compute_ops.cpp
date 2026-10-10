@@ -2878,6 +2878,56 @@ public:
     return true;
   }
 
+  /** [#289] NNTR_HTP_KV_SEED_Q=1: attn_m1 is registered lazily and each
+   *  layer is seeded from its quantized prefill cache on the DSP. */
+  static bool kvSeedQ() {
+    static const bool on = [] {
+      const char *v = std::getenv("NNTR_HTP_KV_SEED_Q");
+      return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+  }
+
+  bool decode_kv_seed_kvq(unsigned n_rows, int kv_handle,
+                          const float *k_rows) override {
+    if (!kvSeedQ() || kv_handle < 0 || seed_ordinal_ == HTP_GRAPH_NO_OP)
+      return false;
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      if (kvq_handles_.count(static_cast<uint32_t>(kv_handle)) == 0)
+        return false;
+    }
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const uint32_t layer =
+      attn_cache_ord_[seed_ordinal_] |
+      (attn_cache_[seed_ordinal_] ? HTP_ATTN_KV_CACHE_B : 0u);
+    const uint64_t t_seed = HtpProfile::nowUs();
+    const int err = nntr_hvx_attn_m1_seed_kvq(
+      session, layer, static_cast<uint32_t>(kv_handle), n_rows, k_rows,
+      k_rows
+        ? static_cast<int>(n_rows * graphOp(attn_op_[seed_ordinal_])->n_kv *
+                           graphOp(attn_op_[seed_ordinal_])->head_dim)
+        : 0);
+    seed_rpc_us_ += HtpProfile::nowUs() - t_seed;
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr,
+                   "[HTP] attn_m1_seed_kvq: layer %u not seeded on the DSP "
+                   "(%s); the f32 seed takes it\n",
+                   seed_ordinal_, graphErr(err).c_str());
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      kvq_handles_.erase(static_cast<uint32_t>(kv_handle)); // DSP released
+    }
+    ++seed_calls_;
+    ++seed_kvq_;
+    kv_len_[seed_ordinal_] = n_rows;
+    seed_ordinal_ = HTP_GRAPH_NO_OP;
+    return true;
+  }
+
   /** Binds a layer's handles to the next unbound MoE op (call order =
    *  list order on the first pass) and returns the op that owns them. */
   uint32_t bindMoeOp(const std::vector<uint32_t> &h_gu,
@@ -2981,12 +3031,23 @@ public:
     pool_dirty_ = false;
     if (!t1_printed_) { // [#282 F]
       t1_printed_ = true;
+      size_t left = 0;
+      if (kvSeedQ() && std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr) {
+        // [#289] a layer the DSP seed did not take keeps its cache till here
+        std::lock_guard<std::mutex> lock(kvq_mutex_);
+        left = kvq_handles_.size();
+        for (uint32_t h : kvq_handles_)
+          nntr_hvx_kv_release_q(
+            static_cast<remote_handle64>(HtpBackend::global().handle()), h);
+        kvq_handles_.clear();
+      }
       std::fprintf(stderr,
                    "[HTP] t1: pool_sync_ms=%.1f (drop_host_fc+pin %.1f) "
-                   "kv_seed_rpc_ms=%.1f seeds=%u\n",
+                   "kv_seed_rpc_ms=%.1f seeds=%u (dsp %u, kvq freed late %zu) "
+                   "rss_mib=%.1f mem_available_mib=%.1f\n",
                    (HtpProfile::nowUs() - t_ps) / 1000.0,
-                   (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0,
-                   seed_calls_);
+                   (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0, seed_calls_,
+                   seed_kvq_, left, rssMib(), memAvailMib());
     }
     // ponytail: a generation's decode loads stay cached until the next
     // prefill (<= misses x 5.3 MiB: 0.7 GiB at G = 1024); a drop per N
@@ -3055,6 +3116,11 @@ public:
         throw std::runtime_error("token driver: a miss request for op " +
                                  std::to_string(r.op) + " is malformed");
       const std::vector<ExpertFileDesc> &d = pool_descs_[it - moe_ops_.begin()];
+      {
+        std::lock_guard<std::mutex> lock(handle_mutex_);
+        pool_answered_.resize(pool_descs_.size());
+        pool_answered_[it - moe_ops_.begin()] = 1;
+      }
       std::vector<const void *> need, loads;
       for (uint32_t i = 0; i < r.n_routed; ++i) {
         if (r.routed[i] >= d.size())
@@ -3352,6 +3418,15 @@ public:
   }
 
   void poolRefresh(const htp_dspq_token_resp &s1r) {
+    // [#289] under LRFU a layer's routed set counts once a token: a layer
+    // whose miss round already handed it to the pool is not handed again
+    std::vector<uint8_t> answered;
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      answered.swap(pool_answered_);
+    }
+    if (!lrfuOn())
+      answered.clear();
     size_t at = 0;
     for (size_t m = 0; m < pool_descs_.size() && at < s1r.route_n; ++m) {
       const uint32_t n = s1r.route[at++];
@@ -3366,6 +3441,8 @@ public:
             need.push_back(k);
         }
       }
+      if (m < answered.size() && answered[m] != 0)
+        continue;
       pool_fn_(
         need,
         [](const void *) {
@@ -3439,6 +3516,18 @@ public:
         setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT, &word, 1u,
                  1u, "PREDICT");
       }
+      // [#289] NNTR_HTP_DENSE_EARLY=1: a miss round runs the layer's dense
+      // branch while the ARM reads (unset: the skel's default, off)
+      if (const char *v = std::getenv("NNTR_HTP_DENSE_EARLY")) {
+        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0)
+          throw std::runtime_error(std::string("NNTR_HTP_DENSE_EARLY=") + v +
+                                   ": want 0 or 1");
+        const uint32_t on = v[0] == '1' ? 1u : 0u;
+        float word;
+        std::memcpy(&word, &on, sizeof(word));
+        setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_DENSE_EARLY, &word,
+                 1u, 1u, "DENSE_EARLY");
+      }
     } catch (...) {
       nntr_hvx_graph_release(session);
       if (!e2e_)
@@ -3457,7 +3546,8 @@ public:
     // token never reads them. ponytail: a later prefill on a layer whose
     // handle is gone fails its append and takes mha_core's CPU attention
     // -- single-prompt runs; the upgrade is mha_core re-registering.
-    if (e2e_ && std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr) {
+    if (e2e_ && std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr &&
+        !kvSeedQ()) { // [#289] the seeds free them one layer at a time
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       for (uint32_t h : kvq_handles_)
         nntr_hvx_kv_release_q(session, h);
@@ -3490,9 +3580,11 @@ public:
         return v != nullptr ? std::atoi(v) : 0;
       }();
       const bool q8 = q8_knob >= 2 || (q8_knob == 1 && c == 0u);
+      // [#289] lazy: a layer's cache comes at its seed, after the layer
+      // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
-        max_seq | (q8 ? 0x80000000u : 0u));
+        max_seq | (q8 ? 0x80000000u : 0u) | (kvSeedQ() ? 0x40000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
@@ -5340,13 +5432,14 @@ private:
           stderr,
           "[HTP] token driver: pool misses=%llu misses/token=%.2f "
           "miss_wait_us/token=%.1f rounds=%llu arm_ms/round=%.3f "
-          "pgpgin_mib=%.1f\n",
+          "pgpgin_mib=%.1f rss_mib=%.1f mem_available_mib=%.1f\n",
           (unsigned long long)e.misses, static_cast<double>(e.misses) / n,
           static_cast<double>(e.miss_us) / n, (unsigned long long)e.pool_rounds,
           e.pool_rounds
             ? static_cast<double>(e.pool_read_us) / 1000.0 / e.pool_rounds
             : 0.0,
-          static_cast<double>(vmstatPgpginKib() - e.pgpgin0) / 1024.0);
+          static_cast<double>(vmstatPgpginKib() - e.pgpgin0) / 1024.0, rssMib(),
+          memAvailMib());
       if (e.pool_rounds != 0) {
         const double rr = static_cast<double>(e.pool_rounds);
         std::fprintf(stderr,
@@ -6982,6 +7075,49 @@ private:
    *  back when it leaves the arena, so the cache holds about the arena's
    *  complement instead of the whole file; 2 = the drop only (diagnostic:
    *  every miss then reads storage). */
+  /** @brief [#289] The process's resident set now, MiB (0 off Linux). */
+  static double rssMib() {
+    double mib = 0.0;
+#if defined(__linux__)
+    if (FILE *f = std::fopen("/proc/self/statm", "r")) {
+      unsigned long size = 0, res = 0;
+      if (std::fscanf(f, "%lu %lu", &size, &res) == 2)
+        mib = static_cast<double>(res) * sysconf(_SC_PAGESIZE) / 1048576.0;
+      std::fclose(f);
+    }
+#endif
+    return mib;
+  }
+
+  /** @brief [#289] /proc/meminfo's MemAvailable, MiB (0 off Linux): the
+   *  dma-buf blocks (the KV cache, the arena) are not in the RSS. */
+  static double memAvailMib() {
+    double mib = 0.0;
+#if defined(__linux__)
+    if (FILE *f = std::fopen("/proc/meminfo", "r")) {
+      char key[64];
+      unsigned long kib = 0;
+      while (std::fscanf(f, "%63s %lu kB", key, &kib) == 2)
+        if (std::strcmp(key, "MemAvailable:") == 0) {
+          mib = static_cast<double>(kib) / 1024.0;
+          break;
+        }
+      std::fclose(f);
+    }
+#endif
+    return mib;
+  }
+
+  /** @brief [#289] NNTR_MOE_LRFU set to a half-life other than 0: the
+   *  pool's policy (causallm::ExpertLru) is LRFU, which parses the value. */
+  static bool lrfuOn() {
+    static const bool on = [] {
+      const char *v = std::getenv("NNTR_MOE_LRFU");
+      return v != nullptr && *v != '\0' && std::strtod(v, nullptr) > 0.0;
+    }();
+    return on;
+  }
+
   static int fadviseKnob() {
     static const int k = [] {
       const char *v = std::getenv("NNTR_MOE_FADVISE");
@@ -8286,6 +8422,7 @@ private:
   /** [#282 F] the first token's setup timers */
   uint64_t seed_rpc_us_ = 0;
   unsigned seed_calls_ = 0;
+  unsigned seed_kvq_ = 0; /**< [#289] of them, seeded on the DSP from kvq */
   bool t1_printed_ = false;
   /** [#282 D] the kv_cache_q handles registered and not released */
   std::mutex kvq_mutex_;
@@ -8303,6 +8440,8 @@ private:
   static inline std::atomic<uint64_t> pf_done_{0};
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
+  std::vector<uint8_t> pool_answered_; /**< [#289] layers a miss round served
+                                          this token (handle_mutex_) */
   bool pool_dirty_ = true;
   bool graph_inited_ = false;
   bool graph_short_warned_ = false;
@@ -8476,6 +8615,9 @@ public:
   }
   void free_shared(void *block) override {
     HtpBackend::global().free_shared(block);
+  }
+  void drop_shared(void *block) override {
+    HtpBackend::global().drop_shared(block);
   }
 
   // --- quantized (int8 / int4) KV cache resident on the DSP ---

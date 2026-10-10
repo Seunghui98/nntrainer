@@ -561,6 +561,17 @@ public:
     (void)v_rows;
     return false;
   }
+  // [#289] The same seed with V from the layer's own quantized prefill
+  // cache (kv_cache_q_register's handle, fixed scales) on the accelerator
+  // and K from k_rows ([n_rows][n_kv x head_dim] f32); the handle is
+  // released on success. False: not taken, seed with decode_kv_seed_fp32.
+  virtual bool decode_kv_seed_kvq(unsigned n_rows, int kv_handle,
+                                  const float *k_rows) {
+    (void)n_rows;
+    (void)kv_handle;
+    (void)k_rows;
+    return false;
+  }
 
   // Registers one K x N expert weight with the accelerator ahead of its
   // first use, so a model's load pays that cost rather than its first
@@ -839,6 +850,13 @@ public:
    * @brief Releases a block from alloc_shared(). nullptr is a no-op.
    */
   virtual void free_shared(void *block) { (void)block; }
+
+  /**
+   * @brief [#289] Frees an alloc_shared() block before its owner does; the
+   *        owner's free_shared() of it is then a no-op. Not a live block:
+   *        ignored.
+   */
+  virtual void drop_shared(void *block) { (void)block; }
 
   /**
    * @brief A quantized copy of an attention layer's KV cache that lives on

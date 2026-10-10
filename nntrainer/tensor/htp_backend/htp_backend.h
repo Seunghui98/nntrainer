@@ -37,6 +37,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace nntrainer {
@@ -95,9 +97,18 @@ public:
   void *alloc_shared(size_t bytes);
 
   /**
-   * @brief Frees a block from alloc_shared(); nullptr is a no-op.
+   * @brief Frees a block from alloc_shared(); nullptr is a no-op, and so is
+   *        a block drop_shared() freed already.
    */
   void free_shared(void *block);
+
+  /**
+   * @brief [#289] Frees a block from alloc_shared() before its owner does
+   *        (the prefill's KV cache once the DSP holds the rows); the owner's
+   *        later free_shared() of it is then a no-op. A pointer that is not
+   *        a live block is ignored.
+   */
+  void drop_shared(void *block);
 
   /**
    * @brief [#141] Runs fn in ~HtpBackend, in registration order, before
@@ -130,6 +141,9 @@ private:
   HtpBackend();
 
   bool enabled_ = false;
+  std::mutex shared_mu_;               /**< [#289] guards the two sets */
+  std::unordered_set<void *> shared_;  /**< live alloc_shared blocks */
+  std::unordered_set<void *> dropped_; /**< drop_shared()'s, till freed */
   uint64_t handle_ = 0; ///< remote_handle64 from nntr_hvx_open; opaque here
                         ///< so this header does not need <remote.h>.
   int qos_mode_ = 0;
