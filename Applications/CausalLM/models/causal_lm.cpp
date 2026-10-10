@@ -700,16 +700,37 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   std::vector<unsigned int> id_list;
 
+  // The graph (and the HTP prefill workspace) is sized by INIT_SEQ_LEN rows,
+  // so a prompt longer than that runs as INIT_SEQ_LEN-row chunks: each chunk's
+  // tokens go to the front of the input buffer and attend to the rows the
+  // earlier chunks left in the KV cache. Only the last chunk's logits are kept.
+  auto prefill = [&](unsigned int n) {
+    std::vector<float *> out;
+    for (unsigned int done = 0; done < n;) {
+      const unsigned int step = std::min(n - done, INIT_SEQ_LEN);
+      if (done > 0)
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          for (unsigned int i = 0; i < step; ++i)
+            input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
+              static_cast<float>(init_input[done + i]);
+      for (auto &o : out)
+        delete[] o;
+      out = model->incremental_inference(BATCH_SIZE, input, label, step,
+                                         prefill_from + done,
+                                         prefill_from + done + step, false);
+      done += step;
+    }
+    return out;
+  };
+
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
     unsigned int skipped_token =
       static_cast<unsigned int>(init_input[init_len - 1]);
 
-    const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(
-      BATCH_SIZE, input, label, init_len - 1, prefill_from, prefill_to, false);
+    output = prefill(init_len - 1);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -719,10 +740,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_len -= 1;
     init_len -= 1;
   } else {
-    const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                          prefill_from, prefill_to, false);
+    output = prefill(init_len);
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
@@ -735,7 +754,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       ppl_cont.push_back(id_list[0]);
     }
 
-    if (init_len < INIT_SEQ_LEN)
+    // a chunked prompt (longer than INIT_SEQ_LEN) registers its first token too
+    if (init_len != INIT_SEQ_LEN)
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
   }
   // output should be deallocated after use
