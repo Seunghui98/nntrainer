@@ -1327,6 +1327,22 @@ interface nntr_hvx : remote_handle64 {
    AEEResult attn_m1_seed_kvq(in uint32 layer, in uint32 kv_handle,
                               in uint32 n_rows, in sequence<float> k_rows);
 
+   // attn_q2_step with f32 Q: the qkv call's rows as they are, quantized
+   // to u16 by the pool before the kernel (x * q_inv[h] + (zp + 0.5),
+   // clamped, truncated, as the CPU's quant_u16_f32), so the ARM converts
+   // nothing. The output stays u16 for mm_u8i4_layer_res_add_u16.
+   AEEResult attn_q2_step_fq(in uint32 kv_handle, in uint32 row0,
+                             in sequence<uint16> k_rows,
+                             in sequence<uint16> v_rows, in uint32 n_q,
+                             in uint32 cache_from, in uint32 cache_to,
+                             in uint32 n_head_q, in uint32 window,
+                             in sequence<float> q_f32,
+                             in sequence<float> q_inv,
+                             in sequence<float> q_enc,
+                             in sequence<float> out_enc,
+                             rout sequence<uint16> out_u16,
+                             rout sequence<uint32> stats_us);
+
    // mm_u8i4_layer_res_add over the attention's u16 output: act_u16 is
    // M x K with a (scale, zero point) per head of act_hd columns in act_enc
    // (the attention's out_enc), dequantized inside the quant pass (the

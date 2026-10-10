@@ -1785,26 +1785,45 @@ public:
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const FcHandles &fh = get_or_register_fc(w, session, K, N, w_scale);
+    // the attention's u16 context, still in its staging buffer: the DSP
+    // dequantizes it inside the quant pass, nothing is copied or converted
+    const bool u16_in = attn_out16_.host == act && attn_out16_.rows == M &&
+                        attn_out16_.width == K;
     const unsigned int step = fcMaxRows(K);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       const size_t a_bytes = static_cast<size_t>(m) * K * sizeof(float);
       const size_t o_bytes = static_cast<size_t>(m) * N * sizeof(float);
       std::lock_guard<std::mutex> lock(invoke_mutex_);
-      float *act_f32 = reinterpret_cast<float *>(
-        stageInput(act_pool_, act + static_cast<size_t>(m0) * K, a_bytes)
-          .data());
+      const float *act_f32 = nullptr;
+      if (!u16_in) {
+        const float *a_host = act + static_cast<size_t>(m0) * K;
+        act_f32 = static_cast<const float *>(ionAlias(a_host, a_bytes));
+        if (!act_f32)
+          act_f32 = reinterpret_cast<float *>(
+            stageInput(act_pool_, a_host, a_bytes).data());
+      }
       float *res_f32 =
         reinterpret_cast<float *>(stage(x2_pool_, o_bytes).data());
       float *out_f32 =
         reinterpret_cast<float *>(stage(out_pool_, o_bytes).data());
       stagedMemcpy(res_f32, res + static_cast<size_t>(m0) * N, o_bytes);
       const uint64_t t0 = HtpProfile::nowUs();
-      const int err = nntr_hvx_mm_u8i4_layer_res_add(
-        session, m, K, eps, scale, gamma, gamma ? static_cast<int>(N) : 0,
-        fh.handles.data(), static_cast<int>(fh.handles.size()), act_f32,
-        static_cast<int>(m * K), res_f32, static_cast<int>(m * N), out_f32,
-        static_cast<int>(m * N));
+      const int err =
+        u16_in
+          ? nntr_hvx_mm_u8i4_layer_res_add_u16(
+              session, m, K, eps, scale, gamma, gamma ? static_cast<int>(N) : 0,
+              fh.handles.data(), static_cast<int>(fh.handles.size()),
+              attn_out16_.ion + static_cast<size_t>(m0) * K,
+              static_cast<int>(m * K), attn_out16_.enc.data(),
+              static_cast<int>(attn_out16_.enc.size()), attn_out16_.head_dim,
+              res_f32, static_cast<int>(m * N), out_f32,
+              static_cast<int>(m * N))
+          : nntr_hvx_mm_u8i4_layer_res_add(
+              session, m, K, eps, scale, gamma, gamma ? static_cast<int>(N) : 0,
+              fh.handles.data(), static_cast<int>(fh.handles.size()), act_f32,
+              static_cast<int>(m * K), res_f32, static_cast<int>(m * N),
+              out_f32, static_cast<int>(m * N));
       const uint64_t elapsed = HtpProfile::nowUs() - t0;
       if (err != AEE_SUCCESS)
         throw std::runtime_error("nntr_hvx_mm_u8i4_layer_res_add failed: err=" +
@@ -1814,6 +1833,8 @@ public:
       if (profile.level())
         profile.addInvoke(m, K, N, elapsed, nullptr);
     }
+    if (u16_in)
+      attn_out16_.host = nullptr;
     return true;
   }
 
@@ -4376,6 +4397,50 @@ private:
     pool.copied_out[cls] = {dst, bytes};
   }
 
+  /** @brief A host range last copied out of a staging buffer, so a later
+   *  call can hand the DSP that buffer's bytes in place of a fresh copy:
+   *  the qkv call's Q block is the attention's Q, the attention's output
+   *  the o-proj's input. The staging buffers live as long as the ops, so
+   *  the pointer stays valid; whether its bytes still are the host's is
+   *  sampledSame's to say at use. */
+  struct IonAlias {
+    const void *host = nullptr;
+    const void *ion = nullptr;
+    size_t bytes = 0;
+  };
+  std::array<IonAlias, 16> ion_alias_{};
+  size_t ion_alias_next_ = 0;
+  void noteIonAlias(const void *host, const void *ion, size_t bytes) {
+    ion_alias_[ion_alias_next_++ % ion_alias_.size()] = {host, ion, bytes};
+  }
+  /** @brief The staging bytes that hold [host, host + bytes), or null. */
+  const void *ionAlias(const void *host, size_t bytes) const {
+    const char *h = static_cast<const char *>(host);
+    for (const IonAlias &a : ion_alias_) {
+      const char *b = static_cast<const char *>(a.host);
+      if (!b || h < b || h + bytes > b + a.bytes)
+        continue;
+      const void *ion = static_cast<const char *>(a.ion) + (h - b);
+      if (sampledSame(host, ion, bytes))
+        return ion;
+    }
+    return nullptr;
+  }
+
+  /** @brief The attention's u16 context left in its staging buffer for the
+   *  o-proj (sdpa_q2_kvcache_f32 -> gemm_qs4cx_res_add_fp32): the host
+   *  tensor it stands for, the buffer, its shape and the per-head
+   *  encodings. One at a time: the graph runs a layer's attention, then its
+   *  o-proj. ponytail: a CPU consumer of that f32 tensor, or another
+   *  attention call before the o-proj, is not covered -- the builder sets
+   *  mha_core's attn_out_u16 only for the folded o-proj on this engine. */
+  struct AttnOut16 {
+    const float *host = nullptr;
+    const uint16_t *ion = nullptr;
+    unsigned int rows = 0, width = 0, head_dim = 0;
+    std::vector<float> enc;
+  } attn_out16_;
+
   /** @brief The one FastRPC layer call both accelerated entries make.
    *
    *  Under NNTR_HTP_PROFILE >= 2 it goes through mm_u8i4_layer_timed so the
@@ -4531,9 +4596,11 @@ private:
       if (slices) {
         for (size_t i = 0; i < slices->size(); ++i) {
           const OutSlice &o = (*slices)[i];
-          if (o.c0 == 0)
-            stagedMemcpy(o.dst, out_cat + out_off[i],
-                         static_cast<size_t>(M) * o.stride * sizeof(float));
+          if (o.c0 == 0) {
+            const size_t b = static_cast<size_t>(M) * o.stride * sizeof(float);
+            stagedMemcpy(o.dst, out_cat + out_off[i], b);
+            noteIonAlias(o.dst, out_cat + out_off[i], b);
+          }
         }
       } else {
         copyOut(matCdata, out_cat, M, N, blocks, dsts);
@@ -8815,6 +8882,91 @@ public:
     }
     if (err != AEE_SUCCESS) {
       ml_logw("HTP row-blocked attention step failed: 0x%x; CPU fallback", err);
+      return false;
+    }
+    return true;
+  }
+
+  bool sdpa_q2_kvcache_f32(int handle, unsigned int append_row0,
+                           unsigned int append_rows, unsigned int kv_stride,
+                           const uint16_t *k_rows, const uint16_t *v_rows,
+                           const float *q, const float *q_inv,
+                           const float *q_enc, unsigned int q_stride,
+                           unsigned int n_q, unsigned int cache_from,
+                           unsigned int cache_to, unsigned int n_head_q,
+                           unsigned int n_head_kv, unsigned int head_dim,
+                           unsigned int window, float *out,
+                           uint16_t *out_u16_copy, const float *out_enc,
+                           unsigned int out_stride) override {
+    HtpBackend &hb = HtpBackend::global();
+    if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
+        (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 64) != 0 ||
+        head_dim > 512 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
+        q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
+        !q || !q_inv || !q_enc || !out || !out_enc ||
+        (append_rows != 0 &&
+         (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
+      return false;
+    }
+    const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
+    const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
+    const int rows_len = static_cast<int>(append_rows * kv_stride);
+    const int enc_len = static_cast<int>(2 * n_head_q);
+    uint32_t stats[12] = {0};
+    const int64_t t0 = now_us();
+    // Q as the qkv call left it (f32, straight from that call's staging
+    // buffer when it still holds it; the DSP's pool quantizes), the u16
+    // context left in its buffer for the o-proj: no ARM pass either way.
+    const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
+    const float *q_ion = static_cast<const float *>(ionAlias(q, q_bytes));
+    if (!q_ion) {
+      float *b = reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
+      stagedMemcpy(b, q, q_bytes);
+      q_ion = b;
+    }
+    const size_t out_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
+    uint16_t *out_ion =
+      reinterpret_cast<uint16_t *>(stage(attn_out_pool_, out_bytes).data());
+    if (attn_out16_.host) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        ml_logw("HTP attention: the previous u16 context was never taken by "
+                "an o-proj on the accelerator (its f32 tensor was not "
+                "written); check attn_out_u16 against the o-proj's engine");
+      }
+    }
+    const int err = nntr_hvx_attn_q2_step_fq(
+      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
+      q_inv, static_cast<int>(n_head_q), q_enc, enc_len, out_enc, enc_len,
+      out_ion, q_len, stats, 12);
+    if (err == AEE_SUCCESS) {
+      attn_out16_.host = out;
+      attn_out16_.ion = out_ion;
+      attn_out16_.rows = n_q;
+      attn_out16_.width = out_stride;
+      attn_out16_.head_dim = head_dim;
+      attn_out16_.enc.assign(out_enc, out_enc + enc_len);
+      if (out_u16_copy)
+        stagedMemcpy(out_u16_copy, out_ion, out_bytes);
+    }
+    if (attn_trace_enabled()) {
+      ml_logi("HTP attn trace q2f: n_q=%u cache=%u..%u err=0x%x wall_us=%lld "
+              "dsp_us: append=%u (quant=%u stage=%u bake=%u rows=%u) q16=%u "
+              "kernel=%u (qk=%u softmax=%u pv=%u wait=%u) total=%u",
+              n_q, cache_from, cache_to, err,
+              static_cast<long long>(now_us() - t0), stats[0], stats[4],
+              stats[5], stats[6], stats[7], stats[2], stats[1], stats[8],
+              stats[9], stats[10], stats[11], stats[3]);
+    }
+    if (err != AEE_SUCCESS) {
+      // a skel without the entry answers with an error: the caller converts
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        ml_logw("HTP f32-Q attention step failed: 0x%x; the u16 path", err);
+      }
       return false;
     }
     return true;

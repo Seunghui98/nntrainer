@@ -966,6 +966,33 @@ public:
     (void)out_stride;
     return false;
   }
+  /**
+   * @brief sdpa_q2_kvcache with f32 Q and the output left on the
+   *        accelerator: Q is quantized there (quant_u16_f32 with q_inv[h]
+   *        = 1 / q_enc[2h], the same u16) and the u16 context stays in the
+   *        accelerator's buffer for the o-proj that follows
+   *        (gemm_qs4cx_res_add_fp32 with @a out as its activation reads it
+   *        from there and dequantizes it on the way in). @a out is NOT
+   *        written: the caller must know the o-proj runs on this engine.
+   *        @a out_u16_copy, when given, receives the u16 context (n_q x
+   *        out_stride) for a host check. false = not available, the caller
+   *        converts.
+   */
+  virtual bool sdpa_q2_kvcache_f32(
+    int handle, unsigned int append_row0, unsigned int append_rows,
+    unsigned int kv_stride, const uint16_t *k_rows, const uint16_t *v_rows,
+    const float *q, const float *q_inv, const float *q_enc,
+    unsigned int q_stride, unsigned int n_q, unsigned int cache_from,
+    unsigned int cache_to, unsigned int n_head_q, unsigned int n_head_kv,
+    unsigned int head_dim, unsigned int window, float *out,
+    uint16_t *out_u16_copy, const float *out_enc, unsigned int out_stride) {
+    (void)handle, (void)append_row0, (void)append_rows, (void)kv_stride;
+    (void)k_rows, (void)v_rows, (void)q, (void)q_inv, (void)q_enc;
+    (void)q_stride, (void)n_q, (void)cache_from, (void)cache_to;
+    (void)n_head_q, (void)n_head_kv, (void)head_dim, (void)window;
+    (void)out, (void)out_u16_copy, (void)out_enc, (void)out_stride;
+    return false;
+  }
 
   /**
    * @brief sdpa_fp16_kvcache() over a registered quantized cache, with the
