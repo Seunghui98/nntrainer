@@ -6585,7 +6585,14 @@ private:
                       uint64_t convert_us) {
     const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
     uint32_t chunk = 0, off = 0;
-    if (ensureArena(session) && placeExisting(wh_len, &chunk, &off)) {
+    // NNTR_HTP_FC_IN_ARENA=1: new 256 MiB chunks when the mapped room runs
+    // out, so the FC set (~880 MiB on Gemma 4) stays off the DSP heap. The
+    // heap's growth stops near 1.7 GiB on the S25, and a 4k prompt's
+    // quantized KV caches (~950 MiB) are heap allocations.
+    static const bool fc_in_arena = std::getenv("NNTR_HTP_FC_IN_ARENA");
+    if (ensureArena(session) &&
+        (fc_in_arena ? place(session, wh_len, size_t(256) << 20, &chunk, &off)
+                     : placeExisting(wh_len, &chunk, &off))) {
       std::vector<uint8_t> wh(wh_len);
       whPack(rm, K, N, wh.data());
       std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(), wh_len);
