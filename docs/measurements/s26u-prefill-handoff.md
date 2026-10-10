@@ -1,4 +1,4 @@
-# S26 Ultra Gemma-4 2-bit prefill 최적화 — 인수인계 (2026-10-10, 밤 갱신)
+# S26 Ultra Gemma-4 2-bit prefill 최적화 — 인수인계 (2026-10-11 새벽 갱신)
 
 다른 Claude 세션이 이 문서만 보고 이어서 작업할 수 있도록 환경, 빌드, 설치, 실행, 측정 규칙,
 지금까지의 결과, 남은 작업을 모두 적는다. 숫자는 모두 기기 실측이다 (S26 Ultra, 2분 cool-down).
@@ -43,13 +43,12 @@ PR 4412가 업데이트되면 `git fetch upstream pull/4412/head` 후 rebase 여
 
 ## 0. 한 줄 요약
 
-- 브랜치 `htp/s26-prefill-opt`에 커밋 11개 (§10). base는 PR 4412 head (`b398e078c`).
-  마지막 3개(2026-10-10 밤)가 attention 가장자리 작업의 확정분: FC 호출 u16 입력, attention f32 Q·u16
-  context를 DSP에서, NEON quant contraction off. **push는 아직 안 됨** (이 워크스테이션에 GitHub 자격증명
-  없음: `gh auth login` 또는 SSH 키 뒤 `git push origin htp/s26-prefill-opt htp/s26-prefill-handoff --force-with-lease`).
-- `htp/s26-prefill-handoff` = opt + 이 문서 + WIP 커밋 1개(qkv 패스에서 Q를 정적 scale로 u16 출력, 정확도
-  미확정, §7).
-- 그 다음: §7의 열린 질문(정확도 게이트), 남은 prefill 최적화(§8), decode(§9).
+- 브랜치 `htp/s26-prefill-opt`에 커밋 14개 (§10). base는 PR 4412 head (`b398e078c`). **push는 아직 안 됨**
+  (이 워크스테이션에 GitHub 자격증명 없음: `gh auth login` 또는 SSH 키 뒤
+  `git push origin htp/s26-prefill-opt htp/s26-static-q-wip && git push --force-with-lease origin htp/s26-prefill-handoff`).
+- `htp/s26-prefill-handoff` = opt + 이 문서. `htp/s26-static-q-wip` = (옛 opt `66e023786` 위) 정적 Q scale WIP, 정확도 미확정(§7).
+- 현재(S26U, C32): p1024 ≈ 2.2 s (≈ 460 TPS), p2048 ≈ 4.2–4.4 s (≈ 460–490 TPS), p4096 C24 9.2 s. decode p1024 마지막 64 ≈ 12–14 TPS.
+- host·transport는 거의 바닥(staging 22–39 ms/prefill, 층당 RPC 6회). 남은 것은 DSP 연산: §8-1.
 
 ## 1. 작업 환경 (이 워크스테이션)
 
@@ -229,7 +228,7 @@ adb shell "cd $D/pr4412 && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH='$D/pr4412' $ENV 
 결정성 0 불일치/146,800,640. 문장 md5 p1024 `1fd0625a`→`2ec61a41`, p2048 `bfc92564`→`aff26409`(둘 다 일관된
 요약, near-tie 토큰에서 갈림). decode TPS 변화 없음(p1024 마지막 64: 12.1–14.3).
 
-**WIP (handoff 브랜치 `78c2ad6a1`, PR 제외): qkv 패스에서 Q를 u16로, 정적 scale**
+**WIP (브랜치 `htp/s26-static-q-wip`, PR 제외): qkv 패스에서 Q를 u16로, 정적 scale**
 - `hvx_norm_rope_rows_ld_q16_f32` / `mm_u8i4_layer_norm_ld_q16`: norm+RoPE 행이 캐시에 있을 때 u16도 씀. 인코딩은
   head 공통 정적 상한 B = √(2·hd)·max|q gamma·q_scale| (norm 뒤 원소 ≤ √hd·|gamma|, RoPE 쌍은 그 √2배).
   mha_core는 `ComputeOps::attn_q16_enc`의 인코딩을 쓰고 Q 보정을 안 함. `QKVLayer attn_q16`(빌더가 q8+HTP일 때),
@@ -248,6 +247,46 @@ adb shell "cd $D/pr4412 && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH='$D/pr4412' $ENV 
 
 **다음 (B 이후 남은 CPU 연산)**: 첫 chunk의 K/V abs-max 보정(`calibrate_q2_scales`, NEON, 층당 0.4–0.8 ms)과
 qkv 출력 Q f32의 host 복사(doc 60 §3.8). 정적 scale이 채택되면 Q f32 복사는 바로 뺄 수 있다.
+
+## 7-1. 블록 텐서를 DSP에 두기 (2026-10-11, opt 커밋 3개)
+
+- `fb6e71850` pre-norm scratch를 M×K → 레인당 4행 (DSP heap 15–24 MB → 0.6 MB). **이게 없으면 p4096 C24가
+  MoE 호출에서 `AEE_ENOMEMORY`** (u16 o-proj 엔트리의 M×K scratch가 heap 한계를 넘김).
+- `e1e4ffca2` FC slice를 K ≥ 4096에서 1 MiB로: o-proj가 1024행 1회 호출(행 상한 896 → 1,472, K=8192는 704).
+  K=2816까지 넓히면 qkv도 2048행 1회가 되지만 뒤의 MoE 호출이 ENOMEMORY (원인 미확인) → 안 함.
+- `1148f40f5` 텐서를 통째로 staging하고 행 chunk는 offset으로 호출; `copyOutOf(to_host=false)`는 `sampledSame`이 보는
+  33개 창(2 KB)만 host에 씀 → 다음 호출이 기존 내용 검사로 버퍼를 swap. `out_to_host` 속성(residual_add·dense_ffn·
+  lfm2_moe·qkv_layer)을 Gemma-4 빌더가 "모든 소비자가 HTP 호출"일 때만 false로. mha_core는 `ComputeOps::host_view`로
+  K/V/Q를 staging 버퍼에서 읽음. CPU fallback은 `sync_to_host` 먼저. decode 한 행·`PROFILE>=2`·마지막 층 출력은 전체 복사.
+
+| | 그 전 opt | 지금 |
+|---|---|---|
+| staging memcpy p1024 | 143–151 ms (2,940 MB) | 22 ms (301 MB) |
+| staging memcpy p2048 | 402 ms (7,444 MB) | 39 ms (408 MB) |
+| o-proj 호출 수 p1024 / p2048 | 95 / 130 | 65 / 95 |
+| prefill p1024 | 2,322 / 2,308 / 2,264 | 2,230 / 2,279 / 2,172 |
+| prefill p2048 | 4,728 / 5,020 / 5,293 | 4,438 / 4,178 / 4,438 |
+문장은 기준과 **바이트 동일**(p1024·p2048, `ATTN_F32=0`, `PROFILE=2`), 결정성 0 불일치, host check 통과.
+
+**이 라운드에서 배운 것 (다음 세션 필독)**
+- 정확도 게이트(프롬프트 NLL)가 없는 동안은 **비트 동일한 최적화만** opt에 넣는다. 검증 = 같은 env에서 기준 빌드와
+  문장 md5 비교. 기기에 두 빌드를 `$D/pr4412_base`·`$D/pr4412_<tag>` 로 나란히 두고 번갈아 돌리면 재설치가 없다.
+- 작은 이득(< 100 ms)은 벽시계(±150 ms)로 안 보인다: `NNTR_HTP_PROFILE=1`의 호출 수·host ms·staging MB가 1차 근거.
+- host 복사를 건너뛰는 변경은 **행 chunk 호출**에서 깨진다(텐서 ≠ chunk 버퍼). 항목별 스위치로 기기에서 이분해 찾았다.
+- `NNTR_MOE_SPLIT`은 기준 빌드에서도 깨진 문장을 낸다(기존 문제): fallback 검증에 못 쓴다.
+- 분석해서 뺀 것: MoE 층 host "other" 169 ms는 거의 전부 router RPC(157 ms)였다. dense+router, attention+o-proj
+  호출 융합은 RPC 60회 ≈ 20 ms라 보류.
+
+## 8-1. 다음: DSP 쪽 (PROFILE=2, p1024, MoE 호출 하나 25.8 ms)
+| 구간 | ms/call |
+|---|---|
+| acc read | 5.2 |
+| drain (expert weight DMA 대기, 0.9 + down 3.5) | 4.4 |
+| mm | 3.6 |
+| stage 1.25 · scatter 0.8 · quant 0.6 · dequant 0.5 · push/alloc 0.5 | 3.7 |
+| **타이머 밖** (`rest<=8791.5`) | **8.8** |
+먼저 그 8.8 ms(30층 ≈ 260 ms)가 어디인지 계측. dense 호출 5.6 ms: swiglu(hidden)·stage 1.1·mm 0.8·requant 0.8.
+router 5.2 ms/call(HVX f32, 157 ms/prefill)은 dense의 HMX 아래로 숨길 후보(풀을 같이 써서 간단하지 않음).
 
 ## 8. 남은 prefill 최적화 (S26U p1024 ≈ 2.4 s 기준, 기대 효과는 기기 미측정)
 | # | 항목 | 근거 |
@@ -281,7 +320,10 @@ D(+`NNTR_MOE_MISS_READERS=8`), miss 감시 스레드 prime 코어 고정(notice 
 | 7d9490881 | FC 호출 u16 activation (quant 패스 안 역양자화) | §7 |
 | f5a70c4d5 | attention f32 Q를 DSP에서 u16로, u16 context를 o-proj에 | p1024 2,514/2,254→2,201/2,188, p2048 4,466/4,530→4,194/4,527 |
 | 66e023786 | NEON quant_u16_f32 contraction off | 두 경로 차이 125→8 step |
-현재 p1024 ≈ 2.2 s (≈465 TPS), p2048 4.2–4.5 s (≈450–490 TPS), p4096 미측정(이 작업 후). decode p1024 마지막 64 ≈ 12–14 TPS(C32).
+| fb6e71850 | pre-norm scratch 레인당 4행 | p4096 C24 ENOMEMORY 해결 |
+| e1e4ffca2 | FC slice 1 MiB (K≥4096), o-proj 1회 호출 | o-proj 호출 95→65 (p1024) |
+| 1148f40f5 | 블록 텐서를 DSP에 (통째 staging, 표본 copy-out) | staging 143→22 ms (p1024), 402→39 ms (p2048) |
+현재 p1024 ≈ 2.2 s (≈460 TPS), p2048 4.2–4.4 s (≈460–490 TPS), p4096 C24 9.2 s. decode p1024 마지막 64 ≈ 12–14 TPS(C32).
 
 ## 11. 커밋 규칙
 
@@ -295,7 +337,7 @@ D(+`NNTR_MOE_MISS_READERS=8`), miss 감시 스레드 prime 코어 고정(notice 
 
 Co-authored-by: Claude <noreply@anthropic.com>
 Signed-off-by: SeungHui Lee <shsh1004.lee@samsung.com>
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: <세션 attribution 줄> 
 Claude-Session: https://claude.ai/code/session_...
 ```
 명령:
