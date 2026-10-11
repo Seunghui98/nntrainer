@@ -43,6 +43,8 @@ PR 4412가 업데이트되면 `git fetch upstream pull/4412/head` 후 rebase 여
 
 ## 0. 한 줄 요약
 
+**결과만 추린 문서**: [`s26u-optimization-log.md`](s26u-optimization-log.md) — 된 것, 안 된 것, 그 이유.
+
 - 브랜치 `htp/s26-prefill-opt`에 커밋 14개 (§10). base는 PR 4412 head (`b398e078c`). **push는 아직 안 됨**
   (이 워크스테이션에 GitHub 자격증명 없음: `gh auth login` 또는 SSH 키 뒤
   `git push origin htp/s26-prefill-opt htp/s26-static-q-wip && git push --force-with-lease origin htp/s26-prefill-handoff`).

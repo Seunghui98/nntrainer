@@ -2,7 +2,7 @@
 
 2026-10-10 ~ 10-11, Galaxy S26 Ultra(SM8850, Hexagon V81), Gemma-4 26B-A4B 2-bit MoE(30층, 층당 expert 128개, top-8).
 코드는 PR [nntrainer#4416](https://github.com/nntrainer/nntrainer/pull/4416)(head 브랜치 `htp/s26-prefill-opt`, 지금 `6c9692c74`)에 있다.
-환경·빌드·실행 방법과 측정 원본은 브랜치 `htp/s26-prefill-handoff`의 `docs/measurements/s26u-prefill-handoff.md`에 있고(PR에는 넣지 않음), 이 문서는 그 결과만 추린 것이다.
+환경·빌드·실행 방법과 측정 원본은 [`s26u-prefill-handoff.md`](s26u-prefill-handoff.md)에 있고, 이 문서는 그 결과만 추린 것이다.
 
 ## 1. 결과
 
