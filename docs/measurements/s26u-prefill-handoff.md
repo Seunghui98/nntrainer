@@ -47,7 +47,7 @@ PR 4412가 업데이트되면 `git fetch upstream pull/4412/head` 후 rebase 여
   (이 워크스테이션에 GitHub 자격증명 없음: `gh auth login` 또는 SSH 키 뒤
   `git push origin htp/s26-prefill-opt htp/s26-static-q-wip && git push --force-with-lease origin htp/s26-prefill-handoff`).
 - `htp/s26-prefill-handoff` = opt + 이 문서. `htp/s26-static-q-wip` = (옛 opt `66e023786` 위) 정적 Q scale WIP, 정확도 미확정(§7).
-- 현재(S26U, C32, opt tip `f29642e3e`): p1024 ≈ 1.8 s (≈ 564 TPS), p2048 ≈ 3.3 s (≈ 619 TPS), p4096 C24 7.3 s (≈ 563 TPS). decode p1024 마지막 64 ≈ 12–13 TPS, p2048 ≈ 10–11.
+- 현재(S26U, C32, opt tip `6c9692c74`): prefill p1024 ≈ 1.8 s (≈ 564 TPS), p2048 ≈ 3.3 s (≈ 619 TPS), p4096 C24 7.3 s (≈ 563 TPS). decode(마지막 64, 128토큰 생성 설정) p1024 ≈ 11.9 TPS, p2048 ≈ 12.2 (그 전 10.8 / 10.4).
 - host·transport는 거의 바닥(staging 22–39 ms/prefill, 층당 RPC 6회). 남은 것은 DSP 연산: §8-1.
 
 ## 1. 작업 환경 (이 워크스테이션)
@@ -417,18 +417,38 @@ miss round: 토큰당 24회, 회당 2.4 expert(3.6 MB)를 ARM이 flash에서 pre
 top-8 겹침 **67.7 %**, 순위별 적중 1위 91 % · 2위 85 % · 3위 80 % · 4위 73 % · 5위 66 % … 8위 39 %; 층별로는 1–4층 32–53 %, 5–28층 59–83 %, 29층 35 %.
 `tools/moe_expert_cache_sim.py route_base.log --cache 32 40 --predict oracle trace`: 추측대로 **풀에 미리 올리면**(prefetch-tail) 대기 읽기가 호출당 1.62 → 0.65(C32), 1.15 → 0.48(C40)로 −60 %, 대신 flash 읽기 1.8×(토큰당 ≈130 MB, 1.5 GB/s 지속 필요 — 측정된 flash 속도에 근접). 페이지 캐시만 올리는 현재 구현이 효과가 없는 이유가 이 flash 경합 + 1층 리드타임(≈2.5 ms)이다.
 
-**계획 (효과 × 확실성 순)**
+**2026-10-11 저녁: 해 본 것과 결과 (기기 폴더 b18 = prefill 끝, d7 = 아래 세 커밋까지)**
 
-| # | 항목 | 근거 | 기대 (p1024, 86 ms 기준) | 비트 동일 |
-|---|---|---|---|---|
-| D1 | env 조합을 기본값으로: C=40(1k/2k) + `LRFU=32` + `DENSE_EARLY=1` | 위 표, 각 1회 | 11.6 → 13.5 TPS. 먼저 번갈아 3회로 확정 | 예 (문장 동일 확인됨) |
-| D2 | **예측 expert를 풀에 직접 staging** (동료 제안의 강한 형태): hint → pool server가 추측의 상위 n개 중 비상주를 미리 읽어 빈/퇴출 가능 슬롯에 넣고 EXPERTS 표를 갱신(miss round의 메커니즘 재사용, DSP는 기다리지 않음). 1–4층·29층은 제외, 순위 0–3만(73–91 %), 2층 앞을 추측하면 리드타임 확보 | 사이뮬 −60 % 대기 읽기 | miss 대기 29 → ≈12 ms, +2.5–3 TPS. 위험: flash 1.5 GB/s 지속, 오예측의 퇴출 | 예 (언제 올리느냐만 바뀜) → md5로 확인 |
-| D3 | decode attention 커널 | 11.8 ms, 피크의 1/15; scores·PV 누산기 구조 | −6~−8 ms | **아니오**: hf 반올림 순서 변경 → `NNTR_PPL_DECODE` 게이트 필요 |
-| D4 | 작은 op 융합: norm·add·QK_NORM·ROPE를 뒤따르는 FC/MoE op에(prefill의 FusedNorms처럼) | 3.8 ms, op당 86 µs dispatch | −2~−3 ms | 예 (같은 산술) |
-| D5 | MoE GEMV 피드 튜닝 (`NNTR_MOE_HTP_GEMV_LEAD_KB/ROWS1/FEED`, `NNTR_MOE_DMA_QUEUES`) | 계산 14 ms = 25 GB/s | −3~−5 ms | 예 (env) |
-| D6 | TTFT: KV seed의 DSP append 벡터화(`hvx_attn_m1_f32.c` scalar `q8_of`, 층당 ≈30 ms) + prefill 끝의 풀을 앞층 expert로 채우기 | 첫 토큰 1.6–2.4 s 중 seed 0.95 s | −0.7 s TTFT | 예 |
-| D7 | router fp16 weight(43 MB → 22) / LM head 비트 수 | 2.8 / 8.1 ms 대역폭 | −1.4 / −4 ms | **아니오**: 정확도 결정 |
-| — | pool server가 토큰 내내 코어 하나를 spin (ponytail 표시) | reader 7개와 경합 가능 | 미측정 | 예 |
+먼저 알아둘 것: 폰의 `g1024_i2048/generation_config.json`이 15:41에 바뀌어 문장 끝 뒤에도 128토큰을 다 만든다. 기준 md5가
+p1024 `fe44d523`, p4096 `1b462136`, NEON-Q p1024 `a741e075`로 바뀌었고(앞부분은 이전 문장과 동일) p2048은 `aff26409` 그대로.
+이 설정에서 b18 기본 decode는 10.1–10.8 TPS(마지막 64)로 읽힌다.
+
+| 시도 | 결과 | 판정 |
+|---|---|---|
+| `ca51dd761` dense 선행을 기본값으로 | p1024 10.83 → 11.53 TPS, p2048 10.44 → 10.82 (3회 평균) | **PR에 넣음** |
+| `353daf3a4` LRFU 32를 기본값으로 | 그 위에 p1024 → 11.93, p2048 → 12.16; p4096 8.9 → 9.6(잡음 큼) | **PR에 넣음** |
+| `6c9692c74` miss server의 poll을 yield 대신 pause | notice 86–150 → 0 µs/round (TPS로는 안 보임) | **PR에 넣음** |
+| D2: 다음 층 추측을 여분 슬롯에 미리 읽기 (ARM만; `~/workspace/s26u-work/d2_guess_staging.patch`) | 쓸모 17/토큰인데 대기 25.7 → 33.2 ms, 10.5 TPS | 버림 |
+| 읽은 expert를 anonymous RAM에 보관 (3 GiB) | hit 28 weight/토큰, RSS +1.1 GB, 대기 변화 없음 | 버림 |
+| `NNTR_MOE_PIN=1/2` | mlock 30/30 실패, 첫 토큰 +4.5 s, 대기 악화 / 메모리 floor에 걸려 0층 | 버림 |
+| D5: `FC_LANES` 8,4·8,6·6,6·4,3, `DMA_QUEUES` 2·4, `GEMV_LEAD_KB` 0·384, `GEMV_FEED=0`, `FC_FEED=l2` | per-kind us/token이 기본값보다 나은 것 없음(feed 끄면 2배 느림) | 기본값 유지 |
+| C: p1024 40까지(41은 미확인, 42는 prefill 첫 qkv에서 매핑 실패), p2048 **36까지**(40 실패), p4096 28 | expert slot 1.45 MiB, MoE arena = 약 0.8 GB + C×43.6 MiB, DSP 매핑 한도 ≈ 3,136 MiB | env로만 |
+| 다음 **토큰** 예측(같은 층의 9–16위를 미리 읽기) — 순위 로그를 남기는 skel로 수집, `~/workspace/s26u-work/nexttok.py` | miss의 20–23 %만 그 안에 있고, miss가 전부 덮이는 층은 14–17 %; 풀에 넣으면 miss가 오히려 늘어남(47 → 48–58/토큰) | 만들지 않음 |
+
+**왜 미리 읽기 계열이 안 되는가 (측정)**: (1) miss 읽기는 이미 flash 속도다 — reader 4개 2.8 GB/s, 1개 1.5 GB/s(대기 2배), `dd`로 그 파일 1.9–2.7 GB/s.
+(2) 한 층의 miss는 병렬로 읽으므로 그 층의 miss가 **전부** 준비돼 있어야 대기가 준다; 일부만 맞히면 그대로고 추가 읽기가 flash를 나눠 쓴다.
+(3) 폰 RAM(11.4 GB)은 expert 5.4 GB를 DSP 쪽 3.3 GB + 시스템 옆에 다 둘 수 없다.
+그래서 miss 대기 = 토큰당 놓친 바이트 ÷ flash 속도이고, 남은 손잡이는 놓치는 양(C, 교체 정책)과 기다리는 동안의 일(dense 선행)뿐이다.
+
+**남은 것**
+
+| # | 항목 | 근거 | 비트 동일 |
+|---|---|---|---|
+| D3 | decode attention 커널 (11.8 ms/토큰, 8레인 포화: scores 30 + PV 31 Mcyc, ≈3 MAC/cycle) | CPU의 fp16 합산 순서를 그대로 따르는 구조라 느림 | **아니오** → `NNTR_PPL_DECODE` 게이트 필요 |
+| D4 | 작은 op 융합 (norm·add·QK_NORM·ROPE 3.8 ms/토큰) | op당 dispatch | 예 |
+| D6 | TTFT: attn_m1 KV append 벡터화(scalar `q8_of`, 층당 ≈30 ms), prefill 끝의 풀을 앞층으로 | 첫 토큰 1.5–2.4 s | 예 |
+| D7 | lm_head·FC 비트 수, router fp16 | 대역폭 한계(가중치 1.5 GB/토큰) | **아니오** |
+| — | miss 대기 중 더 할 일 찾기(dense 선행의 확장: 다음 층의 norm·qkv는 이 층 출력이 필요해 불가) | — | — |
 
 ## 10. 커밋된 것 (htp/s26-prefill-opt, PR 4412 위)
 | 커밋 | 내용 | 효과 (S26U) |
