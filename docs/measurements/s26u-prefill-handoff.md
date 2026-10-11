@@ -277,6 +277,45 @@ qkv 출력 Q f32의 host 복사(doc 60 §3.8). 정적 scale이 채택되면 Q f3
 - 분석해서 뺀 것: MoE 층 host "other" 169 ms는 거의 전부 router RPC(157 ms)였다. dense+router, attention+o-proj
   호출 융합은 RPC 60회 ≈ 20 ms라 보류.
 
+## 7-2. DSP 쪽 라운드 (2026-10-11 오전, WIP 커밋 5개 — 수치 기입 뒤 opt로)
+
+**먼저 읽을 것**: 워크스테이션이 12:08에 재부팅돼 `/tmp` scratchpad(로그·스크립트)가 전부 지워졌다. 스크립트는 이제
+`~/workspace/s26u-work/`(build.sh, dev.sh, sum.sh)에 둔다. 재부팅 뒤 adb는 `no permissions`(USB ACL이 `nntrainer` 계정,
+이 계정은 plugdev 아님) — 사용자에게 `sudo setfacl -m u:shsh1004-lee:rw /dev/bus/usb/003/*`를 부탁한다.
+
+| 기기 폴더 | 내용 (누적) | p1024 | p2048 | p4096 C24 |
+|---|---|---|---|---|
+| `pr4412_b15` | 지난 라운드 끝 (opt tip `1148f40f5`) | 2,259 / 2,370 / 2,310 | 4,970 / 4,485 / 4,494 | 9,246 |
+| `pr4412_b16` | `2f95e012c` MoE: 행을 한 번만 양자화 + down scatter 행 단위 | 1,969 / 1,962 / 2,023 | 3,969 / 4,024 / 4,109 | 8,563 |
+| `pr4412_b17` | + `c792707e1` MoE pre norm을 scan에, 결과 제자리 누적 + `beec11b87` skel이 FC 행 chunk를 돎(qkv·o-proj RPC 1회) + `706564faf` KV seed를 staging으로 | 1,901 / 1,978 / 1,864 | 4,079 / 4,261 / 3,620 | 7,591 / 7,562 |
+| `pr4412_b18` | + `2c71810a2` qkv의 per-head norm·RoPE를 dequant epilogue에 (행 단위) | 1,930 (1회) | 3,475 (1회) | 미확정 |
+
+b15↔b16, b16↔b17은 번갈아 3쌍(2분 냉각). 문장은 전부 동일: 답 줄의 md5(`grep -a -o '<channel|>.*' log | head -1 | md5sum | cut -c1-8`)
+p1024 `2ec61a41`, p2048 `aff26409`, p4096 `028868b0`, `NNTR_HTP_ATTN_F32=0` p1024 `1fd0625a`. decode 변화 없음(p1024 ≈13, p2048 ≈11 TPS).
+**남은 확인**: b17↔b18 교대 측정(재부팅으로 끊김), p4096 반복(b17 한 번 18.9 s, b18 한 번 10.9 s — mem_available 1.6 GiB일 때; 코드 문제인지 메모리 압박인지 미확정),
+작업 트리의 `stageClass` 1/4 옥타브(미측정, 미커밋).
+
+**이 라운드에서 알게 된 것**
+- MoE 커널의 병목은 HMX가 아니라 **HVX 워커의 메모리 접근**이었다. 계측(워커 종류별 시간): p2048 호출당 워커 226 ms 중 down scatter 128
+  (tile 단위라 (행, tile)마다 DDR 미스), pack 63(행을 route된 슬롯 수만큼 f32에서 다시 양자화). 행 단위 scatter + l2fetch → 74, 한 번 양자화 + u8 gather → 27.
+  out 접근을 빼면 16까지 내려가므로 남은 scatter 비용은 출력 23 MB를 8번 RMW하는 대역폭이다(구조적).
+- `NNTR_HTP_PROFILE=2`는 **실제 경로가 아니다**: timed 엔트리 + host norm. 실제(`moe_layer_norm_add`)는 norm 패스 → 커널 안 act 복사 → …
+  → out 복사 → post norm → add 였고, 그 중복 패스를 `c792707e1`이 없앴다. PROFILE=2의 `rest<=`는 대부분 probe 자체 비용(tile당 timer 2회).
+- **FastRPC 드라이버는 인자로 넘긴 버퍼를 호출마다 통째로 매핑·sync한다**: 인자 길이가 아니라 버퍼 크기 MiB당 ≈27 µs. 그래서
+  행 chunk 호출 2–4회가 그대로 2–4배였다(qkv 4.3 ms/call, o-proj 2.2) → skel이 chunk를 돌게 해 RPC 1회로(`beec11b87`).
+  같은 이유로 2의 거듭제곱 class가 손해(23 MB 텐서가 32 MiB 버퍼) → 작업 트리의 1/4 옥타브 class.
+- qkv DSP 시간의 46 %가 matmul 뒤의 norm+RoPE 패스(층당 5.9 of 12.7 ms)였다 → `2c71810a2`. PROFILE=1의 qkv host 506 → 339 ms(p2048).
+- MoE 노드의 CPU 몫은 작다: top-k 0.2 ms/층, "other" 12.9 ms는 router RPC 10.7.
+- attention 노드: kv_write 2.3 ms, calibration 2.4 ms(층마다 첫 호출), RPC 15–18 ms.
+
+**해 봤는데 뺀 것**
+- `RPCMEM_TRY_MAP_STATIC`(staging 버퍼 사전 매핑): p2048 3,139 ms(652 TPS)까지 나오지만 **문장이 깨진다**. host에서 읽기 전 `DC CIVAC`를
+  넣어도 그대로 — DSP가 쓴 내용이 host에 안 보인다. host가 읽는 버퍼만 non-static으로 두면 p2048은 맞지만 p1024는 깨지고 p4096은
+  `layer_norm` 실패(0x80000583류). 캐시 일관성을 문서로 보장받기 전에는 쓰지 말 것. 이득은 p2048 RPC 합 −285 ms.
+- uncached staging(`flags=0`): 호출당 3–8 % 수준, 벽시계로 구분 안 됨. futex wake 생략: 효과 없음.
+- `NNTR_HTP_KV_SEED_Q=1`: 문장 깨짐(기존). KV seed를 ION으로 보낸 것은 1,055–1,097 → 973 ms: 남은 것은 DSP의 scalar append
+  (`hvx_attn_m1_f32.c` `q8_of`, 층당 ≈30 ms).
+
 ## 8-1. 지금 시간이 어디 가는지 (2026-10-11, pr4412_b15, 같은 실행에서 노드·RPC 동시 측정)
 
 p2048 4,604 ms(프로파일 켠 실행; 평소 4,180–4,440) 기준. 노드 시간은 `NNTR_LAYER_PROFILE=1`, RPC host 시간은 `NNTR_HTP_PROFILE=1`, 같은 실행.
@@ -314,6 +353,7 @@ t1(첫 토큰) KV seed: p2048 1,055 ms, p4096 2,137 ms — 30층 K/V f32(1 GB)�
 ## 8. 남은 prefill 최적화 후보 (2026-10-11 재분석; 기대 효과는 모두 기기 미측정, p2048 ≈ 4,400 ms 기준)
 
 비트 동일 조건을 만족하는 것만 opt에 들어간다(§7-1). 순서 = 기대 효과 × 확실성 ÷ 노력.
+**2026-10-11 오전 갱신**: 아래 1·2·10(MoE)·11의 qkv 절반·14는 §7-2에서 처리됨. 3은 §7-2의 이유로 보류. 남은 순서: (a) b18·staging class 기기 확정 → 커밋 메시지에 수치 → opt cherry-pick, (b) KV seed의 DSP append 벡터화(TTFT), (c) attention softmax 5.5 ms/call, (d) o-proj의 post 패스 2.5 ms/층, (e) router.
 
 | # | 항목 | 근거 (p2048) | 기대 | 첫 걸음 |
 |---|---|---|---|---|
