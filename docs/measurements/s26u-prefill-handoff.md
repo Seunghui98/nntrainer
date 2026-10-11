@@ -385,11 +385,50 @@ t1(첫 토큰) KV seed: p2048 1,055 ms, p4096 2,137 ms — 30층 K/V f32(1 GB)�
 해 봤는데 효과 없음(이전): staging memcpy 4스레드, router 행 블록 4→6, DCVS MAX corner. 쓰면 안 됨: `NNTR_HTP_KV_SEED_Q=1`(문장 깨짐), `NNTR_MOE_SPLIT`(기준에서도 깨짐).
 전부 들어가면 p2048 ≈ 1.0–1.5 s 감소(≈ 570–700 TPS)가 상한 추정이고, 절반이 현실적이다 — 기기 미측정.
 
-## 9. decode (prefill 다음)
-p1024 C32 토큰당 ~70 ms. miss 대기가 최대. env 조합 측정 일부: A 기준 13.01 TPS(마지막 64) /
-B(`NNTR_MOE_LRFU=32 NNTR_HTP_DENSE_EARLY=1`) 14.18. 남은 후보: C(+`NNTR_HTP_PREDICT=1`),
-D(+`NNTR_MOE_MISS_READERS=8`), miss 감시 스레드 prime 코어 고정(notice 127 µs vs S25 1 µs),
-작은 op 합치기(norm 3.3 ms), decode ATTN 10 ms, ROUTER 2.9 ms. FC/LM_HEAD/DENSE는 대역폭(~53 GB/s) 한계.
+## 9. decode — 분석과 계획 (2026-10-11 오후, b18 기준)
+
+**토큰 하나 (p2048, 98 ms; p1024 ≈ 86 ms)** — `NNTR_HTP_PROFILE=1`의 `graph per-kind us/token`:
+
+| op | ms/토큰 | 메모 |
+|---|---|---|
+| MOE | 55.5 | 그중 **miss 대기 41** (p1024 29), 계산 14 — 240 expert × 1.5 MB = 360 MB를 25 GB/s로 (대역폭 ~50의 절반) |
+| ATTN_M1 | 11.8 | 378 MMAC를 32 GMAC/s로: KV는 int8 23 MB(0.5 ms)라 대역폭이 아니라 커널 구조. HVX hf 피크의 1/15 |
+| FC (qkv·o-proj) | 10.4 | 520 MB → 50 GB/s, 대역폭 한계 |
+| LM_HEAD | 8.1 | 370 MB Q4_0, 대역폭 한계 |
+| DENSE_FFN | 5.1 | 270 MB, 대역폭 한계 |
+| RMSNORM + QK_NORM + ROPE + ADD | 3.8 | 542 op/토큰 중 작은 op들, op당 ≈ 86 µs = dispatch 비용 |
+| ROUTER_TOPK | 2.8 | f32 weight 1.4 MB × 30 = 43 MB를 15 GB/s로 |
+
+miss round: 토큰당 24회, 회당 2.4 expert(3.6 MB)를 ARM이 flash에서 pread 1.9 ms(≈1.9 GB/s), DSP는 그동안 1.7 ms 대기. pgpgin 64 MB/토큰 → miss의 74 %가 flash. 대역폭 하한 ≈ 1.5 GB/토큰 ÷ 53 GB/s = 28 ms(35 TPS); miss·attention·dispatch를 다 잡으면 ≈ 50 ms(20 TPS)가 현실적 상한.
+
+**env만으로 (p1024, 각 1회, b18; 문장 전부 동일)**
+
+| 옵션 | decode TPS(마지막 64) | miss/토큰 | 대기 ms |
+|---|---|---|---|
+| 기본 C=32 (2회) | 11.6 / 11.4 | 47.5 | 29 / 27 |
+| `NNTR_MOE_CACHE_EXPERTS=40` | 12.7 | 32.3 | 26 |
+| `NNTR_MOE_LRFU=32` | 12.8 | 43.7 | 27 |
+| `NNTR_HTP_DENSE_EARLY=1` | 13.5 | 47.5 | 23 |
+| `NNTR_HTP_PREDICT=1 NNTR_MOE_PREFETCH=4` | 12.0 | 47.5 | 28 (pgpgin +30 %: flash 경합) |
+| `NNTR_MOE_MISS_READERS=8` | 12.4 | 47.5 | 26 |
+| C40 + LRFU + DENSE_EARLY + PREDICT/PREFETCH | 13.4 | 30.3 | 18 |
+
+**다음 층 expert 예측 (동료 제안) 검토** — 이미 코드에 있다: `NNTR_HTP_PREDICT=1`은 각 ROUTER_TOPK op이 **다음** 층 router를 자기 입력으로 미리 돌려 추측(pre-gated MoE, #266 S2)하고, `NNTR_MOE_PREFETCH=N`은 그 추측을 N 스레드가 **페이지 캐시에만** 올린다(#282 B). 오늘 `NNTR_HTP_ROUTE_LOG`로 잰 추측 정확도(p1024, 2,987 router op):
+top-8 겹침 **67.7 %**, 순위별 적중 1위 91 % · 2위 85 % · 3위 80 % · 4위 73 % · 5위 66 % … 8위 39 %; 층별로는 1–4층 32–53 %, 5–28층 59–83 %, 29층 35 %.
+`tools/moe_expert_cache_sim.py route_base.log --cache 32 40 --predict oracle trace`: 추측대로 **풀에 미리 올리면**(prefetch-tail) 대기 읽기가 호출당 1.62 → 0.65(C32), 1.15 → 0.48(C40)로 −60 %, 대신 flash 읽기 1.8×(토큰당 ≈130 MB, 1.5 GB/s 지속 필요 — 측정된 flash 속도에 근접). 페이지 캐시만 올리는 현재 구현이 효과가 없는 이유가 이 flash 경합 + 1층 리드타임(≈2.5 ms)이다.
+
+**계획 (효과 × 확실성 순)**
+
+| # | 항목 | 근거 | 기대 (p1024, 86 ms 기준) | 비트 동일 |
+|---|---|---|---|---|
+| D1 | env 조합을 기본값으로: C=40(1k/2k) + `LRFU=32` + `DENSE_EARLY=1` | 위 표, 각 1회 | 11.6 → 13.5 TPS. 먼저 번갈아 3회로 확정 | 예 (문장 동일 확인됨) |
+| D2 | **예측 expert를 풀에 직접 staging** (동료 제안의 강한 형태): hint → pool server가 추측의 상위 n개 중 비상주를 미리 읽어 빈/퇴출 가능 슬롯에 넣고 EXPERTS 표를 갱신(miss round의 메커니즘 재사용, DSP는 기다리지 않음). 1–4층·29층은 제외, 순위 0–3만(73–91 %), 2층 앞을 추측하면 리드타임 확보 | 사이뮬 −60 % 대기 읽기 | miss 대기 29 → ≈12 ms, +2.5–3 TPS. 위험: flash 1.5 GB/s 지속, 오예측의 퇴출 | 예 (언제 올리느냐만 바뀜) → md5로 확인 |
+| D3 | decode attention 커널 | 11.8 ms, 피크의 1/15; scores·PV 누산기 구조 | −6~−8 ms | **아니오**: hf 반올림 순서 변경 → `NNTR_PPL_DECODE` 게이트 필요 |
+| D4 | 작은 op 융합: norm·add·QK_NORM·ROPE를 뒤따르는 FC/MoE op에(prefill의 FusedNorms처럼) | 3.8 ms, op당 86 µs dispatch | −2~−3 ms | 예 (같은 산술) |
+| D5 | MoE GEMV 피드 튜닝 (`NNTR_MOE_HTP_GEMV_LEAD_KB/ROWS1/FEED`, `NNTR_MOE_DMA_QUEUES`) | 계산 14 ms = 25 GB/s | −3~−5 ms | 예 (env) |
+| D6 | TTFT: KV seed의 DSP append 벡터화(`hvx_attn_m1_f32.c` scalar `q8_of`, 층당 ≈30 ms) + prefill 끝의 풀을 앞층 expert로 채우기 | 첫 토큰 1.6–2.4 s 중 seed 0.95 s | −0.7 s TTFT | 예 |
+| D7 | router fp16 weight(43 MB → 22) / LM head 비트 수 | 2.8 / 8.1 ms 대역폭 | −1.4 / −4 ms | **아니오**: 정확도 결정 |
+| — | pool server가 토큰 내내 코어 하나를 spin (ponytail 표시) | reader 7개와 경합 가능 | 미측정 | 예 |
 
 ## 10. 커밋된 것 (htp/s26-prefill-opt, PR 4412 위)
 | 커밋 | 내용 | 효과 (S26U) |
