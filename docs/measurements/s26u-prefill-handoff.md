@@ -47,7 +47,7 @@ PR 4412가 업데이트되면 `git fetch upstream pull/4412/head` 후 rebase 여
   (이 워크스테이션에 GitHub 자격증명 없음: `gh auth login` 또는 SSH 키 뒤
   `git push origin htp/s26-prefill-opt htp/s26-static-q-wip && git push --force-with-lease origin htp/s26-prefill-handoff`).
 - `htp/s26-prefill-handoff` = opt + 이 문서. `htp/s26-static-q-wip` = (옛 opt `66e023786` 위) 정적 Q scale WIP, 정확도 미확정(§7).
-- 현재(S26U, C32): p1024 ≈ 2.2 s (≈ 460 TPS), p2048 ≈ 4.2–4.4 s (≈ 460–490 TPS), p4096 C24 9.2 s. decode p1024 마지막 64 ≈ 12–14 TPS.
+- 현재(S26U, C32, opt tip `f29642e3e`): p1024 ≈ 1.8 s (≈ 564 TPS), p2048 ≈ 3.3 s (≈ 619 TPS), p4096 C24 7.3 s (≈ 563 TPS). decode p1024 마지막 64 ≈ 12–13 TPS, p2048 ≈ 10–11.
 - host·transport는 거의 바닥(staging 22–39 ms/prefill, 층당 RPC 6회). 남은 것은 DSP 연산: §8-1.
 
 ## 1. 작업 환경 (이 워크스테이션)
@@ -277,23 +277,31 @@ qkv 출력 Q f32의 host 복사(doc 60 §3.8). 정적 scale이 채택되면 Q f3
 - 분석해서 뺀 것: MoE 층 host "other" 169 ms는 거의 전부 router RPC(157 ms)였다. dense+router, attention+o-proj
   호출 융합은 RPC 60회 ≈ 20 ms라 보류.
 
-## 7-2. DSP 쪽 라운드 (2026-10-11 오전, WIP 커밋 5개 — 수치 기입 뒤 opt로)
+## 7-2. DSP 쪽 라운드 (2026-10-11, opt 커밋 5개 — PR 4416에 push됨, head `f29642e3e`)
 
 **먼저 읽을 것**: 워크스테이션이 12:08에 재부팅돼 `/tmp` scratchpad(로그·스크립트)가 전부 지워졌다. 스크립트는 이제
-`~/workspace/s26u-work/`(build.sh, dev.sh, sum.sh)에 둔다. 재부팅 뒤 adb는 `no permissions`(USB ACL이 `nntrainer` 계정,
-이 계정은 plugdev 아님) — 사용자에게 `sudo setfacl -m u:shsh1004-lee:rw /dev/bus/usb/003/*`를 부탁한다.
+`~/workspace/s26u-work/`(build.sh, dev.sh, sum.sh; 로그 m30·m31)에 둔다. 재부팅 뒤 adb는 `no permissions`(USB ACL이 `nntrainer` 계정,
+이 계정은 plugdev 아님; 폰을 다시 꽂을 때마다 노드가 바뀜) → `sudo setfacl -m u:shsh1004-lee:rw /dev/bus/usb/003/*`, 그 다음 폰에서 USB 디버깅 허용.
+push는 `gh auth login`(계정 Seunghui98) 뒤 가능. **PR 4416의 head 브랜치 = `origin/htp/s26-prefill-opt`**.
 
-| 기기 폴더 | 내용 (누적) | p1024 | p2048 | p4096 C24 |
+| 기기 폴더 | 내용 (누적) | p1024 ms | p2048 ms | p4096 C24 ms |
 |---|---|---|---|---|
-| `pr4412_b15` | 지난 라운드 끝 (opt tip `1148f40f5`) | 2,259 / 2,370 / 2,310 | 4,970 / 4,485 / 4,494 | 9,246 |
-| `pr4412_b16` | `2f95e012c` MoE: 행을 한 번만 양자화 + down scatter 행 단위 | 1,969 / 1,962 / 2,023 | 3,969 / 4,024 / 4,109 | 8,563 |
-| `pr4412_b17` | + `c792707e1` MoE pre norm을 scan에, 결과 제자리 누적 + `beec11b87` skel이 FC 행 chunk를 돎(qkv·o-proj RPC 1회) + `706564faf` KV seed를 staging으로 | 1,901 / 1,978 / 1,864 | 4,079 / 4,261 / 3,620 | 7,591 / 7,562 |
-| `pr4412_b18` | + `2c71810a2` qkv의 per-head norm·RoPE를 dequant epilogue에 (행 단위) | 1,930 (1회) | 3,475 (1회) | 미확정 |
+| `pr4412_b15` | 지난 라운드 끝 (`1148f40f5`) | 2,259 / 2,370 / 2,310 | 4,970 / 4,485 / 4,494 | 9,246 |
+| `pr4412_b16` | `a1b2bcc8c` MoE: 행을 한 번만 양자화 + down scatter 행 단위 | 1,969 / 1,962 / 2,023 | 3,969 / 4,024 / 4,109 | 8,563 |
+| `pr4412_b17` | + `ecb2c87db` MoE pre norm을 scan에, 결과 제자리 + `cebe70803` skel이 FC 행 chunk를 돎 + `935a718af` KV seed를 staging으로 | 1,861 / 2,021 / 1,984 | 3,442 / 3,554 / 3,582 | 7,589 |
+| `pr4412_b18` | + `f29642e3e` qkv per-head norm·RoPE를 dequant epilogue에 (**= opt tip**) | 1,783 / 1,718 / 1,943 | 3,325 / 3,288 / 3,311 | 7,260 / 7,280 |
 
-b15↔b16, b16↔b17은 번갈아 3쌍(2분 냉각). 문장은 전부 동일: 답 줄의 md5(`grep -a -o '<channel|>.*' log | head -1 | md5sum | cut -c1-8`)
-p1024 `2ec61a41`, p2048 `aff26409`, p4096 `028868b0`, `NNTR_HTP_ATTN_F32=0` p1024 `1fd0625a`. decode 변화 없음(p1024 ≈13, p2048 ≈11 TPS).
-**남은 확인**: b17↔b18 교대 측정(재부팅으로 끊김), p4096 반복(b17 한 번 18.9 s, b18 한 번 10.9 s — mem_available 1.6 GiB일 때; 코드 문제인지 메모리 압박인지 미확정),
-작업 트리의 `stageClass` 1/4 옥타브(미측정, 미커밋).
+같은 줄의 세 값은 번갈아 3회(2분 냉각). b17·b18 줄은 13:10–14:20의 한 배치(b17·b18·b19 회전), b15·b16 줄은 오전 배치라 시간대가 다르다
+(오전 배치의 b17은 1,901 / 1,978 / 1,864, 4,079 / 4,261 / 3,620). 평균 TPS: b15 443 / 440 → b18 **564 / 619**, p4096 443 → 563.
+문장은 전부 동일: 답 줄 md5(`grep -a -o '<channel|>.*' log | head -1 | md5sum | cut -c1-8`)
+p1024 `2ec61a41`, p2048 `aff26409`, p4096 `028868b0`, `NNTR_HTP_ATTN_F32=0` p1024 `1fd0625a`.
+decode 변화 없음(마지막 64: p1024 11.6–13.2, p2048 10.1–11.1, p4096 8.6–11.7 TPS). decode의 miss: 토큰당 47.5(p1024) / 57.9(p2048) / 66.7(p4096 C24)개, 대기 31–43 ms.
+**p4096 주의**: 다른 길이를 돌린 뒤의 **첫** p4096 실행은 16–19 s가 나온다(b17 두 번, 문장은 동일, mem_available ≈1.6 GiB) — 빌드가 아니라 순서 효과. 첫 실행은 버린다.
+
+**측정했지만 넣지 않은 것 (같은 날 오후)**
+- `stageClass`를 2의 거듭제곱 대신 1/4 옥타브로(23 MB 텐서를 32 대신 24 MiB 버퍼에): b18 대비 p1024 1,705 / 1,804 / 1,737(−66), p2048 3,413 / 3,346 / 3,423(**+86**),
+  p4096 7,037 / 7,087(−210). 방향이 길이마다 달라 확정 못 함 → 뺌. p4096에서는 두 번 다 빨랐으니 p4096이 목표면 다시 볼 것.
+- attention 층별 calibration을 compute 스레드 8개로: trace의 calibration 중앙값 2,483 → 1,596 µs/층(−27 ms/prefill, 0.8 %). 코드 30줄 값을 못 해 뺌.
 
 **이 라운드에서 알게 된 것**
 - MoE 커널의 병목은 HMX가 아니라 **HVX 워커의 메모리 접근**이었다. 계측(워커 종류별 시간): p2048 호출당 워커 226 ms 중 down scatter 128
@@ -353,7 +361,7 @@ t1(첫 토큰) KV seed: p2048 1,055 ms, p4096 2,137 ms — 30층 K/V f32(1 GB)�
 ## 8. 남은 prefill 최적화 후보 (2026-10-11 재분석; 기대 효과는 모두 기기 미측정, p2048 ≈ 4,400 ms 기준)
 
 비트 동일 조건을 만족하는 것만 opt에 들어간다(§7-1). 순서 = 기대 효과 × 확실성 ÷ 노력.
-**2026-10-11 오전 갱신**: 아래 1·2·10(MoE)·11의 qkv 절반·14는 §7-2에서 처리됨. 3은 §7-2의 이유로 보류. 남은 순서: (a) b18·staging class 기기 확정 → 커밋 메시지에 수치 → opt cherry-pick, (b) KV seed의 DSP append 벡터화(TTFT), (c) attention softmax 5.5 ms/call, (d) o-proj의 post 패스 2.5 ms/층, (e) router.
+**2026-10-11 갱신**: 아래 1·2·10(MoE)·11의 qkv 절반·14는 §7-2에서 처리돼 PR에 있다. 3은 §7-2의 이유로 보류. 남은 순서: (a) attention softmax 5.5 ms/call(p2048 168 ms), (b) o-proj의 post 패스 2.5 ms/층과 FC 커널의 acc read, (c) router 10.7 ms/call(sf 연산 한계, fp16 HMX는 정확도 결정 필요), (d) MoE 출력 scatter의 8회 RMW(구조적), (e) TTFT: KV seed의 DSP append 벡터화(scalar q8, 층당 ≈30 ms), (f) decode: expert miss(§9).
 
 | # | 항목 | 근거 (p2048) | 기대 | 첫 걸음 |
 |---|---|---|---|---|
