@@ -1429,6 +1429,19 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
   return fail;
 }
 
+/* The MoE kernel's M=1 path norms whole rows through this (the FC checks
+   have hvx_scalar_stubs.c's): hvx_rmsnorm_row_f32 a row. */
+int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                         uint32_t chunk, const float *gamma, float eps,
+                         hvx_worker_pool *pool) {
+  (void)pool;
+  if (chunk != n)
+    return -1;
+  for (uint32_t m = 0; m < M; ++m)
+    hvx_rmsnorm_row_f32(x + (size_t)m * n, y + (size_t)m * n, gamma, n, eps);
+  return 0;
+}
+
 int main(void) {
   const uint32_t M = 97, K = 64, inter = 32, N_out = 64, NE = 5;
   hvx_scalar_hook.prefetch = hook_prefetch;
