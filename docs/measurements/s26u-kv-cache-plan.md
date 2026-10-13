@@ -222,3 +222,45 @@ O(n²) ≈ 11 TFLOP → 수십 초–수 분. 결과 파일 660 MiB × 2.
 | D. full 층 int8 커널의 컬럼 분할(타일 128 상한) | — | 22k+6k 69 s → 수 초대 | DSP 커널, 며칠 |
 
 데모(cache + 질문, cache + 추가 prefill)는 A로 전부 정상이었다. 프롬프트가 바뀌어도 안전하려면 B를 env/config로 켤 수 있게 두고, 근본은 C·D.
+
+## 8. 2026-10-13 밤 — int8 attention의 길이 제한 해제, C=12 / 16 기준
+
+### 8.1 무엇을 바꿨나 (`3ae1ee19b`)
+
+§7.4의 D를 했다. `hexkl_attn_q2`는 한 호출이 보는 컬럼 타일 전부(K^T·V)와 64행 블록이 보는 타일 전부(점수·P)를 VTCM에 두고,
+softmax가 128타일(4,096컬럼)까지만 받아서, full attention 층 5개는 문맥이 4,096을 넘는 순간 fp16 커널로 떨어졌다.
+이제 커널은 "컬럼 타일 구간 하나에 대한 pass"이고, 한 번에 안 들어가는 호출은 구간(최대 128타일)마다 pass를 돌린다.
+구간별 softmax는 정확히 합쳐진다: 구간의 행 최댓값 m과 P' 행 합 S에서 log2-sum-exp = m·rho/2^F + log2(S/65536)을 얻고,
+뒤 구간의 epilogue가 u16 출력 행에 `out <- wb·ctx + wa·(out − zp) + zp`로 누적한다. 문맥 길이에 따라 커지는 버퍼는 없다.
+4,096컬럼 이하는 기존 단일 pass 그대로다.
+
+검증(기기): ≤4,096은 이전 skel과 답 바이트 동일(2k `d762e507`, 4,049 `db405473`). 합치기는 `-DHEXKL_ATTN_Q2_SEG_TILES=16u`로
+2k 문맥을 강제 분할(full 5구간, sliding 3구간)해 단일 pass와 CPU 대비 오차가 층마다 유효숫자 3자리까지 같음을 확인(layer 5: 2.644 % vs 2.654 %).
+4,123컬럼에서 fp16 fallback 0층, full 층 오차 1.2–2.7 %(같은 층의 2k 단일 pass int8: 1.2–3.0 %, fp16 커널: 0.7–1.5 %).
+기기 gtest(`unittest_hvx_attn_q`)는 4,096 초과 케이스가 없어 돌리지 않았다.
+
+### 8.2 측정 — 22,241행 cache + 6,048토큰 추가 + 60토큰 (각 1회)
+
+| chunk(init_seq_len) | C | 추가 prefill | 토큰당 | 비고 |
+|---|---|---|---|---|
+| 2048 | 8 (fp16 fallback, §7.2) | 69.5 s | 180 ms | 이전 |
+| 2048 | 8 | 39.9 s | 155 ms | int8 구간 분할 |
+| 2048 | **12** | **18.6 s** | 119 ms | |
+| 2048 | 16 | 로드 실패 | — | DSP heap (s1_heap 1,324 MiB at load) |
+| 1024 | 12 | 30.0 s | 137 ms | |
+| 1024 | **16** | **24.4 s** | 133 ms | |
+| 1024 | 24 | 22.8 s | 119 ms | |
+
+full 층 한 호출(2048행 × 24k컬럼): 0.36–0.46 s (qk 105, softmax 181, pv 39 ms; HMX 스레드가 softmax를 167–208 ms 기다림 → softmax가 병목).
+2k cache + 1,818토큰 추가 + 60토큰: C=12 3.58 s / 96 ms, C=16 3.56 s / 103 ms, 답 정상·C와 무관하게 동일(`82ef1572`).
+
+읽는 법: (1) chunk가 클수록 빠르다(같은 토큰에 expert 전체를 훑는 횟수가 준다). (2) 2048행 chunk는 28k 길이에서 C=12까지만 DSP heap에 들어간다.
+(3) C=8은 read-ahead 슬롯이 한 층 분량도 안 돼 느리다. 그래서 지금 최선은 C=12 + 2048행 chunk, C=16이면 1024행 chunk.
+
+### 8.3 남은 것
+
+- C=16에서 2048행 chunk: DSP heap을 줄여야 한다. int8 미러가 K^T·V WH 타일과 같은 크기의 master(kt4/v4)를 함께 들고 있어
+  sliding 25층 × 24.6 MiB + full 5층 × 110 MiB ≈ 1.2 GB. fixed-scale 경로에서 master가 bake 뒤에도 필요한지 확인 필요.
+- full 층 softmax 분할 3 → 5 (대기 167–208 ms/호출).
+- PR 4416의 head가 10-13 오후에 11커밋 전진했다(`87f8580f5`: q2 보정을 DSP로, Q staging 내 양자화, o-proj epilogue 등).
+  이 브랜치는 그 전 head(`48a6bbb22`) 기준이고 `mha_core.cpp`, `hexkl_attn_q2.c`가 충돌한다. rebase 후 기기 재검증이 필요하다.
