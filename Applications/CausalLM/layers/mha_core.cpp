@@ -456,6 +456,8 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // model runs with engine="htp" and the DSP session opened) decides per
   // batch below whether attention leaves the CPU.
   compute_ops_ = context.getComputeOps();
+  if (q2_name_.empty())
+    q2_name_ = context.getName();
 
   // [#130] one decode row through the HTP when ATTN_M1 is resident, on
   // either cache path: _from is the absolute position on both.
@@ -1194,6 +1196,61 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
     finish(x);
   }
   q2_calibrated = true;
+  std::vector<float> &all = q2_store_[q2_name_];
+  all.clear();
+  for (const auto *v : {&q2_scale_k, &q2_scale_v, &q2_q_enc, &q2_out_enc})
+    all.insert(all.end(), v->begin(), v->end());
+}
+
+bool MHACoreLayer::take_q2_calibration() {
+  const auto it = q2_store_.find(q2_name_);
+  const size_t nk = num_heads_KV, nv = nk * head_dim, nq = 2 * num_heads_Q;
+  if (!q2_from_file_ || it == q2_store_.end() ||
+      it->second.size() != nk + nv + 2 * nq)
+    return false;
+  const float *p = it->second.data();
+  q2_scale_k.assign(p, p + nk);
+  q2_scale_v.assign(p + nk, p + nk + nv);
+  q2_q_enc.assign(p + nk + nv, p + nk + nv + nq);
+  q2_out_enc.assign(p + nk + nv + nq, p + nk + nv + 2 * nq);
+  return q2_calibrated = true;
+}
+
+void MHACoreLayer::saveQ2Calibration(std::ostream &file) {
+  auto put = [&](uint32_t v) {
+    file.write(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  put(static_cast<uint32_t>(q2_store_.size()));
+  for (const auto &[name, v] : q2_store_) {
+    put(static_cast<uint32_t>(name.size()));
+    file.write(name.data(), name.size());
+    put(static_cast<uint32_t>(v.size()));
+    file.write(reinterpret_cast<const char *>(v.data()),
+               v.size() * sizeof(float));
+  }
+}
+
+void MHACoreLayer::loadQ2Calibration(std::istream &file) {
+  auto get = [&]() {
+    uint32_t v = 0;
+    file.read(reinterpret_cast<char *>(&v), sizeof(v));
+    // a name or a layer's floats: nothing real comes near 1 MiB
+    if (!file || v > (1u << 20))
+      throw std::runtime_error("loadQ2Calibration: malformed file");
+    return v;
+  };
+  std::map<std::string, std::vector<float>> store;
+  for (uint32_t n = get(); n > 0; --n) {
+    std::string name(get(), '\0');
+    file.read(name.data(), name.size());
+    std::vector<float> v(get());
+    file.read(reinterpret_cast<char *>(v.data()), v.size() * sizeof(float));
+    if (!file)
+      throw std::runtime_error("loadQ2Calibration: truncated file");
+    store[name] = std::move(v);
+  }
+  q2_store_ = std::move(store);
+  q2_from_file_ = true;
 }
 
 bool MHACoreLayer::try_quantized_attention(
@@ -1297,7 +1354,7 @@ bool MHACoreLayer::try_quantized_attention(
       ? 0u
       : static_cast<unsigned int>(local_window_size);
   if (use_q2) {
-    if (!q2_calibrated) {
+    if (!q2_calibrated && !take_q2_calibration()) {
       // The rows about to be appended are the first this layer sees.
       const auto t0 = std::chrono::steady_clock::now();
       calibrate_q2_scales(k_base + off, v_base + off, append_rows, width,
