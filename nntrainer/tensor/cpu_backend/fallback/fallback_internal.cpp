@@ -532,6 +532,12 @@ size_t __fallback_quantize_q4_0(const float *src, void *dst, int64_t nrow,
   return 1;
 }
 
+size_t __fallback_quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                                int64_t n_per_row, const float *quant_weights) {
+  throw std::runtime_error("NYI : __fallback_quantize_q8_0");
+  return 1;
+}
+
 size_t __fallback_quantize_q4_K(const float *src, void *dst, int64_t nrow,
                                 int64_t n_per_row, const float *quant_weights) {
   throw std::runtime_error("NYI : __fallback_quantize_q4_K");
@@ -550,6 +556,10 @@ void __fallback_dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void __fallback_dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   throw std::runtime_error("NYI : __fallback_dequantize_row_q4_0");
+}
+
+void __fallback_dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  throw std::runtime_error("NYI : __fallback_dequantize_row_q8_0");
 }
 
 void __fallback_dequantize_row_q6_K(const void *x, float *y, int64_t k) {
