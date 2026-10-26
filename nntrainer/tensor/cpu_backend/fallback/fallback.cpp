@@ -338,6 +338,16 @@ void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
   __fallback_unpack_q4_0_8_to_q4_0(in_q4_0x, out_q4_0, data_size, M, N);
 }
 
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_repack_q8_0_to_q8_0_4x8(dst, src, data_size, M, N);
+}
+
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_unpack_q8_0_4x8_to_q8_0(src, dst, data_size, M, N);
+}
+
 template <>
 void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
                          size_t num_heads, float *sink) {

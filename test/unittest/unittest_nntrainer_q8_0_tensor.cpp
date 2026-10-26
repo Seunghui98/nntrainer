@@ -9,8 +9,11 @@
  */
 
 #include <cmath>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <random>
 
+#include <cpu_backend.h>
 #include <q8_0_tensor.h>
 #include <quantizer.h>
 #include <tensor.h>
@@ -130,6 +133,51 @@ TEST(Q8_0_Tensor, quantizer_rejects_partial_block_rows_n) {
   nntrainer::GgmlQuantizer q(nntrainer::QScheme::Q8_0);
   EXPECT_THROW(q.quantize(src, nntrainer::TensorDim::DataType::Q8_0),
                std::invalid_argument);
+}
+
+TEST(Q8_0_Tensor, repack_interleaves_four_rows) {
+  constexpr unsigned int M = 8, N = 64, NB = N / QK8_0;
+  std::vector<uint8_t> rows(M * NB * Q8_0_SIZE);
+  std::mt19937 rng(7);
+  for (auto &b : rows)
+    b = static_cast<uint8_t>(rng());
+
+  std::vector<uint8_t> x4(rows.size());
+  nntrainer::repack_q8_0(x4.data(), rows.data(), rows.size(), M, N);
+
+  // Each q8_0x4 block: 4 fp16 scales, then bytes 8k..8k+7 of row r at
+  // qs[32k + 8r].
+  auto row_block = [&](unsigned int r, unsigned int b) {
+    return rows.data() + (r * NB + b) * Q8_0_SIZE;
+  };
+  for (unsigned int g = 0; g < M / 4; ++g) {
+    for (unsigned int b = 0; b < NB; ++b) {
+      const uint8_t *blk = x4.data() + (g * NB + b) * 4 * Q8_0_SIZE;
+      for (unsigned int r = 0; r < 4; ++r) {
+        const uint8_t *src = row_block(4 * g + r, b);
+        EXPECT_EQ(std::memcmp(blk + 2 * r, src, 2), 0);
+        for (unsigned int k = 0; k < 4; ++k)
+          EXPECT_EQ(std::memcmp(blk + 8 + 32 * k + 8 * r, src + 2 + 8 * k, 8),
+                    0)
+            << "group " << g << ", block " << b << ", row " << r;
+      }
+    }
+  }
+
+  std::vector<uint8_t> back(rows.size());
+  nntrainer::unpack_q8_0(x4.data(), back.data(), x4.size(), M, N);
+  EXPECT_EQ(back, rows);
+}
+
+TEST(Q8_0_Tensor, repack_rejects_partial_row_groups_n) {
+  // Rows are interleaved in fours, so 6 rows do not fit.
+  std::vector<uint8_t> rows(6 * Q8_0_SIZE), x4(rows.size());
+  EXPECT_THROW(
+    nntrainer::repack_q8_0(x4.data(), rows.data(), rows.size(), 6, QK8_0),
+    std::invalid_argument);
+  EXPECT_THROW(
+    nntrainer::unpack_q8_0(x4.data(), rows.data(), rows.size(), 6, QK8_0),
+    std::invalid_argument);
 }
 
 TEST(Q8_0_Tensor, quantize_dequantize_round_trip) {

@@ -1141,6 +1141,20 @@ void __fallback_unpack_q4_0_8_to_q4_0(const void *in_q4_0x, void *out_q4_0,
                                       const unsigned int N);
 
 /**
+ * @copydoc repack_q8_0 in cpu_backend.h
+ */
+void __fallback_repack_q8_0_to_q8_0_4x8(void *dst, const void *src,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N);
+
+/**
+ * @copydoc unpack_q8_0 in cpu_backend.h
+ */
+void __fallback_unpack_q8_0_4x8_to_q8_0(const void *src, void *dst,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N);
+
+/**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version
  * @param[in/out] qk_out float* input/output values
  * @param[in] start_row start row number

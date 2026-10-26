@@ -310,13 +310,15 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
     break;
   }
 
-  // For Q4_Kx8 and Q4_0, repack into the optimized layout
+  // For Q4_Kx8, Q4_0 and Q8_0, repack into the optimized layout
   if (scheme_ == QScheme::Q4_Kx8) {
     repack_q4_K(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else if (scheme_ == QScheme::Q4_0) {
     repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
+  } else if (scheme_ == QScheme::Q8_0) {
+    repack_q8_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else {
-    // Q6_K, Q8_0: copy directly (no repacking needed)
+    // Q6_K: copy directly (no repacking needed)
     memcpy(output.getData<uint8_t>(), tmp.data(), out_size);
   }
 
@@ -373,6 +375,8 @@ Tensor &GgmlQuantizer::quantize(const Tensor &input, Tensor &output,
     repack_q4_K(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else if (scheme_ == QScheme::Q4_0) {
     repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
+  } else if (scheme_ == QScheme::Q8_0) {
+    repack_q8_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else {
     memcpy(output.getData<uint8_t>(), tmp.data(), out_size);
   }
@@ -411,7 +415,8 @@ Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
     dequantize_row_q4_0(tmp.data(), output.getData(), total_elems);
     break;
   case QScheme::Q8_0:
-    dequantize_row_q8_0(src, output.getData(), total_elems);
+    unpack_q8_0(src, tmp.data(), data_size, N, K);
+    dequantize_row_q8_0(tmp.data(), output.getData(), total_elems);
     break;
   default:
     throw std::invalid_argument(

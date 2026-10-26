@@ -33,6 +33,9 @@ struct block_q8_0 {
 /**
  * @class Q8_0_Tensor class
  * @brief Q8_0_Tensor class for Q8_0 quantized tensor
+ *
+ * GgmlQuantizer stores the transposed weight as q8_0x4, four rows interleaved
+ * block by block (see repack_q8_0), which is what the Q8_0 GEMM kernels read.
  */
 class Q8_0_Tensor : public TensorBase {
 
