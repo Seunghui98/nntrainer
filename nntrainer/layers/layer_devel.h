@@ -551,9 +551,8 @@ public:
 
                 // Two Q8_0 FC encodings share the block_q8_0 byte layout:
                 //  * default: per-32-block scales, quantized to plain rows and
-                //    then repacked for the target ISA (q8_0x4 interleaved for
-                //    the ARM SMMLA FC kernels via gemm_q8_0_fp32, plain
-                //    pass-through for X86, see FloatTensor::dotQnK);
+                //    then repacked to q8_0x4 on every ISA, the layout the
+                //    q8_0_4x8 GEMM kernels read (see FloatTensor::dotQnK);
                 //  * NNTR_W8A8_PERCH: channel-wise -- one scale per output
                 //    channel, i.e. per row of the transposed [N, K] weight,
                 //    not one per block. Plain rows, no repack, portable
@@ -569,7 +568,7 @@ public:
                   quantize_q8_0(weight_t.getData<float>(), tmp.data(), N, K,
                                 nullptr);
                   repack_q8_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                              quant_weight.size(), N, K, target_isa);
+                              quant_weight.size(), N, K);
                 }
                 quant_weight.save(file);
               }

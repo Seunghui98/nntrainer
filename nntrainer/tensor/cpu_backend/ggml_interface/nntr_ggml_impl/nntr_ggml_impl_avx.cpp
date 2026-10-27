@@ -1075,52 +1075,78 @@ void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
 // GEMM/GEMV - Q8_0 4x8
 //============================================================================
 
+// Weight scales of a block_q8_0x4, spread over the 8 int32 lanes the q8_0x4
+// kernels below accumulate: lanes 2j and 2j+1 belong to weight row j.
+static inline __m256 q8_0x4_pair_scales(const block_q8_0x4 &b) {
+  const __m128i d = _mm_loadl_epi64((const __m128i *)b.d);
+  return _mm256_cvtph_ps(_mm_unpacklo_epi16(d, d));
+}
+
+// Adds up the lane pairs (2j, 2j + 1) of v and stores them to out[0..3].
+static inline void q8_0x4_store_pairs(const __m256 v, float *out) {
+  const __m256 h = _mm256_hadd_ps(v, v); // [p0 p1 p0 p1 | p2 p3 p2 p3]
+  const __m128 lo = _mm256_castps256_ps128(h);
+  const __m128 hi = _mm256_extractf128_ps(h, 1);
+  _mm_storeu_ps(out, _mm_shuffle_ps(lo, hi, _MM_SHUFFLE(1, 0, 1, 0)));
+}
+
+// 8 activation bytes copied to all four 64-bit lanes.
+static inline __m256i q8_0x4_bcast8(const int8_t *p) {
+  int64_t v;
+  memcpy(&v, p, sizeof(v));
+  return _mm256_set1_epi64x(v);
+}
+
+// A block_q8_0x4 with an 8-byte interleave stores chunk k (bytes 8k..8k+7)
+// of its four rows in qs[32k .. 32k+31], one row per 64-bit lane. Multiplying
+// a weight chunk by one activation row copied to every lane leaves the dot
+// product with weight row j in int32 lanes 2j and 2j + 1.
 void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
-  const int qk = QK8_0;
-  const int nb = n / qk;
-  const int ncols_interleaved = 4;
-  const int blocklen = 8;
+  const int nb = n / QK8_0;
 
-  assert(n % qk == 0);
+  assert(n % QK8_0 == 0);
   assert(nr % 4 == 0);
-  assert(nc % ncols_interleaved == 0);
+  assert(nc % 4 == 0);
 
-  float sumf[4][4];
-  int sumi;
+  for (int y = 0; y < nr; y += 4) {
+    const block_q8_0x4 *a_base = (const block_q8_0x4 *)vy + (size_t)y / 4 * nb;
+    for (int x = 0; x < nc; x += 4) {
+      const block_q8_0x4 *a_ptr = a_base;
+      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (size_t)x / 4 * nb;
 
-  for (int y = 0; y < nr / 4; y++) {
-    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
-    for (int x = 0; x < nc / ncols_interleaved; x++) {
-      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
-      for (int m = 0; m < 4; m++) {
-        for (int j = 0; j < ncols_interleaved; j++) {
-          sumf[m][j] = 0.0;
+      __m256 accf[4];
+      for (int m = 0; m < 4; m++)
+        accf[m] = _mm256_setzero_ps();
+
+      for (int l = 0; l < nb; l++, a_ptr++, b_ptr++) {
+        __m256i acci[4];
+        for (int m = 0; m < 4; m++)
+          acci[m] = _mm256_setzero_si256();
+
+        for (int k = 0; k < 4; k++) {
+          const __m256i bk =
+            _mm256_loadu_si256((const __m256i *)(b_ptr->qs + 32 * k));
+          for (int m = 0; m < 4; m++)
+            acci[m] = mul_sum_i8_pairs_acc_int32x8(
+              acci[m], bk, q8_0x4_bcast8(a_ptr->qs + 32 * k + 8 * m));
+        }
+
+        // F16C converts the scales in registers; a conversion call here
+        // would spill the accumulators.
+        const __m256 db = q8_0x4_pair_scales(*b_ptr);
+        const __m256 da = _mm256_castps128_ps256(
+          _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)a_ptr->d)));
+        for (int m = 0; m < 4; m++) {
+          const __m256 d = _mm256_mul_ps(
+            db, _mm256_permutevar8x32_ps(da, _mm256_set1_epi32(m)));
+          accf[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acci[m]), d, accf[m]);
         }
       }
-      for (int l = 0; l < nb; l++) {
-        for (int k = 0; k < (qk / blocklen); k++) {
-          for (int m = 0; m < 4; m++) {
-            for (int j = 0; j < ncols_interleaved; j++) {
-              sumi = 0;
-              for (int i = 0; i < blocklen; ++i) {
-                const int v0 =
-                  b_ptr[l]
-                    .qs[k * ncols_interleaved * blocklen + j * blocklen + i];
-                sumi += v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i];
-              }
-              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
-                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
-            }
-          }
-        }
-      }
-      for (int m = 0; m < 4; m++) {
-        for (int j = 0; j < ncols_interleaved; j++) {
-          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
-        }
-      }
+
+      for (int m = 0; m < 4; m++)
+        q8_0x4_store_pairs(accf[m], s + (size_t)(y + m) * bs + x);
     }
   }
 }
@@ -1128,42 +1154,31 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
-  const int qk = QK8_0;
-  const int nb = n / qk;
-  const int ncols_interleaved = 4;
-  const int blocklen = 8;
+  const int nb = n / QK8_0;
 
   assert(nr == 1);
-  assert(n % qk == 0);
-  assert(nc % ncols_interleaved == 0);
-
-  float sumf[4];
-  int sumi;
+  assert(n % QK8_0 == 0);
+  assert(nc % 4 == 0);
 
   const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
-  for (int x = 0; x < nc / ncols_interleaved; x++) {
-    const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+  for (int x = 0; x < nc; x += 4) {
+    const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (size_t)x / 4 * nb;
 
-    for (int j = 0; j < ncols_interleaved; j++) {
-      sumf[j] = 0.0;
-    }
+    __m256 accf = _mm256_setzero_ps();
     for (int l = 0; l < nb; l++) {
-      for (int k = 0; k < (qk / blocklen); k++) {
-        for (int j = 0; j < ncols_interleaved; j++) {
-          sumi = 0;
-          for (int i = 0; i < blocklen; ++i) {
-            const int v0 =
-              b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
-            sumi += v0 * a_ptr[l].qs[k * blocklen + i];
-          }
-          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
-                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
-        }
+      __m256i acci = _mm256_setzero_si256();
+      for (int k = 0; k < 4; k++) {
+        const __m256i bk =
+          _mm256_loadu_si256((const __m256i *)(b_ptr[l].qs + 32 * k));
+        acci = mul_sum_i8_pairs_acc_int32x8(acci, bk,
+                                            q8_0x4_bcast8(a_ptr[l].qs + 8 * k));
       }
+      const __m256 d = _mm256_mul_ps(q8_0x4_pair_scales(b_ptr[l]),
+                                     _mm256_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(
+                                       _mm_cvtsi32_si128(a_ptr[l].d)))));
+      accf = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acci), d, accf);
     }
-    for (int j = 0; j < ncols_interleaved; j++) {
-      s[x * ncols_interleaved + j] = sumf[j];
-    }
+    q8_0x4_store_pairs(accf, s + x);
   }
 }
 
@@ -4112,79 +4127,6 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
       }
       s[(size_t)m * bs + j] = acc;
     }
-  }
-}
-
-void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx, const void *__restrict vy,
-                         int nr, int nc) {
-  // GEMV is just GEMM with nr (== M for vy-layout) == 1. Keep the names
-  // separate to match the existing Q4_0 API surface so __ggml_q8_0_q8_0_GEMM
-  // can dispatch them.
-  (void)nr;
-  nntr_gemm_q8_0_q8_0(n, s, bs, vx, vy, 1, nc);
-}
-
-void nntr_gemm_q8_0x4_q8_0x4(int n, float *__restrict s, size_t bs,
-                             const void *__restrict vx,
-                             const void *__restrict vy, int nr, int nc) {
-  const int qk = QK8_0;
-  const int nb = n / qk;
-  assert(n % qk == 0);
-  assert(nr % 4 == 0);
-
-  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy; // act    [nr/4][nb]
-  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx; // weight [nc/4][nb]
-
-  // Scalar reference of the NEON SMMLA kernel: per-block int32 accumulation in
-  // the same bi order, so results are bit-identical across implementations.
-  for (int m = 0; m < nr; ++m) {
-    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
-    const int ar = m % 4;
-    for (int j = 0; j < nc; ++j) {
-      const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
-      const int wr = j % 4;
-      float acc = 0.0f;
-      for (int bi = 0; bi < nb; ++bi) {
-        int32_t si = 0;
-        for (int sub = 0; sub < 4; ++sub)
-          for (int c = 0; c < 8; ++c)
-            si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
-                  (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
-        acc += nntr_fp16_to_fp32(a[bi].d[ar]) * nntr_fp16_to_fp32(b[bi].d[wr]) *
-               (float)si;
-      }
-      s[(size_t)m * bs + j] = acc;
-    }
-  }
-}
-
-void nntr_gemv_q8_0x4_q8_0(int n, float *__restrict s, size_t bs,
-                           const void *__restrict vx, const void *__restrict vy,
-                           int nc) {
-  (void)bs;
-  const int qk = QK8_0;
-  const int nb = n / qk;
-  assert(n % qk == 0);
-  assert(nc % 4 == 0);
-
-  const block_q8_0 *a = (const block_q8_0 *)vy; // one activation row [nb]
-  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx; // weights [nc/4][nb]
-
-  for (int j = 0; j < nc; ++j) {
-    const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
-    const int wr = j % 4;
-    float acc = 0.0f;
-    for (int bi = 0; bi < nb; ++bi) {
-      int32_t si = 0;
-      for (int sub = 0; sub < 4; ++sub)
-        for (int c = 0; c < 8; ++c)
-          si += (int32_t)a[bi].qs[8 * sub + c] *
-                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
-      acc +=
-        nntr_fp16_to_fp32(a[bi].d) * nntr_fp16_to_fp32(b[bi].d[wr]) * (float)si;
-    }
-    s[j] = acc;
   }
 }
 

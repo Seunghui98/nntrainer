@@ -978,6 +978,24 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   NNTR_THROW_IF(trans, std::invalid_argument)
     << "dotQnK does not support trans";
 
+  if (dtype == Tdatatype::Q8_0) {
+    // Only the plain FC form: A [.. x K] x W [K x N], overwriting the output.
+    NNTR_THROW_IF(trans_in || beta != 0.0f, std::invalid_argument)
+      << "Q8_0 dot supports neither trans_in nor beta";
+    NNTR_THROW_IF(getFormat() != Tformat::NCHW, std::invalid_argument)
+      << "Q8_0 dot needs an NCHW activation";
+    NNTR_THROW_IF(input.height() != width(), std::invalid_argument)
+      << "Q8_0 dot: the weight has K = " << input.height()
+      << " but the activation has K = " << width();
+    CREATE_IF_EMPTY_DIMS(output, batch(), channel(), height(), input.width(),
+                         getTensorType());
+    NNTR_THROW_IF(output.getDim().getDataLen() != static_cast<size_t>(batch()) *
+                                                    channel() * height() *
+                                                    input.width(),
+                  std::invalid_argument)
+      << "Q8_0 dot: the output does not hold M x N values";
+  }
+
   float *data = (float *)getData();
   uint8_t *mdata = input.getData<uint8_t>();
   // When the destination activation is FP16 (e.g. the V-JEPA patch-embed FC --
@@ -1025,17 +1043,20 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   }
   case Tdatatype::Q8_0: {
     // W8A8. Both operands are 8-bit at compute time; the two paths differ only
-    // in where the scales live.
-    M = getDim().height();
+    // in where the scales live. Every row of the batch, channel and height
+    // axes is one GEMM row.
+    M = batch() * channel() * height();
     K = getDim().width();
     N = input.getDim().width();
     // Channel-wise weight scale plus a tensor-wise activation scale: the inner
     // loop is a pure int8 dot into int32 and the scales apply once per output
     // element. Returns false for a genuine per-block file, which then takes the
-    // block-scaled kernel below (it quantizes activations per row into
-    // block_q8_0 and carries a scale multiply per 32 values).
+    // block-scaled kernel below. That one reads the q8_0x4 weight every FC
+    // save writes, so its leading dimension is K; like the scalar Q4_0 GEMM it
+    // is a CPU-table op.
     if (!int8_gemm::gemmPerChannelA8(M, N, K, data, (void *)mdata, rdata))
-      o->gemm_q8_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
+      nntrainer::getComputeOps()->gemm_q8_0_fp32(M, N, K, data, K,
+                                                 (void *)mdata, K, rdata, N);
     break;
   }
 

@@ -149,14 +149,6 @@ void __ggml_repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
   nntr_repack_q4_K_to_q4_K_8_bl(dst, 8, src, data_size, M, N);
 }
 
-void __ggml_repack_q8_0_to_q8_0_4(void *dst, void *src, size_t data_size,
-                                  const unsigned int M, const unsigned int N) {
-  // The SMMLA q8_0x4 kernels consume the 8-byte interleave (block_q8_0x4 with
-  // qs[32*sub + row*8 + c]), i.e. the same layout as
-  // __ggml_repack_q8_0_to_q8_0_4x8.
-  nntr_repack_q8_0_to_q8_0_4_bl(dst, 8, src, data_size, M, N);
-}
-
 /**
  * @brief De-interleave + gather + plain-SMMLA W8A32 fallback
  * (NNTR_Q8A32_PLAIN).

@@ -124,23 +124,6 @@ int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
                                   size_t nrow, size_t k);
 
 /**
- * @brief Compute interleaved (q8_0x4) Q8_0 weights by q8_0x4 activations GEMM,
- *        FP32 output (register-blocked 4x4 SMMLA on i8mm targets). FP32-output
- *        port of nntr_gemm_q8_0_q8_0_4x4_fp16. Requires nr % 4 == 0.
- */
-void nntr_gemm_q8_0x4_q8_0x4(int n, float *__restrict s, size_t bs,
-                             const void *__restrict vx,
-                             const void *__restrict vy, int nr, int nc);
-
-/**
- * @brief One plain block_q8_0 activation row by interleaved (q8_0x4) Q8_0
- *        weights GEMV, FP32 output. Requires nc % 4 == 0.
- */
-void nntr_gemv_q8_0x4_q8_0(int n, float *__restrict s, size_t bs,
-                           const void *__restrict vx, const void *__restrict vy,
-                           int nc);
-
-/**
  * @brief FP32-output Q8_0 x Q8_0 GEMM. Same numerics as nntr_gemm_q8_0_q8_0 but
  * implemented via the proven SMMLA path on NEON (i8mm) and correct scalar
  * elsewhere; used by the W8A32 indirect conv. vx=weight[nc x nb],
@@ -195,13 +178,6 @@ void nntr_gemm_q8ch_plainA_f32(int n, float *__restrict s, size_t bs,
                                const float *__restrict w_scale,
                                const int8_t *__restrict A, size_t lda,
                                float a_scale, int nr, int nc);
-
-/**
- * @brief Compute Q8_0 weights by Q8_0 activations GEMV
- */
-void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx, const void *__restrict vy,
-                         int nr, int nc);
 
 /**
  * @brief Compute Q4_K 8x8 weights by Q8_K activations GEMV

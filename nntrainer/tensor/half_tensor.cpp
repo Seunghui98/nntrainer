@@ -22,6 +22,7 @@
 #include <cpu_backend.h>
 #include <fp16.h>
 #include <half_tensor.h>
+#include <int8_gemm.h>
 #include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <tensor.h>
 #include <thread_manager.h>
@@ -866,14 +867,24 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
       size_t total_elems = (size_t)K * N;
       static thread_local std::vector<float> dq_buf;
       static thread_local std::vector<_FP16> dq_fp16;
+      static thread_local std::vector<uint8_t> rows;
       if (dq_buf.size() < total_elems) {
         dq_buf.resize(total_elems);
       }
       if (dq_fp16.size() < total_elems) {
         dq_fp16.resize(total_elems);
       }
-      dequantize_row_q8_0((const void *)mdata, dq_buf.data(),
-                          (int64_t)total_elems);
+      // A per-block weight is q8_0x4 (see repack_q8_0); a channel-wise
+      // (NNTR_W8A8_PERCH) one stays in plain rows. Dequantize N rows of K.
+      const void *plain = mdata;
+      if (!int8_gemm::prepareWeight(mdata, N, K).usable) {
+        const size_t q_bytes = input.size();
+        if (rows.size() < q_bytes)
+          rows.resize(q_bytes);
+        unpack_q8_0(mdata, rows.data(), q_bytes, N, K);
+        plain = rows.data();
+      }
+      dequantize_row_q8_0(plain, dq_buf.data(), (int64_t)total_elems);
       // Cast to FP16 using NEON vectorization if available
 #if defined(__ARM_NEON)
       size_t i = 0;

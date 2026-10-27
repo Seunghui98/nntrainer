@@ -49,10 +49,12 @@ The branch adds these executables next to `nntr_causallm` / `nntr_quantize`:
   so that main's `QS4CX = 0x6` files keep loading; a `.bin` written by the
   old branches reads back as the wrong scheme. safetensors packs carry the
   dtype by name and are unaffected.
-- Q8_0 FC weights are written per-block by default (ARM `q8_0x4`, x86 plain
-  rows). Setting `NNTR_W8A8_PERCH=1` at `nntr_quantize` time selects the
-  #4292 per-channel encoding; whatever was set at quantize time must also be
-  set at run time.
+- Q8_0 FC weights are written per-block in `q8_0x4` on every ISA, so a pack
+  quantized on x86 runs on ARM and the other way round. x86 Q8_0 packs made
+  before this change hold plain rows and must be re-quantized. Setting
+  `NNTR_W8A8_PERCH=1` at `nntr_quantize` time selects the #4292 per-channel
+  encoding (plain rows); whatever was set at quantize time must also be set
+  at run time.
 - `nntr_quantize --conv_dtype Q8_0 ...` quantizes conv filters (YOLO,
   FastViT); `--act_dtype` left empty follows the source model's activation
   type.

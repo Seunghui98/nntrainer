@@ -2,246 +2,270 @@
 /**
  * @file   unittest_nntrainer_gemm_q8_0.cpp
  * @date   14 May 2026
- * @brief  Correctness tests for gemm_q8_0_fp32 / __fallback_gemm_q8_0.
- *         Compares the scalar Q8_0 GEMM against a plain FP32 reference
- *         GEMM, expecting agreement to within Q8_0 quantisation tolerance.
+ * @brief  Unit tests for the Q8_0 weight x FP32 activation GEMM
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 
+#include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <random>
 #include <vector>
 
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <fallback_internal.h>
+#include <fp16.h>
 #include <ggml_interface.h>
-#include <nntr_ggml_impl.h>
 #include <q8_0_tensor.h>
+#include <quantizer.h>
+#include <tensor.h>
 
 namespace {
 
-constexpr unsigned int QK = 32;
-
-// Reference Q8_0 quantisation (per-row, 32-element block).
-// Mirrors GGML's quantize_row_q8_0_ref exactly: per-block fp16 scale =
-// amax / 127, then int8 = round(x / scale).
-static void quantize_row_q8_0_ref(const float *x, nntrainer::block_q8_0 *y,
-                                  unsigned int k) {
-  const unsigned int nb = k / QK;
-  for (unsigned int b = 0; b < nb; ++b) {
+/// Reference q8_0 quantization of one row, as GGML does it.
+void quantizeRowRef(const float *x, nntrainer::block_q8_0 *y, unsigned int k) {
+  for (unsigned int b = 0; b < k / QK8_0; ++b) {
     float amax = 0.0f;
-    for (unsigned int l = 0; l < QK; ++l) {
-      amax = std::max(amax, std::fabs(x[b * QK + l]));
-    }
+    for (int l = 0; l < QK8_0; ++l)
+      amax = std::max(amax, std::fabs(x[b * QK8_0 + l]));
     const float d = amax / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    // Pack scale: fp32 -> fp16 bit cast (IEEE 754 half).
-    uint32_t bits;
-    std::memcpy(&bits, &d, sizeof(bits));
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
-    uint32_t mant = (bits >> 13) & 0x3FFu;
-    if (exp <= 0) {
-      y[b].d = static_cast<uint16_t>(sign);
-    } else if (exp >= 31) {
-      y[b].d = static_cast<uint16_t>(sign | (0x1Fu << 10) | mant);
-    } else {
-      y[b].d =
-        static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | mant);
-    }
-    for (unsigned int l = 0; l < QK; ++l) {
-      int32_t q = static_cast<int32_t>(std::round(x[b * QK + l] * id));
-      q = std::max(-127, std::min(127, q));
-      y[b].qs[l] = static_cast<int8_t>(q);
-    }
+    y[b].d = nntrainer::compute_fp32_to_fp16(d);
+    for (int l = 0; l < QK8_0; ++l)
+      y[b].qs[l] = static_cast<int8_t>(std::round(x[b * QK8_0 + l] * id));
   }
 }
 
-// Plain FP32 reference GEMM: C = A * B.T (A is MxK, B is NxK, C is MxN).
-static void gemm_fp32_ref(unsigned int M, unsigned int N, unsigned int K,
-                          const float *A, const float *B, float *C) {
-  for (unsigned int m = 0; m < M; ++m) {
-    for (unsigned int n = 0; n < N; ++n) {
-      float acc = 0.0f;
-      for (unsigned int k = 0; k < K; ++k) {
-        acc += A[m * K + k] * B[n * K + k];
-      }
-      C[m * N + n] = acc;
-    }
-  }
+std::vector<float> randomVector(size_t n, unsigned int seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<float> v(n);
+  for (auto &x : v)
+    x = dist(rng);
+  return v;
 }
+
+/// Weight [N x K] in fp32, as q8_0 rows and repacked to q8_0x4.
+struct Weight {
+  std::vector<float> fp32;
+  std::vector<nntrainer::block_q8_0> q8;
+  std::vector<nntrainer::block_q8_0> q8x4;
+};
+
+Weight makeWeight(unsigned int N, unsigned int K, unsigned int seed) {
+  Weight w{randomVector(static_cast<size_t>(N) * K, seed), {}, {}};
+  w.q8.resize(static_cast<size_t>(N) * K / QK8_0);
+  for (unsigned int n = 0; n < N; ++n)
+    quantizeRowRef(w.fp32.data() + static_cast<size_t>(n) * K,
+                   w.q8.data() + static_cast<size_t>(n) * K / QK8_0, K);
+  w.q8x4.resize(w.q8.size());
+  nntrainer::repack_q8_0(w.q8x4.data(), w.q8.data(), w.q8.size() * Q8_0_SIZE, N,
+                         K);
+  return w;
+}
+
+/// C = A * B.T with A [M x K] and B [N x K].
+std::vector<float> gemmRef(unsigned int M, unsigned int N, unsigned int K,
+                           const float *A, const float *B) {
+  std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int n = 0; n < N; ++n)
+      for (unsigned int k = 0; k < K; ++k)
+        C[m * N + n] += A[m * K + k] * B[n * K + k];
+  return C;
+}
+
+/// Both operands are 8-bit, so each product is off by about 2 / 127.
+float q8Tolerance(unsigned int K) { return 2.0f / 127.0f * K; }
 
 struct Shape {
   unsigned int M, N, K;
 };
 
-class GemmQ8_0Param : public ::testing::TestWithParam<Shape> {};
+class GemmQ8_0 : public ::testing::TestWithParam<Shape> {};
 
 } // namespace
 
-TEST_P(GemmQ8_0Param, scalar_kernel_matches_fp32_reference_within_q8_0_tol) {
+TEST_P(GemmQ8_0, scalar_matches_fp32_reference) {
   const Shape sh = GetParam();
-  ASSERT_EQ(sh.K % QK, 0u) << "K must be a multiple of 32";
+  const auto A = randomVector(static_cast<size_t>(sh.M) * sh.K, 1);
+  const Weight W = makeWeight(sh.N, sh.K, 2);
 
-  // Deterministic RNG so failures are reproducible.
-  std::mt19937 rng(42);
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-  std::vector<float> A(static_cast<size_t>(sh.M) * sh.K);
-  std::vector<float> B_fp32(static_cast<size_t>(sh.N) * sh.K);
-  for (auto &v : A)
-    v = dist(rng);
-  for (auto &v : B_fp32)
-    v = dist(rng);
-
-  // Quantise B row-by-row to Q8_0 (offline).
-  const unsigned int nb_per_row = sh.K / QK;
-  std::vector<nntrainer::block_q8_0> B_q8(static_cast<size_t>(sh.N) *
-                                          nb_per_row);
-  for (unsigned int n = 0; n < sh.N; ++n) {
-    quantize_row_q8_0_ref(B_fp32.data() + static_cast<size_t>(n) * sh.K,
-                          B_q8.data() + static_cast<size_t>(n) * nb_per_row,
-                          sh.K);
-  }
-
-  std::vector<float> C_q8(static_cast<size_t>(sh.M) * sh.N, 0.0f);
-  std::vector<float> C_ref(static_cast<size_t>(sh.M) * sh.N, 0.0f);
-
-  // GEMM under test: A FP32 (auto-quantised inside) * B Q8_0 -> C FP32.
+  std::vector<float> C(static_cast<size_t>(sh.M) * sh.N);
   nntrainer::__fallback_gemm_q8_0<float>(sh.M, sh.N, sh.K, A.data(), sh.K,
-                                         B_q8.data(), sh.K, C_q8.data(), sh.N);
+                                         W.q8x4.data(), sh.K, C.data(), sh.N);
 
-  // Reference: FP32 x FP32, no quantisation.
-  gemm_fp32_ref(sh.M, sh.N, sh.K, A.data(), B_fp32.data(), C_ref.data());
-
-  // Tolerance: Q8_0 (8-bit) on both operands -> per-element relative error
-  // bounded by ~2 / 127 ~= 1.6%, scaled by sqrt(K) for the accumulated dot.
-  // We use an absolute tolerance proportional to K and the input scale.
-  const float input_amax = 1.0f;               // dist range is [-1, 1]
-  const float rel_err_per_dim = 2.0f / 127.0f; // Q8_0 quantisation step
-  const float abs_tol =
-    rel_err_per_dim * input_amax * input_amax * static_cast<float>(sh.K);
-
-  size_t max_abs_off_idx = 0;
-  float max_abs_off = 0.0f;
-  for (size_t i = 0; i < C_q8.size(); ++i) {
-    const float diff = std::fabs(C_q8[i] - C_ref[i]);
-    if (diff > max_abs_off) {
-      max_abs_off = diff;
-      max_abs_off_idx = i;
-    }
-  }
-  EXPECT_LE(max_abs_off, abs_tol)
-    << "max |C_q8 - C_ref| = " << max_abs_off << " at idx " << max_abs_off_idx
-    << " exceeds tolerance " << abs_tol << " (M=" << sh.M << " N=" << sh.N
-    << " K=" << sh.K << ")";
+  const auto ref = gemmRef(sh.M, sh.N, sh.K, A.data(), W.fp32.data());
+  for (size_t i = 0; i < C.size(); ++i)
+    EXPECT_NEAR(C[i], ref[i], q8Tolerance(sh.K)) << "index " << i;
 }
 
-TEST_P(GemmQ8_0Param, identity_weight_reproduces_input_row_sums) {
-  // With B = identity (after Q8_0 quantisation), C[m, n] should be very
-  // close to A[m, n]. This validates that the per-block scale and the int8
-  // dot product cancel correctly.
+TEST_P(GemmQ8_0, simd_matches_scalar) {
   const Shape sh = GetParam();
-  if (sh.K != sh.N) {
-    GTEST_SKIP() << "identity-weight check only defined for square (N == K)";
-  }
-  ASSERT_EQ(sh.K % QK, 0u);
+  const auto A = randomVector(static_cast<size_t>(sh.M) * sh.K, 3);
+  const Weight W = makeWeight(sh.N, sh.K, 4);
 
-  std::mt19937 rng(123);
-  std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
-  std::vector<float> A(static_cast<size_t>(sh.M) * sh.K);
-  for (auto &v : A)
-    v = dist(rng);
-
-  // Build identity FP32 B (N x K with K == N) and quantise to Q8_0.
-  std::vector<float> B_fp32(static_cast<size_t>(sh.N) * sh.K, 0.0f);
-  for (unsigned int n = 0; n < sh.N; ++n) {
-    B_fp32[static_cast<size_t>(n) * sh.K + n] = 1.0f;
-  }
-
-  const unsigned int nb_per_row = sh.K / QK;
-  std::vector<nntrainer::block_q8_0> B_q8(static_cast<size_t>(sh.N) *
-                                          nb_per_row);
-  for (unsigned int n = 0; n < sh.N; ++n) {
-    quantize_row_q8_0_ref(B_fp32.data() + static_cast<size_t>(n) * sh.K,
-                          B_q8.data() + static_cast<size_t>(n) * nb_per_row,
-                          sh.K);
-  }
-
-  std::vector<float> C(static_cast<size_t>(sh.M) * sh.N, 0.0f);
-  nntrainer::__fallback_gemm_q8_0<float>(sh.M, sh.N, sh.K, A.data(), sh.K,
-                                         B_q8.data(), sh.K, C.data(), sh.N);
-
-  // With identity weight, only the diagonal Q8_0 block is non-zero;
-  // expect C ~= A (within Q8_0 quantisation error on both A and that
-  // single non-zero weight entry).
-  const float abs_tol = 0.05f; // generous for an int8 round-trip
-  for (size_t i = 0; i < A.size(); ++i) {
-    ASSERT_LE(std::fabs(C[i] - A[i]), abs_tol)
-      << "C[" << i << "]=" << C[i] << " vs A[" << i << "]=" << A[i];
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(GemmQ8_0Shapes, GemmQ8_0Param,
-                         ::testing::Values(Shape{1, 32, 32}, Shape{1, 64, 64},
-                                           Shape{4, 32, 64}, Shape{8, 128, 128},
-                                           Shape{2, 96, 96}));
-
-// SIMD path: __ggml_q8_0_q8_0_GEMM uses the AVX2 nntr_gemm_q8_0_q8_0 kernel,
-// which shares mul_sum_i8_pairs_acc_int32x8 with the Q4_0 kernel — identical
-// int8 dot product instruction mix.
-TEST_P(GemmQ8_0Param, simd_kernel_matches_scalar_oracle) {
-  const Shape sh = GetParam();
-  ASSERT_EQ(sh.K % QK, 0u);
-
-  std::mt19937 rng(7);
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-  std::vector<float> A(static_cast<size_t>(sh.M) * sh.K);
-  std::vector<float> B_fp32(static_cast<size_t>(sh.N) * sh.K);
-  for (auto &v : A)
-    v = dist(rng);
-  for (auto &v : B_fp32)
-    v = dist(rng);
-
-  const unsigned int nb_per_row = sh.K / QK;
-  std::vector<nntrainer::block_q8_0> B_q8(static_cast<size_t>(sh.N) *
-                                          nb_per_row);
-  for (unsigned int n = 0; n < sh.N; ++n) {
-    quantize_row_q8_0_ref(B_fp32.data() + static_cast<size_t>(n) * sh.K,
-                          B_q8.data() + static_cast<size_t>(n) * nb_per_row,
-                          sh.K);
-  }
-
-  std::vector<float> C_scalar(static_cast<size_t>(sh.M) * sh.N, 0.0f);
-  std::vector<float> C_simd(static_cast<size_t>(sh.M) * sh.N, 0.0f);
-
+  std::vector<float> scalar(static_cast<size_t>(sh.M) * sh.N);
+  std::vector<float> simd(scalar.size());
   nntrainer::__fallback_gemm_q8_0<float>(
-    sh.M, sh.N, sh.K, A.data(), sh.K, B_q8.data(), sh.K, C_scalar.data(), sh.N);
+    sh.M, sh.N, sh.K, A.data(), sh.K, W.q8x4.data(), sh.K, scalar.data(), sh.N);
+  nntrainer::getComputeOps()->gemm_q8_0_fp32(
+    sh.M, sh.N, sh.K, A.data(), sh.K, W.q8x4.data(), sh.K, simd.data(), sh.N);
 
-  nntrainer::__ggml_q8_0_q8_0_GEMM(sh.M, sh.N, sh.K, A.data(), sh.K,
-                                   B_q8.data(), sh.K, C_simd.data(), sh.N);
+  // Same int8 math on the same blocks; only the fp32 summation order differs.
+  for (size_t i = 0; i < scalar.size(); ++i)
+    EXPECT_NEAR(simd[i], scalar[i], 1e-3f) << "index " << i;
+}
 
-  // Both kernels do the same arithmetic on the same Q8_0 blocks; the only
-  // possible discrepancy is fp32 accumulation order. A tight epsilon catches
-  // any structural bug while tolerating that.
-  const float abs_tol = 1e-3f;
-  for (size_t i = 0; i < C_scalar.size(); ++i) {
-    ASSERT_LE(std::fabs(C_simd[i] - C_scalar[i]), abs_tol)
-      << "idx=" << i << "  simd=" << C_simd[i] << "  scalar=" << C_scalar[i];
-  }
+// M = 1 is the GEMV path, M = 5 leaves a row tail after 4-row tiles,
+// N = 36 leaves a partial 16-column tile, and M = 37 spans several 16-row
+// thread tiles.
+INSTANTIATE_TEST_SUITE_P(Shapes, GemmQ8_0,
+                         ::testing::Values(Shape{1, 32, 32}, Shape{1, 64, 128},
+                                           Shape{4, 32, 64}, Shape{5, 36, 96},
+                                           Shape{8, 128, 128},
+                                           Shape{37, 36, 96}));
+
+TEST(GemmQ8_0, repack_matches_ggml_q8_0x4) {
+  constexpr unsigned int N = 8, K = 64;
+  const Weight W = makeWeight(N, K, 8);
+
+  std::vector<nntrainer::block_q8_0> plain = W.q8, ggml(W.q8.size());
+  nntrainer::__ggml_repack_q8_0_to_q8_0_4x8(ggml.data(), plain.data(),
+                                            plain.size() * Q8_0_SIZE, N, K);
+  EXPECT_EQ(std::memcmp(ggml.data(), W.q8x4.data(), ggml.size() * Q8_0_SIZE),
+            0);
+}
+
+TEST(GemmQ8_0, rejects_unsupported_shapes_n) {
+  std::vector<float> A(4 * 64, 1.0f), C(4 * 32);
+  std::vector<nntrainer::block_q8_0> B(32 * 2);
+  auto *ops = nntrainer::getComputeOps();
+
+  // K = 48 is not a whole number of blocks.
+  EXPECT_THROW(
+    ops->gemm_q8_0_fp32(4, 32, 48, A.data(), 48, B.data(), 48, C.data(), 32),
+    std::invalid_argument);
+  // Weight rows come in groups of 4.
+  EXPECT_THROW(
+    ops->gemm_q8_0_fp32(4, 30, 32, A.data(), 32, B.data(), 32, C.data(), 30),
+    std::invalid_argument);
+  // Weight rows have to be packed.
+  EXPECT_THROW(
+    ops->gemm_q8_0_fp32(4, 32, 32, A.data(), 32, B.data(), 64, C.data(), 32),
+    std::invalid_argument);
+  // The scalar version checks the same.
+  EXPECT_THROW(nntrainer::__fallback_gemm_q8_0<float>(
+                 4, 32, 32, A.data(), 32, B.data(), 64, C.data(), 32),
+               std::invalid_argument);
+}
+
+TEST(GemmQ8_0Tensor, dot_rejects_partial_block_rows_n) {
+  // A Q8_0 weight only checks its width, so a 48-row weight can exist.
+  nntrainer::Tensor W(
+    {1, 1, 48, 32, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::Q8_0}},
+    true);
+  nntrainer::Tensor A(1, 1, 2, 48);
+  nntrainer::Tensor out(1, 1, 2, 32);
+  EXPECT_THROW(A.dot(W, out), std::invalid_argument);
+}
+
+TEST(GemmQ8_0Tensor, dot_with_quantized_weight_matches_fp32) {
+  constexpr unsigned int M = 4, K = 96, N = 64;
+
+  nntrainer::Tensor A(1, 1, M, K);
+  nntrainer::Tensor W(1, 1, K, N);
+  const auto a = randomVector(M * K, 5);
+  const auto w = randomVector(K * N, 6);
+  std::copy(a.begin(), a.end(), A.getData<float>());
+  std::copy(w.begin(), w.end(), W.getData<float>());
+
+  nntrainer::GgmlQuantizer quantizer(nntrainer::QScheme::Q8_0);
+  nntrainer::Tensor W_q8 =
+    quantizer.quantize(W, nntrainer::TensorDim::DataType::Q8_0);
+
+  // The quantized dot writes into the given output, so allocate it.
+  nntrainer::Tensor out(1, 1, M, N);
+  A.dot(W_q8, out);
+  nntrainer::Tensor ref = A.dot(W);
+
+  const float *o = out.getData<float>();
+  const float *r = ref.getData<float>();
+  for (size_t i = 0; i < out.size(); ++i)
+    EXPECT_NEAR(o[i], r[i], q8Tolerance(K)) << "index " << i;
+}
+
+namespace {
+
+/// A [b x 1 x h x K] activation and a quantized [K x N] weight.
+struct DotCase {
+  nntrainer::Tensor A, W, W_q8;
+};
+
+DotCase makeDotCase(unsigned int b, unsigned int h, unsigned int K,
+                    unsigned int N) {
+  DotCase c{nntrainer::Tensor(b, 1, h, K), nntrainer::Tensor(1, 1, K, N), {}};
+  const auto a = randomVector(static_cast<size_t>(b) * h * K, 9);
+  const auto w = randomVector(static_cast<size_t>(K) * N, 10);
+  std::copy(a.begin(), a.end(), c.A.getData<float>());
+  std::copy(w.begin(), w.end(), c.W.getData<float>());
+  nntrainer::GgmlQuantizer quantizer(nntrainer::QScheme::Q8_0);
+  c.W_q8 = quantizer.quantize(c.W, nntrainer::TensorDim::DataType::Q8_0);
+  return c;
+}
+
+void expectNearTensor(nntrainer::Tensor &out, nntrainer::Tensor &ref,
+                      unsigned int K) {
+  ASSERT_EQ(out.getDim(), ref.getDim());
+  const float *o = out.getData<float>();
+  const float *r = ref.getData<float>();
+  for (size_t i = 0; i < out.size(); ++i)
+    EXPECT_NEAR(o[i], r[i], q8Tolerance(K)) << "index " << i;
+}
+
+} // namespace
+
+TEST(GemmQ8_0Tensor, dot_returning_output_allocates_it) {
+  DotCase c = makeDotCase(1, 4, 64, 32);
+  nntrainer::Tensor out = c.A.dot(c.W_q8);
+  nntrainer::Tensor ref = c.A.dot(c.W);
+  expectNearTensor(out, ref, 64);
+
+  // An empty output passed in is allocated the same way.
+  nntrainer::Tensor empty;
+  c.A.dot(c.W_q8, empty);
+  expectNearTensor(empty, ref, 64);
+}
+
+TEST(GemmQ8_0Tensor, dot_covers_every_batch_row) {
+  DotCase c = makeDotCase(3, 2, 64, 32);
+  nntrainer::Tensor out = c.A.dot(c.W_q8);
+  nntrainer::Tensor ref = c.A.dot(c.W);
+  expectNearTensor(out, ref, 64);
+}
+
+TEST(GemmQ8_0Tensor, dot_rejects_unsupported_calls_n) {
+  DotCase c = makeDotCase(1, 4, 64, 32);
+  nntrainer::Tensor out(1, 1, 4, 32);
+
+  // The weight's K has to match the activation's.
+  nntrainer::Tensor A_wide(1, 1, 4, 96);
+  EXPECT_THROW(A_wide.dot(c.W_q8, out), std::invalid_argument);
+  // The output is overwritten, so beta cannot be honored.
+  EXPECT_THROW(c.A.dot(c.W_q8, out, false, false, 1.0f), std::invalid_argument);
+  EXPECT_THROW(c.A.dot(c.W_q8, out, false, true), std::invalid_argument);
+  // The output has to hold M x N values.
+  nntrainer::Tensor short_out(1, 1, 2, 32);
+  EXPECT_THROW(c.A.dot(c.W_q8, short_out), std::invalid_argument);
 }
 
 int main(int argc, char **argv) {
-  // Initialise the fp16 <-> fp32 lookup table that the GGML quantised path
-  // depends on. In production this is invoked by init_backend() during model
-  // setup, but unit tests reach the GEMM kernels directly so we have to do it
-  // here. Without this nntr_fp16_to_fp32() returns 0 for every input.
-  nntrainer::__ggml_init();
+  // Sets up the ops table and the fp16 lookup table the q8_0 kernels use.
+  nntrainer::init_backend();
 
   int result = -1;
   try {

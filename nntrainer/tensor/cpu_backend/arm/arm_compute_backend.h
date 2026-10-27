@@ -1403,14 +1403,31 @@ void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
                  ml::train::ISA target = ml::train::ISA::DEFAULT);
 
 /**
- * @brief Repack plain Q8_0 FC weights for the target ISA: q8_0x4 interleaved
- *        for ARM (SMMLA FC kernels), plain pass-through copy for X86.
- * @param M number of rows (output channels)
- * @param N row length in elements (K)
+ * @brief repack q8_0 rows to q8_0x4, the layout the Q8_0 GEMM kernels use
+ *
+ * Every 4 rows are interleaved block by block: the 4 fp16 scales come first,
+ * then bytes 8k..8k+7 of row r go to qs[32k + 8r].
+ *
+ * @param dst output q8_0x4
+ * @param src input q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
  */
-void repack_q8_0(void *dst, void *src, size_t data_size, const unsigned int M,
-                 const unsigned int N,
-                 ml::train::ISA target_isa = ml::train::ISA::DEFAULT);
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N);
+
+/**
+ * @brief unpack q8_0x4 to q8_0 rows - inverse of repack_q8_0
+ *
+ * @param src input q8_0x4
+ * @param dst output q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N);
 
 /**
  * @brief repack q4K to q4Kx8

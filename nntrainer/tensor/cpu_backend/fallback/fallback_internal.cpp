@@ -537,39 +537,53 @@ void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
                           const unsigned int lda, const void *B,
                           const unsigned int ldb, float *C,
                           const unsigned int ldc) {
-  if (K % QK8_0 != 0) {
-    throw std::runtime_error("gemm_q8_0: K must be a multiple of 32 (got K=" +
-                             std::to_string(K) + ")");
-  }
-  const unsigned int n_blocks_k = K / QK8_0;
+  constexpr unsigned int QK = 32;
+  /// same layout as block_q8_0: fp16 scale and 32 int8 quants
+  struct Block {
+    uint16_t d;
+    int8_t qs[QK];
+  };
+  /// same layout as block_q8_0x4: 4 scales, quant l of row r at
+  /// qs[32 * (l / 8) + 8 * r + l % 8]
+  struct Block4 {
+    uint16_t d[4];
+    int8_t qs[4 * QK];
+  };
+  if (K % QK != 0 || N % 4 != 0)
+    throw std::invalid_argument(
+      "gemm_q8_0: K must be a multiple of 32 and N a multiple of 4");
+  if (ldb != K)
+    throw std::invalid_argument("gemm_q8_0: B must be packed (ldb == K)");
 
-  std::vector<nntrainer::block_q8_0> A_q8(static_cast<size_t>(M) * n_blocks_k);
+  const unsigned int nb = K / QK;
+  std::vector<Block> a_q(nb);
+  const Block4 *b_blocks = static_cast<const Block4 *>(B);
+
   for (unsigned int m = 0; m < M; ++m) {
-    nntr_quantize_row_q8_0(A + static_cast<size_t>(m) * lda,
-                           A_q8.data() + static_cast<size_t>(m) * n_blocks_k,
-                           static_cast<int64_t>(K));
-  }
+    // quantize one activation row the way GGML does: d = amax / 127
+    const float *a = A + static_cast<size_t>(m) * lda;
+    for (unsigned int b = 0; b < nb; ++b) {
+      float amax = 0.0f;
+      for (unsigned int l = 0; l < QK; ++l)
+        amax = std::max(amax, std::fabs(a[b * QK + l]));
+      const float d = amax / 127.0f;
+      const float id = d != 0.0f ? 1.0f / d : 0.0f;
+      a_q[b].d = compute_fp32_to_fp16(d);
+      for (unsigned int l = 0; l < QK; ++l)
+        a_q[b].qs[l] = static_cast<int8_t>(std::round(a[b * QK + l] * id));
+    }
 
-  const auto *B_blocks = reinterpret_cast<const nntrainer::block_q8_0 *>(B);
-  const unsigned int b_row_blocks = ldb / QK8_0;
-
-  for (unsigned int m = 0; m < M; ++m) {
-    const nntrainer::block_q8_0 *a_row =
-      A_q8.data() + static_cast<size_t>(m) * n_blocks_k;
     for (unsigned int n = 0; n < N; ++n) {
-      const nntrainer::block_q8_0 *b_row =
-        B_blocks + static_cast<size_t>(n) * b_row_blocks;
+      const Block4 *w = b_blocks + static_cast<size_t>(n / 4) * nb;
+      const unsigned int r = n % 4;
       float acc = 0.0f;
-      for (unsigned int blk = 0; blk < n_blocks_k; ++blk) {
-        const nntrainer::block_q8_0 &a = a_row[blk];
-        const nntrainer::block_q8_0 &b = b_row[blk];
+      for (unsigned int b = 0; b < nb; ++b) {
         int32_t sumi = 0;
-        for (int l = 0; l < QK8_0; ++l) {
-          sumi += static_cast<int32_t>(a.qs[l]) * static_cast<int32_t>(b.qs[l]);
-        }
-        const float a_d = fp16_bits_to_fp32(a.d);
-        const float b_d = fp16_bits_to_fp32(b.d);
-        acc += a_d * b_d * static_cast<float>(sumi);
+        for (unsigned int l = 0; l < QK; ++l)
+          sumi += static_cast<int32_t>(a_q[b].qs[l]) *
+                  w[b].qs[32 * (l / 8) + 8 * r + l % 8];
+        acc += compute_fp16_to_fp32(a_q[b].d) *
+               compute_fp16_to_fp32(w[b].d[r]) * static_cast<float>(sumi);
       }
       C[static_cast<size_t>(m) * ldc + n] = acc;
     }
@@ -671,6 +685,58 @@ void __fallback_unpack_q4_0_8_to_q4_0(const void *in_q4_0x, void *out_q4_0,
                                       size_t data_size, const unsigned int M,
                                       const unsigned int N) {
   throw std::runtime_error("NYI : __fallback_unpack_q4_0_8_to_q4_0");
+}
+
+/**
+ * @brief Moves bytes between q8_0 rows and q8_0x4 blocks, one way or the other.
+ *
+ * A block_q8_0 is an fp16 scale and 32 int8 quants. A block_q8_0x4 holds the
+ * same block of 4 rows: their 4 scales, then bytes 8k..8k+7 of row r at
+ * qs[32k + 8r].
+ */
+template <bool pack>
+static void q8_0x4_convert(const void *src, void *dst, size_t data_size,
+                           const unsigned int M, const unsigned int N) {
+  constexpr size_t block_bytes = sizeof(uint16_t) + 32;
+  const size_t nb = N / 32;
+  if (M % 4 != 0 || N % 32 != 0 || data_size != M * nb * block_bytes)
+    throw std::invalid_argument(
+      "q8_0x4 needs rows in multiples of 4, columns in multiples of 32 and a "
+      "matching data size");
+
+  const uint8_t *in = static_cast<const uint8_t *>(src);
+  uint8_t *out = static_cast<uint8_t *>(dst);
+  auto move = [&](size_t x4_off, size_t row_off, size_t n) {
+    if (pack)
+      std::memcpy(out + x4_off, in + row_off, n);
+    else
+      std::memcpy(out + row_off, in + x4_off, n);
+  };
+
+  for (size_t r = 0; r < M; r += 4) {
+    for (size_t b = 0; b < nb; ++b) {
+      const size_t x4 = (r / 4 * nb + b) * 4 * block_bytes;
+      for (size_t i = 0; i < 4; ++i) {
+        const size_t row = ((r + i) * nb + b) * block_bytes;
+        move(x4 + sizeof(uint16_t) * i, row, sizeof(uint16_t));
+        for (size_t k = 0; k < 4; ++k)
+          move(x4 + 4 * sizeof(uint16_t) + 32 * k + 8 * i,
+               row + sizeof(uint16_t) + 8 * k, 8);
+      }
+    }
+  }
+}
+
+void __fallback_repack_q8_0_to_q8_0_4x8(void *dst, const void *src,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N) {
+  q8_0x4_convert<true>(src, dst, data_size, M, N);
+}
+
+void __fallback_unpack_q8_0_4x8_to_q8_0(const void *src, void *dst,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N) {
+  q8_0x4_convert<false>(src, dst, data_size, M, N);
 }
 
 void __fallback_softmax_row_inplace(float *qk_out, size_t start_row,

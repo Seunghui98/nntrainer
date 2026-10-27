@@ -13,8 +13,10 @@
 
 #include <cstring>
 #include <gtest/gtest.h>
+#include <random>
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <q8_0_tensor.h>
 #include <quantizer.h>
 #include <tensor.h>
@@ -139,6 +141,51 @@ TEST(Q8_0_Tensor, set_zero_zeroes_every_byte) {
   }
 }
 
+TEST(Q8_0_Tensor, repack_interleaves_four_rows) {
+  constexpr unsigned int M = 8, N = 64, NB = N / QK8_0;
+  std::vector<uint8_t> rows(M * NB * Q8_0_SIZE);
+  std::mt19937 rng(7);
+  for (auto &b : rows)
+    b = static_cast<uint8_t>(rng());
+
+  std::vector<uint8_t> x4(rows.size());
+  nntrainer::repack_q8_0(x4.data(), rows.data(), rows.size(), M, N);
+
+  // Each q8_0x4 block: 4 fp16 scales, then bytes 8k..8k+7 of row r at
+  // qs[32k + 8r].
+  auto row_block = [&](unsigned int r, unsigned int b) {
+    return rows.data() + (r * NB + b) * Q8_0_SIZE;
+  };
+  for (unsigned int g = 0; g < M / 4; ++g) {
+    for (unsigned int b = 0; b < NB; ++b) {
+      const uint8_t *blk = x4.data() + (g * NB + b) * 4 * Q8_0_SIZE;
+      for (unsigned int r = 0; r < 4; ++r) {
+        const uint8_t *src = row_block(4 * g + r, b);
+        EXPECT_EQ(std::memcmp(blk + 2 * r, src, 2), 0);
+        for (unsigned int k = 0; k < 4; ++k)
+          EXPECT_EQ(std::memcmp(blk + 8 + 32 * k + 8 * r, src + 2 + 8 * k, 8),
+                    0)
+            << "group " << g << ", block " << b << ", row " << r;
+      }
+    }
+  }
+
+  std::vector<uint8_t> back(rows.size());
+  nntrainer::unpack_q8_0(x4.data(), back.data(), x4.size(), M, N);
+  EXPECT_EQ(back, rows);
+}
+
+TEST(Q8_0_Tensor, repack_rejects_partial_row_groups_n) {
+  // Rows are interleaved in fours, so 6 rows do not fit.
+  std::vector<uint8_t> rows(6 * Q8_0_SIZE), x4(rows.size());
+  EXPECT_THROW(
+    nntrainer::repack_q8_0(x4.data(), rows.data(), rows.size(), 6, QK8_0),
+    std::invalid_argument);
+  EXPECT_THROW(
+    nntrainer::unpack_q8_0(x4.data(), rows.data(), rows.size(), 6, QK8_0),
+    std::invalid_argument);
+}
+
 TEST(Q8_0_Tensor, quantize_dequantize_round_trip) {
   // Create an FP32 tensor and fill it with floating point values.
   nntrainer::TensorDim fp32_dim(
@@ -231,9 +278,14 @@ TEST(Q8_0_Tensor, indirect_conv_q80_vs_fp16) {
     }
   }
 
-  nntrainer::GgmlQuantizer q80(nntrainer::QScheme::Q8_0);
-  nntrainer::Tensor in_q80 =
-    q80.quantize(flat_fp32, nntrainer::TensorDim::DataType::Q8_0);
+  // Quantize each spatial row as it is: GgmlQuantizer would transpose the
+  // matrix and repack it for the GEMM, which is not what the gather reads.
+  nntrainer::TensorDim q80_dim(
+    1, 1, IH * IW, C,
+    {nntrainer::Tformat::NCHW, nntrainer::TensorDim::DataType::Q8_0});
+  nntrainer::Tensor in_q80(q80_dim, true);
+  nntrainer::quantize_q8_0(flat_fp32.getData<float>(),
+                           in_q80.getData<uint8_t>(), IH * IW, C, nullptr);
 
   // Create a Q4_0 filter [CRS, out_ch] = [288, 32] for a 3x3 conv with 32 in_ch
   unsigned int out_ch = 32, k = 3;

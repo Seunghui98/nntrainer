@@ -48,6 +48,10 @@ struct block_q8_0 {
  * @class Q8_0_Tensor
  * @brief Holder for a tensor whose data is laid out as packed block_q8_0
  *        records. Width must be a multiple of QK8_0.
+ *
+ * An FC weight (GgmlQuantizer or Layer::save) is the transposed weight in
+ * q8_0x4, four rows interleaved block by block (see repack_q8_0), which is
+ * what the Q8_0 GEMM kernels read. Embedding tables stay in plain rows.
  */
 class Q8_0_Tensor : public TensorBase {
 

@@ -428,12 +428,11 @@ TEST(SafetensorsQuant, q4_0_records_target_isa_p) {
 }
 
 /**
- * @brief A Q8_0 safetensors records the target ISA in __metadata__: the FC
- *        weight layout is ISA-specific (x86: plain rows, ARM: q8_0x4
- *        interleaved), so the tag makes a file quantized for the wrong
- *        platform identifiable before it is loaded.
+ * @brief A Q8_0 safetensors carries no target ISA in __metadata__: the FC
+ *        weight is q8_0x4 on every ISA, so a file made for one platform
+ *        loads on any other.
  */
-TEST(SafetensorsQuant, q8_0_records_target_isa_p) {
+TEST(SafetensorsQuant, q8_0_needs_no_target_isa_p) {
   const unsigned int W = 32;
   const unsigned int U = 32;
   std::map<std::string, DataType> dtype_map = {{"dense", DataType::Q8_0}};
@@ -450,9 +449,9 @@ TEST(SafetensorsQuant, q8_0_records_target_isa_p) {
   std::string header_json(header_size, '\0');
   stf.read(header_json.data(), static_cast<std::streamsize>(header_size));
 
+  // Q8_0 FC weights are q8_0x4 on every ISA, so the file carries no ISA tag.
   auto md = st::parseMetadata(header_json);
-  ASSERT_EQ(md.count("nntr_q8_0_isa"), 1u);
-  EXPECT_EQ(md["nntr_q8_0_isa"], "arm");
+  EXPECT_EQ(md.count("nntr_q8_0_isa"), 0u);
   EXPECT_EQ(md.count("nntr_q4_0_isa"), 0u); // no Q4_0 tensor in this file
 
   remove(st_path.c_str());

@@ -351,7 +351,14 @@ template <>
 void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
-  return __ggml_q8_0_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
+  // q8_0x4 interleaves 4 weight rows, and the activation is quantized 4 rows
+  // at a time, so the row strides have to be the packed ones.
+  if (K % 32 != 0 || N % 4 != 0)
+    throw std::invalid_argument(
+      "gemm_q8_0: K must be a multiple of 32 and N a multiple of 4");
+  if (lda != K || ldb != K || ldc != N)
+    throw std::invalid_argument("gemm_q8_0: A, B and C must be packed");
+  __ggml_q8_0_4x8_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
@@ -506,21 +513,14 @@ void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
   }
 }
 
-void repack_q8_0(void *dst, void *src, size_t data_size, const unsigned int M,
-                 const unsigned int N, ml::train::ISA target) {
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_repack_q8_0_to_q8_0_4x8(dst, src, data_size, M, N);
+}
 
-  switch (target) {
-  case ml::train::ISA::ARM:
-    // ARM FC runtime consumes the q8_0x4 interleaved layout (SMMLA kernels)
-    __ggml_repack_q8_0_to_q8_0_4(dst, src, data_size, M, N);
-    break;
-  case ml::train::ISA::X86:
-  case ml::train::ISA::DEFAULT:
-  default:
-    // x86 FC runtime consumes plain block_q8_0 rows
-    std::memcpy(dst, src, data_size);
-    break;
-  }
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_unpack_q8_0_4x8_to_q8_0(src, dst, data_size, M, N);
 }
 
 void repack_q4_0_to_q4_0_8(void *dst, void *src, size_t data_size,

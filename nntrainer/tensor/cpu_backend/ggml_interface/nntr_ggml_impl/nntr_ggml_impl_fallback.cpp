@@ -356,20 +356,6 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
     "use __fallback_gemm_q8_0 (scalar) directly otherwise");
 }
 
-void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx, const void *__restrict vy,
-                         int nr, int nc) {
-  (void)n;
-  (void)s;
-  (void)bs;
-  (void)vx;
-  (void)vy;
-  (void)nr;
-  (void)nc;
-  throw std::runtime_error(
-    "NYI: nntr_gemv_q8_0_q8_0 fallback - AVX2 build required for SIMD path");
-}
-
 // FP32-output plain Q8_0xQ8_0 GEMM (scalar). Portable; keeps the W8A32 conv
 // correct on the fallback build.
 void nntr_gemm_q8_0_q8_0_f32(int n, float *__restrict s, size_t bs,
@@ -695,16 +681,17 @@ void nntr_gemv_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
 // Quantization helper functions (matrix packing)
 //============================================================================
 
-void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
-                                int64_t k) {
+// Quantizes 4 rows into block_q8_0x4, interleaving their quants in runs of
+// blck_size_interleave bytes.
+static void quantize_mat_q8_0_4xN(const float *__restrict x,
+                                  void *__restrict vy, int64_t k,
+                                  const int blck_size_interleave) {
   assert(QK8_0 == 32);
   assert(k % QK8_0 == 0);
   const int nb = k / QK8_0;
 
   block_q8_0x4 *__restrict y = (block_q8_0x4 *)vy;
 
-  // scalar
-  const int blck_size_interleave = 4;
   float srcv[4][QK8_0];
   float id[4];
 
@@ -734,10 +721,14 @@ void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
   }
 }
 
+void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
+                                int64_t k) {
+  quantize_mat_q8_0_4xN(x, vy, k, 4);
+}
+
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k) {
-  // NYI: Fallback quantization - requires row-by-row implementation
-  throw std::runtime_error("NYI: nntr_quantize_mat_q8_0_4x8 fallback");
+  quantize_mat_q8_0_4xN(x, vy, k, 8);
 }
 
 void nntr_quantize_mat_q8_K_4x8(const float *__restrict x, void *__restrict vy,
@@ -926,32 +917,6 @@ int nntr_repack_q4_K_to_q4_K_8_bl(void *__restrict dst, int interleave_block,
   return 0;
 }
 
-void nntr_gemm_q8_0x4_q8_0x4(int n, float *__restrict s, size_t bs,
-                             const void *__restrict vx,
-                             const void *__restrict vy, int nr, int nc) {
-  (void)n;
-  (void)s;
-  (void)bs;
-  (void)vx;
-  (void)vy;
-  (void)nr;
-  (void)nc;
-  throw std::runtime_error("NYI: nntr_gemm_q8_0x4_q8_0x4 - use the AVX2 or "
-                           "NEON build for the interleaved Q8_0 path");
-}
-
-void nntr_gemv_q8_0x4_q8_0(int n, float *__restrict s, size_t bs,
-                           const void *__restrict vx, const void *__restrict vy,
-                           int nc) {
-  (void)n;
-  (void)s;
-  (void)bs;
-  (void)vx;
-  (void)vy;
-  (void)nc;
-  throw std::runtime_error("NYI: nntr_gemv_q8_0x4_q8_0 - use the AVX2 or "
-                           "NEON build for the interleaved Q8_0 path");
-}
 #ifdef ENABLE_FP16
 void nntr_gemm_q8_0_q8_0_4x4_fp16(int n, NNTR_GGML_FP16 *__restrict s,
                                   size_t bs, const void *__restrict vx,
