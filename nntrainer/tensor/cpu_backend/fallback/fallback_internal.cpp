@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <tensor_dim.h>
 #include <util_func.h>
+#include <vector>
 
 #define sgemv_loop(ci, cj, cM, cN)                                             \
   do {                                                                         \
@@ -495,6 +496,65 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, float *C,
                           const unsigned int ldc) {
   throw std::runtime_error("NYI : __fallback_gemm_q4_0");
+}
+
+template <>
+void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
+                          const unsigned int K, const float *A,
+                          const unsigned int lda, const void *B,
+                          const unsigned int ldb, float *C,
+                          const unsigned int ldc) {
+  constexpr unsigned int QK = 32;
+  /// same layout as block_q8_0: fp16 scale and 32 int8 quants
+  struct Block {
+    uint16_t d;
+    int8_t qs[QK];
+  };
+  /// same layout as block_q8_0x4: 4 scales, quant l of row r at
+  /// qs[32 * (l / 8) + 8 * r + l % 8]
+  struct Block4 {
+    uint16_t d[4];
+    int8_t qs[4 * QK];
+  };
+  if (K % QK != 0 || N % 4 != 0)
+    throw std::invalid_argument(
+      "gemm_q8_0: K must be a multiple of 32 and N a multiple of 4");
+  if (ldb != K)
+    throw std::invalid_argument("gemm_q8_0: B must be packed (ldb == K)");
+
+  const unsigned int nb = K / QK;
+  std::vector<Block> a_q(nb);
+  const Block4 *b_blocks = static_cast<const Block4 *>(B);
+
+  for (unsigned int m = 0; m < M; ++m) {
+    // quantize one activation row the way GGML does: d = amax / 127
+    const float *a = A + static_cast<size_t>(m) * lda;
+    for (unsigned int b = 0; b < nb; ++b) {
+      float amax = 0.0f;
+      for (unsigned int l = 0; l < QK; ++l)
+        amax = std::max(amax, std::fabs(a[b * QK + l]));
+      const float d = amax / 127.0f;
+      const float id = d != 0.0f ? 1.0f / d : 0.0f;
+      a_q[b].d = compute_fp32_to_fp16(d);
+      for (unsigned int l = 0; l < QK; ++l)
+        a_q[b].qs[l] = static_cast<int8_t>(std::round(a[b * QK + l] * id));
+    }
+
+    for (unsigned int n = 0; n < N; ++n) {
+      const Block4 *w = b_blocks + static_cast<size_t>(n / 4) * nb;
+      const unsigned int r = n % 4;
+      float acc = 0.0f;
+      for (unsigned int b = 0; b < nb; ++b) {
+        int32_t sumi = 0;
+        for (unsigned int l = 0; l < QK; ++l)
+          sumi += static_cast<int32_t>(a_q[b].qs[l]) *
+                  w[b].qs[32 * (l / 8) + 8 * r + l % 8];
+        acc += compute_fp16_to_fp32(a_q[b].d) *
+               compute_fp16_to_fp32(w[b].d[r]) * static_cast<float>(sumi);
+      }
+      C[static_cast<size_t>(m) * ldc + n] = acc;
+    }
+  }
 }
 
 void __fallback_gemm_q4_K(const unsigned int M, const unsigned int N,

@@ -1107,6 +1107,25 @@ extern void gemm_q4_0(const unsigned int M, const unsigned int N,
                       const unsigned int ldc);
 
 /**
+ * @brief q8_0 GEMM : A (M,K) * W.T (N,K) = O (M,N)
+ *
+ * @param M Original row size of output
+ * @param N Original col size of output
+ * @param K Hidden size
+ * @param A Input activation to be online-runtime quantized to q8_0 format
+ * @param lda Leading dimension of A
+ * @param B Offline-quantized transposed weight in q8_0x4 (see repack_q8_0)
+ * @param ldb Leading dimension of B (row length, K)
+ * @param C T* output
+ * @param ldc Leading dimension of C
+ */
+template <typename T = float>
+extern void gemm_q8_0(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const T *A, const unsigned int lda,
+                      const void *B, const unsigned int ldb, T *C,
+                      const unsigned int ldc);
+
+/**
  * @brief q4_0 GEMM against several weights : A (M,K) * Ws[i].T (Ns[i],K)
  *
  * Quantizes A to q8_0 once and walks every weight inside a single parallel

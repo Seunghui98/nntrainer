@@ -916,6 +916,25 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, T *C, const unsigned int ldc);
 
 /**
+ * @brief q8_0 GEMM (scalar) : A (M,K) * W.T (N,K) = O (M,N)
+ *
+ * @param M Original row size of output
+ * @param N Original col size of output, a multiple of 4
+ * @param K Hidden size, a multiple of 32
+ * @param A Input activation, quantized to q8_0 rows at run time
+ * @param lda Leading dimension of A
+ * @param B Transposed weight in q8_0x4 (see repack_q8_0)
+ * @param ldb Leading dimension of B (row length, K)
+ * @param C T* output
+ * @param ldc Leading dimension of C
+ */
+template <typename T = float>
+void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
+                          const unsigned int K, const T *A,
+                          const unsigned int lda, const void *B,
+                          const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output

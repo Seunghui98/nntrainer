@@ -891,6 +891,24 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
 
+/**
+ * @brief q8_0 GEMM : A (M,K) * W.T (N,K) = O (M,N)
+ *
+ * @param M Original row size of output
+ * @param N Original col size of output
+ * @param K Hidden size
+ * @param A Input activation to be online-runtime quantized to q8_0 format
+ * @param lda Leading dimension of A
+ * @param B Offline-quantized transposed weight in q8_0x4 (see repack_q8_0)
+ * @param ldb Leading dimension of B (row length, K)
+ * @param C T* output
+ * @param ldc Leading dimension of C
+ */
+template <typename T = float>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const T *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, T *C, const unsigned int ldc);
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
