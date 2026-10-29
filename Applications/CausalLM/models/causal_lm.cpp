@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <engine.h>
@@ -33,6 +34,8 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -84,6 +87,7 @@ void clLaunchStatDump(const char *phase);
 #include <footprint_sampler.h> // per-run honest peak (RssAnon + accelerator)
 #include <htp_decode_hook.h>
 #include <htp_mha_core.h>
+#include <htp_tie_word_embedding.h> // nllOf, NNTR_PPL_DECODE
 #include <layer_node.h>
 #include <llm_util.hpp>
 #if !defined(_WIN32)
@@ -1528,6 +1532,67 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const char *generated_ids_path = std::getenv("NNTR_GENERATED_IDS");
   std::vector<unsigned int> generated_ids;
 
+  // NNTR_PPL_DECODE=<ids file> (#134, ported from a21cae045 / fead3371b):
+  // the decode-side teacher-forced NLL of the logits each greedy pick is
+  // taken from. A missing file makes a normal greedy run that scores its
+  // own path and writes it there (whitespace-separated ids: the prefill's
+  // pick first when the prefill picks one, then one id per decode step);
+  // an existing file forces that continuation, so variant A writes the
+  // reference and B / C read it without a second knob. Off by default,
+  // never set in a tok/s run: it asks the DSP for the logits every step.
+  // ponytail: ids file only, batch 1, greedy, one run() per process, and
+  // the file does not record skip_prefill (score A and B with the same
+  // pack); upgrade = a header line naming the mode.
+  const char *ppl_dec_env = std::getenv("NNTR_PPL_DECODE");
+  bool ppl_dec = false, ppl_forced = false;
+  std::vector<unsigned int> ppl_cont; // forced: the targets; self: the path
+  unsigned int ppl_base = 0; // ppl_cont index of decode step 0's target
+  double ppl_dec_nll = 0.0;
+  unsigned int ppl_dec_n = 0, ppl_dec_top1 = 0;
+  if (ppl_dec_env != nullptr) {
+    if (BATCH_SIZE != 1 || logits_processor != nullptr || do_sample) {
+      std::cerr << "[PPL] decode unsupported (batch > 1, a logits processor "
+                   "or do_sample); running normally"
+                << std::endl;
+    } else {
+      ppl_dec = true;
+      std::ifstream f(ppl_dec_env);
+      if (f) {
+        ppl_forced = true;
+        long long id;
+        while (f >> id) {
+          if (id < 0 || id >= static_cast<long long>(NUM_VOCAB))
+            throw std::invalid_argument(
+              std::string("NNTR_PPL_DECODE: id out of vocab range in ") +
+              ppl_dec_env);
+          ppl_cont.push_back(static_cast<unsigned int>(id));
+        }
+        if (!f.eof() || ppl_cont.empty())
+          throw std::invalid_argument(
+            std::string("NNTR_PPL_DECODE: not a non-empty list of ids: ") +
+            ppl_dec_env);
+      }
+    }
+  }
+  // [#194] NNTR_PPL_DECODE_ALTS=<id,...> (at most 8, with NNTR_PPL_DECODE):
+  // each step line also prints those ids' logits.
+  std::vector<unsigned int> ppl_alts;
+  if (const char *a = std::getenv("NNTR_PPL_DECODE_ALTS")) {
+    std::stringstream ss(a);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      char *end = nullptr;
+      const unsigned long id = std::strtoul(tok.c_str(), &end, 10);
+      if (tok.empty() || *end != '\0' || id >= NUM_VOCAB ||
+          ppl_alts.size() == 8)
+        throw std::invalid_argument(
+          std::string("NNTR_PPL_DECODE_ALTS: want at most 8 comma-separated "
+                      "ids below the vocab size: ") +
+          a);
+      ppl_alts.push_back(static_cast<unsigned int>(id));
+    }
+  }
+
   /**
    * INPUT PREPARATION
    */
@@ -2123,6 +2188,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
+    if (ppl_forced) { // the prefill's pick is the continuation's first id
+      if (id_list[0] != ppl_cont[0])
+        std::cerr << "[PPL] decode warning: prefill top1 != continuation[0]"
+                  << std::endl;
+      id_list[0] = ppl_cont[0];
+    } else if (ppl_dec) {
+      ppl_cont.push_back(id_list[0]);
+    }
+    ppl_base = 1;
 
     // The bound is ids_history's row stride (MAX_SEQ_LEN), not the prefill
     // block height: a chunked prefill runs prompts longer than INIT_SEQ_LEN.
@@ -2315,13 +2389,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (htp_execution_profile_) {
     htpDecodeWantLogits(do_sample || BATCH_SIZE != 1 ||
                         logits_processor != nullptr ||
-                        REPETITION_PENALTY != 1.0f);
+                        REPETITION_PENALTY != 1.0f || ppl_dec);
     htpDecodeBan(BAD_WORD_IDS.data(), NUM_BADWORDS);
   }
   for (unsigned int token_generation_idx = generation_begin;
        token_generation_idx < generation_end &&
        !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
+
+    if (ppl_forced && ppl_base + generation_cnt >= ppl_cont.size())
+      break; // the continuation is used up
 
     allocateAndBindKVCache();
     auto output_interval = incrementalInference(
@@ -2351,6 +2428,34 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                  ? ids_history + (token_generation_idx - rep_window_len)
                  : nullptr,
                rep_window_len));
+    if (ppl_dec) {
+      // Scored after generate(), on the logits the pick is taken from (the
+      // bad-word ids are -inf there), so the self and the forced run score
+      // the same array.
+      const unsigned int top1 = ids_list[0];
+      const unsigned int target =
+        ppl_forced ? ppl_cont[ppl_base + generation_cnt] : top1;
+      const double nll = nntrainer::HtpTieWordEmbedding::nllOf(
+        output_interval[0], NUM_VOCAB, target);
+      ppl_dec_nll += nll;
+      ++ppl_dec_n;
+      ppl_dec_top1 += top1 == target;
+      std::string alts;
+      for (size_t i = 0; i < ppl_alts.size(); ++i) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s%u:%.9g",
+                      i ? "," : " alts=", ppl_alts[i],
+                      output_interval[0][ppl_alts[i]]);
+        alts += buf;
+      }
+      std::fprintf(stderr,
+                   "[PPL] decode step=%u target=%u nll=%.17g top1=%u%s\n",
+                   ppl_dec_n, target, nll, top1, alts.c_str());
+      if (ppl_forced)
+        ids_list[0] = target;
+      else
+        ppl_cont.push_back(target);
+    }
 
     // Feed the newly generated token back as the next input token.
     // token_generation_idx always starts at input_len + 1, so we are
@@ -2384,8 +2489,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       releaseLogitsBuf(out);
     }
 
-    // check FINISH
-    for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
+    // check FINISH (a forced continuation runs to its end)
+    for (unsigned int j = 0; j < BATCH_SIZE && !ppl_forced; ++j) {
       if (!eos_list[j] && (std::find(EOS_TOKEN_ID.begin(), EOS_TOKEN_ID.end(),
                                      ids_list[j]) != EOS_TOKEN_ID.end())) {
         eos_list[j] = true;
@@ -2412,6 +2517,26 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // Always release the input buffer after the generation loop, whether
   // the loop exited early (EOS found) or ran to the maximum token limit.
   free(input_sample);
+
+  if (ppl_dec && ppl_dec_n == 0) {
+    std::cerr << "[PPL] decode no steps scored (num_to_generate 0, a "
+                 "one-id file, or a stop request)"
+              << std::endl;
+  } else if (ppl_dec) {
+    const double x = ppl_dec_nll / ppl_dec_n;
+    std::fprintf(stderr,
+                 "[PPL] decode tokens=%u nll/token=%.6g ppl=%.6g top1=%u/%u "
+                 "source=%s nll_sum=%.17g\n",
+                 ppl_dec_n, x, std::exp(x), ppl_dec_top1, ppl_dec_n,
+                 ppl_forced ? "file" : "self", ppl_dec_nll);
+    if (!ppl_forced) {
+      std::ofstream f(ppl_dec_env);
+      for (unsigned int id : ppl_cont)
+        f << id << '\n';
+      if (!f)
+        std::cerr << "[PPL] decode cannot write " << ppl_dec_env << std::endl;
+    }
+  }
 
   global_token_len += (generation_cnt + init_len);
 
