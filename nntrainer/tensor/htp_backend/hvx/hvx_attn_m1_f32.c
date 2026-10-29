@@ -746,10 +746,10 @@ static void run_seed_q8(uint32_t n, uint32_t i, void *arg) {
 int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
                         const uint8_t *k8, const uint8_t *v8,
                         size_t head_stride, size_t row_stride, const float *s_k,
-                        const float *s_v, const float *s_v_inv,
-                        const float *k_rows) {
+                        const float *s_k_inv, const float *s_v,
+                        const float *s_v_inv, const float *k_rows) {
   if (!ctx || !ctx->q8 || layer >= ctx->n_layers || ctx->kv_len[layer] != 0u ||
-      !k8 || !v8 || !s_k || !s_v || !s_v_inv) {
+      !k8 || !v8 || (!k_rows && (!s_k || !s_k_inv)) || !s_v || !s_v_inv) {
     return AEE_EBADSTATE;
   }
   if (n_rows == 0u || n_rows > ctx->max_seq) {
@@ -768,9 +768,9 @@ int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
   for (uint32_t h = 0; h < ctx->n_kv; ++h) {
     for (uint32_t d = 0; d < hd; ++d) {
       const size_t x = base + (size_t)h * hd + d;
-      if (!k_rows) {
-        ctx->sk[x] = s_k[h];
-        ctx->sk_inv[x] = 1.0f / s_k[h]; /* the prefill append's inverse */
+      if (!k_rows) { /* the prefill append's scale and inverse */
+        ctx->sk[x] = s_k[(size_t)h * hd + d];
+        ctx->sk_inv[x] = s_k_inv[(size_t)h * hd + d];
       }
       ctx->sv[x] = s_v[(size_t)h * hd + d];
       ctx->sv_inv[x] = s_v_inv[(size_t)h * hd + d];

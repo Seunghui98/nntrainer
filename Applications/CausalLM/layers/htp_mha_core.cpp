@@ -754,9 +754,10 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
               : static_cast<void *>(t->getData<uint16_t>()));
     };
     // [#289] NNTR_HTP_KV_SEED_Q=1: from the layer's quantized prefill cache,
-    // without the rows leaving the DSP (the backend declines otherwise)
-    // K still comes from the CPU cache (the prefill's K scale is one a head,
-    // too coarse: decode nll +9.4 %), V from the DSP's int8 masters
+    // without the rows leaving the DSP (the backend declines otherwise).
+    // V from the DSP's int8 masters; K too when its prefill scale is per
+    // (head, dim) (NNTR_HTP_Q2_KDIM), else from the CPU cache (one scale a
+    // head is too coarse for decode: nll +9.4 %)
     // [#289] the CPU cache's rows [0, m) as f32, rows over the CPU pool (one
     // thread read 0.5 s of the p1024 first token); the same conversion
     auto rows_f32_of = [wk](const nntrainer::Tensor &c, float *dst, size_t m,
@@ -775,14 +776,24 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       const char *v = std::getenv("NNTR_HTP_KV_SEED_Q");
       return v != nullptr && std::strcmp(v, "1") == 0;
     }();
+    const bool from_q = seed_q && cache_base == 0 && !q_cache_handles.empty() &&
+                        q_cache_handles[0] >= 0 && q_cache_synced[0] == pos &&
+                        q2_scales_set[0];
+    if (seed_q && !from_q)
+      ml_logw("mha_core: %s seeds decode from fp16, not the int8 cache "
+              "(cache_base=%u handle=%d synced=%u pos=%u scales_set=%d)",
+              q2_name_.c_str(), cache_base,
+              q_cache_handles.empty() ? -1 : q_cache_handles[0],
+              q_cache_synced.empty() ? 0u : q_cache_synced[0], pos,
+              q2_scales_set.empty() ? 0 : static_cast<int>(q2_scales_set[0]));
+    const bool k_from_q = from_q && q2_scale_k.size() != num_heads_KV;
     std::vector<float> k_only;
-    if (seed_q && cache_base == 0 && !q_cache_handles.empty() &&
-        q_cache_handles[0] >= 0 && q_cache_synced[0] == pos && q2_scales_set[0])
+    if (from_q && !k_from_q) {
       k_only.resize(static_cast<size_t>(pos) * wk);
-    if (!k_only.empty())
       rows_f32_of(ck, k_only.data(), k_only.size(), wk);
-    if (!k_only.empty() &&
-        htpDecodeKvSeedKvq(pos, q_cache_handles[0], k_only.data())) {
+    }
+    if (from_q && htpDecodeKvSeedKvq(pos, q_cache_handles[0],
+                                     k_from_q ? nullptr : k_only.data())) {
       q_cache_handles[0] = -1; // released on the DSP
       drop_cpu_cache();
       r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,

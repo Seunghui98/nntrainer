@@ -181,7 +181,7 @@ int nntr_hvx_attn_m1_seed_kvq(remote_handle64 handle, uint32 layer,
   }
   const int rc = hvx_attn_m1_seed_q8(
     c, layer, n_rows, kv->kt4, kv->v4, (size_t)kv->max_rows * kv->head_dim,
-    kv->head_dim, kv->fs_k, kv->fs_v, kv->fs_v_inv,
+    kv->head_dim, kv->fs_kd, kv->fs_k_inv, kv->fs_v, kv->fs_v_inv,
     k_rowsLen != 0 ? k_rows : NULL);
   if (rc != AEE_SUCCESS) {
     return rc;

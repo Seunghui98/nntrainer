@@ -1506,6 +1506,11 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
           *v8 = (uint8_t *)malloc(n_kv * hs);
   float s_k[2] = {0.03f, 0.5f}, s_v[2 * 256], s_vi[2 * 256];
+  float s_kd[2 * 256], s_kdi[2 * 256]; /* a head scale over its dims */
+  for (uint32_t i = 0; i < n_kv * hd; ++i) {
+    s_kd[i] = s_k[i / hd];
+    s_kdi[i] = 1.0f / s_k[i / hd];
+  }
   for (size_t i = 0; i < n_kv * hs; ++i) {
     k8[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
     v8[i] = (uint8_t)((i * 53u + 7u) & 0xFFu);
@@ -1514,8 +1519,8 @@ static void check_seed_q8(hvx_worker_pool *pool) {
     s_v[i] = 0.01f + 0.001f * (float)i;
     s_vi[i] = 1.0f / s_v[i];
   }
-  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_k, s_v, s_vi, NULL) ==
-          AEE_SUCCESS,
+  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_kd, s_kdi, s_v, s_vi,
+                            NULL) == AEE_SUCCESS,
         "seed_q8: seed");
   CHECK(c->kt[1] && !c->kt[0] && !c->kt[2] && c->kv_len[1] == L && c->scaled[1],
         "seed_q8: one layer allocated and filled");
@@ -1539,8 +1544,8 @@ static void check_seed_q8(hvx_worker_pool *pool) {
     }
   }
   CHECK(bad == 0, "seed_q8: %d bytes or scales moved", bad);
-  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_k, s_v, s_vi, NULL) ==
-          AEE_EBADSTATE,
+  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_kd, s_kdi, s_v, s_vi,
+                            NULL) == AEE_EBADSTATE,
         "seed_q8: a second seed of a layer is refused");
   /* K from f32 rows: the same K bytes and scales as kv_append's */
   float *kf = (float *)malloc((size_t)L * n_kv * hd * sizeof(float));
@@ -1556,8 +1561,8 @@ static void check_seed_q8(hvx_worker_pool *pool) {
                        max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
   CHECK(a && b, "seed_q8: create the K pair");
   if (a && b) {
-    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, s_k, s_v, s_vi, kf) ==
-            AEE_SUCCESS,
+    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, NULL, NULL, s_v, s_vi,
+                              kf) == AEE_SUCCESS,
           "seed_q8: seed with K rows");
     CHECK(hvx_attn_m1_kv_append(b, 0u, 0u, L, kf, kf) == AEE_SUCCESS,
           "seed_q8: kv_append reference");
@@ -1580,6 +1585,128 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   hvx_attn_m1_free(c);
   if (bad == 0) {
     printf("ATTN M1 SEED Q8 OK\n");
+  }
+}
+
+/** [NNTR_HTP_Q2_KDIM] With K's prefill scale per (head, dim) the int8
+ *  masters are the decode cache's own bytes: masters quantized as the
+ *  prefill appends them (rint(x / s), s = amax / 127, hexkl_kv_q's rule)
+ *  and seeded must give kv_append's scales bit for bit and its K bytes,
+ *  except at exact .5 ties (rint to even, q8_of away from zero). Data a:
+ *  irregular values (a few ties, where the two rules may agree). Data b:
+ *  s = 1 / 64 and values on the half grid, so ties are many and some must
+ *  differ, or the case would test nothing. */
+static void check_seed_q8_kd(hvx_worker_pool *pool) {
+  const uint32_t n_kv = 2u, hd = 256u, L = 130u, max_seq = 256u;
+  const size_t hs = (size_t)max_seq * hd, n = (size_t)n_kv * hd;
+  int err = 0, bad = 0;
+  float *kf = (float *)malloc((size_t)L * n * sizeof(float));
+  float *sk = (float *)malloc(n * sizeof(float));
+  float *ski = (float *)malloc(n * sizeof(float));
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs), *v8 = (uint8_t *)calloc(n_kv, hs);
+  float *s_v = (float *)malloc(n * sizeof(float));
+  float *s_vi = (float *)malloc(n * sizeof(float));
+  for (size_t i = 0; i < n; ++i) {
+    s_v[i] = 0.02f;
+    s_vi[i] = 1.0f / 0.02f;
+  }
+  for (int data = 0; data < 2; ++data) {
+    for (size_t i = 0; i < (size_t)L * n; ++i) {
+      const uint32_t u = (uint32_t)(i * 2654435761u);
+      kf[i] =
+        data == 0
+          ? (float)((int)(u % 2001u) - 1000) * 0.0137f *
+              (1.0f + (float)(i % hd) * 0.01f)
+          : ((float)((int)(u % 254u) - 127) + 0.5f * (float)(u >> 31)) / 64.0f;
+      if (data == 1 && i < n) {
+        kf[i] = 127.0f / 64.0f; /* row 0: every dim's amax, s = 1 / 64 */
+      }
+      if (data == 1 && kf[i] > 127.0f / 64.0f) {
+        kf[i] = 127.0f / 64.0f;
+      }
+    }
+    /* the prefill side: amax per (head, dim), scale, inverse, masters */
+    for (size_t e = 0; e < n; ++e) {
+      float m = 0.0f;
+      for (uint32_t r = 0; r < L; ++r) {
+        const float a = fabsf(kf[(size_t)r * n + e]);
+        m = a > m ? a : m;
+      }
+      sk[e] = m > 0.0f ? m * 1.0f / 127.0f : 1.0f;
+      ski[e] = 1.0f / sk[e];
+    }
+    size_t ties = 0;
+    for (uint32_t h = 0; h < n_kv; ++h) {
+      for (uint32_t r = 0; r < L; ++r) {
+        for (uint32_t d = 0; d < hd; ++d) {
+          const size_t e = (size_t)h * hd + d;
+          float q = rintf(kf[(size_t)r * n + e] * ski[e]);
+          q = q > 127.0f ? 127.0f : (q < -127.0f ? -127.0f : q);
+          k8[h * hs + (size_t)r * hd + d] = (uint8_t)(int8_t)q ^ 0x80u;
+          const float x = kf[(size_t)r * n + e] * ski[e];
+          ties += x - floorf(x) == 0.5f;
+        }
+      }
+    }
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+      &err);
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+      &err);
+    CHECK(a && b, "seed_q8 kd: create");
+    if (!a || !b) {
+      hvx_attn_m1_free(a);
+      hvx_attn_m1_free(b);
+      break;
+    }
+    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, sk, ski, s_v, s_vi,
+                              NULL) == AEE_SUCCESS,
+          "seed_q8 kd: seed from masters");
+    CHECK(hvx_attn_m1_kv_append(b, 0u, 0u, L, kf, kf) == AEE_SUCCESS,
+          "seed_q8 kd: kv_append reference");
+    int sbad = 0;
+    for (size_t e = 0; e < n; ++e) {
+      sbad += a->sk[e] != b->sk[e] || a->sk_inv[e] != b->sk_inv[e];
+    }
+    size_t diff = 0, off_tie = 0;
+    for (uint32_t h = 0; h < n_kv; ++h) {
+      const int8_t *ka = (const int8_t *)a->kt[0] + (size_t)h * hd * a->seq;
+      const int8_t *kb = (const int8_t *)b->kt[0] + (size_t)h * hd * b->seq;
+      for (uint32_t r = 0; r < L; ++r) {
+        for (uint32_t d = 0; d < hd; ++d) {
+          const size_t t =
+            (size_t)(r / 64u) * hd * 64u + (size_t)d * 64u + r % 64u;
+          if (ka[t] == kb[t]) {
+            continue;
+          }
+          ++diff;
+          const float x = kf[(size_t)r * n + h * hd + d] * ski[h * hd + d];
+          off_tie += x - floorf(x) != 0.5f;
+        }
+      }
+    }
+    CHECK(sbad == 0, "seed_q8 kd data %d: %d scales differ from kv_append's",
+          data, sbad);
+    CHECK(off_tie == 0, "seed_q8 kd data %d: %zu K bytes differ off a tie",
+          data, off_tie);
+    CHECK(data == 0 || diff > 0, "seed_q8 kd data %d: no tie differs (%zu)",
+          data, ties);
+    printf("seed_q8 kd data %d: ties=%zu K bytes differing (ties only)=%zu\n",
+           data, ties, diff);
+    bad += sbad + (int)off_tie;
+    hvx_attn_m1_free(a);
+    hvx_attn_m1_free(b);
+  }
+  free(kf);
+  free(sk);
+  free(ski);
+  free(k8);
+  free(v8);
+  free(s_v);
+  free(s_vi);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED Q8 KD OK\n");
   }
 }
 
@@ -1992,6 +2119,7 @@ int main(void) {
   check_gemma_fast(pools);
   check_gemma_q8(pools);
   check_seed_q8(pools[2]);
+  check_seed_q8_kd(pools[2]);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);
