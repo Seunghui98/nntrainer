@@ -1180,9 +1180,6 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
       kv->n_head_kv != s->n_head_kv || s->cache_to > kv->max_rows) {
     return AEE_EBADPARM;
   }
-  if (kv->k_per_dim && !io->q_f32) {
-    return AEE_EBADPARM; /* the fold needs Q before its u16 codes */
-  }
   if (hexkl_attn_q2_check(s) != HEXKL_ATTN_OK) {
     return AEE_ENOMEMORY; /* as the plan answered it */
   }

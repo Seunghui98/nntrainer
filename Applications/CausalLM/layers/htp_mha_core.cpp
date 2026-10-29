@@ -1215,12 +1215,9 @@ void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
 bool HtpMHACoreLayer::q2_k_per_dim() const {
   static const bool on = [] {
     const char *v = std::getenv("NNTR_HTP_Q2_KDIM");
-    const char *f32 = std::getenv("NNTR_HTP_ATTN_F32");
-    return v && std::strcmp(v, "1") == 0 &&
-           !std::getenv("NNTR_HTP_ATTN_F32_CHECK") &&
-           !(f32 && std::strcmp(f32, "0") == 0);
+    return v && std::strcmp(v, "1") == 0;
   }();
-  return on && attn_out_u16;
+  return on;
 }
 
 bool HtpMHACoreLayer::q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
@@ -1734,12 +1731,6 @@ bool HtpMHACoreLayer::try_quantized_attention(
         io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q, cache_from,
         cache_to, num_heads_Q, num_heads_KV, head_dim, window, io.out,
         f32_check ? chk16.data() : nullptr, q2_out_enc.data(), q_stride);
-    if (!f32_ran && q2_scale_k.size() != num_heads_KV) {
-      // ponytail: K per dim folds into the f32 Q only, so a failed f32 call
-      // drops the layer to fp16 rather than the u16 Q below; folding into
-      // quant_u16_f32 is the upgrade if that path ever has to carry it.
-      return fail("attention (K per dim needs the f32 Q path)");
-    }
     bool again = false;
     if (f32_ran && f32_check && std::getenv("NNTR_HTP_ATTN_TRACE")) {
       // the u16 context's saturation against the fixed output encoding
@@ -1790,13 +1781,31 @@ bool HtpMHACoreLayer::try_quantized_attention(
     // 4 or 8 compute threads slower (doc 57 section 9.23).
     static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
     const auto tq0 = std::chrono::steady_clock::now();
+    // K per dim: Q's inverse step times fs_kd / fs_k per dim, formed as the
+    // accelerator's f32 path forms it (hexkl_attn_q2 stage_qprep)
+    std::vector<float> q_inv_d;
+    if (q2_scale_k.size() != num_heads_KV) {
+      const unsigned int G = num_heads_Q / num_heads_KV;
+      q_inv_d.resize(q_stride);
+      for (unsigned int h = 0; h < num_heads_Q; ++h) {
+        const float *sk = q2_scale_k.data() + (h / G) * head_dim;
+        const float top = *std::max_element(sk, sk + head_dim);
+        for (unsigned int d = 0; d < head_dim; ++d)
+          q_inv_d[h * head_dim + d] = q_inv[h] * (sk[d] / top);
+      }
+    }
     for (unsigned int r = 0; r < n_q && !again; ++r) {
       const float *qr = q_view + static_cast<size_t>(r) * q_stride;
       uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
       for (unsigned int h = 0; h < num_heads_Q; ++h)
-        causallm::quant_u16_f32(qr + h * head_dim, head_dim,
-                                1.0f / q2_q_enc[2 * h], q2_q_enc[2 * h + 1],
-                                dst + h * head_dim);
+        if (q_inv_d.empty())
+          causallm::quant_u16_f32(qr + h * head_dim, head_dim,
+                                  1.0f / q2_q_enc[2 * h], q2_q_enc[2 * h + 1],
+                                  dst + h * head_dim);
+        else
+          causallm::quant_u16_f32(qr + h * head_dim, head_dim,
+                                  q_inv_d.data() + h * head_dim,
+                                  q2_q_enc[2 * h + 1], dst + h * head_dim);
     }
     const auto tq1 = std::chrono::steady_clock::now();
     if (!again &&

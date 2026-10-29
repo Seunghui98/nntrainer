@@ -104,7 +104,9 @@ typedef struct {
                              never feeds (the row-blocked kernel takes its
                              decode steps too) */
   int k_per_dim;        /**< 1: K's fixed scale is per (head, dim)
-                             (hexkl_kv_q_set_fixed_scales_kd) */
+                             (hexkl_kv_q_set_fixed_scales_kd). The
+                             row-blocked kernel folds fk_ratio into an f32
+                             Q; a u16 Q comes with it folded by its caller */
   float *fs_k;          /**< [n_head_kv] fixed K scale per head: the
                              largest of the head's per-dim scales */
   float *fs_kd;         /**< [n_head_kv][head_dim] K scale per dim (fs_k

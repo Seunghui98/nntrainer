@@ -534,9 +534,10 @@ private:
 
   /**
    * @brief NNTR_HTP_Q2_KDIM=1: K's int8 scale per (KV head, dim) instead of
-   *        per head, the decode cache's granularity. Only the f32-Q path
-   *        (attn_out_u16) folds K's dims into Q, so it needs that path and
-   *        is off under NNTR_HTP_ATTN_F32=0 / NNTR_HTP_ATTN_F32_CHECK.
+   *        per head, the decode cache's granularity. Both Q paths fold
+   *        fs_kd / fs_k into Q's inverse step: the accelerator's f32 one in
+   *        its Q staging, the NEON u16 one here, in the same operations, so
+   *        NNTR_HTP_ATTN_F32_CHECK compares the two.
    */
   bool q2_k_per_dim() const;
 
