@@ -202,46 +202,14 @@ void ConcatLayer::incremental_forwarding(RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
   /**
-   * @todo avoid copy by creating input here as a shared_tensor of the output
-   * here and then this layer can be in_place as well
+   * The step's rows are the whole tensors' rows here, so this is forwarding().
+   * The copy it replaces sized every input by the output width and stepped a
+   * row per input, which read past a narrower input and wrote the second
+   * input past the output of a width (axis 3) concat.
+   * ponytail: copies every row, not only [from, to); a step-sized copy would
+   * need the step's row offset per axis.
    */
-  Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
-
-  const TensorDim out_dim = output.getDim();
-  output.reshape(output_reshape_helper);
-  unsigned int output_height_offset = 0;
-  unsigned int data_copy_size = output_reshape_helper.width();
-
-  // @todo: this implementation is only works when axis is 3(width). Consider
-  // for other axes
-  unsigned int batch_channel = out_dim.batch() * out_dim.channel();
-
-  for (unsigned int idx = 0; idx < context.getNumInputs(); idx++) {
-    Tensor &input = context.getInput(idx);
-    const TensorDim in_dim = input.getDim();
-    auto const &irh = input_reshape_helper[idx];
-    input.reshape(irh);
-
-    /** loop over the dimensions before the concat dimension */
-    for (unsigned int batch = batch_channel * from; batch < batch_channel * to;
-         batch++) {
-      /** loop over the concat dimension itself */
-      for (unsigned int count = 0; count < irh.height(); count++) {
-        Tensor dest_tensor = Tensor::Map(
-          output.getAddress(batch, 0, output_height_offset + count, 0),
-          data_copy_size * sizeof(float), {1, 1, 1, data_copy_size});
-        const Tensor source_tensor = Tensor::Map(
-          input.getAddress(batch, 0, count, 0), data_copy_size * sizeof(float),
-          {1, 1, 1, data_copy_size});
-        dest_tensor.copy(source_tensor);
-      }
-    }
-
-    input.reshape(in_dim);
-    output_height_offset += irh.height();
-  }
-
-  output.reshape(out_dim);
+  forwarding(context, training);
 }
 
 void ConcatLayer::calcDerivative(RunLayerContext &context) {
