@@ -103,7 +103,15 @@ typedef struct {
                              HVX decode kernel, which a fixed-scale cache
                              never feeds (the row-blocked kernel takes its
                              decode steps too) */
-  float *fs_k;          /**< [n_head_kv] fixed K scale per head */
+  int k_per_dim;        /**< 1: K's fixed scale is per (head, dim)
+                             (hexkl_kv_q_set_fixed_scales_kd) */
+  float *fs_k;          /**< [n_head_kv] fixed K scale per head: the
+                             largest of the head's per-dim scales */
+  float *fs_kd;         /**< [n_head_kv][head_dim] K scale per dim (fs_k
+                             repeated without per-dim scales) */
+  float *fs_k_inv;      /**< [n_head_kv][head_dim] 1 / fs_kd, for the append */
+  float *fk_ratio;      /**< [n_head_kv][head_dim] fs_kd / fs_k, at most 1:
+                             the row-blocked kernel folds it into Q */
   float *fs_v;          /**< [n_head_kv][head_dim] fixed V scale per dim */
   float *fs_v_inv;      /**< [n_head_kv][head_dim] 1 / fs_v, for the append */
 } hexkl_kv_q;
@@ -223,12 +231,11 @@ void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
                             int8_t *q, float *scale);
 
 /**
- * @brief K row with a given scale: q = rint(x / scale) clamped, colsum.
- *
- * @param inv  1 / scale
+ * @brief K row with a given scale per dim: q[d] = rint(x[d] * inv[d])
+ *        clamped, colsum.
  */
 void hexkl_kv_q_quant_k_row_fixed(const float *x, uint32_t hd, int32_t qmax,
-                                  float inv, int8_t *q, int32_t *colsum);
+                                  const float *inv, int8_t *q, int32_t *colsum);
 
 /**
  * @brief V row with a given scale per dim: q[d] = rint(x[d] * inv[d])
@@ -248,6 +255,16 @@ void hexkl_kv_q_quant_v_row_fixed(const float *x, uint32_t hd, int32_t qmax,
  */
 int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
                                 const float *s_k, const float *s_v);
+
+/**
+ * @brief hexkl_kv_q_set_fixed_scales with K per (head, dim): @a s_k
+ *        [n_head_kv][head_dim]. fs_k becomes each head's largest, fk_ratio
+ *        the per-dim scale over it; the row-blocked kernel multiplies Q by
+ *        fk_ratio, so its scores (and fs_k in them) are unchanged in form.
+ *        int8 caches only.
+ */
+int hexkl_kv_q_set_fixed_scales_kd(hexkl_kv_q_table *tbl, uint32_t handle,
+                                   const float *s_k, const float *s_v);
 
 /**
  * @brief The int8 WH tile permutation the DSP derived from rm_to_wh_i8:

@@ -489,9 +489,10 @@ private:
    *        the two staging buffers.
    */
   std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
-  /** The raw |max| the scales derive from (K per KV head, V per (head,
-   *  dim)), kept across steps: a later step's rows past them would clip,
-   *  so the scales widen and the mirror is re-quantized (q2_grow). */
+  /** The raw |max| the scales derive from (K per KV head, or per (head,
+   *  dim) under q2_k_per_dim; V per (head, dim)), kept across steps: a
+   *  later step's rows past them would clip, so the scales widen and the
+   *  mirror is re-quantized (q2_grow). */
   std::vector<float> q2_kmax, q2_vmax;
   /** The a16 path's u16 Q and output, one pair for every layer: per layer
    *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
@@ -530,6 +531,14 @@ private:
 
   /** @brief Releases every quantized-cache handle. */
   void release_quantized_cache();
+
+  /**
+   * @brief NNTR_HTP_Q2_KDIM=1: K's int8 scale per (KV head, dim) instead of
+   *        per head, the decode cache's granularity. Only the f32-Q path
+   *        (attn_out_u16) folds K's dims into Q, so it needs that path and
+   *        is off under NNTR_HTP_ATTN_F32=0 / NNTR_HTP_ATTN_F32_CHECK.
+   */
+  bool q2_k_per_dim() const;
 
   /** @brief Fills q2_scale_* from the first rows (see the members). */
   void calibrate_q2_scales(const uint16_t *k_rows, const uint16_t *v_rows,

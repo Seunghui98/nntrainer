@@ -1194,23 +1194,37 @@ void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
                                           unsigned int kv_stride,
                                           const float *q, unsigned int q_stride,
                                           unsigned int n_q) {
-  q2_kmax.assign(num_heads_KV, 0.0f);
+  q2_kmax.assign(q2_k_per_dim() ? num_heads_KV * head_dim : num_heads_KV, 0.0f);
   q2_vmax.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
   q2_grow(k_rows, v_rows, n_rows, kv_stride);
   q2_derive_q(q, q_stride, n_q);
   q2_calibrated = true;
 }
 
+bool HtpMHACoreLayer::q2_k_per_dim() const {
+  static const bool on = [] {
+    const char *v = std::getenv("NNTR_HTP_Q2_KDIM");
+    const char *f32 = std::getenv("NNTR_HTP_ATTN_F32");
+    return v && std::strcmp(v, "1") == 0 &&
+           !std::getenv("NNTR_HTP_ATTN_F32_CHECK") &&
+           !(f32 && std::strcmp(f32, "0") == 0);
+  }();
+  return on && attn_out_u16;
+}
+
 bool HtpMHACoreLayer::q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
                               unsigned int n_rows, unsigned int kv_stride) {
-  std::vector<float> kmax(num_heads_KV, 0.0f),
+  const bool kd = q2_kmax.size() != num_heads_KV;
+  std::vector<float> kmax(q2_kmax.size(), 0.0f),
     vmax(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
   for (unsigned int r = 0; r < n_rows; ++r) {
     const uint16_t *kr = k_rows + static_cast<size_t>(r) * kv_stride;
     const uint16_t *vr = v_rows + static_cast<size_t>(r) * kv_stride;
-    for (unsigned int n = 0; n < num_heads_KV; ++n) {
-      kmax[n] = causallm::abs_max_f16(kr + n * head_dim, head_dim, kmax[n]);
-    }
+    if (kd)
+      causallm::abs_max_f16_lanes(kr, num_heads_KV * head_dim, kmax.data());
+    else
+      for (unsigned int n = 0; n < num_heads_KV; ++n)
+        kmax[n] = causallm::abs_max_f16(kr + n * head_dim, head_dim, kmax[n]);
     causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, vmax.data());
   }
   bool grew = false;
@@ -1270,10 +1284,34 @@ void HtpMHACoreLayer::q2_derive_q(const float *q, unsigned int q_stride,
         q_lo[h] = -q2_q_enc[2 * h + 1] * q2_q_enc[2 * h];
         q_hi[h] = q_lo[h] + 65535.0f * q2_q_enc[2 * h];
       }
-  for (unsigned int r = 0; r < n_q; ++r) {
-    const float *qr = q + static_cast<size_t>(r) * q_stride;
-    for (unsigned int h = 0; h < num_heads_Q; ++h)
-      causallm::min_max_f32(qr + h * head_dim, head_dim, q_lo[h], q_hi[h]);
+  if (q2_scale_k.size() != num_heads_KV) {
+    // K per dim: the range of the Q the kernel quantizes, q * fs_kd / fs_k
+    // (hexkl_attn_q2 stage_qprep); min (q r) = r min (q) for r > 0, so the
+    // per-dim extremes first, as the accelerator's calibration takes them
+    std::vector<float> lo(q_stride, 1e30f), hi(q_stride, -1e30f);
+    for (unsigned int r = 0; r < n_q; ++r) {
+      const float *qr = q + static_cast<size_t>(r) * q_stride;
+      for (unsigned int i = 0; i < q_stride; ++i) {
+        lo[i] = std::min(lo[i], qr[i]);
+        hi[i] = std::max(hi[i], qr[i]);
+      }
+    }
+    const unsigned int G = num_heads_Q / num_heads_KV;
+    for (unsigned int h = 0; h < num_heads_Q; ++h) {
+      const float *sk = q2_scale_k.data() + (h / G) * head_dim;
+      const float top = *std::max_element(sk, sk + head_dim);
+      for (unsigned int d = 0; d < head_dim; ++d) {
+        const float r = sk[d] / top;
+        q_lo[h] = std::min(q_lo[h], lo[h * head_dim + d] * r);
+        q_hi[h] = std::max(q_hi[h], hi[h * head_dim + d] * r);
+      }
+    }
+  } else {
+    for (unsigned int r = 0; r < n_q; ++r) {
+      const float *qr = q + static_cast<size_t>(r) * q_stride;
+      for (unsigned int h = 0; h < num_heads_Q; ++h)
+        causallm::min_max_f32(qr + h * head_dim, head_dim, q_lo[h], q_hi[h]);
+    }
   }
   q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
   for (unsigned int h = 0; h < num_heads_Q; ++h) {
@@ -1325,7 +1363,8 @@ void HtpMHACoreLayer::q2_maxima_from_scales() {
 
 bool HtpMHACoreLayer::take_q2_calibration() {
   const auto it = q2_store_.find(q2_name_);
-  const size_t nk = num_heads_KV, nv = nk * head_dim, nq = 2 * num_heads_Q;
+  const size_t nv = static_cast<size_t>(num_heads_KV) * head_dim,
+               nk = q2_k_per_dim() ? nv : num_heads_KV, nq = 2 * num_heads_Q;
   // [#4428 window] + 2 * nv when the saving run dropped rows (the floor)
   const size_t n_cal = nk + nv + 2 * nq;
   if (!q2_from_file_ || it == q2_store_.end() ||
@@ -1519,7 +1558,8 @@ bool HtpMHACoreLayer::try_quantized_attention(
         !std::getenv("NNTR_HTP_ATTN_F32_CHECK") &&
         !(std::getenv("NNTR_HTP_ATTN_F32") &&
           std::strcmp(std::getenv("NNTR_HTP_ATTN_F32"), "0") == 0)) {
-      q2_scale_k.assign(num_heads_KV, 0.0f);
+      q2_scale_k.assign(q2_k_per_dim() ? num_heads_KV * head_dim : num_heads_KV,
+                        0.0f);
       q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
       q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
       q2_out_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
@@ -1528,7 +1568,8 @@ bool HtpMHACoreLayer::try_quantized_attention(
             handle, append_row0, append_rows, width, k_base + off, v_base + off,
             io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q,
             num_heads_KV, head_dim, window, io.out, q2_scale_k.data(),
-            q2_scale_v.data(), q2_q_enc.data(), q2_out_enc.data(), q_stride)) {
+            q2_scale_v.data(), q2_q_enc.data(), q2_out_enc.data(), q_stride,
+            q2_k_per_dim())) {
         q2_calibrated = true;
         q2_scales_set[batch] = 1;
         synced = cache_to;
@@ -1592,6 +1633,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
     if (std::getenv("NNTR_HTP_ATTN_TRACE") && append_rows != 0) {
       float worst_k = 0.0f, worst_v = 0.0f;
       size_t clip_k = 0, clip_v = 0;
+      const unsigned int k_dims = q2_scale_k.size() / num_heads_KV;
       for (unsigned int r = 0; r < append_rows; ++r) {
         const uint16_t *kr = k_base + off + static_cast<size_t>(r) * width;
         const uint16_t *vr = v_base + off + static_cast<size_t>(r) * width;
@@ -1599,7 +1641,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
           for (unsigned int d = 0; d < head_dim; ++d) {
             const float kq =
               std::fabs(nntrainer::compute_fp16_to_fp32(kr[n * head_dim + d])) /
-              q2_scale_k[n];
+              q2_scale_k[n * k_dims + d % k_dims];
             const float vq =
               std::fabs(nntrainer::compute_fp16_to_fp32(vr[n * head_dim + d])) /
               q2_scale_v[n * head_dim + d];
@@ -1639,7 +1681,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
     if (!q2_scales_set[batch]) {
       if (!compute_ops_->kv_cache_q_set_fixed_scales(
             handle, num_heads_KV, head_dim, q2_scale_k.data(),
-            q2_scale_v.data())) {
+            q2_scale_v.data(), q2_scale_k.size() != num_heads_KV)) {
         return fail("fixed scales");
       }
       q2_scales_set[batch] = 1;
@@ -1681,6 +1723,12 @@ bool HtpMHACoreLayer::try_quantized_attention(
         io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q, cache_from,
         cache_to, num_heads_Q, num_heads_KV, head_dim, window, io.out,
         f32_check ? chk16.data() : nullptr, q2_out_enc.data(), q_stride);
+    if (!f32_ran && q2_scale_k.size() != num_heads_KV) {
+      // ponytail: K per dim folds into the f32 Q only, so a failed f32 call
+      // drops the layer to fp16 rather than the u16 Q below; folding into
+      // quant_u16_f32 is the upgrade if that path ever has to carry it.
+      return fail("attention (K per dim needs the f32 Q path)");
+    }
     bool again = false;
     if (f32_ran && f32_check && std::getenv("NNTR_HTP_ATTN_TRACE")) {
       // the u16 context's saturation against the fixed output encoding

@@ -97,11 +97,12 @@ void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
 }
 
 void hexkl_kv_q_quant_k_row_fixed(const float *x, uint32_t hd, int32_t qmax,
-                                  float inv, int8_t *q, int32_t *colsum) {
+                                  const float *inv, int8_t *q,
+                                  int32_t *colsum) {
   const float fq = (float)qmax;
   int32_t sum = 0;
   for (uint32_t d = 0; d < hd; ++d) {
-    float r = rintf(x[d] * inv);
+    float r = rintf(x[d] * inv[d]);
     if (r > fq) {
       r = fq;
     } else if (r < -fq) {
@@ -147,7 +148,11 @@ int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
   memcpy(kv->fs_v, s_v, (size_t)kv->n_head_kv * kv->head_dim * sizeof(float));
   for (size_t i = 0; i < (size_t)kv->n_head_kv * kv->head_dim; ++i) {
     kv->fs_v_inv[i] = 1.0f / s_v[i];
+    kv->fs_kd[i] = s_k[i / kv->head_dim];
+    kv->fs_k_inv[i] = 1.0f / s_k[i / kv->head_dim];
+    kv->fk_ratio[i] = 1.0f;
   }
+  kv->k_per_dim = 0;
   for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
     for (uint32_t row = 0; row < kv->max_rows; ++row) {
       kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = s_k[n];
@@ -158,8 +163,43 @@ int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
   return AEE_SUCCESS;
 }
 
+int hexkl_kv_q_set_fixed_scales_kd(hexkl_kv_q_table *tbl, uint32_t handle,
+                                   const float *s_k, const float *s_v) {
+  hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
+  if (!kv || !s_k || kv->kind != HEXKL_KV_Q8) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t hd = kv->head_dim;
+  const size_t n = (size_t)kv->n_head_kv * hd;
+  float *head = (float *)calloc(kv->n_head_kv, sizeof(float));
+  if (!head) {
+    return AEE_ENOMEMORY;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (!(s_k[i] > 0.0f)) {
+      free(head);
+      return AEE_EBADPARM;
+    }
+    head[i / hd] = s_k[i] > head[i / hd] ? s_k[i] : head[i / hd];
+  }
+  const int rc = hexkl_kv_q_set_fixed_scales(tbl, handle, head, s_v);
+  if (rc == AEE_SUCCESS) {
+    for (size_t i = 0; i < n; ++i) {
+      kv->fs_kd[i] = s_k[i];
+      kv->fs_k_inv[i] = 1.0f / s_k[i];
+      kv->fk_ratio[i] = s_k[i] / head[i / hd];
+    }
+    kv->k_per_dim = 1;
+  }
+  free(head);
+  return rc;
+}
+
 static void free_slot(hexkl_kv_q *kv) {
   free(kv->fs_k);
+  free(kv->fs_kd);
+  free(kv->fs_k_inv);
+  free(kv->fk_ratio);
   free(kv->fs_v);
   free(kv->fs_v_inv);
   free(kv->kt4);
@@ -220,11 +260,14 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   kv->stage_kt = (int8_t *)calloc((size_t)head_dim * 32u, 1u);
   kv->stage_v = (int8_t *)calloc((size_t)head_dim * 32u, 1u);
   kv->fs_k = (float *)calloc(n_head_kv, sizeof(float));
+  kv->fs_kd = (float *)calloc((size_t)n_head_kv * head_dim, sizeof(float));
+  kv->fs_k_inv = (float *)calloc((size_t)n_head_kv * head_dim, sizeof(float));
+  kv->fk_ratio = (float *)calloc((size_t)n_head_kv * head_dim, sizeof(float));
   kv->fs_v = (float *)calloc((size_t)n_head_kv * head_dim, sizeof(float));
   kv->fs_v_inv = (float *)calloc((size_t)n_head_kv * head_dim, sizeof(float));
   if (!kv->kt4 || !kv->v4 || !kv->s_k || !kv->colsum_k || !kv->s_v || !kv->kt ||
-      !kv->v || !kv->stage_kt || !kv->stage_v || !kv->fs_k || !kv->fs_v ||
-      !kv->fs_v_inv) {
+      !kv->v || !kv->stage_kt || !kv->stage_v || !kv->fs_k || !kv->fs_kd ||
+      !kv->fs_k_inv || !kv->fk_ratio || !kv->fs_v || !kv->fs_v_inv) {
     free_slot(kv);
     return AEE_ENOMEMORY;
   }
@@ -494,7 +537,7 @@ static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
     for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
       int32_t cs;
       hvx_kv_quant_k_row_fixed(krow + (size_t)n * hd, hd, kv->qmax,
-                               1.0f / kv->fs_k[n], q, &cs);
+                               kv->fs_k_inv + (size_t)n * hd, q, &cs);
       kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = kv->fs_k[n];
       kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)] = cs;
       xor80_copy(kv->kt4 + hexkl_kv_q_kt4_index(kv, n, row, 0),
@@ -711,12 +754,13 @@ static void append_dynamic_heads(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
       float sk;
       int32_t cs;
       const float *inv_v = kv->fs_v_inv + (size_t)n * hd;
+      const float *inv_k = kv->fs_k_inv + (size_t)n * hd;
       if (kv->fixed) {
         sk = kv->fs_k[n];
       }
 #ifdef __hexagon__
       if (kv->fixed) {
-        hvx_kv_quant_k_row_fixed(krow + (size_t)n * hd, hd, kv->qmax, 1.0f / sk,
+        hvx_kv_quant_k_row_fixed(krow + (size_t)n * hd, hd, kv->qmax, inv_k,
                                  qk_row, &cs);
       } else {
         hvx_kv_quant_k_row(krow + (size_t)n * hd, hd, kv->qmax, qk_row, &sk,
@@ -727,7 +771,7 @@ static void append_dynamic_heads(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
         x[d] = hexkl_kv_q_hf_to_f32(krow[(size_t)n * hd + d]);
       }
       if (kv->fixed) {
-        hexkl_kv_q_quant_k_row_fixed(x, hd, kv->qmax, 1.0f / sk, qk_row, &cs);
+        hexkl_kv_q_quant_k_row_fixed(x, hd, kv->qmax, inv_k, qk_row, &cs);
       } else {
         hexkl_kv_q_quant_k_row(x, hd, kv->qmax, qk_row, &sk, &cs);
       }

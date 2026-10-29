@@ -11688,7 +11688,7 @@ public:
 
   bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
                                    unsigned int head_dim, const float *s_k,
-                                   const float *s_v) override {
+                                   const float *s_v, bool k_per_dim) override {
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || !s_k || !s_v || n_head_kv == 0 ||
         head_dim == 0) {
@@ -11696,7 +11696,7 @@ public:
     }
     const int err = nntr_hvx_kv_set_fixed_scales_q(
       static_cast<remote_handle64>(hb.handle()), static_cast<uint32_t>(handle),
-      s_k, static_cast<int>(n_head_kv), s_v,
+      s_k, static_cast<int>(k_per_dim ? n_head_kv * head_dim : n_head_kv), s_v,
       static_cast<int>(n_head_kv * head_dim));
     if (err != AEE_SUCCESS) {
       ml_logw("HTP quantized KV cache: fixed scales failed: 0x%x", err);
@@ -11859,7 +11859,7 @@ public:
     unsigned int cache_from, unsigned int cache_to, unsigned int n_head_q,
     unsigned int n_head_kv, unsigned int head_dim, unsigned int window,
     float *out, float *s_k, float *s_v, float *q_enc, float *out_enc,
-    unsigned int out_stride) override {
+    unsigned int out_stride, bool k_per_dim) override {
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 64) != 0 ||
@@ -11886,15 +11886,16 @@ public:
     const size_t out_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
     uint16_t *out_ion =
       reinterpret_cast<uint16_t *>(stage(attn_out_pool_, out_bytes).data());
-    std::vector<float> calib(n_head_kv + kv_stride + 4 * n_head_q);
+    const unsigned int nk = k_per_dim ? kv_stride : n_head_kv;
+    std::vector<float> calib(nk + kv_stride + 4 * n_head_q);
     const int err = nntr_hvx_attn_q2_step_fqc(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
       calib.data(), static_cast<int>(calib.size()), out_ion, q_len, stats, 12);
     if (err == AEE_SUCCESS) {
       const float *p = calib.data();
-      std::copy(p, p + n_head_kv, s_k);
-      p += n_head_kv;
+      std::copy(p, p + nk, s_k);
+      p += nk;
       std::copy(p, p + kv_stride, s_v);
       p += kv_stride;
       std::copy(p, p + enc_len, q_enc);

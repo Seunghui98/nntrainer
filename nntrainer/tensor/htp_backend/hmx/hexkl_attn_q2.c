@@ -243,14 +243,16 @@ static void q_dma_push(ctx *c, uint32_t i) {
 
 /** @brief [P7] 64 f32 of a staged row -> their u16 codes, quant_u16_f32's
  *         floats in q16_worker's operation order: x * inv + (zp + 0.5),
- *         clamped, truncated (Vw_equals_Vsf), the two halves packed. */
-static inline HVX_Vector q_f32_to_u16(const float *x, HVX_Vector vinv,
-                                      HVX_Vector vzp) {
+ *         clamped, truncated (Vw_equals_Vsf), the two halves packed.
+ *         @a ia, @a ib: inv for x[0, 32) and x[32, 64) (the same vector
+ *         unless K's scale is per dim). */
+static inline HVX_Vector q_f32_to_u16(const float *x, HVX_Vector ia,
+                                      HVX_Vector ib, HVX_Vector vzp) {
   const HVX_Vector vlo = Q6_V_vzero(), vhi = hvx_splat_sf(65535.0f);
   HVX_Vector a =
-    Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)x, vinv), vzp);
+    Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)x, ia), vzp);
   HVX_Vector b = Q6_Vsf_vadd_VsfVsf(
-    Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + 32u), vinv), vzp);
+    Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + 32u), ib), vzp);
   a = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(a, vlo), vhi);
   b = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(b, vlo), vhi);
   return Q6_Vuh_vpack_VwVw_sat(Q6_Vw_equals_Vsf(b), Q6_Vw_equals_Vsf(a));
@@ -274,6 +276,16 @@ static void stage_qprep(ctx *c, uint32_t i) {
   const HVX_Vector vinv = hvx_splat_sf(f32 ? c->io->q_inv[it->h] : 0.0f);
   const HVX_Vector vzp =
     hvx_splat_sf(f32 ? c->io->q_enc[2u * it->h + 1u] + 0.5f : 0.0f);
+  /* K per dim: the dims' fs_kd / fs_k folded into Q's inverse step, so the
+     scores stay s_q fs_k sum(q' k8) and alpha keeps fs_k (setup_head) */
+  HVX_Vector inv[HEXKL_KV_Q_MAX_HEAD_DIM / 32u];
+  const float *ratio = c->io->kv->fk_ratio + (size_t)(it->h / c->G) * c->hd;
+  for (uint32_t g = 0; g < c->hd / 32u; ++g) {
+    inv[g] =
+      c->io->kv->k_per_dim
+        ? Q6_Vsf_vmpy_VsfVsf(vinv, *(const HVX_UVector *)(ratio + 32u * g))
+        : vinv;
+  }
   uint8_t *qlo = q_tiles_lo(c, it->qslot);
   uint8_t *qhi = q_tiles_hi(c, it->qslot);
   for (uint32_t d = 0; d < c->dt; d += 2u) {
@@ -286,11 +298,11 @@ static void stage_qprep(ctx *c, uint32_t i) {
       HVX_Vector x[4];
       for (uint32_t k = 0; k < 4u; ++k) {
         const uint32_t rr = r + k;
-        x[k] =
-          rr >= it->n_rows ? pad
-          : f32
-            ? q_f32_to_u16(stage32 + (size_t)rr * c->hd + 32u * d, vinv, vzp)
-            : *(const HVX_UVector *)(stage + (size_t)rr * c->hd + 32u * d);
+        x[k] = rr >= it->n_rows ? pad
+               : f32
+                 ? q_f32_to_u16(stage32 + (size_t)rr * c->hd + 32u * d, inv[d],
+                                inv[d + (uint32_t)two], vzp)
+                 : *(const HVX_UVector *)(stage + (size_t)rr * c->hd + 32u * d);
       }
       /* Bytes: even (low) to lo_W, odd (high) to hi_W; row k then k+1. */
       const HVX_VectorPair b01 = Q6_W_vdeal_VVR(x[1], x[0], -1);
@@ -1167,6 +1179,9 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
   if (!kv->fixed || kv->kind != HEXKL_KV_Q8 || kv->head_dim != s->head_dim ||
       kv->n_head_kv != s->n_head_kv || s->cache_to > kv->max_rows) {
     return AEE_EBADPARM;
+  }
+  if (kv->k_per_dim && !io->q_f32) {
+    return AEE_EBADPARM; /* the fold needs Q before its u16 codes */
   }
   if (hexkl_attn_q2_check(s) != HEXKL_ATTN_OK) {
     return AEE_ENOMEMORY; /* as the plan answered it */

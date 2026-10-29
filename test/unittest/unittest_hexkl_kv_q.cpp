@@ -345,3 +345,89 @@ TEST(HexklKvQ, FixedScalesHeadDim512) {
   EXPECT_GT(clamped, 0u) << "the test data should exercise the clamp";
   EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
 }
+
+/**
+ * K per (head, dim) (NNTR_HTP_Q2_KDIM): the masters are rint(x / s_kd), the
+ * row-blocked kernel keeps fs_k = max_d s_kd in alpha and multiplies Q by
+ * fk_ratio = s_kd / fs_k, so fs_k sum(q r k8) must be sum(q s_kd k8). A
+ * later per-head call puts the cache back to ratio 1.
+ */
+TEST(HexklKvQ, FixedScalesKPerDim) {
+  hexkl_kv_q_table tbl{};
+  uint32_t h = 0;
+  const uint32_t n_kv = 2, hd = 256, rows = 70, width = n_kv * hd;
+  ASSERT_EQ(hexkl_kv_q_register(&tbl, HEXKL_KV_Q8, rows, n_kv, hd, &h), 0);
+  auto k = rows_hf(rows, width, 0x71u, 3.0f);
+  auto v = rows_hf(rows, width, 0x72u, 2.0f);
+  std::vector<float> s_k(width), s_v(width, 0.02f);
+  for (uint32_t i = 0; i < width; ++i)
+    s_k[i] = 0.004f + 0.0001f * static_cast<float>((i * 37u) % 251u);
+  std::vector<float> bad(s_k);
+  bad[hd + 3] = -1.0f;
+  EXPECT_NE(hexkl_kv_q_set_fixed_scales_kd(&tbl, h, bad.data(), s_v.data()), 0);
+  ASSERT_EQ(hexkl_kv_q_set_fixed_scales_kd(&tbl, h, s_k.data(), s_v.data()), 0);
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&tbl, h);
+  ASSERT_NE(kv, nullptr);
+  EXPECT_EQ(kv->k_per_dim, 1);
+  for (uint32_t n = 0; n < n_kv; ++n) {
+    const float top =
+      *std::max_element(s_k.begin() + n * hd, s_k.begin() + (n + 1) * hd);
+    EXPECT_EQ(kv->fs_k[n], top);
+    for (uint32_t d = 0; d < hd; ++d) {
+      EXPECT_EQ(kv->fs_kd[n * hd + d], s_k[n * hd + d]);
+      EXPECT_EQ(kv->fk_ratio[n * hd + d], s_k[n * hd + d] / top);
+      EXPECT_LE(kv->fk_ratio[n * hd + d], 1.0f);
+    }
+  }
+  ASSERT_EQ(
+    hexkl_kv_q_append(&tbl, h, 0, rows, k.data(), v.data(), nullptr, nullptr),
+    0);
+  std::vector<int8_t> kq(static_cast<size_t>(rows) * width), vq(kq.size());
+  std::vector<float> dsk(static_cast<size_t>(rows) * n_kv);
+  std::vector<int32_t> cs(dsk.size());
+  ASSERT_EQ(hexkl_kv_q_dump(kv, 0, rows, kq.data(), vq.data(), dsk.data(),
+                            cs.data(), nullptr),
+            0);
+  uint32_t lcg = 0x73u;
+  std::vector<float> q(hd);
+  double worst = 0.0;
+  for (uint32_t r = 0; r < rows; ++r) {
+    for (uint32_t n = 0; n < n_kv; ++n) {
+      int32_t sum = 0;
+      double ref = 0.0, fold = 0.0;
+      for (uint32_t d = 0; d < hd; ++d) {
+        const size_t at = static_cast<size_t>(r) * width + n * hd + d;
+        float wk =
+          std::rint(hexkl_kv_q_hf_to_f32(k[at]) * (1.0f / s_k[n * hd + d]));
+        wk = std::min(127.0f, std::max(-127.0f, wk));
+        ASSERT_EQ(kq[at], static_cast<int8_t>(wk))
+          << "k row " << r << " d " << d;
+        sum += kq[at];
+        lcg = lcg * 1664525u + 1013904223u;
+        q[d] = static_cast<float>(lcg >> 8) / 16777216.0f - 0.5f;
+        ref += static_cast<double>(q[d]) * s_k[n * hd + d] * kq[at];
+        fold += static_cast<double>(q[d] * kv->fk_ratio[n * hd + d]) * kq[at];
+      }
+      EXPECT_EQ(cs[r * n_kv + n], sum);
+      EXPECT_EQ(dsk[r * n_kv + n], kv->fs_k[n]);
+      fold *= kv->fs_k[n];
+      worst =
+        std::max(worst, std::fabs(fold - ref) / std::max(1e-6, std::fabs(ref)));
+    }
+  }
+  EXPECT_LT(worst, 1e-5) << "fs_k sum(q r k8) != sum(q s_kd k8)";
+
+  std::vector<float> s_head = {0.02f, 0.03f};
+  ASSERT_EQ(hexkl_kv_q_set_fixed_scales(&tbl, h, s_head.data(), s_v.data()), 0);
+  EXPECT_EQ(kv->k_per_dim, 0);
+  for (uint32_t i = 0; i < width; ++i) {
+    EXPECT_EQ(kv->fk_ratio[i], 1.0f);
+    EXPECT_EQ(kv->fs_kd[i], s_head[i / hd]);
+  }
+  EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
+
+  // int4 caches keep one K scale per head
+  ASSERT_EQ(hexkl_kv_q_register(&tbl, HEXKL_KV_Q4, rows, n_kv, hd, &h), 0);
+  EXPECT_NE(hexkl_kv_q_set_fixed_scales_kd(&tbl, h, s_k.data(), s_v.data()), 0);
+  EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
+}
