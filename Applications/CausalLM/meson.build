@@ -583,6 +583,7 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_assistant_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_htp.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_mha_core_dispatch.cpp',

@@ -1,0 +1,13 @@
+{
+  "model_type": "CausalLM",
+  "model_tensor_type": "FP32-FP32",
+  "model_file_name": "nntr_gemma4_assistant_fp32.bin",
+  "fc_layer_dtype": "FP32",
+  "embedding_dtype": "FP32",
+  "lmhead_dtype": "FP32",
+  "batch_size": 1,
+  "init_seq_len": 1,
+  "max_seq_len": 1,
+  "num_to_generate": 1,
+  "bad_word_ids": []
+}

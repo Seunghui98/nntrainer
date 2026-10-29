@@ -1,5 +1,6 @@
 gemma4_src = [
     meson.current_source_dir() / 'gemma4_causallm.cpp',
+    meson.current_source_dir() / 'gemma4_assistant_causallm.cpp',
     meson.current_source_dir() / 'gemma4_moe_causallm.cpp',
     meson.current_source_dir() / 'gemma4_htp_causallm.cpp',
     meson.current_source_dir() / 'gemma4_htp_moe_causallm.cpp',
@@ -33,7 +34,8 @@ causallm_inc += gemma4_inc
 causallm_layer_dependencies += [gemma4_moe_layer_dep]
 
 causallm_inc += include_directories('../lfm2_moe')
-causallm_src += files('../../layers/htp_mha_core.cpp',
+causallm_src += files('../../layers/assistant_attention.cpp',
+                      '../../layers/htp_mha_core.cpp',
                       '../../layers/htp_qkv_layer.cpp',
                       '../lfm2_moe/lfm2_moe_layer.cpp',
                       '../lfm2_moe/lfm2_htp_moe_causallm.cpp',
