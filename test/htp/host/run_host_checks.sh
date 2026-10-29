@@ -791,6 +791,18 @@ for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L 
   echo "ATTN M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL: gemma' "$OUT/attn_m1_mutant.log") Gemma lines failed)"
 done
 
+# The q2 attention's DSP calibration lanes (nntr_hvx_attn_q.c q2c_worker,
+# q2c_worker_kd), extracted from the source and run on hvx_emu against a
+# scalar reference, lane by lane, at Gemma 4's shapes and with fewer rows
+# than lanes (Q2C CALIB WORKERS OK).
+python3 "$HERE/q2c_workers_extract.py" "$HERE/../nntr_hvx_attn_q.c" \
+  "$OUT/q2c_workers.inc"
+"$cc" -std=gnu11 -O2 -fno-strict-aliasing -Wall -Wextra \
+  -Wno-unused-parameter -ffp-contract=off -include malloc.h \
+  -I "$OUT" -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." \
+  -I "$BACKEND/hvx" -o "$OUT/q2c_calib_check" "$HERE/q2c_calib_check.c" -lm
+"$OUT/q2c_calib_check"
+
 # weight_swap_u8i4_arena (doc 52 section 10.12): the real skel entry point
 # over the real weight registry, the arena plain aligned memory. The header
 # qaic would generate is written from the IDL, so the entry points'

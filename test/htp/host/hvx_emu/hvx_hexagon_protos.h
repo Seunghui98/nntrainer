@@ -648,6 +648,15 @@ static inline HVX_Vector Q6_Vuh_vmin_VuhVuh(HVX_Vector a, HVX_Vector b) {
   return r;
 }
 
+static inline HVX_Vector Q6_Vuh_vmax_VuhVuh(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    const uint16_t x = hvx_emu_h(&a, i), y = hvx_emu_h(&b, i);
+    hvx_emu_set_h(&r, i, x > y ? x : y);
+  }
+  return r;
+}
+
 static inline HVX_Vector Q6_Vh_vshuffe_VhVh(HVX_Vector u, HVX_Vector v) {
   HVX_Vector r;
   for (int k = 0; k < HVX_EMU_LANES; ++k) {

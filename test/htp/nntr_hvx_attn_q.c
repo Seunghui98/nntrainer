@@ -572,8 +572,8 @@ typedef struct {
   const float *q;
   uint32_t n_q, n_hq, q_stride;
   uint16_t *vmax;   /**< [lane][n_kv * hd] |V| max as fp16 bits */
-  uint16_t *kmax;   /**< [lane][n_kv * hd] |K| max, the same */
-  float *qlo, *qhi; /**< [lane][n_hq * hd] */
+  uint16_t *kmax;   /**< [lane][n_kv], [lane][n_kv * hd] for q2c_worker_kd */
+  float *qlo, *qhi; /**< [lane][n_hq], [lane][n_hq * hd] for q2c_worker_kd */
 } q2c_ctx;
 
 /** |x| of fp16 bits is the bits with the sign cleared, and for finite
@@ -584,6 +584,74 @@ static void q2c_worker(uint32_t n_threads, uint32_t i, void *v) {
   const q2c_ctx *c = (const q2c_ctx *)v;
   const HVX_Vector mask = Q6_Vh_vsplat_R(0x7fff);
   uint16_t *vmax = c->vmax + (size_t)i * c->n_kv * c->hd;
+  uint16_t *kmax = c->kmax + (size_t)i * c->n_kv;
+  float *qlo = c->qlo + (size_t)i * c->n_hq,
+        *qhi = c->qhi + (size_t)i * c->n_hq;
+  {
+    const uint32_t lo = (uint32_t)(((uint64_t)c->n_rows * i) / n_threads);
+    const uint32_t hi =
+      (uint32_t)(((uint64_t)c->n_rows * (i + 1u)) / n_threads);
+    const uint32_t nvec = c->hd / 64u;
+    memset(vmax, 0, (size_t)c->n_kv * c->hd * sizeof(uint16_t));
+    for (uint32_t n = 0; n < c->n_kv; ++n) {
+      HVX_Vector acc = Q6_V_vzero();
+      for (uint32_t r = lo; r < hi; ++r) {
+        const HVX_UVector *kr =
+          (const HVX_UVector *)(c->k + (size_t)r * c->stride + n * c->hd);
+        const HVX_UVector *vr =
+          (const HVX_UVector *)(c->v + (size_t)r * c->stride + n * c->hd);
+        HVX_UVector *vm = (HVX_UVector *)(vmax + n * c->hd);
+        for (uint32_t j = 0; j < nvec; ++j) {
+          acc = Q6_Vuh_vmax_VuhVuh(acc, Q6_V_vand_VV(kr[j], mask));
+          vm[j] = Q6_Vuh_vmax_VuhVuh(vm[j], Q6_V_vand_VV(vr[j], mask));
+        }
+      }
+      uint16_t lanes[64] __attribute__((aligned(128)));
+      *(HVX_Vector *)lanes = acc;
+      uint16_t m = 0;
+      for (uint32_t j = 0; j < 64u; ++j)
+        m = lanes[j] > m ? lanes[j] : m;
+      kmax[n] = m;
+    }
+  }
+  {
+    const uint32_t lo = (uint32_t)(((uint64_t)c->n_q * i) / n_threads);
+    const uint32_t hi = (uint32_t)(((uint64_t)c->n_q * (i + 1u)) / n_threads);
+    const uint32_t nvec = c->hd / 32u;
+    for (uint32_t h = 0; h < c->n_hq; ++h) {
+      HVX_Vector vlo = hvx_splat_sf(1e30f), vhi = hvx_splat_sf(-1e30f);
+      for (uint32_t r = lo; r < hi; ++r) {
+        const HVX_UVector *qr =
+          (const HVX_UVector *)(c->q + (size_t)r * c->q_stride + h * c->hd);
+        for (uint32_t j = 0; j < nvec; ++j) {
+          vlo = Q6_Vsf_vmin_VsfVsf(vlo, qr[j]);
+          vhi = Q6_Vsf_vmax_VsfVsf(vhi, qr[j]);
+        }
+      }
+      float l[32] __attribute__((aligned(128)));
+      float u[32] __attribute__((aligned(128)));
+      *(HVX_Vector *)l = vlo;
+      *(HVX_Vector *)u = vhi;
+      float flo = 1e30f, fhi = -1e30f;
+      for (uint32_t j = 0; j < 32u; ++j) {
+        flo = l[j] < flo ? l[j] : flo;
+        fhi = u[j] > fhi ? u[j] : fhi;
+      }
+      qlo[h] = flo;
+      qhi[h] = fhi;
+    }
+  }
+}
+
+/** q2c_worker with K's maxima and Q's extremes per dim (NNTR_HTP_Q2_KDIM):
+   one head's per-dim values stay in registers over the lane's rows and are
+   stored once, as q2c_worker keeps one register a head. K and V take
+   hd / 64 vectors each, Q's minimum and maximum 8 vectors each a block of
+   256 dims (hd 512 runs two blocks; every Q value is still read once). */
+static void q2c_worker_kd(uint32_t n_threads, uint32_t i, void *v) {
+  const q2c_ctx *c = (const q2c_ctx *)v;
+  const HVX_Vector mask = Q6_Vh_vsplat_R(0x7fff);
+  uint16_t *vmax = c->vmax + (size_t)i * c->n_kv * c->hd;
   uint16_t *kmax = c->kmax + (size_t)i * c->n_kv * c->hd;
   float *qlo = c->qlo + (size_t)i * c->n_hq * c->hd,
         *qhi = c->qhi + (size_t)i * c->n_hq * c->hd;
@@ -591,41 +659,53 @@ static void q2c_worker(uint32_t n_threads, uint32_t i, void *v) {
     const uint32_t lo = (uint32_t)(((uint64_t)c->n_rows * i) / n_threads);
     const uint32_t hi =
       (uint32_t)(((uint64_t)c->n_rows * (i + 1u)) / n_threads);
-    const uint32_t nvec = c->hd / 64u;
-    memset(vmax, 0, (size_t)c->n_kv * c->hd * sizeof(uint16_t));
-    memset(kmax, 0, (size_t)c->n_kv * c->hd * sizeof(uint16_t));
+    const uint32_t nvec = c->hd / 64u; /* <= 8 */
     for (uint32_t n = 0; n < c->n_kv; ++n) {
+      HVX_Vector ka[8], va[8];
+      for (uint32_t j = 0; j < nvec; ++j) {
+        ka[j] = Q6_V_vzero();
+        va[j] = Q6_V_vzero();
+      }
       for (uint32_t r = lo; r < hi; ++r) {
         const HVX_UVector *kr =
           (const HVX_UVector *)(c->k + (size_t)r * c->stride + n * c->hd);
         const HVX_UVector *vr =
           (const HVX_UVector *)(c->v + (size_t)r * c->stride + n * c->hd);
-        HVX_UVector *km = (HVX_UVector *)(kmax + n * c->hd);
-        HVX_UVector *vm = (HVX_UVector *)(vmax + n * c->hd);
         for (uint32_t j = 0; j < nvec; ++j) {
-          km[j] = Q6_Vuh_vmax_VuhVuh(km[j], Q6_V_vand_VV(kr[j], mask));
-          vm[j] = Q6_Vuh_vmax_VuhVuh(vm[j], Q6_V_vand_VV(vr[j], mask));
+          ka[j] = Q6_Vuh_vmax_VuhVuh(ka[j], Q6_V_vand_VV(kr[j], mask));
+          va[j] = Q6_Vuh_vmax_VuhVuh(va[j], Q6_V_vand_VV(vr[j], mask));
         }
+      }
+      for (uint32_t j = 0; j < nvec; ++j) {
+        ((HVX_UVector *)(kmax + n * c->hd))[j] = ka[j];
+        ((HVX_UVector *)(vmax + n * c->hd))[j] = va[j];
       }
     }
   }
   {
     const uint32_t lo = (uint32_t)(((uint64_t)c->n_q * i) / n_threads);
     const uint32_t hi = (uint32_t)(((uint64_t)c->n_q * (i + 1u)) / n_threads);
-    const uint32_t nvec = c->hd / 32u;
-    for (uint32_t e = 0; e < c->n_hq * c->hd; ++e) {
-      qlo[e] = 1e30f;
-      qhi[e] = -1e30f;
-    }
+    const uint32_t nvec = c->hd / 32u; /* <= 16 */
     for (uint32_t h = 0; h < c->n_hq; ++h) {
-      HVX_UVector *ql = (HVX_UVector *)(qlo + h * c->hd);
-      HVX_UVector *qh = (HVX_UVector *)(qhi + h * c->hd);
-      for (uint32_t r = lo; r < hi; ++r) {
-        const HVX_UVector *qr =
-          (const HVX_UVector *)(c->q + (size_t)r * c->q_stride + h * c->hd);
-        for (uint32_t j = 0; j < nvec; ++j) {
-          ql[j] = Q6_Vsf_vmin_VsfVsf(ql[j], qr[j]);
-          qh[j] = Q6_Vsf_vmax_VsfVsf(qh[j], qr[j]);
+      for (uint32_t b = 0; b < nvec; b += 8u) {
+        const uint32_t nb = nvec - b < 8u ? nvec - b : 8u;
+        HVX_Vector l[8], u[8];
+        for (uint32_t j = 0; j < nb; ++j) {
+          l[j] = hvx_splat_sf(1e30f);
+          u[j] = hvx_splat_sf(-1e30f);
+        }
+        for (uint32_t r = lo; r < hi; ++r) {
+          const HVX_UVector *qr =
+            (const HVX_UVector *)(c->q + (size_t)r * c->q_stride + h * c->hd) +
+            b;
+          for (uint32_t j = 0; j < nb; ++j) {
+            l[j] = Q6_Vsf_vmin_VsfVsf(l[j], qr[j]);
+            u[j] = Q6_Vsf_vmax_VsfVsf(u[j], qr[j]);
+          }
+        }
+        for (uint32_t j = 0; j < nb; ++j) {
+          ((HVX_UVector *)(qlo + h * c->hd))[b + j] = l[j];
+          ((HVX_UVector *)(qhi + h * c->hd))[b + j] = u[j];
         }
       }
     }
@@ -673,7 +753,8 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
     FARF(ERROR, "attn_q2_step_fqc: bad calib length");
     return AEE_EBADPARM;
   }
-  const uint32_t nk = kd ? stride : n_kv;
+  const uint32_t nk = kd ? stride : n_kv; /* K scales, Q extremes a lane */
+  const uint32_t nq = kd ? n_head_q * hd : n_head_q;
   const uint32_t n_rows = (uint32_t)k_rowsLen / stride;
   const uint32_t lanes = hvx_worker_pool_workers(s->quant_pool) + 1u;
   if (lanes > Q2C_MAX_LANES || (uint32_t)k_rowsLen != n_rows * stride) {
@@ -682,10 +763,8 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
   const uint64_t tc0 = HAP_perf_get_time_us();
   uint16_t *vmax =
     (uint16_t *)malloc((size_t)lanes * stride * sizeof(uint16_t));
-  uint16_t *kmax =
-    (uint16_t *)malloc((size_t)lanes * stride * sizeof(uint16_t));
-  float *qlo =
-    (float *)malloc((size_t)lanes * n_head_q * hd * sizeof(float) * 2u);
+  uint16_t *kmax = (uint16_t *)malloc((size_t)lanes * nk * sizeof(uint16_t));
+  float *qlo = (float *)malloc((size_t)lanes * nq * sizeof(float) * 2u);
   float *s_k = calib, *s_v = calib + nk;
   float *q_enc = s_v + stride, *out_enc = q_enc + 2u * n_head_q;
   float q_inv[64];
@@ -701,53 +780,59 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
                q_f32,    n_q,
                n_head_q, n_head_q * hd,
                vmax,     kmax,
-               qlo,      qlo + (size_t)lanes * n_head_q * hd};
+               qlo,      qlo + (size_t)lanes * nq};
   const uint32_t units = n_rows > n_q ? n_rows : n_q;
-  hvx_worker_pool_run(s->quant_pool, q2c_worker, &c, units);
+  hvx_worker_pool_run(s->quant_pool, kd ? q2c_worker_kd : q2c_worker, &c,
+                      units);
   /* the lanes that ran: min(units, lanes), the rest never wrote theirs */
   const uint32_t ran = units < lanes ? (units ? units : 1u) : lanes;
   /** the lanes merged, the maxima to f32 (exact), the scales as
      mha_core::calibrate_q2_scales derives them, in its order of operations */
-  if (!kd) {
-    for (uint32_t n = 0; n < n_kv; ++n)
-      s_k[n] = 0.0f;
+  for (uint32_t n = 0; n < nk; ++n) {
+    uint16_t m = 0;
+    for (uint32_t l = 0; l < ran; ++l)
+      m = kmax[(size_t)l * nk + n] > m ? kmax[(size_t)l * nk + n] : m;
+    s_k[n] = hexkl_kv_q_hf_to_f32(m);
   }
   for (uint32_t e = 0; e < stride; ++e) {
-    uint16_t m = 0, mk = 0;
-    for (uint32_t l = 0; l < ran; ++l) {
+    uint16_t m = 0;
+    for (uint32_t l = 0; l < ran; ++l)
       m = vmax[(size_t)l * stride + e] > m ? vmax[(size_t)l * stride + e] : m;
-      mk =
-        kmax[(size_t)l * stride + e] > mk ? kmax[(size_t)l * stride + e] : mk;
-    }
     s_v[e] = hexkl_kv_q_hf_to_f32(m);
-    const float k = hexkl_kv_q_hf_to_f32(mk);
-    if (kd) {
-      s_k[e] = k;
-    } else if (k > s_k[e / hd]) {
-      s_k[e / hd] = k;
-    }
   }
-  for (uint32_t e = 0; e < nk; ++e)
-    s_k[e] = s_k[e] > 0.0f ? s_k[e] / 127.0f : 1.0f;
   /* per dim: Q's range is that of q * fs_kd / fs_k, the Q the kernel
-     quantizes (stage_qprep); min (q r) = r min (q) for r > 0, exactly */
+     quantizes (stage_qprep); min (q r) = r min (q) for r > 0, exactly.
+     ponytail: a scalar merge of lanes x n_hq x hd under kd; an HVX vmin
+     across lanes is the upgrade if the trace's calib= shows it. */
   float ratio[HEXKL_KV_Q_MAX_HEAD_DIM];
+  if (kd)
+    for (uint32_t e = 0; e < nk; ++e)
+      s_k[e] = s_k[e] > 0.0f ? s_k[e] / 127.0f : 1.0f;
   const uint32_t G = n_head_q / n_kv;
   for (uint32_t h = 0; h < n_head_q; ++h) {
-    const float *sk = s_k + (size_t)(h / G) * hd;
-    float top = 0.0f;
-    for (uint32_t d = 0; kd && d < hd; ++d)
-      top = sk[d] > top ? sk[d] : top;
-    for (uint32_t d = 0; d < hd; ++d)
-      ratio[d] = kd ? sk[d] / top : 1.0f;
     float lo = 1e30f, hi = -1e30f;
-    for (uint32_t l = 0; l < ran; ++l) {
-      for (uint32_t d = 0; d < hd; ++d) {
-        const size_t at = ((size_t)l * n_head_q + h) * hd + d;
-        const float a = kd ? c.qlo[at] * ratio[d] : c.qlo[at];
-        const float b = kd ? c.qhi[at] * ratio[d] : c.qhi[at];
+    if (!kd) {
+      for (uint32_t l = 0; l < ran; ++l) {
+        const float a = c.qlo[(size_t)l * n_head_q + h];
+        const float b = c.qhi[(size_t)l * n_head_q + h];
         lo = a < lo ? a : lo;
         hi = b > hi ? b : hi;
+      }
+    } else {
+      const float *sk = s_k + (size_t)(h / G) * hd;
+      float top = 0.0f;
+      for (uint32_t d = 0; d < hd; ++d)
+        top = sk[d] > top ? sk[d] : top;
+      for (uint32_t d = 0; d < hd; ++d)
+        ratio[d] = sk[d] / top;
+      for (uint32_t l = 0; l < ran; ++l) {
+        for (uint32_t d = 0; d < hd; ++d) {
+          const size_t at = ((size_t)l * n_head_q + h) * hd + d;
+          const float a = c.qlo[at] * ratio[d];
+          const float b = c.qhi[at] * ratio[d];
+          lo = a < lo ? a : lo;
+          hi = b > hi ? b : hi;
+        }
       }
     }
     const float range = (hi - lo) > 1e-6f ? (hi - lo) : 1e-6f;
@@ -763,6 +848,9 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
     out_enc[2u * h + 1u] = 32768.0f;
     q_inv[h] = 1.0f / q_enc[2u * h];
   }
+  if (!kd)
+    for (uint32_t n = 0; n < n_kv; ++n)
+      s_k[n] = s_k[n] > 0.0f ? s_k[n] / 127.0f : 1.0f;
   for (uint32_t e = 0; e < stride; ++e)
     s_v[e] = s_v[e] > 0.0f ? s_v[e] / 127.0f : 1.0f;
   free(vmax);
