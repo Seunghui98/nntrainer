@@ -80,6 +80,7 @@
 #include "embedding_gemma.h"
 #include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
+#include "gemma4_assistant_causallm.h"
 #include "gemma4_causallm.h"
 #include "gemma4_moe_causallm.h"
 #if !defined(_WIN32)
@@ -395,6 +396,12 @@ void registerAllModels() {
         std::make_unique<causallm::Gemma4CausalLM>(cfg, generation_cfg,
                                                    nntr_cfg));
     });
+  factory.registerModel(
+    "Gemma4AssistantForCausalLM",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Gemma4AssistantCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
   factory.registerModel("EmbeddingGemma",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::EmbeddingGemma>(
@@ -515,6 +522,11 @@ void printUsage(const char *prog) {
     << " /path/to/gemma4 --fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype "
        "QS4CX\n"
     << "\n"
+    << "  # Gemma4 assistant drafter for the CPU (int4 per-channel FC, Q4_0 "
+       "head):\n"
+    << "  " << prog
+    << " /path/to/gemma4-assistant --fc_dtype QS4CX --lmhead_dtype Q4_0\n"
+    << "\n"
     << "  # Quantize FC layers to Q4_0 and embedding to Q6_K:\n"
     << "  " << prog << " /path/to/qwen3-4b --fc_dtype Q4_0 --embd_dtype Q6_K\n"
     << "\n"
@@ -575,6 +587,9 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
   }
   // Gemma4 PLE projection is a plain FC layer -> fc_dtype.
   dtype_map["per_layer_input_projection"] = fc_dtype;
+  // Gemma4 assistant (MTP drafter) projections from and to the target width.
+  dtype_map["pre_projection"] = fc_dtype;
+  dtype_map["post_projection"] = fc_dtype;
 
   // Transformer decoder layers
   for (int i = 0; i < num_layers; ++i) {

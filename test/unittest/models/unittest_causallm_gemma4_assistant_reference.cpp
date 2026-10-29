@@ -5,13 +5,14 @@
  * @file   unittest_causallm_gemma4_assistant_reference.cpp
  * @date   29 Oct 2026
  * @brief  Gemma 4 assistant (MTP drafter) against transformers: two chained
- *         drafting steps over shared target K/V.
+ *         drafting steps over shared target K/V, in FP32 and after
+ *         nntr_quantize's CPU recipe (QS4CX FC, Q4_0 head).
  * @see    https://github.com/nntrainer/nntrainer
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  * Fixture: generators/generate_gemma4_assistant_reference.py. The test skips
- * when it is absent.
+ * when it is absent; the quantized case also when NNTR_QUANTIZE_BIN is unset.
  */
 
 #include <causallm_test_utils.h>
@@ -20,6 +21,7 @@
 
 #include <gemma4_assistant_causallm.h>
 
+#include <cstdlib>
 #include <filesystem>
 
 namespace {
@@ -75,4 +77,24 @@ void runSteps(const fs::path &dir, float atol, float cosine_min) {
 TEST(Gemma4AssistantTest, FP32MatchesHFReference) {
   runSteps(causallm_test::findFixtureDir("gemma4_assistant_tiny"), 1e-4f,
            0.9999f);
+}
+
+/**
+ * @brief nntr_quantize's CPU drafter recipe stays close to the reference
+ */
+TEST(Gemma4AssistantTest, QS4CXFcQ40HeadCloseToHFReference) {
+  const char *bin = std::getenv("NNTR_QUANTIZE_BIN");
+  if (bin == nullptr)
+    GTEST_SKIP() << "NNTR_QUANTIZE_BIN not set";
+  const fs::path src = causallm_test::findFixtureDir("gemma4_assistant_tiny");
+  const fs::path out = fs::temp_directory_path() / "gemma4_assistant_qs4cx";
+  fs::remove_all(out);
+  const std::string cmd = std::string(bin) + " " + src.string() + " -o " +
+                          out.string() +
+                          " --fc_dtype QS4CX --lmhead_dtype Q4_0 2>&1";
+  ASSERT_EQ(std::system(cmd.c_str()), 0) << cmd;
+  // int4 noise on a 32-wide random model: the drafted ids must hold, the
+  // values only roughly
+  runSteps(out, 1.0f, 0.98f);
+  fs::remove_all(out);
 }
