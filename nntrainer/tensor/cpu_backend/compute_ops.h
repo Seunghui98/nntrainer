@@ -1041,6 +1041,18 @@ public:
     (void)grow;
   }
 
+  // NNTR_MOE_WARM: the decode pool's warm-up after a prefill. begin makes
+  // room in the layer's pool and returns the experts to read (none: no
+  // warm-up); the backend reads them while the first token's setup runs
+  // and hands the keys it registered to end, before the first token.
+  // Ignored by a backend without the pool.
+  virtual void set_decode_pool_warm(
+    const std::function<std::vector<ExpertFileDesc>()> &begin,
+    const std::function<void(const std::vector<const void *> &)> &end) {
+    (void)begin;
+    (void)end;
+  }
+
   // Undoes the above for one expert: both handles released, the slot back
   // in the pool for the next register_qs4cx_wh_expert_file. False when the
   // key is not resident.

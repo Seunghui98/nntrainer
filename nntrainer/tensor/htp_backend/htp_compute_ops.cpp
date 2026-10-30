@@ -1354,6 +1354,7 @@ public:
   /** Start an independent prompt; the caller has joined its generation. */
   void beginPrompt() {
     htp_router_handoff_invalidate(&router_handoff_);
+    warmEnd(); // a generation stopped before its first token
     if (cpu_predictor_)
       cpu_predictor_->drain();
     if (pool_prefetch_)
@@ -3818,6 +3819,44 @@ public:
     pool_grow_ = grow;
   }
 
+  void set_decode_pool_warm(
+    const std::function<std::vector<ExpertFileDesc>()> &begin,
+    const std::function<void(const std::vector<const void *> &)> &end)
+    override {
+    warm_begin_ = begin;
+    warm_end_ = end;
+  }
+
+  /** NNTR_MOE_WARM: after a prefill (pool_dirty_), the layer's warm list
+   *  is queued to the prefetch readers here, at the first decode row's
+   *  graph init, and registered at poolSync: the reads run under the
+   *  graph init and the seed instead of as the first token's misses. */
+  void warmBegin() {
+    if (!warm_begin_ || warm_pending_ || !pool_dirty_ || !e2e_)
+      return;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const std::vector<ExpertFileDesc> want = warm_begin_();
+    if (want.empty())
+      return;
+    warm_pending_ = prefetch_qs4cx_wh_experts_begin(want);
+    if (!warm_pending_)
+      warm_end_({});
+    std::fprintf(stderr, "[HTP] t1: warm queued=%zu queue_ms=%.1f\n",
+                 warm_pending_ ? want.size() : size_t(0),
+                 (HtpProfile::nowUs() - t0) / 1000.0);
+  }
+
+  void warmEnd() {
+    if (!warm_pending_)
+      return;
+    const uint64_t t0 = HtpProfile::nowUs();
+    warm_pending_ = false;
+    const std::vector<const void *> keys = prefetch_qs4cx_wh_experts_end();
+    warm_end_(keys);
+    std::fprintf(stderr, "[HTP] t1: warm registered=%zu wait_ms=%.1f\n",
+                 keys.size(), (HtpProfile::nowUs() - t0) / 1000.0);
+  }
+
   /** [#4416 mem] NNTR_MOE_CACHE_GROW=<n>: once the first token is done
    *  (the prefill's staging released, its quantized KV caches freed), the
    *  pool takes n more experts a layer; the slots are placed as the
@@ -3950,6 +3989,7 @@ public:
     if (!pool_dirty_)
       return;
     const uint64_t t_ps = HtpProfile::nowUs(); // [#282 F]
+    warmEnd(); // before switchTl2Phase drains the queue without the LRU
     switchTl2Phase(true);
     initPoolPrefetch();
     pinExperts();
@@ -4627,6 +4667,7 @@ public:
   }
 
   void ensureGraphInit(remote_handle64 session) {
+    warmBegin();
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (graph_inited_) {
       ensureAttentionCaches(session);
@@ -11241,6 +11282,10 @@ private:
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
   std::function<void(size_t)> pool_grow_; /**< [#4416] set_decode_pool_grow */
+  /** NNTR_MOE_WARM: set_decode_pool_warm's pair, and a queued batch */
+  std::function<std::vector<ExpertFileDesc>()> warm_begin_;
+  std::function<void(const std::vector<const void *> &)> warm_end_;
+  bool warm_pending_ = false;
   std::vector<uint8_t> pool_answered_;    /**< [#289] layers a miss round served
                                              this token (handle_mutex_) */
   bool pool_dirty_ = true;

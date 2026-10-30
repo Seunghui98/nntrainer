@@ -46,6 +46,32 @@ TEST(ExpertPreload, RejectsMalformedBudget_n) {
     EXPECT_THROW(causallm::expertPreloadLimit(480, bad), std::invalid_argument);
 }
 
+TEST(ExpertWarm, ListIsTheLastTokensRankThenTheMostRoutedRows_p) {
+  // two tokens of three ranked ids; the last token's 5, 2, 7 lead in rank
+  // order, then the rest by rows (3 before 0 before 1, 4 on a tie with 1
+  // goes after it: the lower id first), never an unrouted expert (6)
+  const std::vector<int> ranked = {0, 1, 3, 5, 2, 7};
+  const std::vector<size_t> rows = {4, 2, 1, 9, 2, 1, 0, 1};
+  EXPECT_EQ(causallm::warmList(ranked, 3, rows, 8),
+            (std::vector<unsigned>{5, 2, 7, 3, 0, 1, 4}));
+  EXPECT_EQ(causallm::warmList(ranked, 3, rows, 2),
+            (std::vector<unsigned>{5, 2}));
+  EXPECT_EQ(causallm::warmList(ranked, 3, rows, 4),
+            (std::vector<unsigned>{5, 2, 7, 3}));
+  // a repeated or out-of-range id in the rank list is skipped
+  EXPECT_EQ(causallm::warmList({9, 2, 2}, 3, rows, 3),
+            (std::vector<unsigned>{2, 3, 0}));
+  EXPECT_TRUE(causallm::warmList(ranked, 3, rows, 0).empty());
+}
+
+TEST(ExpertWarm, PerLayerSwitch_n) {
+  EXPECT_EQ(causallm::expertWarmPerLayer(nullptr), 0u);
+  EXPECT_EQ(causallm::expertWarmPerLayer(""), 0u);
+  EXPECT_EQ(causallm::expertWarmPerLayer("8"), 8u);
+  for (const char *bad : {"-1", "x", "8x", "99999"})
+    EXPECT_THROW(causallm::expertWarmPerLayer(bad), std::invalid_argument);
+}
+
 /** Keys are opaque addresses; these are as good as any. */
 static const char kExperts[64] = {};
 static ExpertLru::Key key(int e) { return &kExperts[e]; }
@@ -239,8 +265,7 @@ TEST(ExpertLru, HeldSlotsAreNotHandedOutUntilUnheld) {
     std::logic_error);
   // The reads land: unhold, then file them with no eviction.
   lru.unhold(2);
-  lru.acquire(
-    {key(8), key(9)}, [](ExpertLru::Key) {}, r.evict);
+  lru.acquire({key(8), key(9)}, [](ExpertLru::Key) {}, r.evict);
   EXPECT_EQ(r.evicted.size(), 2u);
   EXPECT_EQ(lru.size(), 6u);
 }
@@ -289,6 +314,39 @@ TEST(ExpertLru, LrfuForgetsOldUsesWithAShortHalfLife) {
     lru.acquire({key(e)}, r.load, r.evict);
   lru.acquire({key(2)}, r.load, r.evict);
   EXPECT_EQ(r.evicted, std::vector<int>{0});
+}
+
+TEST(ExpertLru, WarmUpReplacesThePrefillTailWithoutGrowingThePool) {
+  // The NNTR_MOE_WARM sequence (lfm2_moe_pool_layer.cpp): a pool of 6 the
+  // prefill left with 0..5, a warm list 4, 7, 8 (4 resident, pinned).
+  // makeRoom frees two of the oldest, the held slots keep a decode miss
+  // off them while the reads run, and acquire files the registered keys
+  // with nothing loaded or evicted.
+  ExpertLru lru;
+  int layer;
+  lru.addLayer(&layer, 6);
+  Recorder r;
+  lru.acquire({key(0), key(1), key(2), key(3), key(4), key(5)}, r.load,
+              r.evict);
+  r.loaded.clear();
+  const std::vector<ExpertLru::Key> pinned = {key(4)};
+  ASSERT_EQ(lru.room(pinned), 5u);
+  ASSERT_TRUE(lru.makeRoom(2, pinned, r.evict));
+  EXPECT_EQ(r.evicted, (std::vector<int>{0, 1}));
+  lru.hold(2);
+  EXPECT_THROW(
+    lru.acquire({key(10), key(11), key(12), key(13), key(14)}, r.load, r.evict),
+    std::logic_error);
+  lru.unhold(2);
+  r.evicted.clear();
+  lru.acquire(
+    {key(7), key(8)}, [](ExpertLru::Key) {},
+    [](ExpertLru::Key) { FAIL() << "the warm-up evicted"; });
+  EXPECT_TRUE(r.evicted.empty());
+  EXPECT_EQ(lru.size(), 6u);
+  EXPECT_EQ(lru.capacity(), 6u);
+  EXPECT_TRUE(lru.resident(key(7)) && lru.resident(key(8)) &&
+              lru.resident(key(4)));
 }
 
 } // namespace
