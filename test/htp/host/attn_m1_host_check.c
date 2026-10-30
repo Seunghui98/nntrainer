@@ -1710,6 +1710,104 @@ static void check_seed_q8_kd(hvx_worker_pool *pool) {
   }
 }
 
+/** seed_q8_tiles (the vector transpose with a window shift) against
+ *  seed_q8 (the scalar scatter) given the shifted masters: the whole layer
+ *  -- Kt tiles, V rows, the zeros past n_rows -- and the scales bit for
+ *  bit, at Gemma 4's sliding (8 x 256, a masters cache taller than the
+ *  decode one, shifted) and full (2 x 512) heads, a partial last tile, one
+ *  row, and every pool. A head_dim the tiles do not take is refused. */
+static void check_seed_q8_tiles(hvx_worker_pool *const *pools) {
+  static const uint32_t CASES[][5] = {
+    /* n_kv, hd, decode max_seq, masters rows, shift */
+    {8u, 256u, 1152u, 2048u, 66u},
+    {2u, 512u, 512u, 512u, 0u},
+    {1u, 128u, 128u, 192u, 63u},
+  };
+  int bad = 0;
+  for (size_t c = 0; c < sizeof(CASES) / sizeof(CASES[0]); ++c) {
+    const uint32_t n_kv = CASES[c][0], hd = CASES[c][1], max_seq = CASES[c][2];
+    const uint32_t src_rows = CASES[c][3], shift = CASES[c][4];
+    const size_t hs = (size_t)src_rows * hd, n = (size_t)n_kv * hd;
+    uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+            *v8 = (uint8_t *)malloc(n_kv * hs);
+    float *sc = (float *)malloc(4u * n * sizeof(float));
+    for (size_t i = 0; i < n_kv * hs; ++i) {
+      k8[i] = (uint8_t)(i * 2654435761u >> 13);
+      v8[i] = (uint8_t)(i * 40503u >> 7);
+    }
+    for (size_t i = 0; i < 4u * n; ++i)
+      sc[i] = 0.001f * (float)(1u + i % 977u);
+    const uint32_t lens[3] = {max_seq - 64u - 13u, 1u, max_seq};
+    for (int li = 0; li < 3; ++li) {
+      const uint32_t L =
+        lens[li] + shift > src_rows ? src_rows - shift : lens[li];
+      for (int pi = 0; pi < 3; ++pi) {
+        int err = 0;
+        hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+          1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY,
+          pools[pi], &err);
+        hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+          1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY,
+          pools[pi], &err);
+        CHECK(a && b, "seed_q8_tiles: create");
+        if (!a || !b) {
+          hvx_attn_m1_free(a);
+          hvx_attn_m1_free(b);
+          continue;
+        }
+        CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, L, k8, v8, hs, shift, sc, sc + n,
+                                        sc + 2u * n,
+                                        sc + 3u * n) == AEE_SUCCESS,
+              "seed_q8_tiles: seed");
+        CHECK(hvx_attn_m1_seed_q8(
+                b, 0u, L, k8 + (size_t)shift * hd, v8 + (size_t)shift * hd, hs,
+                hd, sc, sc + n, sc + 2u * n, sc + 3u * n, NULL) == AEE_SUCCESS,
+              "seed_q8_tiles: seed_q8 reference");
+        int cb = a->kv_len[0] != b->kv_len[0] ||
+                 memcmp(a->kt[0], b->kt[0], a->layer_bytes) != 0 ||
+                 memcmp(a->v[0], b->v[0], a->layer_bytes) != 0;
+        for (size_t e = 0; e < n; ++e)
+          cb += a->sk[e] != b->sk[e] || a->sk_inv[e] != b->sk_inv[e] ||
+                a->sv[e] != b->sv[e] || a->sv_inv[e] != b->sv_inv[e];
+        CHECK(cb == 0,
+              "seed_q8_tiles n_kv=%u hd=%u seq=%u rows=%u shift=%u L=%u "
+              "pool %d: differs from seed_q8",
+              n_kv, hd, max_seq, src_rows, shift, L, pi);
+        bad += cb;
+        hvx_attn_m1_free(a);
+        hvx_attn_m1_free(b);
+      }
+    }
+    free(k8);
+    free(v8);
+    free(sc);
+  }
+  {
+    int err = 0;
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      1u, 1u, 2u, 64u, 128u | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[0],
+      &err);
+    static uint8_t m[128 * 128];
+    float s1[128];
+    for (int i = 0; i < 128; ++i)
+      s1[i] = 1.0f;
+    CHECK(a && hvx_attn_m1_seed_q8_tiles(a, 0u, 4u, m, m, sizeof(m), 0u, s1, s1,
+                                         s1, s1) == AEE_EINVALIDFORMAT,
+          "seed_q8_tiles: head_dim 64 refused");
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      1u, 1u, 2u, 128u, 128u | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[0],
+      &err);
+    CHECK(b && hvx_attn_m1_seed_q8_tiles(b, 0u, 4u, m, m, 4u * 128u, 1u, s1, s1,
+                                         s1, s1) == AEE_EINVALIDFORMAT,
+          "seed_q8_tiles: rows past the masters refused");
+    hvx_attn_m1_free(b);
+    hvx_attn_m1_free(a);
+  }
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED Q8 TILES OK\n");
+  }
+}
+
 /** [#4428 window] A windowed host cache seeds only its window, so the int8
  *  scales (the seed rows' amax) would differ from a full cache's and so
  *  would every token after: with the dropped rows' |max| as the floor the
@@ -2120,6 +2218,7 @@ int main(void) {
   check_gemma_q8(pools);
   check_seed_q8(pools[2]);
   check_seed_q8_kd(pools[2]);
+  check_seed_q8_tiles(pools);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);

@@ -270,9 +270,10 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   free(ctx);
 }
 
-/** @brief [#289] A lazy layer's kt / v, allocated and zeroed on first use;
- *  a no-op for an allocated one. */
-static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
+/** @brief [#289] A lazy layer's kt / v, allocated and zeroed on first use
+ *  (not zeroed with @a fill 0: the caller writes every byte); a no-op for
+ *  an allocated one. */
+static int layer_alloc_fill(hvx_attn_m1_ctx *ctx, uint32_t l, int fill) {
   if (ctx->kt[l] && ctx->v[l]) {
     return AEE_SUCCESS;
   }
@@ -285,9 +286,15 @@ static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
     ctx->v[l] = NULL;
     return AEE_ENOMEMORY;
   }
-  memset(ctx->kt[l], 0, ctx->layer_bytes);
-  memset(ctx->v[l], 0, ctx->layer_bytes);
+  if (fill) {
+    memset(ctx->kt[l], 0, ctx->layer_bytes);
+    memset(ctx->v[l], 0, ctx->layer_bytes);
+  }
   return AEE_SUCCESS;
+}
+
+static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  return layer_alloc_fill(ctx, l, 1);
 }
 
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
@@ -784,6 +791,118 @@ int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
     head_stride, row_stride,
     k_rows};
   hvx_worker_pool_run(ctx->pool, run_seed_q8, &job, job.units);
+  ctx->kv_len[layer] = n_rows;
+  return AEE_SUCCESS;
+}
+
+/** seed_q8_tiles over the pool: units are (kv head, 64-position tile) */
+typedef struct {
+  hvx_attn_m1_ctx *ctx;
+  uint32_t layer, n_rows, shift, units;
+  const uint8_t *k8, *v8;
+  size_t head_stride;
+} tile_seed_job;
+
+/**
+ * One tile of K: the masters' 64 positions x 128 dims (a vector a
+ * position) to Kt's 128 dims x 64 positions (a vector two dims). A byte's
+ * place is (vector, offset) = (position p, dim d) before and (d / 2,
+ * (d % 2) 64 + p) after: each vshuff byte zip of the vectors that differ in
+ * one bit of p moves that bit into the offset's lowest bit and the
+ * offset's highest bit into the vector index, so six zips over the
+ * position bits 5, 4, ..., 0 leave d's bits 6..1 in the vector index, d0
+ * on top of the offset and p below it.
+ */
+static inline void kt_tile_128(int8_t *dst, const uint8_t *src, uint32_t hd,
+                               uint32_t n) {
+  const HVX_Vector x80 = Q6_V_vsplat_R(0x80808080);
+  HVX_Vector v[TILE];
+  for (uint32_t p = 0; p < TILE; ++p) {
+    v[p] = p < n
+             ? Q6_V_vxor_VV(*(const HVX_UVector *)(src + (size_t)p * hd), x80)
+             : Q6_V_vzero();
+  }
+  for (uint32_t b = TILE / 2u; b >= 1u; b >>= 1) {
+    for (uint32_t p = 0; p < TILE; ++p) {
+      if (p & b) {
+        continue;
+      }
+      const HVX_VectorPair w = Q6_W_vshuff_VVR(v[p + b], v[p], -1);
+      v[p] = Q6_V_lo_W(w);
+      v[p + b] = Q6_V_hi_W(w);
+    }
+  }
+  for (uint32_t k = 0; k < TILE; ++k) {
+    *(HVX_Vector *)(dst + (size_t)k * 2u * TILE) = v[k];
+  }
+}
+
+static void run_seed_q8_tiles(uint32_t n, uint32_t i, void *arg) {
+  const tile_seed_job *job = (const tile_seed_job *)arg;
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const uint32_t hd = ctx->head_dim;
+  const HVX_Vector x80 = Q6_V_vsplat_R(0x80808080);
+  for (uint32_t u = i; u < job->units; u += n) {
+    const uint32_t h = u % ctx->n_kv, t = u / ctx->n_kv;
+    const uint32_t p0 = t * TILE;
+    const uint32_t np = job->n_rows - p0 < TILE ? job->n_rows - p0 : TILE;
+    const uint8_t *ks =
+      job->k8 + h * job->head_stride + (size_t)(job->shift + p0) * hd;
+    const uint8_t *vs =
+      job->v8 + h * job->head_stride + (size_t)(job->shift + p0) * hd;
+    int8_t *kt = kt8_head(ctx, job->layer, h) + (size_t)t * hd * TILE;
+    for (uint32_t m = 0; m < hd / VLEN; ++m) {
+      kt_tile_128(kt + (size_t)m * VLEN * TILE, ks + (size_t)m * VLEN, hd, np);
+    }
+    int8_t *vr = v8_head(ctx, job->layer, h) + (size_t)p0 * hd;
+    for (uint32_t p = 0; p < TILE; ++p) {
+      HVX_Vector *d = (HVX_Vector *)(vr + (size_t)p * hd);
+      const HVX_UVector *src = (const HVX_UVector *)(vs + (size_t)p * hd);
+      for (uint32_t m = 0; m < hd / VLEN; ++m) {
+        d[m] = p < np ? Q6_V_vxor_VV(src[m], x80) : Q6_V_vzero();
+      }
+    }
+  }
+}
+
+int hvx_attn_m1_seed_q8_tiles(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t n_rows, const uint8_t *k8,
+                              const uint8_t *v8, size_t head_stride,
+                              uint32_t shift, const float *s_k,
+                              const float *s_k_inv, const float *s_v,
+                              const float *s_v_inv) {
+  if (!ctx || !ctx->q8 || layer >= ctx->n_layers || ctx->kv_len[layer] != 0u ||
+      !k8 || !v8 || !s_k || !s_k_inv || !s_v || !s_v_inv) {
+    return AEE_EBADSTATE;
+  }
+  const uint32_t hd = ctx->head_dim;
+  if (n_rows == 0u || n_rows > ctx->max_seq || hd % VLEN != 0u ||
+      (uint64_t)(shift + n_rows) * hd > head_stride) {
+    return AEE_EINVALIDFORMAT;
+  }
+  const int fresh = !ctx->kt[layer] || !ctx->v[layer];
+  if (layer_alloc_fill(ctx, layer, 0) != AEE_SUCCESS) {
+    return AEE_ENOMEMORY;
+  }
+  const size_t base = (size_t)layer * ctx->n_kv * hd;
+  for (size_t x = 0; x < (size_t)ctx->n_kv * hd; ++x) {
+    ctx->sk[base + x] = s_k[x];
+    ctx->sk_inv[base + x] = s_k_inv[x];
+    ctx->sv[base + x] = s_v[x];
+    ctx->sv_inv[base + x] = s_v_inv[x];
+  }
+  ctx->scaled[layer] = 1u;
+  const uint32_t tiles = tiles_of(n_rows);
+  tile_seed_job job = {ctx, layer, n_rows,     shift, ctx->n_kv * tiles,
+                       k8,  v8,    head_stride};
+  hvx_worker_pool_run(ctx->pool, run_seed_q8_tiles, &job, job.units);
+  /* the tiles past the seed's, zero as layer_alloc leaves them */
+  const size_t done = (size_t)tiles * TILE * hd;
+  const size_t head = (size_t)ctx->seq * hd;
+  for (uint32_t h = 0; fresh && h < ctx->n_kv; ++h) {
+    memset(kt8_head(ctx, layer, h) + done, 0, head - done);
+    memset(v8_head(ctx, layer, h) + done, 0, head - done);
+  }
   ctx->kv_len[layer] = n_rows;
   return AEE_SUCCESS;
 }

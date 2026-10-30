@@ -232,6 +232,27 @@ int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
                         const float *s_v_inv, const float *k_rows);
 
 /**
+ * @brief hvx_attn_m1_seed_q8 from the prefill's row-major masters
+ *        (@a k8 / @a v8, q ^ 0x80, @a head_stride bytes between heads,
+ *        head_dim between positions) on HVX: positions [@a shift,
+ *        @a shift + @a n_rows) of the masters become the layer's [0,
+ *        n_rows) -- @a shift is the rows a windowed cache moved past since
+ *        the masters were filled. K goes into Kt's tiles a 64-position tile
+ *        and 128 dims at a time (six byte-zip rounds), V row by row; every
+ *        byte of the layer is written once (zeros past n_rows), so a lazy
+ *        layer is allocated without its zero fill. Scales as seed_q8's.
+ *        head_dim a multiple of 128.
+ * @return as hvx_attn_m1_seed_q8; AEE_EINVALIDFORMAT for a head_dim the
+ *         tiles do not take
+ */
+int hvx_attn_m1_seed_q8_tiles(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t n_rows, const uint8_t *k8,
+                              const uint8_t *v8, size_t head_stride,
+                              uint32_t shift, const float *s_k,
+                              const float *s_k_inv, const float *s_v,
+                              const float *s_v_inv);
+
+/**
  * @brief Appends position @a pos (k, v of the new token) to @a layer and
  *        computes the attention output over positions 0..pos.
  *
