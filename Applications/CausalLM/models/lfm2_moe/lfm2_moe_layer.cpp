@@ -34,6 +34,7 @@
 #endif
 #include <expert_lru.h>
 #include <expert_preload.h>
+#include <expert_warm.h>
 #include <htp_fixed_opts.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
@@ -200,6 +201,9 @@ using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
  *  needs them to read one from the file, in layer order (preloadExperts is
  *  called in graph order). Row i + 1 is what layer i reads ahead. */
 static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
+
+/** NNTR_MOE_WARM: the decode pool's warm-up (expert_warm.h). */
+static causallm::ExpertWarm g_warm;
 /** [PR 4428] The pool's slot sizes: the experts of one (K, inter, N_out,
  *  dtype) share a size, and the rotated ternary Gemma4 has two (native
  *  TL2 in layers 0-27, 4-bit affine in 28-29). Each layer adds its share
@@ -253,6 +257,7 @@ void resetLfm2HtpExpertPool() {
   g_expert_class_reserved.clear();
   g_expert_slots_reserved = 0;
   g_expert_layers.clear();
+  g_warm.reset();
   g_prefetch_batches.clear();
   g_prefetch_inflight.clear();
   g_handed_expert_layers.clear();
@@ -1573,8 +1578,14 @@ static bool tryMoeLayerOnAccelerator(
           g_expert_lru.acquire(need, load, evict);
         });
       ops->set_decode_pool_grow([](size_t n) { g_expert_lru.addCapacity(n); });
+      g_warm.install(ops, g_expert_lru, g_expert_layers);
     }
   }
+
+  // NNTR_MOE_WARM: this layer's warm list, the last prefill call's
+  if (experts_virtual && extra_top_k != nullptr)
+    g_warm.note(expert_layer_slot, *extra_top_k, expert_assignments,
+                total_tokens);
 
   // [doc 52] Virtual experts: the ones this call routes to are made
   // resident through the shared LRU (a miss releases the least recently

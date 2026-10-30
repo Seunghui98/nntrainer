@@ -17,6 +17,7 @@
 
 #include <expert_lru.h>
 #include <expert_preload.h>
+#include <expert_warm.h>
 
 #include <vector>
 
@@ -347,6 +348,62 @@ TEST(ExpertLru, WarmUpReplacesThePrefillTailWithoutGrowingThePool) {
   EXPECT_EQ(lru.capacity(), 6u);
   EXPECT_TRUE(lru.resident(key(7)) && lru.resident(key(8)) &&
               lru.resident(key(4)));
+}
+
+/** The backend side of set_decode_pool_warm: keeps the pair, releases. */
+class WarmOps : public nntrainer::ComputeOps {
+public:
+  std::function<std::vector<ExpertFileDesc>()> begin;
+  std::function<void(const std::vector<const void *> &)> end;
+  std::vector<const void *> released;
+  void set_decode_pool_warm(
+    const std::function<std::vector<ExpertFileDesc>()> &b,
+    const std::function<void(const std::vector<const void *> &)> &e) override {
+    begin = b;
+    end = e;
+  }
+  bool release_qs4cx_wh_expert(const void *key_gu) override {
+    released.push_back(key_gu);
+    return true;
+  }
+};
+
+TEST(ExpertWarm, PrefillListsBecomeTheReadsAndTheLruTakesThem) {
+  // Two warm experts a layer, two layers of 4 experts (layer l's expert e
+  // is key 4l + e) in a pool of 4 the prefill left with layer 1's. Layer
+  // 0's last token ranked 2, 1; layer 1's 1, 2 (keys 5, 6, resident:
+  // pinned). The reads are keys 2, 1, the two oldest outside the pins
+  // (4, 7) make room, and the LRU files the reads without evicting.
+  ExpertLru lru;
+  int layer0, layer1;
+  lru.addLayer(&layer0, 2);
+  lru.addLayer(&layer1, 2);
+  Recorder r;
+  lru.acquire({key(4), key(5), key(6), key(7)}, r.load, r.evict);
+  using Desc = nntrainer::ComputeOps::ExpertFileDesc;
+  std::vector<std::vector<Desc>> layers(2, std::vector<Desc>(4));
+  for (int l = 0; l < 2; ++l)
+    for (int e = 0; e < 4; ++e)
+      layers[l][e].key_gu = key(4 * l + e);
+  using Rows = std::vector<std::vector<std::pair<unsigned, float>>>;
+  causallm::ExpertWarm warm(2);
+  warm.note(0, {0, 3, 2, 1}, Rows{{{0, 1.f}}, {{1, 1.f}}, {{1, 1.f}}, {}}, 2);
+  warm.note(1, {0, 3, 1, 2}, Rows(4), 2);
+  WarmOps ops;
+  warm.install(&ops, lru, layers);
+  ASSERT_TRUE(ops.begin && ops.end);
+  const std::vector<Desc> want = ops.begin();
+  std::vector<const void *> keys;
+  for (const Desc &d : want)
+    keys.push_back(d.key_gu);
+  EXPECT_EQ(ids(keys), (std::vector<int>{2, 1}));
+  EXPECT_EQ(ids(ops.released), (std::vector<int>{4, 7}));
+  ops.end(keys); // what the backend registered
+  EXPECT_EQ(lru.size(), 4u);
+  for (int e : {1, 2, 5, 6})
+    EXPECT_TRUE(lru.resident(key(e))) << e;
+  // the slots are no longer held: a call of four fits
+  lru.acquire({key(1), key(2), key(5), key(6)}, r.load, r.evict);
 }
 
 } // namespace

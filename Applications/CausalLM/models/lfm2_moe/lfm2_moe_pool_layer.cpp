@@ -30,6 +30,7 @@
 #endif
 #include <expert_lru.h>
 #include <expert_preload.h>
+#include <expert_warm.h>
 #include <htp_decode_hook.h>
 #include <htp_fixed_opts.h>
 #include <iostream>
@@ -193,16 +194,8 @@ using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
  *  called in graph order). Row i + 1 is what layer i reads ahead. */
 static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
 
-/** NNTR_MOE_WARM: each layer slot's warm list from its last prefill call
- *  (causallm::warmList), and the LRU slots the queued warm-up holds. */
-static std::vector<std::vector<unsigned>> g_warm;
-static size_t g_warm_held = 0;
-
-static size_t expertWarm() {
-  static const size_t n =
-    causallm::expertWarmPerLayer(std::getenv("NNTR_MOE_WARM"));
-  return n;
-}
+/** NNTR_MOE_WARM: the decode pool's warm-up (expert_warm.h). */
+static causallm::ExpertWarm g_warm;
 
 /** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
 static std::atomic<unsigned> g_moe_layer_count{0};
@@ -1104,63 +1097,14 @@ static bool tryMoeLayerOnAccelerator(
           g_expert_lru.acquire(need, load, evict);
         });
       ops->set_decode_pool_grow([](size_t n) { g_expert_lru.addCapacity(n); });
-      if (expertWarm() != 0)
-        ops->set_decode_pool_warm(
-          [ops] {
-            // rank-major over the layers: a short room cuts every layer's
-            // tail, not the last layers
-            std::vector<ExpertFileDesc> want;
-            std::vector<causallm::ExpertLru::Key> pinned;
-            size_t depth = 0;
-            for (const auto &w : g_warm)
-              depth = std::max(depth, w.size());
-            for (size_t r = 0; r < depth; ++r)
-              for (size_t l = 0; l < g_warm.size(); ++l) {
-                if (r >= g_warm[l].size() || l >= g_expert_layers.size() ||
-                    g_warm[l][r] >= g_expert_layers[l].size())
-                  continue;
-                const ExpertFileDesc &d = g_expert_layers[l][g_warm[l][r]];
-                if (g_expert_lru.resident(d.key_gu))
-                  pinned.push_back(d.key_gu);
-                else
-                  want.push_back(d);
-              }
-            want.resize(std::min(want.size(), g_expert_lru.room(pinned)));
-            auto release = [ops](causallm::ExpertLru::Key k) {
-              if (!ops->release_qs4cx_wh_expert(k))
-                throw std::logic_error("expert warm-up evicted an expert the "
-                                       "accelerator does not hold");
-            };
-            if (want.empty() ||
-                !g_expert_lru.makeRoom(want.size(), pinned, release))
-              return std::vector<ExpertFileDesc>{};
-            g_expert_lru.hold(want.size());
-            g_warm_held = want.size();
-            return want;
-          },
-          [](const std::vector<const void *> &keys) {
-            g_expert_lru.unhold(g_warm_held);
-            g_warm_held = 0;
-            g_expert_lru.acquire(
-              keys, [](causallm::ExpertLru::Key) {},
-              [](causallm::ExpertLru::Key) {
-                throw std::logic_error("expert warm-up overfilled the LRU");
-              });
-          });
+      g_warm.install(ops, g_expert_lru, g_expert_layers);
     }
   }
 
   // NNTR_MOE_WARM: this layer's warm list, the last prefill call's
-  if (experts_virtual && total_tokens > 1 && expert_layer_slot >= 0 &&
-      expertWarm() != 0 && extra_top_k != nullptr) {
-    if (g_warm.size() <= static_cast<size_t>(expert_layer_slot))
-      g_warm.resize(expert_layer_slot + 1);
-    std::vector<size_t> rows(n_experts);
-    for (size_t e = 0; e < n_experts; ++e)
-      rows[e] = expert_assignments[e].size();
-    g_warm[expert_layer_slot] = causallm::warmList(
-      *extra_top_k, extra_top_k->size() / total_tokens, rows, expertWarm());
-  }
+  if (experts_virtual && extra_top_k != nullptr)
+    g_warm.note(expert_layer_slot, *extra_top_k, expert_assignments,
+                total_tokens);
 
   // [doc 52] Virtual experts: the ones this call routes to are made
   // resident through the shared LRU (a miss releases the least recently
