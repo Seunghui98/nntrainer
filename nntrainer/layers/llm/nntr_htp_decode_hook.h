@@ -215,6 +215,21 @@ inline bool htpDecodeKvSeedKvq(unsigned n_rows, int kv_handle,
 #endif
 }
 
+/** @brief [C] The seed with K and V from the layer's int8 masters, rows
+ *  [shift, shift + n_rows) (ComputeOps::decode_kv_seed_kvq_tiles). */
+inline bool htpDecodeKvSeedKvqTiles(unsigned n_rows, int kv_handle,
+                                    unsigned shift) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_seed_kvq_tiles(n_rows, kv_handle,
+                                                            shift);
+#else
+  (void)n_rows;
+  (void)kv_handle;
+  (void)shift;
+  return false;
+#endif
+}
+
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,
  *  [n_rows][n_kv x head_dim] f32 each. */
 inline bool htpDecodeKvSeed(unsigned n_rows, const float *k_rows,

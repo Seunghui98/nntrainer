@@ -3726,6 +3726,53 @@ public:
     return on;
   }
 
+  /** [C] NNTR_HTP_KV_ADOPT=1: each layer's int8 masters outlive its last
+   *  prefill call (trimmed to them, its CPU rows freed there) and seed its
+   *  decode cache on the DSP (decode_kv_seed_kvq_tiles); attn_m1 is
+   *  registered lazily, as under kvSeedQ. Implies NNTR_HTP_Q2_KDIM. */
+  static bool kvAdopt() {
+    static const bool on = [] {
+      const char *v = std::getenv("NNTR_HTP_KV_ADOPT");
+      return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+  }
+
+  bool decode_kv_seed_kvq_tiles(unsigned n_rows, int kv_handle,
+                                unsigned shift) override {
+    if (!kvAdopt() || kv_handle < 0 || seed_ordinal_ == HTP_GRAPH_NO_OP)
+      return false;
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      if (kvq_handles_.count(static_cast<uint32_t>(kv_handle)) == 0)
+        return false;
+    }
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const uint32_t layer =
+      attn_cache_ord_[seed_ordinal_] |
+      (attn_cache_[seed_ordinal_] ? HTP_ATTN_KV_CACHE_B : 0u);
+    const uint64_t t_seed = HtpProfile::nowUs();
+    const int err = nntr_hvx_attn_m1_seed_kvq_tiles(
+      session, layer, static_cast<uint32_t>(kv_handle), n_rows, shift);
+    seed_rpc_us_ += HtpProfile::nowUs() - t_seed;
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr,
+                   "[HTP] attn_m1_seed_kvq_tiles: layer %u not seeded (%s)\n",
+                   seed_ordinal_, graphErr(err).c_str());
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      kvq_handles_.erase(static_cast<uint32_t>(kv_handle)); // DSP released
+    }
+    ++seed_calls_;
+    ++seed_kvq_;
+    kv_len_[seed_ordinal_] = n_rows;
+    seed_ordinal_ = HTP_GRAPH_NO_OP;
+    return true;
+  }
+
   bool decode_kv_seed_kvq(unsigned n_rows, int kv_handle,
                           const float *k_rows) override {
     if (!kvSeedQ() || kv_handle < 0 || seed_ordinal_ == HTP_GRAPH_NO_OP)
@@ -4055,7 +4102,7 @@ public:
     if (!t1_printed_) { // [#282 F]
       t1_printed_ = true;
       size_t left = 0;
-      if (kvSeedQ() && htp_fixed::E2E_FREE_KVQ) {
+      if ((kvSeedQ() || kvAdopt()) && htp_fixed::E2E_FREE_KVQ) {
         // [#289] a layer the DSP seed did not take keeps its cache till here
         std::lock_guard<std::mutex> lock(kvq_mutex_);
         left = kvq_handles_.size();
@@ -4798,8 +4845,8 @@ public:
     // token never reads them. ponytail: a later prefill on a layer whose
     // handle is gone fails its append and takes mha_core's CPU attention
     // -- single-prompt runs; the upgrade is mha_core re-registering.
-    if (e2e_ && htp_fixed::E2E_FREE_KVQ &&
-        !kvSeedQ()) { // [#289] the seeds free them one layer at a time
+    if (e2e_ && htp_fixed::E2E_FREE_KVQ && !kvSeedQ() &&
+        !kvAdopt()) { // [#289] the seeds free them one layer at a time
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       for (uint32_t h : kvq_handles_)
         nntr_hvx_kv_release_q(session, h);
@@ -4843,7 +4890,8 @@ public:
       // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
-        max_seq | (q8 ? 0x80000000u : 0u) | (kvSeedQ() ? 0x40000000u : 0u) |
+        max_seq | (q8 ? 0x80000000u : 0u) |
+          (kvSeedQ() || kvAdopt() ? 0x40000000u : 0u) |
           (fast ? 0x20000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
@@ -11633,6 +11681,18 @@ public:
       nntr_hvx_kv_release_q(static_cast<remote_handle64>(hb.handle()),
                             static_cast<uint32_t>(handle));
     }
+  }
+
+  bool kv_cache_q_trim(int handle) override {
+    HtpBackend &hb = HtpBackend::global();
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      if (handle < 0 || kvq_handles_.count(static_cast<uint32_t>(handle)) == 0)
+        return false;
+    }
+    return hb.enabled() &&
+           nntr_hvx_kv_trim_q(static_cast<remote_handle64>(hb.handle()),
+                              static_cast<uint32_t>(handle)) == AEE_SUCCESS;
   }
 
   bool sdpa_q_kvcache(int handle, unsigned int append_row0,

@@ -292,11 +292,37 @@ int hexkl_kv_q_release(hexkl_kv_q_table *tbl, uint32_t handle) {
   return AEE_SUCCESS;
 }
 
-const hexkl_kv_q *hexkl_kv_q_get(const hexkl_kv_q_table *tbl, uint32_t handle) {
+const hexkl_kv_q *hexkl_kv_q_get_masters(const hexkl_kv_q_table *tbl,
+                                         uint32_t handle) {
   if (!tbl || handle >= HEXKL_KV_Q_MAX || !tbl->slots[handle].in_use) {
     return NULL;
   }
   return &tbl->slots[handle];
+}
+
+const hexkl_kv_q *hexkl_kv_q_get(const hexkl_kv_q_table *tbl, uint32_t handle) {
+  const hexkl_kv_q *kv = hexkl_kv_q_get_masters(tbl, handle);
+  return kv && !kv->trimmed ? kv : NULL;
+}
+
+int hexkl_kv_q_trim(hexkl_kv_q_table *tbl, uint32_t handle) {
+  hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
+  if (!kv || kv->kind != HEXKL_KV_Q8 || !kv->fixed || !kv->plain_masters) {
+    return AEE_EBADPARM;
+  }
+  free(kv->kt);
+  free(kv->v);
+  free(kv->stage_kt);
+  free(kv->stage_v);
+  free(kv->s_k);
+  free(kv->colsum_k);
+  free(kv->s_v);
+  kv->kt = kv->v = NULL;
+  kv->stage_kt = kv->stage_v = NULL;
+  kv->s_k = kv->s_v = NULL;
+  kv->colsum_k = NULL;
+  kv->trimmed = 1;
+  return AEE_SUCCESS;
 }
 
 void hexkl_kv_q_stage(hexkl_kv_q *kv, uint32_t n, uint32_t c) {

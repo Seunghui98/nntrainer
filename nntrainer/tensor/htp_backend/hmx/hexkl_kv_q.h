@@ -64,6 +64,7 @@ typedef enum {
 
 typedef struct {
   int in_use;
+  int trimmed; /**< hexkl_kv_q_trim: masters and fixed scales only */
   hexkl_kv_q_kind kind;
   int32_t qmax;        /**< 127 or 7: the symmetric range */
   uint32_t tile_bytes; /**< WH tile size for this kind */
@@ -288,8 +289,24 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
 
 int hexkl_kv_q_release(hexkl_kv_q_table *tbl, uint32_t handle);
 
-/** @brief The slot, or NULL if the handle is not in use. */
+/**
+ * @brief After a cache's last append and attention: frees its WH tiles,
+ *        staging and per-row scales and keeps the masters and the fixed
+ *        scales (fs_*), all a decode seed reads (hexkl_kv_q_get_masters).
+ *        A trimmed cache is gone for every other reader (hexkl_kv_q_get
+ *        returns NULL); hexkl_kv_q_release frees the rest.
+ * @return AEE_SUCCESS; AEE_EBADPARM unless a fixed-scale int8 cache with
+ *         plain masters
+ */
+int hexkl_kv_q_trim(hexkl_kv_q_table *tbl, uint32_t handle);
+
+/** @brief The slot, or NULL if the handle is not in use or is trimmed. */
 const hexkl_kv_q *hexkl_kv_q_get(const hexkl_kv_q_table *tbl, uint32_t handle);
+
+/** @brief The slot, trimmed or not, or NULL if the handle is not in use:
+ *         for a reader of the masters and fixed scales only. */
+const hexkl_kv_q *hexkl_kv_q_get_masters(const hexkl_kv_q_table *tbl,
+                                         uint32_t handle);
 
 /** @brief Where an append spends its time, microseconds (DSP only; the host
  *         build leaves it zero). */

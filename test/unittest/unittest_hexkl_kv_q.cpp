@@ -431,3 +431,45 @@ TEST(HexklKvQ, FixedScalesKPerDim) {
   EXPECT_NE(hexkl_kv_q_set_fixed_scales_kd(&tbl, h, s_k.data(), s_v.data()), 0);
   EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
 }
+
+TEST(HexklKvQ, TrimKeepsMastersAndFixedScales) {
+  hexkl_kv_q_table tbl{};
+  uint32_t h = 0;
+  const uint32_t n_kv = 2, hd = 128, rows = 40, width = n_kv * hd;
+  ASSERT_EQ(hexkl_kv_q_register(&tbl, HEXKL_KV_Q8, rows, n_kv, hd, &h), 0);
+  // a cache without fixed scales cannot be trimmed: its scales are per row
+  EXPECT_NE(hexkl_kv_q_trim(&tbl, h), 0);
+  std::vector<float> s_k(width, 0.01f), s_v(width, 0.02f);
+  ASSERT_EQ(hexkl_kv_q_set_fixed_scales_kd(&tbl, h, s_k.data(), s_v.data()), 0);
+  auto k = rows_hf(rows, width, 0x81u, 1.0f);
+  auto v = rows_hf(rows, width, 0x82u, 2.0f);
+  ASSERT_EQ(
+    hexkl_kv_q_append(&tbl, h, 0, rows, k.data(), v.data(), nullptr, nullptr),
+    0);
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&tbl, h);
+  ASSERT_NE(kv, nullptr);
+  const size_t values = static_cast<size_t>(n_kv) * kv->max_rows * hd;
+  const std::vector<uint8_t> kt4(kv->kt4, kv->kt4 + values);
+  const std::vector<uint8_t> v4(kv->v4, kv->v4 + values);
+  ASSERT_EQ(hexkl_kv_q_trim(&tbl, h), 0);
+  EXPECT_EQ(hexkl_kv_q_get(&tbl, h), nullptr) << "trimmed: no other reader";
+  EXPECT_NE(hexkl_kv_q_trim(&tbl, h), 0) << "trimmed twice";
+  EXPECT_NE(
+    hexkl_kv_q_append(&tbl, h, rows, 1, k.data(), v.data(), nullptr, nullptr),
+    0)
+    << "an append after the trim";
+  const hexkl_kv_q *m = hexkl_kv_q_get_masters(&tbl, h);
+  ASSERT_NE(m, nullptr);
+  EXPECT_EQ(m->trimmed, 1);
+  EXPECT_EQ(m->kt, nullptr);
+  EXPECT_EQ(m->v, nullptr);
+  EXPECT_EQ(m->s_k, nullptr);
+  EXPECT_EQ(std::memcmp(m->kt4, kt4.data(), values), 0);
+  EXPECT_EQ(std::memcmp(m->v4, v4.data(), values), 0);
+  for (uint32_t i = 0; i < width; ++i) {
+    EXPECT_EQ(m->fs_kd[i], s_k[i]);
+    EXPECT_EQ(m->fs_v[i], s_v[i]);
+  }
+  EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
+  EXPECT_EQ(hexkl_kv_q_get_masters(&tbl, h), nullptr);
+}

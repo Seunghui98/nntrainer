@@ -189,6 +189,33 @@ int nntr_hvx_attn_m1_seed_kvq(remote_handle64 handle, uint32 layer,
   return hexkl_kv_q_release(&s->kv_q, kv_handle);
 }
 
+int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
+                                    uint32 kv_handle, uint32 n_rows,
+                                    uint32 shift) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  hvx_attn_m1_ctx *c =
+    (layer & HTP_ATTN_KV_CACHE_B) != 0u ? s->attn_m1_b : s->attn_m1;
+  layer &= ~HTP_ATTN_KV_CACHE_B;
+  const hexkl_kv_q *kv = hexkl_kv_q_get_masters(&s->kv_q, kv_handle);
+  if (!c || !kv || kv->kind != HEXKL_KV_Q8 || !kv->fixed ||
+      !kv->plain_masters || !kv->k_per_dim || kv->n_head_kv != c->n_kv ||
+      kv->head_dim != c->head_dim) {
+    FARF(ERROR, "attn_m1_seed_kvq_tiles: cache %u does not fit layer %u",
+         (unsigned)kv_handle, (unsigned)layer);
+    return AEE_EBADSTATE;
+  }
+  const int rc = hvx_attn_m1_seed_q8_tiles(
+    c, layer, n_rows, kv->kt4, kv->v4, (size_t)kv->max_rows * kv->head_dim,
+    shift, kv->fs_kd, kv->fs_k_inv, kv->fs_v, kv->fs_v_inv);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_kv_q_release(&s->kv_q, kv_handle);
+}
+
 int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,
                              float scale, const float *q, int qLen,
                              const float *k, int kLen, const float *v, int vLen,

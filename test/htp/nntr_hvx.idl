@@ -1504,4 +1504,18 @@ interface nntr_hvx : remote_handle64 {
    AEEResult weight_set_static_quant(in sequence<uint32> handles,
       in sequence<float> scales, in sequence<int32> zero_points,
       in uint32 gate_plus1, in uint32 up_plus1);
+
+   // [C] NNTR_HTP_KV_ADOPT: after a fixed-scale int8 cache's last prefill
+   // call, frees its WH tiles, staging and per-row scales and keeps the
+   // masters and fixed scales for the decode seed below
+   // (hexkl_kv_q_trim). Every other entry then refuses kv_handle.
+   AEEResult kv_trim_q(in uint32 kv_handle);
+
+   // [C] attn_m1_seed_kvq from the masters on HVX (hvx_attn_m1_seed_q8_
+   // tiles): K and V both from the masters (K's prefill scale per (head,
+   // dim)), rows [shift, shift + n_rows) of them as the layer's [0,
+   // n_rows) -- shift: the rows a windowed cache moved since the masters
+   // were filled. kv_handle may be trimmed; it is released.
+   AEEResult attn_m1_seed_kvq_tiles(in uint32 layer, in uint32 kv_handle,
+                                    in uint32 n_rows, in uint32 shift);
 };

@@ -867,6 +867,19 @@ public:
     return false;
   }
 
+  // [C] NNTR_HTP_KV_ADOPT: the seed with K and V both from the cache's
+  // int8 masters (K's prefill scale per (head, dim)), rows [shift, shift +
+  // n_rows) of them -- shift: the rows a windowed cache moved since the
+  // masters were filled; the handle (trimmed or not) is released on
+  // success. False: not taken.
+  virtual bool decode_kv_seed_kvq_tiles(unsigned n_rows, int kv_handle,
+                                        unsigned shift) {
+    (void)n_rows;
+    (void)kv_handle;
+    (void)shift;
+    return false;
+  }
+
   /** Whether the complete decode graph consumes this registered source.
    * Per-op M=1 capability can be false when the whole token runs on device.
    */
@@ -1281,6 +1294,15 @@ public:
   }
 
   virtual void kv_cache_q_release(int handle) { (void)handle; }
+
+  // [C] After a cache's last prefill call: frees its WH tiles and keeps
+  // the masters and fixed scales for decode_kv_seed_kvq_tiles; every other
+  // entry then refuses the handle. False: not trimmed (the cache is as it
+  // was).
+  virtual bool kv_cache_q_trim(int handle) {
+    (void)handle;
+    return false;
+  }
 
   /**
    * @brief The row-blocked int8 attention (hexkl_attn_q2) over a cache in

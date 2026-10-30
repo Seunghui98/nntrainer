@@ -17,6 +17,7 @@ using nntrainer::htpDecodeKvAmaxFloor;
 using nntrainer::htpDecodeKvSeed;
 using nntrainer::htpDecodeKvSeedF16;
 using nntrainer::htpDecodeKvSeedKvq;
+using nntrainer::htpDecodeKvSeedKvqTiles;
 using nntrainer::htpDecodeKvWindow;
 using nntrainer::htpDecodeLmHead;
 using nntrainer::htpDecodeOp;
