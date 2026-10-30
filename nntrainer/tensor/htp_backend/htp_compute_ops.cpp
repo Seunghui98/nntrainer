@@ -4674,17 +4674,30 @@ public:
       return;
     }
     memLine("t1 before graph init (= prefill end)");
-    // [#282 F] the first token's setup, timed (one line at the end)
+    // [#282 F] the first token's setup, timed (one line at the end), and
+    // its stages: which of them could move before the prefill
     const uint64_t t_init = HtpProfile::nowUs();
     struct InitLine {
       uint64_t t0;
+      uint64_t at[6] = {}; /**< place_fc bind rpc params attn e2e ends */
       ~InitLine() {
-        std::fprintf(stderr, "[HTP] t1: graph_init_ms=%.1f\n",
-                     (HtpProfile::nowUs() - t0) / 1000.0);
+        double ms[6];
+        uint64_t prev = t0;
+        for (int i = 0; i < 6; ++i) {
+          const uint64_t t = at[i] ? at[i] : prev;
+          ms[i] = (t - prev) / 1000.0;
+          prev = t;
+        }
+        std::fprintf(stderr,
+                     "[HTP] t1: graph_init_ms=%.1f (place_fc %.1f bind %.1f "
+                     "rpc %.1f params %.1f attn %.1f e2e %.1f)\n",
+                     (HtpProfile::nowUs() - t0) / 1000.0, ms[0], ms[1], ms[2],
+                     ms[3], ms[4], ms[5]);
       }
     } init_line{t_init};
     if (e2e_ && !q4m1_bound_)
       e2ePlaceFc(); // a caller that never ran finish_decode_graph_q4_0
+    init_line.at[0] = HtpProfile::nowUs();
     if ((resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u && !q4m1_bound_) {
       try {
         bindQ4m1(session);
@@ -4695,6 +4708,7 @@ public:
       // [#132 Part B E3] the E2E FC arena is placed once: a retry keeps it
       q4m1_bound_ = e2e_;
     }
+    init_line.at[1] = HtpProfile::nowUs();
     uint32_t n_ops = 0;
     {
       const int err =
@@ -4706,6 +4720,7 @@ public:
                                  graphErr(err));
       }
     }
+    init_line.at[2] = HtpProfile::nowUs();
     // [plan 201 S1] each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
@@ -4760,6 +4775,7 @@ public:
       throw;
     }
     graph_inited_ = true;
+    init_line.at[3] = HtpProfile::nowUs();
     memLine("t1 after graph init");
     char names[128];
     std::fprintf(stderr, "[HTP] graph: init n_ops=%u resident=%s moe_ops=%zu\n",
@@ -4767,8 +4783,10 @@ public:
                  htp_graph_kinds_str(resident_mask_, names, sizeof(names)),
                  moe_ops_.size());
     ensureAttentionCaches(session);
+    init_line.at[4] = HtpProfile::nowUs();
     if (e2e_)
       e2eStart();
+    init_line.at[5] = HtpProfile::nowUs();
   }
 
   void ensureAttentionCaches(remote_handle64 session) {
@@ -11286,8 +11304,8 @@ private:
   std::function<std::vector<ExpertFileDesc>()> warm_begin_;
   std::function<void(const std::vector<const void *> &)> warm_end_;
   bool warm_pending_ = false;
-  std::vector<uint8_t> pool_answered_;    /**< [#289] layers a miss round served
-                                             this token (handle_mutex_) */
+  std::vector<uint8_t> pool_answered_; /**< [#289] layers a miss round served
+                                          this token (handle_mutex_) */
   bool pool_dirty_ = true;
   std::shared_ptr<HtpExpertPrefetch<StagedExpert>> pool_prefetch_;
   std::unique_ptr<HtpExpertReadPool> demand_read_pool_;
