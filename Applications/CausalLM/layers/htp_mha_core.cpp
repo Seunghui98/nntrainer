@@ -1663,13 +1663,27 @@ bool HtpMHACoreLayer::try_quantized_attention(
       // from the calibration rows)
       size_t clip_q = 0;
       float worst_q = 0.0f;
+      // K per dim: the encoding is the folded Q's, q * fs_kd / fs_k
+      std::vector<float> fold;
+      if (q2_scale_k.size() != num_heads_KV) {
+        fold.resize(q2_scale_k.size());
+        for (unsigned int n = 0; n < num_heads_KV; ++n) {
+          const float *sk = q2_scale_k.data() + n * head_dim;
+          const float top = *std::max_element(sk, sk + head_dim);
+          for (unsigned int d = 0; d < head_dim; ++d)
+            fold[n * head_dim + d] = sk[d] / top;
+        }
+      }
+      const unsigned int G = num_heads_Q / num_heads_KV;
       for (unsigned int r = 0; r < n_q; ++r)
         for (unsigned int h = 0; h < num_heads_Q; ++h) {
           const float step = q2_q_enc[2 * h], zp = q2_q_enc[2 * h + 1];
           const float *qr =
             q_view + static_cast<size_t>(r) * q_stride + h * head_dim;
           for (unsigned int d = 0; d < head_dim; ++d) {
-            const float code = qr[d] / step + zp; // 0 .. 65535 inside
+            const float qd =
+              fold.empty() ? qr[d] : qr[d] * fold[(h / G) * head_dim + d];
+            const float code = qd / step + zp; // 0 .. 65535 inside
             const float over = code < 0.0f       ? -code
                                : code > 65535.0f ? code - 65535.0f
                                                  : 0.0f;

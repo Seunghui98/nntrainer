@@ -20,7 +20,7 @@ def main(src, out):
     text = open(src, encoding="utf-8").read()
     end = text.index("} q2c_ctx;") + len("} q2c_ctx;")
     parts = [text[text.rindex("typedef struct {", 0, end):end]]
-    for name in ("q2c_worker", "q2c_worker_kd"):
+    for name in ("q2c_worker", "q2c_worker_kd", "q2c_q_range_kd"):
         m = re.search(r"^static void " + name + r"\(", text, re.M)
         if not m:
             raise SystemExit("missing production function " + name)

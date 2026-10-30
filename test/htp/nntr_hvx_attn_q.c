@@ -712,6 +712,38 @@ static void q2c_worker_kd(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
+/** Under kd, Q head h's folded range over the lanes that ran: the minimum
+   and maximum of q * ratio[d] over lanes and dims, ratio = fs_kd / fs_k of
+   its KV head. Per dim the lanes first, then the multiply: for r > 0 the
+   rounded product is monotone in q, so min_l (q) r = min_l (q r) bit for
+   bit, and min / max are order-free, so this is the scalar merge's value. */
+static void q2c_q_range_kd(const q2c_ctx *c, uint32_t lanes, uint32_t h,
+                           const float *ratio, float *lo, float *hi) {
+  HVX_Vector vl = hvx_splat_sf(1e30f), vh = hvx_splat_sf(-1e30f);
+  for (uint32_t j = 0; j < c->hd / 32u; ++j) {
+    HVX_Vector l = hvx_splat_sf(1e30f), u = hvx_splat_sf(-1e30f);
+    for (uint32_t i = 0; i < lanes; ++i) {
+      const size_t at = ((size_t)i * c->n_hq + h) * c->hd + 32u * j;
+      l = Q6_Vsf_vmin_VsfVsf(l, *(const HVX_UVector *)(c->qlo + at));
+      u = Q6_Vsf_vmax_VsfVsf(u, *(const HVX_UVector *)(c->qhi + at));
+    }
+    const HVX_Vector r = *(const HVX_UVector *)(ratio + 32u * j);
+    vl = Q6_Vsf_vmin_VsfVsf(vl, Q6_Vsf_vmpy_VsfVsf(l, r));
+    vh = Q6_Vsf_vmax_VsfVsf(vh, Q6_Vsf_vmpy_VsfVsf(u, r));
+  }
+  float a[32] __attribute__((aligned(128)));
+  float b[32] __attribute__((aligned(128)));
+  *(HVX_Vector *)a = vl;
+  *(HVX_Vector *)b = vh;
+  float flo = 1e30f, fhi = -1e30f;
+  for (uint32_t j = 0; j < 32u; ++j) {
+    flo = a[j] < flo ? a[j] : flo;
+    fhi = b[j] > fhi ? b[j] : fhi;
+  }
+  *lo = flo;
+  *hi = fhi;
+}
+
 /** std::round: halves away from zero; the DSP image has no roundf. Below
    2^23 trunc then the exact fraction compared with 0.5; above, integral. */
 static inline float q2c_roundf(float x) {
@@ -801,10 +833,9 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
     s_v[e] = hexkl_kv_q_hf_to_f32(m);
   }
   /* per dim: Q's range is that of q * fs_kd / fs_k, the Q the kernel
-     quantizes (stage_qprep); min (q r) = r min (q) for r > 0, exactly.
-     ponytail: a scalar merge of lanes x n_hq x hd under kd; an HVX vmin
-     across lanes is the upgrade if the trace's calib= shows it. */
-  float ratio[HEXKL_KV_Q_MAX_HEAD_DIM];
+     quantizes (stage_qprep); q2c_q_range_kd folds the lanes. ratio is the
+     KV head's, as hexkl_kv_q_set_fixed_scales_kd forms fk_ratio */
+  float ratio[HEXKL_KV_Q_MAX_HEAD_DIM] __attribute__((aligned(128)));
   if (kd)
     for (uint32_t e = 0; e < nk; ++e)
       s_k[e] = s_k[e] > 0.0f ? s_k[e] / 127.0f : 1.0f;
@@ -819,21 +850,15 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
         hi = b > hi ? b : hi;
       }
     } else {
-      const float *sk = s_k + (size_t)(h / G) * hd;
-      float top = 0.0f;
-      for (uint32_t d = 0; d < hd; ++d)
-        top = sk[d] > top ? sk[d] : top;
-      for (uint32_t d = 0; d < hd; ++d)
-        ratio[d] = sk[d] / top;
-      for (uint32_t l = 0; l < ran; ++l) {
-        for (uint32_t d = 0; d < hd; ++d) {
-          const size_t at = ((size_t)l * n_head_q + h) * hd + d;
-          const float a = c.qlo[at] * ratio[d];
-          const float b = c.qhi[at] * ratio[d];
-          lo = a < lo ? a : lo;
-          hi = b > hi ? b : hi;
-        }
+      if (h % G == 0u) {
+        const float *sk = s_k + (size_t)(h / G) * hd;
+        float top = 0.0f;
+        for (uint32_t d = 0; d < hd; ++d)
+          top = sk[d] > top ? sk[d] : top;
+        for (uint32_t d = 0; d < hd; ++d)
+          ratio[d] = sk[d] / top;
       }
+      q2c_q_range_kd(&c, ran, h, ratio, &lo, &hi);
     }
     const float range = (hi - lo) > 1e-6f ? (hi - lo) : 1e-6f;
     q_enc[2u * h] = range / 65535.0f;

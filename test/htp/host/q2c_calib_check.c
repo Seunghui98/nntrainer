@@ -5,10 +5,11 @@
  *         q2c_worker, q2c_worker_kd, extracted by q2c_workers_extract.py) on
  *         hvx_emu against a scalar reference, lane by lane: per (head, dim)
  *         |K| and |V| maxima as sign-cleared fp16 bits and Q's minimum and
- *         maximum (q2c_worker_kd, byte for byte), and their per-head
- *         reductions (q2c_worker). Lanes past the rows (a prompt shorter
- *         than the pool) are run as the pool runs them: n = min(units,
- *         lanes).
+ *         maximum (q2c_worker_kd, byte for byte), their per-head
+ *         reductions (q2c_worker) and the folded per-head Q range of
+ *         q2c_q_range_kd against the scalar merge it replaced. Lanes past the
+ * rows (a prompt shorter than the pool) are run as the pool runs them: n =
+ * min(units, lanes).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -104,6 +105,34 @@ static int check_case(uint32_t n_kv, uint32_t hd, uint32_t n_hq,
       const size_t e = (size_t)i * n_hq + h;
       bad +=
         memcmp(&hd0.qlo[e], &hlo, 4) != 0 || memcmp(&hd0.qhi[e], &hhi, 4) != 0;
+    }
+  }
+  /* q2c_q_range_kd: each Q head's folded range over the lanes that ran,
+     against the scalar merge it replaced (lanes x dims of q * ratio) */
+  {
+    float ratio[512] __attribute__((aligned(128)));
+    const uint32_t G = n_hq / n_kv;
+    for (uint32_t h = 0; h < n_hq; ++h) {
+      if (h % G == 0u) {
+        float top = 0.0f, sk[512];
+        for (uint32_t d = 0; d < hd; ++d) {
+          sk[d] = 0.001f * (float)(1u + rnd() % 997u);
+          top = sk[d] > top ? sk[d] : top;
+        }
+        for (uint32_t d = 0; d < hd; ++d)
+          ratio[d] = sk[d] / top;
+      }
+      float lo = 1e30f, hi = -1e30f;
+      for (uint32_t l = 0; l < n; ++l)
+        for (uint32_t d = 0; d < hd; ++d) {
+          const size_t at = ((size_t)l * n_hq + h) * hd + d;
+          const float a = kd.qlo[at] * ratio[d], b = kd.qhi[at] * ratio[d];
+          lo = a < lo ? a : lo;
+          hi = b > hi ? b : hi;
+        }
+      float vlo, vhi;
+      q2c_q_range_kd(&kd, n, h, ratio, &vlo, &vhi);
+      bad += memcmp(&vlo, &lo, 4) != 0 || memcmp(&vhi, &hi, 4) != 0;
     }
   }
   printf("q2c workers n_kv=%u hd=%u n_hq=%u rows=%u q=%u lanes=%u ran=%u: "
