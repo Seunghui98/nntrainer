@@ -144,7 +144,7 @@ Prefill과 Decode는 완전히 다른 길을 탑니다. Prefill은 레이어마�
 - SDK 헤더: remote.h, AEEStdErr.h, rpcmem.h, HAP_compute_res.h, HAP_mem.h, HAP_vtcm_mgr.h, HAP_power.h, HAP_perf.h, HAP_farf.h, qurt.h, qurt_memory.h, dspqueue.h, hexagon_types.h, hvx_hexagon_protos.h, hexagon_protos.h, hmx_hexagon_protos.h.
 - 호스트 검증용 stand-in: `test/htp/host/{stub,inproc,hvx_emu,standin}`에 위 헤더의 x86 대체본이 있어 SDK 없이 CI가 돌아갑니다. 포팅 시 바꿔야 할 표면적이 여기에 그대로 드러나 있습니다.
 
-HVX intrinsic 124종의 전체 목록(범주, 호출 수, 사용 파일)은 이 파일 끝의 부록에 있습니다.
+HVX intrinsic 124종의 전체 목록(범주, 호출 수, 사용 파일)과 DMA 관련 명령은 이 파일 끝의 부록에 있습니다.
 
 ## Exynos(SLSI)·MTK NPU에 요구할 API
 
@@ -412,6 +412,51 @@ PR #4428 head `a3640d20`의 DSP 소스(`nntrainer/tensor/htp_backend/`, `test/ht
 | Q6_vmem_QRIV | 1 | hvx_attn_m1_f32.c |
 | Q6_dcinva_A | 1 | hexkl_dma_ring.c |
 | Q6_dcfetch_A | 1 | hvx_m1_ops_f32.c |
+
+### DMA 관련 명령 (HVX intrinsic 아님)
+
+DMA는 HVX가 아니라 스칼라 코어의 user DMA 엔진을 인라인 어셈블리로 직접 제어합니다. 그래서 위 124종 집계에는 들어가지 않고, 이 절에 따로 모았습니다. 원시 명령은 `hexkl_dma_ring.h` 한 파일에만 있고, 나머지 커널은 모두 그 위의 래퍼 함수를 부릅니다. DSP 소스 전체를 다시 확인했으며, 아래 외의 DMA 명령(dmwait, dmpause, dmresume, dmsyncht 등)은 쓰지 않습니다.
+
+**원시 명령 (인라인 asm)**
+
+| 명령 | 역할 | 감싸는 함수 |
+|---|---|---|
+| dmstart(desc) | 호출 스레드의 DMA 엔진을 디스크립터 하나로 시작 | hexkl_dma_start |
+| dmlink(cur, next) | 진행 중인 체인 뒤에 디스크립터를 이어 붙임. 두 번째 dmstart 없이 한 엔진에서 연속 전송 | hexkl_dma_link |
+| dmpoll | 엔진 상태 한 번 조회. 호출부는 디스크립터의 done 비트를 보며 이 명령으로 스핀 | hexkl_dma_poll |
+| release(addr):at | dmstart/dmlink 직전에 디스크립터 쓰기를 메모리에 확정 | hexkl_dma_start, hexkl_dma_link 안에서 사용 |
+
+**DMA와 함께 쓰는 캐시 intrinsic** (위 "캐시 · 메모리 제어" 범주와 겹침)
+
+| intrinsic | DMA에서의 용도 | 위치 |
+|---|---|---|
+| Q6_dccleaninva_A | 디스크립터를 채운 뒤 캐시에서 메모리로 밀어내 엔진이 읽게 함 | hexkl_dma_ring.c, nntr_hvx_dma_probe.c |
+| Q6_dcinva_A | DDR→DDR 전송 전후로 소스·목적지 캐시 라인 무효화 (hexkl_dcache_inva, 32 B 라인 단위). VTCM 목적지는 필요 없음 | hexkl_dma_ring.c |
+| qurt_mem_cache_clean(FLUSH) | DSP가 힙에 직접 쓴 가중치 이미지를 DDR로 flush. L2를 우회해 읽는 DMA(src_bypass)가 최신 바이트를 보게 함 (QuRT API) | hexkl_mm_u8i4_dma.c |
+
+**2D 디스크립터** (`hexkl_dma_desc2d`, 128 B 정렬, 하드웨어 정의 레이아웃)
+
+| 필드 | 비트 | 설정 값 |
+|---|---|---|
+| next | 포인터 | dmlink가 채움 |
+| desc_type / desc_size | 8 / 2 | 9 (2D) / 1 |
+| src, dst | 포인터 | DDR arena 주소, VTCM 주소 |
+| row_size, nrows_lo + nrows_hi | 24 / 8 + 8 | 행 바이트 수, 행 수(최대 16비트) |
+| src_stride, dst_stride | 24 / 24 | 행 간 간격 |
+| src_bypass, dst_bypass | 1 / 1 | L2 우회. 목적지가 VTCM이면 1, 소스가 DSP가 쓴 적 없는 arena 가중치면 1 (HEXKL_MOE_FLAG_DMA_BYPASS) |
+| src_comp, dst_comp, order, offset | 1 / 1 / 1 / 24 | 0 |
+| done | 1 | 엔진이 완료 시 1로 씀. 대기 루프가 이 비트를 봄 |
+
+**래퍼 API와 사용처**
+
+| 함수 | 역할 | 사용 파일 |
+|---|---|---|
+| hexkl_dma_ring_reset / push2d / next_idx | 전역 256칸 디스크립터 링. 엔진이 쉬면 dmstart, 아니면 dmlink로 체인에 추가 | hexkl_mm_u8i4_dma.c, hexkl_mm_u8i4_moe.c, hexkl_mm_u8i8_dma.c, hexkl_attn_q.c, hexkl_attn_q2.c, hexkl_attn_f16.c, nntr_hvx_mm_u8i4.c |
+| hexkl_dma_ring_wait / drain / is_done | 특정 인덱스까지 또는 전부 완료 대기. 체인이라 앞선 전송도 함께 끝난 것으로 봄. 5천만 회 폴링 가드 | 위와 같음 + hexkl_conv_block.c |
+| hexkl_dma_lane_push2d / lane_wait | 워커 스레드마다 자기 엔진으로 가중치 조각을 병렬 전송. 가드 초과 시 -1을 돌려 호출 실패 처리 | hexkl_mm_u8i4_moe.c (decode MoE, 큐 4개 = htp_fixed::MOE_DMA_QUEUES) |
+| hexkl_dma_trace_* | 전송 push·wait 시각 기록 (진단용) | hexkl_dma_trace.c, hexkl_mm_u8i4_moe.c |
+
+벤더 요구서 관점에서 정리하면 필요한 것은 네 가지입니다: 스레드별로 독립된 DMA 큐, 디스크립터 체이닝과 완료 비트 폴링, 소스·목적지별 캐시 bypass 제어, 그리고 디스크립터를 엔진에 보이게 하는 캐시 clean 명령. 본문 요구사항 D(#13)와 B(#10)가 이 절에 대응합니다.
 
 타입 쪽도 같이 봐야 합니다. 커널은 `HVX_Vector`(1,816회), `HVX_UVector`(비정렬, 405회), `HVX_VectorPair`(126회), `HVX_VectorPred`(64회) 네 타입 위에 쓰여 있어서, 128 B 벡터와 벡터 pair, 비트 predicate 레지스터가 없는 ISA로 옮기면 intrinsic 치환보다 데이터 레이아웃 재설계가 먼저입니다.
 
