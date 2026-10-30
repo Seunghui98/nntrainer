@@ -803,6 +803,20 @@ python3 "$HERE/q2c_workers_extract.py" "$HERE/../nntr_hvx_attn_q.c" \
   -I "$BACKEND/hvx" -o "$OUT/q2c_calib_check" "$HERE/q2c_calib_check.c" -lm
 "$OUT/q2c_calib_check"
 
+# The q2 kernel's Q prep with K's scale per dim (hexkl_attn_q2.c
+# stage_qprep_kd), extracted and run on hvx_emu: the f32 Q folded and
+# quantized in VTCM against the u16 path fed with the host's folded
+# quantization, tile bytes equal (Q2 QPREP KD OK).
+python3 "$HERE/q2c_workers_extract.py" "$BACKEND/hmx/hexkl_attn_q2.c" \
+  "$OUT/q2_qprep.inc" "item_t;" "head_t;" "seg_t;" "ctx;" now_us \
+  q_tiles_lo q_tiles_hi q_stage q_zp_of q_f32_to_u16 stage_qprep_kd
+"$cc" -std=gnu11 -O2 -fno-strict-aliasing -Wall -Wextra \
+  -Wno-unused-parameter -ffp-contract=off -include malloc.h \
+  -I "$OUT" -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." \
+  -I "$BACKEND/hvx" -I "$BACKEND/hmx" -o "$OUT/q2_qprep_check" \
+  "$HERE/q2_qprep_check.c" -lm
+"$OUT/q2_qprep_check"
+
 # weight_swap_u8i4_arena (doc 52 section 10.12): the real skel entry point
 # over the real weight registry, the arena plain aligned memory. The header
 # qaic would generate is written from the IDL, so the entry points'
