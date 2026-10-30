@@ -7427,6 +7427,24 @@ private:
     if (profile.level())
       profile.addInvokeForward(static_cast<unsigned>(stretch_start_.size()), 0,
                                r.pcycles);
+    // NNTR_HTP_PROFILE: the first tokens one line each, the summary lines
+    // being per-token means (the first token's packet runs ~3x a steady
+    // one: its misses and kinds side by side with the next tokens')
+    if (profile.level() && e.tokens <= 4) {
+      std::string kinds;
+      char buf[48];
+      for (uint32_t kd = 0; kd < HTP_OP_KIND_N; ++kd)
+        if (r.kind_us[kd] != 0) {
+          std::snprintf(buf, sizeof(buf), " %s=%u", htp_graph_kind_name(kd),
+                        r.kind_us[kd]);
+          kinds += buf;
+        }
+      std::fprintf(stderr,
+                   "[HTP] token driver: token %llu pos=%u us=%llu "
+                   "dsp_wall_us=%u misses=%u miss_us=%u kind_us:%s\n",
+                   (unsigned long long)e.tokens, pos, (unsigned long long)us,
+                   r.wall_us, r.misses, r.miss_us, kinds.c_str());
+    }
     e.last_exit_us = HtpProfile::nowUs();
     e.fwd_us += e.last_exit_us - entry_us;
   }
