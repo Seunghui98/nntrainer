@@ -147,6 +147,7 @@ void HtpMHACoreLayer::beginHtpPrompt() {
   release_quantized_cache();
   cache_index = 0;
   htp_owns_cache_ = false;
+  kv_detached_ = false;
   q_cache_failed = false;
   q2_calibrated = false;
   kv_floor_k_.clear();
@@ -772,6 +773,43 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
           dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
       });
     };
+    // [C] htpKvAdopt: the last prefill call kept the masters and freed the
+    // CPU rows, so the seed is the masters' or nothing. Rows [0, pos -
+    // cache_base) of the window are the masters' from cache_base -
+    // q_cache_base_ on (the rows the model's compaction moved past).
+    if (kv_detached_) {
+      const auto t_adopt = std::chrono::steady_clock::now();
+      NNTR_THROW_IF(q_cache_handles.empty() || q_cache_handles[0] < 0 ||
+                      pos < cache_base || cache_base < q_cache_base_,
+                    std::runtime_error)
+        << "mha_core: " << q2_name_ << " lost its int8 masters before the "
+        << "decode seed (pos=" << pos << " base=" << cache_base
+        << " masters_base=" << q_cache_base_ << ")";
+      NNTR_THROW_IF(!htpDecodeKvSeedKvqTiles(pos - cache_base,
+                                             q_cache_handles[0],
+                                             cache_base - q_cache_base_),
+                    std::runtime_error)
+        << "mha_core: " << q2_name_ << " could not seed its decode cache "
+        << "from the int8 masters, and its CPU rows are freed "
+        << "(NNTR_HTP_KV_ADOPT=1; unset it to keep them)";
+      q_cache_handles[0] = -1; // released on the DSP
+      kv_detached_ = false;
+      {
+        static double all_ms = 0.0; // [#282 F] summed, logged
+        all_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_adopt)
+                    .count();
+        ml_logi("mha_core: t1 seed pos=%u from the masters seed_ms_sum=%.1f",
+                pos, all_ms);
+      }
+      r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
+                        htp_rope_table_.data(),
+                        static_cast<unsigned>(htp_rope_table_.size()));
+      NNTR_THROW_IF(r != 1, std::runtime_error)
+        << "mha_core: the HTP attention hook asked for a seed twice at pos "
+        << pos;
+      return true;
+    }
     static const bool seed_q = [] {
       const char *v = std::getenv("NNTR_HTP_KV_SEED_Q");
       return v != nullptr && std::strcmp(v, "1") == 0;
@@ -1213,9 +1251,10 @@ void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
 }
 
 bool HtpMHACoreLayer::q2_k_per_dim() const {
+  // [C] htpKvAdopt seeds decode K from the masters: per dim, or nll +9.4 %
   static const bool on = [] {
     const char *v = std::getenv("NNTR_HTP_Q2_KDIM");
-    return v && std::strcmp(v, "1") == 0;
+    return (v && std::strcmp(v, "1") == 0) || htpKvAdopt();
   }();
   return on;
 }
@@ -1446,8 +1485,9 @@ bool HtpMHACoreLayer::try_quantized_attention(
   const bool release_prefill = nntrainer::weightPageCachePolicy() >= 0 &&
                                cache_to - cache_from > 1 &&
                                !(seed_q && std::strcmp(seed_q, "1") == 0);
-  auto release = [release_prefill](HtpMHACoreLayer *layer) {
-    if (release_prefill)
+  bool keep_q = false; // [C] handed to the decode seed (handoff below)
+  auto release = [release_prefill, &keep_q](HtpMHACoreLayer *layer) {
+    if (release_prefill && !keep_q)
       layer->release_quantized_cache();
   };
   std::unique_ptr<HtpMHACoreLayer, decltype(release)> cache_lifetime(this,
@@ -1495,6 +1535,26 @@ bool HtpMHACoreLayer::try_quantized_attention(
     release_quantized_cache();
     q_cache_failed = true;
     return false;
+  };
+
+  // [C] htpKvAdopt: the layer's last prefill call (it ends at the prompt's
+  // end) keeps its int8 cache for the decode seed, trimmed to the masters
+  // and fixed scales, and frees the CPU rows: from here the masters are the
+  // layer's only copy of the context (KVCacheManager compaction then moves
+  // its base only, HtpMHACoreLayer::kvDetached). Not taken, nothing changes.
+  auto handoff = [&](unsigned int &synced_rows, int h, bool q2) {
+    if (!htpKvAdopt() || !q2 || batch != 0 || h < 0 || !q2_k_per_dim() ||
+        q2_scales_set.empty() || !q2_scales_set[0] || synced_rows != cache_to ||
+        cache_to - cache_from < 2 || htpPrefillEnd() == 0 ||
+        cache_base + cache_to != htpPrefillEnd() ||
+        !compute_ops_->kv_cache_q_trim(h))
+      return;
+    keep_q = true;
+    kv_detached_ = true;
+    htp_owns_cache_ = true;
+    q_cache_base_ = cache_base;
+    for (const uint16_t *p : {k_base, v_base})
+      compute_ops_->drop_shared(const_cast<uint16_t *>(p));
   };
 
   if (q_cache_handles.size() <= batch) {
@@ -1600,6 +1660,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
                   "the accelerator (row-blocked, fixed scales calibrated "
                   "there, u16 context handed to the o-proj)");
         }
+        handoff(synced, handle, use_q2);
         return true;
       }
     }
@@ -1887,6 +1948,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
             kv_cache_quant_kind == 0 ? "int8" : "int4",
             use_q2 ? " (row-blocked, fixed scales)" : "");
   }
+  handoff(synced, handle, use_q2);
   return true;
 }
 

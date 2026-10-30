@@ -416,6 +416,41 @@ public:
     return getLayerKVSource(layer_idx) >= 0;
   }
 
+  /** @brief Whether any layer's K/V are views onto another layer's. */
+  bool hasKVAliasing() const {
+    for (int src : layer_kv_sources_)
+      if (src >= 0)
+        return true;
+    return false;
+  }
+
+  /** @brief Whether any layer is a ring (setLayerCaps: fewer rows than
+   *         max_seq_len, modulo-indexed) rather than a compacted window. */
+  bool hasRingLayer() const {
+    for (unsigned int l = 0; l < layer_caps_.size(); ++l)
+      if (layer_caps_[l] > 0 && layer_caps_[l] < max_seq_len_ && !windowed(l))
+        return true;
+    return false;
+  }
+
+  /**
+   * @brief [C] Marks a layer whose rows another owner holds now (an HTP
+   *        attention layer that freed them for its DSP int8 copy,
+   *        NNTR_HTP_KV_ADOPT): compact() moves its base and touches no row
+   *        -- no fold of the dropped rows' |max|, no memmove -- since the
+   *        storage is gone. Cleared by allocate().
+   */
+  void setLayerDetached(unsigned int layer_idx, bool detached) {
+    if (detached_.size() <= layer_idx)
+      detached_.resize(layer_idx + 1, false);
+    detached_[layer_idx] = detached;
+  }
+
+  /** @brief setLayerDetached's flag. */
+  bool isLayerDetached(unsigned int layer_idx) const {
+    return layer_idx < detached_.size() && detached_[layer_idx];
+  }
+
   /**
    * @brief [kv-window-ring] Set the per-layer physical row capacity. A
    * sliding-window layer under the ring stores only Wcap rows instead of
@@ -548,6 +583,7 @@ private:
   std::vector<unsigned int> layer_caps_;
   /** [HTP window] per-layer window of a compacting layer (0 = ring or full) */
   std::vector<unsigned int> keep_;
+  std::vector<bool> detached_; /**< setLayerDetached */
   /** [HTP window] per-layer absolute position of row 0 */
   std::vector<unsigned int> bases_;
   /** [HTP window] per-layer droppedAmaxK / V (empty: nothing dropped) */

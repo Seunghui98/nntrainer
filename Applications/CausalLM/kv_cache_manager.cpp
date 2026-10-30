@@ -148,6 +148,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // its last keep rows contiguous at the front (compact()); the physical
   // capacity goes through the same per-layer cap the ring uses.
   keep_.assign(num_layers, 0u);
+  detached_.clear();
   bases_.assign(num_layers, 0u);
   dropped_amax_k_.assign(num_layers, {});
   dropped_amax_v_.assign(num_layers, {});
@@ -649,6 +650,11 @@ bool KVCacheManager::compact(unsigned int pos) {
     const unsigned int from = liveFrom(l, pos);
     if (from <= bases_[l])
       continue;
+    if (isLayerDetached(l)) { // [C] the rows are gone: the base moves only
+      bases_[l] = from;
+      changed = true;
+      continue;
+    }
     const size_t w = kv_widths_[l];
     const unsigned int rows = getLayerCap(l);
     const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;

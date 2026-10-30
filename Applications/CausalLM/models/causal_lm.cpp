@@ -1036,6 +1036,24 @@ std::string CausalLM::kvCacheModelTag() const {
 }
 
 void CausalLM::compactKVCache(unsigned int pos, bool force) {
+  // [C] NNTR_HTP_KV_ADOPT: a layer that freed its rows for its DSP int8
+  // copy has its base moved and no row touched
+  if (htpKvAdopt() && kv_cache.isAllocated()) {
+    unsigned int a = 0;
+    std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                       void *)>
+      mark = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+        if (l.getType() != causallm::HtpMHACoreLayer::type ||
+            a >= kv_cache.getNumLayers())
+          return;
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+        auto *mha =
+          node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
+               : nullptr;
+        kv_cache.setLayerDetached(a++, mha && mha->kvDetached());
+      };
+    model->forEachLayer(mark, nullptr);
+  }
   if (!kv_cache.compact(pos) && !force)
     return;
   // ponytail: the n-th HTP attention layer in graph order is attention
@@ -2110,6 +2128,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       SpanHint(unsigned int s) { setPrefillSpanHint(s); }
       ~SpanHint() { setPrefillSpanHint(0); }
     } _span_hint(from_pos + n_tok);
+    // [C] NNTR_HTP_KV_ADOPT: where the prompt ends, so each HTP attention
+    // layer knows its last call there; not where another layer reads its
+    // rows (KV sharing) or a ring keeps them modulo its capacity
+    struct EndHint {
+      EndHint(unsigned int e) { htpPrefillEnd() = e; }
+      ~EndHint() { htpPrefillEnd() = 0; }
+    } _end_hint(htpKvAdopt() && !kv_cache.hasKVAliasing() &&
+                    !kv_cache.hasRingLayer()
+                  ? from_pos + n_tok
+                  : 0u);
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
     if (!resume_block_on && from_pos > 0 && n_tok > 1) {
       std::vector<float *> out;

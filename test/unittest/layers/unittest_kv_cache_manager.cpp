@@ -211,6 +211,60 @@ TEST(KVCacheManagerHybrid, compact_folds_the_dropped_rows_amax) {
   EXPECT_TRUE(m.droppedAmaxV(0).empty());
 }
 
+TEST(KVCacheManagerHybrid, compact_moves_a_detached_layers_base_only) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  // two windowed layers of 4 rows, a window of 2; layer 0's rows freed
+  // elsewhere (an HTP layer's DSP copy took them): its base moves as layer
+  // 1's does, its bytes and its dropped-rows fold stay untouched
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 4}, {2, 2});
+  EXPECT_FALSE(m.hasKVAliasing());
+  EXPECT_FALSE(m.hasRingLayer()) << "a compacted window is not a ring";
+  for (unsigned l = 0; l < 2; ++l)
+    for (auto *cache : {&m.getKeyCache(l), &m.getValueCache(l)}) {
+      auto *bits = cache->getData<uint16_t>();
+      for (unsigned i = 0; i < 8; ++i)
+        bits[i] = static_cast<uint16_t>(0x3C00 + 16 * l + i);
+    }
+  m.setLayerDetached(0, true);
+  EXPECT_TRUE(m.isLayerDetached(0));
+  EXPECT_FALSE(m.isLayerDetached(1));
+  EXPECT_FALSE(m.isLayerDetached(9));
+  EXPECT_TRUE(m.compact(4));
+  EXPECT_EQ(m.getBase(0), 2u);
+  EXPECT_EQ(m.getBase(1), 2u);
+  for (auto *cache : {&m.getKeyCache(0), &m.getValueCache(0)})
+    for (unsigned i = 0; i < 8; ++i)
+      EXPECT_EQ(cache->getData<uint16_t>()[i], 0x3C00 + i) << "touched";
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  for (auto *cache : {&m.getKeyCache(1), &m.getValueCache(1)})
+    for (unsigned i = 0; i < 4; ++i)
+      EXPECT_EQ(cache->getData<uint16_t>()[i], 0x3C00 + 16 + 4 + i);
+  EXPECT_FALSE(m.droppedAmaxK(1).empty());
+  // a new allocation forgets it
+  m = causallm::KVCacheManager{};
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 4}, {2, 2});
+  EXPECT_FALSE(m.isLayerDetached(0));
+}
+
+TEST(KVCacheManagerHybrid, ring_and_alias_queries) {
+  causallm::KVCacheManager m;
+  m.setLayerCaps({4, 0});
+  m.allocate(2, 1, 8, 2, 8, ml::train::TensorDim::DataType::FP32);
+  EXPECT_TRUE(m.hasRingLayer());
+  causallm::KVCacheManager a;
+  a.setLayerKVSources({-1, 0});
+  a.allocate(2, 1, 8, 2, 8, ml::train::TensorDim::DataType::FP32);
+  EXPECT_TRUE(a.hasKVAliasing());
+  EXPECT_FALSE(a.hasRingLayer());
+}
+
 TEST(KVCacheManagerHybrid, invalid_later_window_leaves_every_layer_unchanged) {
   causallm::KVCacheManager m;
 #ifdef ENABLE_FP16

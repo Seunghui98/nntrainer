@@ -672,7 +672,18 @@ private:
     htp_rope_table_;            /**< [max_timestep][cos hd/2 | sin hd/2] */
   bool htp_owns_cache_ = false; /**< a hook returned 1: rows past the
                                      prompt are the DSP's, not this cache's */
+  /** [C] htpKvAdopt: the last prefill call kept the int8 cache (trimmed to
+   *  its masters) and freed the CPU rows; the decode seed takes the masters,
+   *  their row 0 at absolute position q_cache_base_ */
+  bool kv_detached_ = false;
+  unsigned int q_cache_base_ = 0;
 
+public:
+  /** @brief [C] Whether the layer's CPU KV rows are gone (kv_detached_):
+   *  the model's compaction moves this layer's base only. */
+  bool kvDetached() const { return kv_detached_; }
+
+private:
   /**
    * @brief _compute frequency parameters for default ROPE
    */
