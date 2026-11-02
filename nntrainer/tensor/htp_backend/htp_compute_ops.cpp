@@ -1355,6 +1355,8 @@ public:
   void beginPrompt() {
     htp_router_handoff_invalidate(&router_handoff_);
     warmEnd(); // a generation stopped before its first token
+    if (t1_defer_pending_)
+      runAfterFirstToken(); // ... or right after it
     if (cpu_predictor_)
       cpu_predictor_->drain();
     if (pool_prefetch_)
@@ -4032,6 +4034,23 @@ public:
   /** Release prefill/seed temporaries between completed synchronous calls.
    * The public phase-boundary hook publishes kept outputs first. The token
    * driver calls here after the seed's last reader has completed. */
+  /** [#282 F] What the first token's packet leaves: the prefill's staging,
+   *  its idle readers, its heap, and the pool's growth (in that order:
+   *  the growth places slots in the room the staging leaves). */
+  void runAfterFirstToken() {
+    t1_defer_pending_ = false;
+    const uint64_t t0 = HtpProfile::nowUs();
+    releasePrefillStaging(); // [#4416 mem] the seed was the last big row
+    releaseIdlePrefillReaders();
+    purgePrefillHeap();
+    if (t1_grow_pending_) {
+      t1_grow_pending_ = false;
+      growPool();
+    }
+    std::fprintf(stderr, "[HTP] t1: after-token cleanups ms=%.1f\n",
+                 (HtpProfile::nowUs() - t0) / 1000.0);
+  }
+
   void releasePrefillStaging() {
     htp_router_handoff_invalidate(&router_handoff_);
     constexpr size_t keep_bytes = size_t(64) << 10;
@@ -4824,6 +4843,12 @@ public:
                      ms[3], ms[4], ms[5]);
       }
     } init_line{t_init};
+    // [#282 F] the first token's timeline (tokenForward prints it)
+    struct T1Mark {
+      uint64_t &end;
+      ~T1Mark() { end = HtpProfile::nowUs(); }
+    } t1_mark{t1_gi1_};
+    t1_gi0_ = t_init;
     if (e2e_ && !q4m1_bound_)
       e2ePlaceFc(); // a caller that never ran finish_decode_graph_q4_0
     init_line.at[0] = HtpProfile::nowUs();
@@ -4850,7 +4875,7 @@ public:
       }
     }
     init_line.at[2] = HtpProfile::nowUs();
-    size_t param_bytes = 0, param_staged = 0;
+    size_t param_bytes = 0;
     // [plan 201 S1] each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
@@ -4861,31 +4886,10 @@ public:
                    static_cast<unsigned>(t.size()),
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
-      // [plan 201 S4] the parameters the model handed at load, by name.
-      // Through one ION buffer when they are large: FastRPC maps an rpcmem
-      // argument instead of copying it, and the 30 routers of Gemma 4
-      // (43 MB of f32) were 38 ms of the first token's graph init on S26
-      // Ultra. NNTR_HTP_PARAM_ION=0 hands the host arrays as before.
-      static const bool param_ion = [] {
-        const char *v = std::getenv("NNTR_HTP_PARAM_ION");
-        return v == nullptr || std::strcmp(v, "0") != 0;
-      }();
-      size_t param_max = 0;
-      for (const LoadParam &p : load_params_)
-        param_max = std::max(param_max, size_t(p.n) * sizeof(float));
-      std::unique_ptr<HtpRpcBuffer> param_buf;
-      if (param_ion && param_max >= kParamIonMin)
-        param_buf = std::make_unique<HtpRpcBuffer>(param_max);
+      // [plan 201 S4] the parameters the model handed at load, by name
       for (const LoadParam &p : load_params_) {
-        const size_t bytes = size_t(p.n) * sizeof(float);
-        const float *src = p.data;
-        if (param_buf && param_buf->isIon() && bytes >= kParamIonMin) {
-          std::memcpy(param_buf->data(), p.data, bytes);
-          src = reinterpret_cast<const float *>(param_buf->data());
-          param_staged += bytes;
-        }
-        param_bytes += bytes;
-        setParam(session, p.op, p.which, src, p.n, p.n, "load parameter");
+        param_bytes += size_t(p.n) * sizeof(float);
+        setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
         const auto q = static_quant_.find(p.data);
         if (p.which == HTP_GRAPH_PARAM_ROUTER_W && q != static_quant_.end()) {
           const float grid[] = {q->second.scale,
@@ -4928,12 +4932,18 @@ public:
     }
     graph_inited_ = true;
     init_line.at[3] = HtpProfile::nowUs();
-    std::fprintf(stderr,
-                 "[HTP] t1: graph_init params=%zu mib=%.1f staged_ion_mib=%.1f "
-                 "ms=%.1f\n",
-                 load_params_.size(), param_bytes / 1048576.0,
-                 param_staged / 1048576.0,
-                 (init_line.at[3] - init_line.at[2]) / 1000.0);
+    {
+      // the DSP's share of the params stage (graph_set_param's own time;
+      // the rest is the round trips and the argument copies)
+      uint32_t si[13] = {0};
+      const bool dsp = nntr_hvx_session_info(session, si, 13) == AEE_SUCCESS;
+      std::fprintf(stderr,
+                   "[HTP] t1: graph_init params=%zu mib=%.1f ms=%.1f "
+                   "dsp_ms=%.1f\n",
+                   load_params_.size(), param_bytes / 1048576.0,
+                   (init_line.at[3] - init_line.at[2]) / 1000.0,
+                   dsp ? si[12] / 1000.0 : -1.0);
+    }
     memLine("t1 after graph init");
     char names[128];
     std::fprintf(stderr, "[HTP] graph: init n_ops=%u resident=%s moe_ops=%zu\n",
@@ -7504,9 +7514,14 @@ private:
                static_cast<unsigned>(ban_.size()), "LM_BAN");
       ban_sent_ = ban_;
     }
+    const uint64_t ps0 = HtpProfile::nowUs();
     if (!pool_descs_.empty())
       poolSync(); // [plan 201 S1]
+    const uint64_t ps1 = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(invoke_mutex_);
+    if (t1_defer_pending_)
+      runAfterFirstToken(); // the second token: the first one's cleanups,
+                            // under the lock they ran under before
     htp_router_handoff_invalidate(&router_handoff_);
     std::memcpy(q.act->data(), act, act_bytes);
     const uint32_t tok = e.tok++;
@@ -7632,18 +7647,41 @@ private:
     e.inout_us += static_cast<int32_t>(r.t_out_us - r.t_in_us);
     ++fwd_calls_; // one ARM -> DSP packet per token: calls/token = 1.00
     ++fwd_tokens_;
-    if (++prompt_tokens_ == 1) {
-      releasePrefillStaging(); // [#4416 mem] the seed was the last big row
-      releaseIdlePrefillReaders();
-      purgePrefillHeap();
-    }
-    if (e.tokens == 1)
+    const bool first = ++prompt_tokens_ == 1;
+    // [#282 F] the first token's cleanups -- the prefill's staging, its
+    // readers, its heap, then the pool's growth -- run before the second
+    // token instead, after the first is out (NNTR_HTP_T1_DEFER=0: here)
+    static const bool t1_defer = [] {
+      const char *v = std::getenv("NNTR_HTP_T1_DEFER");
+      return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    const uint64_t cl0 = HtpProfile::nowUs();
+    if (first) {
+      t1_grow_pending_ = e.tokens == 1;
+      if (t1_defer)
+        t1_defer_pending_ = true;
+      else
+        runAfterFirstToken();
+    } else if (e.tokens == 1) {
       growPool();
-    if (e.tokens == 1)
+    }
+    if (e.tokens == 1) {
       std::fprintf(stderr,
                    "[HTP] token driver: first token pos=%u id=%u us=%llu "
                    "logits=%d\n",
                    pos, r.id, (unsigned long long)us, logits);
+      auto ms = [](uint64_t a, uint64_t b) {
+        return b > a ? (b - a) / 1000.0 : 0.0;
+      };
+      // from the graph init's start: the graph init, the model's rows up
+      // to this token's packet, the pool sync, the packet, the cleanups
+      std::fprintf(stderr,
+                   "[HTP] t1: timeline_ms graph_init=%.1f to_token=%.1f "
+                   "pool_sync=%.1f to_packet=%.1f packet=%.1f cleanup=%.1f%s\n",
+                   ms(t1_gi0_, t1_gi1_), ms(t1_gi1_, entry_us), ms(ps0, ps1),
+                   ms(ps1, t0), us / 1000.0, ms(cl0, HtpProfile::nowUs()),
+                   t1_defer_pending_ ? " (deferred to the second token)" : "");
+    }
     HtpProfile &profile = HtpProfile::global();
     if (profile.level())
       profile.addInvokeForward(static_cast<unsigned>(stretch_start_.size()), 0,
@@ -11561,6 +11599,9 @@ private:
    *  DSP time (printed with the t1 seed line) */
   uint32_t prefill_seeds_ = 0;
   uint64_t prefill_seed_us_ = 0;
+  uint64_t t1_gi0_ = 0, t1_gi1_ = 0; /**< [#282 F] graph init's window */
+  bool t1_defer_pending_ = false;    /**< runAfterFirstToken still owed */
+  bool t1_grow_pending_ = false;     /**< ...and the pool's growth with it */
   bool attn_registered_ = false;
   uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */
   /** [plan 201 S4] per attention ordinal its op, its session cache (0, or
@@ -11574,8 +11615,6 @@ private:
     const float *data;
     uint32_t n;
   };
-  /** A load parameter this large goes through the graph init's ION buffer */
-  static constexpr size_t kParamIonMin = size_t(64) << 10;
   std::vector<LoadParam> load_params_;
   uint32_t seed_ordinal_ = HTP_GRAPH_NO_OP;
   uint32_t pending_op_ = HTP_GRAPH_NO_OP;

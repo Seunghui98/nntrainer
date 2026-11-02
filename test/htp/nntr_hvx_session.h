@@ -116,6 +116,8 @@ typedef struct {
   uint64_t seed_rpc_us;       /**< [C] attn_m1_seed_kvq_tiles' time on the DSP,
                                    and its calls (session_info, 12 words) */
   uint32_t seed_rpcs;
+  uint64_t param_us;          /**< [#282 F] graph_set_param's time on the DSP
+                                   (session_info, 13 words) */
   struct nntr_hvx_dspq *dspq; /**< [#141] the MoE call's dspqueue thread
                                  (nntr_hvx_dspq.c); NULL = no queue.
                                  Stopped first in close() */

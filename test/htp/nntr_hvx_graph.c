@@ -17,6 +17,7 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <HAP_perf.h>
 #include <remote.h>
 
 #include "hexkl_graph.h"
@@ -102,7 +103,9 @@ int nntr_hvx_graph_set_param(remote_handle64 handle, uint32 op, uint32 which,
   if (dataLen < 0) {
     return AEE_EINVALIDFORMAT;
   }
+  const uint64_t t0 = HAP_perf_get_time_us();
   rc = hexkl_graph_set_param(s->graph, op, which, data, (uint32_t)dataLen);
+  s->param_us += HAP_perf_get_time_us() - t0;
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "graph_set_param: op=%u which=%u n=%d: %s (0x%08x)",
          (unsigned)op, (unsigned)which, dataLen, htp_graph_err_name(rc),

@@ -2577,10 +2577,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                      ms(t1_gen, step_end));
       }
       decode_step_mark = step_end;
-      if (perf_split_first_out.time_since_epoch().count() == 0) {
+      if (perf_split_first_out.time_since_epoch().count() == 0)
         perf_split_first_out = step_end;
+      // the first step's end, whether or not a streamer already stamped
+      // perf_split_first_out (it does, at the token's hand-out)
+      if (t1_split)
         FootprintSampler::get().phase(FootprintSampler::kDecode);
-      }
     }
 #if defined(ENABLE_OPENCL)
     nntrainer::opencl::clLaunchStatTick();

@@ -80,7 +80,7 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (resLen != 7 && resLen != 8 && resLen != 12) {
+  if (resLen != 7 && resLen != 8 && resLen != 12 && resLen != 13) {
     return AEE_EINVALIDFORMAT;
   }
   if (HAP_query_avail_VTCM) {
@@ -127,6 +127,11 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
     res[11] = (inl << 16) | (hits & 0xFFFFu);
     s->seed_rpc_us = 0;
     s->seed_rpcs = 0;
+  }
+  if (resLen == 13) {
+    /** [#282 F] graph_set_param's DSP time since the last such read */
+    res[12] = (uint32)s->param_us;
+    s->param_us = 0;
   }
   return AEE_SUCCESS;
 }
