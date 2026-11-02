@@ -113,6 +113,9 @@ typedef struct {
                                  shape (Gemma 4's full layers): the second
                                  attn_m1_register of a different shape;
                                  freed with attn_m1 */
+  uint64_t seed_rpc_us;       /**< [C] attn_m1_seed_kvq_tiles' time on the DSP,
+                                   and its calls (session_info, 12 words) */
+  uint32_t seed_rpcs;
   struct nntr_hvx_dspq *dspq; /**< [#141] the MoE call's dspqueue thread
                                  (nntr_hvx_dspq.c); NULL = no queue.
                                  Stopped first in close() */

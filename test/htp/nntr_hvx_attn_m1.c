@@ -21,6 +21,7 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <HAP_perf.h>
 #include <remote.h>
 #include <string.h>
 
@@ -215,12 +216,16 @@ int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
   /* [C] on the pool's background lane: the tiles are built under the
      prefill's next calls, and the cache is released once they are
      (seed_release_kvq, from a reap or the layer's first forward) */
+  const uint64_t t0 = HAP_perf_get_time_us();
   hvx_attn_m1_seed_reap(s->attn_m1, 0);
   hvx_attn_m1_seed_reap(s->attn_m1_b, 0);
-  return hvx_attn_m1_seed_q8_tiles_async(
+  const int rc = hvx_attn_m1_seed_q8_tiles_async(
     c, layer, n_rows, kv->kt4, kv->v4, (size_t)kv->max_rows * kv->head_dim,
     shift, kv->fs_kd, kv->fs_k_inv, kv->fs_v, kv->fs_v_inv, seed_release_kvq, s,
     kv_handle);
+  s->seed_rpc_us += HAP_perf_get_time_us() - t0;
+  ++s->seed_rpcs;
+  return rc;
 }
 
 int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,

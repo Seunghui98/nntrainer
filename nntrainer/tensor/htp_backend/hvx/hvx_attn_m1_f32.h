@@ -144,6 +144,16 @@ typedef struct {
   /** [C] [n_layers] seeds on the pool's background lane
    *  (hvx_attn_m1_seed_q8_tiles_async); NULL until the first */
   struct hvx_attn_m1_seed_bg *seed_bg;
+  /** [C] the thread that allocates the layer after a seed's, one ahead
+   *  (hvx_attn_m1_seed_q8_tiles_async); NULL until the first seed */
+  struct hvx_attn_m1_pre *pre;
+  /** [C] [n_layers] 1: allocated ahead, not yet written (a seed writes
+   *  every tile; layer_alloc zero-fills it first otherwise) */
+  uint8_t *unfilled;
+  /** [C] seeds whose layer the thread had allocated / that allocated it
+   *  themselves, and the microseconds of each kind of allocation */
+  uint32_t pre_hits, pre_inline;
+  uint64_t pre_us, inline_us;
 } hvx_attn_m1_ctx;
 
 /** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */

@@ -1705,6 +1705,125 @@ static void check_seed_q8_tiles_async(hvx_worker_pool *const *pools) {
   }
 }
 
+/** [C] The allocation thread one layer ahead of the seeds: each seed after
+ *  a ctx's first finds its layer allocated (pre_hits), the layers equal
+ *  the synchronous seed's bytes, and a layer allocated ahead but never
+ *  seeded is zero-filled at its first append (unfilled), as a lazy layer
+ *  is: its forward equals a fresh ctx's. A free with an allocation in
+ *  flight stops the thread. */
+static void check_seed_prealloc(hvx_worker_pool *const *pools) {
+  const uint32_t n_kv = 2u, hd = 256u, max_seq = 256u, L = 130u;
+  const size_t hs = (size_t)max_seq * hd, n = (size_t)n_kv * hd;
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float *sc = (float *)malloc(4u * n * sizeof(float));
+  float *q = (float *)malloc(2u * n * sizeof(float));
+  float *kv = (float *)malloc(2u * n * sizeof(float));
+  float *ya = (float *)malloc(2u * n * sizeof(float));
+  float *yb = (float *)malloc(2u * n * sizeof(float));
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)(i * 2654435761u >> 13);
+    v8[i] = (uint8_t)(i * 40503u >> 7);
+  }
+  for (size_t i = 0; i < 4u * n; ++i)
+    sc[i] = 0.003f * (float)(1u + i % 251u);
+  for (size_t i = 0; i < 2u * n; ++i) {
+    q[i] = 0.01f * (float)((int)(i % 201u) - 100);
+    kv[i] = 0.02f * (float)((int)(i % 97u) - 48);
+  }
+  const uint32_t flags = max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY;
+  int bad = 0;
+  for (int pi = 0; pi < 3; ++pi) {
+    int err = 0;
+    hvx_attn_m1_ctx *a =
+      hvx_attn_m1_create(3u, n_kv, 2u, hd, flags, pools[pi], &err);
+    hvx_attn_m1_ctx *r =
+      hvx_attn_m1_create(3u, n_kv, 2u, hd, flags, pools[pi], &err);
+    CHECK(a && r, "seed prealloc: create");
+    if (!a || !r) {
+      hvx_attn_m1_free(a);
+      hvx_attn_m1_free(r);
+      continue;
+    }
+    int calls = 0, cb = 0;
+    for (uint32_t l = 0; l < 3u; ++l) {
+      cb |= hvx_attn_m1_seed_q8_tiles_async(
+              a, l, L, k8, v8, hs, 0u, sc, sc + n, sc + 2u * n, sc + 3u * n,
+              count_done, &calls, l) != AEE_SUCCESS;
+      hvx_attn_m1_seed_reap(a, 1);
+    }
+    /* the reference: each layer seeded synchronously */
+    for (uint32_t l = 0; l < 3u; ++l) {
+      cb |= hvx_attn_m1_seed_q8_tiles(r, l, L, k8, v8, hs, 0u, sc, sc + n,
+                                      sc + 2u * n, sc + 3u * n) != AEE_SUCCESS;
+      cb |= memcmp(a->kt[l], r->kt[l], a->layer_bytes) != 0 ||
+            memcmp(a->v[l], r->v[l], a->layer_bytes) != 0;
+    }
+    cb |= a->pre_hits != 2u || a->pre_inline != 1u || calls != 3 ||
+          r->pre_hits != 2u;
+    CHECK(cb == 0,
+          "seed prealloc pool %d: hits %u inline %u calls %d, or the layers "
+          "differ",
+          pi, a->pre_hits, a->pre_inline, calls);
+    bad += cb;
+    hvx_attn_m1_free(a);
+    hvx_attn_m1_free(r);
+    /* layer 1 allocated ahead, then run without a seed */
+    hvx_attn_m1_ctx *d =
+      hvx_attn_m1_create(2u, n_kv, 2u, hd, flags, pools[pi], &err);
+    hvx_attn_m1_ctx *e =
+      hvx_attn_m1_create(2u, n_kv, 2u, hd, flags, pools[pi], &err);
+    CHECK(d && e, "seed prealloc: create d / e");
+    if (!d || !e) {
+      hvx_attn_m1_free(d);
+      hvx_attn_m1_free(e);
+      continue;
+    }
+    cb = hvx_attn_m1_seed_q8_tiles_async(d, 0u, L, k8, v8, hs, 0u, sc, sc + n,
+                                         sc + 2u * n, sc + 3u * n, count_done,
+                                         &calls, 9u) != AEE_SUCCESS;
+    hvx_attn_m1_seed_reap(d, 1); /* and the thread's allocation */
+    cb |= !d->kt[1] || !d->unfilled || d->unfilled[1] != 1u;
+    if (d->kt[1] && d->v[1]) { /* what a reused block may hold */
+      memset(d->kt[1], 0x5A, d->layer_bytes);
+      memset(d->v[1], 0xA5, d->layer_bytes);
+    }
+    const int rd =
+      hvx_attn_m1_forward(d, 1u, 0u, 0u, 0.0625f, q, kv, kv + n, ya, NULL);
+    const int re =
+      hvx_attn_m1_forward(e, 1u, 0u, 0u, 0.0625f, q, kv, kv + n, yb, NULL);
+    cb |= rd != AEE_SUCCESS || re != AEE_SUCCESS ||
+          (d->unfilled && d->unfilled[1] != 0u) ||
+          memcmp(ya, yb, 2u * n * sizeof(float)) != 0 ||
+          memcmp(d->kt[1], e->kt[1], d->layer_bytes) != 0;
+    CHECK(cb == 0,
+          "seed prealloc pool %d: a layer allocated ahead and not seeded "
+          "differs from a fresh one (rc %d %d)",
+          pi, rd, re);
+    bad += cb;
+    hvx_attn_m1_free(e);
+    /* a free right after a seed: the thread may be allocating layer 1 */
+    hvx_attn_m1_ctx *f =
+      hvx_attn_m1_create(2u, n_kv, 2u, hd, flags, pools[pi], &err);
+    CHECK(f && hvx_attn_m1_seed_q8_tiles_async(
+                 f, 0u, L, k8, v8, hs, 0u, sc, sc + n, sc + 2u * n, sc + 3u * n,
+                 count_done, &calls, 10u) == AEE_SUCCESS,
+          "seed prealloc: submit then free");
+    hvx_attn_m1_free(f);
+    hvx_attn_m1_free(d);
+  }
+  free(k8);
+  free(v8);
+  free(sc);
+  free(q);
+  free(kv);
+  free(ya);
+  free(yb);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED PREALLOC OK\n");
+  }
+}
+
 /** [NNTR_HTP_Q2_KDIM] With K's prefill scale per (head, dim) the int8
  *  masters are the decode cache's own bytes: masters quantized as the
  *  prefill appends them (rint(x / s), s = amax / 127, hexkl_kv_q's rule)
@@ -2337,6 +2456,7 @@ int main(void) {
   check_seed_q8_kd(pools[2]);
   check_seed_q8_tiles(pools);
   check_seed_q8_tiles_async(pools);
+  check_seed_prealloc(pools);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);

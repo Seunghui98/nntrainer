@@ -72,6 +72,7 @@
 #include <HAP_perf.h>
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
+#include <qurt.h>
 
 #include "attn_m1_det.h"
 #include "hvx_attn_m1_hf.h"
@@ -238,12 +239,16 @@ out:
   return ctx;
 }
 
+static void pre_stop(hvx_attn_m1_ctx *ctx);
+
 void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   if (!ctx) {
     return;
   }
   hvx_attn_m1_seed_reap(ctx, 1); /* [C] no unit may outlive the tiles */
+  pre_stop(ctx);                 /* nor an allocation the layers */
   free(ctx->seed_bg);
+  free(ctx->unfilled);
   free(ctx->psum);
   free(ctx->q16);
   free(ctx->sf);
@@ -273,10 +278,141 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   free(ctx);
 }
 
+/** [C] The allocation thread: the layer after a seed's is allocated while
+    the prefill runs on, so the next seed's RPC -- which the prefill waits
+    for -- does not grow the DSP heap itself (S26 Ultra, Gemma 4: 275 MiB
+    over the 30 layers; the switch off pays the same at the graph init,
+    59-75 ms with the zero fill). One layer ahead: the heap holds one
+    layer's cache early, not all of them (round 7's peak). */
+struct hvx_attn_m1_pre {
+  hvx_attn_m1_ctx *ctx;
+  qurt_thread_t tid;
+  unsigned char *stack;
+  _Atomic int32_t want; /**< the layer queued; PRE_IDLE, PRE_STOP */
+};
+#define PRE_IDLE (-1)
+#define PRE_STOP (-2)
+#define PRE_STACK (32u * 1024u)
+
+static int layer_alloc_raw(hvx_attn_m1_ctx *ctx, uint32_t l, int fill);
+
+static void pre_thread(void *arg) {
+  struct hvx_attn_m1_pre *p = (struct hvx_attn_m1_pre *)arg;
+  for (;;) {
+    const int32_t l = atomic_load_explicit(&p->want, memory_order_acquire);
+    if (l == PRE_STOP) {
+      break;
+    }
+    if (l == PRE_IDLE) {
+      qurt_futex_wait(&p->want, PRE_IDLE);
+      continue;
+    }
+    const uint64_t t0 = HAP_perf_get_qtimer_count();
+    /* a failure leaves the layer to its seed, which allocates inline */
+    if (layer_alloc_raw(p->ctx, (uint32_t)l, 0) == AEE_SUCCESS) {
+      p->ctx->unfilled[l] = 1u;
+    }
+    /* ponytail: read by session_info after the graph init's reap, which
+       waits for this thread to be idle; a read mid-prefill could tear */
+    p->ctx->pre_us +=
+      HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+    atomic_store_explicit(&p->want, PRE_IDLE, memory_order_release);
+    qurt_futex_wake(&p->want, 2);
+  }
+  qurt_thread_exit(0);
+}
+
+/** @brief Until the thread is done with layer @a l (if it is on it). */
+static void pre_wait(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  struct hvx_attn_m1_pre *p = ctx->pre;
+  if (!p) {
+    return;
+  }
+  int32_t w;
+  while ((w = atomic_load_explicit(&p->want, memory_order_acquire)) ==
+         (int32_t)l) {
+    qurt_futex_wait(&p->want, w);
+  }
+}
+
+/** @brief Queues layer @a l to the thread (started at the first call),
+ *         unless it is allocated or the thread is busy. */
+static void pre_request(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  if (l >= ctx->n_layers || (ctx->kt[l] && ctx->v[l])) {
+    return;
+  }
+  if (!ctx->pre) {
+    struct hvx_attn_m1_pre *p = (struct hvx_attn_m1_pre *)calloc(1, sizeof(*p));
+    if (!ctx->unfilled) {
+      ctx->unfilled = (uint8_t *)calloc(ctx->n_layers, 1);
+    }
+    if (!p || !ctx->unfilled || !(p->stack = memalign(64, PRE_STACK))) {
+      free(p);
+      return; /* the seeds allocate inline */
+    }
+    p->ctx = ctx;
+    atomic_init(&p->want, PRE_IDLE);
+    qurt_thread_attr_t attr;
+    qurt_thread_attr_init(&attr);
+    qurt_thread_attr_set_stack_size(&attr, PRE_STACK);
+    qurt_thread_attr_set_stack_addr(&attr, p->stack);
+    int prio = qurt_thread_get_priority(qurt_thread_get_id());
+    qurt_thread_attr_set_priority(&attr, (unsigned short)(prio < 1 ? 1 : prio));
+    qurt_thread_attr_set_name(&attr, "attnm1pre");
+    if (qurt_thread_create(&p->tid, &attr, pre_thread, p) != 0) {
+      free(p->stack);
+      free(p);
+      return;
+    }
+    ctx->pre = p;
+  }
+  int32_t idle = PRE_IDLE;
+  if (atomic_compare_exchange_strong_explicit(&ctx->pre->want, &idle,
+                                              (int32_t)l, memory_order_release,
+                                              memory_order_relaxed)) {
+    qurt_futex_wake(&ctx->pre->want, 1);
+  }
+}
+
+/** @brief Until the thread has no allocation in hand. */
+static void pre_idle(hvx_attn_m1_ctx *ctx) {
+  struct hvx_attn_m1_pre *p = ctx->pre;
+  int32_t w;
+  while (p && (w = atomic_load_explicit(&p->want, memory_order_acquire)) >= 0) {
+    qurt_futex_wait(&p->want, w);
+  }
+}
+
+static void pre_stop(hvx_attn_m1_ctx *ctx) {
+  struct hvx_attn_m1_pre *p = ctx->pre;
+  if (!p) {
+    return;
+  }
+  pre_idle(ctx);
+  atomic_store_explicit(&p->want, PRE_STOP, memory_order_release);
+  qurt_futex_wake(&p->want, 1);
+  int status;
+  qurt_thread_join(p->tid, &status);
+  free(p->stack);
+  free(p);
+  ctx->pre = NULL;
+}
+
 /** @brief [#289] A lazy layer's kt / v, allocated and zeroed on first use
  *  (not zeroed with @a fill 0: the caller writes every byte); a no-op for
- *  an allocated one. */
+ *  an allocated one -- zeroed then if the thread allocated it and no seed
+ *  wrote it. */
 static int layer_alloc_fill(hvx_attn_m1_ctx *ctx, uint32_t l, int fill) {
+  pre_wait(ctx, l);
+  if (fill && ctx->unfilled && ctx->unfilled[l]) {
+    memset(ctx->kt[l], 0, ctx->layer_bytes);
+    memset(ctx->v[l], 0, ctx->layer_bytes);
+    ctx->unfilled[l] = 0u;
+  }
+  return layer_alloc_raw(ctx, l, fill);
+}
+
+static int layer_alloc_raw(hvx_attn_m1_ctx *ctx, uint32_t l, int fill) {
   if (ctx->kt[l] && ctx->v[l]) {
     return AEE_SUCCESS;
   }
@@ -905,6 +1041,9 @@ static void seed_join(hvx_attn_m1_ctx *ctx, uint32_t layer) {
 }
 
 void hvx_attn_m1_seed_reap(hvx_attn_m1_ctx *ctx, int wait) {
+  if (ctx && wait) {
+    pre_idle(ctx); /* the graph init: no allocation left in flight */
+  }
   if (!ctx || !ctx->seed_bg) {
     return;
   }
@@ -943,10 +1082,23 @@ int hvx_attn_m1_seed_q8_tiles_async(
   /* every tile of the layer: the seed's, then zeros as layer_alloc's */
   const uint32_t units = ctx->n_kv * tiles_of(ctx->seq);
   b->done = (uint8_t *)calloc(units, 1u);
+  pre_wait(ctx, layer);
+  const int ahead = ctx->kt[layer] && ctx->v[layer];
+  const uint64_t t0 = HAP_perf_get_qtimer_count();
   if (!b->done || layer_alloc_fill(ctx, layer, 0) != AEE_SUCCESS) {
     free(b->done);
     b->done = NULL;
     return AEE_ENOMEMORY;
+  }
+  if (ahead) {
+    ++ctx->pre_hits;
+  } else {
+    ++ctx->pre_inline;
+    ctx->inline_us +=
+      HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+  }
+  if (ctx->unfilled) {
+    ctx->unfilled[layer] = 0u; /* the units write every tile */
   }
   const size_t base = (size_t)layer * ctx->n_kv * hd;
   for (size_t x = 0; x < (size_t)ctx->n_kv * hd; ++x) {
@@ -970,6 +1122,7 @@ int hvx_attn_m1_seed_q8_tiles_async(
   b->token = token;
   b->live = 1;
   hvx_worker_pool_submit_bg(ctx->pool, &b->job);
+  pre_request(ctx, layer + 1u);
   return AEE_SUCCESS;
 }
 

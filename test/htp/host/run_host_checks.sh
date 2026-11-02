@@ -776,13 +776,18 @@ done
 # of seed_q8_tiles (ATTN M1 SEED Q8 TILES OK): the zips in the wrong order,
 # the window shift dropped, V's rows past the seed left unzeroed; one of
 # the background seed (ATTN M1 SEED Q8 ASYNC OK): its done callback never
-# called, so its prefill cache would never be released.
+# called, so its prefill cache would never be released; and two of the
+# allocation thread (ATTN M1 SEED PREALLOC OK): the next layer never
+# queued to it, and a layer it allocated left unzeroed when no seed writes
+# it.
 for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L + 1u, window);/' \
   's/      hvx_hf_round_row(v + i);/      hvx_hf_round_row(k + i);/' \
   's/  for (uint32_t b = TILE \/ 2u; b >= 1u; b >>= 1) {/  for (uint32_t b = 1u; b < TILE; b <<= 1) {/' \
   's/  const size_t at = h \* job->head_stride + (size_t)(job->shift + p0) \* hd;/  const size_t at = h * job->head_stride + (size_t)p0 * hd;/' \
   's/    b->fn(b->arg, b->token);/    (void)b;/' \
-  's/      d\[m\] = p < np ? Q6_V_vxor_VV(src\[m\], x80) : Q6_V_vzero();/      d[m] = Q6_V_vxor_VV(src[m], x80);/'; do
+  's/      d\[m\] = p < np ? Q6_V_vxor_VV(src\[m\], x80) : Q6_V_vzero();/      d[m] = Q6_V_vxor_VV(src[m], x80);/' \
+  's/  pre_request(ctx, layer + 1u);/  (void)0;/' \
+  's/  if (fill \&\& ctx->unfilled \&\& ctx->unfilled\[l\]) {/  if (0) {/'; do
   sed "$mut" "$BACKEND/hvx/hvx_attn_m1_f32.c" > "$OUT/hvx_attn_m1_mut.c"
   if cmp -s "$OUT/hvx_attn_m1_mut.c" "$BACKEND/hvx/hvx_attn_m1_f32.c"; then
     echo "ATTN M1 MUTATION DID NOT APPLY: $mut"; exit 1

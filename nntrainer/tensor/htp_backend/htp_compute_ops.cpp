@@ -4187,6 +4187,19 @@ public:
                    (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0, seed_calls_,
                    seed_kvq_, left, prefill_seeds_, prefill_seed_us_ / 1000.0,
                    rssMib(), memAvailMib());
+      uint32_t si[12] = {0};
+      if (prefill_seeds_ != 0 &&
+          nntr_hvx_session_info(
+            static_cast<remote_handle64>(HtpBackend::global().handle()), si,
+            12) == AEE_SUCCESS)
+        // [C] where prefill_seed_ms goes: the RPCs' DSP time (the rest is
+        // the round trips), and the decode layers' allocations, inline in
+        // a seed or by the DSP thread one layer ahead (off the prefill)
+        std::fprintf(stderr,
+                     "[HTP] t1: prefill_seed dsp_ms=%.1f alloc inline=%u "
+                     "(%.1f ms) ahead=%u (%.1f ms)\n",
+                     si[8] / 1000.0, si[11] >> 16, si[9] / 1000.0,
+                     si[11] & 0xFFFFu, si[10] / 1000.0);
     }
     // ponytail: a generation's decode loads stay cached until the next
     // prefill (<= misses x 5.3 MiB: 0.7 GiB at G = 1024); a drop per N
