@@ -1859,6 +1859,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // model->resetInputDimension(input_dims);
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
+  FootprintSampler::get().phase(FootprintSampler::kPrefill);
 
   std::vector<float *> output;
 
@@ -2378,6 +2379,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   for (auto *ops : prefill_backends)
     ops->release_prefill_scratch();
   auto finish_prefill = std::chrono::high_resolution_clock::now();
+  FootprintSampler::get().phase(FootprintSampler::kFirstToken);
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
 
@@ -2575,8 +2577,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                      ms(t1_gen, step_end));
       }
       decode_step_mark = step_end;
-      if (perf_split_first_out.time_since_epoch().count() == 0)
+      if (perf_split_first_out.time_since_epoch().count() == 0) {
         perf_split_first_out = step_end;
+        FootprintSampler::get().phase(FootprintSampler::kDecode);
+      }
     }
 #if defined(ENABLE_OPENCL)
     nntrainer::opencl::clLaunchStatTick();
@@ -2679,6 +2683,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::cout << "peak memory: " << peak_memory << " KB\n";
     std::cout << "  (honest RssAnon+accel: " << honest_kb
               << " KB, ru_maxrss: " << maxrss_kb << " KB)\n";
+    {
+      // which phase sets the peak (each phase's own, sampled per tick)
+      FootprintSampler &fs = FootprintSampler::get();
+      std::cout << "  (peak by phase KB: load "
+                << fs.phasePeakKb(FootprintSampler::kLoad) << ", prefill "
+                << fs.phasePeakKb(FootprintSampler::kPrefill)
+                << ", first_token "
+                << fs.phasePeakKb(FootprintSampler::kFirstToken) << ", decode "
+                << fs.phasePeakKb(FootprintSampler::kDecode) << ")\n";
+    }
     std::cout << "==========================================================\n";
   }
 
