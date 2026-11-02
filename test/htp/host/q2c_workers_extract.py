@@ -8,7 +8,7 @@ typedef struct (`} name;`), any other a static function."""
 import re
 import sys
 
-Q2C = ("q2c_ctx;", "q2c_worker", "q2c_worker_kd", "q2c_q_range_kd")
+Q2C = ("q2c_ctx;", "q2c_worker", "q2c_worker_kd", "q2c_worker_kd_q")
 
 
 def block(text, start):
