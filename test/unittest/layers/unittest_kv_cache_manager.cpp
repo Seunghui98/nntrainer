@@ -253,6 +253,28 @@ TEST(KVCacheManagerHybrid, compact_moves_a_detached_layers_base_only) {
   EXPECT_FALSE(m.isLayerDetached(0));
 }
 
+TEST(KVCacheManagerHybrid, base_after_compact_is_what_compact_leaves) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  // layer 0 windowed (8 rows, keep 4), layer 1 full
+  m.allocate(2, 1, 16, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {8, 16}, {4, 0});
+  for (unsigned pos : {2u, 4u, 5u, 7u, 8u}) {
+    const unsigned want0 = m.baseAfterCompact(0, pos);
+    const unsigned want1 = m.baseAfterCompact(1, pos);
+    m.compact(pos);
+    EXPECT_EQ(m.getBase(0), want0) << "pos " << pos;
+    EXPECT_EQ(m.getBase(1), want1) << "pos " << pos;
+  }
+  EXPECT_EQ(m.getBase(0), 4u);
+  EXPECT_EQ(m.baseAfterCompact(0, 6u), 4u) << "a base never moves back";
+  EXPECT_EQ(m.getBase(1), 0u);
+}
+
 TEST(KVCacheManagerHybrid, ring_and_alias_queries) {
   causallm::KVCacheManager m;
   m.setLayerCaps({4, 0});

@@ -880,6 +880,25 @@ public:
     return false;
   }
 
+  // [C] NNTR_HTP_KV_ADOPT: registers the decode attention caches now,
+  // before the prefill (set_decode_kv_window first), so each layer's last
+  // prefill call can seed its decode cache (decode_kv_seed_kvq_layer)
+  // instead of keeping its int8 cache to the first token. False: not
+  // registered, the seeds wait for the first token.
+  virtual bool decode_kv_prepare() { return false; }
+
+  // [C] decode_kv_seed_kvq_tiles for attention layer @a ordinal (graph
+  // order) during the prefill, outside any decode hook: needs
+  // decode_kv_prepare. The handle is released on success.
+  virtual bool decode_kv_seed_kvq_layer(unsigned ordinal, unsigned n_rows,
+                                        int kv_handle, unsigned shift) {
+    (void)ordinal;
+    (void)n_rows;
+    (void)kv_handle;
+    (void)shift;
+    return false;
+  }
+
   /** Whether the complete decode graph consumes this registered source.
    * Per-op M=1 capability can be false when the whole token runs on device.
    */

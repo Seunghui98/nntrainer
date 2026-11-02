@@ -230,6 +230,30 @@ inline bool htpDecodeKvSeedKvqTiles(unsigned n_rows, int kv_handle,
 #endif
 }
 
+/** @brief [C] ComputeOps::decode_kv_prepare. */
+inline bool htpDecodeKvPrepare() {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_prepare();
+#else
+  return false;
+#endif
+}
+
+/** @brief [C] ComputeOps::decode_kv_seed_kvq_layer. */
+inline bool htpDecodeKvSeedKvqLayer(unsigned ordinal, unsigned n_rows,
+                                    int kv_handle, unsigned shift) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_seed_kvq_layer(ordinal, n_rows,
+                                                            kv_handle, shift);
+#else
+  (void)ordinal;
+  (void)n_rows;
+  (void)kv_handle;
+  (void)shift;
+  return false;
+#endif
+}
+
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,
  *  [n_rows][n_kv x head_dim] f32 each. */
 inline bool htpDecodeKvSeed(unsigned n_rows, const float *k_rows,

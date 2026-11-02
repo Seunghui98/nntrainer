@@ -1035,6 +1035,38 @@ std::string CausalLM::kvCacheModelTag() const {
   return std::string(buf);
 }
 
+void CausalLM::prepareKvAdopt(unsigned int end) {
+  adopt_window_end_ = 0;
+  // the windowed layers' decode cache, as the generation sets it below
+  for (unsigned int l = 0; l < kv_cache.getNumLayers(); ++l)
+    if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
+      const unsigned int base = kv_cache.baseAfterCompact(l, end);
+      htpDecodeKvWindow(end - base + NUM_TO_GENERATE, base);
+      break;
+    }
+  const bool ready = htpDecodeKvPrepare();
+  // ponytail: the n-th HTP attention layer is attention ordinal n, as in
+  // compactKVCache
+  unsigned int n = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+      if (l.getType() != causallm::HtpMHACoreLayer::type ||
+          n >= kv_cache.getNumLayers())
+        return;
+      const unsigned int idx = n++;
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+      auto *mha =
+        node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
+             : nullptr;
+      if (mha)
+        mha->setHtpPrefillSeed(ready ? static_cast<int>(idx) : -1,
+                               kv_cache.baseAfterCompact(idx, end));
+    };
+  model->forEachLayer(fn, nullptr);
+  if (ready)
+    adopt_window_end_ = end;
+}
+
 void CausalLM::compactKVCache(unsigned int pos, bool force) {
   // [C] NNTR_HTP_KV_ADOPT: a layer that freed its rows for its DSP int8
   // copy has its base moved and no row touched
@@ -2138,6 +2170,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                     !kv_cache.hasRingLayer()
                   ? from_pos + n_tok
                   : 0u);
+    adopt_window_end_ = 0;
+    if (htpPrefillEnd() != 0 && kv_cache.isAllocated())
+      prepareKvAdopt(htpPrefillEnd());
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
     if (!resume_block_on && from_pos > 0 && n_tok > 1) {
       std::vector<float *> out;
@@ -2397,7 +2432,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // ponytail: one (rows, base) for all windowed layers -- they share one
   // window and one DSP cache; per-layer values if a model ever mixes them.
   compactKVCache(input_len + global_token_len);
-  for (unsigned int l = 0; l < kv_cache.getNumLayers(); ++l)
+  // [C] prepareKvAdopt registered the decode caches with this window already
+  NNTR_THROW_IF(adopt_window_end_ != 0 &&
+                  adopt_window_end_ != input_len + global_token_len,
+                std::runtime_error)
+    << "NNTR_HTP_KV_ADOPT: the decode caches were registered for a prompt "
+       "ending at "
+    << adopt_window_end_ << ", the generation starts at "
+    << input_len + global_token_len;
+  for (unsigned int l = 0;
+       adopt_window_end_ == 0 && l < kv_cache.getNumLayers(); ++l)
     if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
       const unsigned int base = kv_cache.getBase(l);
       htpDecodeKvWindow(input_len + global_token_len - base + NUM_TO_GENERATE,

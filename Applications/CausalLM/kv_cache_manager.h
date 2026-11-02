@@ -446,6 +446,19 @@ public:
     detached_[layer_idx] = detached;
   }
 
+  /** @brief The base compact(@a pos) would leave the layer at, without
+   *         compacting: what the decode caches are sized and based by when
+   *         they are registered before the prefill that reaches @a pos. */
+  unsigned int baseAfterCompact(unsigned int layer_idx,
+                                unsigned int pos) const {
+    const unsigned int base = getBase(layer_idx);
+    if (!isLayerActive(layer_idx) || !windowed(layer_idx) ||
+        isLayerKVAliased(layer_idx))
+      return base;
+    const unsigned int from = liveFrom(layer_idx, pos);
+    return from > base ? from : base;
+  }
+
   /** @brief setLayerDetached's flag. */
   bool isLayerDetached(unsigned int layer_idx) const {
     return layer_idx < detached_.size() && detached_[layer_idx];

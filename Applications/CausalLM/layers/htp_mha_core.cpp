@@ -148,6 +148,7 @@ void HtpMHACoreLayer::beginHtpPrompt() {
   cache_index = 0;
   htp_owns_cache_ = false;
   kv_detached_ = false;
+  htp_seed_ord_ = -1;
   q_cache_failed = false;
   q2_calibrated = false;
   kv_floor_k_.clear();
@@ -1538,21 +1539,34 @@ bool HtpMHACoreLayer::try_quantized_attention(
   };
 
   // [C] htpKvAdopt: the layer's last prefill call (it ends at the prompt's
-  // end) keeps its int8 cache for the decode seed, trimmed to the masters
-  // and fixed scales, and frees the CPU rows: from here the masters are the
-  // layer's only copy of the context (KVCacheManager compaction then moves
-  // its base only, HtpMHACoreLayer::kvDetached). Not taken, nothing changes.
+  // end) hands its int8 cache to the decode seed and frees the CPU rows.
+  // With the decode caches registered before the prefill
+  // (setHtpPrefillSeed) the seed runs here and the int8 cache is released
+  // with it, so the DSP never holds the layers' caches at once; else the
+  // cache is trimmed to the masters and fixed scales and kept to the first
+  // token. Either way the CPU rows are gone from here (KVCacheManager
+  // compaction then moves this layer's base only, kvDetached). Not taken,
+  // nothing changes.
   auto handoff = [&](unsigned int &synced_rows, int h, bool q2) {
+    const unsigned int end = htpPrefillEnd();
     if (!htpKvAdopt() || !q2 || batch != 0 || h < 0 || !q2_k_per_dim() ||
         q2_scales_set.empty() || !q2_scales_set[0] || synced_rows != cache_to ||
-        cache_to - cache_from < 2 || htpPrefillEnd() == 0 ||
-        cache_base + cache_to != htpPrefillEnd() ||
-        !compute_ops_->kv_cache_q_trim(h))
+        cache_to - cache_from < 2 || end == 0 || cache_base + cache_to != end)
       return;
-    keep_q = true;
+    if (htp_seed_ord_ >= 0 && htp_seed_base_ >= cache_base &&
+        end > htp_seed_base_ &&
+        htpDecodeKvSeedKvqLayer(static_cast<unsigned>(htp_seed_ord_),
+                                end - htp_seed_base_, h,
+                                htp_seed_base_ - cache_base)) {
+      q_cache_handles[batch] = -1; // released on the DSP with the seed
+    } else if (compute_ops_->kv_cache_q_trim(h)) {
+      keep_q = true;
+      q_cache_base_ = cache_base;
+    } else {
+      return;
+    }
     kv_detached_ = true;
     htp_owns_cache_ = true;
-    q_cache_base_ = cache_base;
     for (const uint16_t *p : {k_base, v_base})
       compute_ops_->drop_shared(const_cast<uint16_t *>(p));
   };

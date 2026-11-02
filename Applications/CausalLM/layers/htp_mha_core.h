@@ -677,11 +677,26 @@ private:
    *  their row 0 at absolute position q_cache_base_ */
   bool kv_detached_ = false;
   unsigned int q_cache_base_ = 0;
+  /** [C] setHtpPrefillSeed: the layer's attention ordinal and its decode
+   *  cache's base, when the decode caches are registered before the
+   *  prefill; -1: the seed waits for the first token */
+  int htp_seed_ord_ = -1;
+  unsigned int htp_seed_base_ = 0;
 
 public:
   /** @brief [C] Whether the layer's CPU KV rows are gone (kv_detached_):
    *  the model's compaction moves this layer's base only. */
   bool kvDetached() const { return kv_detached_; }
+
+  /** @brief [C] htpKvAdopt with the decode caches registered before the
+   *  prefill (htpDecodeKvPrepare): the layer's last prefill call seeds its
+   *  decode cache (attention layer @a ordinal in graph order, based at
+   *  absolute position @a decode_base) and releases its int8 cache there.
+   *  @a ordinal -1: it keeps the cache to the first token. */
+  void setHtpPrefillSeed(int ordinal, unsigned int decode_base) {
+    htp_seed_ord_ = ordinal;
+    htp_seed_base_ = decode_base;
+  }
 
 private:
   /**
