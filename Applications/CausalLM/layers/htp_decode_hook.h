@@ -54,4 +54,12 @@ inline unsigned &htpPrefillEnd() {
   static unsigned end = 0;
   return end;
 }
+
+/** @brief NNTR_MOE_WARM: true while the model runs the last block of a
+ *  prefill, the one the first decode row follows (set around it by the
+ *  model's prefill; false elsewhere, and in any other prefill path). */
+inline bool &htpPrefillLastBlock() {
+  static bool last = false;
+  return last;
+}
 } // namespace causallm

@@ -3929,10 +3929,13 @@ public:
   }
 
   /** NNTR_MOE_WARM: after a prefill (pool_dirty_), the layer's warm list
-   *  is queued to the prefetch readers here, at the first decode row's
-   *  graph init, and registered at poolSync: the reads run under the
-   *  graph init and the seed instead of as the first token's misses. */
-  void warmBegin() {
+   *  is queued to the prefetch readers here -- at the prompt's last MoE
+   *  call (begin_decode_pool_warm), else at the first decode row's graph
+   *  init -- and registered at poolSync: the reads run under the lm head,
+   *  the graph init and the seed instead of as the first token's misses. */
+  void begin_decode_pool_warm() override { warmBegin("prefill_end"); }
+
+  void warmBegin(const char *at) {
     if (!warm_begin_ || warm_pending_ || !pool_dirty_ || !e2e_)
       return;
     const uint64_t t0 = HtpProfile::nowUs();
@@ -3942,20 +3945,30 @@ public:
     warm_pending_ = prefetch_qs4cx_wh_experts_begin(want);
     if (!warm_pending_)
       warm_end_({});
-    std::fprintf(stderr, "[HTP] t1: warm queued=%zu queue_ms=%.1f\n",
+    std::fprintf(stderr, "[HTP] t1: warm queued=%zu queue_ms=%.1f at=%s\n",
                  warm_pending_ ? want.size() : size_t(0),
-                 (HtpProfile::nowUs() - t0) / 1000.0);
+                 (HtpProfile::nowUs() - t0) / 1000.0, at);
   }
 
+  /** The first token is the deadline: the reads not started by now are
+   *  cancelled (their slots go back, the token's misses read what it
+   *  routes to) and only the ones in flight are waited for. Waiting for
+   *  all 416 of NNTR_MOE_WARM=16 cost the S26 Ultra's first token 68-139
+   *  ms with the adoption, where the graph init hides only 42 ms of them,
+   *  while a third of them is the first token's. */
   void warmEnd() {
     if (!warm_pending_)
       return;
     const uint64_t t0 = HtpProfile::nowUs();
     warm_pending_ = false;
-    const std::vector<const void *> keys = prefetch_qs4cx_wh_experts_end();
+    const std::vector<const void *> none;
+    std::vector<const void *> cancelled;
+    const std::vector<const void *> keys =
+      prefetch_qs4cx_wh_experts_end(&none, &cancelled);
     warm_end_(keys);
-    std::fprintf(stderr, "[HTP] t1: warm registered=%zu wait_ms=%.1f\n",
-                 keys.size(), (HtpProfile::nowUs() - t0) / 1000.0);
+    std::fprintf(
+      stderr, "[HTP] t1: warm registered=%zu cancelled=%zu wait_ms=%.1f\n",
+      keys.size(), cancelled.size(), (HtpProfile::nowUs() - t0) / 1000.0);
   }
 
   /** [#4416 mem] NNTR_MOE_CACHE_GROW=<n>: once the first token is done
@@ -4770,7 +4783,7 @@ public:
   }
 
   void ensureGraphInit(remote_handle64 session) {
-    warmBegin();
+    warmBegin("graph_init");
     std::lock_guard<std::mutex> lock(graph_mutex_);
     if (graph_inited_) {
       ensureAttentionCaches(session);
@@ -5298,6 +5311,9 @@ public:
    */
   bool prefetch_qs4cx_wh_experts_begin(
     const std::vector<ExpertFileDesc> &ds) override {
+    // a prefill started before the first token: its batches queue behind
+    // no warm-up (the readers hand batches back in order)
+    warmEnd();
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     switchTl2Phase(false);

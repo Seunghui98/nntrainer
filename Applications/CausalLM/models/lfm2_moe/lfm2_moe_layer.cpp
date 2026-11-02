@@ -1907,6 +1907,14 @@ static bool tryMoeLayerOnAccelerator(
     }
     g_expert_lru.refresh(recency);
   }
+  // NNTR_MOE_WARM: the prompt's last MoE call starts the warm-up's reads,
+  // under the lm head, the sampling and the first row's graph init rather
+  // than the graph init alone; no read-ahead batch is left to share the
+  // queue with.
+  if (experts_virtual && total_tokens > 1 && htpPrefillLastBlock() &&
+      expert_layer_slot + 1 == static_cast<int>(g_expert_layers.size()) &&
+      g_prefetch_batches.empty())
+    ops->begin_decode_pool_warm();
   return true;
 }
 

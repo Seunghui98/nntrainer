@@ -2193,8 +2193,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // Single block (default) when chunking is off or the prompt fits one chunk.
     const bool one_block_on_grid =
       ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
+    // NNTR_MOE_WARM: the last block starts the warm-up's reads at its last
+    // MoE layer (htpPrefillLastBlock)
+    struct LastBlock {
+      LastBlock(bool on) { htpPrefillLastBlock() = on; }
+      ~LastBlock() { htpPrefillLastBlock() = false; }
+    };
     if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
       beforePrefillBlock(from_pos, from_pos + n_tok);
+      LastBlock last(true);
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
     }
@@ -2214,6 +2221,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       // a windowed (sliding) layer keeps its window in front of the chunk
       compactKVCache(cf);
       beforePrefillBlock(cf, cf + clen);
+      LastBlock last(o + clen == n_tok);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
       if (o + clen < n_tok)
         for (auto &oo : so)

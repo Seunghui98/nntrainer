@@ -1085,6 +1085,10 @@ public:
     (void)end;
   }
 
+  // NNTR_MOE_WARM: starts the warm-up's reads now, at a prefill's last MoE
+  // call, instead of at the first decode row. Ignored without the pool.
+  virtual void begin_decode_pool_warm() {}
+
   // Undoes the above for one expert: both handles released, the slot back
   // in the pool for the next register_qs4cx_wh_expert_file. False when the
   // key is not resident.

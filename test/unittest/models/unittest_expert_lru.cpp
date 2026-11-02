@@ -406,4 +406,35 @@ TEST(ExpertWarm, PrefillListsBecomeTheReadsAndTheLruTakesThem) {
   lru.acquire({key(1), key(2), key(5), key(6)}, r.load, r.evict);
 }
 
+TEST(ExpertWarm, ReadsCancelledAtTheFirstTokenLeaveTheirSlotsFree) {
+  // As above, but the first token's deadline cancelled the read of key 1
+  // (warmEnd): the LRU files key 2 alone and every slot is free again, so
+  // the token's miss of key 1 fills the cancelled one without evicting.
+  ExpertLru lru;
+  int layer0, layer1;
+  lru.addLayer(&layer0, 2);
+  lru.addLayer(&layer1, 2);
+  Recorder r;
+  lru.acquire({key(4), key(5), key(6), key(7)}, r.load, r.evict);
+  using Desc = nntrainer::ComputeOps::ExpertFileDesc;
+  std::vector<std::vector<Desc>> layers(2, std::vector<Desc>(4));
+  for (int l = 0; l < 2; ++l)
+    for (int e = 0; e < 4; ++e)
+      layers[l][e].key_gu = key(4 * l + e);
+  using Rows = std::vector<std::vector<std::pair<unsigned, float>>>;
+  causallm::ExpertWarm warm(2);
+  warm.note(0, {0, 3, 2, 1}, Rows{{{0, 1.f}}, {{1, 1.f}}, {{1, 1.f}}, {}}, 2);
+  warm.note(1, {0, 3, 1, 2}, Rows(4), 2);
+  WarmOps ops;
+  warm.install(&ops, lru, layers);
+  ASSERT_EQ(ops.begin().size(), 2u);
+  ops.end({key(2)});
+  EXPECT_EQ(lru.size(), 3u);
+  EXPECT_TRUE(lru.resident(key(2)) && !lru.resident(key(1)));
+  EXPECT_EQ(lru.room({key(2), key(5), key(6)}), 1u);
+  r.evicted.clear();
+  EXPECT_EQ(lru.acquire({key(1), key(2), key(5), key(6)}, r.load, r.evict), 1u);
+  EXPECT_TRUE(r.evicted.empty());
+}
+
 } // namespace
