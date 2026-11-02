@@ -29,6 +29,7 @@
 #include "hexkl_kv_q.h"
 #include "hexkl_micro.h"
 #include "hvx_attn_decode_q.h"
+#include "hvx_attn_m1_f32.h"
 #include "hvx_convert.h"
 #include "hvx_softmax_q.h"
 #include "hvx_worker_pool.h"
@@ -90,6 +91,10 @@ int nntr_hvx_kv_register_q(remote_handle64 handle, uint32 kind, uint32 max_rows,
   if (!s || !kv_handle) {
     return AEE_EBADPARM;
   }
+  /* [C] the caches the background seeds are done with go before this one
+     comes, so the heap can place it in their room */
+  hvx_attn_m1_seed_reap(s->attn_m1, 0);
+  hvx_attn_m1_seed_reap(s->attn_m1_b, 0);
   return hexkl_kv_q_register(&s->kv_q, (hexkl_kv_q_kind)kind, max_rows,
                              n_head_kv, head_dim, kv_handle);
 }

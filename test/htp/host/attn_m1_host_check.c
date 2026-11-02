@@ -1588,6 +1588,123 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   }
 }
 
+/** [C] The background seed (seed_q8_tiles_async): reaped, it leaves the
+ *  layer seed_q8_tiles leaves, bit for bit, and calls its done callback
+ *  once with its token; a forward of the layer before any reap joins the
+ *  seed first and gives the synchronously seeded layer's output; a free
+ *  with a seed in flight finishes it. A second seed of a live layer is
+ *  refused. Gemma 4's sliding shape, every pool. */
+static int g_done_calls;
+static uint32_t g_done_token;
+static void count_done(void *arg, uint32_t token) {
+  ++*(int *)arg;
+  g_done_token = token;
+}
+
+static void check_seed_q8_tiles_async(hvx_worker_pool *const *pools) {
+  const uint32_t n_kv = 8u, hd = 256u, max_seq = 1152u, src = 2048u;
+  const uint32_t shift = 66u, L = 1024u;
+  const size_t hs = (size_t)src * hd, n = (size_t)n_kv * hd;
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float *sc = (float *)malloc(4u * n * sizeof(float));
+  float *q = (float *)malloc(2u * n * sizeof(float));
+  float *kv = (float *)malloc(2u * n * sizeof(float));
+  float *ya = (float *)malloc(2u * n * sizeof(float));
+  float *yb = (float *)malloc(2u * n * sizeof(float));
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)(i * 2654435761u >> 11);
+    v8[i] = (uint8_t)(i * 40503u >> 5);
+  }
+  for (size_t i = 0; i < 4u * n; ++i)
+    sc[i] = 0.002f * (float)(1u + i % 499u);
+  for (size_t i = 0; i < 2u * n; ++i) {
+    q[i] = 0.01f * (float)((int)(i % 201u) - 100);
+    kv[i] = 0.02f * (float)((int)(i % 97u) - 48);
+  }
+  int bad = 0;
+  for (int pi = 0; pi < 3; ++pi) {
+    int err = 0;
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      2u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[pi],
+      &err);
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      2u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[pi],
+      &err);
+    CHECK(a && b, "seed async: create");
+    if (!a || !b) {
+      hvx_attn_m1_free(a);
+      hvx_attn_m1_free(b);
+      continue;
+    }
+    g_done_calls = 0;
+    int calls = 0;
+    CHECK(hvx_attn_m1_seed_q8_tiles_async(
+            a, 0u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n, sc + 3u * n,
+            count_done, &calls, 41u) == AEE_SUCCESS,
+          "seed async: submit");
+    CHECK(hvx_attn_m1_seed_q8_tiles_async(
+            a, 0u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n, sc + 3u * n,
+            count_done, &calls, 42u) == AEE_EBADSTATE,
+          "seed async: a second seed of a live layer refused");
+    CHECK(hvx_attn_m1_seed_q8_tiles(b, 0u, L, k8, v8, hs, shift, sc, sc + n,
+                                    sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+          "seed async: the synchronous reference");
+    hvx_attn_m1_seed_reap(a, 1);
+    int cb = calls != 1 || g_done_token != 41u ||
+             memcmp(a->kt[0], b->kt[0], a->layer_bytes) != 0 ||
+             memcmp(a->v[0], b->v[0], a->layer_bytes) != 0 ||
+             a->kv_len[0] != b->kv_len[0];
+    CHECK(cb == 0, "seed async pool %d: reaped layer differs (calls %d)", pi,
+          calls);
+    bad += cb;
+    /* layer 1: a forward before any reap joins the seed */
+    calls = 0;
+    CHECK(hvx_attn_m1_seed_q8_tiles_async(
+            a, 1u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n, sc + 3u * n,
+            count_done, &calls, 43u) == AEE_SUCCESS,
+          "seed async: submit layer 1");
+    CHECK(hvx_attn_m1_seed_q8_tiles(b, 1u, L, k8, v8, hs, shift, sc, sc + n,
+                                    sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+          "seed async: reference layer 1");
+    const int ra =
+      hvx_attn_m1_forward(a, 1u, L, 0u, 0.0625f, q, kv, kv + n, ya, NULL);
+    const int rb =
+      hvx_attn_m1_forward(b, 1u, L, 0u, 0.0625f, q, kv, kv + n, yb, NULL);
+    cb = ra != AEE_SUCCESS || rb != AEE_SUCCESS || calls != 1 ||
+         memcmp(ya, yb, 2u * n * sizeof(float)) != 0;
+    CHECK(cb == 0,
+          "seed async pool %d: forward over an unjoined seed differs (rc %d "
+          "%d calls %d)",
+          pi, ra, rb, calls);
+    bad += cb;
+    hvx_attn_m1_free(b);
+    /* a free with a seed in flight finishes it */
+    calls = 0;
+    hvx_attn_m1_ctx *c = hvx_attn_m1_create(
+      1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[pi],
+      &err);
+    CHECK(c && hvx_attn_m1_seed_q8_tiles_async(
+                 c, 0u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n,
+                 sc + 3u * n, count_done, &calls, 44u) == AEE_SUCCESS,
+          "seed async: submit then free");
+    hvx_attn_m1_free(c);
+    CHECK(calls == 1, "seed async pool %d: free left the seed (%d)", pi, calls);
+    bad += calls != 1;
+    hvx_attn_m1_free(a);
+  }
+  free(k8);
+  free(v8);
+  free(sc);
+  free(q);
+  free(kv);
+  free(ya);
+  free(yb);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED Q8 ASYNC OK\n");
+  }
+}
+
 /** [NNTR_HTP_Q2_KDIM] With K's prefill scale per (head, dim) the int8
  *  masters are the decode cache's own bytes: masters quantized as the
  *  prefill appends them (rint(x / s), s = amax / 127, hexkl_kv_q's rule)
@@ -2219,6 +2336,7 @@ int main(void) {
   check_seed_q8(pools[2]);
   check_seed_q8_kd(pools[2]);
   check_seed_q8_tiles(pools);
+  check_seed_q8_tiles_async(pools);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);

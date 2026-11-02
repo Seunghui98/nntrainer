@@ -189,6 +189,11 @@ int nntr_hvx_attn_m1_seed_kvq(remote_handle64 handle, uint32 layer,
   return hexkl_kv_q_release(&s->kv_q, kv_handle);
 }
 
+/** [C] A background seed's done callback: its prefill cache goes. */
+static void seed_release_kvq(void *arg, uint32_t kv_handle) {
+  hexkl_kv_q_release(&((nntr_hvx_session *)arg)->kv_q, kv_handle);
+}
+
 int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
                                     uint32 kv_handle, uint32 n_rows,
                                     uint32 shift) {
@@ -207,13 +212,15 @@ int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
          (unsigned)kv_handle, (unsigned)layer);
     return AEE_EBADSTATE;
   }
-  const int rc = hvx_attn_m1_seed_q8_tiles(
+  /* [C] on the pool's background lane: the tiles are built under the
+     prefill's next calls, and the cache is released once they are
+     (seed_release_kvq, from a reap or the layer's first forward) */
+  hvx_attn_m1_seed_reap(s->attn_m1, 0);
+  hvx_attn_m1_seed_reap(s->attn_m1_b, 0);
+  return hvx_attn_m1_seed_q8_tiles_async(
     c, layer, n_rows, kv->kt4, kv->v4, (size_t)kv->max_rows * kv->head_dim,
-    shift, kv->fs_kd, kv->fs_k_inv, kv->fs_v, kv->fs_v_inv);
-  if (rc != AEE_SUCCESS) {
-    return rc;
-  }
-  return hexkl_kv_q_release(&s->kv_q, kv_handle);
+    shift, kv->fs_kd, kv->fs_k_inv, kv->fs_v, kv->fs_v_inv, seed_release_kvq, s,
+    kv_handle);
 }
 
 int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,

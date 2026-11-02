@@ -141,6 +141,9 @@ typedef struct {
   float *sf;     /**< f32 [n_kv * gqa][seq]: the scores */
   int16_t *q16;  /**< [n_kv * gqa][head_dim]: q quantized */
   int32_t *psum; /**< [n_kv * gqa][seq / 64]: a tile's P sum */
+  /** [C] [n_layers] seeds on the pool's background lane
+   *  (hvx_attn_m1_seed_q8_tiles_async); NULL until the first */
+  struct hvx_attn_m1_seed_bg *seed_bg;
 } hvx_attn_m1_ctx;
 
 /** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */
@@ -251,6 +254,32 @@ int hvx_attn_m1_seed_q8_tiles(hvx_attn_m1_ctx *ctx, uint32_t layer,
                               uint32_t shift, const float *s_k,
                               const float *s_k_inv, const float *s_v,
                               const float *s_v_inv);
+
+/** @brief Called once a background seed is done, with its @a token. */
+typedef void (*hvx_attn_m1_seed_done_fn)(void *arg, uint32_t token);
+
+/**
+ * @brief [C] hvx_attn_m1_seed_q8_tiles on the pool's background lane: the
+ *        layer's scales and length are set and its tiles queued
+ *        (hvx_worker_pool_submit_bg), a (kv head, tile) a unit, and the
+ *        call returns; the pool's idle workers, and any wait_bg caller, run
+ *        them under whatever foreground work follows. The masters must stay
+ *        as they are until @a done (@a arg, @a token) is called, from
+ *        hvx_attn_m1_seed_reap or from the layer's first forward or
+ *        append, which join the seed first.
+ * @return as hvx_attn_m1_seed_q8_tiles; AEE_EBADSTATE for a layer with a
+ *         seed in flight
+ */
+int hvx_attn_m1_seed_q8_tiles_async(
+  hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows, const uint8_t *k8,
+  const uint8_t *v8, size_t head_stride, uint32_t shift, const float *s_k,
+  const float *s_k_inv, const float *s_v, const float *s_v_inv,
+  hvx_attn_m1_seed_done_fn done, void *arg, uint32_t token);
+
+/** @brief [C] Finishes the background seeds that are done (every one with
+ *         @a wait, waiting for them): their done callbacks run here. A
+ *         NULL ctx is a no-op. */
+void hvx_attn_m1_seed_reap(hvx_attn_m1_ctx *ctx, int wait);
 
 /**
  * @brief Appends position @a pos (k, v of the new token) to @a layer and

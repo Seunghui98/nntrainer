@@ -21,6 +21,7 @@
 
 #include "hexkl_graph.h"
 #include "hexkl_probe.h"
+#include "hvx_attn_m1_f32.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -35,6 +36,10 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     FARF(ERROR, "graph_init: a graph is already live; release it first");
     return AEE_EBADSTATE;
   }
+  /* [C] the prefill's background seeds are done before the graph can run
+     a decode row, and their caches released */
+  hvx_attn_m1_seed_reap(s->attn_m1, 1);
+  hvx_attn_m1_seed_reap(s->attn_m1_b, 1);
   {
     /** [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles;
        [plan 201 S4] on the heap (2 KiB at 256 slots, init copies it) */
