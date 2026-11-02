@@ -203,7 +203,9 @@ using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
 static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
 
 /** NNTR_MOE_WARM: the decode pool's warm-up (expert_warm.h). */
-static causallm::ExpertWarm g_warm;
+/** On by default at 16 a layer (Gemma 4 26B-A4B, S26 Ultra round 10:
+ *  the first token's misses 222 -> ~115); NNTR_MOE_WARM=0 turns it off. */
+static causallm::ExpertWarm g_warm(causallm::ExpertWarm::kFromEnv, 16);
 /** [PR 4428] The pool's slot sizes: the experts of one (K, inter, N_out,
  *  dtype) share a size, and the rotated ternary Gemma4 has two (native
  *  TL2 in layers 0-27, 4-bit affine in 28-29). Each layer adds its share

@@ -792,7 +792,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                     std::runtime_error)
         << "mha_core: " << q2_name_ << " could not seed its decode cache "
         << "from the int8 masters, and its CPU rows are freed "
-        << "(NNTR_HTP_KV_ADOPT=1; unset it to keep them)";
+        << "(the KV adoption; NNTR_HTP_KV_ADOPT=0 keeps them)";
       q_cache_handles[0] = -1; // released on the DSP
       kv_detached_ = false;
       {

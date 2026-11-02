@@ -28,14 +28,23 @@ namespace causallm {
 class ExpertWarm {
 public:
   using Desc = nntrainer::ComputeOps::ExpertFileDesc;
+  /** @brief The count NNTR_MOE_WARM gives (perLayer); kFromEnv also when
+   *         it is unset. */
+  static constexpr size_t kFromEnv = static_cast<size_t>(-1);
 
   /** @param n experts per layer; by default NNTR_MOE_WARM's, read at the
-   *         first use rather than at static initialization (0: off) */
-  explicit ExpertWarm(size_t n = kFromEnv) : n_(n) {}
+   *         first use rather than at static initialization (0: off)
+   *  @param unset the count when NNTR_MOE_WARM is unset */
+  explicit ExpertWarm(size_t n = kFromEnv, size_t unset = 0) :
+    n_(n), unset_(unset) {}
 
-  /** @brief NNTR_MOE_WARM's experts per layer, read once (0: off). */
+  /** @brief NNTR_MOE_WARM's experts per layer, read once (0: off;
+   *         kFromEnv when unset: the constructor's @a unset applies). */
   static size_t perLayer() {
-    static const size_t n = expertWarmPerLayer(std::getenv("NNTR_MOE_WARM"));
+    static const size_t n = [] {
+      const char *v = std::getenv("NNTR_MOE_WARM");
+      return v ? expertWarmPerLayer(v) : kFromEnv;
+    }();
     return n;
   }
 
@@ -82,11 +91,9 @@ public:
   }
 
 private:
-  static constexpr size_t kFromEnv = static_cast<size_t>(-1);
-
   size_t count() {
     if (n_ == kFromEnv)
-      n_ = perLayer();
+      n_ = perLayer() == kFromEnv ? unset_ : perLayer();
     return n_;
   }
 
@@ -124,6 +131,7 @@ private:
   }
 
   size_t n_;
+  size_t unset_;
   std::vector<std::vector<unsigned>> lists_;
   size_t held_ = 0;
 };

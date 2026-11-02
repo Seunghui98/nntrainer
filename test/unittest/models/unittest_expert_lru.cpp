@@ -406,6 +406,31 @@ TEST(ExpertWarm, PrefillListsBecomeTheReadsAndTheLruTakesThem) {
   lru.acquire({key(1), key(2), key(5), key(6)}, r.load, r.evict);
 }
 
+TEST(ExpertWarm, TheLayersDefaultAppliesWhenTheSwitchIsUnset) {
+  // Lfm2MoELayer's warm-up is on at 16 a layer with NNTR_MOE_WARM unset:
+  // the constructor's default is the count then, and 0 stays off.
+  if (std::getenv("NNTR_MOE_WARM"))
+    GTEST_SKIP() << "NNTR_MOE_WARM is set";
+  ExpertLru lru;
+  int layer0;
+  lru.addLayer(&layer0, 4);
+  using Desc = nntrainer::ComputeOps::ExpertFileDesc;
+  std::vector<std::vector<Desc>> layers(1, std::vector<Desc>(4));
+  for (int e = 0; e < 4; ++e)
+    layers[0][e].key_gu = key(e);
+  using Rows = std::vector<std::vector<std::pair<unsigned, float>>>;
+  causallm::ExpertWarm on(causallm::ExpertWarm::kFromEnv, 2);
+  causallm::ExpertWarm off(causallm::ExpertWarm::kFromEnv, 0);
+  WarmOps ops_on, ops_off;
+  on.note(0, {3, 1, 2, 0}, Rows(4), 2);
+  off.note(0, {3, 1, 2, 0}, Rows(4), 2);
+  on.install(&ops_on, lru, layers);
+  off.install(&ops_off, lru, layers);
+  ASSERT_TRUE(ops_on.begin);
+  EXPECT_FALSE(ops_off.begin);
+  EXPECT_EQ(ops_on.begin().size(), 2u);
+}
+
 TEST(ExpertWarm, ReadsCancelledAtTheFirstTokenLeaveTheirSlotsFree) {
   // As above, but the first token's deadline cancelled the read of key 1
   // (warmEnd): the LRU files key 2 alone and every slot is free again, so

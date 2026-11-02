@@ -3728,14 +3728,14 @@ public:
     return on;
   }
 
-  /** [C] NNTR_HTP_KV_ADOPT=1: each layer's int8 masters outlive its last
-   *  prefill call (trimmed to them, its CPU rows freed there) and seed its
-   *  decode cache on the DSP (decode_kv_seed_kvq_tiles); attn_m1 is
+  /** [C] The KV adoption, on unless NNTR_HTP_KV_ADOPT=0 (htpKvAdopt's
+   *  rule): each layer's last prefill call seeds its decode cache on the
+   *  DSP from its int8 cache (decode_kv_seed_kvq_layer); attn_m1 is
    *  registered lazily, as under kvSeedQ. Implies NNTR_HTP_Q2_KDIM. */
   static bool kvAdopt() {
     static const bool on = [] {
       const char *v = std::getenv("NNTR_HTP_KV_ADOPT");
-      return v != nullptr && std::strcmp(v, "1") == 0;
+      return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     return on;
   }

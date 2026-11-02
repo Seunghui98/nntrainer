@@ -7,6 +7,7 @@
  */
 #pragma once
 #include <cstdlib>
+#include <cstring>
 
 #include <nntr_htp_decode_hook.h>
 namespace causallm {
@@ -33,15 +34,18 @@ using nntrainer::htpDecodeTokenId;
 using nntrainer::htpDecodeWantLogits;
 
 /**
- * @brief [C] NNTR_HTP_KV_ADOPT=1: each HTP attention layer keeps its int8
- *        prefill cache past its last prefill call -- trimmed to the masters,
- *        its CPU rows freed -- and seeds its decode cache from it. Implies
+ * @brief [C] The KV adoption, on unless NNTR_HTP_KV_ADOPT=0: each HTP
+ *        attention layer's last prefill call seeds its decode cache from
+ *        its int8 prefill cache and frees its CPU rows. Implies
  *        NNTR_HTP_Q2_KDIM (K's prefill scale per (head, dim)). Read once.
+ *        The default since S26 Ultra round 10 (Gemma 4 26B-A4B, p1k /
+ *        p2k): the first token 436 / 501 -> 174 / 183 ms with the
+ *        warm-up, the peak 20 MiB lower, the prefill within noise.
  */
 inline bool htpKvAdopt() {
   static const bool on = [] {
     const char *v = std::getenv("NNTR_HTP_KV_ADOPT");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    return v == nullptr || std::strcmp(v, "0") != 0;
   }();
   return on;
 }
