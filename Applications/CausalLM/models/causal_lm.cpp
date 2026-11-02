@@ -2480,10 +2480,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (ppl_forced && ppl_base + generation_cnt >= ppl_cont.size())
       break; // the continuation is used up
 
+    // the first token's split (one line after it): what first_token_ms
+    // holds besides the HTP lines' graph init, pool sync and token
+    using t1clk = std::chrono::high_resolution_clock;
+    const bool t1_split = generation_cnt == 0;
+    const auto t1_loop = t1clk::now();
     allocateAndBindKVCache();
+    const auto t1_bind = t1clk::now();
     auto output_interval = incrementalInference(
       BATCH_SIZE, input, input_len, token_generation_idx - 1 + global_token_len,
       token_generation_idx + global_token_len);
+    const auto t1_fwd = t1clk::now();
     // Repetition-penalty window. ids_history is one MAX_SEQ_LEN-strided row of
     // token ids per batch entry -- the same layout generate() walks with
     // `input_ids += MAX_SEQ_LEN` -- and registerOutputs() below has already
@@ -2537,6 +2544,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         ppl_cont.push_back(target);
     }
 
+    const auto t1_gen = t1clk::now();
     // Feed the newly generated token back as the next input token.
     // token_generation_idx always starts at input_len + 1, so we are
     // always in the auto-regressive generation phase here.
@@ -2555,6 +2563,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       decode_step_ms.push_back(
         std::chrono::duration<double, std::milli>(step_end - decode_step_mark)
           .count());
+      if (t1_split) {
+        auto ms = [](t1clk::time_point a, t1clk::time_point b) {
+          return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr,
+                     "[perf] first_token split: setup_ms=%.1f bind_ms=%.1f "
+                     "forward_ms=%.1f generate_ms=%.1f output_ms=%.1f\n",
+                     ms(decode_step_mark, t1_loop), ms(t1_loop, t1_bind),
+                     ms(t1_bind, t1_fwd), ms(t1_fwd, t1_gen),
+                     ms(t1_gen, step_end));
+      }
       decode_step_mark = step_end;
       if (perf_split_first_out.time_since_epoch().count() == 0)
         perf_split_first_out = step_end;

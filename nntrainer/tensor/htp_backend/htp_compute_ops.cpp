@@ -4850,6 +4850,7 @@ public:
       }
     }
     init_line.at[2] = HtpProfile::nowUs();
+    size_t param_bytes = 0, param_staged = 0;
     // [plan 201 S1] each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
@@ -4860,9 +4861,31 @@ public:
                    static_cast<unsigned>(t.size()),
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
-      // [plan 201 S4] the parameters the model handed at load, by name
+      // [plan 201 S4] the parameters the model handed at load, by name.
+      // Through one ION buffer when they are large: FastRPC maps an rpcmem
+      // argument instead of copying it, and the 30 routers of Gemma 4
+      // (43 MB of f32) were 38 ms of the first token's graph init on S26
+      // Ultra. NNTR_HTP_PARAM_ION=0 hands the host arrays as before.
+      static const bool param_ion = [] {
+        const char *v = std::getenv("NNTR_HTP_PARAM_ION");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+      }();
+      size_t param_max = 0;
+      for (const LoadParam &p : load_params_)
+        param_max = std::max(param_max, size_t(p.n) * sizeof(float));
+      std::unique_ptr<HtpRpcBuffer> param_buf;
+      if (param_ion && param_max >= kParamIonMin)
+        param_buf = std::make_unique<HtpRpcBuffer>(param_max);
       for (const LoadParam &p : load_params_) {
-        setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
+        const size_t bytes = size_t(p.n) * sizeof(float);
+        const float *src = p.data;
+        if (param_buf && param_buf->isIon() && bytes >= kParamIonMin) {
+          std::memcpy(param_buf->data(), p.data, bytes);
+          src = reinterpret_cast<const float *>(param_buf->data());
+          param_staged += bytes;
+        }
+        param_bytes += bytes;
+        setParam(session, p.op, p.which, src, p.n, p.n, "load parameter");
         const auto q = static_quant_.find(p.data);
         if (p.which == HTP_GRAPH_PARAM_ROUTER_W && q != static_quant_.end()) {
           const float grid[] = {q->second.scale,
@@ -4905,6 +4928,12 @@ public:
     }
     graph_inited_ = true;
     init_line.at[3] = HtpProfile::nowUs();
+    std::fprintf(stderr,
+                 "[HTP] t1: graph_init params=%zu mib=%.1f staged_ion_mib=%.1f "
+                 "ms=%.1f\n",
+                 load_params_.size(), param_bytes / 1048576.0,
+                 param_staged / 1048576.0,
+                 (init_line.at[3] - init_line.at[2]) / 1000.0);
     memLine("t1 after graph init");
     char names[128];
     std::fprintf(stderr, "[HTP] graph: init n_ops=%u resident=%s moe_ops=%zu\n",
@@ -11545,6 +11574,8 @@ private:
     const float *data;
     uint32_t n;
   };
+  /** A load parameter this large goes through the graph init's ION buffer */
+  static constexpr size_t kParamIonMin = size_t(64) << 10;
   std::vector<LoadParam> load_params_;
   uint32_t seed_ordinal_ = HTP_GRAPH_NO_OP;
   uint32_t pending_op_ = HTP_GRAPH_NO_OP;
