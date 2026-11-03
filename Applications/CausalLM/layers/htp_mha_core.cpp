@@ -1960,6 +1960,9 @@ bool HtpMHACoreLayer::try_quantized_attention(
                 "accelerator (row-blocked, fixed scales, u16 context handed "
                 "to the o-proj)");
       }
+      // a later chunk's call ends here, as the first call ends at the
+      // calibration: it seeds the decode cache the same way
+      handoff(synced, handle, use_q2);
       return true;
     }
     // Both conversions NEON on this thread: scalar they were 8-13 ms a
@@ -2185,6 +2188,14 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
   NNTR_THROW_IF(!done && htpKvStaging(), std::runtime_error)
     << "mha_core: " << q2_name_ << " fell off the int8 KV path, and the CPU "
     << "keeps no rows to attend over (NNTR_HTP_KV_INT8_ONLY=0 keeps them)";
+  // [C] staging: every call that ran ends seeding the decode cache, which
+  // releases its int8 cache; one left means a path returned without it
+  NNTR_THROW_IF(done && htpKvStaging() && batch < q_cache_handles.size() &&
+                  q_cache_handles[batch] >= 0,
+                std::runtime_error)
+    << "mha_core: " << q2_name_ << " attended rows [" << cache_base + cache_from
+    << ", " << cache_base + cache_to
+    << ") without seeding its decode cache (int8-only KV)";
   if (!done) {
     // every path below reads Q in the host tensor
     if (compute_ops_ &&
