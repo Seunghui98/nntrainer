@@ -18,6 +18,7 @@
 #include <app_context.h>
 #include <dense_ffn_layer.h>
 #include <engine.h>
+#include <htp_decode_hook.h>
 #include <htp_mha_core.h>
 #include <htp_qkv_layer.h>
 #include <htp_tie_word_embedding.h>
@@ -71,7 +72,27 @@ bool Gemma4HtpTransformer::isKVSharedLayer(int layer_id) const {
   return layer_id >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0;
 }
 
+bool Gemma4HtpTransformer::kvStaging() const {
+  static const bool on = [] {
+    const char *v = std::getenv("NNTR_HTP_KV_INT8_ONLY");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return on && htpKvAdopt() && ATTENTION_ENGINE == "htp" &&
+         NUM_KV_SHARED_LAYERS == 0;
+}
+
+unsigned int Gemma4HtpTransformer::stagingRows() const {
+  // a prefill block is at most the chunk or, unchunked, INIT_SEQ_LEN rows
+  const unsigned int rows =
+    std::max({static_cast<unsigned int>(INIT_SEQ_LEN), prefillDriveChunk(),
+              static_cast<unsigned int>(NUM_TO_GENERATE)});
+  return std::min((rows + 63u) / 64u * 64u,
+                  static_cast<unsigned int>(MAX_SEQ_LEN));
+}
+
 unsigned int Gemma4HtpTransformer::getKVCacheRows(int layer_id) const {
+  if (kvStaging())
+    return stagingRows(); // [C] every layer stages one block
   // A sliding layer reads its window and writes one prefill chunk or the
   // generated tokens behind it: at a long max_seq_len (23k: 5 GB of fp16
   // rows over 25 layers otherwise) that is all its cache holds, and
@@ -1102,10 +1123,14 @@ void Gemma4HtpCausalLM::allocateAndBindKVCache() {
         [ops](void *ptr) { ops->free_shared(ptr); });
     }
 #endif
+    // [C] the int8 decode caches keep the rows; the CPU stages a step's
+    // in one block all layers share (some 16 MiB, not 450-550)
+    kv_cache.setStaging(kvStaging() ? stagingRows() : 0u);
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
                       cache_dtype, ml::train::TensorDim::Format::NCHW, rows,
                       keep);
+    htpKvStaging() = kv_cache.isStaging();
     kv_cache_bound = false;
   }
 

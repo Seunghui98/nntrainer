@@ -1580,6 +1580,13 @@ bool HtpMHACoreLayer::try_quantized_attention(
     return false;
   };
 
+  // [C] htpKvStaging: the CPU cache holds this step's rows only and the
+  // decode cache every earlier one, so the int8 cache spans the absolute
+  // positions [0, cache_base + cache_to): its rows are the CPU rows shifted
+  // by cache_base. Each call registers it afresh, fills the earlier rows
+  // from the decode cache, appends its own and seeds the decode cache back.
+  const bool staging = htpKvStaging() && batch == 0;
+  const unsigned int kv_shift = staging ? cache_base : 0u;
   // [C] htpKvAdopt: the layer's last prefill call (it ends at the prompt's
   // end) hands its int8 cache to the decode seed and frees the CPU rows.
   // With the decode caches registered before the prefill
@@ -1590,6 +1597,24 @@ bool HtpMHACoreLayer::try_quantized_attention(
   // compaction then moves this layer's base only, kvDetached). Not taken,
   // nothing changes.
   auto handoff = [&](unsigned int &synced_rows, int h, bool q2) {
+    if (staging) {
+      // [C] every call: the decode cache takes the rows [0, cache_base +
+      // cache_to) the int8 cache now holds (a later call's seed takes over
+      // an earlier one's); the int8 cache goes with the seed
+      NNTR_THROW_IF(
+        !q2 || h < 0 || htp_seed_ord_ < 0 || synced_rows != cache_to ||
+          !htpDecodeKvSeedKvqLayer(static_cast<unsigned>(htp_seed_ord_),
+                                   cache_base + cache_to, h, 0u,
+                                   cache_base > 0),
+        std::runtime_error)
+        << "mha_core: " << q2_name_ << " could not seed its decode cache "
+        << "(int8-only KV: the CPU keeps no rows; NNTR_HTP_KV_INT8_ONLY=0 "
+        << "keeps them)";
+      q_cache_handles[batch] = -1; // released on the DSP with the seed
+      kv_detached_ = true;
+      htp_owns_cache_ = true;
+      return;
+    }
     const unsigned int end = htpPrefillEnd();
     if (!htpKvAdopt() || !q2 || batch != 0 || h < 0 || !q2_k_per_dim() ||
         q2_scales_set.empty() || !q2_scales_set[0] || synced_rows != cache_to ||
@@ -1620,6 +1645,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
   }
   int &handle = q_cache_handles[batch];
   unsigned int &synced = q_cache_synced[batch];
+  std::vector<float> fill_kr, fill_vr; // the old scale over the new, or none
   // int8 with the row-blocked kernel when the backend has it: fixed scales,
   // no softcap, no sinks, head_dim up to 512.
   // NNTR_HTP_ATTN_Q2=0: the per-row-scale int8 kernel (sdpa_q_kvcache)
@@ -1637,8 +1663,8 @@ bool HtpMHACoreLayer::try_quantized_attention(
   if (handle < 0) {
     ts2 = clk::now();
     handle = compute_ops_->kv_cache_q_register(
-      static_cast<unsigned int>(kv_cache_quant_kind), max_rows, num_heads_KV,
-      head_dim);
+      static_cast<unsigned int>(kv_cache_quant_kind),
+      staging ? kv_shift + cache_to : max_rows, num_heads_KV, head_dim);
     if (handle < 0) {
       return fail("register");
     }
@@ -1661,7 +1687,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
   const unsigned int n_q = cache_to - cache_from;
   const unsigned int q_stride = num_heads_Q * head_dim;
   const unsigned int window =
-    (local_window_size == 0 || local_window_size >= cache_to)
+    (local_window_size == 0 || local_window_size >= kv_shift + cache_to)
       ? 0u
       : static_cast<unsigned int>(local_window_size);
   if (use_q2) {
@@ -1689,11 +1715,11 @@ bool HtpMHACoreLayer::try_quantized_attention(
       q2_out_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
       const auto t0 = std::chrono::steady_clock::now();
       if (compute_ops_->sdpa_q2_kvcache_f32_calib(
-            handle, append_row0, append_rows, width, k_base + off, v_base + off,
-            io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q,
-            num_heads_KV, head_dim, window, io.out, q2_scale_k.data(),
-            q2_scale_v.data(), q2_q_enc.data(), q2_out_enc.data(), q_stride,
-            q2_k_per_dim())) {
+            handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+            v_base + off, io.q, q_stride, n_q, cache_from + kv_shift,
+            cache_to + kv_shift, num_heads_Q, num_heads_KV, head_dim, window,
+            io.out, q2_scale_k.data(), q2_scale_v.data(), q2_q_enc.data(),
+            q2_out_enc.data(), q_stride, q2_k_per_dim())) {
         q2_calibrated = true;
         q2_scales_set[batch] = 1;
         synced = cache_to;
@@ -1738,8 +1764,22 @@ bool HtpMHACoreLayer::try_quantized_attention(
       // and would clip at 127 (seen: V 2x at a third chunk). The scales
       // widen to them and every row is re-quantized: the mirror takes rows
       // [0, cache_to) again under the new scales.
+      std::vector<float> old_k, old_v; // staging: the scales before growing
+      if (staging) {
+        old_k = q2_scale_k;
+        old_v = q2_scale_v;
+      }
       if (append_rows != 0 &&
           q2_grow(k_base + off, v_base + off, append_rows, width)) {
+        if (staging) {
+          // the earlier rows come back at the grown scales
+          fill_kr.resize(old_k.size());
+          fill_vr.resize(old_v.size());
+          for (size_t x = 0; x < old_k.size(); ++x)
+            fill_kr[x] = old_k[x] / q2_scale_k[x];
+          for (size_t x = 0; x < old_v.size(); ++x)
+            fill_vr[x] = old_v[x] / q2_scale_v[x];
+        }
         if (std::getenv("NNTR_HTP_ATTN_TRACE"))
           ml_logi("mha_core trace: q2 scales grew at rows=%u from=%u; "
                   "re-quantizing %u rows",
@@ -1825,6 +1865,17 @@ bool HtpMHACoreLayer::try_quantized_attention(
       }
       q2_scales_set[batch] = 1;
     }
+    if (staging && kv_shift > 0) {
+      NNTR_THROW_IF(htp_seed_ord_ < 0 || fill_kr.size() != fill_vr.size() ||
+                      !htpDecodeKvFillKvq(
+                        static_cast<unsigned>(htp_seed_ord_), handle, kv_shift,
+                        fill_kr.empty() ? nullptr : fill_kr.data(),
+                        fill_vr.empty() ? nullptr : fill_vr.data(),
+                        static_cast<unsigned>(fill_kr.size())),
+                    std::runtime_error)
+        << "mha_core: " << q2_name_ << " could not take its rows [0, "
+        << kv_shift << ") back from the decode cache";
+    }
     // Q as the model's u16 tensor and the output back from u16: in a
     // quantized graph both are the neighbouring layers' formats already;
     // here the f32 layer converts at its edges.
@@ -1858,10 +1909,11 @@ bool HtpMHACoreLayer::try_quantized_attention(
     const bool f32_ran =
       attn_out_u16 && !f32_off &&
       compute_ops_->sdpa_q2_kvcache_f32(
-        handle, append_row0, append_rows, width, k_base + off, v_base + off,
-        io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q, cache_from,
-        cache_to, num_heads_Q, num_heads_KV, head_dim, window, io.out,
-        f32_check ? chk16.data() : nullptr, q2_out_enc.data(), q_stride);
+        handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+        v_base + off, io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q,
+        cache_from + kv_shift, cache_to + kv_shift, num_heads_Q, num_heads_KV,
+        head_dim, window, io.out, f32_check ? chk16.data() : nullptr,
+        q2_out_enc.data(), q_stride);
     bool again = false;
     if (f32_ran && f32_check && std::getenv("NNTR_HTP_ATTN_TRACE")) {
       // the u16 context's saturation against the fixed output encoding
@@ -1881,12 +1933,13 @@ bool HtpMHACoreLayer::try_quantized_attention(
             chk16.data() + static_cast<size_t>(r) * q_stride + h * head_dim,
             head_dim, q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
             chk.data() + static_cast<size_t>(r) * q_stride + h * head_dim);
-      again = f32_check_mode == 2 &&
-              compute_ops_->sdpa_q2_kvcache_f32(
-                handle, append_row0, append_rows, width, k_base + off,
-                v_base + off, io.q, q_inv.data(), q2_q_enc.data(), q_stride,
-                n_q, cache_from, cache_to, num_heads_Q, num_heads_KV, head_dim,
-                window, io.out, chk16.data(), q2_out_enc.data(), q_stride);
+      again =
+        f32_check_mode == 2 &&
+        compute_ops_->sdpa_q2_kvcache_f32(
+          handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+          v_base + off, io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q,
+          cache_from + kv_shift, cache_to + kv_shift, num_heads_Q, num_heads_KV,
+          head_dim, window, io.out, chk16.data(), q2_out_enc.data(), q_stride);
       if (again)
         for (unsigned int r = 0; r < n_q; ++r)
           for (unsigned int h = 0; h < num_heads_Q; ++h)
@@ -1941,10 +1994,10 @@ bool HtpMHACoreLayer::try_quantized_attention(
     const auto tq1 = std::chrono::steady_clock::now();
     if (!again &&
         !compute_ops_->sdpa_q2_kvcache(
-          handle, append_row0, append_rows, width, k_base + off, v_base + off,
-          q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q, cache_from, cache_to,
-          num_heads_Q, num_heads_KV, head_dim, window, q2_out_u16.data(),
-          q2_out_enc.data(), q_stride)) {
+          handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+          v_base + off, q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q,
+          cache_from + kv_shift, cache_to + kv_shift, num_heads_Q, num_heads_KV,
+          head_dim, window, q2_out_u16.data(), q2_out_enc.data(), q_stride)) {
       return fail("attention");
     }
     const auto tq2 = std::chrono::steady_clock::now();
@@ -1989,9 +2042,9 @@ bool HtpMHACoreLayer::try_quantized_attention(
               n_q, us(tq1 - tq0), us(tq2 - tq1), us(tq3 - tq2));
     }
   } else if (!compute_ops_->sdpa_q_kvcache(
-               handle, append_row0, append_rows, width, k_base + off,
-               v_base + off, q_view, q_stride, n_q, cache_from, cache_to,
-               num_heads_Q, num_heads_KV, head_dim, window,
+               handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+               v_base + off, q_view, q_stride, n_q, cache_from + kv_shift,
+               cache_to + kv_shift, num_heads_Q, num_heads_KV, head_dim, window,
                attn_logit_softcapping, io.sinks, io.out, q_stride)) {
     return fail("attention");
   }
@@ -2127,6 +2180,9 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
   bool done = try_quantized_attention(batch, query_step, cache_key, cache_value,
                                       cache_key_dim, attention_output_step,
                                       cache_from, cache_to, nullptr);
+  NNTR_THROW_IF(!done && htpKvStaging(), std::runtime_error)
+    << "mha_core: " << q2_name_ << " fell off the int8 KV path, and the CPU "
+    << "keeps no rows to attend over (NNTR_HTP_KV_INT8_ONLY=0 keeps them)";
   if (!done) {
     // every path below reads Q in the host tensor
     if (compute_ops_ &&
@@ -2275,8 +2331,13 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
   // enabled, and the accelerated paths take f32 (staged inside).
   if (try_quantized_attention(batch, query_step, cache_key, cache_value,
                               cache_key_dim, attention_output_step, from, to,
-                              &sink_step) ||
-      try_accelerated_attention(query_step, b_cached_key, b_cached_value,
+                              &sink_step)) {
+    return;
+  }
+  NNTR_THROW_IF(htpKvStaging(), std::runtime_error)
+    << "mha_core: " << q2_name_ << " fell off the int8 KV path, and the CPU "
+    << "keeps no rows to attend over (NNTR_HTP_KV_INT8_ONLY=0 keeps them)";
+  if (try_accelerated_attention(query_step, b_cached_key, b_cached_value,
                                 attention_output_step, from, to, &sink_step)) {
     return;
   }

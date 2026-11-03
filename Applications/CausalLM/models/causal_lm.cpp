@@ -1037,8 +1037,14 @@ std::string CausalLM::kvCacheModelTag() const {
 
 void CausalLM::prepareKvAdopt(unsigned int end) {
   adopt_window_end_ = 0;
+  // [C] staging: the decode caches hold every row from 0 (the int8 prefill
+  // refills its earlier rows from them); the sliding layers' attention still
+  // reads its window only (the record's top_k)
+  const bool staging = kv_cache.isStaging();
+  if (staging)
+    htpDecodeKvWindow(end + NUM_TO_GENERATE, 0);
   // the windowed layers' decode cache, as the generation sets it below
-  for (unsigned int l = 0; l < kv_cache.getNumLayers(); ++l)
+  for (unsigned int l = 0; !staging && l < kv_cache.getNumLayers(); ++l)
     if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
       const unsigned int base = kv_cache.baseAfterCompact(l, end);
       htpDecodeKvWindow(end - base + NUM_TO_GENERATE, base);
@@ -1060,7 +1066,8 @@ void CausalLM::prepareKvAdopt(unsigned int end) {
              : nullptr;
       if (mha)
         mha->setHtpPrefillSeed(ready ? static_cast<int>(idx) : -1,
-                               kv_cache.baseAfterCompact(idx, end));
+                               staging ? 0u
+                                       : kv_cache.baseAfterCompact(idx, end));
     };
   model->forEachLayer(fn, nullptr);
   if (ready)
@@ -1124,6 +1131,10 @@ void CausalLM::save_kvcache(std::string path, int to_) {
   if (to_ < 0)
     throw std::out_of_range("save_kvcache: position must not be negative");
   const auto pos = static_cast<unsigned int>(to_);
+  // [C] staging: the rows live in the accelerator's int8 decode caches
+  NNTR_THROW_IF(kv_cache.isStaging(), std::runtime_error)
+    << "save_kvcache: the KV cache stages one step's rows (int8-only KV); "
+       "run with NNTR_HTP_KV_INT8_ONLY=0 to save it";
   kv_cache.validateSaveRange(pos);
   // [#4428 window] a windowed layer's rows before its window are not in
   // the dump: their |max| is folded first and goes with the calibration
@@ -1176,6 +1187,9 @@ void CausalLM::load_kvcache(std::string path, int to_) {
   if (!kv_cache.isAllocated()) {
     allocateAndBindKVCache();
   }
+  NNTR_THROW_IF(kv_cache.isStaging(), std::runtime_error)
+    << "load_kvcache: the KV cache stages one step's rows (int8-only KV); "
+       "run with NNTR_HTP_KV_INT8_ONLY=0 to load one";
   const unsigned int loaded =
     kv_cache.load(path, static_cast<unsigned int>(to_), kvCacheModelTag());
   // absent (a dump of an older build, a CPU run): the layers calibrate on
@@ -2201,6 +2215,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       ~LastBlock() { htpPrefillLastBlock() = false; }
     };
     if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
+      // [C] staging: a later prompt's block starts at the staged block's
+      // front too (its rows past the generated ones would not fit)
+      if (kv_cache.isStaging())
+        compactKVCache(from_pos);
       beforePrefillBlock(from_pos, from_pos + n_tok);
       LastBlock last(true);
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
@@ -2450,8 +2468,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
        "ending at "
     << adopt_window_end_ << ", the generation starts at "
     << input_len + global_token_len;
-  for (unsigned int l = 0;
-       adopt_window_end_ == 0 && l < kv_cache.getNumLayers(); ++l)
+  if (adopt_window_end_ == 0 && kv_cache.isStaging())
+    htpDecodeKvWindow(input_len + global_token_len + NUM_TO_GENERATE, 0);
+  for (unsigned int l = 0; adopt_window_end_ == 0 && !kv_cache.isStaging() &&
+                           l < kv_cache.getNumLayers();
+       ++l)
     if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
       const unsigned int base = kv_cache.getBase(l);
       htpDecodeKvWindow(input_len + global_token_len - base + NUM_TO_GENERATE,

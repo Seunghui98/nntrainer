@@ -132,6 +132,13 @@ protected:
   /** @brief Rows of a layer's KV cache: max_seq_len, or for a sliding layer
    *         at a long max_seq_len its window plus one step. */
   unsigned int getKVCacheRows(int layer_id) const;
+  /** @brief [C] One KV store a layer: the int8 decode caches hold the rows
+   *  and the CPU cache stages a step's (KVCacheManager::setStaging). With
+   *  the KV adoption, HTP attention and no KV-shared layers, unless
+   *  NNTR_HTP_KV_INT8_ONLY=0. */
+  bool kvStaging() const;
+  /** @brief [C] The staged rows: the largest prefill block or generation. */
+  unsigned int stagingRows() const;
   /** @brief A prompt past init_seq_len is fed in init_seq_len-row chunks:
    *         the windowed sliding cache is sized for exactly that. */
   bool chunkLongPrompts() const override { return true; }

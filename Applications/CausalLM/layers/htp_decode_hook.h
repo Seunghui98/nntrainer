@@ -17,6 +17,7 @@ using nntrainer::htpDecodeBan;
 using nntrainer::htpDecodeConvGate;
 using nntrainer::htpDecodeHasTokenId;
 using nntrainer::htpDecodeKvAmaxFloor;
+using nntrainer::htpDecodeKvFillKvq;
 using nntrainer::htpDecodeKvPrepare;
 using nntrainer::htpDecodeKvSeed;
 using nntrainer::htpDecodeKvSeedF16;
@@ -57,6 +58,15 @@ inline bool htpKvAdopt() {
 inline unsigned &htpPrefillEnd() {
   static unsigned end = 0;
   return end;
+}
+
+/** @brief [C] True once the model's KV cache stages a step's rows only
+ *  (KVCacheManager::setStaging): every HTP attention layer keeps its rows in
+ *  its int8 decode cache alone, so the int8 path may not fall back to the
+ *  CPU's (htp_mha_core). Set by the model at its cache allocation. */
+inline bool &htpKvStaging() {
+  static bool on = false;
+  return on;
 }
 
 /** @brief NNTR_MOE_WARM: true while the model runs the last block of a
