@@ -1355,8 +1355,6 @@ public:
   void beginPrompt() {
     htp_router_handoff_invalidate(&router_handoff_);
     warmEnd(); // a generation stopped before its first token
-    if (t1_defer_pending_)
-      runAfterFirstToken(); // ... or right after it
     if (cpu_predictor_)
       cpu_predictor_->drain();
     if (pool_prefetch_)
@@ -2762,6 +2760,7 @@ public:
     stretch_end_.assign(n_ops, 0);
     attn_ordinal_.assign(n_ops, 0);
     param_bound_.assign(n_ops, 0);
+    rope_ptrs_.clear();
     conv_next_pos_.assign(n_ops, HTP_GRAPH_NO_OP);
     first_resident_op_ = HTP_GRAPH_NO_OP;
     uint32_t n_attn = 0;
@@ -3454,13 +3453,24 @@ public:
         // (S26 Ultra, p1024: 30 binds were 439 ms of the first token)
         const uint32_t want = graph_words_[6] * rec->head_dim;
         uint32_t src = HTP_GRAPH_NO_OP;
-        for (const auto &t : rope_tables_)
+        // [#282 F] the layers of one RoPE cache hand one table at one
+        // address over the first row (HtpMHACoreLayer's table cache): that
+        // address names it, without the memcmp below
+        for (const RopePtr &p : rope_ptrs_)
+          if (p.data == param && p.n == param_len && param_len == want) {
+            src = p.op;
+            break;
+          }
+        for (const auto &t : rope_tables_) {
+          if (src != HTP_GRAPH_NO_OP)
+            break;
           if (t.second.size() == param_len && param_len == want &&
               std::memcmp(t.second.data(), param, param_len * sizeof(float)) ==
                 0) {
             src = t.first;
             break;
           }
+        }
         if (src != HTP_GRAPH_NO_OP) {
           const int err = nntr_hvx_graph_share_param(
             session, r, HTP_GRAPH_PARAM_ROPE_TABLE, src);
@@ -3474,6 +3484,8 @@ public:
           rope_tables_.emplace_back(
             r, std::vector<float>(param, param + param_len));
         }
+        rope_ptrs_.push_back(
+          {param, param_len, src != HTP_GRAPH_NO_OP ? src : r});
         param_bound_[r] = 1;
       }
       // The DSP cache must hold rows [0, pos): seed it from the layer's
@@ -4034,21 +4046,15 @@ public:
   /** Release prefill/seed temporaries between completed synchronous calls.
    * The public phase-boundary hook publishes kept outputs first. The token
    * driver calls here after the seed's last reader has completed. */
-  /** [#282 F] What the first token's packet leaves: the prefill's staging,
-   *  its idle readers, its heap, and the pool's growth (in that order:
-   *  the growth places slots in the room the staging leaves). */
-  void runAfterFirstToken() {
-    t1_defer_pending_ = false;
-    const uint64_t t0 = HtpProfile::nowUs();
+  /** What a prompt's first token leaves: the prefill's staging, its idle
+   *  readers, its heap, and (@a grow) the pool's growth, in that order: the
+   *  growth places slots in the room the staging leaves. */
+  void runAfterFirstToken(bool grow) {
     releasePrefillStaging(); // [#4416 mem] the seed was the last big row
     releaseIdlePrefillReaders();
     purgePrefillHeap();
-    if (t1_grow_pending_) {
-      t1_grow_pending_ = false;
+    if (grow)
       growPool();
-    }
-    std::fprintf(stderr, "[HTP] t1: after-token cleanups ms=%.1f\n",
-                 (HtpProfile::nowUs() - t0) / 1000.0);
   }
 
   void releasePrefillStaging() {
@@ -4876,6 +4882,7 @@ public:
     }
     init_line.at[2] = HtpProfile::nowUs();
     size_t param_bytes = 0;
+    bool param_batched = false;
     // [plan 201 S1] each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
@@ -4886,18 +4893,41 @@ public:
                    static_cast<unsigned>(t.size()),
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
-      // [plan 201 S4] the parameters the model handed at load, by name
+      // [plan 201 S4] the parameters the model handed at load, by name,
+      // in one graph_set_params call (one round trip for 301 on Gemma 4;
+      // NNTR_HTP_PARAM_BATCH=0 or a refused call: one call each)
+      static const bool batch_on = [] {
+        const char *v = std::getenv("NNTR_HTP_PARAM_BATCH");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+      }();
+      std::vector<uint32_t> hdr;
+      std::vector<float> data;
+      auto add = [&](uint32_t op, uint32_t which, const float *d, unsigned n) {
+        hdr.insert(hdr.end(), {op, which, n});
+        data.insert(data.end(), d, d + n);
+      };
       for (const LoadParam &p : load_params_) {
         param_bytes += size_t(p.n) * sizeof(float);
-        setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
+        add(p.op, p.which, p.data, p.n);
         const auto q = static_quant_.find(p.data);
         if (p.which == HTP_GRAPH_PARAM_ROUTER_W && q != static_quant_.end()) {
           const float grid[] = {q->second.scale,
                                 static_cast<float>(q->second.zp)};
-          setParam(session, p.op, HTP_GRAPH_PARAM_ROUTER_QUANT, grid, 2, 2,
-                   "router static quantization");
+          add(p.op, HTP_GRAPH_PARAM_ROUTER_QUANT, grid, 2);
         }
       }
+      const bool batched =
+        batch_on && !hdr.empty() &&
+        nntr_hvx_graph_set_params(session, hdr.data(),
+                                  static_cast<int>(hdr.size()), data.data(),
+                                  static_cast<int>(data.size())) == AEE_SUCCESS;
+      if (!batched)
+        for (size_t i = 0, at = 0; i < hdr.size(); i += 3) {
+          setParam(session, hdr[i], hdr[i + 1], data.data() + at, hdr[i + 2],
+                   hdr[i + 2], "load parameter");
+          at += hdr[i + 2];
+        }
+      param_batched = batched;
       // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
       // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
       if (const uint32_t on = predictMode()) {
@@ -4938,9 +4968,10 @@ public:
       uint32_t si[13] = {0};
       const bool dsp = nntr_hvx_session_info(session, si, 13) == AEE_SUCCESS;
       std::fprintf(stderr,
-                   "[HTP] t1: graph_init params=%zu mib=%.1f ms=%.1f "
-                   "dsp_ms=%.1f\n",
+                   "[HTP] t1: graph_init params=%zu mib=%.1f batched=%d "
+                   "ms=%.1f dsp_ms=%.1f\n",
                    load_params_.size(), param_bytes / 1048576.0,
+                   param_batched ? 1 : 0,
                    (init_line.at[3] - init_line.at[2]) / 1000.0,
                    dsp ? si[12] / 1000.0 : -1.0);
     }
@@ -7519,9 +7550,6 @@ private:
       poolSync(); // [plan 201 S1]
     const uint64_t ps1 = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    if (t1_defer_pending_)
-      runAfterFirstToken(); // the second token: the first one's cleanups,
-                            // under the lock they ran under before
     htp_router_handoff_invalidate(&router_handoff_);
     std::memcpy(q.act->data(), act, act_bytes);
     const uint32_t tok = e.tok++;
@@ -7647,24 +7675,11 @@ private:
     e.inout_us += static_cast<int32_t>(r.t_out_us - r.t_in_us);
     ++fwd_calls_; // one ARM -> DSP packet per token: calls/token = 1.00
     ++fwd_tokens_;
-    const bool first = ++prompt_tokens_ == 1;
-    // [#282 F] the first token's cleanups -- the prefill's staging, its
-    // readers, its heap, then the pool's growth -- run before the second
-    // token instead, after the first is out (NNTR_HTP_T1_DEFER=0: here)
-    static const bool t1_defer = [] {
-      const char *v = std::getenv("NNTR_HTP_T1_DEFER");
-      return v == nullptr || std::strcmp(v, "0") != 0;
-    }();
     const uint64_t cl0 = HtpProfile::nowUs();
-    if (first) {
-      t1_grow_pending_ = e.tokens == 1;
-      if (t1_defer)
-        t1_defer_pending_ = true;
-      else
-        runAfterFirstToken();
-    } else if (e.tokens == 1) {
+    if (++prompt_tokens_ == 1)
+      runAfterFirstToken(e.tokens == 1);
+    else if (e.tokens == 1)
       growPool();
-    }
     if (e.tokens == 1) {
       std::fprintf(stderr,
                    "[HTP] token driver: first token pos=%u id=%u us=%llu "
@@ -7677,10 +7692,9 @@ private:
       // to this token's packet, the pool sync, the packet, the cleanups
       std::fprintf(stderr,
                    "[HTP] t1: timeline_ms graph_init=%.1f to_token=%.1f "
-                   "pool_sync=%.1f to_packet=%.1f packet=%.1f cleanup=%.1f%s\n",
+                   "pool_sync=%.1f to_packet=%.1f packet=%.1f cleanup=%.1f\n",
                    ms(t1_gi0_, t1_gi1_), ms(t1_gi1_, entry_us), ms(ps0, ps1),
-                   ms(ps1, t0), us / 1000.0, ms(cl0, HtpProfile::nowUs()),
-                   t1_defer_pending_ ? " (deferred to the second token)" : "");
+                   ms(ps1, t0), us / 1000.0, ms(cl0, HtpProfile::nowUs()));
     }
     HtpProfile &profile = HtpProfile::global();
     if (profile.level())
@@ -11593,6 +11607,13 @@ private:
   std::vector<uint8_t> param_bound_;
   /** [#4416 D6] the distinct RoPE tables bound: (ROPE op, its bytes) */
   std::vector<std::pair<uint32_t, std::vector<float>>> rope_tables_;
+  /** [#282 F] the host address each bound RoPE table came from, this graph */
+  struct RopePtr {
+    const float *data;
+    unsigned n;
+    uint32_t op;
+  };
+  std::vector<RopePtr> rope_ptrs_;
   std::vector<uint32_t> conv_next_pos_;
   std::vector<uint32_t> kv_len_;
   /** [C] decode_kv_seed_kvq_layer: seeds run inside the prefill, and their
@@ -11600,8 +11621,6 @@ private:
   uint32_t prefill_seeds_ = 0;
   uint64_t prefill_seed_us_ = 0;
   uint64_t t1_gi0_ = 0, t1_gi1_ = 0; /**< [#282 F] graph init's window */
-  bool t1_defer_pending_ = false;    /**< runAfterFirstToken still owed */
-  bool t1_grow_pending_ = false;     /**< ...and the pool's growth with it */
   bool attn_registered_ = false;
   uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */
   /** [plan 201 S4] per attention ordinal its op, its session cache (0, or

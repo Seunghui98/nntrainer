@@ -668,8 +668,9 @@ private:
    */
   bool htpDecodeAttention(nntrainer::RunLayerContext &context,
                           unsigned int pos);
-  std::vector<float>
-    htp_rope_table_;            /**< [max_timestep][cos hd/2 | sin hd/2] */
+  /** [max_timestep][cos hd/2 | sin hd/2], shared by the layers of one RoPE
+   *  cache over the first decode row (htpRopeTable) */
+  std::shared_ptr<const std::vector<float>> htp_rope_table_;
   bool htp_owns_cache_ = false; /**< a hook returned 1: rows past the
                                      prompt are the DSP's, not this cache's */
   /** [C] htpKvAdopt: the last prefill call kept the int8 cache (trimmed to

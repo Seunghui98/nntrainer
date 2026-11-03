@@ -12,11 +12,13 @@
  *         This code is a part of the break down version of the mha layer.
  */
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 static std::mutex rope_init_mtx;
@@ -153,7 +155,7 @@ void HtpMHACoreLayer::beginHtpPrompt() {
   q2_calibrated = false;
   kv_floor_k_.clear();
   kv_floor_v_.clear();
-  htp_rope_table_.clear();
+  htp_rope_table_.reset();
 }
 
 /************************************************************** */
@@ -701,36 +703,62 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
       << " positions, max_timestep is " << rows;
-    htp_rope_table_.resize(static_cast<size_t>(rows) * head_dim);
-    for (unsigned int i = 0; i < rows; ++i) {
-      float *t = htp_rope_table_.data() + static_cast<size_t>(i) * head_dim;
-      std::memcpy(t, freqs_fp32->cos[i].data(), half * sizeof(float));
-      std::memcpy(t + half, freqs_fp32->sin[i].data(), half * sizeof(float));
+    // [#282 F] one table per RoPE cache and length for the row: the layers
+    // that share a cache (Gemma 4: 25 sliding, 5 full) hand the same bytes
+    // at the same address, and the backend shares them by that address
+    // instead of a 30-table build and memcmp (~38 ms of the S26 Ultra's
+    // first token, round 12's to_token). Kept to the next row's first call.
+    static std::mutex tab_mtx;
+    static unsigned int tab_pos = UINT_MAX;
+    static std::map<std::tuple<const void *, unsigned, unsigned>,
+                    std::shared_ptr<const std::vector<float>>>
+      tabs;
+    const std::lock_guard<std::mutex> lock(tab_mtx);
+    if (tab_pos != pos) {
+      tabs.clear();
+      tab_pos = pos;
     }
+    auto &slot = tabs[{freqs_fp32.get(), rows, head_dim}];
+    if (!slot) {
+      auto tab = std::make_shared<std::vector<float>>(
+        static_cast<size_t>(rows) * head_dim);
+      for (unsigned int i = 0; i < rows; ++i) {
+        float *t = tab->data() + static_cast<size_t>(i) * head_dim;
+        std::memcpy(t, freqs_fp32->cos[i].data(), half * sizeof(float));
+        std::memcpy(t + half, freqs_fp32->sin[i].data(), half * sizeof(float));
+      }
+      slot = std::move(tab);
+    }
+    htp_rope_table_ = slot;
   };
-  if (htp_rope_table_.empty() && use_rope && head_dim == 64)
+  auto rope_data = [&]() -> const float * {
+    return htp_rope_table_ ? htp_rope_table_->data() : nullptr;
+  };
+  auto rope_len = [&]() -> unsigned {
+    return htp_rope_table_ ? static_cast<unsigned>(htp_rope_table_->size())
+                           : 0u;
+  };
+  if (!htp_rope_table_ && use_rope && head_dim == 64)
     build_rope_table();
   int r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                        htp_rope_table_.data(),
-                        static_cast<unsigned>(htp_rope_table_.size()));
+                        rope_data(), rope_len());
   if (r == 3) {
     // [#260] use_rope may be off here when the token runs the row: its
     // q / k are the DSP's own, unrotated (qkv_layer rotates on the CPU
     // path, #4415, with the table precompute_freqs also builds). A row the
     // CPU projected arrives rotated already.
-    NNTR_THROW_IF(!htp_rope_table_.empty() ||
+    NNTR_THROW_IF(htp_rope_table_ != nullptr ||
                     (!use_rope && !htpDecodeRowResident(pos)),
                   std::runtime_error)
       << "mha_core: the HTP attention hook asked for a RoPE table it has";
     build_rope_table();
     r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                      htp_rope_table_.data(),
-                      static_cast<unsigned>(htp_rope_table_.size()));
+                      rope_data(), rope_len());
     // [#4416 mem] bound: the DSP holds its copy and asks (3) again only
     // after a new graph init, when build_rope_table makes it again. 30
     // layers x 2.2-4.5 MB kept for nothing otherwise.
     if (r != 3)
-      std::vector<float>().swap(htp_rope_table_);
+      htp_rope_table_.reset();
   }
   if (r == 2) {
     // Seed the DSP cache from this layer's rows [0, pos): fp16 bits on
@@ -804,8 +832,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                 pos, all_ms);
       }
       r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                        htp_rope_table_.data(),
-                        static_cast<unsigned>(htp_rope_table_.size()));
+                        rope_data(), rope_len());
       NNTR_THROW_IF(r != 1, std::runtime_error)
         << "mha_core: the HTP attention hook asked for a seed twice at pos "
         << pos;
@@ -836,8 +863,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       q_cache_handles[0] = -1; // released on the DSP
       drop_cpu_cache();
       r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                        htp_rope_table_.data(),
-                        static_cast<unsigned>(htp_rope_table_.size()));
+                        rope_data(), rope_len());
       NNTR_THROW_IF(r != 1, std::runtime_error)
         << "mha_core: the HTP attention hook asked for a seed twice at pos "
         << pos;
@@ -884,8 +910,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
               pos, conv_ms, all_ms);
     }
     r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                      htp_rope_table_.data(),
-                      static_cast<unsigned>(htp_rope_table_.size()));
+                      rope_data(), rope_len());
     NNTR_THROW_IF(r != 1, std::runtime_error)
       << "mha_core: the HTP attention hook asked for a seed twice at pos "
       << pos;
