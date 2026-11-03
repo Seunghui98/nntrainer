@@ -78,7 +78,7 @@ bool Gemma4HtpTransformer::kvStaging() const {
     return v == nullptr || std::strcmp(v, "0") != 0;
   }();
   return on && htpKvAdopt() && ATTENTION_ENGINE == "htp" &&
-         NUM_KV_SHARED_LAYERS == 0;
+         NUM_KV_SHARED_LAYERS == 0 && !kv_cache_file_;
 }
 
 unsigned int Gemma4HtpTransformer::stagingRows() const {
@@ -192,6 +192,8 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
   Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
   ATTENTION_ENGINE = nntr_cfg.value("attention_engine", std::string());
   ATTENTION_KV_DTYPE = nntr_cfg.value("attention_kv_dtype", std::string());
+  kv_cache_file_ = nntr_cfg.contains("system_prompt") &&
+                   nntr_cfg["system_prompt"].contains("kvcache");
   FC_WH_FILE_NAME = nntr_cfg.value("fc_wh_file_name", std::string());
   FC_WH_FORMAT = nntr_cfg.value("fc_wh_format", std::string());
 
