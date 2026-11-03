@@ -491,21 +491,30 @@ TEST(HexklKvQ, FillFromDecodeLayout) {
   ASSERT_EQ(hexkl_kv_q_fill_q8(&tbl, h, 0, 64, kt8.data(), v8.data(), hs,
                                kr.data(), vr.data(), nullptr, nullptr),
             0);
+  // Q15: r as round(r 2^15) (1.0 as 2^15 - 1), (q r + 2^14) >> 15
+  auto q15 = [](int q, float r) {
+    const float x = r * 32768.0f + 0.5f;
+    const int32_t R = x >= 32767.0f ? 32767 : static_cast<int32_t>(x);
+    return std::max(-127, std::min(127, (q * R + 16384) >> 15));
+  };
   bad = 0;
+  int far = 0, moved_at_one = 0;
   for (uint32_t r = 0; r < 64; ++r)
     for (uint32_t n = 0; n < n_kv; ++n)
       for (uint32_t d = 0; d < hd; ++d) {
         const size_t i = n * hd + d;
-        const int ek = static_cast<int>(std::nearbyint(k_at(n, r, d) * kr[i]));
-        const int ev =
-          std::max(-127, std::min(127, static_cast<int>(std::nearbyint(
-                                         v8[n * hs + r * hd + d] * vr[i]))));
+        const int qk = k_at(n, r, d), qv = v8[n * hs + r * hd + d];
+        const int ek = q15(qk, kr[i]), ev = q15(qv, vr[i]);
         bad += static_cast<int8_t>(kv->kt4[hexkl_kv_q_kt4_index(kv, n, r, d)] ^
                                    0x80u) != ek;
         bad += static_cast<int8_t>(kv->v4[hexkl_kv_q_v4_index(kv, n, r, d)] ^
                                    0x80u) != ev;
+        far += std::abs(ek - static_cast<int>(std::nearbyint(qk * kr[i]))) > 1;
+        moved_at_one += kr[i] == 1.0f && ek != qk;
       }
   EXPECT_EQ(bad, 0);
+  EXPECT_EQ(far, 0) << "the Q15 rescale is within 1 of rint(q r)";
+  EXPECT_EQ(moved_at_one, 0) << "a ratio of 1 keeps every value";
   EXPECT_NE(hexkl_kv_q_fill_q8(&tbl, h, 150, 20, kt8.data(), v8.data(), hs,
                                nullptr, nullptr, nullptr, nullptr),
             0);

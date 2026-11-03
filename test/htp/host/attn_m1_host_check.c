@@ -1781,6 +1781,116 @@ static void check_fill_roundtrip(hvx_worker_pool *pool) {
   }
 }
 
+/** [C] The HVX fill (hexkl_kv_q.c fill_tile_unit, built here with
+ *  HEXKL_KV_Q_FILL_HVX) against the row-by-row fill: Gemma 4's head
+ *  dims, a range starting and ending inside 64-row tiles, with and without
+ *  the rescale ratios (1.0 among them). Masters, column sums and scales
+ *  byte for byte, and the rows outside the range left as they were.
+ *  (ATTN M1 FILL HVX OK) */
+static void check_fill_hvx(hvx_worker_pool *pool) {
+  static const uint32_t hds[2] = {256u, 512u};
+  int bad = 0, cells = 0;
+  for (uint32_t hi = 0; hi < 2u; ++hi) {
+    const uint32_t hd = hds[hi], n_kv = hd == 512u ? 2u : 3u, seq = 320u;
+    const size_t n = (size_t)n_kv * hd, hs = (size_t)seq * hd;
+    int8_t *kt8 = (int8_t *)malloc(n_kv * hs),
+           *v8 = (int8_t *)malloc(n_kv * hs);
+    float *kr = (float *)malloc(n * sizeof(float)),
+          *vr = (float *)malloc(n * sizeof(float));
+    if (!kt8 || !v8 || !kr || !vr) {
+      CHECK(0, "fill hvx: alloc");
+      free(kt8);
+      free(v8);
+      free(kr);
+      free(vr);
+      return;
+    }
+    uint32_t lcg = 0x5eedu + hd;
+    for (size_t i = 0; i < n_kv * hs; ++i) {
+      lcg = lcg * 1664525u + 1013904223u;
+      kt8[i] = (int8_t)((int)((lcg >> 24) % 255u) - 127);
+      lcg = lcg * 1664525u + 1013904223u;
+      v8[i] = (int8_t)((int)((lcg >> 24) % 255u) - 127);
+    }
+    for (size_t i = 0; i < n; ++i) {
+      kr[i] = i % 7u == 0u ? 1.0f : 0.3f + 0.1f * (float)(i % 7u);
+      vr[i] = i % 5u == 0u ? 1.0f : 0.45f + 0.1f * (float)(i % 5u);
+    }
+    static const uint32_t ranges[3][2] = {{0u, 64u}, {37u, 230u}, {5u, 1u}};
+    for (uint32_t ri = 0; ri < 3u; ++ri)
+      for (int with_ratio = 0; with_ratio < 2; ++with_ratio) {
+        const uint32_t row0 = ranges[ri][0], rows = ranges[ri][1];
+        hexkl_kv_q_table *ta = (hexkl_kv_q_table *)calloc(1, sizeof(*ta));
+        hexkl_kv_q_table *tb = (hexkl_kv_q_table *)calloc(1, sizeof(*tb));
+        uint32_t ha = 0, hb = 0;
+        float *sk = (float *)malloc(n * sizeof(float)),
+              *sv = (float *)malloc(n * sizeof(float));
+        for (size_t i = 0; sk && sv && i < n; ++i) {
+          sk[i] = 0.002f * (float)(1u + i % 97u);
+          sv[i] = 0.003f * (float)(1u + i % 89u);
+        }
+        if (!ta || !tb || !sk || !sv ||
+            hexkl_kv_q_register(ta, HEXKL_KV_Q8, seq, n_kv, hd, &ha) != 0 ||
+            hexkl_kv_q_register(tb, HEXKL_KV_Q8, seq, n_kv, hd, &hb) != 0 ||
+            hexkl_kv_q_set_fixed_scales_kd(ta, ha, sk, sv) != 0 ||
+            hexkl_kv_q_set_fixed_scales_kd(tb, hb, sk, sv) != 0) {
+          CHECK(0, "fill hvx: register hd %u", (unsigned)hd);
+          bad = 1;
+        } else {
+          const hexkl_kv_q *a = hexkl_kv_q_get(ta, ha),
+                           *b = hexkl_kv_q_get(tb, hb);
+          const int ra = hexkl_kv_q_fill_q8(ta, ha, row0, rows, kt8, v8, hs,
+                                            with_ratio ? kr : NULL,
+                                            with_ratio ? vr : NULL, NULL, pool);
+          const int rb = hexkl_kv_q_fill_q8_scalar(tb, hb, row0, rows, kt8, v8,
+                                                   hs, with_ratio ? kr : NULL,
+                                                   with_ratio ? vr : NULL);
+          int diff = ra != 0 || rb != 0;
+          for (uint32_t k = 0; !diff && k < n_kv; ++k)
+            for (uint32_t r = 0; r < seq; ++r) {
+              for (uint32_t d = 0; d < hd; ++d) {
+                diff += a->kt4[hexkl_kv_q_kt4_index(a, k, r, d)] !=
+                        b->kt4[hexkl_kv_q_kt4_index(b, k, r, d)];
+                diff += a->v4[hexkl_kv_q_v4_index(a, k, r, d)] !=
+                        b->v4[hexkl_kv_q_v4_index(b, k, r, d)];
+              }
+              const size_t s = hexkl_kv_q_sk_index(a, k, r);
+              diff += a->colsum_k[s] != b->colsum_k[s];
+              diff += a->s_k[s] != b->s_k[s];
+              diff += a->s_v[hexkl_kv_q_sv_index(a, k, r)] !=
+                      b->s_v[hexkl_kv_q_sv_index(b, k, r)];
+            }
+          if (diff) {
+            printf("FAIL: fill hvx hd=%u rows [%u, %u) ratio=%d: %d values "
+                   "differ from the row-by-row fill\n",
+                   (unsigned)hd, (unsigned)row0, (unsigned)(row0 + rows),
+                   with_ratio, diff);
+            g_fail = 1;
+            bad = 1;
+          }
+          ++cells;
+        }
+        if (ta && ha)
+          hexkl_kv_q_release(ta, ha);
+        if (tb && hb)
+          hexkl_kv_q_release(tb, hb);
+        free(ta);
+        free(tb);
+        free(sk);
+        free(sv);
+      }
+    free(kt8);
+    free(v8);
+    free(kr);
+    free(vr);
+  }
+  if (bad == 0) {
+    printf("ATTN M1 FILL HVX OK: %d cells (head_dim 256 / 512, rows inside "
+           "tiles, Q15 ratios) equal the row-by-row fill\n",
+           cells);
+  }
+}
+
 /** [C] The allocation thread one layer ahead of the seeds: each seed after
  *  a ctx's first finds its layer allocated (pre_hits), the layers equal
  *  the synchronous seed's bytes, and a layer allocated ahead but never
@@ -2534,6 +2644,8 @@ int main(void) {
   check_seed_q8_tiles_async(pools);
   check_seed_prealloc(pools);
   check_fill_roundtrip(pools[2]);
+  check_fill_hvx(pools[2]);
+  check_fill_hvx(NULL);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);

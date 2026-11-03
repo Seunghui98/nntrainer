@@ -352,18 +352,27 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
  *        [tiles][head_dim][64], V row-major, [seq][head_dim], each head
  *        @a head_stride bytes after the last. Each value is taken times
  *        @a k_ratio / @a v_ratio ([n_head_kv][head_dim]: the old scale over
- *        the cache's, NULL for 1) and rounded to nearest even, clamped to
- *        qmax; the masters, per-row scales and column sums come out as an
- *        append of those values writes them, and the tiles are baked as an
- *        append bakes them (vtcm_base NULL: no bake, host builds). With no
- *        ratio the cache holds the decode cache's bytes back: what lets a
- *        prefill call's attention run over earlier rows the CPU no longer
- *        keeps.
+ *        the cache's, in [0, 1], NULL for 1) as a Q15 ratio r:
+ *        (q r + 2^14) >> 15, clamped to qmax; the masters, per-row scales
+ *        and column sums come out as an append of those values writes them,
+ *        and the tiles are baked as an append bakes them (vtcm_base NULL: no
+ *        bake, host builds). With no ratio the cache holds the decode
+ *        cache's bytes back: what lets a prefill call's attention run over
+ *        earlier rows the CPU no longer keeps. HVX over (head, 64-row tile)
+ *        units when head_dim is a multiple of 128 (the DSP build, or a host
+ *        build with HEXKL_KV_Q_FILL_HVX on hvx_emu); else row by row.
  */
 int hexkl_kv_q_fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
                        uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
                        size_t head_stride, const float *k_ratio,
                        const float *v_ratio, uint8_t *vtcm_base, void *pool);
+
+/** @brief hexkl_kv_q_fill_q8 row by row, no bake: the HVX fill's reference
+ *         in the host checks. */
+int hexkl_kv_q_fill_q8_scalar(hexkl_kv_q_table *tbl, uint32_t handle,
+                              uint32_t row0, uint32_t n_rows, const int8_t *kt8,
+                              const int8_t *v8, size_t head_stride,
+                              const float *k_ratio, const float *v_ratio);
 
 /**
  * @brief Fills the row-major staging buffers with column tile @a c of head

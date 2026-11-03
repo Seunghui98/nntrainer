@@ -16,6 +16,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(__hexagon__) && defined(HEXKL_KV_Q_FILL_HVX)
+/* the host checks build the HVX fill on hvx_emu */
+#include "hvx_worker_pool.h"
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#endif
+
 #ifdef __hexagon__
 #include "hexkl_micro.h"
 #include "hvx_kv_quant.h"
@@ -547,18 +554,25 @@ typedef struct {
 
 #endif /* __hexagon__: the row filler below builds everywhere */
 
-/** [C] One int8 value of the decode cache, rescaled when @a ratio is set:
- *  rne(q * ratio) in [-qmax, qmax]. */
-static inline int8_t fill_q8_value(int8_t q, const float *ratio, size_t i,
+/** [C] A rescale ratio (old scale / new, in [0, 1]) as Q15, 1.0 as 32767:
+ *  every |q| <= 127 rounds back to itself at it. */
+static inline int32_t fill_ratio_q15(float r) {
+  const float x = r * 32768.0f + 0.5f;
+  return x <= 0.0f ? 0 : x >= 32767.0f ? 32767 : (int32_t)x;
+}
+
+/** [C] One int8 value of the decode cache, rescaled when @a r15 is set:
+ *  (q * r + 2^14) >> 15 in [-qmax, qmax], the HVX fill's arithmetic. */
+static inline int8_t fill_q8_value(int8_t q, const int32_t *r15, size_t i,
                                    int32_t qmax) {
-  if (!ratio) {
+  if (!r15) {
     return q;
   }
-  float x = rintf((float)q * ratio[i]);
-  if (x > (float)qmax) {
-    x = (float)qmax;
-  } else if (x < (float)-qmax) {
-    x = (float)-qmax;
+  int32_t x = ((int32_t)q * r15[i] + 16384) >> 15;
+  if (x > qmax) {
+    x = qmax;
+  } else if (x < -qmax) {
+    x = -qmax;
   }
   return (int8_t)x;
 }
@@ -568,7 +582,8 @@ typedef struct {
   uint32_t row0, n_rows;
   const int8_t *kt8, *v8;
   size_t head_stride;
-  const float *k_ratio, *v_ratio;
+  const int32_t *k_r15, *v_r15; /**< Q15 ratios a (head, dim), or NULL */
+  uint32_t t0, n_tiles;         /**< the HVX fill's 64-row tiles */
 } fill_rows_ctx;
 
 /** Rows [lo, hi) of hexkl_kv_q_fill_q8: each row's K and V from the decode
@@ -590,10 +605,10 @@ static void fill_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
       uint8_t *vm = kv->v4 + hexkl_kv_q_v4_index(kv, n, row, 0);
       int32_t cs = 0;
       for (uint32_t d = 0; d < hd; ++d) {
-        const int8_t qk = fill_q8_value(kh[(size_t)d * 64u], c->k_ratio,
+        const int8_t qk = fill_q8_value(kh[(size_t)d * 64u], c->k_r15,
                                         (size_t)n * hd + d, kv->qmax);
         const int8_t qv =
-          fill_q8_value(vh[d], c->v_ratio, (size_t)n * hd + d, kv->qmax);
+          fill_q8_value(vh[d], c->v_r15, (size_t)n * hd + d, kv->qmax);
         cs += qk;
         km[d] = (uint8_t)qk ^ 0x80u;
         vm[d] = (uint8_t)qv ^ 0x80u;
@@ -604,6 +619,125 @@ static void fill_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
     }
   }
 }
+
+#if defined(__hexagon__) || defined(HEXKL_KV_Q_FILL_HVX)
+#define HEXKL_FILL_HVX 1
+
+/** [C] 128 int8 values rescaled: (q * r + 2^14) >> 15, clamped to
+ *  [-qmax, qmax]; r a Q15 ratio per value, the low half of a word in
+ *  @a rw[g] for values 32 g .. 32 g + 31. fill_q8_value's arithmetic. */
+static inline HVX_Vector fill_rescale(HVX_Vector q, const HVX_Vector rw[4],
+                                      int32_t qmax) {
+  const HVX_Vector half = Q6_V_vsplat_R(16384);
+  const HVX_Vector top = Q6_V_vsplat_R(qmax), bot = Q6_V_vsplat_R(-qmax);
+  const HVX_VectorPair h = Q6_Wh_vunpack_Vb(q);
+  const HVX_VectorPair w01 = Q6_Ww_vunpack_Vh(Q6_V_lo_W(h));
+  const HVX_VectorPair w23 = Q6_Ww_vunpack_Vh(Q6_V_hi_W(h));
+  HVX_Vector w[4] = {Q6_V_lo_W(w01), Q6_V_hi_W(w01), Q6_V_lo_W(w23),
+                     Q6_V_hi_W(w23)};
+  for (uint32_t g = 0; g < 4u; ++g) {
+    HVX_Vector x = Q6_Vw_vmpyie_VwVuh(w[g], rw[g]);
+    x = Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(x, half), 15);
+    w[g] = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(x, bot), top);
+  }
+  return Q6_Vb_vpacke_VhVh(Q6_Vh_vpack_VwVw_sat(w[3], w[2]),
+                           Q6_Vh_vpack_VwVw_sat(w[1], w[0]));
+}
+
+/**
+ * [C] Unit u of the HVX fill: kv head u % n_kv, 64-row tile t0 + u / n_kv.
+ * K: each 128-dim block of the tile is 64 vectors of two dims x 64
+ * positions (seed_tile_unit's layout); the ratio goes on there (one per
+ * half vector), then the six byte deals undo the seed's six zips
+ * (position bits 0 .. 5) and leave a vector a position, which goes to the
+ * masters with the bias; the column sum is a vrmpy of those biased bytes.
+ * V: the rows are the masters' already, rescaled and biased a vector at a
+ * time. Rows outside [row0, row0 + n_rows) are not written.
+ */
+static void fill_tile_unit(const fill_rows_ctx *c, uint32_t u) {
+  hexkl_kv_q *kv = c->kv;
+  const uint32_t hd = kv->head_dim, n_kv = kv->n_head_kv;
+  const uint32_t n = u % n_kv, t = c->t0 + u / n_kv;
+  const uint32_t r_lo = c->row0, r_hi = c->row0 + c->n_rows;
+  const HVX_Vector x80 = Q6_V_vsplat_R(0x80808080);
+  const int8_t *ks = c->kt8 + (size_t)n * c->head_stride + (size_t)t * hd * 64u;
+  int32_t cs[64];
+  int32_t sums[32] __attribute__((aligned(128)));
+  for (uint32_t p = 0; p < 64u; ++p) {
+    cs[p] = -HEXKL_KV_Q_BIAS * (int32_t)hd;
+  }
+  for (uint32_t m = 0; m < hd / 128u; ++m) {
+    HVX_Vector v[64];
+    for (uint32_t k = 0; k < 64u; ++k) {
+      v[k] = *(const HVX_UVector *)(ks + ((size_t)m * 64u + k) * 128u);
+      if (c->k_r15) {
+        const int32_t *r = c->k_r15 + (size_t)n * hd + m * 128u + 2u * k;
+        const HVX_Vector a = Q6_V_vsplat_R(r[0]), b = Q6_V_vsplat_R(r[1]);
+        const HVX_Vector rw[4] = {a, a, b, b};
+        v[k] = fill_rescale(v[k], rw, kv->qmax);
+      }
+    }
+    for (uint32_t b = 1u; b < 64u; b <<= 1) {
+      for (uint32_t p = 0; p < 64u; ++p) {
+        if (p & b) {
+          continue;
+        }
+        const HVX_VectorPair w = Q6_W_vdeal_VVR(v[p + b], v[p], -1);
+        v[p] = Q6_V_lo_W(w);
+        v[p + b] = Q6_V_hi_W(w);
+      }
+    }
+    for (uint32_t p = 0; p < 64u; ++p) {
+      const uint32_t row = t * 64u + p;
+      if (row < r_lo || row >= r_hi) {
+        continue;
+      }
+      const HVX_Vector mk = Q6_V_vxor_VV(v[p], x80);
+      *(HVX_UVector *)(kv->kt4 + hexkl_kv_q_kt4_index(kv, n, row, m * 128u)) =
+        mk;
+      *(HVX_Vector *)sums =
+        Q6_Vw_vrmpyacc_VwVubRb(Q6_V_vzero(), mk, 0x01010101);
+      int32_t s = 0;
+      for (uint32_t j = 0; j < 32u; ++j) {
+        s += sums[j];
+      }
+      cs[p] += s;
+    }
+  }
+  for (uint32_t p = 0; p < 64u; ++p) {
+    const uint32_t row = t * 64u + p;
+    if (row < r_lo || row >= r_hi) {
+      continue;
+    }
+    const int8_t *vs = c->v8 + (size_t)n * c->head_stride + (size_t)row * hd;
+    uint8_t *vm = kv->v4 + hexkl_kv_q_v4_index(kv, n, row, 0);
+    for (uint32_t m = 0; m < hd / 128u; ++m) {
+      HVX_Vector x = *(const HVX_UVector *)(vs + (size_t)m * 128u);
+      if (c->v_r15) {
+        const int32_t *r = c->v_r15 + (size_t)n * hd + m * 128u;
+        const HVX_Vector rw[4] = {
+          *(const HVX_UVector *)r, *(const HVX_UVector *)(r + 32),
+          *(const HVX_UVector *)(r + 64), *(const HVX_UVector *)(r + 96)};
+        x = fill_rescale(x, rw, kv->qmax);
+      }
+      *(HVX_UVector *)(vm + (size_t)m * 128u) = Q6_V_vxor_VV(x, x80);
+    }
+    kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = kv->fs_k[n];
+    kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)] = cs[p];
+    kv->s_v[hexkl_kv_q_sv_index(kv, n, row)] = 1.0f;
+  }
+}
+
+static void fill_tiles_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const fill_rows_ctx *c = (const fill_rows_ctx *)v;
+  const uint32_t units = c->n_tiles * c->kv->n_head_kv;
+  const uint32_t lo = (uint32_t)(((uint64_t)units * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)units * (i + 1u)) / n_threads);
+  for (uint32_t u = lo; u < hi; ++u) {
+    fill_tile_unit(c, u);
+  }
+}
+#endif /* the HVX fill */
 
 #ifdef __hexagon__
 
@@ -1090,27 +1224,78 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
   return AEE_SUCCESS;
 }
 
-int hexkl_kv_q_fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
-                       uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
-                       size_t head_stride, const float *k_ratio,
-                       const float *v_ratio, uint8_t *vtcm_base, void *pool) {
+static int fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
+                   uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
+                   size_t head_stride, const float *k_ratio,
+                   const float *v_ratio, uint8_t *vtcm_base, void *pool,
+                   int vector) {
   hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
   if (!kv || !kt8 || !v8 || n_rows == 0 || kv->kind != HEXKL_KV_Q8 ||
       !kv->fixed || !kv->plain_masters || row0 + n_rows > kv->max_rows ||
       row0 + n_rows < row0) {
     return AEE_EBADPARM;
   }
-  fill_rows_ctx fc = {kv, row0, n_rows, kt8, v8, head_stride, k_ratio, v_ratio};
+  const size_t n = (size_t)kv->n_head_kv * kv->head_dim;
+  int32_t *r15 = NULL;
+  if (k_ratio || v_ratio) {
+    r15 = (int32_t *)malloc(2u * n * sizeof(int32_t));
+    if (!r15) {
+      return AEE_ENOMEMORY;
+    }
+    for (size_t i = 0; i < n; ++i) {
+      r15[i] = k_ratio ? fill_ratio_q15(k_ratio[i]) : 32767;
+      r15[n + i] = v_ratio ? fill_ratio_q15(v_ratio[i]) : 32767;
+    }
+  }
+  fill_rows_ctx fc = {kv,
+                      row0,
+                      n_rows,
+                      kt8,
+                      v8,
+                      head_stride,
+                      k_ratio ? r15 : NULL,
+                      v_ratio ? r15 + n : NULL,
+                      row0 / 64u,
+                      (row0 + n_rows + 63u) / 64u - row0 / 64u};
+#ifdef HEXKL_FILL_HVX
+  if (vector && kv->head_dim % 128u == 0u) {
+    hvx_worker_pool_run((hvx_worker_pool *)pool, fill_tiles_worker, &fc,
+                        fc.n_tiles * kv->n_head_kv);
+  } else
+#endif
+  {
+    (void)vector;
 #ifdef __hexagon__
-  hvx_worker_pool_run((hvx_worker_pool *)pool, fill_rows_worker, &fc, n_rows);
+    hvx_worker_pool_run((hvx_worker_pool *)pool, fill_rows_worker, &fc, n_rows);
+#else
+    fill_rows_worker(1u, 0u, &fc);
+#endif
+  }
+  free(r15);
+#ifdef __hexagon__
   return vtcm_base ? bake_fixed_i8(kv, row0, n_rows, vtcm_base, pool, NULL)
                    : AEE_SUCCESS;
 #else
   (void)vtcm_base;
   (void)pool;
-  fill_rows_worker(1u, 0u, &fc);
   return AEE_SUCCESS;
 #endif
+}
+
+int hexkl_kv_q_fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
+                       uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
+                       size_t head_stride, const float *k_ratio,
+                       const float *v_ratio, uint8_t *vtcm_base, void *pool) {
+  return fill_q8(tbl, handle, row0, n_rows, kt8, v8, head_stride, k_ratio,
+                 v_ratio, vtcm_base, pool, 1);
+}
+
+int hexkl_kv_q_fill_q8_scalar(hexkl_kv_q_table *tbl, uint32_t handle,
+                              uint32_t row0, uint32_t n_rows, const int8_t *kt8,
+                              const int8_t *v8, size_t head_stride,
+                              const float *k_ratio, const float *v_ratio) {
+  return fill_q8(tbl, handle, row0, n_rows, kt8, v8, head_stride, k_ratio,
+                 v_ratio, NULL, NULL, 0);
 }
 
 int hexkl_kv_q_dump(const hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,

@@ -745,7 +745,7 @@ done
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc
 # declares in stdlib.h and glibc in malloc.h.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
-  -pthread -include malloc.h \
+  -pthread -include malloc.h -DHEXKL_KV_Q_FILL_HVX \
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
   -I "$BACKEND/hmx" -o "$OUT/attn_m1_host_check" \
   "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
@@ -762,7 +762,7 @@ done
   -pthread -include malloc.h \
   -DNNTR_ATTN_Q8_HEAD_PREP=1 -DNNTR_ATTN_Q8_HEAD_PIPELINE=1 \
   -DNNTR_ATTN_Q8_QK_PAIR=1 -DNNTR_ATTN_Q8_GQA8_REUSE=1 \
-  -DNNTR_ATTN_Q8_NARROW_PREFETCH=1 \
+  -DNNTR_ATTN_Q8_NARROW_PREFETCH=1 -DHEXKL_KV_Q_FILL_HVX \
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
   -I "$BACKEND/hmx" -o "$OUT/attn_m1_v81_host_check" \
   "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
@@ -802,6 +802,30 @@ for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L 
     echo "ATTN M1 MUTANT PASSED (the check is blind): $mut"; exit 1
   fi
   echo "ATTN M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL: gemma' "$OUT/attn_m1_mutant.log") Gemma lines failed)"
+done
+
+# [C] Four mutants of the HVX fill (hexkl_kv_q.c fill_tile_unit), each of
+# which must fail ATTN M1 FILL HVX: the last byte deal (position bit 5)
+# skipped, the column sum's bias dropped, the two dims of a K vector given
+# each other's ratio, and the rescale truncating instead of rounding.
+for mut in 's/    for (uint32_t b = 1u; b < 64u; b <<= 1) {/    for (uint32_t b = 1u; b < 32u; b <<= 1) {/' \
+  's/    cs\[p\] = -HEXKL_KV_Q_BIAS \* (int32_t)hd;/    cs[p] = 0;/' \
+  's/        const HVX_Vector rw\[4\] = {a, a, b, b};/        const HVX_Vector rw[4] = {b, b, a, a};/' \
+  's/    x = Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(x, half), 15);/    x = Q6_Vw_vasr_VwR(x, 15);/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_kv_q.c" > "$OUT/hexkl_kv_q_mut.c"
+  if cmp -s "$OUT/hexkl_kv_q_mut.c" "$BACKEND/hmx/hexkl_kv_q.c"; then
+    echo "FILL HVX MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -pthread -include malloc.h -DHEXKL_KV_Q_FILL_HVX \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+    -I "$BACKEND/hmx" -o "$OUT/attn_m1_fill_mutant" \
+    "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
+    "$BACKEND/hvx/hvx_worker_pool.c" "$OUT/hexkl_kv_q_mut.c" -lm
+  if "$OUT/attn_m1_fill_mutant" > "$OUT/attn_m1_fill_mutant.log"; then
+    echo "FILL HVX MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "FILL HVX MUTANT CAUGHT: $mut ($(grep -c '^FAIL: fill hvx' "$OUT/attn_m1_fill_mutant.log") cells failed)"
 done
 
 # The q2 attention's DSP calibration lanes (nntr_hvx_attn_q.c q2c_worker,
