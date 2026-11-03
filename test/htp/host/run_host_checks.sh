@@ -747,9 +747,9 @@ done
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
   -pthread -include malloc.h \
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
-  -o "$OUT/attn_m1_host_check" \
+  -I "$BACKEND/hmx" -o "$OUT/attn_m1_host_check" \
   "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
-  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  "$BACKEND/hvx/hvx_worker_pool.c" "$BACKEND/hmx/hexkl_kv_q.c" -lm
 
 "$OUT/attn_m1_host_check"
 # The host default leaves the architecture-specific options off. Exercise
@@ -764,9 +764,9 @@ done
   -DNNTR_ATTN_Q8_QK_PAIR=1 -DNNTR_ATTN_Q8_GQA8_REUSE=1 \
   -DNNTR_ATTN_Q8_NARROW_PREFETCH=1 \
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
-  -o "$OUT/attn_m1_v81_host_check" \
+  -I "$BACKEND/hmx" -o "$OUT/attn_m1_v81_host_check" \
   "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
-  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  "$BACKEND/hvx/hvx_worker_pool.c" "$BACKEND/hmx/hexkl_kv_q.c" -lm
 
 "$OUT/attn_m1_v81_host_check"
 # [plan 201 S4] Two mutants of the kernel at Gemma 4's shapes, each of which
@@ -795,9 +795,9 @@ for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L 
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
     -pthread -include malloc.h \
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
-    -o "$OUT/attn_m1_mutant" \
+    -I "$BACKEND/hmx" -o "$OUT/attn_m1_mutant" \
     "$HERE/attn_m1_host_check.c" "$OUT/hvx_attn_m1_mut.c" \
-    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+    "$BACKEND/hvx/hvx_worker_pool.c" "$BACKEND/hmx/hexkl_kv_q.c" -lm
   if "$OUT/attn_m1_mutant" > "$OUT/attn_m1_mutant.log"; then
     echo "ATTN M1 MUTANT PASSED (the check is blind): $mut"; exit 1
   fi

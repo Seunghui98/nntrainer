@@ -66,6 +66,7 @@
 
 #include "attn_m1_cases.h"
 #include "attn_m1_det.h"
+#include "hexkl_kv_q.h"
 #include "hvx_attn_m1_f32.h"
 #include "hvx_attn_m1_hf.h"
 #include "hvx_convert.h"
@@ -1705,6 +1706,81 @@ static void check_seed_q8_tiles_async(hvx_worker_pool *const *pools) {
   }
 }
 
+/** [C] The int8 KV kept in one place: masters seeded into a decode layer
+ *  (hvx_attn_m1_seed_q8_tiles) and filled back into a fixed-scale int8
+ *  cache (hexkl_kv_q_fill_q8, what a later prefill call's attention reads)
+ *  give the masters' bytes back, with their column sums; a layer seeded
+ *  again after hvx_attn_m1_seed_settle(forget) takes the longer seed. */
+static void check_fill_roundtrip(hvx_worker_pool *pool) {
+  const uint32_t n_kv = 2u, hd = 256u, max_seq = 256u, L = 130u, M = 160u;
+  const size_t n = (size_t)n_kv * hd, hs = (size_t)M * hd;
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float *sc = (float *)malloc(4u * n * sizeof(float));
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)(1u + (i * 2654435761u >> 13) % 255u); /* q in -127..127 */
+    v8[i] = (uint8_t)(1u + (i * 40503u >> 7) % 255u);
+  }
+  for (size_t i = 0; i < 4u * n; ++i)
+    sc[i] = 0.003f * (float)(1u + i % 251u);
+  int err = 0, bad = 0;
+  hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+    1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
+  CHECK(a != NULL, "fill roundtrip: create");
+  if (!a) {
+    free(k8);
+    free(v8);
+    free(sc);
+    return;
+  }
+  /* a first call's 64 rows, then the layer again with all 130 */
+  CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, 64u, k8, v8, hs, 0u, sc, sc + n,
+                                  sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+        "fill roundtrip: first seed");
+  CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, L, k8, v8, hs, 0u, sc, sc + n,
+                                  sc + 2u * n, sc + 3u * n) == AEE_EBADSTATE,
+        "fill roundtrip: a seeded layer refuses a plain second seed");
+  hvx_attn_m1_seed_settle(a, 0u, 1);
+  CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, L, k8, v8, hs, 0u, sc, sc + n,
+                                  sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+        "fill roundtrip: reseed after settle");
+  hexkl_kv_q_table *tbl = (hexkl_kv_q_table *)calloc(1, sizeof(*tbl));
+  uint32_t h = 0;
+  CHECK(tbl && hexkl_kv_q_register(tbl, HEXKL_KV_Q8, M, n_kv, hd, &h) == 0 &&
+          hexkl_kv_q_set_fixed_scales_kd(tbl, h, sc, sc + 2u * n) == 0,
+        "fill roundtrip: register");
+  const hexkl_kv_q *kv = tbl ? hexkl_kv_q_get(tbl, h) : NULL;
+  if (kv && hexkl_kv_q_fill_q8(tbl, h, 0u, L, (const int8_t *)a->kt[0],
+                               (const int8_t *)a->v[0], (size_t)hd * a->seq,
+                               NULL, NULL, NULL, NULL) == 0) {
+    for (uint32_t r = 0; r < L; ++r)
+      for (uint32_t k = 0; k < n_kv; ++k) {
+        int32_t cs = 0;
+        for (uint32_t d = 0; d < hd; ++d) {
+          const uint8_t mk = k8[k * hs + (size_t)r * hd + d];
+          cs += (int32_t)mk - 128;
+          bad += kv->kt4[hexkl_kv_q_kt4_index(kv, k, r, d)] != mk;
+          bad += kv->v4[hexkl_kv_q_v4_index(kv, k, r, d)] !=
+                 v8[k * hs + (size_t)r * hd + d];
+        }
+        bad += kv->colsum_k[hexkl_kv_q_sk_index(kv, k, r)] != cs;
+      }
+  } else {
+    bad = 1;
+  }
+  CHECK(bad == 0, "fill roundtrip: %d bytes differ from the masters", bad);
+  if (tbl)
+    hexkl_kv_q_release(tbl, h);
+  free(tbl);
+  hvx_attn_m1_free(a);
+  free(k8);
+  free(v8);
+  free(sc);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 FILL ROUNDTRIP OK\n");
+  }
+}
+
 /** [C] The allocation thread one layer ahead of the seeds: each seed after
  *  a ctx's first finds its layer allocated (pre_hits), the layers equal
  *  the synchronous seed's bytes, and a layer allocated ahead but never
@@ -2457,6 +2533,7 @@ int main(void) {
   check_seed_q8_tiles(pools);
   check_seed_q8_tiles_async(pools);
   check_seed_prealloc(pools);
+  check_fill_roundtrip(pools[2]);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);

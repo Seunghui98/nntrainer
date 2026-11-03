@@ -1518,4 +1518,15 @@ interface nntr_hvx : remote_handle64 {
    // were filled. kv_handle may be trimmed; it is released.
    AEEResult attn_m1_seed_kvq_tiles(in uint32 layer, in uint32 kv_handle,
                                     in uint32 n_rows, in uint32 shift);
+
+   // [C] The other way: rows [0, n_rows) of decode layer `layer` (its word
+   // as attn_m1_kv_append's) into the fixed-scale int8 cache kv_handle --
+   // the masters, per-row scales and column sums, and the WH tiles baked
+   // -- each value times k_ratio / v_ratio ([n_kv][head_dim], the old
+   // scale over the cache's: empty for 1). A prefill call after the first
+   // runs its attention over the rows earlier calls left in the decode
+   // cache, with no CPU copy of them. The layer's seed in flight is waited
+   // for first.
+   AEEResult kv_fill_q(in uint32 kv_handle, in uint32 layer, in uint32 n_rows,
+                       in sequence<float> k_ratio, in sequence<float> v_ratio);
 };

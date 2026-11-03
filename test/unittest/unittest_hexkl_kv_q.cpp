@@ -432,6 +432,86 @@ TEST(HexklKvQ, FixedScalesKPerDim) {
   EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
 }
 
+/** [C] hexkl_kv_q_fill_q8 takes rows back from the decode cache's layout
+ *  (K [tiles][hd][64] a head, V [seq][hd]): with no ratio the masters are
+ *  those bytes (offset by 128), the column sums their sums and the scales
+ *  the fixed ones; with a ratio each value is rne(q * ratio) clamped. */
+TEST(HexklKvQ, FillFromDecodeLayout) {
+  hexkl_kv_q_table tbl{};
+  uint32_t h = 0;
+  const uint32_t n_kv = 2, hd = 256, rows = 150, seq = 192, width = n_kv * hd;
+  ASSERT_EQ(hexkl_kv_q_register(&tbl, HEXKL_KV_Q8, 160, n_kv, hd, &h), 0);
+  std::vector<float> s_k(width), s_v(width, 0.02f);
+  for (uint32_t i = 0; i < width; ++i)
+    s_k[i] = 0.004f + 0.0001f * static_cast<float>((i * 37u) % 251u);
+  ASSERT_EQ(hexkl_kv_q_set_fixed_scales_kd(&tbl, h, s_k.data(), s_v.data()), 0);
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&tbl, h);
+  ASSERT_NE(kv, nullptr);
+  const size_t hs = static_cast<size_t>(seq) * hd;
+  std::vector<int8_t> kt8(n_kv * hs), v8(n_kv * hs);
+  uint32_t lcg = 0x9u;
+  auto next = [&lcg]() {
+    lcg = lcg * 1664525u + 1013904223u;
+    return static_cast<int8_t>(static_cast<int>((lcg >> 24) % 255u) - 127);
+  };
+  for (auto &x : kt8)
+    x = next();
+  for (auto &x : v8)
+    x = next();
+  auto k_at = [&](uint32_t n, uint32_t r, uint32_t d) {
+    return kt8[n * hs + (r / 64u) * hd * 64u + d * 64u + r % 64u];
+  };
+  // rows [10, 150): a later call's history after a first one's 10
+  ASSERT_EQ(hexkl_kv_q_fill_q8(&tbl, h, 10, rows - 10, kt8.data(), v8.data(),
+                               hs, nullptr, nullptr, nullptr, nullptr),
+            0);
+  int bad = 0;
+  for (uint32_t r = 10; r < rows; ++r)
+    for (uint32_t n = 0; n < n_kv; ++n) {
+      int32_t cs = 0;
+      for (uint32_t d = 0; d < hd; ++d) {
+        const int8_t qk = k_at(n, r, d), qv = v8[n * hs + r * hd + d];
+        cs += qk;
+        bad += kv->kt4[hexkl_kv_q_kt4_index(kv, n, r, d)] !=
+               static_cast<uint8_t>(static_cast<uint8_t>(qk) ^ 0x80u);
+        bad += kv->v4[hexkl_kv_q_v4_index(kv, n, r, d)] !=
+               static_cast<uint8_t>(static_cast<uint8_t>(qv) ^ 0x80u);
+      }
+      bad += kv->colsum_k[hexkl_kv_q_sk_index(kv, n, r)] != cs;
+      bad += kv->s_k[hexkl_kv_q_sk_index(kv, n, r)] != kv->fs_k[n];
+      bad += kv->s_v[hexkl_kv_q_sv_index(kv, n, r)] != 1.0f;
+    }
+  EXPECT_EQ(bad, 0);
+  // a scale that grew: the values come back at the new one
+  std::vector<float> kr(width), vr(width);
+  for (uint32_t i = 0; i < width; ++i) {
+    kr[i] = 0.5f + 0.25f * static_cast<float>(i % 3u); // 0.5, 0.75, 1.0
+    vr[i] = 1.0f / 1.5f;
+  }
+  ASSERT_EQ(hexkl_kv_q_fill_q8(&tbl, h, 0, 64, kt8.data(), v8.data(), hs,
+                               kr.data(), vr.data(), nullptr, nullptr),
+            0);
+  bad = 0;
+  for (uint32_t r = 0; r < 64; ++r)
+    for (uint32_t n = 0; n < n_kv; ++n)
+      for (uint32_t d = 0; d < hd; ++d) {
+        const size_t i = n * hd + d;
+        const int ek = static_cast<int>(std::nearbyint(k_at(n, r, d) * kr[i]));
+        const int ev =
+          std::max(-127, std::min(127, static_cast<int>(std::nearbyint(
+                                         v8[n * hs + r * hd + d] * vr[i]))));
+        bad += static_cast<int8_t>(kv->kt4[hexkl_kv_q_kt4_index(kv, n, r, d)] ^
+                                   0x80u) != ek;
+        bad += static_cast<int8_t>(kv->v4[hexkl_kv_q_v4_index(kv, n, r, d)] ^
+                                   0x80u) != ev;
+      }
+  EXPECT_EQ(bad, 0);
+  EXPECT_NE(hexkl_kv_q_fill_q8(&tbl, h, 150, 20, kt8.data(), v8.data(), hs,
+                               nullptr, nullptr, nullptr, nullptr),
+            0);
+  EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
+}
+
 TEST(HexklKvQ, TrimKeepsMastersAndFixedScales) {
   hexkl_kv_q_table tbl{};
   uint32_t h = 0;

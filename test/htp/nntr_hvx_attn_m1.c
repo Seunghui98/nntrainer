@@ -204,7 +204,11 @@ int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
   }
   hvx_attn_m1_ctx *c =
     (layer & HTP_ATTN_KV_CACHE_B) != 0u ? s->attn_m1_b : s->attn_m1;
-  layer &= ~HTP_ATTN_KV_CACHE_B;
+  const int reseed = (layer & HTP_ATTN_KV_RESEED) != 0u;
+  layer &= ~(HTP_ATTN_KV_CACHE_B | HTP_ATTN_KV_RESEED);
+  if (reseed && c) {
+    hvx_attn_m1_seed_settle(c, layer, 1); /* [C] an earlier call's seed */
+  }
   const hexkl_kv_q *kv = hexkl_kv_q_get_masters(&s->kv_q, kv_handle);
   if (!c || !kv || kv->kind != HEXKL_KV_Q8 || !kv->fixed ||
       !kv->plain_masters || !kv->k_per_dim || kv->n_head_kv != c->n_kv ||
@@ -226,6 +230,41 @@ int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
   s->seed_rpc_us += HAP_perf_get_time_us() - t0;
   ++s->seed_rpcs;
   return rc;
+}
+
+int nntr_hvx_kv_fill_q(remote_handle64 handle, uint32 kv_handle, uint32 layer,
+                       uint32 n_rows, const float *k_ratio, int k_ratioLen,
+                       const float *v_ratio, int v_ratioLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  hvx_attn_m1_ctx *c =
+    (layer & HTP_ATTN_KV_CACHE_B) != 0u ? s->attn_m1_b : s->attn_m1;
+  layer &= ~(HTP_ATTN_KV_CACHE_B | HTP_ATTN_KV_RESEED);
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
+  if (!c || !c->q8 || layer >= c->n_layers || !kv || kv->n_head_kv != c->n_kv ||
+      kv->head_dim != c->head_dim) {
+    FARF(ERROR, "kv_fill_q: cache %u does not fit layer %u",
+         (unsigned)kv_handle, (unsigned)layer);
+    return AEE_EBADSTATE;
+  }
+  const uint32_t n = c->n_kv * c->head_dim;
+  if ((k_ratioLen != 0 && (uint32_t)k_ratioLen != n) ||
+      (v_ratioLen != 0 && (uint32_t)v_ratioLen != n)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  hvx_attn_m1_seed_settle(c, layer, 0); /* its rows written, its cache freed */
+  if (!c->kt[layer] || !c->v[layer] || c->kv_len[layer] < n_rows) {
+    FARF(ERROR, "kv_fill_q: layer %u holds %u rows, not %u", (unsigned)layer,
+         (unsigned)c->kv_len[layer], (unsigned)n_rows);
+    return AEE_EBADSTATE;
+  }
+  return hexkl_kv_q_fill_q8(
+    &s->kv_q, kv_handle, 0u, n_rows, (const int8_t *)c->kt[layer],
+    (const int8_t *)c->v[layer], (size_t)c->head_dim * c->seq,
+    k_ratioLen ? k_ratio : NULL, v_ratioLen ? v_ratio : NULL, s->vtcm_base,
+    s->quant_pool);
 }
 
 int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,

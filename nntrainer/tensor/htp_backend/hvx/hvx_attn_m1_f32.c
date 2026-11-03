@@ -1056,6 +1056,16 @@ void hvx_attn_m1_seed_reap(hvx_attn_m1_ctx *ctx, int wait) {
   }
 }
 
+void hvx_attn_m1_seed_settle(hvx_attn_m1_ctx *ctx, uint32_t layer, int forget) {
+  if (!ctx || layer >= ctx->n_layers) {
+    return;
+  }
+  seed_join(ctx, layer);
+  if (forget) {
+    ctx->kv_len[layer] = 0u;
+  }
+}
+
 int hvx_attn_m1_seed_q8_tiles_async(
   hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows, const uint8_t *k8,
   const uint8_t *v8, size_t head_stride, uint32_t shift, const float *s_k,

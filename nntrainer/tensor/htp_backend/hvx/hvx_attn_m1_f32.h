@@ -291,6 +291,12 @@ int hvx_attn_m1_seed_q8_tiles_async(
  *         NULL ctx is a no-op. */
 void hvx_attn_m1_seed_reap(hvx_attn_m1_ctx *ctx, int wait);
 
+/** @brief [C] Waits for layer @a layer's background seed, if one is in
+ *         flight (its done callback runs here), so its tiles and scales can
+ *         be read, or the layer seeded again: @a forget also sets its
+ *         length to 0, which a new seed of the layer needs. */
+void hvx_attn_m1_seed_settle(hvx_attn_m1_ctx *ctx, uint32_t layer, int forget);
+
 /**
  * @brief Appends position @a pos (k, v of the new token) to @a layer and
  *        computes the attention output over positions 0..pos.

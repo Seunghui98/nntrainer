@@ -346,6 +346,26 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
                            hexkl_kv_q_append_stats *st);
 
 /**
+ * @brief [C] Rows [row0, row0 + n_rows) of a fixed-scale int8 cache from
+ *        int8 values kept in the decode cache's layout (hvx_attn_m1's q8
+ *        layers): K per head as 64-position transposed tiles,
+ *        [tiles][head_dim][64], V row-major, [seq][head_dim], each head
+ *        @a head_stride bytes after the last. Each value is taken times
+ *        @a k_ratio / @a v_ratio ([n_head_kv][head_dim]: the old scale over
+ *        the cache's, NULL for 1) and rounded to nearest even, clamped to
+ *        qmax; the masters, per-row scales and column sums come out as an
+ *        append of those values writes them, and the tiles are baked as an
+ *        append bakes them (vtcm_base NULL: no bake, host builds). With no
+ *        ratio the cache holds the decode cache's bytes back: what lets a
+ *        prefill call's attention run over earlier rows the CPU no longer
+ *        keeps.
+ */
+int hexkl_kv_q_fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
+                       uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
+                       size_t head_stride, const float *k_ratio,
+                       const float *v_ratio, uint8_t *vtcm_base, void *pool);
+
+/**
  * @brief Fills the row-major staging buffers with column tile @a c of head
  *        @a n from the masters (stage_kt as [head_dim][32], stage_v as
  *        [32][head_dim]). What the bake reads; exposed for the host test.

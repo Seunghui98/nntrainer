@@ -545,6 +545,68 @@ typedef struct {
   const uint16_t *k_rows, *v_rows;
 } quant_rows_ctx;
 
+#endif /* __hexagon__: the row filler below builds everywhere */
+
+/** [C] One int8 value of the decode cache, rescaled when @a ratio is set:
+ *  rne(q * ratio) in [-qmax, qmax]. */
+static inline int8_t fill_q8_value(int8_t q, const float *ratio, size_t i,
+                                   int32_t qmax) {
+  if (!ratio) {
+    return q;
+  }
+  float x = rintf((float)q * ratio[i]);
+  if (x > (float)qmax) {
+    x = (float)qmax;
+  } else if (x < (float)-qmax) {
+    x = (float)-qmax;
+  }
+  return (int8_t)x;
+}
+
+typedef struct {
+  hexkl_kv_q *kv;
+  uint32_t row0, n_rows;
+  const int8_t *kt8, *v8;
+  size_t head_stride;
+  const float *k_ratio, *v_ratio;
+} fill_rows_ctx;
+
+/** Rows [lo, hi) of hexkl_kv_q_fill_q8: each row's K and V from the decode
+ *  layout into the masters, the scales and the column sums, as
+ *  quant_rows_worker writes them. A unit's rows touch only their own bytes. */
+static void fill_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const fill_rows_ctx *c = (const fill_rows_ctx *)v;
+  hexkl_kv_q *kv = c->kv;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->n_rows * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->n_rows * (i + 1u)) / n_threads);
+  const uint32_t hd = kv->head_dim;
+  for (uint32_t r = lo; r < hi; ++r) {
+    const uint32_t row = c->row0 + r;
+    for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
+      const int8_t *kh = c->kt8 + (size_t)n * c->head_stride +
+                         (size_t)(row / 64u) * hd * 64u + row % 64u;
+      const int8_t *vh = c->v8 + (size_t)n * c->head_stride + (size_t)row * hd;
+      uint8_t *km = kv->kt4 + hexkl_kv_q_kt4_index(kv, n, row, 0);
+      uint8_t *vm = kv->v4 + hexkl_kv_q_v4_index(kv, n, row, 0);
+      int32_t cs = 0;
+      for (uint32_t d = 0; d < hd; ++d) {
+        const int8_t qk = fill_q8_value(kh[(size_t)d * 64u], c->k_ratio,
+                                        (size_t)n * hd + d, kv->qmax);
+        const int8_t qv =
+          fill_q8_value(vh[d], c->v_ratio, (size_t)n * hd + d, kv->qmax);
+        cs += qk;
+        km[d] = (uint8_t)qk ^ 0x80u;
+        vm[d] = (uint8_t)qv ^ 0x80u;
+      }
+      kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = kv->fs_k[n];
+      kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)] = cs;
+      kv->s_v[hexkl_kv_q_sv_index(kv, n, row)] = 1.0f;
+    }
+  }
+}
+
+#ifdef __hexagon__
+
 /** Rows [lo, hi) of the append: the fixed-scale int8 quantization of each
  *  row's K and V into its masters, scales and column sums. A worker's
  *  rows touch no other worker's bytes. */
@@ -601,12 +663,15 @@ static void bake_tiles_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
+static int bake_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
+                         uint8_t *vtcm_base, void *pool,
+                         hexkl_kv_q_append_stats *st);
+
 static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
                            const uint16_t *k_rows, const uint16_t *v_rows,
                            uint8_t *vtcm_base, void *pool,
                            hexkl_kv_q_append_stats *st) {
   const uint64_t tq0 = kvq_now_us();
-  const uint32_t hd = kv->head_dim;
   // The quantization alone was 6.2 ms of a 1024-row sliding layer on the
   // HMX thread (doc 59 section 2.2); rows split over the workers.
   quant_rows_ctx qc = {kv, row0, n_rows, k_rows, v_rows};
@@ -618,6 +683,15 @@ static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
   if (!vtcm_base) {
     return AEE_SUCCESS;
   }
+  return bake_fixed_i8(kv, row0, n_rows, vtcm_base, pool, st);
+}
+
+/** The append's bake of rows [row0, row0 + n_rows): the full column tiles
+ *  over the pool, the partial ones row by row. */
+static int bake_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
+                         uint8_t *vtcm_base, void *pool,
+                         hexkl_kv_q_append_stats *st) {
+  const uint32_t hd = kv->head_dim;
   const int direct = wh_i8_probe(vtcm_base);
   const uint32_t c_lo = row0 / 32u;
   const uint32_t c_hi = (row0 + n_rows - 1u) / 32u;
@@ -1014,6 +1088,29 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
     }
   }
   return AEE_SUCCESS;
+}
+
+int hexkl_kv_q_fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
+                       uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
+                       size_t head_stride, const float *k_ratio,
+                       const float *v_ratio, uint8_t *vtcm_base, void *pool) {
+  hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
+  if (!kv || !kt8 || !v8 || n_rows == 0 || kv->kind != HEXKL_KV_Q8 ||
+      !kv->fixed || !kv->plain_masters || row0 + n_rows > kv->max_rows ||
+      row0 + n_rows < row0) {
+    return AEE_EBADPARM;
+  }
+  fill_rows_ctx fc = {kv, row0, n_rows, kt8, v8, head_stride, k_ratio, v_ratio};
+#ifdef __hexagon__
+  hvx_worker_pool_run((hvx_worker_pool *)pool, fill_rows_worker, &fc, n_rows);
+  return vtcm_base ? bake_fixed_i8(kv, row0, n_rows, vtcm_base, pool, NULL)
+                   : AEE_SUCCESS;
+#else
+  (void)vtcm_base;
+  (void)pool;
+  fill_rows_worker(1u, 0u, &fc);
+  return AEE_SUCCESS;
+#endif
 }
 
 int hexkl_kv_q_dump(const hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
