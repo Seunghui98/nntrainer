@@ -4882,7 +4882,6 @@ public:
     }
     init_line.at[2] = HtpProfile::nowUs();
     size_t param_bytes = 0;
-    bool param_batched = false;
     // [plan 201 S1] each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
@@ -4893,41 +4892,21 @@ public:
                    static_cast<unsigned>(t.size()),
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
-      // [plan 201 S4] the parameters the model handed at load, by name,
-      // in one graph_set_params call (one round trip for 301 on Gemma 4;
-      // NNTR_HTP_PARAM_BATCH=0 or a refused call: one call each)
-      static const bool batch_on = [] {
-        const char *v = std::getenv("NNTR_HTP_PARAM_BATCH");
-        return v == nullptr || std::strcmp(v, "0") != 0;
-      }();
-      std::vector<uint32_t> hdr;
-      std::vector<float> data;
-      auto add = [&](uint32_t op, uint32_t which, const float *d, unsigned n) {
-        hdr.insert(hdr.end(), {op, which, n});
-        data.insert(data.end(), d, d + n);
-      };
+      // [plan 201 S4] the parameters the model handed at load, by name.
+      // ponytail: one call each; one batched call (18ace9d) and an ION
+      // staging (e6ae500) were both slower on S26 Ultra -- the 20 ms beside
+      // the DSP's 17.5 is not the round trips nor the argument copy alone
       for (const LoadParam &p : load_params_) {
         param_bytes += size_t(p.n) * sizeof(float);
-        add(p.op, p.which, p.data, p.n);
+        setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
         const auto q = static_quant_.find(p.data);
         if (p.which == HTP_GRAPH_PARAM_ROUTER_W && q != static_quant_.end()) {
           const float grid[] = {q->second.scale,
                                 static_cast<float>(q->second.zp)};
-          add(p.op, HTP_GRAPH_PARAM_ROUTER_QUANT, grid, 2);
+          setParam(session, p.op, HTP_GRAPH_PARAM_ROUTER_QUANT, grid, 2, 2,
+                   "router static quantization");
         }
       }
-      const bool batched =
-        batch_on && !hdr.empty() &&
-        nntr_hvx_graph_set_params(session, hdr.data(),
-                                  static_cast<int>(hdr.size()), data.data(),
-                                  static_cast<int>(data.size())) == AEE_SUCCESS;
-      if (!batched)
-        for (size_t i = 0, at = 0; i < hdr.size(); i += 3) {
-          setParam(session, hdr[i], hdr[i + 1], data.data() + at, hdr[i + 2],
-                   hdr[i + 2], "load parameter");
-          at += hdr[i + 2];
-        }
-      param_batched = batched;
       // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
       // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
       if (const uint32_t on = predictMode()) {
@@ -4968,10 +4947,9 @@ public:
       uint32_t si[13] = {0};
       const bool dsp = nntr_hvx_session_info(session, si, 13) == AEE_SUCCESS;
       std::fprintf(stderr,
-                   "[HTP] t1: graph_init params=%zu mib=%.1f batched=%d "
-                   "ms=%.1f dsp_ms=%.1f\n",
+                   "[HTP] t1: graph_init params=%zu mib=%.1f ms=%.1f "
+                   "dsp_ms=%.1f\n",
                    load_params_.size(), param_bytes / 1048576.0,
-                   param_batched ? 1 : 0,
                    (init_line.at[3] - init_line.at[2]) / 1000.0,
                    dsp ? si[12] / 1000.0 : -1.0);
     }

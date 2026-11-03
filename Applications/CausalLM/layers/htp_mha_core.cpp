@@ -657,8 +657,32 @@ void HtpMHACoreLayer::incremental_forwarding(
   cache_index += step_size;
 }
 
+namespace {
+/** [#282 F] The RoPE tables the layers of one RoPE cache share over the
+ *  first decode row (htpDecodeAttention's build_rope_table), by cache and
+ *  shape. Freed at the first call of a later row: 2.6 + 5.2 MiB on Gemma 4
+ *  otherwise kept to the end, which round 13 read as 7-8 MiB on the peak. */
+struct RopeTables {
+  std::mutex m;
+  unsigned int pos = UINT_MAX;
+  std::map<std::tuple<const void *, unsigned, unsigned>,
+           std::shared_ptr<const std::vector<float>>>
+    tabs;
+};
+RopeTables &ropeTables() {
+  static RopeTables t;
+  return t;
+}
+} // namespace
+
 bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                                          unsigned int pos) {
+  {
+    RopeTables &rt = ropeTables();
+    const std::lock_guard<std::mutex> lock(rt.m);
+    if (rt.pos != pos)
+      rt.tabs.clear();
+  }
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
   nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
@@ -706,19 +730,12 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     // [#282 F] one table per RoPE cache and length for the row: the layers
     // that share a cache (Gemma 4: 25 sliding, 5 full) hand the same bytes
     // at the same address, and the backend shares them by that address
-    // instead of a 30-table build and memcmp (~38 ms of the S26 Ultra's
-    // first token, round 12's to_token). Kept to the next row's first call.
-    static std::mutex tab_mtx;
-    static unsigned int tab_pos = UINT_MAX;
-    static std::map<std::tuple<const void *, unsigned, unsigned>,
-                    std::shared_ptr<const std::vector<float>>>
-      tabs;
-    const std::lock_guard<std::mutex> lock(tab_mtx);
-    if (tab_pos != pos) {
-      tabs.clear();
-      tab_pos = pos;
-    }
-    auto &slot = tabs[{freqs_fp32.get(), rows, head_dim}];
+    // instead of a 30-table build and memcmp (round 13: to_token 35.4 ->
+    // 17.8 ms on the S26 Ultra's first token). Freed at the next row.
+    RopeTables &rt = ropeTables();
+    const std::lock_guard<std::mutex> lock(rt.m);
+    rt.pos = pos;
+    auto &slot = rt.tabs[{freqs_fp32.get(), rows, head_dim}];
     if (!slot) {
       auto tab = std::make_shared<std::vector<float>>(
         static_cast<size_t>(rows) * head_dim);

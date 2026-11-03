@@ -114,41 +114,6 @@ int nntr_hvx_graph_set_param(remote_handle64 handle, uint32 op, uint32 which,
   return rc;
 }
 
-int nntr_hvx_graph_set_params(remote_handle64 handle, const uint32 *hdr,
-                              int hdrLen, const float *data, int dataLen) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || hdrLen < 0 || dataLen < 0 || hdrLen % 3 != 0 || (hdrLen && !hdr) ||
-      (dataLen && !data)) {
-    return AEE_EBADPARM;
-  }
-  if (s->graph == NULL) {
-    FARF(ERROR, "graph_set_params: no graph; call graph_init first");
-    return AEE_EBADSTATE;
-  }
-  const uint64_t t0 = HAP_perf_get_time_us();
-  int rc = AEE_SUCCESS;
-  uint32_t at = 0;
-  for (int i = 0; i < hdrLen && rc == AEE_SUCCESS; i += 3) {
-    const uint32_t n = hdr[i + 2];
-    if (n > (uint32_t)dataLen - at) {
-      rc = AEE_EINVALIDFORMAT;
-      break;
-    }
-    rc = hexkl_graph_set_param(s->graph, hdr[i], hdr[i + 1], data + at, n);
-    if (rc != AEE_SUCCESS) {
-      FARF(ERROR, "graph_set_params: op=%u which=%u n=%u: %s (0x%08x)",
-           (unsigned)hdr[i], (unsigned)hdr[i + 1], (unsigned)n,
-           htp_graph_err_name(rc), (unsigned)rc);
-    }
-    at += n;
-  }
-  if (rc == AEE_SUCCESS && at != (uint32_t)dataLen) {
-    rc = AEE_EINVALIDFORMAT; /* data longer than the triples say */
-  }
-  s->param_us += HAP_perf_get_time_us() - t0;
-  return rc;
-}
-
 int nntr_hvx_graph_share_param(remote_handle64 handle, uint32 op, uint32 which,
                                uint32 src_op) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;

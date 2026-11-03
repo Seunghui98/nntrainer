@@ -715,15 +715,6 @@ interface nntr_hvx : remote_handle64 {
    AEEResult graph_set_param(in uint32 op, in uint32 which,
                              in sequence<float> data);
 
-   // [#282 F] graph_set_param for many parameters in one call: hdr holds
-   // (op, which, n) triples, data their floats back to back in that order.
-   // Each is set as graph_set_param sets it; the first failure's code is
-   // returned and the ones before it stay set. The graph init's load
-   // parameters were 301 calls, 38 ms of the S26 Ultra's first token of
-   // which the DSP's own work was 17.5.
-   AEEResult graph_set_params(in sequence<uint32> hdr,
-                              in sequence<float> data);
-
    // [#4416 D6] ROPE op `op` shares the table ROPE op `src_op` already
    // holds (which = ROPE_TABLE only): the ARM sends a layer's table once
    // and points the layers that have the same one at it (Gemma 4: 2 of
