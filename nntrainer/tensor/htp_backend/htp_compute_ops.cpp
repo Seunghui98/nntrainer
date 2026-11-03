@@ -1392,6 +1392,8 @@ public:
     seed_rpc_us_ = seed_calls_ = seed_kvq_ = 0;
     prefill_seeds_ = 0;
     prefill_seed_us_ = 0;
+    prefill_fills_ = 0;
+    prefill_fill_us_ = 0;
   }
 
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
@@ -3808,9 +3810,10 @@ public:
   }
 
   bool decode_kv_seed_kvq_layer(unsigned ordinal, unsigned n_rows,
-                                int kv_handle, unsigned shift) override {
+                                int kv_handle, unsigned shift,
+                                bool reseed) override {
     if (!kvAdopt() || !attn_registered_ || kv_handle < 0 ||
-        ordinal >= attn_op_.size() || kv_len_[ordinal] != 0u)
+        ordinal >= attn_op_.size() || (kv_len_[ordinal] != 0u && !reseed))
       return false;
     {
       std::lock_guard<std::mutex> lock(kvq_mutex_);
@@ -3820,7 +3823,8 @@ public:
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const uint32_t layer = attn_cache_ord_[ordinal] |
-                           (attn_cache_[ordinal] ? HTP_ATTN_KV_CACHE_B : 0u);
+                           (attn_cache_[ordinal] ? HTP_ATTN_KV_CACHE_B : 0u) |
+                           (reseed ? HTP_ATTN_KV_RESEED : 0u);
     const uint64_t t0 = HtpProfile::nowUs();
     const int err = nntr_hvx_attn_m1_seed_kvq_tiles(
       session, layer, static_cast<uint32_t>(kv_handle), n_rows, shift);
@@ -3838,6 +3842,30 @@ public:
     }
     ++prefill_seeds_;
     kv_len_[ordinal] = n_rows;
+    return true;
+  }
+
+  bool decode_kv_fill_kvq(unsigned ordinal, int kv_handle, unsigned n_rows,
+                          const float *k_ratio, const float *v_ratio,
+                          unsigned n_ratio) override {
+    if (!kvAdopt() || !attn_registered_ || kv_handle < 0 ||
+        ordinal >= attn_op_.size() || kv_len_[ordinal] < n_rows)
+      return false;
+    const uint32_t layer = attn_cache_ord_[ordinal] |
+                           (attn_cache_[ordinal] ? HTP_ATTN_KV_CACHE_B : 0u);
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_kv_fill_q(
+      static_cast<remote_handle64>(HtpBackend::global().handle()),
+      static_cast<uint32_t>(kv_handle), layer, n_rows, k_ratio,
+      k_ratio ? static_cast<int>(n_ratio) : 0, v_ratio,
+      v_ratio ? static_cast<int>(n_ratio) : 0);
+    prefill_fill_us_ += HtpProfile::nowUs() - t0;
+    ++prefill_fills_;
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr, "[HTP] prefill fill: layer %u not filled (%s)\n",
+                   ordinal, graphErr(err).c_str());
+      return false;
+    }
     return true;
   }
 
@@ -4207,11 +4235,13 @@ public:
                    "[HTP] t1: pool_sync_ms=%.1f (drop_host_fc+pin %.1f) "
                    "kv_seed_rpc_ms=%.1f seeds=%u (dsp %u, kvq freed late %zu) "
                    "prefill_seeds=%u prefill_seed_ms=%.1f "
+                   "prefill_fills=%u prefill_fill_ms=%.1f "
                    "rss_mib=%.1f mem_available_mib=%.1f\n",
                    (HtpProfile::nowUs() - t_ps) / 1000.0,
                    (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0, seed_calls_,
                    seed_kvq_, left, prefill_seeds_, prefill_seed_us_ / 1000.0,
-                   rssMib(), memAvailMib());
+                   prefill_fills_, prefill_fill_us_ / 1000.0, rssMib(),
+                   memAvailMib());
       uint32_t si[12] = {0};
       if (prefill_seeds_ != 0 &&
           nntr_hvx_session_info(
@@ -11598,6 +11628,8 @@ private:
    *  DSP time (printed with the t1 seed line) */
   uint32_t prefill_seeds_ = 0;
   uint64_t prefill_seed_us_ = 0;
+  uint64_t prefill_fill_us_ = 0; /**< [C] decode_kv_fill_kvq's RPCs */
+  unsigned prefill_fills_ = 0;
   uint64_t t1_gi0_ = 0, t1_gi1_ = 0; /**< [#282 F] graph init's window */
   bool attn_registered_ = false;
   uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */

@@ -241,15 +241,35 @@ inline bool htpDecodeKvPrepare() {
 
 /** @brief [C] ComputeOps::decode_kv_seed_kvq_layer. */
 inline bool htpDecodeKvSeedKvqLayer(unsigned ordinal, unsigned n_rows,
-                                    int kv_handle, unsigned shift) {
+                                    int kv_handle, unsigned shift,
+                                    bool reseed = false) {
 #ifdef ENABLE_HEXKL
-  return nntrainer::get_htp_ops()->decode_kv_seed_kvq_layer(ordinal, n_rows,
-                                                            kv_handle, shift);
+  return nntrainer::get_htp_ops()->decode_kv_seed_kvq_layer(
+    ordinal, n_rows, kv_handle, shift, reseed);
 #else
   (void)ordinal;
   (void)n_rows;
   (void)kv_handle;
   (void)shift;
+  (void)reseed;
+  return false;
+#endif
+}
+
+/** @brief [C] ComputeOps::decode_kv_fill_kvq. */
+inline bool htpDecodeKvFillKvq(unsigned ordinal, int kv_handle, unsigned n_rows,
+                               const float *k_ratio, const float *v_ratio,
+                               unsigned n_ratio) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_fill_kvq(
+    ordinal, kv_handle, n_rows, k_ratio, v_ratio, n_ratio);
+#else
+  (void)ordinal;
+  (void)kv_handle;
+  (void)n_rows;
+  (void)k_ratio;
+  (void)v_ratio;
+  (void)n_ratio;
   return false;
 #endif
 }

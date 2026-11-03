@@ -889,13 +889,33 @@ public:
 
   // [C] decode_kv_seed_kvq_tiles for attention layer @a ordinal (graph
   // order) during the prefill, outside any decode hook: needs
-  // decode_kv_prepare. The handle is released on success.
+  // decode_kv_prepare. The handle is released on success. @a reseed: the
+  // layer was seeded by an earlier prefill call and takes this seed over.
   virtual bool decode_kv_seed_kvq_layer(unsigned ordinal, unsigned n_rows,
-                                        int kv_handle, unsigned shift) {
+                                        int kv_handle, unsigned shift,
+                                        bool reseed = false) {
     (void)ordinal;
     (void)n_rows;
     (void)kv_handle;
     (void)shift;
+    (void)reseed;
+    return false;
+  }
+
+  // [C] The other way: rows [0, n_rows) of attention layer @a ordinal's
+  // decode cache into the fixed-scale int8 cache @a kv_handle, each value
+  // times @a k_ratio / @a v_ratio (head x dim; nullptr for 1), so a prefill
+  // call's attention reads the rows earlier calls left there. False: not
+  // filled.
+  virtual bool decode_kv_fill_kvq(unsigned ordinal, int kv_handle,
+                                  unsigned n_rows, const float *k_ratio,
+                                  const float *v_ratio, unsigned n_ratio) {
+    (void)ordinal;
+    (void)kv_handle;
+    (void)n_rows;
+    (void)k_ratio;
+    (void)v_ratio;
+    (void)n_ratio;
     return false;
   }
 
