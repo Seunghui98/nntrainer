@@ -2537,9 +2537,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                       output_interval[0][ppl_alts[i]]);
         alts += buf;
       }
+      // margin: the pick's logit over the runner-up's (a near tie flips on
+      // a small numeric change); gap: the pick's over the target's (0 when
+      // they agree). The accuracy gate reads both at the steps two paths
+      // disagree (ppl_eval.py).
+      const float *lg = output_interval[0];
+      float second = -std::numeric_limits<float>::infinity();
+      for (unsigned int i = 0; i < NUM_VOCAB; ++i)
+        if (i != top1 && lg[i] > second)
+          second = lg[i];
       std::fprintf(stderr,
-                   "[PPL] decode step=%u target=%u nll=%.17g top1=%u%s\n",
-                   ppl_dec_n, target, nll, top1, alts.c_str());
+                   "[PPL] decode step=%u target=%u nll=%.17g top1=%u "
+                   "margin=%.6g gap=%.6g%s\n",
+                   ppl_dec_n, target, nll, top1, lg[top1] - second,
+                   lg[top1] - lg[target], alts.c_str());
       if (ppl_forced)
         ids_list[0] = target;
       else
