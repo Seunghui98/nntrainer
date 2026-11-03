@@ -1612,7 +1612,9 @@ bool HtpMHACoreLayer::try_quantized_attention(
         << "keeps them)";
       q_cache_handles[batch] = -1; // released on the DSP with the seed
       kv_detached_ = true;
-      htp_owns_cache_ = true;
+      // not htp_owns_cache_: this prompt's next chunk takes its earlier rows
+      // back from the decode cache (the fill above), so it is not refused;
+      // only the decode hook's first row hands the cache over for good
       return;
     }
     const unsigned int end = htpPrefillEnd();
