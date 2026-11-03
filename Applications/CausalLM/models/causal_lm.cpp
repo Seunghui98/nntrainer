@@ -1133,8 +1133,9 @@ void CausalLM::save_kvcache(std::string path, int to_) {
   const auto pos = static_cast<unsigned int>(to_);
   // [C] staging: the rows live in the accelerator's int8 decode caches
   NNTR_THROW_IF(kv_cache.isStaging(), std::runtime_error)
-    << "save_kvcache: the KV cache stages one step's rows (int8-only KV); "
-       "run with NNTR_HTP_KV_INT8_ONLY=0 to save it";
+    << "save_kvcache: the KV cache stages one step's rows (int8-only KV, "
+       "the rows are on the accelerator); a model configured with "
+       "system_prompt.kvcache keeps a CPU cache to save";
   kv_cache.validateSaveRange(pos);
   // [#4428 window] a windowed layer's rows before its window are not in
   // the dump: their |max| is folded first and goes with the calibration
@@ -1188,8 +1189,9 @@ void CausalLM::load_kvcache(std::string path, int to_) {
     allocateAndBindKVCache();
   }
   NNTR_THROW_IF(kv_cache.isStaging(), std::runtime_error)
-    << "load_kvcache: the KV cache stages one step's rows (int8-only KV); "
-       "run with NNTR_HTP_KV_INT8_ONLY=0 to load one";
+    << "load_kvcache: the KV cache stages one step's rows (int8-only KV, "
+       "the rows are on the accelerator); a model configured with "
+       "system_prompt.kvcache keeps a CPU cache to load into";
   const unsigned int loaded =
     kv_cache.load(path, static_cast<unsigned int>(to_), kvCacheModelTag());
   // absent (a dump of an older build, a CPU run): the layers calibrate on

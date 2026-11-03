@@ -1608,8 +1608,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
                                    cache_base > 0),
         std::runtime_error)
         << "mha_core: " << q2_name_ << " could not seed its decode cache "
-        << "(int8-only KV: the CPU keeps no rows; NNTR_HTP_KV_INT8_ONLY=0 "
-        << "keeps them)";
+        << "(int8-only KV: the CPU keeps no rows)";
       q_cache_handles[batch] = -1; // released on the DSP with the seed
       kv_detached_ = true;
       // not htp_owns_cache_: this prompt's next chunk takes its earlier rows
@@ -2187,7 +2186,7 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
                                       cache_from, cache_to, nullptr);
   NNTR_THROW_IF(!done && htpKvStaging(), std::runtime_error)
     << "mha_core: " << q2_name_ << " fell off the int8 KV path, and the CPU "
-    << "keeps no rows to attend over (NNTR_HTP_KV_INT8_ONLY=0 keeps them)";
+    << "keeps no rows to attend over (int8-only KV)";
   // [C] staging: every call that ran ends seeding the decode cache, which
   // releases its int8 cache; one left means a path returned without it
   NNTR_THROW_IF(done && htpKvStaging() && batch < q_cache_handles.size() &&
@@ -2349,7 +2348,7 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
   }
   NNTR_THROW_IF(htpKvStaging(), std::runtime_error)
     << "mha_core: " << q2_name_ << " fell off the int8 KV path, and the CPU "
-    << "keeps no rows to attend over (NNTR_HTP_KV_INT8_ONLY=0 keeps them)";
+    << "keeps no rows to attend over (int8-only KV)";
   if (try_accelerated_attention(query_step, b_cached_key, b_cached_value,
                                 attention_output_step, from, to, &sink_step)) {
     return;

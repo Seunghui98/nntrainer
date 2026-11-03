@@ -73,11 +73,10 @@ bool Gemma4HtpTransformer::isKVSharedLayer(int layer_id) const {
 }
 
 bool Gemma4HtpTransformer::kvStaging() const {
-  static const bool on = [] {
-    const char *v = std::getenv("NNTR_HTP_KV_INT8_ONLY");
-    return v == nullptr || std::strcmp(v, "0") != 0;
-  }();
-  return on && htpKvAdopt() && ATTENTION_ENGINE == "htp" &&
+  // [C] the only KV layout with HTP attention: what keeps a CPU cache is a
+  // configuration whose CPU rows are read (KV sharing, a KV cache file) or
+  // one without the decode seed (NNTR_HTP_KV_ADOPT=0)
+  return htpKvAdopt() && ATTENTION_ENGINE == "htp" &&
          NUM_KV_SHARED_LAYERS == 0 && !kv_cache_file_;
 }
 

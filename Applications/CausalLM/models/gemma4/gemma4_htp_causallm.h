@@ -133,10 +133,10 @@ protected:
    *         at a long max_seq_len its window plus one step. */
   unsigned int getKVCacheRows(int layer_id) const;
   /** @brief [C] One KV store a layer: the int8 decode caches hold the rows
-   *  and the CPU cache stages a step's (KVCacheManager::setStaging). With
-   *  the KV adoption, HTP attention, no KV-shared layers and no KV cache
-   *  file (system_prompt.kvcache: save / load read the CPU rows), unless
-   *  NNTR_HTP_KV_INT8_ONLY=0. */
+   *  and the CPU cache stages a step's (KVCacheManager::setStaging). Always
+   *  with HTP attention, but for what reads CPU rows: KV-shared layers, a
+   *  KV cache file (system_prompt.kvcache: save / load), or no decode seed
+   *  (NNTR_HTP_KV_ADOPT=0). */
   bool kvStaging() const;
   bool kv_cache_file_ = false; /**< nntr_config's system_prompt.kvcache */
   /** @brief [C] The staged rows: the largest prefill block or generation. */
